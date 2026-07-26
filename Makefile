@@ -150,7 +150,8 @@ lunaria: loader.o arm_exec.o trace.o libdl.so libpthread.so \
        runtime/libpthread.so runtime/libc.so \
        runtime/libandroid.so runtime/liblog.so \
        runtime/libEGL.so runtime/libOpenSLES.so \
-       runtime/libjvm.so runtime/libm.so runtime/libz.so
+       runtime/libjvm.so runtime/libm.so runtime/libz.so \
+       runtime/libmediandk.so runtime/libGLESv3.so
 	$(CXX) -std=c++20 -O2 -g \
 	    -L. -Wl,-Y,runtime,-rpath,$(PREFIX)$(LIBDIR)$(RUNTIMEDIR) $(LDFLAGS) \
 	    loader.o arm_exec.o trace.o \

@@ -65,6 +65,16 @@ int arm_exec_call(uint32_t fn_va, uint32_t r0, uint32_t r1,
 int arm_exec_call6(uint32_t fn_va, uint32_t r0, uint32_t r1,
                    uint32_t r2, uint32_t r3, uint32_t stk0, uint32_t stk1);
 
+/* 任意個数の 32bit 引数で ARM 関数を呼ぶ (AAPCS: r0-r3 + スタック)。
+ * nativeSetGlobalActivity(ZZLjava/lang/String;Ljava/lang/String;ZLjava/lang/String;)
+ * のように引数が 8 個ある JNI ネイティブ用。 */
+int arm_exec_calln(uint32_t fn_va, const uint32_t *args, int nargs);
+
+/* arm_exec_lookup_native と同じだが、オーバーロード時の long-form
+ * (Java_Cls_method__SIG) 解決のために JNI シグネチャを渡せる。 */
+uint32_t arm_exec_lookup_native_isig(const char *klass, const char *method,
+                                     const char *sig);
+
 /* Like arm_exec_call but with no tick limit.  Use for calls that MUST run to
  * completion — abandoning them mid-execution (e.g. mid-PlayerLoop) leaves
  * guest state inconsistent.  The caller must ensure the function terminates. */

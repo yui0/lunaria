@@ -230,6 +230,56 @@ static void mono_rewrite_corlib_path(std::string &path) {
  *   zero-fill / use obliterates executable code (seen as word[pc]=0 →
  *   NoExecuteFault mid-function, with 0x00/0xFF scars in the instruction stream).
  * - Falls back to MMAP2 when the primary arena is exhausted. */
+/* Freed guest VA ranges, kept sorted, coalesced and MMAP_ALIGN-aligned.
+ * munmap used to reclaim only a suffix of the most recent mapping, so every
+ * other unmap leaked address space outright.  UE4's binned allocator maps and
+ * unmaps OS blocks continuously, which exhausted both arenas after ~660 frames
+ * ("[mmap] MAP_FAILED primary_next=ffffffff secondary_next=ffffffff"); guest
+ * allocations then returned null and the engine asserted on a negative index. */
+static std::vector<MmapSlab> g_mmap_freelist;
+
+static void mmap_free_insert(uint32_t lo, uint32_t hi) {
+    /* Only whole aligned blocks go back: mmap_bump hands out MMAP_ALIGN-aligned
+     * addresses and callers rely on that. */
+    lo = (uint32_t)(((uint64_t)lo + MMAP_ALIGN - 1u) & ~(uint64_t)(MMAP_ALIGN - 1u));
+    hi &= ~(MMAP_ALIGN - 1u);
+    if (hi <= lo) return;
+    auto it = std::lower_bound(g_mmap_freelist.begin(), g_mmap_freelist.end(), lo,
+                               [](const MmapSlab &s, uint32_t v) { return s.lo < v; });
+    it = g_mmap_freelist.insert(it, MmapSlab{lo, hi});
+    if (it != g_mmap_freelist.begin()) {
+        auto prev = std::prev(it);
+        if (prev->hi >= it->lo) {
+            prev->hi = std::max(prev->hi, it->hi);
+            it = std::prev(g_mmap_freelist.erase(it));
+        }
+    }
+    for (auto nxt = std::next(it);
+         nxt != g_mmap_freelist.end() && nxt->lo <= it->hi;
+         nxt = std::next(it)) {
+        it->hi = std::max(it->hi, nxt->hi);
+        g_mmap_freelist.erase(nxt);
+    }
+}
+
+/* First fit.  The arenas are bump-allocated, so the free list is the only way a
+ * long-running guest ever gets address space back. */
+static uint32_t mmap_free_take(uint32_t len) {
+    for (auto it = g_mmap_freelist.begin(); it != g_mmap_freelist.end(); ++it) {
+        if ((uint64_t)it->hi - it->lo < len) continue;
+        uint32_t addr = it->lo;
+        uint64_t next = ((uint64_t)addr + len + MMAP_ALIGN - 1u) &
+                        ~(uint64_t)(MMAP_ALIGN - 1u);
+        if (next >= it->hi) g_mmap_freelist.erase(it);
+        else it->lo = (uint32_t)next;
+        if (getenv("LUNARIA_TRACE_MMAP"))
+            fprintf(stderr, "[mmap] reuse %08x len=%u (%zu free ranges left)\n",
+                    addr, len, g_mmap_freelist.size());
+        return addr;
+    }
+    return ~0u;
+}
+
 static uint32_t mmap_bump(uint32_t raw_len) {
     uint32_t len = (raw_len + 4095u) & ~4095u;
     if (len == 0 || len > g_mmap_max_single) {
@@ -238,6 +288,10 @@ static uint32_t mmap_bump(uint32_t raw_len) {
             fprintf(stderr, "[mmap] reject len=%u > cap=%u\n", len, g_mmap_max_single);
         return ~0u;
     }
+
+    /* Recycled space first — otherwise the bump pointers walk off the end of
+     * both arenas and never come back. */
+    if (uint32_t reuse = mmap_free_take(len); reuse != ~0u) return reuse;
 
     auto bump_in = [&](uint32_t &next, uint64_t arena_end) -> uint32_t {
         for (int spins = 0; spins < 64; ++spins) {
@@ -1098,7 +1152,13 @@ static constexpr uint32_t SVC_QSORT                   = SVC_DETOUR_BASE + NUM_DE
 static constexpr uint32_t SVC_FDOPEN                  = SVC_DETOUR_BASE + NUM_DETOURS + 100u;
 /* strerror_r: write error string into buffer */
 static constexpr uint32_t SVC_STRERROR_R              = SVC_DETOUR_BASE + NUM_DETOURS + 101u;
-static constexpr uint32_t SVC_TOTAL              = SVC_ICALL_PROBE_BASE + NUM_ICALL_PROBES;
+/* pread64/pwrite64: LP32 bionic passes the 64-bit offset as an 8-byte-aligned
+ * value, so after fd/buf/count fill r0-r2 the odd r3 is skipped and the offset
+ * lands on the stack ([sp]=lo, [sp+4]=hi) — a different ABI from pread/pwrite
+ * (32-bit off_t in r3), hence distinct handlers. */
+static constexpr uint32_t SVC_PREAD64                = SVC_ICALL_PROBE_BASE + NUM_ICALL_PROBES + 0u;
+static constexpr uint32_t SVC_PWRITE64               = SVC_ICALL_PROBE_BASE + NUM_ICALL_PROBES + 1u;
+static constexpr uint32_t SVC_TOTAL              = SVC_ICALL_PROBE_BASE + NUM_ICALL_PROBES + 2u;
 
 
 static constexpr uint32_t SVC29_BASE             = SVC_TOTAL;
@@ -1144,7 +1204,8 @@ static constexpr uint32_t SVC_AEABI_LLSR           = SVC29_BASE + 35u;
 static constexpr uint32_t SVC_ISFINITEF            = SVC29_BASE + 36u;
 static constexpr uint32_t SVC_WPRINTF              = SVC29_BASE + 37u;
 static constexpr uint32_t SVC_SWSCANF              = SVC29_BASE + 38u;
-static constexpr uint32_t SVC29_TOTAL            = SVC29_BASE + 39u;
+static constexpr uint32_t SVC_LRINT                = SVC29_BASE + 39u; /* lrint(double)->long */
+static constexpr uint32_t SVC29_TOTAL            = SVC29_BASE + 40u;
 
 /* ---- GC signal / sigaction ---- */
 static constexpr uint32_t SVC31_BASE             = SVC29_TOTAL;
@@ -1202,7 +1263,86 @@ static constexpr uint32_t SVC_GL_GEN_QUERIES       = SVC31_BASE + 122u;
 static constexpr uint32_t SVC_GL_QUERY_OPS         = SVC31_BASE + 123u; /* Begin/End/GetQueryObjectuiv */
 static constexpr uint32_t SVC_GL_SAMPLER_OPS       = SVC31_BASE + 124u; /* Gen/Delete/Parameteri */
 static constexpr uint32_t SVC_GL_MISC3_NOP         = SVC31_BASE + 125u; /* safe no-op GL3 */
-static constexpr uint32_t SVC_MPROTECT            = SVC31_BASE + 126u;
+/* Kept as the highest real SVC number so SVC_TRAMP_TOTAL (= +1) bounds the
+ * whole known-SVC range; bumped past the appended GL SVCs above (+127/+128). */
+static constexpr uint32_t SVC_MPROTECT            = SVC31_BASE + 129u;
+
+/* zlib size helpers.  These must return the real bound: UE4 sizes the pak
+ * decompression scratch buffer with FCompression::CompressMemoryBound(), which
+ * is compressBound() straight through.  A stubbed 0 leaves
+ * FCompressionScratchBuffers::ScratchBuffer unallocated (EnsureBufferSpace only
+ * allocates when the stored size is *smaller* than the request), so every
+ * compressed pak read then hands a NULL destination to
+ * FFileHandleAndroid::Read → "Assertion failed: Destination" → no content. */
+static constexpr uint32_t SVC_Z_COMPRESSBOUND     = SVC31_BASE + 130u;
+static constexpr uint32_t SVC_Z_DEFLATEBOUND      = SVC31_BASE + 131u;
+
+/* GLES 3.1/3.2 + EXT entry points the host driver advertises through
+ * glGetString(GL_EXTENSIONS) but which had no trampoline.  eglGetProcAddress
+ * then returned NULL and UE4 stored it unchecked — FOpenGLVertexBufferUnordered
+ * AccessView's ctor calls glTexBufferEXT straight after
+ * bSupportsTextureBuffer, so the first UAV creation jumped to pc=0.  Each
+ * handler forwards to the host function when one exists, else no-ops. */
+static constexpr uint32_t SVC_GLX_TexBuffer          = SVC31_BASE + 132u;
+static constexpr uint32_t SVC_GLX_TexBufferRange     = SVC31_BASE + 133u;
+static constexpr uint32_t SVC_GLX_CopyImageSubData   = SVC31_BASE + 134u;
+static constexpr uint32_t SVC_GLX_Enablei            = SVC31_BASE + 135u;
+static constexpr uint32_t SVC_GLX_Disablei           = SVC31_BASE + 136u;
+static constexpr uint32_t SVC_GLX_ColorMaski         = SVC31_BASE + 137u;
+static constexpr uint32_t SVC_GLX_BlendEquationi     = SVC31_BASE + 138u;
+static constexpr uint32_t SVC_GLX_BlendEquationSepi  = SVC31_BASE + 139u;
+static constexpr uint32_t SVC_GLX_BlendFunci         = SVC31_BASE + 140u;
+static constexpr uint32_t SVC_GLX_BlendFuncSepi      = SVC31_BASE + 141u;
+static constexpr uint32_t SVC_GLX_GetPointerv        = SVC31_BASE + 142u;
+
+/* OpenSL ES object model.  UE4's Audio::FMixerPlatformAndroid drives the whole
+ * engine → output-mix → audio-player chain through `check(SL_RESULT_SUCCESS)`,
+ * so neither a zeroed SLObjectItf (the guest calls straight through the NULL
+ * interface pointer) nor an honest error code gets past InitializeHardware().
+ * Build real vtables out of SVC trampolines instead. */
+static constexpr uint32_t SVC_SL_OBJ_REALIZE         = SVC31_BASE + 143u;
+static constexpr uint32_t SVC_SL_OBJ_GETSTATE        = SVC31_BASE + 144u;
+static constexpr uint32_t SVC_SL_OBJ_GETINTERFACE    = SVC31_BASE + 145u;
+static constexpr uint32_t SVC_SL_ENG_CREATE_OUTMIX   = SVC31_BASE + 146u;
+static constexpr uint32_t SVC_SL_ENG_CREATE_PLAYER   = SVC31_BASE + 147u;
+static constexpr uint32_t SVC_SL_BQ_REGISTER         = SVC31_BASE + 148u;
+static constexpr uint32_t SVC_SL_BQ_ENQUEUE          = SVC31_BASE + 149u;
+static constexpr uint32_t SVC_SL_BQ_GETSTATE         = SVC31_BASE + 150u;
+/* sched_getaffinity(pid, setsize, cpu_set_t*).  Mapping it to SVC_RET0 reported
+ * success without ever writing the mask, so FAndroidMisc counted zero
+ * assignable cores and UE4's core-affinity setup spun ("4 cores and 0
+ * assignable cores" every tick, stuck on frame 2). */
+static constexpr uint32_t SVC_SCHED_GETAFFINITY      = SVC31_BASE + 151u;
+
+/* GLES 3.0/3.1 entry points that were bound to SVC_GL_MISC3_NOP.  Silently
+ * dropping them is not neutral: glUniformBlockBinding is how every UE4 uniform
+ * buffer reaches its shader, and glClearBuffer* is how the ES3 path clears
+ * render targets, so the guest rendered a full frame's worth of draw calls into
+ * an uncleared target with unbound constants -- 24 draws per frame, glGetError
+ * 0, and a black framebuffer. */
+static constexpr uint32_t SVC_GL3_ClearBufferfv      = SVC31_BASE + 152u;
+static constexpr uint32_t SVC_GL3_ClearBufferiv      = SVC31_BASE + 153u;
+static constexpr uint32_t SVC_GL3_ClearBufferuiv     = SVC31_BASE + 154u;
+static constexpr uint32_t SVC_GL3_ClearBufferfi      = SVC31_BASE + 155u;
+static constexpr uint32_t SVC_GL3_GetUniformBlockIndex   = SVC31_BASE + 156u;
+static constexpr uint32_t SVC_GL3_UniformBlockBinding    = SVC31_BASE + 157u;
+static constexpr uint32_t SVC_GL3_GetActiveUniformBlockiv= SVC31_BASE + 158u;
+static constexpr uint32_t SVC_GL3_GetUniformIndices      = SVC31_BASE + 159u;
+static constexpr uint32_t SVC_GL3_GetActiveUniformsiv    = SVC31_BASE + 160u;
+static constexpr uint32_t SVC_GL3_FramebufferTextureLayer= SVC31_BASE + 161u;
+static constexpr uint32_t SVC_GL3_CopyBufferSubData      = SVC31_BASE + 162u;
+static constexpr uint32_t SVC_GL3_RenderbufferStorageMS  = SVC31_BASE + 163u;
+static constexpr uint32_t SVC_GL3_BindImageTexture       = SVC31_BASE + 164u;
+static constexpr uint32_t SVC_GL3_MemoryBarrier          = SVC31_BASE + 165u;
+static constexpr uint32_t SVC_GL3_DispatchCompute        = SVC31_BASE + 166u;
+static constexpr uint32_t SVC_GL3_BindVertexBuffer       = SVC31_BASE + 167u;
+static constexpr uint32_t SVC_GL3_VertexAttribFormat     = SVC31_BASE + 168u;
+static constexpr uint32_t SVC_GL3_VertexAttribIFormat    = SVC31_BASE + 169u;
+static constexpr uint32_t SVC_GL3_VertexAttribBinding    = SVC31_BASE + 170u;
+static constexpr uint32_t SVC_GL3_VertexBindingDivisor   = SVC31_BASE + 171u;
+static constexpr uint32_t SVC_GL3_TexStorage2DMS         = SVC31_BASE + 172u;
+static constexpr uint32_t SVC_GL3_Uniform4uiv            = SVC31_BASE + 173u;
+static constexpr uint32_t SVC_GL3_GetProgramResourceIndex= SVC31_BASE + 174u;
 
 /* ---- AAudio (FMOD output/recorder path; API 26+) ----
  * Minimal stubs: streams open successfully with plausible parameters but no
@@ -1261,6 +1401,9 @@ static constexpr uint32_t SVC_GL3_ProgramBinary          = SVC31_BASE + 46u;
 static constexpr uint32_t SVC_GL3_FenceSync              = SVC31_BASE + 47u;
 static constexpr uint32_t SVC_GL3_ClientWaitSync         = SVC31_BASE + 48u;
 static constexpr uint32_t SVC_GL3_DeleteSync             = SVC31_BASE + 49u;
+/* Appended after the packed SVC31 block (see SVC_MPROTECT below). */
+static constexpr uint32_t SVC_GL3_IsSync                 = SVC31_BASE + 127u;
+static constexpr uint32_t SVC_GL_TexParameterfv          = SVC31_BASE + 128u;
 static constexpr uint32_t SVC_GL3_InvalidateFramebuffer  = SVC31_BASE + 50u;
 static constexpr uint32_t SVC_GL3_DetachShader           = SVC31_BASE + 51u;
 static constexpr uint32_t SVC_GL3_DrawBuffers            = SVC31_BASE + 52u;
@@ -1314,7 +1457,27 @@ static constexpr uint32_t SVC_ISBLANK                    = SVC31_BASE + 85u;
 static constexpr uint32_t SVC_TOUPPER                    = SVC31_BASE + 86u;
 
 /* Cover ASENSOR + UE extras (must be ≥ highest SVC31_* used as trampoline). */
-static constexpr uint32_t SVC_TRAMP_TOTAL        = SVC_MPROTECT + 1u;
+static constexpr uint32_t SVC_TRAMP_TOTAL        = SVC_GL3_GetProgramResourceIndex + 1u;
+
+/* ---- OpenSL ES fake object page --------------------------------------------
+ * `SLObjectItf` and every `SL*Itf` are `const struct X_ * const *`, i.e. a
+ * pointer to a word holding the vtable address.  Each instance below is such a
+ * word plus per-object state; the vtables are filled with SVC trampolines. */
+static constexpr uint32_t SL_PAGE_BASE   = 0x41016000u;
+static constexpr uint32_t SL_VT_OBJECT   = SL_PAGE_BASE + 0x000u; /* 10 slots */
+static constexpr uint32_t SL_VT_ENGINE   = SL_PAGE_BASE + 0x040u; /* 15 slots */
+static constexpr uint32_t SL_VT_PLAY     = SL_PAGE_BASE + 0x080u; /* 12 slots */
+static constexpr uint32_t SL_VT_BUFQ     = SL_PAGE_BASE + 0x0C0u; /*  4 slots */
+static constexpr uint32_t SL_VT_VOLUME   = SL_PAGE_BASE + 0x0E0u; /* 10 slots */
+static constexpr uint32_t SL_VT_ANDROIDCFG = SL_PAGE_BASE + 0x120u; /* 4 slots */
+static constexpr uint32_t SL_INST_BASE   = SL_PAGE_BASE + 0x200u;
+static constexpr uint32_t SL_INST_STRIDE = 32u;
+static constexpr uint32_t SL_INST_END    = SL_PAGE_BASE + 0x1000u;
+/* Instance words: [0]=vtable [4]=kind [8]=bufq callback [12]=callback context */
+enum : uint32_t { SL_KIND_ENGINE = 1, SL_KIND_OUTMIX, SL_KIND_PLAYER };
+static uint32_t g_sl_inst_next = SL_INST_BASE;
+/* SL_IID_* data symbol address → interface name (filled as they are resolved). */
+static std::map<uint32_t, std::string> g_sl_iid_names;
 
 static constexpr uint32_t TRAMP_STRIDE     = 8u; /* ARM32: SVC #n + BX LR */
 
@@ -1554,6 +1717,7 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"glStencilOpSeparate",     SVC_GL_StencilOpSeparate},
     {"glBlendFunc",             SVC_GL_BlendFunc},
     {"glTexParameterf",         SVC_GL_TexParameterf},
+    {"glTexParameterfv",        SVC_GL_TexParameterfv},
     {"glDepthRangef",           SVC_GL_DepthRangef},
     {"glPolygonOffset",         SVC_GL_PolygonOffset},
     {"glLineWidth",             SVC_GL_LineWidth},
@@ -1615,6 +1779,7 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"glFenceSync",              SVC_GL3_FenceSync},
     {"glClientWaitSync",         SVC_GL3_ClientWaitSync},
     {"glDeleteSync",             SVC_GL3_DeleteSync},
+    {"glIsSync",                 SVC_GL3_IsSync},
     {"glInvalidateFramebuffer",  SVC_GL3_InvalidateFramebuffer},
     {"glDetachShader",           SVC_GL3_DetachShader},
     {"glDrawBuffers",            SVC_GL3_DrawBuffers},
@@ -1662,6 +1827,41 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"glBlendBarrier",           SVC_GLX_BlendBarrier},
     {"glBlendBarrierKHR",        SVC_GLX_BlendBarrier},
     {"glBlendBarrierNV",         SVC_GLX_BlendBarrier},
+    /* GL_EXT_texture_buffer (UE4 gates UAVs on it via bSupportsTextureBuffer) */
+    {"glTexBuffer",              SVC_GLX_TexBuffer},
+    {"glTexBufferEXT",           SVC_GLX_TexBuffer},
+    {"glTexBufferOES",           SVC_GLX_TexBuffer},
+    {"glTexBufferRange",         SVC_GLX_TexBufferRange},
+    {"glTexBufferRangeEXT",      SVC_GLX_TexBufferRange},
+    {"glTexBufferRangeOES",      SVC_GLX_TexBufferRange},
+    /* GL_EXT_copy_image */
+    {"glCopyImageSubData",       SVC_GLX_CopyImageSubData},
+    {"glCopyImageSubDataEXT",    SVC_GLX_CopyImageSubData},
+    {"glCopyImageSubDataOES",    SVC_GLX_CopyImageSubData},
+    /* GL_EXT_draw_buffers_indexed */
+    {"glEnablei",                SVC_GLX_Enablei},
+    {"glEnableiEXT",             SVC_GLX_Enablei},
+    {"glDisablei",               SVC_GLX_Disablei},
+    {"glDisableiEXT",            SVC_GLX_Disablei},
+    {"glColorMaski",             SVC_GLX_ColorMaski},
+    {"glColorMaskiEXT",          SVC_GLX_ColorMaski},
+    {"glBlendEquationi",         SVC_GLX_BlendEquationi},
+    {"glBlendEquationiEXT",      SVC_GLX_BlendEquationi},
+    {"glBlendEquationSeparatei",    SVC_GLX_BlendEquationSepi},
+    {"glBlendEquationSeparateiEXT", SVC_GLX_BlendEquationSepi},
+    {"glBlendFunci",             SVC_GLX_BlendFunci},
+    {"glBlendFunciEXT",          SVC_GLX_BlendFunci},
+    {"glBlendFuncSeparatei",     SVC_GLX_BlendFuncSepi},
+    {"glBlendFuncSeparateiEXT",  SVC_GLX_BlendFuncSepi},
+    /* GL_KHR_debug leftovers: annotation-only, safe to answer inertly */
+    {"glGetPointerv",            SVC_GLX_GetPointerv},
+    {"glGetPointervKHR",         SVC_GLX_GetPointerv},
+    {"glObjectPtrLabel",         SVC_GLX_MarkerNop},
+    {"glObjectPtrLabelKHR",      SVC_GLX_MarkerNop},
+    {"glGetObjectPtrLabel",      SVC_GLX_GetObjectLabel},
+    {"glGetObjectPtrLabelKHR",   SVC_GLX_GetObjectLabel},
+    {"glDebugMessageLog",        SVC_RET0},
+    {"glDebugMessageLogKHR",     SVC_RET0},
 
     /* UE arm64 (demoProjectLight / libUnreal) extras */
     {"eglBindAPI",               SVC_EGL_BIND_API},
@@ -1725,25 +1925,31 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"glGenSamplers",            SVC_GL_SAMPLER_OPS},
     {"glDeleteSamplers",         SVC_GL_SAMPLER_OPS},
     {"glSamplerParameteri",      SVC_GL_SAMPLER_OPS},
-    {"glBindImageTexture",       SVC_GL_MISC3_NOP},
-    {"glBindVertexBuffer",       SVC_GL_MISC3_NOP},
-    {"glVertexAttribBinding",    SVC_GL_MISC3_NOP},
-    {"glVertexAttribFormat",     SVC_GL_MISC3_NOP},
-    {"glVertexAttribIFormat",    SVC_GL_MISC3_NOP},
-    {"glVertexBindingDivisor",   SVC_GL_MISC3_NOP},
-    {"glMemoryBarrier",          SVC_GL_MISC3_NOP},
-    {"glDispatchCompute",        SVC_GL_MISC3_NOP},
+    {"glBindImageTexture",       SVC_GL3_BindImageTexture},
+    {"glBindVertexBuffer",       SVC_GL3_BindVertexBuffer},
+    {"glVertexAttribBinding",    SVC_GL3_VertexAttribBinding},
+    {"glVertexAttribFormat",     SVC_GL3_VertexAttribFormat},
+    {"glVertexAttribIFormat",    SVC_GL3_VertexAttribIFormat},
+    {"glVertexBindingDivisor",   SVC_GL3_VertexBindingDivisor},
+    {"glMemoryBarrier",          SVC_GL3_MemoryBarrier},
+    {"glDispatchCompute",        SVC_GL3_DispatchCompute},
     {"glDispatchComputeIndirect",SVC_GL_MISC3_NOP},
-    {"glFramebufferTextureLayer",SVC_GL_MISC3_NOP},
-    {"glClearBufferfi",          SVC_GL_MISC3_NOP},
-    {"glClearBufferfv",          SVC_GL_MISC3_NOP},
-    {"glClearBufferiv",          SVC_GL_MISC3_NOP},
-    {"glCopyBufferSubData",      SVC_GL_MISC3_NOP},
-    {"glGetProgramResourceIndex",SVC_GL_MISC3_NOP},
-    {"glGetUniformBlockIndex",   SVC_GL_MISC3_NOP},
-    {"glUniformBlockBinding",    SVC_GL_MISC3_NOP},
-    {"glUniform4uiv",            SVC_GL_MISC3_NOP},
-    {"glTexStorage2DMultisample",SVC_GL_MISC3_NOP},
+    {"glFramebufferTextureLayer",SVC_GL3_FramebufferTextureLayer},
+    {"glClearBufferfi",          SVC_GL3_ClearBufferfi},
+    {"glClearBufferfv",          SVC_GL3_ClearBufferfv},
+    {"glClearBufferuiv",         SVC_GL3_ClearBufferuiv},
+    {"glClearBufferiv",          SVC_GL3_ClearBufferiv},
+    {"glCopyBufferSubData",      SVC_GL3_CopyBufferSubData},
+    {"glRenderbufferStorageMultisample",    SVC_GL3_RenderbufferStorageMS},
+    {"glRenderbufferStorageMultisampleEXT", SVC_GL3_RenderbufferStorageMS},
+    {"glGetActiveUniformBlockiv",SVC_GL3_GetActiveUniformBlockiv},
+    {"glGetUniformIndices",      SVC_GL3_GetUniformIndices},
+    {"glGetActiveUniformsiv",    SVC_GL3_GetActiveUniformsiv},
+    {"glGetProgramResourceIndex",SVC_GL3_GetProgramResourceIndex},
+    {"glGetUniformBlockIndex",   SVC_GL3_GetUniformBlockIndex},
+    {"glUniformBlockBinding",    SVC_GL3_UniformBlockBinding},
+    {"glUniform4uiv",            SVC_GL3_Uniform4uiv},
+    {"glTexStorage2DMultisample",SVC_GL3_TexStorage2DMS},
 
     {"clock_gettime",           SVC_CLOCK_GETTIME},
     {"gettimeofday",            SVC_GETTIMEOFDAY},
@@ -1771,7 +1977,7 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"setpriority",             SVC_RET0},
     {"getpriority",             SVC_RET0},
     {"sched_setaffinity",       SVC_RET0},
-    {"sched_getaffinity",       SVC_RET0},
+    {"sched_getaffinity",       SVC_SCHED_GETAFFINITY},
     {"__errno",                 SVC_ERRNO_ADDR},
     {"__system_property_get",   SVC_SYSPROP_GET},
     {"__system_property_find",  SVC_RET0},
@@ -1848,6 +2054,8 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"realpath",                SVC_REALPATH},
     {"pread",                   SVC_PREAD},
     {"pwrite",                  SVC_PWRITE},
+    {"pread64",                 SVC_PREAD64},
+    {"pwrite64",                SVC_PWRITE64},
     {"lstat",                   SVC_LIBC_STAT},
     {"fseeko",                  SVC_LIBC_FSEEK},
     {"ftello",                  SVC_LIBC_FTELL},
@@ -2312,8 +2520,8 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"setrlimit",      SVC_RET0},
     {"fdatasync",      SVC_RET0},
     {"compress2",      SVC_COMPRESS2},
-    {"compressBound",    SVC_RET0}, /* size helper — return 0 ok for bound queries that realloc */
-    {"deflateBound",     SVC_RET0},
+    {"compressBound",    SVC_Z_COMPRESSBOUND},
+    {"deflateBound",     SVC_Z_DEFLATEBOUND},
     {"islower",        SVC_ISLOWER},
     {"isupper",        SVC_ISUPPER},
     {"isblank",        SVC_ISBLANK},
@@ -2470,7 +2678,8 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"swprintf",                  SVC_SWPRINTF},
     {"wprintf",                   SVC_WPRINTF},
     {"swscanf",                   SVC_SWSCANF},
-    
+    {"lrint",                     SVC_LRINT},
+
     {"localeconv",                SVC_LOCALECONV},
     
     {"socketpair",                SVC_SOCKETPAIR},
@@ -2623,7 +2832,14 @@ static uint32_t lookup_symbol_direct_va(const char *name) {
     /* __libc_current_sigrtmax/min: inline on bionic but sometimes GOT-referenced */
     if (strcmp(name, "__libc_current_sigrtmax") == 0) return NOOP_RET0;
     if (strcmp(name, "__libc_current_sigrtmin") == 0) return NOOP_RET0;
-    /* OpenSLES IIDs are const SLInterfaceID* data symbols (GUID blobs). */
+    /* OpenSLES IIDs.  `SL_IID_ENGINE` and friends are declared
+     * `extern const SLInterfaceID SL_IID_x;` -- the symbol is a *pointer
+     * variable*, so callers pass its stored value, not its address.  Give each
+     * slot a self-pointer so GetInterface() receives something unique it can
+     * map back to an interface name (a zeroed slot made every iid arrive as 0
+     * and every GetInterface hand back the plain object vtable).  The
+     * self-pointers themselves are laid down in build_jni_tables(); slots are
+     * handed out lazily from here, so the whole region is pre-filled. */
     if (strncmp(name, "SL_IID_", 7) == 0) {
         static std::map<std::string, uint32_t> s_sl;
         auto it = s_sl.find(name);
@@ -2633,6 +2849,7 @@ static uint32_t lookup_symbol_direct_va(const char *name) {
         next += 16u;
         if (next >= 0x41015000u) next = 0x41014000u; /* wrap; rare */
         s_sl.emplace(name, va);
+        g_sl_iid_names.emplace(va, name);
         return va;
     }
     if (strcmp(name, "tzname") == 0) return 0x41014100u;
@@ -3208,6 +3425,40 @@ static const char *synthetic_proc_path(const char *path) {
             }
             return (slot && slot[0]) ? slot : nullptr;
         }
+        /* /proc/sys/kernel/random/uuid: the kernel yields a *fresh* random v4
+         * UUID on every open.  Blocking it (falling through to the host-/proc
+         * guard) left the guest with an empty read — some engines then derive a
+         * zero/garbage device or session id.  Synthesise a new UUID per call
+         * into its own temp file so repeated reads stay unique. */
+        if (!strcmp(path, "/proc/sys/kernel/random/uuid")) {
+            static char uuid_f[64] = "";
+            uint8_t b[16];
+            bool have = false;
+            if (FILE *ur = fopen("/dev/urandom", "rb")) {
+                have = (fread(b, 1, 16, ur) == 16);
+                fclose(ur);
+            }
+            if (!have) for (int i = 0; i < 16; ++i) b[i] = (uint8_t)(rand() & 0xff);
+            b[6] = (uint8_t)((b[6] & 0x0f) | 0x40);   /* version 4 */
+            b[8] = (uint8_t)((b[8] & 0x3f) | 0x80);   /* variant 1 */
+            char buf[64]; strcpy(buf, "/tmp/lunaria-proc-uuid-XXXXXX");
+            int fd = mkstemp(buf);
+            if (fd < 0) return nullptr;
+            char u[40];
+            snprintf(u, sizeof u,
+                     "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+                     "%02x%02x%02x%02x%02x%02x\n",
+                     b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],
+                     b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+            if (write(fd, u, strlen(u)) < 0) { /* best effort */ }
+            close(fd);
+            /* Best-effort unlink of the previous one to avoid unbounded temp
+             * files; the guest has already opened it by the time we return. */
+            if (uuid_f[0]) unlink(uuid_f);
+            strncpy(uuid_f, buf, sizeof uuid_f - 1);
+            uuid_f[sizeof uuid_f - 1] = '\0';
+            return uuid_f;
+        }
         if (!strcmp(path, "/proc/version")) {
             static char ver_f[64] = "";
             if (!ver_f[0]) {
@@ -3259,6 +3510,17 @@ static std::map<std::string, uint32_t> g_exported_syms;
 /* A64 exports are architectural 64-bit guest VAs.  Keep them separate from
  * the A32 table so no caller can silently truncate a code/data pointer. */
 static std::map<std::string, GuestVA> g_exported_syms64;
+
+/* Imports that found no definition (nor a host SVC) at relocation time.  A
+ * sibling .so loaded later may define them; relink_pending_xlib_relocs()
+ * re-runs the lookup after every load so the binding matches what the real
+ * Android linker would produce. */
+struct PendingXlibReloc {
+    uint32_t    addr;   /* guest VA of the GOT/PLT slot to rewrite */
+    std::string sym;
+    uint32_t    type;   /* R_ARM_JUMP_SLOT / GLOB_DAT / ABS32 */
+};
+static std::vector<PendingXlibReloc> g_pending_xlib_relocs;
 
 /* High-water mark of all loaded library segments (page-rounded up).
  * arm_exec_load_library passes base=0 for auto-placement: we assign the next
@@ -3583,6 +3845,21 @@ static constexpr uint32_t ARM_EGL_DISPLAY = 1u;
 static constexpr uint32_t ARM_EGL_CONFIG  = 2u;
 static constexpr uint32_t ARM_EGL_SURFACE = 3u;
 static constexpr uint32_t ARM_EGL_CONTEXT = 4u;
+/* Maps fake EGL context handles to host EGLContext.  UE4's AndroidEGL creates a
+ * *shared* context and a *rendering* context and tells them apart purely by
+ * comparing handles from eglGetCurrentContext(); collapsing both onto
+ * ARM_EGL_CONTEXT made GetCurrentContextType() report CONTEXT_Rendering on the
+ * game thread and trip check(... == CONTEXT_Shared) in the OpenGL RHI. */
+static constexpr uint32_t ARM_EGL_CTXTAB_BASE = 0x100u;
+static std::vector<EGLContext> g_egl_ctx_tab;
+/* eglMakeCurrent binds per *thread* on real EGL.  Lunaria multiplexes every
+ * guest thread onto one host thread, so the binding has to be tracked per guest
+ * tid and re-applied by the scheduler — otherwise the render thread's
+ * eglMakeCurrent(rendering) leaks into the game thread and UE4's
+ * check(PlatformOpenGLCurrentContext(...) == CONTEXT_Shared) fails. */
+static std::map<uint32_t, uint32_t> g_egl_tid_ctx;  /* guest tid → guest handle */
+static uint32_t g_egl_bound_handle = 0u;            /* handle bound on the host */
+
 /* Maps fake EGL config handles to host EGLConfig (Android-style chooser) */
 static constexpr uint32_t ARM_EGL_CFGTAB_BASE = 0x10u;
 static std::vector<EGLConfig> g_egl_cfg_tab;
@@ -3591,6 +3868,45 @@ static EGLConfig resolve_egl_config(uint32_t handle) {
         handle - ARM_EGL_CFGTAB_BASE < g_egl_cfg_tab.size())
         return g_egl_cfg_tab[handle - ARM_EGL_CFGTAB_BASE];
     return g_egl_cfg;
+}
+
+/* Guest EGL context handle → host EGLContext.  ARM_EGL_CONTEXT stays valid as
+ * the alias for the primary context created by init_host_egl(). */
+static EGLContext resolve_egl_context(uint32_t handle) {
+    if (handle >= ARM_EGL_CTXTAB_BASE &&
+        handle - ARM_EGL_CTXTAB_BASE < g_egl_ctx_tab.size())
+        return g_egl_ctx_tab[handle - ARM_EGL_CTXTAB_BASE];
+    if (handle == ARM_EGL_CONTEXT) return g_egl_ctx;
+    return EGL_NO_CONTEXT;
+}
+
+/* Bump-allocate one OpenSL ES instance word out of the fake object page. */
+static uint32_t sl_new_instance(ArmExecCtx &ctx, uint32_t vtable, uint32_t kind) {
+    if (g_sl_inst_next + SL_INST_STRIDE > SL_INST_END) return 0;
+    uint32_t va = g_sl_inst_next;
+    g_sl_inst_next += SL_INST_STRIDE;
+    for (uint32_t o = 0; o < SL_INST_STRIDE; o += 4) ctx.mem.write32(va + o, 0u);
+    ctx.mem.write32(va,      vtable);
+    ctx.mem.write32(va + 4u, kind);
+    return va;
+}
+
+/* Guest handle eglGetCurrentContext() must report for `tid`. */
+static uint32_t egl_ctx_for_tid(uint32_t tid) {
+    auto it = g_egl_tid_ctx.find(tid);
+    return it != g_egl_tid_ctx.end() ? it->second : 0u;
+}
+
+/* Re-point the single host binding at whichever context the guest thread that
+ * is about to run had made current.  No-op until the guest binds anything. */
+static void egl_sync_current_context(uint32_t tid) {
+    if (g_egl_tid_ctx.empty() || g_egl_dpy == EGL_NO_DISPLAY) return;
+    uint32_t want = egl_ctx_for_tid(tid);
+    if (!want || want == g_egl_bound_handle) return;
+    EGLContext ectx = resolve_egl_context(want);
+    if (ectx == EGL_NO_CONTEXT) return;
+    if (eglMakeCurrent(g_egl_dpy, g_egl_surf, g_egl_surf, ectx))
+        g_egl_bound_handle = want;
 }
 static uint32_t g_fake_anw_va = 0; /* guest ANativeWindow { ops*, ... } */
 static uint32_t g_mono_base   = 0; /* libmono.so load base (set in load_elf) */
@@ -4144,6 +4460,17 @@ static std::string g_main_lib_dir;
 /* Helper: reinterpret uint32 register as float */
 static inline float rf(uint32_t r) { float f; std::memcpy(&f, &r, 4); return f; }
 
+/* Resolve the first available spelling of a GL entry point.  eglGetProcAddress
+ * is authoritative for extension names; libGLESv2's dynamic table is the
+ * fallback for the core spellings some drivers do not export through EGL. */
+static void *host_gl_proc(std::initializer_list<const char *> names) {
+    for (const char *n : names) {
+        if (auto p = (void *)eglGetProcAddress(n)) return p;
+        if (g_libgles2) if (auto p = dlsym(g_libgles2, n)) return p;
+    }
+    return nullptr;
+}
+
 /* Macro to declare + load a GL function pointer */
 #define GL_DECL(ret, name, ...) \
     static ret (*pfn_##name)(__VA_ARGS__) = nullptr;
@@ -4307,6 +4634,8 @@ GL_DECL(void,    glProgramBinary,        GLuint,GLenum,const void*,GLsizei)
 GL_DECL(void*,   glFenceSync,            GLenum,GLbitfield)
 GL_DECL(GLenum,  glClientWaitSync,       void*,GLbitfield,uint64_t)
 GL_DECL(void,    glDeleteSync,           void*)
+GL_DECL(GLboolean, glIsSync,             void*)
+GL_DECL(void,    glTexParameterfv,       GLenum,GLenum,const GLfloat*)
 GL_DECL(void,    glInvalidateFramebuffer, GLenum,GLsizei,const GLenum*)
 GL_DECL(void,    glDetachShader,         GLuint,GLuint)
 GL_DECL(void,    glDrawBuffers,          GLsizei,const GLenum*)
@@ -4379,6 +4708,7 @@ static void load_gl_procs() {
     GL_LOAD(glTexStorage2D); GL_LOAD(glTexStorage3D); GL_LOAD(glTexSubImage3D);
     GL_LOAD(glProgramParameteri); GL_LOAD(glGetProgramBinary); GL_LOAD(glProgramBinary);
     GL_LOAD(glFenceSync); GL_LOAD(glClientWaitSync); GL_LOAD(glDeleteSync);
+    GL_LOAD(glIsSync); GL_LOAD(glTexParameterfv);
     GL_LOAD(glInvalidateFramebuffer); GL_LOAD(glDetachShader); GL_LOAD(glDrawBuffers);
     GL_LOAD(glDrawElementsBaseVertex);
     if (!pfn_glDrawElementsBaseVertex)   /* GLES 3.2 core; try the EXT/OES forms */
@@ -6288,6 +6618,27 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (verbose)
         fprintf(stderr, "[detour] >>> %s #%llu r0=%08x r1=%08x r2=%08x r3=%08x lr=%08x tid=%u\n",
                 nm, (unsigned long long)h, r0, r1, r2, r3, regs[14], g_current_tid);
+        /* LUNARIA_DETOUR_REGS=1: full register file plus a short dump behind
+         * every register that looks like a guest pointer.  The detour SVC fires
+         * before the relocated prologue, so this is the exact machine state the
+         * patched instruction would have seen — the only way to inspect callee-
+         * saved values (r4-r11) and stack frames, which AddTicks PC sampling and
+         * the r0-r3 line above cannot show. */
+        if (verbose && getenv("LUNARIA_DETOUR_REGS")) {
+            fprintf(stderr, "[detour]   regs:");
+            for (int i = 0; i < 16; ++i)
+                fprintf(stderr, " r%d=%08x", i, (uint32_t)regs[i]);
+            fprintf(stderr, "\n");
+            for (int i = 0; i < 14; ++i) {
+                uint32_t v = (uint32_t)regs[i];
+                if (v < 0x1000u || (v & 3u) || !ctx.mem.ptr(v) || !ctx.mem.ptr(v + 28u))
+                    continue;
+                fprintf(stderr, "[detour]   [r%d=%08x]:", i, v);
+                for (int k = 0; k < 8; ++k)
+                    fprintf(stderr, " %08x", ctx.mem.read32(v + (uint32_t)k * 4u));
+                fprintf(stderr, "\n");
+            }
+        }
         if (verbose && nm && strstr(nm, "mono_image_open") && r0) {
             const char *p = ctx.mem.cstr(r0);
             if (p) fprintf(stderr, "[detour]   path=\"%s\" status=%#x\n", p, r1);
@@ -7476,6 +7827,48 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             RET_OBJ(msg);
             break;
         }
+        /* GameActivity.AndroidThunkJava_GetMetaDataString(key).  Not every key
+         * lives in the manifest: GameActivity.java answers
+         * "ue4.displaymetrics.dpi" from DisplayMetrics at runtime, so no APK
+         * carries it.  Returning an empty string made
+         * FAndroidApplicationMisc::ComputePhysicalScreenDensity() run
+         * ParseIntoArray over "" and then index element 0 of the empty result
+         * ("Array index out of bounds: 0 from an array of size 0"). */
+        if (!strcmp(mname, "AndroidThunkJava_GetMetaDataString")) {
+            int variant = (int)svc_no - 34;
+            uint32_t key_h = jni_arg_word(ctx, regs, variant, 0);
+            const char *key = key_h
+                ? jvm->native.GetStringUTFChars(env, AS_STR(key_h), nullptr)
+                : nullptr;
+            char val[128]; val[0] = '\0';
+            if (key && !strcmp(key, "ue4.displaymetrics.dpi")) {
+                /* "xdpi,ydpi,densityDpi" — LUNARIA_DPI overrides the default
+                 * xxhdpi-class density that phone-targeted UMG layouts expect. */
+                long dpi = lunaria_env_long("LUNARIA_DPI", 420);
+                if (dpi < 1) dpi = 420;
+                snprintf(val, sizeof val, "%ld.0,%ld.0,%ld", dpi, dpi, dpi);
+            } else if (key && !strcmp(key, "audiomanager.optimalSampleRate")) {
+                /* AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE, cached into the
+                 * bundle by GameActivity.java. */
+                snprintf(val, sizeof val, "%ld",
+                         lunaria_env_long("LUNARIA_AUDIO_RATE", 48000));
+            } else if (key && !strcmp(key, "audiomanager.framesPerBuffer")) {
+                /* AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER.  Must be
+                 * non-zero: Audio::FMixerPlatformAndroid::GetPlatformSettings()
+                 * rounds the callback size up with
+                 * `while (n < CallbackBufferFrameSize) n += NativeFrames;`,
+                 * which never terminates when NativeFrames parses as 0 — the
+                 * game thread then spun forever inside CreateMainAudioDevice. */
+                long n = lunaria_env_long("LUNARIA_AUDIO_FRAMES", 1024);
+                if (n < 1) n = 1024;
+                snprintf(val, sizeof val, "%ld", n);
+            }
+            fprintf(stderr, "[arm_jni] GetMetaDataString(\"%s\") -> \"%s\"\n",
+                    key ? key : "(null)", val);
+            if (key) jvm->native.ReleaseStringUTFChars(env, AS_STR(key_h), key);
+            RET_OBJ(jvm->native.NewStringUTF(env, val));
+            break;
+        }
         /* Context.getDir(name, mode) — libgpg extracts its embedded jar here.
          * Generic CallObjectMethodA passes nullptr args, so handle name here. */
         if (!strcmp(mname, "getDir")) {
@@ -7693,13 +8086,42 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         /* Returning 0 makes Unity abort(); return actual JVM string length. */
         auto mid = AS_MID(r2);
         uintptr_t midx = (uintptr_t)mid;
+        const char *imname = nullptr;
         if (midx > 0 && midx <= 65536) {
             auto &mo = jvm->objects[midx - 1];
-            if (mo.type == jvm_object::JVM_OBJECT_METHOD && mo.method.name.data &&
-                strcmp(mo.method.name.data, "length") == 0) {
+            if (mo.type == jvm_object::JVM_OBJECT_METHOD && mo.method.name.data)
+                imname = mo.method.name.data;
+            if (imname && strcmp(imname, "length") == 0) {
                 ret32((uint32_t)jvm->native.GetStringUTFLength(env, AS_STR(r1)));
                 break;
             }
+        }
+        /* GameActivity.AndroidThunkJava_GetMetaDataInt(key).  Same runtime-only
+         * keys as GetMetaDataString: GameActivity.java caches AudioManager's
+         * PROPERTY_OUTPUT_* into the bundle, so no APK carries them.  A zero
+         * "audiomanager.framesPerBuffer" hangs the game thread forever in
+         * Audio::FMixerPlatformAndroid::GetPlatformSettings(), whose
+         * `while (n < CallbackBufferFrameSize) n += NativeFrames;` never
+         * advances — CreateMainAudioDevice then never returns. */
+        if (imname && !strcmp(imname, "AndroidThunkJava_GetMetaDataInt")) {
+            int variant = (int)svc_no - 49;
+            uint32_t key_h = jni_arg_word(ctx, regs, variant, 0);
+            const char *key = key_h
+                ? jvm->native.GetStringUTFChars(env, AS_STR(key_h), nullptr)
+                : nullptr;
+            long v = 0;
+            if (key && !strcmp(key, "audiomanager.framesPerBuffer")) {
+                v = lunaria_env_long("LUNARIA_AUDIO_FRAMES", 1024);
+                if (v < 1) v = 1024;
+            } else if (key && !strcmp(key, "audiomanager.optimalSampleRate")) {
+                v = lunaria_env_long("LUNARIA_AUDIO_RATE", 48000);
+                if (v < 1) v = 48000;
+            }
+            fprintf(stderr, "[arm_jni] GetMetaDataInt(\"%s\") -> %ld\n",
+                    key ? key : "(null)", v);
+            if (key) jvm->native.ReleaseStringUTFChars(env, AS_STR(key_h), key);
+            ret32((uint32_t)v);
+            break;
         }
         /* Forward to the host JVM (dlsym'd libjvm-*.c handlers), same as
  * CallObjectMethod above.  Always returning 0 here broke touch input:
@@ -7888,6 +8310,27 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             if (vm_seen.emplace(mname ? mname : "?").second)
                 fprintf(stderr, "[arm_jni] CallVoidMethod: %s obj=0x%x (svc=%u, first)\n",
                         mname ? mname : "?", r1, svc_no);
+        }
+        /* GameActivity.AndroidThunkJava_InitHMDs() is a *round trip*: the Java
+         * side enumerates HMD plugins and then calls nativeInitHMDs(), which is
+         * the only thing that sets the flag InitHMDs() spins on
+         * (`while (!HeadMountedDisplayInitialized) FPlatformProcess::Sleep(0.01f)`
+         * in LaunchAndroid.cpp).  Swallowing the call left PreInit spinning
+         * forever, so the engine never reached its first frame.  Close the loop
+         * by invoking the guest's own JNI entry point. */
+        if (mname && !strcmp(mname, "AndroidThunkJava_InitHMDs") && !ctx.is_arm64) {
+            static bool hmd_done = false;
+            uint32_t fn = hmd_done ? 0u : arm_exec_lookup_native(
+                "com/epicgames/ue4/GameActivity", "nativeInitHMDs");
+            if (fn) {
+                hmd_done = true;
+                fprintf(stderr, "[arm_jni] InitHMDs → nativeInitHMDs @0x%08x\n", fn);
+                call_guest_cb(ctx, fn, ENV_SLOT_BASE, r1);
+            } else if (!hmd_done) {
+                fprintf(stderr, "[arm_jni] InitHMDs: nativeInitHMDs not found — "
+                        "PreInit will spin\n");
+            }
+            break;
         }
         /* Pass real args — CallVoidMethodA(nullptr) dropped them.  That made
          * AndroidJavaProxy → C# OnApplicationPause(Z) see a garbage/zero
@@ -8979,8 +9422,34 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         /* pthread_create(thread_t*, attr*, fn_va, arg) */
         if (r2 && g_thread_stack_next + THREAD_STACK_SIZE <= HEAP_BASE) {
             ArmThread t;
-            
-            t.id = (uint32_t)g_threads.size() + 2;
+            /* Ids must be unique across every entry in g_threads.  `size() + 2`
+             * was not: pthread_join erases entries, so after a join the next
+             * create handed a *live* thread's id to a new one.  Everything
+             * keyed by tid then aliases — pthread TLS, cond/futex parking, the
+             * fast-mutex owner byte — and worst of all the post-Run write-back
+             * re-resolves the thread by id and finds the other one, so the
+             * duplicate's registers are never saved and it never advances a
+             * single instruction.  That is how UE4's rendering thread ended up
+             * created but permanently unexecuted (ticks=0), leaving the game
+             * thread waiting on a render fence that could never complete. */
+            static uint32_t s_next_tid = 2;
+            uint32_t nid = s_next_tid;
+            /* Prefer a never-before-used id: recycling one after pthread_join
+             * confuses anything that keys long-lived per-thread state off it —
+             * UE4's stats stream is one ("Stat _NNN was not cleared every
+             * frame").  The fast-mutex owner field is only 8 bits, so past 254
+             * fall back to the lowest id no live thread holds. */
+            if (nid > 254u) {
+                nid = 2u;
+                for (bool taken = true; taken; ) {
+                    taken = false;
+                    for (const auto &th : g_threads)
+                        if (th.id == nid) { taken = true; ++nid; break; }
+                }
+            } else {
+                ++s_next_tid;
+            }
+            t.id = nid;
             uint32_t stack_top = g_thread_stack_next + THREAD_STACK_SIZE - 16;
             t.stack_base = g_thread_stack_next;
             g_thread_stack_next += THREAD_STACK_SIZE;
@@ -9532,40 +10001,75 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_EGL_CREATECTX: {
-        /* eglCreateContext(dpy, cfg, share, attribs) */
+        /* eglCreateContext(dpy, cfg, share, attribs).  Every call gets its own
+         * guest handle: UE4 relies on shared-vs-rendering context identity (see
+         * ARM_EGL_CTXTAB_BASE).  Back it with a real host context sharing the
+         * primary one so GL objects stay visible across both; if the driver
+         * refuses a second context, alias the primary — a distinct *handle* is
+         * what the guest's identity comparisons need. */
         if (g_egl_dpy == EGL_NO_DISPLAY || !g_egl_cfg)
             { ret32(0u); break; }
-        if (g_egl_ctx == EGL_NO_CONTEXT) {
-            auto attrs = read_egl_attribs(ctx, r3);
-            /* Try with Unity's requested attribs first, fall back to GLES2 */
-            g_egl_ctx = eglCreateContext(
-                g_egl_dpy, g_egl_cfg, EGL_NO_CONTEXT, attrs.data());
-            if (g_egl_ctx == EGL_NO_CONTEXT) {
-                static const EGLint fallback[] =
-                    {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
-                g_egl_ctx = eglCreateContext(
-                    g_egl_dpy, g_egl_cfg, EGL_NO_CONTEXT, fallback);
-            }
+        auto attrs = read_egl_attribs(ctx, r3);
+        static const EGLint fallback[] =
+            {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+        /* Always share with the first context we made, whatever the guest asked
+         * for.  AndroidEGL creates its single-threaded context with no share
+         * list (a device only ever uses one of rendering/single-threaded), but
+         * Lunaria binds whichever one the guest makes current, so objects born
+         * under an isolated context are invisible to the others: glCreateShader
+         * handed out name 1 twice and UE4 then attached a vertex shader where a
+         * fragment shader belonged.  One namespace for every guest context is
+         * both safe and closer to what the guest observes on hardware. */
+        EGLContext share = g_egl_ctx != EGL_NO_CONTEXT ? g_egl_ctx
+                                                       : resolve_egl_context(r2);
+        EGLContext nctx = eglCreateContext(g_egl_dpy, g_egl_cfg, share, attrs.data());
+        if (nctx == EGL_NO_CONTEXT)
+            nctx = eglCreateContext(g_egl_dpy, g_egl_cfg, share, fallback);
+        if (nctx == EGL_NO_CONTEXT && share != EGL_NO_CONTEXT) {
+            /* Retry unshared before giving up — some drivers reject a share
+             * list whose config differs from the new context's. */
+            nctx = eglCreateContext(g_egl_dpy, g_egl_cfg, EGL_NO_CONTEXT, attrs.data());
         }
-        fprintf(stderr, "[arm_exec] eglCreateContext → %p\n", g_egl_ctx);
-        ret32(g_egl_ctx != EGL_NO_CONTEXT ? ARM_EGL_CONTEXT : 0u);
+        bool aliased = false;
+        if (nctx == EGL_NO_CONTEXT) {
+            if (g_egl_ctx == EGL_NO_CONTEXT) { ret32(0u); break; }
+            nctx = g_egl_ctx;
+            aliased = true;
+        }
+        if (g_egl_ctx == EGL_NO_CONTEXT) g_egl_ctx = nctx;
+        g_egl_ctx_tab.push_back(nctx);
+        uint32_t handle = ARM_EGL_CTXTAB_BASE + (uint32_t)(g_egl_ctx_tab.size() - 1);
+        fprintf(stderr, "[arm_exec] eglCreateContext → %p (handle 0x%x, share=%p%s)\n",
+                nctx, handle, share, aliased ? ", aliased" : "");
+        ret32(handle);
         break;
     }
     case SVC_EGL_MAKECURRENT: {
         /* eglMakeCurrent(dpy, draw, read, ctx) */
         EGLSurface draw = (r1 && r1 != ~0u) ? g_egl_surf : EGL_NO_SURFACE;
         EGLSurface read_s = (r2 && r2 != ~0u) ? g_egl_surf : EGL_NO_SURFACE;
-        EGLContext ectx = (r3 && r3 != ~0u) ? g_egl_ctx  : EGL_NO_CONTEXT;
+        EGLContext ectx = (r3 && r3 != ~0u) ? resolve_egl_context(r3) : EGL_NO_CONTEXT;
         /* Unity 4.x releases the context (NO_CTX) expecting GLSurfaceView to re-bind
  * each frame.  In the emulated environment there is no GLSurfaceView thread to
  * re-bind it, so honour the unbind only if the ARM guest explicitly passes
- * EGL_NO_CONTEXT; otherwise keep the context current so GL calls succeed. */
+ * EGL_NO_CONTEXT; otherwise keep the context current so GL calls succeed.
+ * g_egl_cur_ctx_handle is left alone on unbind precisely because the host
+ * context stays bound — eglGetCurrentContext must keep answering truthfully. */
         if (ectx == EGL_NO_CONTEXT) {
             ret32(EGL_TRUE);
             break;
         }
         EGLBoolean ok = (g_egl_dpy != EGL_NO_DISPLAY)
             ? eglMakeCurrent(g_egl_dpy, draw, read_s, ectx) : EGL_FALSE;
+        if (ok) {
+            g_egl_tid_ctx[g_current_tid] = r3;
+            g_egl_bound_handle = r3;
+        }
+        if (getenv("LUNARIA_TRACE_EGL"))
+            fprintf(stderr, "[egl] makeCurrent ctx=0x%x(%p) draw=0x%x ok=%d "
+                    "err=0x%x tid=%u\n",
+                    r3, ectx, r1, (int)ok, (unsigned)eglGetError(),
+                    g_current_tid);
         ret32((uint32_t)ok);
         break;
     }
@@ -9614,7 +10118,23 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_EGL_DESTROYSURF: ret32(EGL_TRUE); break;
-    case SVC_EGL_DESTROYCTX:  ret32(EGL_TRUE); break;
+    case SVC_EGL_DESTROYCTX: {
+        /* Retire the handle so eglGetCurrentContext can never report a context
+         * the guest already destroyed.  The host context itself is kept: the
+         * primary one still backs every legacy ARM_EGL_CONTEXT path. */
+        if (r1 >= ARM_EGL_CTXTAB_BASE &&
+            r1 - ARM_EGL_CTXTAB_BASE < g_egl_ctx_tab.size()) {
+            EGLContext dead = g_egl_ctx_tab[r1 - ARM_EGL_CTXTAB_BASE];
+            g_egl_ctx_tab[r1 - ARM_EGL_CTXTAB_BASE] = EGL_NO_CONTEXT;
+            if (dead != EGL_NO_CONTEXT && dead != g_egl_ctx)
+                eglDestroyContext(g_egl_dpy, dead);
+        }
+        for (auto it = g_egl_tid_ctx.begin(); it != g_egl_tid_ctx.end();)
+            it = (it->second == r1) ? g_egl_tid_ctx.erase(it) : std::next(it);
+        if (g_egl_bound_handle == r1) g_egl_bound_handle = 0u;
+        ret32(EGL_TRUE);
+        break;
+    }
     case SVC_EGL_TERMINATE:   ret32(EGL_TRUE); break;
     case SVC_EGL_SWAPINTERVAL: {
         EGLBoolean ok = (g_egl_dpy != EGL_NO_DISPLAY)
@@ -9692,8 +10212,19 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_EGL_SURFACEATTRIB: ret32(EGL_TRUE); break;
-    case SVC_EGL_GETCURCTX:
-        ret32(g_egl_ctx != EGL_NO_CONTEXT ? ARM_EGL_CONTEXT : 0u); break;
+    case SVC_EGL_GETCURCTX: {
+        uint32_t cur = egl_ctx_for_tid(g_current_tid);
+        if (!cur) cur = (g_egl_ctx != EGL_NO_CONTEXT && g_egl_ctx_tab.empty())
+                        ? ARM_EGL_CONTEXT : 0u;
+        if (getenv("LUNARIA_TRACE_EGL")) {
+            static int n = 0;
+            if (n++ < 40)
+                fprintf(stderr, "[egl] getCurrentContext → 0x%x tid=%u lr=0x%08x\n",
+                        cur, g_current_tid, regs[14]);
+        }
+        ret32(cur);
+        break;
+    }
     case SVC_EGL_GETCURSURF:
         ret32(g_egl_surf != EGL_NO_SURFACE ? ARM_EGL_SURFACE : 0u); break;
 
@@ -10013,8 +10544,16 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (pfn_glRenderbufferStorage) pfn_glRenderbufferStorage((GLenum)r0,(GLenum)r1,(GLsizei)r2,(GLsizei)r3); break;
 
     
-    case SVC_GL_CreateShader:
-        ret32(pfn_glCreateShader ? (uint32_t)pfn_glCreateShader((GLenum)r0) : 0u); break;
+    case SVC_GL_CreateShader: {
+        /* LUNARIA_TRACE_GLSHADER=1 traces the whole create/attach/link chain —
+         * a link failure only says which stage is *missing*, not who failed to
+         * produce it. */
+        uint32_t sh = pfn_glCreateShader ? (uint32_t)pfn_glCreateShader((GLenum)r0) : 0u;
+        if (getenv("LUNARIA_TRACE_GLSHADER"))
+            fprintf(stderr, "[glsh] CreateShader(type=0x%x) -> %u\n", r0, sh);
+        ret32(sh);
+        break;
+    }
     case SVC_GL_ShaderSource: {
         /* r0=shader r1=count r2=strings_va r3=lengths_va */
         if (pfn_glShaderSource && r2) {
@@ -10081,6 +10620,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         break;
     case SVC_GL_DeleteShader:
+        if (getenv("LUNARIA_TRACE_GLSHADER"))
+            fprintf(stderr, "[glsh] DeleteShader(%u)\n", r0);
         if (pfn_glDeleteShader) pfn_glDeleteShader((GLuint)r0); break;
     case SVC_GL_GetShaderiv:
         if (pfn_glGetShaderiv && r2) pfn_glGetShaderiv((GLuint)r0,(GLenum)r1,(GLint*)ctx.mem.ptr(r2)); break;
@@ -10107,9 +10648,16 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
 
     
-    case SVC_GL_CreateProgram:
-        ret32(pfn_glCreateProgram ? (uint32_t)pfn_glCreateProgram() : 0u); break;
+    case SVC_GL_CreateProgram: {
+        uint32_t pr = pfn_glCreateProgram ? (uint32_t)pfn_glCreateProgram() : 0u;
+        if (getenv("LUNARIA_TRACE_GLSHADER"))
+            fprintf(stderr, "[glsh] CreateProgram() -> %u\n", pr);
+        ret32(pr);
+        break;
+    }
     case SVC_GL_AttachShader:
+        if (getenv("LUNARIA_TRACE_GLSHADER"))
+            fprintf(stderr, "[glsh] AttachShader(prog=%u, shader=%u)\n", r0, r1);
         if (pfn_glAttachShader) pfn_glAttachShader((GLuint)r0,(GLuint)r1); break;
     case SVC_GL_LinkProgram:
         if (pfn_glLinkProgram) pfn_glLinkProgram((GLuint)r0);
@@ -10123,7 +10671,28 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     GLsizei len = 0;
                     pfn_glGetProgramInfoLog((GLuint)r0, sizeof info - 1, &len, info);
                 }
-                fprintf(stderr, "[gl] program %u link FAILED: %s\n", r0, info);
+                /* Which stages actually made it to the host?  "lacks a fragment
+                 * shader" can mean the guest never attached one or that the
+                 * attach never reached us, and only the attachment list tells
+                 * the two apart. */
+                GLint nsh = 0;
+                pfn_glGetProgramiv((GLuint)r0, 0x8B85 /* GL_ATTACHED_SHADERS */, &nsh);
+                fprintf(stderr, "[gl] program %u link FAILED (%d attached", r0, nsh);
+                if (nsh > 0 && nsh <= 8) {
+                    GLuint sh[8] = {};
+                    if (auto getatt = (void(*)(GLuint,GLsizei,GLsizei*,GLuint*))
+                            host_gl_proc({"glGetAttachedShaders"})) {
+                        GLsizei got = 0;
+                        getatt((GLuint)r0, nsh, &got, sh);
+                        for (GLsizei k = 0; k < got; ++k) {
+                            GLint ty = 0;
+                            if (pfn_glGetShaderiv)
+                                pfn_glGetShaderiv(sh[k], 0x8B4F /* GL_SHADER_TYPE */, &ty);
+                            fprintf(stderr, " %u:type=0x%x", sh[k], (unsigned)ty);
+                        }
+                    }
+                }
+                fprintf(stderr, "): %s\n", info);
             }
         }
         break;
@@ -10343,6 +10912,19 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (pfn_glBlendFunc) pfn_glBlendFunc((GLenum)r0,(GLenum)r1); break;
     case SVC_GL_TexParameterf:
         if (pfn_glTexParameterf) pfn_glTexParameterf((GLenum)r0,(GLenum)r1,rf(r2)); break;
+    case SVC_GL_TexParameterfv: {
+        /* glTexParameterfv(target,pname, const GLfloat *params[r2]).  GLES
+         * pnames take a single float; copy up to 4 from the guest arena so
+         * multi-value pnames also work, then hand a host pointer to the driver. */
+        GLfloat params[4] = {0,0,0,0};
+        if (r2) for (int i = 0; i < 4; ++i) {
+            uint32_t w = ctx.mem.read32(r2 + 4u*(uint32_t)i);
+            memcpy(&params[i], &w, 4);
+        }
+        if (pfn_glTexParameterfv) pfn_glTexParameterfv((GLenum)r0,(GLenum)r1,params);
+        else if (pfn_glTexParameterf) pfn_glTexParameterf((GLenum)r0,(GLenum)r1,params[0]);
+        break;
+    }
     case SVC_GL_DepthRangef:
         if (pfn_glDepthRangef) pfn_glDepthRangef(rf(r0),rf(r1)); break;
     case SVC_GL_PolygonOffset:
@@ -11010,8 +11592,31 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                         r0, old_hi, *next);
             break;
         }
-        if (getenv("LUNARIA_TRACE_MMAP") && !reclaimed)
-            fprintf(stderr, "[munmap] accepted non-tail addr=%08x len=%u\n", r0, r1);
+        if (!reclaimed) {
+            /* Not the bump tail: hand the range to the free list instead of
+             * leaking it.  Only ranges that came out of our arenas qualify —
+             * the guest also unmaps library and heap addresses we do not own.
+             * Zero it here so the next mmap of these pages still looks like
+             * MAP_ANONYMOUS to the guest. */
+            uint64_t lo64 = r0 & ~4095ull;
+            uint64_t hi64 = ((uint64_t)r0 + r1 + 4095ull) & ~4095ull;
+            bool in_primary   = lo64 >= MMAP_BASE && hi64 <= MMAP_END;
+            bool in_secondary = lo64 >= g_mmap2_base && hi64 <= mmap2_end_excl();
+            if ((in_primary || in_secondary) && hi64 > lo64 && hi64 <= 0x100000000ull) {
+                uint32_t lo = (uint32_t)lo64, hi = (uint32_t)hi64;
+                if (uint8_t *p = ctx.mem.ptr(lo))
+                    if (ctx.mem.ptr(hi - 1u)) memset(p, 0, hi - lo);
+                mmap_free_insert(lo, hi);
+                for (auto it = g_mmap_slabs.begin(); it != g_mmap_slabs.end();)
+                    it = (it->lo >= lo && it->hi <= hi) ? g_mmap_slabs.erase(it)
+                                                        : std::next(it);
+                if (getenv("LUNARIA_TRACE_MMAP"))
+                    fprintf(stderr, "[munmap] freed [%08x,%08x) → %zu free ranges\n",
+                            lo, hi, g_mmap_freelist.size());
+            } else if (getenv("LUNARIA_TRACE_MMAP")) {
+                fprintf(stderr, "[munmap] accepted non-arena addr=%08x len=%u\n", r0, r1);
+            }
+        }
         ret32(0); break;
     }
     /* ---- time / environment / misc ---- */
@@ -11173,18 +11778,116 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         break;
     }
-    case SVC_SL_CREATE_ENGINE: {
-        /* slCreateEngine(engine**, numOptions, options, numInterfaces, iids, reqs) */
-        if (r0) {
-            uint32_t eng = arm_malloc(ctx, 64u);
-            if (eng) {
-                memset(ctx.mem.ptr(eng), 0, 64u);
-                ctx.mem.write32(r0, eng);
-                ret32(0); /* SL_RESULT_SUCCESS */
-                break;
-            }
+    /* ---- OpenSL ES ------------------------------------------------------- */
+    case SVC_SL_OBJ_REALIZE:
+        ret32(0); /* SL_RESULT_SUCCESS */
+        break;
+    case SVC_SL_OBJ_GETSTATE:
+        if (r1) ctx.mem.write32(r1, 2u); /* SL_OBJECT_STATE_REALIZED */
+        ret32(0);
+        break;
+    case SVC_SL_OBJ_GETINTERFACE: {
+        /* GetInterface(self, iid, void *pInterface).  `self` is the instance
+         * word; hand back another instance word whose vtable matches the iid so
+         * the guest's `(*itf)->Method(itf, …)` lands on our trampolines. */
+        uint32_t vt = SL_VT_OBJECT;
+        const char *iid = "?";
+        uint32_t kind = r0 ? ctx.mem.read32(r0 + 4u) : 0u;
+        if (auto it = g_sl_iid_names.find(r1); it != g_sl_iid_names.end()) {
+            iid = it->second.c_str();
+            if      (!strcmp(iid, "SL_IID_ENGINE"))               vt = SL_VT_ENGINE;
+            else if (!strcmp(iid, "SL_IID_PLAY"))                 vt = SL_VT_PLAY;
+            else if (!strcmp(iid, "SL_IID_VOLUME"))               vt = SL_VT_VOLUME;
+            else if (!strcmp(iid, "SL_IID_ANDROIDCONFIGURATION")) vt = SL_VT_ANDROIDCFG;
+            else if (strstr(iid, "BUFFERQUEUE"))                  vt = SL_VT_BUFQ;
+        } else if (kind == SL_KIND_PLAYER && r0 &&
+                   !ctx.mem.read32(r0 + 20u)) {
+            /* Heuristic, and deliberately used at most once per player: not
+             * every SL_IID_* import reaches us as one of the synthesised
+             * addresses (SL_IID_ANDROIDSIMPLEBUFFERQUEUE arrives as a value
+             * libUE4 resolved for itself).  The buffer queue is the only
+             * interface whose methods do anything here, and UE4 asks a player
+             * for it immediately after SL_IID_PLAY, so bind the first
+             * unrecognised request to it and leave later ones inert -- writing
+             * buffer-queue semantics onto, say, GetConfiguration's key pointer
+             * would corrupt guest memory. */
+            vt = SL_VT_BUFQ;
+            ctx.mem.write32(r0 + 20u, 1u);
+            iid = "(unrecognised → buffer queue)";
         }
-        ret32(1u); /* SL_RESULT_MEMORY_FAILURE */
+        uint32_t itf = sl_new_instance(ctx, vt, kind);
+        if (!itf || !r2) { ret32(12u); break; }   /* FEATURE_UNSUPPORTED */
+        /* Share the owner's state words so a buffer-queue callback registered
+         * through one interface is visible from the player object. */
+        if (r0) { ctx.mem.write32(itf + 16u, r0); }
+        ctx.mem.write32(r2, itf);
+        fprintf(stderr, "[opensles] GetInterface(%s iid=0x%08x) → 0x%08x (vt=0x%08x)\n",
+                iid, r1, itf, vt);
+        ret32(0);
+        break;
+    }
+    case SVC_SL_ENG_CREATE_OUTMIX: {
+        /* CreateOutputMix(self, SLObjectItf *pMix, numItf, iids, req) */
+        uint32_t obj = sl_new_instance(ctx, SL_VT_OBJECT, SL_KIND_OUTMIX);
+        if (!obj || !r1) { ret32(12u); break; }
+        ctx.mem.write32(r1, obj);
+        ret32(0);
+        break;
+    }
+    case SVC_SL_ENG_CREATE_PLAYER: {
+        /* CreateAudioPlayer(self, SLObjectItf *pPlayer, src, sink, n, iids, req) */
+        uint32_t obj = sl_new_instance(ctx, SL_VT_OBJECT, SL_KIND_PLAYER);
+        if (!obj || !r1) { ret32(12u); break; }
+        ctx.mem.write32(r1, obj);
+        fprintf(stderr, "[opensles] CreateAudioPlayer → 0x%08x\n", obj);
+        ret32(0);
+        break;
+    }
+    case SVC_SL_BQ_REGISTER: {
+        /* RegisterCallback(self, callback, pContext).  Record it on the owning
+         * player object; nothing drives it yet, so the guest simply never gets
+         * asked for more audio (silence) instead of stalling on a bad call. */
+        uint32_t owner = r0 ? ctx.mem.read32(r0 + 16u) : 0u;
+        uint32_t slot  = owner ? owner : r0;
+        if (slot) { ctx.mem.write32(slot + 8u, r1); ctx.mem.write32(slot + 12u, r2); }
+        fprintf(stderr, "[opensles] bufferqueue RegisterCallback cb=0x%08x ctx=0x%08x\n",
+                r1, r2);
+        ret32(0);
+        break;
+    }
+    case SVC_SL_BQ_ENQUEUE:
+        ret32(0);
+        break;
+    case SVC_SCHED_GETAFFINITY: {
+        /* (pid, cpusetsize, mask*) — report every guest CPU as assignable. */
+        uint32_t bytes = r1 < 4u ? 0u : (r1 > 128u ? 128u : r1);
+        if (r2 && bytes >= 4u) {
+            for (uint32_t o = 0; o + 4u <= bytes; o += 4u)
+                ctx.mem.write32(r2 + o, o == 0u ? ((1u << GUEST_NCPU) - 1u) : 0u);
+        }
+        ret32(0);
+        break;
+    }
+    case SVC_SL_BQ_GETSTATE:
+        /* SLAndroidSimpleBufferQueueState { count, index } — always drained. */
+        if (r1) { ctx.mem.write32(r1, 0u); ctx.mem.write32(r1 + 4u, 0u); }
+        ret32(0);
+        break;
+
+    case SVC_SL_CREATE_ENGINE: {
+        /* slCreateEngine(engine**, numOptions, options, numInterfaces, iids, reqs)
+         *
+         * The old handler returned a zeroed 64-byte block.  The guest then does
+         * `(*engineObject)->Realize(...)`, which loads the NULL interface
+         * pointer and calls through it -- and since libc++_shared.so is mapped
+         * at guest base 0, that read lands on its ELF header and the JIT jumped
+         * to 0x464c457f ("\x7fELF").  Returning an error is no good either:
+         * FMixerPlatformAndroid uses check(SL_RESULT_SUCCESS == result). */
+        uint32_t obj = sl_new_instance(ctx, SL_VT_OBJECT, SL_KIND_ENGINE);
+        if (!obj || !r0) { ret32(12u); break; }  /* SL_RESULT_FEATURE_UNSUPPORTED */
+        ctx.mem.write32(r0, obj);
+        fprintf(stderr, "[opensles] slCreateEngine -> 0x%08x\n", obj);
+        ret32(0); /* SL_RESULT_SUCCESS */
         break;
     }
     case SVC_GL_BLIT_FRAMEBUFFER: {
@@ -11549,6 +12252,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             g_gl_syncs[r0-1] = nullptr;
         }
         break;
+    case SVC_GL3_IsSync: {
+        /* glIsSync(sync[r0]) → GLboolean: valid iff it maps to a live handle. */
+        bool live = (r0 && r0 <= g_gl_syncs.size() && g_gl_syncs[r0-1] != nullptr);
+        ret32(live ? 1u : 0u);
+        break;
+    }
     case SVC_GL3_InvalidateFramebuffer:
         if (pfn_glInvalidateFramebuffer)
             pfn_glInvalidateFramebuffer((GLenum)r0,(GLsizei)r1,
@@ -11654,6 +12363,279 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 (GLsizei)instancecount, (GLint)basevertex);
         break;
     }
+    /* ---- GLES 3.1/3.2 + EXT entry points (host-forwarded) ----
+     * `host_gl_proc` prefers eglGetProcAddress and falls back to dlsym on the
+     * GLESv2 handle: Mesa's eglGetProcAddress answers for extension names but
+     * not always for the promoted core spellings. */
+    /* ---- GLES 3.0/3.1 entry points (host-forwarded) ---------------------- */
+    case SVC_GL3_ClearBufferfv: {
+        typedef void (*pfn_t)(GLenum, GLint, const GLfloat*);
+        static pfn_t f = (pfn_t)host_gl_proc({"glClearBufferfv"});
+        if (f) f((GLenum)r0, (GLint)r1, (const GLfloat*)ARM_CPTR(r2));
+        ++g_guest_gl_clear_count;
+        break;
+    }
+    case SVC_GL3_ClearBufferiv: {
+        typedef void (*pfn_t)(GLenum, GLint, const GLint*);
+        static pfn_t f = (pfn_t)host_gl_proc({"glClearBufferiv"});
+        if (f) f((GLenum)r0, (GLint)r1, (const GLint*)ARM_CPTR(r2));
+        ++g_guest_gl_clear_count;
+        break;
+    }
+    case SVC_GL3_ClearBufferuiv: {
+        typedef void (*pfn_t)(GLenum, GLint, const GLuint*);
+        static pfn_t f = (pfn_t)host_gl_proc({"glClearBufferuiv"});
+        if (f) f((GLenum)r0, (GLint)r1, (const GLuint*)ARM_CPTR(r2));
+        ++g_guest_gl_clear_count;
+        break;
+    }
+    case SVC_GL3_ClearBufferfi: {
+        /* (buffer, drawbuffer, GLfloat depth, GLint stencil) — softfp puts the
+         * float in a core register, so reinterpret r2 rather than convert. */
+        typedef void (*pfn_t)(GLenum, GLint, GLfloat, GLint);
+        static pfn_t f = (pfn_t)host_gl_proc({"glClearBufferfi"});
+        if (f) f((GLenum)r0, (GLint)r1, rf(r2), (GLint)r3);
+        ++g_guest_gl_clear_count;
+        break;
+    }
+    case SVC_GL3_GetUniformBlockIndex: {
+        typedef GLuint (*pfn_t)(GLuint, const GLchar*);
+        static pfn_t f = (pfn_t)host_gl_proc({"glGetUniformBlockIndex"});
+        const char *nm = r1 ? ctx.mem.cstr(r1) : nullptr;
+        ret32((f && nm) ? (uint32_t)f((GLuint)r0, nm) : 0xffffffffu /* INVALID_INDEX */);
+        break;
+    }
+    case SVC_GL3_UniformBlockBinding: {
+        typedef void (*pfn_t)(GLuint, GLuint, GLuint);
+        static pfn_t f = (pfn_t)host_gl_proc({"glUniformBlockBinding"});
+        if (f) f((GLuint)r0, (GLuint)r1, (GLuint)r2);
+        break;
+    }
+    case SVC_GL3_GetActiveUniformBlockiv: {
+        typedef void (*pfn_t)(GLuint, GLuint, GLenum, GLint*);
+        static pfn_t f = (pfn_t)host_gl_proc({"glGetActiveUniformBlockiv"});
+        if (f && r3) f((GLuint)r0, (GLuint)r1, (GLenum)r2, (GLint*)ARM_PTR(r3));
+        break;
+    }
+    case SVC_GL3_GetUniformIndices: {
+        /* (program, count, const GLchar *const *names, GLuint *indices) — the
+         * name array holds guest pointers, so rebuild it host-side. */
+        typedef void (*pfn_t)(GLuint, GLsizei, const GLchar* const*, GLuint*);
+        static pfn_t f = (pfn_t)host_gl_proc({"glGetUniformIndices"});
+        uint32_t n = r1;
+        if (!f || !r2 || !r3 || n > 4096u) break;
+        std::vector<const GLchar*> names(n, nullptr);
+        for (uint32_t k = 0; k < n; ++k) {
+            uint32_t va = ctx.mem.read32(r2 + k * 4u);
+            names[k] = va ? ctx.mem.cstr(va) : nullptr;
+        }
+        f((GLuint)r0, (GLsizei)n, names.data(), (GLuint*)ARM_PTR(r3));
+        break;
+    }
+    case SVC_GL3_GetActiveUniformsiv: {
+        /* (program, count, const GLuint *indices, GLenum pname | GLint *params) */
+        typedef void (*pfn_t)(GLuint, GLsizei, const GLuint*, GLenum, GLint*);
+        static pfn_t f = (pfn_t)host_gl_proc({"glGetActiveUniformsiv"});
+        uint32_t params_va = ctx.mem.read32(regs[13]);
+        if (f && r2 && params_va)
+            f((GLuint)r0, (GLsizei)r1, (const GLuint*)ARM_CPTR(r2), (GLenum)r3,
+              (GLint*)ARM_PTR(params_va));
+        break;
+    }
+    case SVC_GL3_FramebufferTextureLayer: {
+        /* (target, attachment, texture, level | layer) */
+        typedef void (*pfn_t)(GLenum, GLenum, GLuint, GLint, GLint);
+        static pfn_t f = (pfn_t)host_gl_proc({"glFramebufferTextureLayer"});
+        uint32_t layer = ctx.mem.read32(regs[13]);
+        if (f) f((GLenum)r0, (GLenum)r1, (GLuint)r2, (GLint)r3, (GLint)layer);
+        break;
+    }
+    case SVC_GL3_CopyBufferSubData: {
+        /* (readTarget, writeTarget, readOffset, writeOffset | size) */
+        typedef void (*pfn_t)(GLenum, GLenum, GLintptr, GLintptr, GLsizeiptr);
+        static pfn_t f = (pfn_t)host_gl_proc({"glCopyBufferSubData"});
+        uint32_t size = ctx.mem.read32(regs[13]);
+        if (f) f((GLenum)r0, (GLenum)r1, (GLintptr)(int32_t)r2,
+                 (GLintptr)(int32_t)r3, (GLsizeiptr)size);
+        break;
+    }
+    case SVC_GL3_RenderbufferStorageMS: {
+        /* (target, samples, internalformat, width | height) */
+        typedef void (*pfn_t)(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
+        static pfn_t f = (pfn_t)host_gl_proc({"glRenderbufferStorageMultisample",
+                                              "glRenderbufferStorageMultisampleEXT"});
+        uint32_t h = ctx.mem.read32(regs[13]);
+        if (f) f((GLenum)r0, (GLsizei)r1, (GLenum)r2, (GLsizei)r3, (GLsizei)h);
+        break;
+    }
+    case SVC_GL3_BindImageTexture: {
+        /* (unit, texture, level, layered | layer, access, format) */
+        typedef void (*pfn_t)(GLuint, GLuint, GLint, GLboolean, GLint, GLenum, GLenum);
+        static pfn_t f = (pfn_t)host_gl_proc({"glBindImageTexture"});
+        uint32_t layer  = ctx.mem.read32(regs[13]);
+        uint32_t access = ctx.mem.read32(regs[13] + 4u);
+        uint32_t fmt    = ctx.mem.read32(regs[13] + 8u);
+        if (f) f((GLuint)r0, (GLuint)r1, (GLint)r2, (GLboolean)r3,
+                 (GLint)layer, (GLenum)access, (GLenum)fmt);
+        break;
+    }
+    case SVC_GL3_MemoryBarrier: {
+        typedef void (*pfn_t)(GLbitfield);
+        static pfn_t f = (pfn_t)host_gl_proc({"glMemoryBarrier"});
+        if (f) f((GLbitfield)r0);
+        break;
+    }
+    case SVC_GL3_DispatchCompute: {
+        typedef void (*pfn_t)(GLuint, GLuint, GLuint);
+        static pfn_t f = (pfn_t)host_gl_proc({"glDispatchCompute"});
+        if (f) f((GLuint)r0, (GLuint)r1, (GLuint)r2);
+        break;
+    }
+    case SVC_GL3_BindVertexBuffer: {
+        typedef void (*pfn_t)(GLuint, GLuint, GLintptr, GLsizei);
+        static pfn_t f = (pfn_t)host_gl_proc({"glBindVertexBuffer"});
+        if (f) f((GLuint)r0, (GLuint)r1, (GLintptr)(int32_t)r2, (GLsizei)r3);
+        break;
+    }
+    case SVC_GL3_VertexAttribFormat: {
+        /* (attribindex, size, type, normalized | relativeoffset) */
+        typedef void (*pfn_t)(GLuint, GLint, GLenum, GLboolean, GLuint);
+        static pfn_t f = (pfn_t)host_gl_proc({"glVertexAttribFormat"});
+        uint32_t rel = ctx.mem.read32(regs[13]);
+        if (f) f((GLuint)r0, (GLint)r1, (GLenum)r2, (GLboolean)r3, (GLuint)rel);
+        break;
+    }
+    case SVC_GL3_VertexAttribIFormat: {
+        typedef void (*pfn_t)(GLuint, GLint, GLenum, GLuint);
+        static pfn_t f = (pfn_t)host_gl_proc({"glVertexAttribIFormat"});
+        if (f) f((GLuint)r0, (GLint)r1, (GLenum)r2, (GLuint)r3);
+        break;
+    }
+    case SVC_GL3_VertexAttribBinding: {
+        typedef void (*pfn_t)(GLuint, GLuint);
+        static pfn_t f = (pfn_t)host_gl_proc({"glVertexAttribBinding"});
+        if (f) f((GLuint)r0, (GLuint)r1);
+        break;
+    }
+    case SVC_GL3_VertexBindingDivisor: {
+        typedef void (*pfn_t)(GLuint, GLuint);
+        static pfn_t f = (pfn_t)host_gl_proc({"glVertexBindingDivisor"});
+        if (f) f((GLuint)r0, (GLuint)r1);
+        break;
+    }
+    case SVC_GL3_TexStorage2DMS: {
+        /* (target, samples, internalformat, width | height, fixedsamplelocations) */
+        typedef void (*pfn_t)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLboolean);
+        static pfn_t f = (pfn_t)host_gl_proc({"glTexStorage2DMultisample"});
+        uint32_t h  = ctx.mem.read32(regs[13]);
+        uint32_t fx = ctx.mem.read32(regs[13] + 4u);
+        if (f) f((GLenum)r0, (GLsizei)r1, (GLenum)r2, (GLsizei)r3,
+                 (GLsizei)h, (GLboolean)fx);
+        break;
+    }
+    case SVC_GL3_Uniform4uiv: {
+        typedef void (*pfn_t)(GLint, GLsizei, const GLuint*);
+        static pfn_t f = (pfn_t)host_gl_proc({"glUniform4uiv"});
+        if (f && r2) f((GLint)r0, (GLsizei)r1, (const GLuint*)ARM_CPTR(r2));
+        break;
+    }
+    case SVC_GL3_GetProgramResourceIndex: {
+        typedef GLuint (*pfn_t)(GLuint, GLenum, const GLchar*);
+        static pfn_t f = (pfn_t)host_gl_proc({"glGetProgramResourceIndex"});
+        const char *nm = r2 ? ctx.mem.cstr(r2) : nullptr;
+        ret32((f && nm) ? (uint32_t)f((GLuint)r0, (GLenum)r1, nm) : 0xffffffffu);
+        break;
+    }
+
+    case SVC_GLX_TexBuffer: {
+        typedef void (*pfn_t)(GLenum, GLenum, GLuint);
+        static pfn_t f = (pfn_t)host_gl_proc({"glTexBuffer", "glTexBufferEXT",
+                                              "glTexBufferOES"});
+        if (f) f((GLenum)r0, (GLenum)r1, (GLuint)r2);
+        break;
+    }
+    case SVC_GLX_TexBufferRange: {
+        /* (target, internalformat, buffer, offset | size) — GLintptr/GLsizeiptr
+         * are 32-bit in the guest ABI, so `size` is the first stack word. */
+        typedef void (*pfn_t)(GLenum, GLenum, GLuint, GLintptr, GLsizeiptr);
+        static pfn_t f = (pfn_t)host_gl_proc({"glTexBufferRange",
+                                              "glTexBufferRangeEXT",
+                                              "glTexBufferRangeOES"});
+        uint32_t size = ctx.mem.read32(regs[13]);
+        if (f) f((GLenum)r0, (GLenum)r1, (GLuint)r2, (GLintptr)(int32_t)r3,
+                 (GLsizeiptr)size);
+        break;
+    }
+    case SVC_GLX_CopyImageSubData: {
+        /* 15 args: r0-r3 then 11 stack words. */
+        typedef void (*pfn_t)(GLuint, GLenum, GLint, GLint, GLint, GLint,
+                              GLuint, GLenum, GLint, GLint, GLint, GLint,
+                              GLsizei, GLsizei, GLsizei);
+        static pfn_t f = (pfn_t)host_gl_proc({"glCopyImageSubData",
+                                              "glCopyImageSubDataEXT",
+                                              "glCopyImageSubDataOES"});
+        uint32_t a[11];
+        for (int i = 0; i < 11; ++i) a[i] = ctx.mem.read32(regs[13] + (uint32_t)i * 4u);
+        if (f) f((GLuint)r0, (GLenum)r1, (GLint)r2, (GLint)r3,
+                 (GLint)a[0], (GLint)a[1], (GLuint)a[2], (GLenum)a[3],
+                 (GLint)a[4], (GLint)a[5], (GLint)a[6], (GLint)a[7],
+                 (GLsizei)a[8], (GLsizei)a[9], (GLsizei)a[10]);
+        break;
+    }
+    case SVC_GLX_Enablei:
+    case SVC_GLX_Disablei: {
+        typedef void (*pfn_t)(GLenum, GLuint);
+        static pfn_t fe = (pfn_t)host_gl_proc({"glEnablei", "glEnableiEXT"});
+        static pfn_t fd = (pfn_t)host_gl_proc({"glDisablei", "glDisableiEXT"});
+        pfn_t f = (svc_no == SVC_GLX_Enablei) ? fe : fd;
+        if (f) f((GLenum)r0, (GLuint)r1);
+        break;
+    }
+    case SVC_GLX_ColorMaski: {
+        /* (index, r, g, b | a) */
+        typedef void (*pfn_t)(GLuint, GLboolean, GLboolean, GLboolean, GLboolean);
+        static pfn_t f = (pfn_t)host_gl_proc({"glColorMaski", "glColorMaskiEXT"});
+        uint32_t a = ctx.mem.read32(regs[13]);
+        if (f) f((GLuint)r0, (GLboolean)r1, (GLboolean)r2, (GLboolean)r3,
+                 (GLboolean)a);
+        break;
+    }
+    case SVC_GLX_BlendEquationi: {
+        typedef void (*pfn_t)(GLuint, GLenum);
+        static pfn_t f = (pfn_t)host_gl_proc({"glBlendEquationi",
+                                              "glBlendEquationiEXT"});
+        if (f) f((GLuint)r0, (GLenum)r1);
+        break;
+    }
+    case SVC_GLX_BlendEquationSepi: {
+        typedef void (*pfn_t)(GLuint, GLenum, GLenum);
+        static pfn_t f = (pfn_t)host_gl_proc({"glBlendEquationSeparatei",
+                                              "glBlendEquationSeparateiEXT"});
+        if (f) f((GLuint)r0, (GLenum)r1, (GLenum)r2);
+        break;
+    }
+    case SVC_GLX_BlendFunci: {
+        typedef void (*pfn_t)(GLuint, GLenum, GLenum);
+        static pfn_t f = (pfn_t)host_gl_proc({"glBlendFunci", "glBlendFunciEXT"});
+        if (f) f((GLuint)r0, (GLenum)r1, (GLenum)r2);
+        break;
+    }
+    case SVC_GLX_BlendFuncSepi: {
+        /* (buf, srcRGB, dstRGB, srcAlpha | dstAlpha) */
+        typedef void (*pfn_t)(GLuint, GLenum, GLenum, GLenum, GLenum);
+        static pfn_t f = (pfn_t)host_gl_proc({"glBlendFuncSeparatei",
+                                              "glBlendFuncSeparateiEXT"});
+        uint32_t da = ctx.mem.read32(regs[13]);
+        if (f) f((GLuint)r0, (GLenum)r1, (GLenum)r2, (GLenum)r3, (GLenum)da);
+        break;
+    }
+    case SVC_GLX_GetPointerv: {
+        /* Host pointers must never reach the guest; the only pointer these
+         * queries return is the debug callback, which never leaves Lunaria. */
+        if (r1) ctx.mem.write32(r1, 0u);
+        break;
+    }
+
     case SVC_GLX_BlendBarrier: {
         typedef void (*pfn_blendbar_t)(void);
         static pfn_blendbar_t host_bb = []() {
@@ -11674,6 +12656,31 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
  * Record handler VA so pthread_kill can simulate GC signal delivery. */
         int signum = (int)r0;
         uint32_t new_act_va = r1;
+        uint32_t old_act_va = r2;
+        /* Fill `oldact` *before* installing the new one.  Leaving it untouched
+         * (the previous behaviour) made every save/restore pair restore
+         * uninitialised stack: OPENSSL_cpuid_setup does
+         *   sigaction(SIGILL, &ill_act, &ill_oact); ... sigaction(SIGILL, &ill_oact, NULL);
+         * and the second call was registering a garbage sa_handler
+         * (0xef0001b6 — literally an `svc` opcode read off the stack) as the
+         * process-wide SIGILL disposition. */
+        if (old_act_va) {
+            uint32_t prev = 0;
+            if (auto it = g_sighandlers.find(signum); it != g_sighandlers.end())
+                prev = it->second;
+            if (ctx.is_arm64) {
+                ctx.mem.write64((GuestVA)old_act_va, prev);
+                ctx.mem.write64((GuestVA)old_act_va + 8, 0);   /* sa_flags */
+                ctx.mem.write64((GuestVA)old_act_va + 16, 0);  /* sa_restorer */
+                ctx.mem.write64((GuestVA)old_act_va + 24, 0);  /* sa_mask */
+            } else {
+                ctx.mem.write32(old_act_va, prev);
+                ctx.mem.write32(old_act_va + 4, 0);            /* sa_flags */
+                ctx.mem.write32(old_act_va + 8, 0);            /* sa_restorer */
+                ctx.mem.write32(old_act_va + 12, 0);           /* sa_mask[0] */
+                ctx.mem.write32(old_act_va + 16, 0);           /* sa_mask[1] */
+            }
+        }
         if (new_act_va) {
             uint32_t sa_handler;
             if (ctx.is_arm64) {
@@ -11688,6 +12695,17 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 static int sa_log = 0;
                 if (sa_log++ < 20)
                     fprintf(stderr, "[sigaction] sig=%d handler=0x%08x\n", signum, sa_handler);
+            } else {
+                /* SIG_DFL / SIG_IGN: drop the handler.  Probes such as
+                 * OPENSSL_cpuid_setup restore the previous disposition when
+                 * done; keeping the stale entry would route a much later fault
+                 * into a function that is no longer prepared to handle it. */
+                if (g_sighandlers.erase(signum)) {
+                    static int sa_rst = 0;
+                    if (sa_rst++ < 20)
+                        fprintf(stderr, "[sigaction] sig=%d reset to %s\n", signum,
+                                sa_handler ? "SIG_IGN" : "SIG_DFL");
+                }
             }
         }
         ret32(0); break;
@@ -12240,6 +13258,24 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         ret32((uint32_t)rc);
         break;
     }
+    /* compressBound(sourceLen) — pure arithmetic, forward to host zlib. */
+    case SVC_Z_COMPRESSBOUND:
+        ret32((uint32_t)compressBound((uLong)r0));
+        break;
+    /* deflateBound(strm, sourceLen).  Use the host stream when the guest
+     * z_stream has been through deflateInit2_; otherwise fall back to the
+     * worst-case raw-deflate bound (compressBound already covers the zlib
+     * wrapper, so it is never an under-estimate). */
+    case SVC_Z_DEFLATEBOUND: {
+        uLong bound = 0;
+        if (g_dstreams) {
+            auto it = g_dstreams->find(r0);
+            if (it != g_dstreams->end()) bound = deflateBound(it->second, (uLong)r1);
+        }
+        if (!bound) bound = compressBound((uLong)r1);
+        ret32((uint32_t)bound);
+        break;
+    }
 
     /* ---- string→number conversions ---- */
 
@@ -12627,6 +13663,48 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         ret32((uint32_t)n);
         break;
     }
+    case SVC_PREAD64: {
+        /* pread64(fd, buf, count, off64): 8-byte-aligned offset spills to the
+         * stack (r3 skipped as padding).  [sp]=lo, [sp+4]=hi. */
+        uint64_t off = 0;
+        if (regs[13]) off = (uint64_t)ctx.mem.read32(regs[13]) |
+                            ((uint64_t)ctx.mem.read32(regs[13] + 4) << 32);
+        ssize_t n = (r1) ? pread((int)r0, ctx.mem.ptr(r1), (size_t)r2, (off_t)off)
+                         : -1;
+        if (getenv("LUNARIA_TRACE_FILE")) {
+            char lp[96] = {0}, proc[64];
+            snprintf(proc, sizeof proc, "/proc/self/fd/%d", (int)r0);
+            ssize_t ll = readlink(proc, lp, sizeof(lp) - 1);
+            if (ll > 0) lp[ll] = '\0';
+            fprintf(stderr, "[pread64] fd=%d buf=0x%08x cnt=%u off=%llu -> %zd "
+                    "errno=%d sp=0x%08x tid=%u path=%s lr=0x%08x\n",
+                    (int)r0, r1, r2, (unsigned long long)off, n, errno,
+                    regs[13], g_current_tid, lp, regs[14]);
+            if (!r1) {
+                /* NULL destination: dump plausible return addresses off the
+                 * guest stack so the caller can be symbolised offline. */
+                fprintf(stderr, "[pread64] NULL dst — stack:");
+                for (uint32_t i = 0; i < 1200; ++i) {
+                    uint32_t w = ctx.mem.read32(regs[13] + i * 4u);
+                    /* libUE4.so .text only (data/rodata sit far below). */
+                    if (w >= 0x06000000u && w < 0x0e000000u)
+                        fprintf(stderr, " 0x%08x", w);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+        ret32((uint32_t)n);
+        break;
+    }
+    case SVC_PWRITE64: {
+        uint64_t off = 0;
+        if (regs[13]) off = (uint64_t)ctx.mem.read32(regs[13]) |
+                            ((uint64_t)ctx.mem.read32(regs[13] + 4) << 32);
+        ssize_t n = (r1) ? pwrite((int)r0, ctx.mem.ptr(r1), (size_t)r2, (off_t)off)
+                         : -1;
+        ret32((uint32_t)n);
+        break;
+    }
     case SVC_FGETS: {
         FILE *f = resolve_file(ctx, r2);
         if (!f || !r0 || r1 == 0) { ret32(0); break; }
@@ -12880,9 +13958,18 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         if (retval_ptr) ctx.mem.write32(retval_ptr, 0u);
         
-        g_threads.erase(std::remove_if(g_threads.begin(), g_threads.end(),
-            [&](const ArmThread &t){ return t.id == target_tid && t.finished; }),
-            g_threads.end());
+        auto dead = std::remove_if(g_threads.begin(), g_threads.end(),
+            [&](const ArmThread &t){ return t.id == target_tid && t.finished; });
+        if (dead != g_threads.end()) {
+            /* The id becomes available again, so drop everything keyed by it —
+             * otherwise the next thread to be handed this id inherits the dead
+             * one's pthread TLS and EGL binding.  Real pthread_key values are
+             * cleared when a thread exits. */
+            for (auto it = g_tls.begin(); it != g_tls.end();)
+                it = (it->first.first == target_tid) ? g_tls.erase(it) : std::next(it);
+            g_egl_tid_ctx.erase(target_tid);
+        }
+        g_threads.erase(dead, g_threads.end());
         ret32(0); break;
     }
 
@@ -13947,6 +15034,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         ret32((uint32_t)(int32_t)lrintf(f));
         break;
     }
+    case SVC_LRINT: {
+        /* lrint(double x[r0:r1]) → long/int[r0] (LP32 long is 32-bit) */
+        uint64_t bits = (uint64_t)r1 << 32 | r0;
+        double v; memcpy(&v, &bits, 8);
+        ret32((uint32_t)(int32_t)lrint(v));
+        break;
+    }
     case SVC_EXPM1F: {
         /* expm1f(float x[r0]) → float[r0] */
         float f; uint32_t tmp = r0; memcpy(&f, &tmp, 4);
@@ -14289,16 +15383,33 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_SYSINFO: {
         /* sysinfo(struct sysinfo*): fill a guest-sized bionic layout (32-bit). */
         if (!r0) { ret32((uint32_t)-1); break; }
-        /* bionic sysinfo: uptime, loads[3], totalram, freeram, … — write a
-         * plausible 2 GB guest profile.  Offsets match Linux 32-bit sysinfo. */
-        auto w = [&](uint32_t off, uint32_t v) { ctx.mem.write32(r0 + off, v); };
-        w(0, 100);          /* uptime */
-        w(4, 0); w(8, 0); w(12, 0); /* loads */
-        w(16, 512u << 20);  /* totalram bytes-ish — bionic uses mem_unit */
-        w(20, 384u << 20);  /* freeram */
-        w(24, 0); w(28, 0); w(32, 0); /* shared/buffer/totalhigh */
-        w(36, 0);           /* freehigh */
-        w(40, 1);           /* mem_unit = 1 byte */
+        /* 32-bit struct sysinfo (uapi/linux/sysinfo.h):
+         *   0 uptime, 4/8/12 loads[3], 16 totalram, 20 freeram, 24 sharedram,
+         *   28 bufferram, 32 totalswap, 36 freeswap, 40 procs(u16)+pad(u16),
+         *   44 totalhigh, 48 freehigh, 52 mem_unit, 56.. _f padding.
+         * The old code put freehigh at 36 and mem_unit at 40, so mem_unit was
+         * never written: FAndroidPlatformMemory::GetConstants() multiplied
+         * totalram by whatever the guest stack held there and reported
+         * "Memory total: Physical=2199023255552.00MB".  Report the same figures
+         * as the synthetic /proc/meminfo, scaled by mem_unit the way the kernel
+         * does when the byte count would not fit in a 32-bit unsigned long. */
+        auto w   = [&](uint32_t off, uint32_t v) { ctx.mem.write32(r0 + off, v); };
+        auto w16 = [&](uint32_t off, uint16_t v) {
+            if (auto *p = ctx.mem.ptr(r0 + off)) memcpy(p, &v, 2);
+        };
+        const uint32_t unit  = 4096u;
+        uint64_t total_b = (uint64_t)lunaria_mem_total_mb() * 1024ull * 1024ull;
+        uint64_t avail_b = (uint64_t)lunaria_mem_avail_mb() * 1024ull * 1024ull;
+        w(0, 100);                                  /* uptime */
+        w(4, 0); w(8, 0); w(12, 0);                 /* loads[3] */
+        w(16, (uint32_t)(total_b / unit));          /* totalram (in mem_unit) */
+        w(20, (uint32_t)(avail_b / unit));          /* freeram */
+        w(24, 0); w(28, 0);                         /* sharedram, bufferram */
+        w(32, 0); w(36, 0);                         /* totalswap, freeswap */
+        w16(40, 64); w16(42, 0);                    /* procs, pad */
+        w(44, 0); w(48, 0);                         /* totalhigh, freehigh */
+        w(52, unit);                                /* mem_unit */
+        w(56, 0); w(60, 0);                         /* _f padding */
         ret32(0);
         break;
     }
@@ -15545,6 +16656,42 @@ public:
                     jit->Cpsr());
         }
         ++exc_count;
+        /* An instruction dynarmic cannot decode is, to the guest, exactly a
+         * SIGILL.  When the guest has installed a SIGILL handler it is
+         * *probing*: OpenSSL's OPENSSL_cpuid_setup runs _armv8_pmull_probe /
+         * _armv8_aes_probe / _armv8_sha1_probe / _armv8_sha256_probe under
+         * sigsetjmp+ill_handler to decide which ARMv8 crypto extensions this
+         * CPU has.  Silently NOP-patching the probe made it *succeed*, so
+         * OpenSSL set ARMV8_PMULL|ARMV8_AES and later ran real vmull.p64 in
+         * gcm_ghash_v8 (also NOP'd → wrong GHASH); the sha1c probe then hit
+         * the UnpredictableInstruction path and halted the run outright,
+         * abandoning the remaining ~34 of libUE4.so's 930 INIT_ARRAY ctors.
+         * Deliver the signal instead: PC is already at the faulting
+         * instruction + 4, so LR is the correct resume point for a handler
+         * that returns, and one that siglongjmps never uses it. */
+        if ((ex == E::UndefinedInstruction || ex == E::UnpredictableInstruction ||
+             ex == E::DecodeError) && jit) {
+            constexpr int GUEST_SIGILL = 4; /* Linux/ARM signal number */
+            auto sh = g_sighandlers.find(GUEST_SIGILL);
+            if (sh != g_sighandlers.end() && sh->second > 1u) {
+                auto &regs = jit->Regs();
+                uint32_t handler = sh->second;
+                static int sigill_log = 0;
+                if (sigill_log++ < 8)
+                    fprintf(stderr, "[sigill] undefined instr 0x%08x at 0x%08x → "
+                            "guest handler 0x%08x (resume lr=0x%08x)\n",
+                            instr, pc, handler, regs[15]);
+                regs[14] = regs[15];          /* return = instruction after fault */
+                regs[0]  = (uint32_t)GUEST_SIGILL;
+                regs[1]  = 0;                 /* siginfo_t*  (SA_SIGINFO unused) */
+                regs[2]  = 0;                 /* ucontext_t* */
+                uint32_t cpsr = jit->Cpsr();
+                if (handler & 1u) cpsr |= (1u << 5); else cpsr &= ~(1u << 5);
+                jit->SetCpsr(cpsr);
+                regs[15] = handler & ~1u;
+                return;                       /* dispatch resumes in the handler */
+            }
+        }
         if (ex == E::UndefinedInstruction) {
             /* Runaway guard: thousands of patches mean the PC is marching
  * through data (e.g. after a wild jump).  Patching forever grows
@@ -15969,12 +17116,27 @@ static void schedule_threads(uint64_t slice) {
  * so a CPU-bound thread actually consumes its whole slice instead of
  * being cut off after ~1M ticks. */
         Dynarmic::HaltReason thr;
+        /* Stable id captured before Run: an SVC fired by this slice (e.g. a
+ * worker's pthread_create → g_threads.push_back, or pthread_join →
+ * g_threads.erase) can reallocate or shift g_threads *during* jit.Run(),
+ * leaving the `t` reference above dangling.  Writing the register file back
+ * through a dangling `t` corrupts the host heap.  Re-resolve by id below. */
+        const uint32_t cur_id = t.id;
         for (;;) {
             thr = jit.Run();
             if (thr != Dynarmic::HaltReason{}) break;
             if (pc_in_sentinel(jit.Regs()[15])) break;
             if (cb.ticks >= slice) break;
         }
+        /* Re-resolve the thread by stable id; skip write-back if it was retired
+ * and erased mid-slice.  The nested scope lets the fresh reference shadow
+ * the (possibly stale) outer `t` without disturbing the code below. */
+        ArmThread *tp = nullptr;
+        for (auto &th : g_threads)
+            if (th.id == cur_id) { tp = &th; break; }
+        if (!tp) continue;
+        {
+        ArmThread &t = *tp;
         t.regs  = jit.Regs();
         t.ext   = jit.ExtRegs();
         t.cpsr  = jit.Cpsr();
@@ -16028,8 +17190,9 @@ static void schedule_threads(uint64_t slice) {
         } else {
             t.stuck_count = 0; /* made progress, reset counter */
         }
+        } /* end re-resolved-thread scope */
     }
-    
+
     {
         static const uint32_t dump_every =
             (uint32_t)strtoul(getenv("LUNARIA_SCHED_DUMP") ? getenv("LUNARIA_SCHED_DUMP") : "0",
@@ -16037,11 +17200,35 @@ static void schedule_threads(uint64_t slice) {
         static uint32_t pass = 0;
         if (dump_every && (++pass % dump_every) == 0) {
             fprintf(stderr, "[sched] pass=%u threads:\n", pass);
-            for (const auto &t : g_threads)
-                if (!t.finished)
-                    fprintf(stderr, "[sched]   tid=%-3u pc=0x%08x lr=0x%08x r0=0x%08x "
-                            "ticks=%llu\n", t.id, t.regs[15] & ~1u, t.regs[14],
-                            t.regs[0], (unsigned long long)t.total_ticks);
+            for (const auto &t : g_threads) {
+                if (t.finished) continue;
+                /* wcond/wfutex/wsem say *why* a thread is de-scheduled; without
+                 * them a parked thread is indistinguishable from an idle one. */
+                fprintf(stderr, "[sched]   tid=%-3u pc=0x%08x lr=0x%08x r0=0x%08x "
+                        "sp=0x%08x wcond=0x%08x(tok=%d) wfutex=0x%08x wsem=0x%08x "
+                        "ticks=%llu\n", t.id, t.regs[15] & ~1u, t.regs[14],
+                        t.regs[0], t.regs[13], t.waiting_cond,
+                        (t.waiting_cond && g_conds.count(t.waiting_cond))
+                            ? (int)g_conds[t.waiting_cond] : -1,
+                        t.waiting_futex, t.waiting_sem,
+                        (unsigned long long)t.total_ticks);
+                /* Return-address scan of the parked stack: pc/lr alone only name
+                 * the blocking primitive, never which engine subsystem is stuck
+                 * on it.  Restricted to the loaded image range, capped so a deep
+                 * stack cannot flood the dump. */
+                if (!getenv("LUNARIA_SCHED_DUMP_STACK")) continue;
+                fprintf(stderr, "[sched]     stack:");
+                unsigned shown = 0;
+                for (uint32_t o = 0; o < 0x1000u && shown < 24; o += 4) {
+                    if (!ctx.mem.ptr(t.regs[13] + o)) break;
+                    uint32_t w = ctx.mem.read32(t.regs[13] + o);
+                    if (w >= 0x00080000u && w < g_lib_load_end) {
+                        fprintf(stderr, " 0x%08x", w);
+                        ++shown;
+                    }
+                }
+                fprintf(stderr, "\n");
+            }
         }
     }
     set_cur_tid(ctx, prev_tid);
@@ -16320,6 +17507,7 @@ static void build_fast_mutex_stubs(ArmExecCtx &ctx) {
 
 static void set_cur_tid(ArmExecCtx &ctx, uint32_t tid) {
     g_current_tid = tid;
+    egl_sync_current_context(tid);
     if (ctx.is_arm64) {
         uint64_t tls = arm64_tls_for_tid(ctx, tid);
         ctx.tpidr_el0_val = tls;
@@ -16369,6 +17557,25 @@ static void build_jni_tables(ArmExecCtx &ctx) {
     /* String scratch buffer */
     ctx.mem.map(STR_SCRATCH, 4096);
     ctx.mem.map(0x41014000u, 4096); /* SL_IID_* / tzname data page */
+    /* SL_IID_* slots live in [0x41014000, 0x41014100).  Each must read back as
+     * a unique non-zero value (see the SL_IID_ case in the data-symbol synth),
+     * so seed every word with its own address. */
+    for (uint32_t va = 0x41014000u; va < 0x41014100u; va += 4u)
+        ctx.mem.write32(va, va);
+
+    /* OpenSL ES vtables.  Everything not listed returns SL_RESULT_SUCCESS (0),
+     * which is also a harmless value for the `void` slots. */
+    ctx.mem.map(SL_PAGE_BASE, 0x1000u);
+    for (uint32_t o = 0; o < 0x200u; o += 4)
+        ctx.mem.write32(SL_PAGE_BASE + o, tramp(SVC_RET0));
+    ctx.mem.write32(SL_VT_OBJECT + 0*4,  tramp(SVC_SL_OBJ_REALIZE));
+    ctx.mem.write32(SL_VT_OBJECT + 2*4,  tramp(SVC_SL_OBJ_GETSTATE));
+    ctx.mem.write32(SL_VT_OBJECT + 3*4,  tramp(SVC_SL_OBJ_GETINTERFACE));
+    ctx.mem.write32(SL_VT_ENGINE + 2*4,  tramp(SVC_SL_ENG_CREATE_PLAYER));
+    ctx.mem.write32(SL_VT_ENGINE + 7*4,  tramp(SVC_SL_ENG_CREATE_OUTMIX));
+    ctx.mem.write32(SL_VT_BUFQ   + 2*4,  tramp(SVC_SL_BQ_GETSTATE));
+    ctx.mem.write32(SL_VT_BUFQ   + 3*4,  tramp(SVC_SL_BQ_REGISTER));
+    ctx.mem.write32(SL_VT_BUFQ   + 0*4,  tramp(SVC_SL_BQ_ENQUEUE));
 
     /* libc data globals (bionic exports these as variables) */
     ctx.mem.map(LIBC_DATA, 4096);
@@ -16727,6 +17934,38 @@ static void install_inline_detour(ArmExecCtx &ctx, uint32_t target_va, const cha
             name, tgt, stub, SVC_DETOUR_BASE + n, o0, o1);
 }
 
+/* Re-resolve imports that had no definition when their own ELF was relocated.
+ * Called after each library load: the exports published by the new .so may
+ * satisfy a sibling's pending slot (mirrors the real linker, which relocates
+ * only after the whole DT_NEEDED graph is mapped). */
+static void relink_pending_xlib_relocs(ArmExecCtx &ctx) {
+    if (g_pending_xlib_relocs.empty()) return;
+    size_t keep = 0;
+    unsigned fixed = 0;
+    for (size_t i = 0; i < g_pending_xlib_relocs.size(); ++i) {
+        auto &pr = g_pending_xlib_relocs[i];
+        uint32_t tv = 0;
+        if (auto it = g_exported_syms.find(pr.sym); it != g_exported_syms.end())
+            tv = it->second;
+        else
+            tv = lookup_symbol_direct_va(pr.sym.c_str());
+        if (!tv) {
+            if (keep != i) g_pending_xlib_relocs[keep] = std::move(pr);
+            ++keep;
+            continue;
+        }
+        ctx.mem.write32(pr.addr, tv);
+        if (fixed < 8)
+            fprintf(stderr, "[relink] %s → 0x%08x (slot 0x%08x)\n",
+                    pr.sym.c_str(), tv, pr.addr);
+        ++fixed;
+    }
+    g_pending_xlib_relocs.resize(keep);
+    if (fixed)
+        fprintf(stderr, "[relink] resolved %u late import(s), %zu still unbound\n",
+                fixed, keep);
+}
+
 static bool load_elf(ArmExecCtx &ctx, const char *path,
                      uint32_t &jni_onload_va, uint32_t base_addr,
                      bool ctors_via_cb) {
@@ -16935,12 +18174,21 @@ static bool load_elf(ArmExecCtx &ctx, const char *path,
                 } else {
                     uint32_t svc = sym_svc(sym);
                     if (svc == UINT32_MAX) {
-                        
+
                         static std::unordered_set<std::string> s_warned;
                         if (s_warned.insert(sym).second)
                             fprintf(stderr, "[unresolved] sym=%s not in SVC map"
                                     " (addr=0x%08x) → returns 0 when called\n", sym, ro);
                         tv = tramp(SVC_UNKNOWN_CALL);
+                        /* A real Android linker loads the whole DT_NEEDED graph
+                         * before relocating any of it; we load+relocate one .so
+                         * at a time, so an import satisfied by a *later* sibling
+                         * (libOVRPlugin.so's 56 vrapi_* imports vs libvrapi.so)
+                         * bound to this returns-0 stub forever.  Remember the
+                         * slot and re-resolve it once more libraries land. */
+                        if (rt == R_ARM_JUMP_SLOT || rt == R_ARM_GLOB_DAT ||
+                            rt == R_ARM_ABS32)
+                            g_pending_xlib_relocs.push_back({ro, sym, rt});
                     } else {
                         tv = tramp(svc);
                     }
@@ -16965,6 +18213,9 @@ static bool load_elf(ArmExecCtx &ctx, const char *path,
     if (getenv("LUNARIA_TRACE_MUTEX") && base_addr == 0xa0000u)
         fprintf(stderr, "[litprobe] after-reloc  mem[0x914524]=0x%08x\n",
                 ctx.mem.read32(0x914524u));
+    /* This ELF's exports are published now — retry every earlier import that
+     * had nothing to bind to, before running its constructors. */
+    relink_pending_xlib_relocs(ctx);
     /* Execute DT_INIT_ARRAY (C++ static constructors).
  * In real Android the dynamic linker calls these before any user code.
  * Without them, global singletons stay zero-initialized (BSS). */
@@ -17738,16 +18989,38 @@ extern "C" int arm_exec_call_native(uint32_t fn_va, JNIEnv *env, jobject obj,
     return 0;
 }
 
-extern "C" uint32_t arm_exec_lookup_native(const char *klass, const char *method) {
-    if (!g_ctx || !klass || !method) return 0;
-    for (auto &rn : g_ctx->natives)
-        if (rn.klass == klass && rn.name == method)
-            return rn.fn_va;
-    return 0;
+/* JNI name mangling (JNI spec 2.0 §"Resolving Native Method Names"):
+ * '.'/'/' → '_', '_' → "_1", ';' → "_2", '[' → "_3", other non-alnum → _0XXXX. */
+static std::string jni_mangle(const char *s) {
+    std::string out;
+    for (const unsigned char *p = (const unsigned char *)s; *p; ++p) {
+        char c = (char)*p;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9')) { out += c; continue; }
+        switch (c) {
+        case '.': case '/': out += '_';   break;
+        case '_':           out += "_1";  break;
+        case ';':           out += "_2";  break;
+        case '[':           out += "_3";  break;
+        default: {
+            char buf[8];
+            snprintf(buf, sizeof buf, "_0%04x", (unsigned)*p);
+            out += buf;
+            break;
+        }
+        }
+    }
+    return out;
 }
 
-extern "C" uint32_t arm_exec_lookup_native_sig(const char *klass, const char *method,
-                                                char *sig_out, int sig_max) {
+/* Resolve a native method the way a real JVM does: RegisterNatives table
+ * first, then JNI *implicit binding* against the loaded ELF exports.  UE4's
+ * GameActivity natives are plain `Java_com_epicgames_ue4_GameActivity_nativeXxx`
+ * exports and are never passed to RegisterNatives, so without the second step
+ * every lookup returned 0 and the loader silently skipped the whole
+ * GameActivity → engine startup handshake (nativeResumeMainInit et al). */
+static uint32_t lookup_native_impl(const char *klass, const char *method,
+                                   const char *sig, char *sig_out, int sig_max) {
     if (!g_ctx || !klass || !method) return 0;
     for (auto &rn : g_ctx->natives) {
         if (rn.klass == klass && rn.name == method) {
@@ -17756,7 +19029,40 @@ extern "C" uint32_t arm_exec_lookup_native_sig(const char *klass, const char *me
             return rn.fn_va;
         }
     }
-    return 0;
+    /* Implicit binding: short name first, then the long (overload) form. */
+    const std::string base = "Java_" + jni_mangle(klass) + "_" + jni_mangle(method);
+    auto try_sym = [](const std::string &n) -> uint32_t {
+        auto it = g_exported_syms.find(n);
+        if (it != g_exported_syms.end()) return it->second;
+        return lookup_symbol_direct_va(n.c_str());
+    };
+    uint32_t va = try_sym(base);
+    if (!va && sig && *sig == '(') {
+        std::string args(sig + 1, strchr(sig, ')') ? (size_t)(strchr(sig, ')') - sig - 1)
+                                                   : strlen(sig + 1));
+        va = try_sym(base + "__" + jni_mangle(args.c_str()));
+    }
+    if (va) {
+        static std::set<std::string> logged;
+        if (logged.insert(base).second)
+            fprintf(stderr, "[jni] implicit binding %s → 0x%08x\n", base.c_str(), va);
+        if (sig_out && sig_max > 0 && sig) snprintf(sig_out, (size_t)sig_max, "%s", sig);
+    }
+    return va;
+}
+
+extern "C" uint32_t arm_exec_lookup_native(const char *klass, const char *method) {
+    return lookup_native_impl(klass, method, nullptr, nullptr, 0);
+}
+
+extern "C" uint32_t arm_exec_lookup_native_sig(const char *klass, const char *method,
+                                                char *sig_out, int sig_max) {
+    return lookup_native_impl(klass, method, nullptr, sig_out, sig_max);
+}
+
+extern "C" uint32_t arm_exec_lookup_native_isig(const char *klass, const char *method,
+                                                 const char *sig) {
+    return lookup_native_impl(klass, method, sig, nullptr, 0);
 }
 
 extern "C" uint32_t arm_exec_lookup_export(const char *sym) {
@@ -17792,6 +19098,17 @@ extern "C" int arm_exec_call6(uint32_t fn_va, uint32_t r0, uint32_t r1,
     memcpy(g_ctx->mem.ptr(sp),     &stk0, 4);
     memcpy(g_ctx->mem.ptr(sp + 4), &stk1, 4);
     return arm_exec_call(fn_va, r0, r1, r2, r3);
+}
+
+extern "C" int arm_exec_calln(uint32_t fn_va, const uint32_t *args, int nargs) {
+    if (!g_ctx || !fn_va || (nargs > 0 && !args)) return 0;
+    /* AAPCS: r0-r3, then the rest on the stack at the SP run_arm starts with. */
+    const uint32_t sp = STACK_BASE + STACK_SIZE - 16;
+    for (int i = 4; i < nargs; ++i)
+        g_ctx->mem.write32(sp + (uint32_t)((i - 4) * 4), args[i]);
+    uint32_t r[4] = {0, 0, 0, 0};
+    for (int i = 0; i < nargs && i < 4; ++i) r[i] = args[i];
+    return arm_exec_call(fn_va, r[0], r[1], r[2], r[3]);
 }
 
 extern "C" int arm_exec_call_unlimited(uint32_t fn_va, uint32_t r0, uint32_t r1,

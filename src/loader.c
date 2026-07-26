@@ -242,21 +242,109 @@ run_ue4_game_arm(struct jvm *jvm)
    if (!act_va)
       errx(EXIT_FAILURE, "UE4: failed to allocate ANativeActivity");
 
-   /* Optional JNI hooks GameActivity calls before/during native startup */
+   /* JNI hooks GameActivity.java calls before/during native startup.  These
+    * are declared `native` in Java and exported from libUE4.so under the JNI
+    * implicit-binding name (Java_com_epicgames_ue4_GameActivity_nativeXxx) —
+    * they never go through RegisterNatives, so arm_exec_lookup_native must
+    * fall back to the mangled export (it does).  Signatures come straight
+    * from classes2.dex:
+    *   nativeSetGlobalActivity (ZZLjava/lang/String;Ljava/lang/String;ZLjava/lang/String;)V
+    *   nativeSetAndroidVersionInformation (Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V
+    *   nativeSetObbInfo (Ljava/lang/String;Ljava/lang/String;IILjava/lang/String;)V
+    *   nativeSetWindowInfo (ZI)V          <- (bIsPortrait, DepthBufferPreference)
+    *   nativeSetSurfaceViewInfo (II)V     <- (width, height)
+    *   nativeSetAndroidStartupState (Z)V
+    *   nativeResumeMainInit ()V
+    * AndroidMain() spins on `while (!GResumeMainInit) Sleep(0.01f)` right after
+    * "Controller interface supported"; without nativeResumeMainInit the engine
+    * never initialises and every frame presents an empty surface. */
    uint32_t va_set_global = arm_exec_lookup_native(
          "com.epicgames.ue4.GameActivity", "nativeSetGlobalActivity");
+   uint32_t va_set_ver = arm_exec_lookup_native(
+         "com.epicgames.ue4.GameActivity", "nativeSetAndroidVersionInformation");
+   uint32_t va_set_obb = arm_exec_lookup_native(
+         "com.epicgames.ue4.GameActivity", "nativeSetObbInfo");
+   uint32_t va_set_obb_paths = arm_exec_lookup_native(
+         "com.epicgames.ue4.GameActivity", "nativeSetObbFilePaths");
    uint32_t va_set_win = arm_exec_lookup_native(
          "com.epicgames.ue4.GameActivity", "nativeSetWindowInfo");
    uint32_t va_set_surf = arm_exec_lookup_native(
          "com.epicgames.ue4.GameActivity", "nativeSetSurfaceViewInfo");
+   uint32_t va_startup_state = arm_exec_lookup_native(
+         "com.epicgames.ue4.GameActivity", "nativeSetAndroidStartupState");
    uint32_t va_resume_init = arm_exec_lookup_native(
          "com.epicgames.ue4.GameActivity", "nativeResumeMainInit");
    uint32_t env = arm_exec_env_va();
    uint32_t ctx = (uint32_t)(uintptr_t)activity;
 
+   const char *apk = getenv("ANDROID_APK_FILE");
+   const char *pkg = getenv("ANDROID_PACKAGE_NAME");
+   const char *ext = getenv("ANDROID_EXTERNAL_FILES_DIR");
+   const char *obb_main = getenv("ANDROID_OBB_MAIN");
+   const char *obb_patch = getenv("ANDROID_OBB_PATCH");
+   if (!apk) apk = "";
+   if (!pkg) pkg = "com.lunaria.app";
+   if (!ext) ext = "/tmp";
+   if (!obb_main) obb_main = "";
+   if (!obb_patch) obb_patch = "";
+
    if (va_set_global) {
-      fprintf(stderr, "[loader] UE4 nativeSetGlobalActivity\n");
-      arm_exec_call(va_set_global, env, ctx, ctx, 0);
+      /* (env, thiz, bUseExternalFilesDir, bPublicLogFiles,
+       *  internalFilePath, externalFilePath, bOBBinAPK, APKFilename)
+       * bOBBinAPK must reflect reality: claiming the expansion file lives in
+       * the APK when it does not makes the engine search the zip, log
+       * "OBB not found in APK", and mount no content at all. */
+      jobject s_int = jvm->native.NewStringUTF(&jvm->env, ext);
+      jobject s_ext = jvm->native.NewStringUTF(&jvm->env, ext);
+      jobject s_apk = jvm->native.NewStringUTF(&jvm->env, apk);
+      uint32_t obb_in_apk = *obb_main ? 0u : 1u;
+      uint32_t a[8] = { env, ctx, 1u, 1u,
+                        (uint32_t)(uintptr_t)s_int, (uint32_t)(uintptr_t)s_ext,
+                        obb_in_apk, (uint32_t)(uintptr_t)s_apk };
+      fprintf(stderr, "[loader] UE4 nativeSetGlobalActivity apk=%s files=%s obbInAPK=%u\n",
+              apk, ext, obb_in_apk);
+      arm_exec_calln(va_set_global, a, 8);
+   }
+   if (va_set_obb_paths && *obb_main) {
+      /* (env, thiz, OBBMainFilePath, OBBPatchFilePath,
+       *  OBBOverflow1FilePath, OBBOverflow2FilePath) — absolute paths, which
+       * take priority over the /sdcard/Android/obb/<pkg> search. */
+      jobject s_main  = jvm->native.NewStringUTF(&jvm->env, obb_main);
+      jobject s_patch = jvm->native.NewStringUTF(&jvm->env, obb_patch);
+      jobject s_none  = jvm->native.NewStringUTF(&jvm->env, "");
+      uint32_t a[6] = { env, ctx, (uint32_t)(uintptr_t)s_main,
+                        (uint32_t)(uintptr_t)s_patch,
+                        (uint32_t)(uintptr_t)s_none,
+                        (uint32_t)(uintptr_t)s_none };
+      fprintf(stderr, "[loader] UE4 nativeSetObbFilePaths main=%s\n", obb_main);
+      arm_exec_calln(va_set_obb_paths, a, 6);
+   }
+   if (va_set_ver) {
+      /* (env, thiz, AndroidVersion, TargetSDKversion, PhoneMake, PhoneModel,
+       *  PhoneBuildNumber, OSLanguage) */
+      jobject s_rel   = jvm->native.NewStringUTF(&jvm->env, "12");
+      jobject s_make  = jvm->native.NewStringUTF(&jvm->env, "Lunaria");
+      jobject s_model = jvm->native.NewStringUTF(&jvm->env, "Lunaria Emulator");
+      jobject s_build = jvm->native.NewStringUTF(&jvm->env, "lunaria-1");
+      jobject s_lang  = jvm->native.NewStringUTF(&jvm->env, "en");
+      uint32_t a[8] = { env, ctx, (uint32_t)(uintptr_t)s_rel, 31u,
+                        (uint32_t)(uintptr_t)s_make, (uint32_t)(uintptr_t)s_model,
+                        (uint32_t)(uintptr_t)s_build, (uint32_t)(uintptr_t)s_lang };
+      fprintf(stderr, "[loader] UE4 nativeSetAndroidVersionInformation\n");
+      arm_exec_calln(va_set_ver, a, 8);
+   }
+   if (va_set_obb) {
+      /* (env, thiz, ProjectName, PackageName, Version, PatchVersion, AppType) */
+      const char *proj = strrchr(pkg, '.');
+      proj = proj ? proj + 1 : pkg;
+      jobject s_proj = jvm->native.NewStringUTF(&jvm->env, proj);
+      jobject s_pkg  = jvm->native.NewStringUTF(&jvm->env, pkg);
+      jobject s_type = jvm->native.NewStringUTF(&jvm->env, "");
+      uint32_t a[7] = { env, ctx, (uint32_t)(uintptr_t)s_proj,
+                        (uint32_t)(uintptr_t)s_pkg, 1u, 0u,
+                        (uint32_t)(uintptr_t)s_type };
+      fprintf(stderr, "[loader] UE4 nativeSetObbInfo project=%s package=%s\n", proj, pkg);
+      arm_exec_calln(va_set_obb, a, 7);
    }
 
    fprintf(stderr, "[loader] UE4 ANativeActivity_onCreate @0x%08x act=0x%08x\n",
@@ -322,16 +410,29 @@ run_ue4_game_arm(struct jvm *jvm)
 
    int w = arm_exec_fb_width(), h = arm_exec_fb_height();
    if (va_set_win) {
-      fprintf(stderr, "[loader] UE4 nativeSetWindowInfo %dx%d\n", w, h);
-      arm_exec_call6(va_set_win, env, ctx, (uint32_t)w, (uint32_t)h, 0, 0);
+      /* (env, thiz, jboolean bIsPortrait, jint DepthBufferPreference).
+       * NOT (width, height): passing the width here made every landscape
+       * window report "portrait" and fed the height in as a depth-buffer
+       * preference enum. */
+      uint32_t portrait = (h > w) ? 1u : 0u;
+      fprintf(stderr, "[loader] UE4 nativeSetWindowInfo portrait=%u depth=0\n", portrait);
+      arm_exec_call(va_set_win, env, ctx, portrait, 0);
    }
    if (va_set_surf) {
       fprintf(stderr, "[loader] UE4 nativeSetSurfaceViewInfo %dx%d\n", w, h);
-      arm_exec_call6(va_set_surf, env, ctx, (uint32_t)w, (uint32_t)h, 0, 0);
+      arm_exec_call(va_set_surf, env, ctx, (uint32_t)w, (uint32_t)h);
+   }
+   if (va_startup_state) {
+      /* (env, thiz, jboolean bDebuggerAttached) */
+      fprintf(stderr, "[loader] UE4 nativeSetAndroidStartupState\n");
+      arm_exec_call(va_startup_state, env, ctx, 0, 0);
    }
    if (va_resume_init) {
+      /* Releases AndroidMain()'s `while (!GResumeMainInit)` spin so
+       * FEngineLoop::PreInit + the game thread finally start. */
       fprintf(stderr, "[loader] UE4 nativeResumeMainInit\n");
       arm_exec_call(va_resume_init, env, ctx, 0, 0);
+      arm_exec_run_pending_threads();
    }
 
    signal(SIGUSR1, svc_dump_handler);

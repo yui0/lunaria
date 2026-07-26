@@ -222,6 +222,34 @@ mkdir -p "$ANDROID_EXTERNAL_FILES_DIR"
 export ANDROID_EXTERNAL_OBB_DIR="$PWD/local/data/$pkgname/obb"
 mkdir -p "$ANDROID_EXTERNAL_OBB_DIR"
 
+# Expansion files (.obb).  UE4 ships all game content (Content/Paks/*.pak) in
+# main.<ver>.<pkg>.obb, which Google Play installs next to the APK — it is NOT
+# inside the APK.  Without it the engine finds no project and PreInit fails
+# ("Project file not found" → LaunchAndroid.cpp assert).  Pick up an .obb
+# sitting beside the APK and expose it both under the conventional on-device
+# path and via ANDROID_OBB_MAIN/PATCH (handed to nativeSetObbFilePaths).
+apkdir="$(dirname "$pkgfile")"
+for _obb in "$apkdir"/main.*."$pkgname".obb "$apkdir"/main.*.obb; do
+    [ -f "$_obb" ] || continue
+    export ANDROID_OBB_MAIN="$_obb"
+    break
+done
+for _obb in "$apkdir"/patch.*."$pkgname".obb "$apkdir"/patch.*.obb; do
+    [ -f "$_obb" ] || continue
+    export ANDROID_OBB_PATCH="$_obb"
+    break
+done
+if [ -n "$ANDROID_OBB_MAIN" ]; then
+    # /sdcard/Android/obb/<pkg>/ layout, for the engine's default search path
+    _obbdir="$ANDROID_EXTERNAL_FILES_DIR/Android/obb/$pkgname"
+    mkdir -p "$_obbdir"
+    ln -sf "$ANDROID_OBB_MAIN" "$_obbdir/$(basename "$ANDROID_OBB_MAIN")"
+    ln -sf "$ANDROID_OBB_MAIN" "$ANDROID_EXTERNAL_OBB_DIR/$(basename "$ANDROID_OBB_MAIN")"
+    [ -n "$ANDROID_OBB_PATCH" ] && \
+        ln -sf "$ANDROID_OBB_PATCH" "$_obbdir/$(basename "$ANDROID_OBB_PATCH")"
+    msg "obb: $ANDROID_OBB_MAIN"
+fi
+
 # Mono assembly search path: without this, mono_assembly_load_corlib's
 # load_in_path() iterates over an empty search list and returns NULL with
 # status OK, tripping g_assert_not_reached() at domain.c:1254 → exit(1) every
