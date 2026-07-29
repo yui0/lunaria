@@ -14,8 +14,11 @@ err() { msg "$@"; exit 1; }
 [ -z "$1" ] && err 'usage: <apk>'
 pkgfile="$(realpath "$1")"
 
-# Prefer arm64-v8a (A64 JIT); fall back to armeabi-v7a (A32 JIT)
-if unzip -l "$1" 2>/dev/null | grep -q 'lib/arm64-v8a/'; then
+# Prefer arm64-v8a (A64 JIT); fall back to armeabi-v7a (A32 JIT).
+# Override with LUNARIA_ARCH=armeabi-v7a|arm64-v8a for comparisons.
+if [ -n "$LUNARIA_ARCH" ]; then
+    arch="$LUNARIA_ARCH"
+elif unzip -l "$1" 2>/dev/null | grep -q 'lib/arm64-v8a/'; then
     arch="arm64-v8a"
 else
     arch="armeabi-v7a"
@@ -107,62 +110,43 @@ unzip "$1" -d "$tmpdir"
 # Create symlinks so Mono finds everything via the extracted dir.
 managed_dir="$tmpdir/assets/bin/Data/Managed"
 
-# Unity Android splits assets >1MB into name.split0..N inside the APK.  The
-# player concatenates them at runtime; our fopen/ZIP path only opens split0 and
-# then seeks past EOF → "Position out of bounds" / multi-GB texture OOM.
-# Materialise the logical files in the extract tree and rebuild a STORE APK so
-# both the filesystem VFS and ArchiveFileSystem see a single asset.
-python3 - "$tmpdir" <<'PYEOF'
+# Keep the input APK byte-for-byte intact by default: repacking Play Asset
+# Delivery entries changes bundle bytes/order and makes Addressables reject
+# otherwise valid content.  Legacy Unity players, however, require the old
+# `name.split0..N` convention to be materialised as one regular asset.
+has_legacy_splits=0
+if find "$tmpdir/assets/bin/Data" -type f -name '*.split[0-9]*' -print -quit 2>/dev/null | grep -q .; then
+    python3 - "$tmpdir/assets/bin/Data" <<'PYEOF'
 import os, sys
 root = sys.argv[1]
 joined = 0
 for dirpath, _, files in os.walk(root):
-    splits = [f for f in files if ".split" in f]
-    # Group by base name: foo.assets.split0 → foo.assets
     bases = {}
-    for f in splits:
-        idx = f.rfind(".split")
-        if idx < 0:
-            continue
-        suf = f[idx + 6:]
-        if not suf.isdigit():
-            continue
-        bases.setdefault(f[:idx], []).append((int(suf), f))
+    for name in files:
+        base, marker, suffix = name.rpartition('.split')
+        if marker and suffix.isdigit():
+            bases.setdefault(base, []).append((int(suffix), name))
     for base, parts in bases.items():
-        parts.sort(key=lambda x: x[0])
-        out = os.path.join(dirpath, base)
-        # Skip if a complete base already exists and is larger than split0
-        if os.path.isfile(out) and os.path.getsize(out) > 0:
-            # Still remove splits so Unity does not prefer the split reader
-            for _, f in parts:
-                try: os.remove(os.path.join(dirpath, f))
-                except OSError: pass
+        parts.sort()
+        if [n for n, _ in parts] != list(range(len(parts))):
             continue
-        with open(out, "wb") as wf:
-            for _, f in parts:
-                p = os.path.join(dirpath, f)
-                with open(p, "rb") as rf:
-                    while True:
-                        chunk = rf.read(1 << 20)
-                        if not chunk:
-                            break
-                        wf.write(chunk)
-                os.remove(p)
+        with open(os.path.join(dirpath, base), 'wb') as out:
+            for _, name in parts:
+                with open(os.path.join(dirpath, name), 'rb') as part:
+                    while chunk := part.read(1 << 20):
+                        out.write(chunk)
+                os.unlink(os.path.join(dirpath, name))
         joined += 1
-        print(f"[lunaria-apk] joined {len(parts)} splits → {os.path.relpath(out, root)}",
-              file=sys.stderr)
-print(f"[lunaria-apk] joined {joined} split asset(s)", file=sys.stderr)
-open(os.path.join(root, ".lunaria-joined-count"), "w").write(str(joined))
+print(f"[lunaria-apk] joined {joined} legacy split asset(s)", file=sys.stderr)
 PYEOF
+    has_legacy_splits=1
+fi
 
-# Repack only when Unity split assets were joined.  UE4 / plain APKs keep the
-# original file (repacking a 200MB+ libUE4.so extract is slow and unnecessary).
-joined_n=0
-[ -f "$tmpdir/.lunaria-joined-count" ] && joined_n="$(cat "$tmpdir/.lunaria-joined-count")"
-rm -f "$tmpdir/.lunaria-joined-count"
-if [ "${joined_n:-0}" -gt 0 ] || [ -d "$tmpdir/assets/bin/Data" ]; then
-    repacked="$tmpdir/lunaria-joined.apk"
-    ( cd "$tmpdir" && zip -0 -q -r "$repacked" . -x "lunaria-joined.apk" ) || err "repack apk failed"
+# Detecting split files before joining is sufficient: this temporary archive
+# is solely for the legacy split-file convention.
+if [ "$has_legacy_splits" -eq 1 ]; then
+    repacked="$tmpdir/lunaria-legacy-splits.apk"
+    ( cd "$tmpdir" && zip -0 -q -r "$repacked" . -x 'lunaria-legacy-splits.apk' ) || err "repack apk failed"
     export ANDROID_APK_FILE="$repacked"
 else
     export ANDROID_APK_FILE="$pkgfile"

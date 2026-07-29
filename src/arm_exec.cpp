@@ -204,8 +204,15 @@ static void guest_layout_init(void) {
 /* Recover (N<<32)|offset → real Dynamic Heap mapping after corrupted 64-bit ptr stores.
  * Defined later with Arm64Callbacks; forward-declared for futex / early use. */
 static uint32_t a64_canon_va(uint64_t va);
+static GuestVA a64_mint_preferred(GuestVA preferred);
 static GuestVA a64_record_pref_alias(GuestVA preferred, BackingOffset backing,
                                      uint32_t raw_len);
+/* size_t / count args: A64 W-ops zero-extend, but stale high halves from a
+ * prior pointer in the same xN must not turn a 192-byte fread into a multi-GB
+ * smash.  Prefer the low 32 bits when the high half is non-zero. */
+static inline size_t a64_buf_len(uint64_t x) {
+    return (x >> 32) ? (size_t)(uint32_t)x : (size_t)x;
+}
 
 /* Guest library regions, recorded by load_elf. Used by mmap_bump (skip),
  * /proc/self/maps synth, and RX write guards. ELF p_flags: PF_X=1, PF_W=2, PF_R=4. */
@@ -1343,6 +1350,50 @@ static constexpr uint32_t SVC_GL3_VertexBindingDivisor   = SVC31_BASE + 171u;
 static constexpr uint32_t SVC_GL3_TexStorage2DMS         = SVC31_BASE + 172u;
 static constexpr uint32_t SVC_GL3_Uniform4uiv            = SVC31_BASE + 173u;
 static constexpr uint32_t SVC_GL3_GetProgramResourceIndex= SVC31_BASE + 174u;
+static constexpr uint32_t SVC_GL3_FramebufferTexture     = SVC31_BASE + 175u;
+static constexpr uint32_t SVC_GL3_FramebufferTexture3D   = SVC31_BASE + 176u;
+/* GLES2 leftovers + GLES3.1 ProgramUniform / MS that Unity dlsyms via EGL.
+ * Previously fell into SVC_UNKNOWN_SYM stubs (and collided with unknown-slot 0
+ * because SVC_TRAMP_TOTAL stopped at GetProgramResourceIndex). */
+static constexpr uint32_t SVC_GL3_CopyTexImage2D            = SVC31_BASE + 177u;
+static constexpr uint32_t SVC_GL3_GetRenderbufferParameteriv= SVC31_BASE + 178u;
+static constexpr uint32_t SVC_GL3_ValidateProgram           = SVC31_BASE + 179u;
+static constexpr uint32_t SVC_GL3_GetTexLevelParameterfv    = SVC31_BASE + 180u;
+static constexpr uint32_t SVC_GL3_GetTexLevelParameteriv    = SVC31_BASE + 181u;
+static constexpr uint32_t SVC_GL3_GetUniformiv              = SVC31_BASE + 182u;
+static constexpr uint32_t SVC_GL3_TexImage2DMultisample     = SVC31_BASE + 183u;
+static constexpr uint32_t SVC_GL3_TexParameteriv            = SVC31_BASE + 184u;
+static constexpr uint32_t SVC_GL3_Uniform1uiv               = SVC31_BASE + 185u;
+static constexpr uint32_t SVC_GL3_Uniform2uiv               = SVC31_BASE + 186u;
+static constexpr uint32_t SVC_GL3_Uniform3uiv               = SVC31_BASE + 187u;
+static constexpr uint32_t SVC_GL3_DeleteQueries             = SVC31_BASE + 188u;
+static constexpr uint32_t SVC_GL3_GetQueryiv                = SVC31_BASE + 189u;
+static constexpr uint32_t SVC_GL3_CompressedTexImage3D      = SVC31_BASE + 190u;
+static constexpr uint32_t SVC_GL3_GetActiveUniformBlockName = SVC31_BASE + 191u;
+static constexpr uint32_t SVC_GL3_VertexAttribIPointer      = SVC31_BASE + 192u;
+static constexpr uint32_t SVC_GL3_ProgramUniform1fv         = SVC31_BASE + 193u;
+static constexpr uint32_t SVC_GL3_ProgramUniform1iv         = SVC31_BASE + 194u;
+static constexpr uint32_t SVC_GL3_ProgramUniform2fv         = SVC31_BASE + 195u;
+static constexpr uint32_t SVC_GL3_ProgramUniform2iv         = SVC31_BASE + 196u;
+static constexpr uint32_t SVC_GL3_ProgramUniform3fv         = SVC31_BASE + 197u;
+static constexpr uint32_t SVC_GL3_ProgramUniform3iv         = SVC31_BASE + 198u;
+static constexpr uint32_t SVC_GL3_ProgramUniform4fv         = SVC31_BASE + 199u;
+static constexpr uint32_t SVC_GL3_ProgramUniform4iv         = SVC31_BASE + 200u;
+static constexpr uint32_t SVC_GL3_ProgramUniformMatrix2fv   = SVC31_BASE + 201u;
+static constexpr uint32_t SVC_GL3_ProgramUniformMatrix3fv   = SVC31_BASE + 202u;
+static constexpr uint32_t SVC_GL3_ProgramUniformMatrix4fv   = SVC31_BASE + 203u;
+static constexpr uint32_t SVC_GL3_ProgramUniformMatrix2x3fv = SVC31_BASE + 204u;
+static constexpr uint32_t SVC_GL3_ProgramUniformMatrix3x2fv = SVC31_BASE + 205u;
+static constexpr uint32_t SVC_GL3_ProgramUniformMatrix2x4fv = SVC31_BASE + 206u;
+static constexpr uint32_t SVC_GL3_ProgramUniformMatrix4x2fv = SVC31_BASE + 207u;
+static constexpr uint32_t SVC_GL3_ProgramUniformMatrix3x4fv = SVC31_BASE + 208u;
+static constexpr uint32_t SVC_GL3_ProgramUniformMatrix4x3fv = SVC31_BASE + 209u;
+static constexpr uint32_t SVC_GL3_ProgramUniform1uiv        = SVC31_BASE + 210u;
+static constexpr uint32_t SVC_GL3_ProgramUniform2uiv        = SVC31_BASE + 211u;
+static constexpr uint32_t SVC_GL3_ProgramUniform3uiv        = SVC31_BASE + 212u;
+static constexpr uint32_t SVC_GL3_ProgramUniform4uiv        = SVC31_BASE + 213u;
+static constexpr uint32_t SVC_GL3_PatchParameteri           = SVC31_BASE + 214u;
+static constexpr uint32_t SVC_GL3_TexStorage3DMultisample   = SVC31_BASE + 215u;
 
 /* ---- AAudio (FMOD output/recorder path; API 26+) ----
  * Minimal stubs: streams open successfully with plausible parameters but no
@@ -1457,7 +1508,7 @@ static constexpr uint32_t SVC_ISBLANK                    = SVC31_BASE + 85u;
 static constexpr uint32_t SVC_TOUPPER                    = SVC31_BASE + 86u;
 
 /* Cover ASENSOR + UE extras (must be ≥ highest SVC31_* used as trampoline). */
-static constexpr uint32_t SVC_TRAMP_TOTAL        = SVC_GL3_GetProgramResourceIndex + 1u;
+static constexpr uint32_t SVC_TRAMP_TOTAL        = SVC_GL3_TexStorage3DMultisample + 1u;
 
 /* ---- OpenSL ES fake object page --------------------------------------------
  * `SLObjectItf` and every `SL*Itf` are `const struct X_ * const *`, i.e. a
@@ -1935,6 +1986,11 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"glDispatchCompute",        SVC_GL3_DispatchCompute},
     {"glDispatchComputeIndirect",SVC_GL_MISC3_NOP},
     {"glFramebufferTextureLayer",SVC_GL3_FramebufferTextureLayer},
+    {"glFramebufferTexture",     SVC_GL3_FramebufferTexture},
+    {"glFramebufferTextureEXT",  SVC_GL3_FramebufferTexture},
+    {"glFramebufferTextureOES",  SVC_GL3_FramebufferTexture},
+    {"glFramebufferTexture3D",   SVC_GL3_FramebufferTexture3D},
+    {"glFramebufferTexture3DOES",SVC_GL3_FramebufferTexture3D},
     {"glClearBufferfi",          SVC_GL3_ClearBufferfi},
     {"glClearBufferfv",          SVC_GL3_ClearBufferfv},
     {"glClearBufferuiv",         SVC_GL3_ClearBufferuiv},
@@ -1950,6 +2006,45 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"glUniformBlockBinding",    SVC_GL3_UniformBlockBinding},
     {"glUniform4uiv",            SVC_GL3_Uniform4uiv},
     {"glTexStorage2DMultisample",SVC_GL3_TexStorage2DMS},
+    {"glCopyTexImage2D",         SVC_GL3_CopyTexImage2D},
+    {"glGetRenderbufferParameteriv", SVC_GL3_GetRenderbufferParameteriv},
+    {"glValidateProgram",        SVC_GL3_ValidateProgram},
+    {"glGetTexLevelParameterfv", SVC_GL3_GetTexLevelParameterfv},
+    {"glGetTexLevelParameteriv", SVC_GL3_GetTexLevelParameteriv},
+    {"glGetUniformiv",           SVC_GL3_GetUniformiv},
+    {"glTexImage2DMultisample",  SVC_GL3_TexImage2DMultisample},
+    {"glTexParameteriv",         SVC_GL3_TexParameteriv},
+    {"glUniform1uiv",            SVC_GL3_Uniform1uiv},
+    {"glUniform2uiv",            SVC_GL3_Uniform2uiv},
+    {"glUniform3uiv",            SVC_GL3_Uniform3uiv},
+    {"glDeleteQueries",          SVC_GL3_DeleteQueries},
+    {"glGetQueryiv",             SVC_GL3_GetQueryiv},
+    {"glCompressedTexImage3D",   SVC_GL3_CompressedTexImage3D},
+    {"glGetActiveUniformBlockName", SVC_GL3_GetActiveUniformBlockName},
+    {"glVertexAttribIPointer",   SVC_GL3_VertexAttribIPointer},
+    {"glProgramUniform1fv",      SVC_GL3_ProgramUniform1fv},
+    {"glProgramUniform1iv",      SVC_GL3_ProgramUniform1iv},
+    {"glProgramUniform2fv",      SVC_GL3_ProgramUniform2fv},
+    {"glProgramUniform2iv",      SVC_GL3_ProgramUniform2iv},
+    {"glProgramUniform3fv",      SVC_GL3_ProgramUniform3fv},
+    {"glProgramUniform3iv",      SVC_GL3_ProgramUniform3iv},
+    {"glProgramUniform4fv",      SVC_GL3_ProgramUniform4fv},
+    {"glProgramUniform4iv",      SVC_GL3_ProgramUniform4iv},
+    {"glProgramUniformMatrix2fv",   SVC_GL3_ProgramUniformMatrix2fv},
+    {"glProgramUniformMatrix3fv",   SVC_GL3_ProgramUniformMatrix3fv},
+    {"glProgramUniformMatrix4fv",   SVC_GL3_ProgramUniformMatrix4fv},
+    {"glProgramUniformMatrix2x3fv", SVC_GL3_ProgramUniformMatrix2x3fv},
+    {"glProgramUniformMatrix3x2fv", SVC_GL3_ProgramUniformMatrix3x2fv},
+    {"glProgramUniformMatrix2x4fv", SVC_GL3_ProgramUniformMatrix2x4fv},
+    {"glProgramUniformMatrix4x2fv", SVC_GL3_ProgramUniformMatrix4x2fv},
+    {"glProgramUniformMatrix3x4fv", SVC_GL3_ProgramUniformMatrix3x4fv},
+    {"glProgramUniformMatrix4x3fv", SVC_GL3_ProgramUniformMatrix4x3fv},
+    {"glProgramUniform1uiv",     SVC_GL3_ProgramUniform1uiv},
+    {"glProgramUniform2uiv",     SVC_GL3_ProgramUniform2uiv},
+    {"glProgramUniform3uiv",     SVC_GL3_ProgramUniform3uiv},
+    {"glProgramUniform4uiv",     SVC_GL3_ProgramUniform4uiv},
+    {"glPatchParameteri",        SVC_GL3_PatchParameteri},
+    {"glTexStorage3DMultisample",SVC_GL3_TexStorage3DMultisample},
 
     {"clock_gettime",           SVC_CLOCK_GETTIME},
     {"gettimeofday",            SVC_GETTIMEOFDAY},
@@ -2865,6 +2960,10 @@ static uint32_t lookup_symbol_direct_va(const char *name) {
 /* Set by ret64() inside dispatch_svc so A64 CallSVC can form a real x0. */
 static bool g_svc_ret64 = false;
 static bool g_svc_retptr = false;
+/* Some C APIs return an input pointer verbatim.  On A64 that architectural
+ * value can be a preferred mmap alias and must not be reconstructed from its
+ * 32-bit backing offset. */
+static bool g_svc_ret_arg0 = false;
 /* Architectural A64 arguments retained across the LP32 dispatch adapter. */
 static std::array<GuestVA, 8> g_svc_args64{};
 
@@ -2913,6 +3012,8 @@ public:
     /* Resolve A64 GuestVA → host pointer, handling overflow segments that
      * were allocated outside the 4 GiB flat arena when it was exhausted. */
     uint8_t *ptr(GuestVA va) {
+        /* Image window (code + retptr-mapped data) — distinct from preferred
+         * heap aliases, which a64_record_pref_alias keeps off hi=0x7000. */
         if (a64_is_guest_va(va))
             return host + (BackingOffset)(va - A64_GUEST_BASE);
         uint32_t hi = (uint32_t)(va >> 32);
@@ -2944,10 +3045,47 @@ public:
                                                    : host + s.backing + off;
                         }
                     }
-                    return host + 0; /* reserved but not yet committed */
+                    /* Soft-fault: commit a page-aligned run on first touch.
+                     * Keep runs modest — full-alias commits exhausted the
+                     * 4 GiB arena (MAP_FAILED 256 MiB).  Bulk memcpy/fread
+                     * must chunk via a64_guest_bulk_* so host contiguity is
+                     * not assumed across segment boundaries. */
+                    if (lo < alias.size) {
+                        uint32_t page = lo & ~4095u;
+                        uint32_t need = 0x10000u; /* 64 KiB */
+                        if ((uint64_t)page + need > alias.size)
+                            need = alias.size - page;
+                        need = (need + 4095u) & ~4095u;
+                        if (!need) need = 4096u;
+                        uint32_t actual = 0;
+                        uint32_t backing = mmap_bump_exact(need, &actual,
+                                                           /*allow_split=*/false);
+                        uint8_t *overflow_host = nullptr;
+                        if (backing == ~0u || actual != need) {
+                            void *ext = ::mmap(nullptr, need,
+                                               PROT_READ | PROT_WRITE,
+                                               MAP_PRIVATE | MAP_ANONYMOUS |
+                                                   MAP_NORESERVE,
+                                               -1, 0);
+                            if (ext == MAP_FAILED)
+                                return host + 0;
+                            overflow_host = static_cast<uint8_t *>(ext);
+                            backing = 0;
+                        }
+                        alias.committed.push_back({page, backing, need, overflow_host});
+                        alias.last_seg_idx = (int)alias.committed.size() - 1;
+                        uint32_t off = lo - page;
+                        return overflow_host ? overflow_host + off
+                                             : host + backing + off;
+                    }
+                    return host + 0; /* outside reserve */
                 }
-                /* Non-lazy alias: check for overflow_base */
                 if (alias.overflow_base) return alias.overflow_base + lo;
+                if (lo < alias.size)
+                    return host + alias.base + lo;
+                if (lo >= alias.base &&
+                    (uint64_t)lo < (uint64_t)alias.base + alias.size)
+                    return host + lo;
             }
         }
         return host + a64_canon_va(va);
@@ -2974,6 +3112,84 @@ public:
         return reinterpret_cast<const char *>(ptr(va));
     }
 };
+
+/* Lazy preferred aliases may be split across non-contiguous host segments.
+ * Never memmove/memset/read more than to the next page boundary from one ptr(). */
+static void a64_guest_memset(ArmMemory &mem, GuestVA dst, int c, size_t n) {
+    while (n) {
+        size_t chunk = 4096u - (size_t)(dst & 4095u);
+        if (chunk > n) chunk = n;
+        memset(mem.ptr(dst), c, chunk);
+        dst += chunk;
+        n -= chunk;
+    }
+}
+static void a64_guest_memmove(ArmMemory &mem, GuestVA dst, GuestVA src, size_t n) {
+    if (!n || dst == src) return;
+    if (dst < src || dst >= src + n) {
+        while (n) {
+            size_t cd = 4096u - (size_t)(dst & 4095u);
+            size_t cs = 4096u - (size_t)(src & 4095u);
+            size_t chunk = cd < cs ? cd : cs;
+            if (chunk > n) chunk = n;
+            memmove(mem.ptr(dst), mem.ptr(src), chunk);
+            dst += chunk;
+            src += chunk;
+            n -= chunk;
+        }
+    } else {
+        dst += n;
+        src += n;
+        while (n) {
+            size_t cd = (size_t)((dst - 1) & 4095u) + 1u;
+            size_t cs = (size_t)((src - 1) & 4095u) + 1u;
+            size_t chunk = cd < cs ? cd : cs;
+            if (chunk > n) chunk = n;
+            dst -= chunk;
+            src -= chunk;
+            memmove(mem.ptr(dst), mem.ptr(src), chunk);
+            n -= chunk;
+        }
+    }
+}
+static size_t a64_guest_fread(ArmMemory &mem, GuestVA dst, size_t total, FILE *f) {
+    size_t got = 0;
+    while (got < total) {
+        size_t chunk = 4096u - (size_t)((dst + got) & 4095u);
+        if (chunk > total - got) chunk = total - got;
+        size_t n = fread(mem.ptr(dst + got), 1, chunk, f);
+        got += n;
+        if (n < chunk) break;
+    }
+    return got;
+}
+static ssize_t a64_guest_read(ArmMemory &mem, GuestVA dst, size_t total, int fd) {
+    size_t got = 0;
+    while (got < total) {
+        size_t chunk = 4096u - (size_t)((dst + got) & 4095u);
+        if (chunk > total - got) chunk = total - got;
+        ssize_t n = read(fd, mem.ptr(dst + got), chunk);
+        if (n < 0) return got ? (ssize_t)got : n;
+        if (n == 0) break;
+        got += (size_t)n;
+        if ((size_t)n < chunk) break;
+    }
+    return (ssize_t)got;
+}
+static ssize_t a64_guest_pread(ArmMemory &mem, GuestVA dst, size_t total,
+                               int fd, off_t off) {
+    size_t got = 0;
+    while (got < total) {
+        size_t chunk = 4096u - (size_t)((dst + got) & 4095u);
+        if (chunk > total - got) chunk = total - got;
+        ssize_t n = pread(fd, mem.ptr(dst + got), chunk, off + (off_t)got);
+        if (n < 0) return got ? (ssize_t)got : n;
+        if (n == 0) break;
+        got += (size_t)n;
+        if ((size_t)n < chunk) break;
+    }
+    return (ssize_t)got;
+}
 
 /* -------------------------------------------------------------------------
  * Execution context
@@ -3621,10 +3837,14 @@ static std::map<uint32_t, int32_t> g_sems;
  * credits so the GC polling loop can exit.  A32 handlers are real code and
  * call sem_post themselves, so this counter stays 0 in A32 mode. */
 static int g_gc_pending_acks = 0;
+/* Debug: buffer that received the Localization SerializedFile (0610960…). */
+static GuestVA g_dbg_asset_buf = 0;
+static size_t  g_dbg_asset_len = 0;
 
 /* Signal handler table: VA registered via sigaction().
- * Used by pthread_kill emulation to simulate Mono GC stop-the-world. */
-static std::map<int, uint32_t> g_sighandlers;
+ * Used by pthread_kill emulation to simulate Mono GC stop-the-world.
+ * A64 stores the architectural GuestVA (often 0x7000… image window). */
+static std::map<int, GuestVA> g_sighandlers;
 
 /* pthread_mutex guest VA → lock depth; ARM32 mutex is 4 bytes; blocking via SVC_WAIT */
 /* Mutex state stored in the mutex word ([va] = count<<8 | (tid+1)) */
@@ -4241,6 +4461,13 @@ static uint64_t g_host_egl_swap_count = 0;
  * no buffer is bound is it a guest VA needing host translation. */
 static uint32_t g_gl_bound_array_buf = 0;     /* GL_ARRAY_BUFFER (0x8892) */
 static uint32_t g_gl_bound_elem_buf  = 0;     /* GL_ELEMENT_ARRAY_BUFFER (0x8893) */
+/* EGL surface presentation on the host can discard the current texture-unit
+ * selector and bindings.  Unity 4 caches both and deliberately omits binds on
+ * subsequent GUI frames, so retain the guest-visible state and replay it
+ * after every swap.  The map includes zero bindings: unbinding is state too. */
+static GLenum g_gl_active_texture = 0x84C0; /* GL_TEXTURE0 */
+static std::map<GLenum, std::map<GLenum, GLuint>> g_gl_texture_bindings;
+
 
 /* Unity 4: nativeRender queues GfxDevice work as Java Runnables on a
  * ConcurrentLinkedQueue; Activity.executeGLThreadJobs() drains it on the GL
@@ -4760,6 +4987,16 @@ static void gldraw_dump_state() {
             prog, fbo, tex, vbo, ibo, depth, cull, blend, scis,
             vp[0], vp[1], vp[2], vp[3],
             g_gl_bound_array_buf, g_gl_bound_elem_buf);
+}
+
+static void gl_restore_texture_units() {
+    if (!pfn_glActiveTexture || !pfn_glBindTexture) return;
+    for (const auto &[unit, targets] : g_gl_texture_bindings) {
+        pfn_glActiveTexture(unit);
+        for (const auto &[target, texture] : targets)
+            pfn_glBindTexture(target, texture);
+    }
+    pfn_glActiveTexture(g_gl_active_texture);
 }
 
 /* ---- Touch input: GLFW mouse → Android MotionEvent bridge -----------------
@@ -5407,6 +5644,15 @@ static bool apk_path_inner(const char *path, const char **inner_out) {
             return true;
         }
     }
+    /* jar:file:///…/foo.apk!/assets/…  (Unity Addressables RuntimePath) */
+    if (const char *bang = strstr(path, ".apk!/")) {
+        *inner_out = bang + 6;
+        return true;
+    }
+    if (const char *bang = strstr(path, ".APK!/")) {
+        *inner_out = bang + 6;
+        return true;
+    }
     if (const char *sfx = strstr(path, ".apk/")) {
         *inner_out = sfx + 5;
         return true;
@@ -5777,7 +6023,7 @@ static int guest_open_path(const char *path, int flags, mode_t mode) {
  *   { void *__stack; void *__gr_top; void *__vr_top; int __gr_offs; int __vr_offs; }
  * Integer/pointer args come from the saved-GPR area while __gr_offs < 0,
  * then from *__stack.  Peek the i-th GPR-sized arg without mutating guest memory. */
-static uint64_t a64_va_arg_u64(ArmExecCtx &ctx, uint32_t va_list_va, int i) {
+static uint64_t a64_va_arg_u64(ArmExecCtx &ctx, GuestVA va_list_va, int i) {
     if (!va_list_va || !ctx.mem.ptr(va_list_va) || !ctx.mem.ptr(va_list_va + 28))
         return 0;
     uint64_t stack = 0, gr_top = 0;
@@ -5788,13 +6034,13 @@ static uint64_t a64_va_arg_u64(ArmExecCtx &ctx, uint32_t va_list_va, int i) {
     uint64_t val = 0;
     for (int n = 0; n <= i; ++n) {
         if (gr_offs < 0) {
-            uint32_t addr = (uint32_t)(gr_top + (int64_t)gr_offs);
+            GuestVA addr = (GuestVA)(gr_top + (int64_t)gr_offs);
             if (!ctx.mem.ptr(addr)) return 0;
             std::memcpy(&val, ctx.mem.ptr(addr), 8);
             gr_offs += 8;
         } else {
-            if (!stack || !ctx.mem.ptr((uint32_t)stack)) return 0;
-            std::memcpy(&val, ctx.mem.ptr((uint32_t)stack), 8);
+            if (!stack || !ctx.mem.ptr((GuestVA)stack)) return 0;
+            std::memcpy(&val, ctx.mem.ptr((GuestVA)stack), 8);
             stack += 8;
         }
     }
@@ -5823,7 +6069,7 @@ static uint32_t jni_arg_word(ArmExecCtx &ctx, std::array<uint32_t,16> &regs, int
         return ctx.mem.read32(regs[3] + (uint32_t)(i * 8));
     /* variant == 1 (MethodV) */
     if (ctx.is_arm64)
-        return (uint32_t)a64_va_arg_u64(ctx, regs[3], i);
+        return (uint32_t)a64_va_arg_u64(ctx, g_svc_args64[3], i);
     /* Android ARM32 passes va_list by value in r3; r3 itself IS the ap pointer. */
     return ctx.mem.read32(regs[3] + (uint32_t)(i * 4));
 }
@@ -6150,7 +6396,7 @@ struct ArmVarArgs {
     ArmExecCtx &ctx;
     const std::array<uint32_t, 16> &regs;
     uint32_t reg_idx;
-    uint32_t mem_ptr;
+    GuestVA  mem_ptr;
     bool     valist;
     bool     is_a64;
     uint32_t valist_idx = 0;
@@ -6161,16 +6407,20 @@ struct ArmVarArgs {
         if (valist && is_a64)
             return (uint32_t)a64_va_arg_u64(ctx, mem_ptr, (int)valist_idx++);
         if (!valist && reg_idx < reg_limit()) {
-            uint32_t v = regs[reg_idx++];
-            return v;
+            if (is_a64)
+                return (uint32_t)g_svc_args64[reg_idx++];
+            return regs[reg_idx++];
         }
         if (is_a64) {
-            mem_ptr = (mem_ptr + 7u) & ~7u;
-            uint32_t v = ctx.mem.read32(mem_ptr);
+            mem_ptr = (mem_ptr + 7u) & ~7ull;
+            uint32_t v = 0;
+            std::memcpy(&v, ctx.mem.ptr(mem_ptr), 4);
             mem_ptr += 8;
             return v;
         }
-        uint32_t v = ctx.mem.read32(mem_ptr); mem_ptr += 4; return v;
+        uint32_t v = ctx.mem.read32((uint32_t)mem_ptr);
+        mem_ptr += 4;
+        return v;
     }
     uint64_t next64() {
         if (valist && is_a64)
@@ -6179,21 +6429,18 @@ struct ArmVarArgs {
             if (!is_a64)
                 reg_idx = (reg_idx + 1u) & ~1u;
             if (reg_idx < reg_limit()) {
-                if (is_a64) {
-                    /* Each X register is one 64-bit slot; we only have lo32 in
-                     * regs[] — high half was truncated at CallSVC.  Enough for
-                     * guest VAs that pack() already canon'd into lo32. */
-                    return (uint64_t)regs[reg_idx++];
-                }
+                if (is_a64)
+                    return g_svc_args64[reg_idx++];
                 uint64_t lo = regs[reg_idx], hi = regs[reg_idx + 1];
                 reg_idx += 2;
                 return lo | (hi << 32);
             }
         }
-        mem_ptr = (mem_ptr + 7u) & ~7u;
-        uint64_t lo = ctx.mem.read32(mem_ptr), hi = ctx.mem.read32(mem_ptr + 4);
+        mem_ptr = (mem_ptr + 7u) & ~7ull;
+        uint64_t v = 0;
+        std::memcpy(&v, ctx.mem.ptr(mem_ptr), 8);
         mem_ptr += 8;
-        return lo | (hi << 32);
+        return v;
     }
     /* Guest pointer: A64 stack/register slots are 8 bytes. */
     uint32_t next_ptr() {
@@ -6204,6 +6451,24 @@ struct ArmVarArgs {
         return next32();
     }
 };
+
+static ArmVarArgs make_arm_varargs(ArmExecCtx &ctx, const std::array<uint32_t, 16> &regs,
+                                   uint32_t reg_idx, uint32_t mem_or_va_reg,
+                                   bool valist) {
+    GuestVA mp = (GuestVA)mem_or_va_reg;
+    if (ctx.is_arm64) {
+        if (valist) {
+            unsigned ri = mem_or_va_reg <= 7u ? mem_or_va_reg : 3u;
+            mp = g_svc_args64[ri];
+        } else if (ctx.jit64) {
+            mp = ctx.jit64->GetSP();
+        } else {
+            mp = a64_guest_va(regs[13]);
+        }
+    }
+    ArmVarArgs ap{ctx, regs, reg_idx, mp, valist, ctx.is_arm64};
+    return ap;
+}
 
 static std::string arm_vformat(ArmExecCtx &ctx, const char *fmt, ArmVarArgs &ap) {
     std::string out;
@@ -6409,7 +6674,10 @@ static uint32_t arm_vsscanf(ArmExecCtx &ctx, const char *in, const char *fmt,
 /* bionic struct stat differs between LP32 and LP64.  In particular A64 has
  * 64-bit ino_t and 16-byte timespec fields; writing the LP32 form made callers
  * read timestamps as pointers and corrupted adjacent archive state. */
-static void write_guest_stat(ArmExecCtx &ctx, uint32_t va, const struct stat &st) {
+static void write_guest_stat(ArmExecCtx &ctx, GuestVA va, const struct stat &st) {
+    auto w32 = [&](uint32_t off, uint32_t v) {
+        std::memcpy(ctx.mem.ptr(va + off), &v, 4);
+    };
     auto w64 = [&](uint32_t off, uint64_t v) {
         std::memcpy(ctx.mem.ptr(va + off), &v, sizeof v);
     };
@@ -6417,13 +6685,13 @@ static void write_guest_stat(ArmExecCtx &ctx, uint32_t va, const struct stat &st
         memset(ctx.mem.ptr(va), 0, 128);
         w64(0,  (uint64_t)st.st_dev);
         w64(8,  (uint64_t)st.st_ino);
-        ctx.mem.write32(va + 16, (uint32_t)st.st_mode);
-        ctx.mem.write32(va + 20, (uint32_t)st.st_nlink);
-        ctx.mem.write32(va + 24, (uint32_t)st.st_uid);
-        ctx.mem.write32(va + 28, (uint32_t)st.st_gid);
+        w32(16, (uint32_t)st.st_mode);
+        w32(20, (uint32_t)st.st_nlink);
+        w32(24, (uint32_t)st.st_uid);
+        w32(28, (uint32_t)st.st_gid);
         w64(32, (uint64_t)st.st_rdev);
         w64(48, (uint64_t)st.st_size);
-        ctx.mem.write32(va + 56, (uint32_t)st.st_blksize);
+        w32(56, (uint32_t)st.st_blksize);
         w64(64, (uint64_t)st.st_blocks);
         w64(72, (uint64_t)st.st_atime);
         w64(88, (uint64_t)st.st_mtime);
@@ -6432,18 +6700,18 @@ static void write_guest_stat(ArmExecCtx &ctx, uint32_t va, const struct stat &st
     }
     memset(ctx.mem.ptr(va), 0, 104);
     w64(0,  (uint64_t)st.st_dev);
-    ctx.mem.write32(va + 12, (uint32_t)st.st_ino);
-    ctx.mem.write32(va + 16, (uint32_t)st.st_mode);
-    ctx.mem.write32(va + 20, (uint32_t)st.st_nlink);
-    ctx.mem.write32(va + 24, (uint32_t)st.st_uid);
-    ctx.mem.write32(va + 28, (uint32_t)st.st_gid);
+    w32(12, (uint32_t)st.st_ino);
+    w32(16, (uint32_t)st.st_mode);
+    w32(20, (uint32_t)st.st_nlink);
+    w32(24, (uint32_t)st.st_uid);
+    w32(28, (uint32_t)st.st_gid);
     w64(32, (uint64_t)st.st_rdev);
     w64(48, (uint64_t)st.st_size);
-    ctx.mem.write32(va + 56, (uint32_t)st.st_blksize);
+    w32(56, (uint32_t)st.st_blksize);
     w64(64, (uint64_t)st.st_blocks);
-    ctx.mem.write32(va + 72, (uint32_t)st.st_atime);
-    ctx.mem.write32(va + 80, (uint32_t)st.st_mtime);
-    ctx.mem.write32(va + 88, (uint32_t)st.st_ctime);
+    w32(72, (uint32_t)st.st_atime);
+    w32(80, (uint32_t)st.st_mtime);
+    w32(88, (uint32_t)st.st_ctime);
     w64(96, (uint64_t)st.st_ino);
 }
 
@@ -6580,6 +6848,11 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     auto retptr = [&](BackingOffset v) {
         g_svc_retptr = true;
         regs[0] = v;
+    };
+    auto retarg0 = [&] {
+        g_svc_retptr = true;
+        g_svc_ret_arg0 = true;
+        regs[0] = r0;
     };
     auto ret64 = [&](uint64_t v)  {
         g_svc_ret64 = true;
@@ -8848,11 +9121,30 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     /* ---- Android/POSIX stubs ---- */
 
     case SVC_LOG_PRINT: {
-        const char *tag = ARM_STR(r1);
-        ArmVarArgs ap{ctx, regs, 3, regs[13], false, ctx.is_arm64};
-        std::string s = arm_vformat(ctx, ARM_STR(r2), ap);
+        const char *tag = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[1]) : ARM_STR(r1);
+        ArmVarArgs ap = make_arm_varargs(ctx, regs, 3, 13, false);
+        const char *fmt = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[2]) : ARM_STR(r2);
+        std::string s = arm_vformat(ctx, fmt, ap);
         fprintf(stderr, "[android_log p=%u t=%s lr=0x%08x] %s\n",
                 r0, tag?tag:"?", regs[14], s.c_str());
+        if (ctx.is_arm64 && g_dbg_asset_buf && s.find("Build target") != std::string::npos) {
+            const uint8_t *p = ctx.mem.ptr(g_dbg_asset_buf);
+            uint32_t plat = 0;
+            if (g_dbg_asset_len >= 63)
+                std::memcpy(&plat, p + 59, 4);
+            fprintf(stderr, "[dbg-asset] at error: dest=0x%llx platLE=%u @48=",
+                    (unsigned long long)g_dbg_asset_buf, plat);
+            for (size_t i = 48; i < 64 && i < g_dbg_asset_len; i++)
+                fprintf(stderr, "%02x", p[i]);
+            fprintf(stderr, "\n");
+            /* Also dump x0..x3 in case the printed int is a different arg. */
+            if (ctx.jit64)
+                fprintf(stderr, "[dbg-asset] x0=%llx x1=%llx x2=%llx x3=%llx\n",
+                        (unsigned long long)ctx.jit64->GetRegister(0),
+                        (unsigned long long)ctx.jit64->GetRegister(1),
+                        (unsigned long long)ctx.jit64->GetRegister(2),
+                        (unsigned long long)ctx.jit64->GetRegister(3));
+        }
         wapi_trace_caller(ctx, regs, s.c_str());
         ret32(0);
         break;
@@ -9164,7 +9456,17 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             }
         }
         if (r2) {
-            if ((uint64_t)r1 + r2 > 0x100000000ull) {
+            /* A64 Dynamic Heap pointers are preferred high VAs (N<<32)|off.
+             * Truncating to r0/r1 writes into host+off instead of the aliased
+             * slab — Addressables then CRC-checks the real buffer and fails. */
+            if (ctx.is_arm64) {
+                GuestVA dst = g_svc_args64[0];
+                GuestVA src = g_svc_args64[1];
+                /* Sizes fit in 32 bits; x2's upper bits may be stale. */
+                size_t n = (size_t)r2;
+                if (n && dst && src)
+                    a64_guest_memmove(ctx.mem, dst, src, n);
+            } else if ((uint64_t)r1 + r2 > 0x100000000ull) {
                 static uint64_t bad = 0;
                 if (bad < 20)
                     fprintf(stderr, "[memmove] OOB src rejected dst=0x%08x src=0x%08x "
@@ -9173,67 +9475,91 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 ++bad;
                 ret32(r0);
                 break;
-            }
-            uint32_t want = r2;
-            r2 = guest_clamp_write_n(r0, r2);
-            if (r2 != want) {
-                static int cl = 0;
-                if (cl++ < 12)
-                    fprintf(stderr, "[memmove] clamped n=0x%08x→0x%08x dst=0x%08x "
-                            "lr=0x%08x tid=%u\n",
-                            want, r2, r0, regs[14], g_current_tid);
-            }
-            if (r2) {
-                wrange_log(r0, r1, r2, regs[15], regs[14],
-                           svc_no == SVC_MEMCPY ? "memcpy" : "memmove");
-                memmove(ctx.mem.ptr(r0), ctx.mem.ptr(r1), r2);
+            } else {
+                uint32_t want = r2;
+                r2 = guest_clamp_write_n(r0, r2);
+                if (r2 != want) {
+                    static int cl = 0;
+                    if (cl++ < 12)
+                        fprintf(stderr, "[memmove] clamped n=0x%08x→0x%08x dst=0x%08x "
+                                "lr=0x%08x tid=%u\n",
+                                want, r2, r0, regs[14], g_current_tid);
+                }
+                if (r2) {
+                    wrange_log(r0, r1, r2, regs[15], regs[14],
+                               svc_no == SVC_MEMCPY ? "memcpy" : "memmove");
+                    memmove(ctx.mem.ptr(r0), ctx.mem.ptr(r1), r2);
+                }
             }
         }
-        retptr(r0);
+        retarg0();
         break;
     }
     case SVC_MEMSET: {
         if (r2) {
-            uint32_t want = r2;
-            r2 = guest_clamp_write_n(r0, r2);
-            if (r2 != want) {
-                static int cl = 0;
-                if (cl++ < 12)
-                    fprintf(stderr, "[memset] clamped n=0x%08x→0x%08x dst=0x%08x "
-                            "c=0x%02x lr=0x%08x tid=%u\n",
-                            want, r2, r0, r1 & 0xFF, regs[14], g_current_tid);
-            }
-            if (r2) {
-                wrange_log(r0, r1 & 0xFF, r2, regs[15], regs[14], "memset");
-                memset(ctx.mem.ptr(r0), (int)(r1 & 0xFF), r2);
+            if (ctx.is_arm64) {
+                GuestVA dst = g_svc_args64[0];
+                size_t n = (size_t)r2;
+                if (n && dst)
+                    a64_guest_memset(ctx.mem, dst, (int)(r1 & 0xFF), n);
+            } else {
+                uint32_t want = r2;
+                r2 = guest_clamp_write_n(r0, r2);
+                if (r2 != want) {
+                    static int cl = 0;
+                    if (cl++ < 12)
+                        fprintf(stderr, "[memset] clamped n=0x%08x→0x%08x dst=0x%08x "
+                                "c=0x%02x lr=0x%08x tid=%u\n",
+                                want, r2, r0, r1 & 0xFF, regs[14], g_current_tid);
+                }
+                if (r2) {
+                    wrange_log(r0, r1 & 0xFF, r2, regs[15], regs[14], "memset");
+                    memset(ctx.mem.ptr(r0), (int)(r1 & 0xFF), r2);
+                }
             }
         }
-        retptr(r0);
+        retarg0();
         break;
     }
     case SVC_STRLEN: {
-        const char *s = ctx.mem.cstr(r0);
+        const char *s = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[0])
+                                     : ctx.mem.cstr(r0);
         ret32(s ? (uint32_t)strnlen(s, 65536) : 0);
         break;
     }
     case SVC_STRCPY: {
-        if (r0 && r1) {
+        if (ctx.is_arm64) {
+            GuestVA dst = g_svc_args64[0], src = g_svc_args64[1];
+            if (dst && src) {
+                const char *s = (const char *)ctx.mem.ptr(src);
+                size_t n = strnlen(s, 65536);
+                memcpy(ctx.mem.ptr(dst), s, n);
+                ctx.mem.ptr(dst)[n] = 0;
+            }
+        } else if (r0 && r1) {
             const char *src = (const char*)ctx.mem.ptr(r1);
             size_t n = strnlen(src, 65536);
             memcpy(ctx.mem.ptr(r0), src, n);
             ctx.mem.ptr(r0)[n] = 0;
         }
-        retptr(r0);
+        retarg0();
         break;
     }
     case SVC_STRNCPY: {
-        if (r0 && r1) strncpy((char*)ctx.mem.ptr(r0), (const char*)ctx.mem.ptr(r1), r2);
-        retptr(r0);
+        if (ctx.is_arm64) {
+            GuestVA dst = g_svc_args64[0], src = g_svc_args64[1];
+            if (dst && src)
+                strncpy((char *)ctx.mem.ptr(dst), (const char *)ctx.mem.ptr(src),
+                        (size_t)g_svc_args64[2]);
+        } else if (r0 && r1) {
+            strncpy((char*)ctx.mem.ptr(r0), (const char*)ctx.mem.ptr(r1), r2);
+        }
+        retarg0();
         break;
     }
     case SVC_STRCMP: {
-        const char *s1 = ctx.mem.cstr(r0);
-        const char *s2 = ctx.mem.cstr(r1);
+        const char *s1 = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[0]) : ctx.mem.cstr(r0);
+        const char *s2 = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[1]) : ctx.mem.cstr(r1);
         if (!s1 && !s2) { ret32(0); break; }
         if (!s1) { ret32((uint32_t)-1); break; }
         if (!s2) { ret32(1); break; }
@@ -9241,16 +9567,17 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_STRNCMP: {
-        const char *s1 = ctx.mem.cstr(r0);
-        const char *s2 = ctx.mem.cstr(r1);
+        const char *s1 = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[0]) : ctx.mem.cstr(r0);
+        const char *s2 = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[1]) : ctx.mem.cstr(r1);
+        size_t n = ctx.is_arm64 ? (size_t)g_svc_args64[2] : (size_t)r2;
         if (!s1 && !s2) { ret32(0); break; }
         if (!s1) { ret32((uint32_t)-1); break; }
         if (!s2) { ret32(1); break; }
-        ret32((uint32_t)strncmp(s1, s2, (size_t)r2));
+        ret32((uint32_t)strncmp(s1, s2, n));
         break;
     }
     case SVC_STRDUP: {
-        const char *s = ctx.mem.cstr(r0);
+        const char *s = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[0]) : ctx.mem.cstr(r0);
         if (!s) { ret32(0); break; }
         size_t len = strlen(s) + 1;
         uint32_t addr = arm_malloc(ctx, (uint32_t)len);
@@ -9259,9 +9586,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_STRNDUP: {
-        const char *s = ctx.mem.cstr(r0);
+        const char *s = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[0]) : ctx.mem.cstr(r0);
+        size_t lim = ctx.is_arm64 ? (size_t)g_svc_args64[1] : (size_t)r1;
         if (!s) { ret32(0); break; }
-        size_t len = strnlen(s, r1);
+        size_t len = strnlen(s, lim);
         uint32_t addr = arm_malloc(ctx, (uint32_t)(len + 1));
         if (addr) {
             memcpy(ctx.mem.ptr(addr), s, len);
@@ -9271,13 +9599,26 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_STRCAT: {
-        if (r0 && r1) strcat((char*)ctx.mem.ptr(r0), (const char*)ctx.mem.ptr(r1));
-        retptr(r0);
+        if (ctx.is_arm64) {
+            GuestVA dst = g_svc_args64[0], src = g_svc_args64[1];
+            if (dst && src)
+                strcat((char *)ctx.mem.ptr(dst), (const char *)ctx.mem.ptr(src));
+        } else if (r0 && r1) {
+            strcat((char*)ctx.mem.ptr(r0), (const char*)ctx.mem.ptr(r1));
+        }
+        retarg0();
         break;
     }
     case SVC_STRNCAT: {
-        if (r0 && r1) strncat((char*)ctx.mem.ptr(r0), (const char*)ctx.mem.ptr(r1), r2);
-        retptr(r0);
+        if (ctx.is_arm64) {
+            GuestVA dst = g_svc_args64[0], src = g_svc_args64[1];
+            if (dst && src)
+                strncat((char *)ctx.mem.ptr(dst), (const char *)ctx.mem.ptr(src),
+                        (size_t)g_svc_args64[2]);
+        } else if (r0 && r1) {
+            strncat((char*)ctx.mem.ptr(r0), (const char*)ctx.mem.ptr(r1), r2);
+        }
+        retarg0();
         break;
     }
     case SVC_ABORT:
@@ -10100,6 +10441,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (g_glfw) glfwPollEvents();
         maybe_dump_screenshot(g_guest_egl_swap_count - 1, true);
         EGLBoolean ok = eglSwapBuffers(g_egl_dpy, g_egl_surf);
+        gl_restore_texture_units();
         {
             
             static uint64_t last_draw = 0, last_clear = 0, sn = 0;
@@ -10343,8 +10685,15 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (pfn_glClear) pfn_glClear((GLbitfield)r0); break;
     case SVC_GL_ClearColor:
         if (pfn_glClearColor) pfn_glClearColor(rf(r0),rf(r1),rf(r2),rf(r3)); break;
-    case SVC_GL_ClearDepthf:
-        if (pfn_glClearDepthf) pfn_glClearDepthf(rf(r0)); break;
+    case SVC_GL_ClearDepthf: {
+        float d = rf(r0);
+        static int n = 0;
+        if (n++ < 8)
+            fprintf(stderr, "[gl] ClearDepthf %g (bits=0x%08x) arm64=%d\n",
+                    d, r0, (int)ctx.is_arm64);
+        if (pfn_glClearDepthf) pfn_glClearDepthf(d);
+        break;
+    }
     case SVC_GL_ClearStencil:
         if (pfn_glClearStencil) pfn_glClearStencil((GLint)r0); break;
     case SVC_GL_Enable:
@@ -10398,11 +10747,16 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_GL_PixelStorei:
         if (pfn_glPixelStorei) pfn_glPixelStorei((GLenum)r0,(GLint)r1); break;
     case SVC_GL_ReadPixels:
-        /* r0=x r1=y r2=w r3=h sp[0]=fmt sp[1]=type sp[2]=pixels_va */
+        /* (x,y,w,h, format,type,pixels) — A64: x4..x6; A32: [sp] */
         if (pfn_glReadPixels) {
-            uint32_t fmt  = ctx.mem.read32(regs[13]);
-            uint32_t type = ctx.mem.read32(regs[13]+4);
-            uint32_t pva  = ctx.mem.read32(regs[13]+8);
+            uint32_t fmt, type, pva;
+            if (ctx.is_arm64) {
+                fmt = regs[4]; type = regs[5]; pva = regs[6];
+            } else {
+                fmt  = ctx.mem.read32(regs[13]);
+                type = ctx.mem.read32(regs[13]+4);
+                pva  = ctx.mem.read32(regs[13]+8);
+            }
             pfn_glReadPixels((GLint)r0,(GLint)r1,(GLsizei)r2,(GLsizei)r3,(GLenum)fmt,(GLenum)type,ARM_PTR(pva));
         }
         break;
@@ -10438,8 +10792,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_GL_GenTextures:
         if (pfn_glGenTextures && r1) pfn_glGenTextures((GLsizei)r0,(GLuint*)ctx.mem.ptr(r1)); break;
     case SVC_GL_BindTexture:
+        g_gl_texture_bindings[g_gl_active_texture][(GLenum)r0] = (GLuint)r1;
         if (pfn_glBindTexture) pfn_glBindTexture((GLenum)r0,(GLuint)r1); break;
     case SVC_GL_ActiveTexture:
+        g_gl_active_texture = (GLenum)r0;
         if (pfn_glActiveTexture) pfn_glActiveTexture((GLenum)r0); break;
     case SVC_GL_DeleteTextures:
         if (pfn_glDeleteTextures && r1) pfn_glDeleteTextures((GLsizei)r0,(const GLuint*)ctx.mem.ptr(r1)); break;
@@ -10457,58 +10813,91 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_GL_GetTexParameteriv:
         if (pfn_glGetTexParameteriv && r2) pfn_glGetTexParameteriv((GLenum)r0,(GLenum)r1,(GLint*)ctx.mem.ptr(r2)); break;
     case SVC_GL_TexImage2D: {
-        /* r0=target r1=level r2=internalfmt r3=width sp[0]=height sp[1]=border
- * sp[2]=format sp[3]=type sp[4]=pixels_va */
+        /* (target,level,internalfmt,width, height,border,format,type,pixels).
+         * A64: x4..x7 + pixels @ [sp] (8-byte); A32: all extras on [sp]. */
         if (pfn_glTexImage2D) {
-            GLsizei h   = (GLsizei)ctx.mem.read32(regs[13]);
-            GLint   brd = (GLint)  ctx.mem.read32(regs[13]+4);
-            GLenum  fmt = (GLenum) ctx.mem.read32(regs[13]+8);
-            GLenum  typ = (GLenum) ctx.mem.read32(regs[13]+12);
-            uint32_t pva= ctx.mem.read32(regs[13]+16);
+            GLsizei h; GLint brd; GLenum fmt, typ; uint32_t pva;
+            if (ctx.is_arm64) {
+                h = (GLsizei)regs[4]; brd = (GLint)regs[5];
+                fmt = (GLenum)regs[6]; typ = (GLenum)regs[7];
+                pva = a64_canon_va(ctx.mem.read64((GuestVA)regs[13]));
+            } else {
+                h   = (GLsizei)ctx.mem.read32(regs[13]);
+                brd = (GLint)  ctx.mem.read32(regs[13]+4);
+                fmt = (GLenum) ctx.mem.read32(regs[13]+8);
+                typ = (GLenum) ctx.mem.read32(regs[13]+12);
+                pva = ctx.mem.read32(regs[13]+16);
+            }
             pfn_glTexImage2D((GLenum)r0,(GLint)r1,(GLint)r2,(GLsizei)r3,h,brd,fmt,typ,ARM_CPTR(pva));
         }
         break;
     }
     case SVC_GL_TexSubImage2D: {
-        /* r0=target r1=level r2=xoff r3=yoff sp[0]=w sp[1]=h sp[2]=fmt sp[3]=type sp[4]=pva */
+        /* (target,level,xoff,yoff, w,h,fmt,type,pixels) */
         if (pfn_glTexSubImage2D) {
-            GLsizei w   = (GLsizei)ctx.mem.read32(regs[13]);
-            GLsizei h   = (GLsizei)ctx.mem.read32(regs[13]+4);
-            GLenum  fmt = (GLenum) ctx.mem.read32(regs[13]+8);
-            GLenum  typ = (GLenum) ctx.mem.read32(regs[13]+12);
-            uint32_t pva= ctx.mem.read32(regs[13]+16);
+            GLsizei w, h; GLenum fmt, typ; uint32_t pva;
+            if (ctx.is_arm64) {
+                w = (GLsizei)regs[4]; h = (GLsizei)regs[5];
+                fmt = (GLenum)regs[6]; typ = (GLenum)regs[7];
+                pva = a64_canon_va(ctx.mem.read64((GuestVA)regs[13]));
+            } else {
+                w   = (GLsizei)ctx.mem.read32(regs[13]);
+                h   = (GLsizei)ctx.mem.read32(regs[13]+4);
+                fmt = (GLenum) ctx.mem.read32(regs[13]+8);
+                typ = (GLenum) ctx.mem.read32(regs[13]+12);
+                pva = ctx.mem.read32(regs[13]+16);
+            }
             pfn_glTexSubImage2D((GLenum)r0,(GLint)r1,(GLint)r2,(GLint)r3,w,h,fmt,typ,ARM_CPTR(pva));
         }
         break;
     }
     case SVC_GL_CopyTexSubImage2D: {
-        /* r0=target r1=level r2=xoff r3=yoff sp[0]=x sp[1]=y sp[2]=w sp[3]=h */
+        /* (target,level,xoff,yoff, x,y,w,h) — 8 args, A64 fits in x0..x7 */
         if (pfn_glCopyTexSubImage2D) {
-            GLint x=(GLint)ctx.mem.read32(regs[13]), y=(GLint)ctx.mem.read32(regs[13]+4);
-            GLsizei w=(GLsizei)ctx.mem.read32(regs[13]+8), h=(GLsizei)ctx.mem.read32(regs[13]+12);
+            GLint x, y; GLsizei w, h;
+            if (ctx.is_arm64) {
+                x = (GLint)regs[4]; y = (GLint)regs[5];
+                w = (GLsizei)regs[6]; h = (GLsizei)regs[7];
+            } else {
+                x=(GLint)ctx.mem.read32(regs[13]); y=(GLint)ctx.mem.read32(regs[13]+4);
+                w=(GLsizei)ctx.mem.read32(regs[13]+8); h=(GLsizei)ctx.mem.read32(regs[13]+12);
+            }
             pfn_glCopyTexSubImage2D((GLenum)r0,(GLint)r1,(GLint)r2,(GLint)r3,x,y,w,h);
         }
         break;
     }
     case SVC_GL_CompressedTexImage2D: {
-        /* r0=target r1=level r2=internalfmt r3=width sp[0]=h sp[1]=border sp[2]=size sp[3]=pva */
+        /* (target,level,internalfmt,width, h,border,imageSize,data) — 8 args */
         if (pfn_glCompressedTexImage2D) {
-            GLsizei h  = (GLsizei)ctx.mem.read32(regs[13]);
-            GLint   brd= (GLint)  ctx.mem.read32(regs[13]+4);
-            GLsizei sz = (GLsizei)ctx.mem.read32(regs[13]+8);
-            uint32_t pva = ctx.mem.read32(regs[13]+12);
+            GLsizei h, sz; GLint brd; uint32_t pva;
+            if (ctx.is_arm64) {
+                h = (GLsizei)regs[4]; brd = (GLint)regs[5];
+                sz = (GLsizei)regs[6]; pva = regs[7];
+            } else {
+                h  = (GLsizei)ctx.mem.read32(regs[13]);
+                brd= (GLint)  ctx.mem.read32(regs[13]+4);
+                sz = (GLsizei)ctx.mem.read32(regs[13]+8);
+                pva = ctx.mem.read32(regs[13]+12);
+            }
             pfn_glCompressedTexImage2D((GLenum)r0,(GLint)r1,(GLenum)r2,(GLsizei)r3,h,brd,sz,ARM_CPTR(pva));
         }
         break;
     }
     case SVC_GL_CompressedTexSubImage2D: {
-        /* r0=target r1=level r2=xoff r3=yoff sp[0]=w sp[1]=h sp[2]=fmt sp[3]=size sp[4]=pva */
+        /* (target,level,xoff,yoff, w,h,fmt,imageSize,data) — 9 args */
         if (pfn_glCompressedTexSubImage2D) {
-            GLsizei w  = (GLsizei)ctx.mem.read32(regs[13]);
-            GLsizei h  = (GLsizei)ctx.mem.read32(regs[13]+4);
-            GLenum  fmt= (GLenum) ctx.mem.read32(regs[13]+8);
-            GLsizei sz = (GLsizei)ctx.mem.read32(regs[13]+12);
-            uint32_t pva = ctx.mem.read32(regs[13]+16);
+            GLsizei w, h, sz; GLenum fmt; uint32_t pva;
+            if (ctx.is_arm64) {
+                w = (GLsizei)regs[4]; h = (GLsizei)regs[5];
+                fmt = (GLenum)regs[6]; sz = (GLsizei)regs[7];
+                pva = a64_canon_va(ctx.mem.read64((GuestVA)regs[13]));
+            } else {
+                w  = (GLsizei)ctx.mem.read32(regs[13]);
+                h  = (GLsizei)ctx.mem.read32(regs[13]+4);
+                fmt= (GLenum) ctx.mem.read32(regs[13]+8);
+                sz = (GLsizei)ctx.mem.read32(regs[13]+12);
+                pva = ctx.mem.read32(regs[13]+16);
+            }
             pfn_glCompressedTexSubImage2D((GLenum)r0,(GLint)r1,(GLint)r2,(GLint)r3,w,h,fmt,sz,ARM_CPTR(pva));
         }
         break;
@@ -10523,10 +10912,36 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (pfn_glBindFramebuffer) pfn_glBindFramebuffer((GLenum)r0,(GLuint)r1); break;
     case SVC_GL_DeleteFramebuffers:
         if (pfn_glDeleteFramebuffers && r1) pfn_glDeleteFramebuffers((GLsizei)r0,(const GLuint*)ctx.mem.ptr(r1)); break;
-    case SVC_GL_CheckFramebufferStatus:
-        ret32(pfn_glCheckFramebufferStatus ? (uint32_t)pfn_glCheckFramebufferStatus((GLenum)r0) : 0x8CD5u); break;
+    case SVC_GL_CheckFramebufferStatus: {
+        GLenum st = pfn_glCheckFramebufferStatus
+            ? pfn_glCheckFramebufferStatus((GLenum)r0) : 0x8CD5u;
+        static int n = 0;
+        if (st != 0x8CD5u && n++ < 16) { /* not GL_FRAMEBUFFER_COMPLETE */
+            GLint fbo = 0, tex = 0, rb = 0;
+            if (pfn_glGetIntegerv) {
+                pfn_glGetIntegerv(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, &fbo);
+                pfn_glGetIntegerv(0x0DE1 /* GL_TEXTURE_BINDING_2D */, &tex);
+                pfn_glGetIntegerv(0x8CA7 /* GL_RENDERBUFFER_BINDING */, &rb);
+            }
+            fprintf(stderr, "[gl] CheckFramebufferStatus(0x%x)=0x%x "
+                    "fbo=%d tex2d=%d rb=%d tid=%u\n",
+                    r0, st, fbo, tex, rb, g_current_tid);
+        }
+        ret32((uint32_t)st);
+        break;
+    }
     case SVC_GL_FramebufferTexture2D:
-        if (pfn_glFramebufferTexture2D) pfn_glFramebufferTexture2D((GLenum)r0,(GLenum)r1,(GLenum)r2,(GLuint)r3,(GLint)ctx.mem.read32(regs[13])); break;
+        if (pfn_glFramebufferTexture2D) {
+            GLint level = (GLint)(ctx.is_arm64 ? regs[4]
+                                               : ctx.mem.read32(regs[13]));
+            static int n = 0;
+            if (n++ < 12)
+                fprintf(stderr, "[gl] FramebufferTexture2D tgt=0x%x att=0x%x "
+                        "textgt=0x%x tex=%u lvl=%d\n",
+                        r0, r1, r2, r3, (int)level);
+            pfn_glFramebufferTexture2D((GLenum)r0,(GLenum)r1,(GLenum)r2,(GLuint)r3,level);
+        }
+        break;
     case SVC_GL_FramebufferRenderbuffer:
         if (pfn_glFramebufferRenderbuffer) pfn_glFramebufferRenderbuffer((GLenum)r0,(GLenum)r1,(GLenum)r2,(GLuint)r3); break;
     case SVC_GL_GetFramebufferAttachmentParameteriv:
@@ -10555,26 +10970,44 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_GL_ShaderSource: {
-        /* r0=shader r1=count r2=strings_va r3=lengths_va */
+        /* r0=shader r1=count r2=strings_va r3=lengths_va.
+         * A32: strings[] is uint32_t[count]; A64: uint64_t[count].
+         * lengths[] is always GLint[count] (4-byte) on both ABIs. */
         if (pfn_glShaderSource && r2) {
-            /* Build host string array from ARM VAs */
             GLsizei cnt = (GLsizei)r1;
-            std::vector<const char*> strs(cnt);
-            std::vector<GLint> lens(cnt, -1);
+            if (cnt < 0) cnt = 0;
+            if (cnt > 4096) cnt = 4096;
+            std::vector<const char*> strs((size_t)cnt);
+            std::vector<GLint> lens((size_t)cnt, -1);
+            const uint32_t pstride = ctx.is_arm64 ? 8u : 4u;
             for (GLsizei i = 0; i < cnt; ++i) {
-                uint32_t sva = ctx.mem.read32(r2 + (uint32_t)(i*4));
-                strs[i] = ctx.mem.cstr(sva);
-                if (r3) {
-                    GLint l; uint32_t lv = ctx.mem.read32(r3 + (uint32_t)(i*4));
-                    l = (GLint)lv; lens[i] = l;
+                uint32_t sva;
+                if (ctx.is_arm64) {
+                    GuestVA raw = ctx.mem.read64((GuestVA)r2 + (GuestVA)i * pstride);
+                    sva = a64_canon_va(raw);
+                } else {
+                    sva = ctx.mem.read32(r2 + (uint32_t)i * pstride);
                 }
+                strs[(size_t)i] = sva ? ctx.mem.cstr(sva) : nullptr;
+                if (r3)
+                    lens[(size_t)i] = (GLint)ctx.mem.read32(r3 + (uint32_t)i * 4u);
             }
-            
+
             std::string src;
             for (GLsizei i = 0; i < cnt; ++i) {
-                if (!strs[i]) continue;
-                if (r3 && lens[i] >= 0) src.append(strs[i], (size_t)lens[i]);
-                else src.append(strs[i]);
+                if (!strs[(size_t)i]) continue;
+                if (r3 && lens[(size_t)i] >= 0)
+                    src.append(strs[(size_t)i], (size_t)lens[(size_t)i]);
+                else
+                    src.append(strs[(size_t)i]);
+            }
+            if (getenv("LUNARIA_TRACE_GLSHADER")) {
+                static int n = 0;
+                if (n++ < 8)
+                    fprintf(stderr, "[glsh] ShaderSource id=%u cnt=%d len=%zu "
+                            "head=\"%.60s\"%s\n",
+                            r0, (int)cnt, src.size(), src.c_str(),
+                            src.size() > 60 ? "…" : "");
             }
             if (src.find("#extension") != std::string::npos) {
                 std::string ver, ext, body;
@@ -10837,10 +11270,16 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_GL_DisableVertexAttribArray:
         if (pfn_glDisableVertexAttribArray) pfn_glDisableVertexAttribArray((GLuint)r0); break;
     case SVC_GL_VertexAttribPointer:
-        /* r0=idx r1=size r2=type r3=norm sp[0]=stride sp[1]=ptr_va */
+        /* (idx,size,type,norm, stride,ptr) — A64: x4/x5; A32: [sp] */
         if (pfn_glVertexAttribPointer) {
-            GLsizei stride = (GLsizei)ctx.mem.read32(regs[13]);
-            uint32_t pva   = ctx.mem.read32(regs[13]+4);
+            GLsizei stride; uint32_t pva;
+            if (ctx.is_arm64) {
+                stride = (GLsizei)regs[4];
+                pva    = regs[5];
+            } else {
+                stride = (GLsizei)ctx.mem.read32(regs[13]);
+                pva    = ctx.mem.read32(regs[13]+4);
+            }
             /* VBO bound → pva is a byte offset, pass untranslated */
             const void *p = g_gl_bound_array_buf
                 ? (const void*)(uintptr_t)pva : ARM_CPTR(pva);
@@ -10865,6 +11304,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                             (unsigned long long)g_gl_draw_count, pre);
             }
         }
+        gl_restore_texture_units();
         if (pfn_glDrawArrays) pfn_glDrawArrays((GLenum)r0,(GLint)r1,(GLsizei)r2);
         if (gldraw_traced() && pfn_glGetError) {
             GLenum e = pfn_glGetError();
@@ -10885,13 +11325,157 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                             (unsigned long long)g_gl_draw_count, pre);
             }
         }
-        if (pfn_glDrawElements) pfn_glDrawElements((GLenum)r0,(GLsizei)r1,(GLenum)r2,
-            g_gl_bound_elem_buf ? (const void*)(uintptr_t)r3 : ARM_CPTR(r3));
-        if (gldraw_traced() && pfn_glGetError) {
-            GLenum e = pfn_glGetError();
-            fprintf(stderr, "[gl] DrawElements#%llu mode=0x%x count=%d type=0x%x err=0x%x\n",
-                    (unsigned long long)g_gl_draw_count, r0, (int)r1, r2, e);
-            gldraw_dump_state();
+        /* A64 diagnosis: composite pass (count=3 → default FB) sometimes loses
+         * to DEPTH_TEST when ClearDepthf hard-float is wrong.  Probe both ways. */
+        {
+            GLint fbo_before = -1, depth_on = 0, dfunc = 0;
+            if (g_gl_draw_count <= 6 && pfn_glGetIntegerv) {
+                pfn_glGetIntegerv(0x8CA6, &fbo_before);
+                pfn_glGetIntegerv(0x0B71 /* GL_DEPTH_TEST */, &depth_on);
+                pfn_glGetIntegerv(0x0B74 /* GL_DEPTH_FUNC */, &dfunc);
+            }
+            gl_restore_texture_units();
+            if (pfn_glDrawElements) pfn_glDrawElements((GLenum)r0,(GLsizei)r1,(GLenum)r2,
+                g_gl_bound_elem_buf ? (const void*)(uintptr_t)r3 : ARM_CPTR(r3));
+            if (gldraw_traced() && pfn_glGetError) {
+                GLenum e = pfn_glGetError();
+                fprintf(stderr, "[gl] DrawElements#%llu mode=0x%x count=%d type=0x%x err=0x%x\n",
+                        (unsigned long long)g_gl_draw_count, r0, (int)r1, r2, e);
+                gldraw_dump_state();
+                if (g_gl_draw_count <= 6 && pfn_glReadPixels && pfn_glGetIntegerv) {
+                    GLint fbo = 0, vp[4] = {};
+                    pfn_glGetIntegerv(0x8CA6, &fbo);
+                    pfn_glGetIntegerv(0x0BA2, vp);
+                    GLint x = vp[0] + (vp[2] > 0 ? vp[2] / 2 : 0);
+                    GLint y = vp[1] + (vp[3] > 0 ? vp[3] / 2 : 0);
+                    unsigned char px[4] = {0,0,0,0};
+                    pfn_glReadPixels(x, y, 1, 1, 0x1908, 0x1401, px);
+                    GLint vao = 0, abuf = 0, ebuf = 0, prog = 0, cm[4] = {};
+                    pfn_glGetIntegerv(0x85B5 /* GL_VERTEX_ARRAY_BINDING */, &vao);
+                    pfn_glGetIntegerv(0x8894 /* GL_ARRAY_BUFFER_BINDING */, &abuf);
+                    pfn_glGetIntegerv(0x8895 /* GL_ELEMENT_ARRAY_BUFFER_BINDING */, &ebuf);
+                    pfn_glGetIntegerv(0x8B8D /* GL_CURRENT_PROGRAM */, &prog);
+                    if (pfn_glGetIntegerv)
+                        pfn_glGetIntegerv(0x0C23 /* GL_COLOR_WRITEMASK */, cm);
+                    /* attrib 0 enabled? */
+                    GLint a0en = 0, a0size = 0, a0stride = 0;
+                    typedef void (*PFgetva)(GLuint, GLenum, GLint*);
+                    static PFgetva getva = (PFgetva)eglGetProcAddress("glGetVertexAttribiv");
+                    if (getva) {
+                        getva(0, 0x8622 /* GL_VERTEX_ATTRIB_ARRAY_ENABLED */, &a0en);
+                        getva(0, 0x8623 /* SIZE */, &a0size);
+                        getva(0, 0x8624 /* STRIDE */, &a0stride);
+                    }
+                    GLint a0type = 0, a0norm = 0, a0div = 0;
+                    void *a0ptr = nullptr;
+                    if (getva) {
+                        getva(0, 0x8625 /* TYPE */, &a0type);
+                        getva(0, 0x886A /* NORMALIZED */, &a0norm);
+                        getva(0, 0x88FE /* DIVISOR */, &a0div);
+                    }
+                    typedef void (*PFgap)(GLuint, GLenum, void**);
+                    static PFgap gap = (PFgap)eglGetProcAddress("glGetVertexAttribPointerv");
+                    if (gap) gap(0, 0x8643 /* ARRAY_POINTER */, &a0ptr);
+                    fprintf(stderr, "[gl]   probe fbo=%d center(%d,%d)=%u,%u,%u,%u "
+                            "depth_on=%d dfunc=0x%x vao=%d abuf=%d ebuf=%d prog=%d "
+                            "a0en=%d a0sz=%d a0str=%d a0ty=0x%x a0norm=%d a0div=%d a0ptr=%p "
+                            "cmask=%d%d%d%d\n",
+                            fbo, x, y, px[0], px[1], px[2], px[3],
+                            depth_on, dfunc, vao, abuf, ebuf, prog,
+                            a0en, a0size, a0stride, a0type, a0norm, a0div, a0ptr,
+                            cm[0], cm[1], cm[2], cm[3]);
+                    GLint rast_disc = 0, stencil_on = 0, sample_on = 0, srgb_on = 0;
+                    if (pfn_glIsEnabled) {
+                        rast_disc = pfn_glIsEnabled(0x8C89 /* GL_RASTERIZER_DISCARD */) ? 1 : 0;
+                        stencil_on = pfn_glIsEnabled(0x0B90 /* GL_STENCIL_TEST */) ? 1 : 0;
+                        sample_on = pfn_glIsEnabled(0x809E /* GL_SAMPLE_ALPHA_TO_COVERAGE */) ? 1 : 0;
+                        srgb_on = pfn_glIsEnabled(0x8DB9 /* GL_FRAMEBUFFER_SRGB */) ? 1 : 0;
+                    }
+                    fprintf(stderr, "[gl]   caps rast_discard=%d stencil=%d a2c=%d srgb=%d\n",
+                            rast_disc, stencil_on, sample_on, srgb_on);
+                    /* Dump linked VS/FS sources for prog (first composite only). */
+                    static int dumped_prog = 0;
+                    if (!dumped_prog && prog && fbo == 0 && r1 == 3) {
+                        dumped_prog = 1;
+                        typedef void (*PFgai)(GLuint, GLenum, GLint*);
+                        typedef void (*PFgas)(GLuint, GLsizei, GLsizei*, GLuint*);
+                        typedef void (*PFgsh)(GLuint, GLsizei, GLsizei*, GLchar*);
+                        static PFgai gai = (PFgai)eglGetProcAddress("glGetProgramiv");
+                        static PFgas gas = (PFgas)eglGetProcAddress("glGetAttachedShaders");
+                        static PFgsh gsh = (PFgsh)eglGetProcAddress("glGetShaderSource");
+                        static PFgai gsiv = (PFgai)eglGetProcAddress("glGetShaderiv");
+                        GLint nsh = 0;
+                        if (gai) gai((GLuint)prog, 0x8B85 /* ATTACHED_SHADERS */, &nsh);
+                        GLuint sh[4] = {};
+                        if (gas && nsh > 0) gas((GLuint)prog, 4, nullptr, sh);
+                        for (int i = 0; i < nsh && i < 4; ++i) {
+                            GLint typ = 0, len = 0;
+                            if (gsiv) {
+                                gsiv(sh[i], 0x8B4F /* SHADER_TYPE */, &typ);
+                                gsiv(sh[i], 0x8B88 /* SHADER_SOURCE_LENGTH */, &len);
+                            }
+                            std::vector<char> src((size_t)std::max(len, 1) + 1u);
+                            GLsizei got = 0;
+                            if (gsh && len > 0) gsh(sh[i], (GLsizei)src.size(), &got, src.data());
+                            fprintf(stderr, "[gl]   prog%d shader%u type=0x%x len=%d:\n%.200s%s\n",
+                                    prog, sh[i], typ, len, src.data(),
+                                    got > 200 ? "…" : "");
+                        }
+                    }
+                    if (fbo == 0 && r1 == 3 && abuf) {
+                        fprintf(stderr, "[gl]   draw3 idx_arg=0x%x guest_ibo=%u\n",
+                                r3, g_gl_bound_elem_buf);
+                        /* GLES has no GetBufferSubData — use MapBufferRange READ. */
+                        float vf[12]; memset(vf, 0, sizeof vf);
+                        uint16_t ix[4]; memset(ix, 0, sizeof ix);
+                        if (pfn_glMapBufferRange) {
+                            void *vp = pfn_glMapBufferRange(0x8892, 0, sizeof vf, 0x0001);
+                            if (vp) {
+                                memcpy(vf, vp, sizeof vf);
+                                if (pfn_glUnmapBuffer) pfn_glUnmapBuffer(0x8892);
+                            }
+                            fprintf(stderr, "[gl]   abuf#%d map=%p verts: "
+                                    "%.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | "
+                                    "%.4f %.4f %.4f %.4f\n",
+                                    abuf, vp, vf[0],vf[1],vf[2],vf[3],
+                                    vf[4],vf[5],vf[6],vf[7],
+                                    vf[8],vf[9],vf[10],vf[11]);
+                            if (ebuf) {
+                                GLint bsz = -1;
+                                typedef void (*PFgbi)(GLenum, GLenum, GLint*);
+                                static PFgbi gbi = (PFgbi)eglGetProcAddress("glGetBufferParameteriv");
+                                if (gbi) gbi(0x8893, 0x8764 /*GL_BUFFER_SIZE*/, &bsz);
+                                GLsizeiptr want = (bsz > 0 && bsz < 6) ? bsz : 6;
+                                void *ip = pfn_glMapBufferRange(0x8893, 0, want, 0x0001);
+                                GLenum me = pfn_glGetError ? pfn_glGetError() : 0;
+                                if (ip) {
+                                    memcpy(ix, ip, (size_t)want);
+                                    if (pfn_glUnmapBuffer) pfn_glUnmapBuffer(0x8893);
+                                }
+                                fprintf(stderr, "[gl]   ebuf#%d map=%p size=%d err=0x%x idx: %u %u %u\n",
+                                        ebuf, ip, bsz, me, ix[0], ix[1], ix[2]);
+                            }
+                        }
+                        GLint tex = 0;
+                        pfn_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &tex);
+                        typedef void (*PFgu)(GLuint, GLint, GLfloat*);
+                        static PFgu getu = (PFgu)eglGetProcAddress("glGetUniformfv");
+                        if (getu && prog) {
+                            for (int loc = 0; loc < 8; ++loc) {
+                                GLfloat u[16]; memset(u, 0, sizeof u);
+                                while (pfn_glGetError && pfn_glGetError()) {}
+                                getu((GLuint)prog, loc, u);
+                                GLenum ue = pfn_glGetError ? pfn_glGetError() : 0;
+                                if (ue) continue;
+                                fprintf(stderr, "[gl]   uniform[%d]= "
+                                        "%.4f %.4f %.4f %.4f\n",
+                                        loc, u[0], u[1], u[2], u[3]);
+                            }
+                        }
+                        fprintf(stderr, "[gl]   tex2d bound=%d\n", tex);
+                    }
+                }
+            }
         }
         break;
 
@@ -10942,7 +11526,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_GL_Uniform3f:
         if (pfn_glUniform3f) pfn_glUniform3f((GLint)r0, rf(r1), rf(r2), rf(r3)); break;
     case SVC_GL_Uniform4f: {
-        uint32_t v3 = ctx.mem.read32(regs[13]);
+        /* (loc, v0,v1,v2,v3) — A64: x4 holds bits of 5th float; A32: [sp] */
+        uint32_t v3 = ctx.is_arm64 ? regs[4] : ctx.mem.read32(regs[13]);
         if (pfn_glUniform4f) pfn_glUniform4f((GLint)r0, rf(r1), rf(r2), rf(r3), rf(v3));
         break;
     }
@@ -10954,7 +11539,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_GL_VertexAttrib3f:
         if (pfn_glVertexAttrib3f) pfn_glVertexAttrib3f((GLuint)r0, rf(r1), rf(r2), rf(r3)); break;
     case SVC_GL_VertexAttrib4f: {
-        uint32_t v3 = ctx.mem.read32(regs[13]);
+        /* A64 hard-float: CallSVC puts s3 bits in regs[4]; A32 spills on [sp]. */
+        uint32_t v3 = ctx.is_arm64 ? regs[4] : ctx.mem.read32(regs[13]);
         if (pfn_glVertexAttrib4f) pfn_glVertexAttrib4f((GLuint)r0, rf(r1), rf(r2), rf(r3), rf(v3));
         break;
     }
@@ -11001,8 +11587,11 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_GL_UniformMatrix2fv: {
-        uint32_t pva = ctx.mem.read32(regs[13]);
-        if (pfn_glUniformMatrix2fv && pva) pfn_glUniformMatrix2fv((GLint)r0,(GLsizei)r1,(GLboolean)r2,(const GLfloat*)ctx.mem.ptr(pva)); break;
+        /* 4 args: value* is r3 on both ABIs (was wrongly read from [sp]). */
+        if (pfn_glUniformMatrix2fv && r3)
+            pfn_glUniformMatrix2fv((GLint)r0,(GLsizei)r1,(GLboolean)r2,
+                                   (const GLfloat*)ctx.mem.ptr(r3));
+        break;
     }
 
 #undef ARM_PTR
@@ -11049,10 +11638,15 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     /* File descriptors and FILE* are stored directly in ARM 32-bit registers.
  * Host fds are small numbers; FILE* are stored as a table index. */
     case SVC_LIBC_OPEN: {
-        const char *path = ctx.mem.cstr(r0);
+        const char *path = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[0])
+                                        : ctx.mem.cstr(r0);
         if (const char *subst = synthetic_proc_path(path)) path = subst;
         int fd = guest_open_path(path, (int)r1, (mode_t)r2);
-        if (getenv("LUNARIA_TRACE_OPEN"))
+        if (path && strstr(path, "0610960decb49bc4494914c7af6dfd7f"))
+            fprintf(stderr, "[open] asset 0610960… path=%s -> fd=%d "
+                    "path_va=0x%llx\n", path, fd,
+                    (unsigned long long)(ctx.is_arm64 ? g_svc_args64[0] : r0));
+        else if (getenv("LUNARIA_TRACE_OPEN"))
             fprintf(stderr, "[open] %s -> fd=%d\n", path ? path : "(null)", fd);
         ret32((uint32_t)fd); break;
     }
@@ -11061,7 +11655,14 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         else ret32(0);
         break;
     case SVC_LIBC_READ: {
-        void *buf = ctx.mem.ptr(r1);
+        /* CallSVC keeps the architectural A64 arguments in g_svc_args64.
+         * Do not reconstruct a pointer from its low 32 bits here: Unity's
+         * Dynamic Heap uses preferred high VA aliases, whose backing is not at
+         * host + low32.  Reading an AssetBundle into that wrong alias leaves
+         * the real buffer stale and makes Addressables fail its CRC check. */
+        void *buf = ctx.is_arm64 ? (void *)ctx.mem.ptr(g_svc_args64[1])
+                                 : (void *)ctx.mem.ptr(r1);
+        size_t len = ctx.is_arm64 ? a64_buf_len(g_svc_args64[2]) : (size_t)r2;
         if (!buf) { ret32(~0u); break; }
         int fd = (int)r0;
         /* For pipe/socket reads that might block (Unity render thread sync),
@@ -11071,36 +11672,72 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             struct pollfd pfd = { fd, POLLIN, 0 };
             int poll0 = poll(&pfd, 1, 0);
             if (poll0 == 0) /* only log blocking reads */
-                fprintf(stderr, "[read-block] fd=%d len=%u tid=%u lr=0x%08x\n",
-                        fd, r2, g_current_tid, regs[14]);
+                fprintf(stderr, "[read-block] fd=%d len=%zu tid=%u lr=0x%08x\n",
+                        fd, len, g_current_tid, regs[14]);
             if (poll0 == 0 && !g_threads.empty()) {
                 /* No data yet — run worker threads (render thread may write to pipe) */
                 for (int spin = 0; spin < 20 && poll(&pfd, 1, 0) == 0; ++spin)
                     schedule_threads(20'000'000ULL);
             }
         }
-        ssize_t nr = read(fd, buf, (size_t)r2);
+        ssize_t nr;
+        if (ctx.is_arm64)
+            nr = a64_guest_read(ctx.mem, g_svc_args64[1], len, fd);
+        else
+            nr = read(fd, buf, len);
+        if (ctx.is_arm64 && nr > 0) {
+            char lp[160] = {};
+            char proc[64];
+            snprintf(proc, sizeof proc, "/proc/self/fd/%d", fd);
+            ssize_t ll = readlink(proc, lp, sizeof(lp) - 1);
+            if (ll > 0) {
+                lp[ll] = '\0';
+                if (strstr(lp, "0610960decb49bc4494914c7af6dfd7f")) {
+                    const uint8_t *p = ctx.mem.ptr(g_svc_args64[1]);
+                    fprintf(stderr, "[read] asset 0610960… nr=%zd dest=0x%llx head=",
+                            nr, (unsigned long long)g_svc_args64[1]);
+                    for (ssize_t i = 0; i < nr && i < 32; i++)
+                        fprintf(stderr, "%02x", p[i]);
+                    fprintf(stderr, "\n");
+                    if (nr >= 64) {
+                        fprintf(stderr, "[read] asset 0610960… @48=");
+                        for (ssize_t i = 48; i < 64 && i < nr; i++)
+                            fprintf(stderr, "%02x", p[i]);
+                        uint32_t plat = 0;
+                        std::memcpy(&plat, p + 59, 4);
+                        uint32_t hi = (uint32_t)(g_svc_args64[1] >> 32);
+                        fprintf(stderr, " platLE=%u alias=%d host=%p\n",
+                                plat, g_a64_pref_aliases.count(hi) ? 1 : 0,
+                                (void *)p);
+                        g_dbg_asset_buf = g_svc_args64[1];
+                        g_dbg_asset_len = (size_t)nr;
+                    }
+                }
+            }
+        }
         if (getenv("LUNARIA_TRACE_READ")) {
             static uint64_t rc = 0;
             char lp[64] = {0};
             if (rc < 2000) {
                 char proc[64]; snprintf(proc, sizeof proc, "/proc/self/fd/%d", fd);
                 ssize_t ll = readlink(proc, lp, sizeof(lp) - 1); if (ll > 0) lp[ll] = '\0';
-                fprintf(stderr, "[read] fd=%d req=%u nr=%zd off=%ld path=%s lr=0x%08x\n",
-                        fd, r2, nr, (long)lseek(fd, 0, SEEK_CUR), lp, regs[14]);
+                fprintf(stderr, "[read] fd=%d req=%zu nr=%zd off=%ld path=%s lr=0x%08x\n",
+                        fd, len, nr, (long)lseek(fd, 0, SEEK_CUR), lp, regs[14]);
             }
             ++rc;
         }
         ret32((uint32_t)nr); break;
     }
     case SVC_LIBC_WRITE: {
-        const void *buf = ctx.mem.ptr(r1);
-        ret32(buf ? (uint32_t)write((int)r0, buf, (size_t)r2) : ~0u); break;
+        const void *buf = ctx.is_arm64 ? (const void *)ctx.mem.ptr(g_svc_args64[1])
+                                       : (const void *)ctx.mem.ptr(r1);
+        size_t n = ctx.is_arm64 ? a64_buf_len(g_svc_args64[2]) : (size_t)r2;
+        ret32(buf ? (uint32_t)write((int)r0, buf, n) : ~0u); break;
     }
     case SVC_LIBC_LSEEK: {
         /* LP32 off_t is 32-bit; AAPCS64 passes the 64-bit off_t in x1 and
          * whence in x2.  Guest files fit the 32-bit backing VA. */
-        off_t off = ctx.is_arm64 ? (off_t)(int64_t)(uint64_t)r1
+        off_t off = ctx.is_arm64 ? (off_t)(int64_t)g_svc_args64[1]
                                  : (off_t)(int32_t)r1;
         off_t res = lseek((int)r0, off, (int)r2);
         if (getenv("LUNARIA_TRACE_LSEEK")) {
@@ -11145,8 +11782,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_LIBC_FOPEN: {
-        const char *path = ctx.mem.cstr(r0);
-        const char *mode = ctx.mem.cstr(r1);
+        const char *path = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[0])
+                                        : ctx.mem.cstr(r0);
+        const char *mode = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[1])
+                                        : ctx.mem.cstr(r1);
         char fo_mapped[PATH_MAX];
         path = map_guest_path(path, fo_mapped, sizeof fo_mapped);
         /* mono try_open_assembly passes "file:///abs/path" to fopen; strip scheme. */
@@ -11157,7 +11796,11 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 if (sl) path = sl;
             }
         }
-        if (getenv("LUNARIA_TRACE_OPEN"))
+        if (path && strstr(path, "0610960decb49bc4494914c7af6dfd7f"))
+            fprintf(stderr, "[fopen] asset 0610960… path=%s mode=%s path_va=0x%llx\n",
+                    path, mode ? mode : "(null)",
+                    (unsigned long long)(ctx.is_arm64 ? g_svc_args64[0] : r0));
+        else if (getenv("LUNARIA_TRACE_OPEN"))
             fprintf(stderr, "[fopen] %s mode=%s\n", path ? path : "(null)", mode ? mode : "(null)");
         if (const char *subst = synthetic_proc_path(path)) path = subst;
         if (path && (!strncmp(path, "/proc/", 6) || !strcmp(path, "/proc"))) {
@@ -11213,22 +11856,60 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_LIBC_FREAD: {
-        void *buf = ctx.mem.ptr(r0);
+        void *buf = ctx.is_arm64 ? (void *)ctx.mem.ptr(g_svc_args64[0])
+                                 : (void *)ctx.mem.ptr(r0);
         FILE *f = resolve_file(ctx, r3);
+        size_t sz = ctx.is_arm64 ? a64_buf_len(g_svc_args64[1]) : (size_t)r1;
+        size_t nm = ctx.is_arm64 ? a64_buf_len(g_svc_args64[2]) : (size_t)r2;
         long pos = (f && getenv("LUNARIA_TRACE_READ")) ? ftell(f) : -1;
-        uint32_t n = (buf && f) ? (uint32_t)fread(buf, (size_t)r1, (size_t)r2, f) : 0u;
+        uint32_t n = 0u;
+        if (buf && f) {
+            size_t total = sz * nm;
+            if (ctx.is_arm64 && total && sz == 1) {
+                size_t got = a64_guest_fread(ctx.mem, g_svc_args64[0], total, f);
+                n = (uint32_t)got; /* nmemb when size==1 */
+            } else if (ctx.is_arm64 && total) {
+                size_t got = a64_guest_fread(ctx.mem, g_svc_args64[0], total, f);
+                n = sz ? (uint32_t)(got / sz) : 0u;
+            } else {
+                n = (uint32_t)fread(buf, sz, nm, f);
+            }
+        }
         if (getenv("LUNARIA_TRACE_READ")) {
             static uint64_t frc = 0;
             if (frc++ < 4000)
-                fprintf(stderr, "[fread] file=%#x pos=%ld sz=%u n=%u -> %u fd=%d lr=0x%08x\n",
-                        r3, pos, r1, r2, n, f ? fileno(f) : -1, regs[14]);
+                fprintf(stderr, "[fread] file=%#x pos=%ld sz=%zu n=%zu -> %u fd=%d lr=0x%08x\n",
+                        r3, pos, sz, nm, n, f ? fileno(f) : -1, regs[14]);
+        }
+        /* Spot-check SerializedFile loads that previously showed a bogus
+         * build-target (0x20000) after preferred-VA truncation. */
+        if (ctx.is_arm64 && n && buf && f) {
+            char lp[160] = {};
+            char proc[64];
+            snprintf(proc, sizeof proc, "/proc/self/fd/%d", fileno(f));
+            ssize_t ll = readlink(proc, lp, sizeof(lp) - 1);
+            if (ll > 0) {
+                lp[ll] = '\0';
+                if (strstr(lp, "0610960decb49bc4494914c7af6dfd7f")) {
+                    const uint8_t *p = (const uint8_t *)buf;
+                    size_t bytes = (size_t)sz * n;
+                    fprintf(stderr, "[fread] asset 0610960… bytes=%zu dest=0x%llx head=",
+                            bytes, (unsigned long long)g_svc_args64[0]);
+                    for (size_t i = 0; i < 32 && i < bytes; i++)
+                        fprintf(stderr, "%02x", p[i]);
+                    fprintf(stderr, "\n");
+                }
+            }
         }
         ret32(n); break;
     }
     case SVC_LIBC_FWRITE: {
-        const void *buf = ctx.mem.ptr(r0);
+        const void *buf = ctx.is_arm64 ? (const void *)ctx.mem.ptr(g_svc_args64[0])
+                                       : (const void *)ctx.mem.ptr(r0);
         FILE *f = resolve_file(ctx, r3);
-        ret32((buf && f) ? (uint32_t)fwrite(buf, (size_t)r1, (size_t)r2, f) : 0u); break;
+        size_t sz = ctx.is_arm64 ? a64_buf_len(g_svc_args64[1]) : (size_t)r1;
+        size_t nm = ctx.is_arm64 ? a64_buf_len(g_svc_args64[2]) : (size_t)r2;
+        ret32((buf && f) ? (uint32_t)fwrite(buf, sz, nm, f) : 0u); break;
     }
     case SVC_LIBC_FSEEK: {
         FILE *f = resolve_file(ctx, r0);
@@ -11247,7 +11928,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_LIBC_STAT: {
         struct stat st;
-        const char *path = ctx.mem.cstr(r0);
+        const char *path = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[0])
+                                        : ctx.mem.cstr(r0);
         if (const char *subst = synthetic_proc_path(path)) path = subst;
         else if (path && (!strncmp(path, "/proc/", 6) || !strcmp(path, "/proc"))) {
             ret32(~0u); break;
@@ -11277,7 +11959,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             rc = 0;
         }
         if (rc != 0) { ret32(~0u); break; }
-        if (r1) write_guest_stat(ctx, r1, st);
+        GuestVA st_va = ctx.is_arm64 ? g_svc_args64[1] : (GuestVA)r1;
+        if (st_va) write_guest_stat(ctx, st_va, st);
         ret32(0); break;
     }
     case SVC_LIBC_FSTAT: {
@@ -11285,7 +11968,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (getenv("LUNARIA_TRACE_OPEN"))
             fprintf(stderr, "[fstat] fd=%d\n", (int)r0);
         if (fstat((int)r0, &st) != 0) { ret32(~0u); break; }
-        if (r1) write_guest_stat(ctx, r1, st);
+        GuestVA st_va = ctx.is_arm64 ? g_svc_args64[1] : (GuestVA)r1;
+        if (st_va) write_guest_stat(ctx, st_va, st);
         ret32(0); break;
     }
     /* statfs/statvfs use long-sized fields on A64.  Returning the LP32
@@ -11368,9 +12052,6 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     uint32_t backing = mmap_bump_exact(len, &actual, /*allow_split=*/false);
                     uint8_t *overflow_host = nullptr;
                     if (backing == ~0u || actual != len) {
-                        /* Backing arena exhausted: allocate a separate host mapping.
-                         * GuestMem is MAP_NORESERVE so physical pages are only used
-                         * where Unity actually writes; overflow likewise. */
                         void *ext = ::mmap(nullptr, len,
                                            PROT_READ | PROT_WRITE,
                                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
@@ -11387,7 +12068,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                             fprintf(stderr, "[mprotect] overflow commit %x:%08x+%u "
                                     "-> hostptr=%p\n", hi, off, len, ext);
                     }
-                    alias.committed.push_back({off, backing, len, overflow_host});
+                    alias.committed.push_back({off, backing == ~0u ? 0u : backing, len, overflow_host});
                     if (getenv("LUNARIA_TRACE_MMAP"))
                         fprintf(stderr, "[mprotect] commit %x:%08x+%u -> %08x\n",
                                 hi, off, len, backing);
@@ -11444,12 +12125,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
              * a handful of sparse Unity heaps exhaust all backing space. */
             if (ctx.is_arm64 && (r3 & 0x20u) && r2 == 0 &&
                 r1 >= 0x01000000u) {
-                GuestVA preferred = g_svc_args64[0];
-                if (!preferred && g_a64_mmap_slot < 0x40u)
-                    preferred = (GuestVA)g_a64_mmap_slot++ << 40;
+                GuestVA preferred = a64_mint_preferred(g_svc_args64[0]);
                 uint32_t hi = (uint32_t)(preferred >> 32);
                 uint32_t size = (r1 + 4095u) & ~4095u;
-                if (!preferred || hi == 0 || hi > 0xffffu || size == 0) {
+                if (!preferred || size == 0) {
                     ret32(~0u); break;
                 }
                 A64PrefAlias alias;
@@ -11459,8 +12138,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 g_mmap_prot_none_bytes += size;
                 if (getenv("LUNARIA_TRACE_MMAP"))
                     fprintf(stderr, "[mmap] A64 VA reserve 0x%llx len=%u (no backing)\n",
-                            (unsigned long long)(preferred & ~0xfffull), size);
-                ret64(preferred & ~0xfffull);
+                            (unsigned long long)preferred, size);
+                ret64(preferred);
                 break;
             }
             /* Disable split for A64 large anon mmaps so they fall through to
@@ -11476,21 +12155,18 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
                                        -1, 0);
                     if (ext != MAP_FAILED) {
-                        GuestVA preferred = g_svc_args64[0];
-                        if (!preferred && g_a64_mmap_slot < 0xffu)
-                            preferred = (GuestVA)g_a64_mmap_slot++ << 40;
+                        GuestVA preferred = a64_mint_preferred(g_svc_args64[0]);
                         uint32_t hi = (uint32_t)(preferred >> 32);
-                        if (preferred && hi != 0 && hi <= 0xffffu) {
+                        if (preferred) {
                             A64PrefAlias ov;
                             ov.size = olen;
                             ov.overflow_base = static_cast<uint8_t *>(ext);
                             g_a64_pref_aliases[hi] = std::move(ov);
-                            GuestVA gva = preferred & ~(GuestVA)0xfffu;
                             if (getenv("LUNARIA_TRACE_MMAP"))
                                 fprintf(stderr, "[mmap] overflow anon %u -> 0x%llx "
                                         "hostptr=%p\n", olen,
-                                        (unsigned long long)gva, ext);
-                            ret64(gva); break;
+                                        (unsigned long long)preferred, ext);
+                            ret64(preferred); break;
                         }
                         ::munmap(ext, olen);
                     }
@@ -12052,7 +12728,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             pfn_glGetIntegeri_v((GLenum)r0,(GLuint)r1,(GLint*)ARM_PTR(r2));
         break;
     case SVC_GL3_GetInternalformativ: {
-        uint32_t params = ctx.mem.read32(regs[13]);
+        /* (target, internalformat, pname, bufSize, params*) — 5th in x4 / [sp] */
+        uint32_t params = ctx.is_arm64 ? regs[4]
+                                       : ctx.mem.read32(regs[13]);
         if (params && r3) ctx.mem.write32(params, 0u);
         if (pfn_glGetInternalformativ)
             pfn_glGetInternalformativ((GLenum)r0,(GLenum)r1,(GLenum)r2,
@@ -12120,8 +12798,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             pfn_glBindBufferBase((GLenum)r0,(GLuint)r1,(GLuint)r2);
         break;
     case SVC_GL3_BindBufferRange: {
-        uint32_t off = ctx.mem.read32(regs[13]);
-        uint32_t sz  = ctx.mem.read32(regs[13]+4);
+        /* (target, index, buffer, offset, size) — size is 5th arg (x4 / [sp]) */
+        uint32_t off = r3;
+        uint32_t sz  = ctx.is_arm64 ? regs[4]
+                                    : ctx.mem.read32(regs[13]);
         if (pfn_glBindBufferRange)
             pfn_glBindBufferRange((GLenum)r0,(GLuint)r1,(GLuint)r2,
                                   (intptr_t)off,(intptr_t)sz);
@@ -12147,7 +12827,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                         "len=%u access=0x%x host=%p → gva=0x%08x\n",
                         r0, buf, off, len, access, host, gva);
         }
-        ret32(gva);
+        if (ctx.is_arm64) retptr(gva); else ret32(gva);
         break;
     }
     case SVC_GL3_UnmapBuffer: {
@@ -12176,25 +12856,46 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             if (m.host && off + len <= m.len)
                 memcpy((char*)m.host + off, ctx.mem.ptr(m.gva + off), len);
             static int n = 0;
-            if (n++ < 24)
+            if (n++ < 24) {
                 fprintf(stderr, "[gl] FlushMappedBufferRange target=0x%x buf=%u "
                         "off=%u len=%u copied=%d\n", r0, it->first, off, len,
                         (m.host && off + len <= m.len) ? 1 : 0);
+                if (m.host && len >= 16 && off == 0) {
+                    const float *f = (const float *)ctx.mem.ptr(m.gva);
+                    fprintf(stderr, "[gl]   vbo floats: %g %g %g %g  %g %g %g %g\n",
+                            f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+                }
+            }
             if (pfn_glFlushMappedBufferRange)
                 pfn_glFlushMappedBufferRange((GLenum)r0,(intptr_t)off,(intptr_t)len);
         }
         break;
     }
     case SVC_GL3_TexStorage2D: {
-        uint32_t h = ctx.mem.read32(regs[13]);
+        /* (target, levels, internalformat, width, height).
+         * A64 height is x4; reading [sp] left FBO color/depth at garbage size
+         * → GL_FRAMEBUFFER_INCOMPLETE → draws to fbo≠0 return 0x506 (black). */
+        uint32_t h = ctx.is_arm64 ? regs[4]
+                                  : ctx.mem.read32(regs[13]);
+        static int n_texstorage = 0;
+        if (n_texstorage++ < 12)
+            fprintf(stderr, "[gl] TexStorage2D tgt=0x%x lv=%u ifmt=0x%x "
+                    "%ux%u\n", r0, r1, r2, r3, h);
         if (pfn_glTexStorage2D)
             pfn_glTexStorage2D((GLenum)r0,(GLsizei)r1,(GLenum)r2,(GLsizei)r3,
                                (GLsizei)h);
         break;
     }
     case SVC_GL3_TexStorage3D: {
-        uint32_t h = ctx.mem.read32(regs[13]);
-        uint32_t d = ctx.mem.read32(regs[13]+4);
+        /* (target, levels, internalformat, width, height, depth) */
+        uint32_t h, d;
+        if (ctx.is_arm64) {
+            h = regs[4];
+            d = regs[5];
+        } else {
+            h = ctx.mem.read32(regs[13]);
+            d = ctx.mem.read32(regs[13]+4);
+        }
         if (pfn_glTexStorage3D)
             pfn_glTexStorage3D((GLenum)r0,(GLsizei)r1,(GLenum)r2,(GLsizei)r3,
                                (GLsizei)h,(GLsizei)d);
@@ -12272,8 +12973,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     case SVC_GL3_DrawElementsBaseVertex: {
         /* (mode, count, type, indices | basevertex); IBO bound → byte offset */
-        uint32_t basevertex = ctx.mem.read32(regs[13]);
+        uint32_t basevertex = ctx.is_arm64 ? regs[4]
+                                           : ctx.mem.read32(regs[13]);
         ++g_gl_draw_count;
+        gl_restore_texture_units();
         if (pfn_glDrawElementsBaseVertex)
             pfn_glDrawElementsBaseVertex((GLenum)r0,(GLsizei)r1,(GLenum)r2,
                 g_gl_bound_elem_buf ? (const void*)(uintptr_t)r3 : ARM_CPTR(r3),
@@ -12419,14 +13122,22 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_GL3_GetUniformIndices: {
         /* (program, count, const GLchar *const *names, GLuint *indices) — the
-         * name array holds guest pointers, so rebuild it host-side. */
+         * name array holds guest pointers, so rebuild it host-side.
+         * A64 name slots are 8 bytes; A32 are 4. */
         typedef void (*pfn_t)(GLuint, GLsizei, const GLchar* const*, GLuint*);
         static pfn_t f = (pfn_t)host_gl_proc({"glGetUniformIndices"});
         uint32_t n = r1;
         if (!f || !r2 || !r3 || n > 4096u) break;
         std::vector<const GLchar*> names(n, nullptr);
+        const uint32_t pstride = ctx.is_arm64 ? 8u : 4u;
         for (uint32_t k = 0; k < n; ++k) {
-            uint32_t va = ctx.mem.read32(r2 + k * 4u);
+            uint32_t va;
+            if (ctx.is_arm64) {
+                GuestVA raw = ctx.mem.read64((GuestVA)r2 + (GuestVA)k * pstride);
+                va = a64_canon_va(raw);
+            } else {
+                va = ctx.mem.read32(r2 + k * pstride);
+            }
             names[k] = va ? ctx.mem.cstr(va) : nullptr;
         }
         f((GLuint)r0, (GLsizei)n, names.data(), (GLuint*)ARM_PTR(r3));
@@ -12436,7 +13147,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         /* (program, count, const GLuint *indices, GLenum pname | GLint *params) */
         typedef void (*pfn_t)(GLuint, GLsizei, const GLuint*, GLenum, GLint*);
         static pfn_t f = (pfn_t)host_gl_proc({"glGetActiveUniformsiv"});
-        uint32_t params_va = ctx.mem.read32(regs[13]);
+        uint32_t params_va = ctx.is_arm64 ? regs[4]
+                                          : ctx.mem.read32(regs[13]);
         if (f && r2 && params_va)
             f((GLuint)r0, (GLsizei)r1, (const GLuint*)ARM_CPTR(r2), (GLenum)r3,
               (GLint*)ARM_PTR(params_va));
@@ -12446,15 +13158,52 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         /* (target, attachment, texture, level | layer) */
         typedef void (*pfn_t)(GLenum, GLenum, GLuint, GLint, GLint);
         static pfn_t f = (pfn_t)host_gl_proc({"glFramebufferTextureLayer"});
-        uint32_t layer = ctx.mem.read32(regs[13]);
+        uint32_t layer = ctx.is_arm64 ? regs[4]
+                                      : ctx.mem.read32(regs[13]);
         if (f) f((GLenum)r0, (GLenum)r1, (GLuint)r2, (GLint)r3, (GLint)layer);
+        break;
+    }
+    case SVC_GL3_FramebufferTexture: {
+        /* (target, attachment, texture, level) — 4 args, all in regs.
+         * Without this, Unity's GLES3 FBO stays incomplete → draws to fbo≠0
+         * return GL_INVALID_FRAMEBUFFER_OPERATION (0x506) and the swap is black. */
+        typedef void (*pfn_t)(GLenum, GLenum, GLuint, GLint);
+        static pfn_t f = (pfn_t)host_gl_proc({"glFramebufferTexture",
+                                              "glFramebufferTextureEXT",
+                                              "glFramebufferTextureOES"});
+        static int n = 0;
+        if (n++ < 12)
+            fprintf(stderr, "[gl] FramebufferTexture tgt=0x%x att=0x%x tex=%u "
+                    "lvl=%d fn=%p\n", r0, r1, r2, (int)r3, (void*)f);
+        if (f) f((GLenum)r0, (GLenum)r1, (GLuint)r2, (GLint)r3);
+        else if (pfn_glFramebufferTexture2D)
+            pfn_glFramebufferTexture2D((GLenum)r0, (GLenum)r1,
+                                       0x0DE1 /* GL_TEXTURE_2D */,
+                                       (GLuint)r2, (GLint)r3);
+        break;
+    }
+    case SVC_GL3_FramebufferTexture3D: {
+        /* (target, attachment, textarget, texture | level, zoffset) */
+        typedef void (*pfn_t)(GLenum, GLenum, GLenum, GLuint, GLint, GLint);
+        static pfn_t f = (pfn_t)host_gl_proc({"glFramebufferTexture3D",
+                                              "glFramebufferTexture3DOES"});
+        GLint level, zoff;
+        if (ctx.is_arm64) {
+            level = (GLint)regs[4];
+            zoff  = (GLint)regs[5];
+        } else {
+            level = (GLint)ctx.mem.read32(regs[13]);
+            zoff  = (GLint)ctx.mem.read32(regs[13] + 4);
+        }
+        if (f) f((GLenum)r0, (GLenum)r1, (GLenum)r2, (GLuint)r3, level, zoff);
         break;
     }
     case SVC_GL3_CopyBufferSubData: {
         /* (readTarget, writeTarget, readOffset, writeOffset | size) */
         typedef void (*pfn_t)(GLenum, GLenum, GLintptr, GLintptr, GLsizeiptr);
         static pfn_t f = (pfn_t)host_gl_proc({"glCopyBufferSubData"});
-        uint32_t size = ctx.mem.read32(regs[13]);
+        uint32_t size = ctx.is_arm64 ? regs[4]
+                                     : ctx.mem.read32(regs[13]);
         if (f) f((GLenum)r0, (GLenum)r1, (GLintptr)(int32_t)r2,
                  (GLintptr)(int32_t)r3, (GLsizeiptr)size);
         break;
@@ -12464,7 +13213,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         typedef void (*pfn_t)(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
         static pfn_t f = (pfn_t)host_gl_proc({"glRenderbufferStorageMultisample",
                                               "glRenderbufferStorageMultisampleEXT"});
-        uint32_t h = ctx.mem.read32(regs[13]);
+        uint32_t h = ctx.is_arm64 ? regs[4]
+                                  : ctx.mem.read32(regs[13]);
         if (f) f((GLenum)r0, (GLsizei)r1, (GLenum)r2, (GLsizei)r3, (GLsizei)h);
         break;
     }
@@ -12472,9 +13222,16 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         /* (unit, texture, level, layered | layer, access, format) */
         typedef void (*pfn_t)(GLuint, GLuint, GLint, GLboolean, GLint, GLenum, GLenum);
         static pfn_t f = (pfn_t)host_gl_proc({"glBindImageTexture"});
-        uint32_t layer  = ctx.mem.read32(regs[13]);
-        uint32_t access = ctx.mem.read32(regs[13] + 4u);
-        uint32_t fmt    = ctx.mem.read32(regs[13] + 8u);
+        uint32_t layer, access, fmt;
+        if (ctx.is_arm64) {
+            layer  = regs[4];
+            access = regs[5];
+            fmt    = regs[6];
+        } else {
+            layer  = ctx.mem.read32(regs[13]);
+            access = ctx.mem.read32(regs[13] + 4u);
+            fmt    = ctx.mem.read32(regs[13] + 8u);
+        }
         if (f) f((GLuint)r0, (GLuint)r1, (GLint)r2, (GLboolean)r3,
                  (GLint)layer, (GLenum)access, (GLenum)fmt);
         break;
@@ -12524,11 +13281,18 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_GL3_TexStorage2DMS: {
-        /* (target, samples, internalformat, width | height, fixedsamplelocations) */
+        /* (target, samples, internalformat, width, height, fixedSampleLocations)
+         * A64: height=x4, fixed=x5; A32: both on [sp]. */
         typedef void (*pfn_t)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLboolean);
         static pfn_t f = (pfn_t)host_gl_proc({"glTexStorage2DMultisample"});
-        uint32_t h  = ctx.mem.read32(regs[13]);
-        uint32_t fx = ctx.mem.read32(regs[13] + 4u);
+        uint32_t h, fx;
+        if (ctx.is_arm64) {
+            h  = regs[4];
+            fx = regs[5];
+        } else {
+            h  = ctx.mem.read32(regs[13]);
+            fx = ctx.mem.read32(regs[13] + 4u);
+        }
         if (f) f((GLenum)r0, (GLsizei)r1, (GLenum)r2, (GLsizei)r3,
                  (GLsizei)h, (GLboolean)fx);
         break;
@@ -12544,6 +13308,266 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         static pfn_t f = (pfn_t)host_gl_proc({"glGetProgramResourceIndex"});
         const char *nm = r2 ? ctx.mem.cstr(r2) : nullptr;
         ret32((f && nm) ? (uint32_t)f((GLuint)r0, (GLenum)r1, nm) : 0xffffffffu);
+        break;
+    }
+    case SVC_GL3_CopyTexImage2D: {
+        /* (target, level, internalformat, x | y, width, height) */
+        typedef void (*pfn_t)(GLenum, GLint, GLenum, GLint, GLint, GLsizei, GLsizei);
+        static pfn_t f = (pfn_t)host_gl_proc({"glCopyTexImage2D"});
+        GLint y; GLsizei w, h;
+        if (ctx.is_arm64) {
+            y = (GLint)regs[4]; w = (GLsizei)regs[5]; h = (GLsizei)regs[6];
+        } else {
+            y = (GLint)ctx.mem.read32(regs[13]);
+            w = (GLsizei)ctx.mem.read32(regs[13] + 4u);
+            h = (GLsizei)ctx.mem.read32(regs[13] + 8u);
+        }
+        if (f) f((GLenum)r0, (GLint)r1, (GLenum)r2, (GLint)r3, y, w, h);
+        break;
+    }
+    case SVC_GL3_GetRenderbufferParameteriv: {
+        typedef void (*pfn_t)(GLenum, GLenum, GLint*);
+        static pfn_t f = (pfn_t)host_gl_proc({"glGetRenderbufferParameteriv"});
+        if (f && r2) f((GLenum)r0, (GLenum)r1, (GLint*)ARM_PTR(r2));
+        break;
+    }
+    case SVC_GL3_ValidateProgram: {
+        typedef void (*pfn_t)(GLuint);
+        static pfn_t f = (pfn_t)host_gl_proc({"glValidateProgram"});
+        if (f) f((GLuint)r0);
+        break;
+    }
+    case SVC_GL3_GetTexLevelParameterfv: {
+        typedef void (*pfn_t)(GLenum, GLint, GLenum, GLfloat*);
+        static pfn_t f = (pfn_t)host_gl_proc({"glGetTexLevelParameterfv"});
+        if (f && r3) f((GLenum)r0, (GLint)r1, (GLenum)r2, (GLfloat*)ARM_PTR(r3));
+        break;
+    }
+    case SVC_GL3_GetTexLevelParameteriv: {
+        typedef void (*pfn_t)(GLenum, GLint, GLenum, GLint*);
+        static pfn_t f = (pfn_t)host_gl_proc({"glGetTexLevelParameteriv"});
+        if (f && r3) f((GLenum)r0, (GLint)r1, (GLenum)r2, (GLint*)ARM_PTR(r3));
+        break;
+    }
+    case SVC_GL3_GetUniformiv: {
+        typedef void (*pfn_t)(GLuint, GLint, GLint*);
+        static pfn_t f = (pfn_t)host_gl_proc({"glGetUniformiv"});
+        if (f && r2) f((GLuint)r0, (GLint)r1, (GLint*)ARM_PTR(r2));
+        break;
+    }
+    case SVC_GL3_TexImage2DMultisample: {
+        /* (target, samples, internalformat, width | height, fixedSampleLocations) */
+        typedef void (*pfn_t)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLboolean);
+        static pfn_t f = (pfn_t)host_gl_proc({"glTexImage2DMultisample"});
+        uint32_t h, fx;
+        if (ctx.is_arm64) {
+            h  = regs[4];
+            fx = regs[5];
+        } else {
+            h  = ctx.mem.read32(regs[13]);
+            fx = ctx.mem.read32(regs[13] + 4u);
+        }
+        if (f) f((GLenum)r0, (GLsizei)r1, (GLenum)r2, (GLsizei)r3,
+                 (GLsizei)h, (GLboolean)fx);
+        break;
+    }
+    case SVC_GL3_TexParameteriv: {
+        typedef void (*pfn_t)(GLenum, GLenum, const GLint*);
+        static pfn_t f = (pfn_t)host_gl_proc({"glTexParameteriv"});
+        if (f && r2) f((GLenum)r0, (GLenum)r1, (const GLint*)ARM_CPTR(r2));
+        break;
+    }
+    case SVC_GL3_Uniform1uiv:
+    case SVC_GL3_Uniform2uiv:
+    case SVC_GL3_Uniform3uiv: {
+        typedef void (*pfn_t)(GLint, GLsizei, const GLuint*);
+        static pfn_t f1 = (pfn_t)host_gl_proc({"glUniform1uiv"});
+        static pfn_t f2 = (pfn_t)host_gl_proc({"glUniform2uiv"});
+        static pfn_t f3 = (pfn_t)host_gl_proc({"glUniform3uiv"});
+        pfn_t f = (svc_no == SVC_GL3_Uniform1uiv) ? f1
+                : (svc_no == SVC_GL3_Uniform2uiv) ? f2 : f3;
+        if (f && r2) f((GLint)r0, (GLsizei)r1, (const GLuint*)ARM_CPTR(r2));
+        break;
+    }
+    case SVC_GL3_DeleteQueries: {
+        typedef void (*pfn_t)(GLsizei, const GLuint*);
+        static pfn_t f = (pfn_t)host_gl_proc({"glDeleteQueries"});
+        if (f && r1) f((GLsizei)r0, (const GLuint*)ARM_CPTR(r1));
+        break;
+    }
+    case SVC_GL3_GetQueryiv: {
+        typedef void (*pfn_t)(GLenum, GLenum, GLint*);
+        static pfn_t f = (pfn_t)host_gl_proc({"glGetQueryiv"});
+        if (f && r2) f((GLenum)r0, (GLenum)r1, (GLint*)ARM_PTR(r2));
+        break;
+    }
+    case SVC_GL3_CompressedTexImage3D: {
+        /* (target, level, internalformat, width | height, depth, border,
+         *  imageSize, data) — A64: x4..x7 + data @ [sp]; A32: 5 stack words. */
+        typedef void (*pfn_t)(GLenum, GLint, GLenum, GLsizei, GLsizei, GLsizei,
+                              GLint, GLsizei, const void*);
+        static pfn_t f = (pfn_t)host_gl_proc({"glCompressedTexImage3D"});
+        GLsizei h, d, isz; GLint brd; uint32_t pva;
+        if (ctx.is_arm64) {
+            h   = (GLsizei)regs[4];
+            d   = (GLsizei)regs[5];
+            brd = (GLint)regs[6];
+            isz = (GLsizei)regs[7];
+            pva = a64_canon_va(ctx.mem.read64((GuestVA)regs[13]));
+        } else {
+            h   = (GLsizei)ctx.mem.read32(regs[13]);
+            d   = (GLsizei)ctx.mem.read32(regs[13] + 4u);
+            brd = (GLint)ctx.mem.read32(regs[13] + 8u);
+            isz = (GLsizei)ctx.mem.read32(regs[13] + 12u);
+            pva = ctx.mem.read32(regs[13] + 16u);
+        }
+        if (f) f((GLenum)r0, (GLint)r1, (GLenum)r2, (GLsizei)r3,
+                 h, d, brd, isz, ARM_CPTR(pva));
+        break;
+    }
+    case SVC_GL3_GetActiveUniformBlockName: {
+        /* (program, uniformBlockIndex, bufSize | length*, name*) */
+        typedef void (*pfn_t)(GLuint, GLuint, GLsizei, GLsizei*, GLchar*);
+        static pfn_t f = (pfn_t)host_gl_proc({"glGetActiveUniformBlockName"});
+        uint32_t length_va, name_va;
+        if (ctx.is_arm64) {
+            length_va = regs[3];
+            name_va   = regs[4];
+        } else {
+            length_va = r3;
+            name_va   = ctx.mem.read32(regs[13]);
+        }
+        if (f && name_va)
+            f((GLuint)r0, (GLuint)r1, (GLsizei)r2,
+              (GLsizei*)ARM_PTR(length_va), (GLchar*)ARM_PTR(name_va));
+        break;
+    }
+    case SVC_GL3_VertexAttribIPointer: {
+        /* (index, size, type | stride, pointer) — VBO bound → byte offset */
+        typedef void (*pfn_t)(GLuint, GLint, GLenum, GLsizei, const void*);
+        static pfn_t f = (pfn_t)host_gl_proc({"glVertexAttribIPointer"});
+        GLsizei stride; uint32_t pva;
+        if (ctx.is_arm64) {
+            stride = (GLsizei)regs[3];
+            pva    = regs[4];
+        } else {
+            stride = (GLsizei)r3;
+            pva    = ctx.mem.read32(regs[13]);
+        }
+        if (f) {
+            const void *p = g_gl_bound_array_buf
+                ? (const void*)(uintptr_t)pva : ARM_CPTR(pva);
+            f((GLuint)r0, (GLint)r1, (GLenum)r2, stride, p);
+        }
+        break;
+    }
+    case SVC_GL3_ProgramUniform1fv:
+    case SVC_GL3_ProgramUniform1iv:
+    case SVC_GL3_ProgramUniform2fv:
+    case SVC_GL3_ProgramUniform2iv:
+    case SVC_GL3_ProgramUniform3fv:
+    case SVC_GL3_ProgramUniform3iv:
+    case SVC_GL3_ProgramUniform4fv:
+    case SVC_GL3_ProgramUniform4iv:
+    case SVC_GL3_ProgramUniform1uiv:
+    case SVC_GL3_ProgramUniform2uiv:
+    case SVC_GL3_ProgramUniform3uiv:
+    case SVC_GL3_ProgramUniform4uiv: {
+        /* (program, location, count | value*) */
+        typedef void (*pfn_t)(GLuint, GLint, GLsizei, const void*);
+        static pfn_t f1fv  = (pfn_t)host_gl_proc({"glProgramUniform1fv"});
+        static pfn_t f1iv  = (pfn_t)host_gl_proc({"glProgramUniform1iv"});
+        static pfn_t f2fv  = (pfn_t)host_gl_proc({"glProgramUniform2fv"});
+        static pfn_t f2iv  = (pfn_t)host_gl_proc({"glProgramUniform2iv"});
+        static pfn_t f3fv  = (pfn_t)host_gl_proc({"glProgramUniform3fv"});
+        static pfn_t f3iv  = (pfn_t)host_gl_proc({"glProgramUniform3iv"});
+        static pfn_t f4fv  = (pfn_t)host_gl_proc({"glProgramUniform4fv"});
+        static pfn_t f4iv  = (pfn_t)host_gl_proc({"glProgramUniform4iv"});
+        static pfn_t f1uiv = (pfn_t)host_gl_proc({"glProgramUniform1uiv"});
+        static pfn_t f2uiv = (pfn_t)host_gl_proc({"glProgramUniform2uiv"});
+        static pfn_t f3uiv = (pfn_t)host_gl_proc({"glProgramUniform3uiv"});
+        static pfn_t f4uiv = (pfn_t)host_gl_proc({"glProgramUniform4uiv"});
+        pfn_t f = nullptr;
+        switch (svc_no) {
+        case SVC_GL3_ProgramUniform1fv:  f = f1fv;  break;
+        case SVC_GL3_ProgramUniform1iv:  f = f1iv;  break;
+        case SVC_GL3_ProgramUniform2fv:  f = f2fv;  break;
+        case SVC_GL3_ProgramUniform2iv:  f = f2iv;  break;
+        case SVC_GL3_ProgramUniform3fv:  f = f3fv;  break;
+        case SVC_GL3_ProgramUniform3iv:  f = f3iv;  break;
+        case SVC_GL3_ProgramUniform4fv:  f = f4fv;  break;
+        case SVC_GL3_ProgramUniform4iv:  f = f4iv;  break;
+        case SVC_GL3_ProgramUniform1uiv: f = f1uiv; break;
+        case SVC_GL3_ProgramUniform2uiv: f = f2uiv; break;
+        case SVC_GL3_ProgramUniform3uiv: f = f3uiv; break;
+        default:                         f = f4uiv; break;
+        }
+        uint32_t val = r3; /* 4th arg: A32 r3 / A64 x3 */
+        if (f && val) f((GLuint)r0, (GLint)r1, (GLsizei)r2, ARM_CPTR(val));
+        break;
+    }
+    case SVC_GL3_ProgramUniformMatrix2fv:
+    case SVC_GL3_ProgramUniformMatrix3fv:
+    case SVC_GL3_ProgramUniformMatrix4fv:
+    case SVC_GL3_ProgramUniformMatrix2x3fv:
+    case SVC_GL3_ProgramUniformMatrix3x2fv:
+    case SVC_GL3_ProgramUniformMatrix2x4fv:
+    case SVC_GL3_ProgramUniformMatrix4x2fv:
+    case SVC_GL3_ProgramUniformMatrix3x4fv:
+    case SVC_GL3_ProgramUniformMatrix4x3fv: {
+        /* (program, location, count, transpose | value*) */
+        typedef void (*pfn_t)(GLuint, GLint, GLsizei, GLboolean, const GLfloat*);
+        static pfn_t fm2   = (pfn_t)host_gl_proc({"glProgramUniformMatrix2fv"});
+        static pfn_t fm3   = (pfn_t)host_gl_proc({"glProgramUniformMatrix3fv"});
+        static pfn_t fm4   = (pfn_t)host_gl_proc({"glProgramUniformMatrix4fv"});
+        static pfn_t fm23  = (pfn_t)host_gl_proc({"glProgramUniformMatrix2x3fv"});
+        static pfn_t fm32  = (pfn_t)host_gl_proc({"glProgramUniformMatrix3x2fv"});
+        static pfn_t fm24  = (pfn_t)host_gl_proc({"glProgramUniformMatrix2x4fv"});
+        static pfn_t fm42  = (pfn_t)host_gl_proc({"glProgramUniformMatrix4x2fv"});
+        static pfn_t fm34  = (pfn_t)host_gl_proc({"glProgramUniformMatrix3x4fv"});
+        static pfn_t fm43  = (pfn_t)host_gl_proc({"glProgramUniformMatrix4x3fv"});
+        pfn_t f = nullptr;
+        switch (svc_no) {
+        case SVC_GL3_ProgramUniformMatrix2fv:   f = fm2;  break;
+        case SVC_GL3_ProgramUniformMatrix3fv:   f = fm3;  break;
+        case SVC_GL3_ProgramUniformMatrix4fv:   f = fm4;  break;
+        case SVC_GL3_ProgramUniformMatrix2x3fv: f = fm23; break;
+        case SVC_GL3_ProgramUniformMatrix3x2fv: f = fm32; break;
+        case SVC_GL3_ProgramUniformMatrix2x4fv: f = fm24; break;
+        case SVC_GL3_ProgramUniformMatrix4x2fv: f = fm42; break;
+        case SVC_GL3_ProgramUniformMatrix3x4fv: f = fm34; break;
+        default:                                f = fm43; break;
+        }
+        uint32_t val = ctx.is_arm64 ? regs[4] : ctx.mem.read32(regs[13]);
+        if (f && val)
+            f((GLuint)r0, (GLint)r1, (GLsizei)r2, (GLboolean)r3,
+              (const GLfloat*)ARM_CPTR(val));
+        break;
+    }
+    case SVC_GL3_PatchParameteri: {
+        typedef void (*pfn_t)(GLenum, GLint);
+        static pfn_t f = (pfn_t)host_gl_proc({"glPatchParameteri"});
+        if (f) f((GLenum)r0, (GLint)r1);
+        break;
+    }
+    case SVC_GL3_TexStorage3DMultisample: {
+        /* (target, samples, internalformat, width | height, depth,
+         *  fixedSampleLocations) */
+        typedef void (*pfn_t)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLsizei,
+                              GLboolean);
+        static pfn_t f = (pfn_t)host_gl_proc({"glTexStorage3DMultisample"});
+        uint32_t h, d, fx;
+        if (ctx.is_arm64) {
+            h  = regs[4];
+            d  = regs[5];
+            fx = regs[6];
+        } else {
+            h  = ctx.mem.read32(regs[13]);
+            d  = ctx.mem.read32(regs[13] + 4u);
+            fx = ctx.mem.read32(regs[13] + 8u);
+        }
+        if (f) f((GLenum)r0, (GLsizei)r1, (GLenum)r2, (GLsizei)r3,
+                 (GLsizei)h, (GLsizei)d, (GLboolean)fx);
         break;
     }
 
@@ -12652,11 +13676,11 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_SIGACTION: {
         /* sigaction(signum=r0, new_act=r1, old_act=r2)
  * ARM32: struct sigaction { sa_handler(4), sa_flags(4), sa_restorer(4), sa_mask[2](8) }
- * ARM64: struct sigaction { sa_handler(8), sa_flags(8), sa_restorer(8), sa_mask(8) }
+ * A64 bionic/Linux: { sa_handler(8), sa_mask(8), sa_flags(4), pad(4), sa_restorer(8) }
  * Record handler VA so pthread_kill can simulate GC signal delivery. */
         int signum = (int)r0;
-        uint32_t new_act_va = r1;
-        uint32_t old_act_va = r2;
+        GuestVA new_act_va = ctx.is_arm64 ? g_svc_args64[1] : (GuestVA)r1;
+        GuestVA old_act_va = ctx.is_arm64 ? g_svc_args64[2] : (GuestVA)r2;
         /* Fill `oldact` *before* installing the new one.  Leaving it untouched
          * (the previous behaviour) made every save/restore pair restore
          * uninitialised stack: OPENSSL_cpuid_setup does
@@ -12665,36 +13689,47 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
          * (0xef0001b6 — literally an `svc` opcode read off the stack) as the
          * process-wide SIGILL disposition. */
         if (old_act_va) {
-            uint32_t prev = 0;
+            GuestVA prev = 0;
             if (auto it = g_sighandlers.find(signum); it != g_sighandlers.end())
                 prev = it->second;
             if (ctx.is_arm64) {
-                ctx.mem.write64((GuestVA)old_act_va, prev);
-                ctx.mem.write64((GuestVA)old_act_va + 8, 0);   /* sa_flags */
-                ctx.mem.write64((GuestVA)old_act_va + 16, 0);  /* sa_restorer */
-                ctx.mem.write64((GuestVA)old_act_va + 24, 0);  /* sa_mask */
+                /* bionic aarch64: handler, mask, flags(+pad), restorer */
+                ctx.mem.write64(old_act_va, prev);
+                ctx.mem.write64(old_act_va + 8, 0);
+                ctx.mem.write64(old_act_va + 16, 0);
+                ctx.mem.write64(old_act_va + 24, 0);
             } else {
-                ctx.mem.write32(old_act_va, prev);
-                ctx.mem.write32(old_act_va + 4, 0);            /* sa_flags */
-                ctx.mem.write32(old_act_va + 8, 0);            /* sa_restorer */
-                ctx.mem.write32(old_act_va + 12, 0);           /* sa_mask[0] */
-                ctx.mem.write32(old_act_va + 16, 0);           /* sa_mask[1] */
+                uint32_t o = (uint32_t)old_act_va;
+                ctx.mem.write32(o, (uint32_t)prev);
+                ctx.mem.write32(o + 4, 0);            /* sa_flags */
+                ctx.mem.write32(o + 8, 0);            /* sa_restorer */
+                ctx.mem.write32(o + 12, 0);           /* sa_mask[0] */
+                ctx.mem.write32(o + 16, 0);           /* sa_mask[1] */
             }
         }
         if (new_act_va) {
-            uint32_t sa_handler;
+            GuestVA sa_handler = 0;
             if (ctx.is_arm64) {
-                /* sa_handler is 8 bytes at offset 0; canonicalize to backing. */
-                uint64_t v64 = ctx.mem.read64((GuestVA)new_act_va);
-                sa_handler = a64_canon_va(v64);
+                /* Do not run a64_canon_va on the handler: the hi=1→MMAP_BASE
+                 * heuristic turned real image VAs / stubs into 0x10000000, so
+                 * pthread_kill IFB'd and GC stop-the-world never ran. */
+                sa_handler = ctx.mem.read64(new_act_va);
+                static int sa_raw = 0;
+                if (sa_raw++ < 24)
+                    fprintf(stderr, "[sigaction] sig=%d act=0x%llx raw_handler=0x%llx "
+                            "canon=%08x\n",
+                            signum, (unsigned long long)new_act_va,
+                            (unsigned long long)sa_handler,
+                            a64_canon_va(sa_handler));
             } else {
-                sa_handler = ctx.mem.read32(new_act_va);  /* offset 0 = sa_handler */
+                sa_handler = ctx.mem.read32((uint32_t)new_act_va);
             }
             if (sa_handler > 1u /* not SIG_DFL(0) or SIG_IGN(1) */) {
                 g_sighandlers[signum] = sa_handler;
                 static int sa_log = 0;
                 if (sa_log++ < 20)
-                    fprintf(stderr, "[sigaction] sig=%d handler=0x%08x\n", signum, sa_handler);
+                    fprintf(stderr, "[sigaction] sig=%d handler=0x%llx\n",
+                            signum, (unsigned long long)sa_handler);
             } else {
                 /* SIG_DFL / SIG_IGN: drop the handler.  Probes such as
                  * OPENSSL_cpuid_setup restore the previous disposition when
@@ -12714,17 +13749,19 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_BSD_SIGNAL: {
         /* bsd_signal(signum=r0, handler=r1) → returns old handler (or 0) */
         int signum = (int)r0;
-        uint32_t handler_va = r1;
-        uint32_t old_handler = 0;
+        GuestVA handler_va = ctx.is_arm64 ? g_svc_args64[1] : (GuestVA)r1;
+        GuestVA old_handler = 0;
         auto it = g_sighandlers.find(signum);
         if (it != g_sighandlers.end()) old_handler = it->second;
         if (handler_va > 1u /* not SIG_DFL/SIG_IGN */) {
             g_sighandlers[signum] = handler_va;
             static int bsd_log = 0;
             if (bsd_log++ < 20)
-                fprintf(stderr, "[bsd_signal] sig=%d handler=0x%08x\n", signum, handler_va);
+                fprintf(stderr, "[bsd_signal] sig=%d handler=0x%llx\n",
+                        signum, (unsigned long long)handler_va);
         }
-        ret32(old_handler); break;
+        if (ctx.is_arm64) ret64(old_handler); else ret32((uint32_t)old_handler);
+        break;
     }
 
     case SVC_PTHREAD_KILL: {
@@ -12742,30 +13779,34 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             fprintf(stderr, "[pthread_kill] target=0x%08x sig=%d lr=0x%08x\n",
                     target_tid, sig, regs[14]);
 
-        uint32_t handler_va = 0;
+        GuestVA handler_va = 0;
         auto it = g_sighandlers.find(sig);
         if (it != g_sighandlers.end() && it->second > 1u)
             handler_va = it->second;
 
         if (handler_va > 1u) {
             if (pkill_log <= 5)
-                fprintf(stderr, "[pthread_kill] calling handler=0x%08x for sig=%d\n",
-                        handler_va, sig);
+                fprintf(stderr, "[pthread_kill] calling handler=0x%llx for sig=%d\n",
+                        (unsigned long long)handler_va, sig);
             /* Pretend we are the target thread so pthread_self() inside the
  * signal handler (GC_suspend_handler) returns the correct TID.
  * GC_lookup_thread(tid) then finds the right per-thread GC struct. */
             uint32_t saved_tid = g_current_tid;
             g_current_tid = target_tid;
             if (ctx.is_arm64) {
-                GuestVA h64 = a64_guest_va((BackingOffset)handler_va);
+                GuestVA h64 = handler_va;
+                /* Legacy path stored 32-bit backing; promote into the image window. */
+                if (h64 < 0x100000000ull && !a64_is_guest_va(h64))
+                    h64 = a64_guest_va((BackingOffset)(uint32_t)h64);
                 (void)call_guest_cb64(ctx, h64, (uint32_t)sig, 0, 0, 0, nullptr, 0);
+                uint32_t canon = a64_canon_va(h64);
                 /* If the handler landed in the MMAP pointer-table area, IFB MMAP
                  * returned to LR without executing sem_post(GC_ack_sem).  Credit
                  * one ack so the GC sem_getvalue polling loop can exit. */
-                if (handler_va >= MMAP_BASE && handler_va < MMAP_END)
+                if (canon >= MMAP_BASE && canon < MMAP_END)
                     ++g_gc_pending_acks;
             } else {
-                (void)call_guest_cb(ctx, handler_va, (uint32_t)sig, 0);
+                (void)call_guest_cb(ctx, (uint32_t)handler_va, (uint32_t)sig, 0);
             }
             g_current_tid = saved_tid;
         } else if (pkill_log <= 5)
@@ -13542,16 +14583,24 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         ret32(0); break;
     }
     case SVC_LOG_VPRINT: {
-        const char *tag = ctx.mem.cstr(r1);
-        const char *fmt = ctx.mem.cstr(r2);
+        const char *tag = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[1]) : ctx.mem.cstr(r1);
+        const char *fmt = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[2]) : ctx.mem.cstr(r2);
         if (getenv("LUNARIA_TRACE_LOG")) {
             fprintf(stderr, "[log_vprint] prio=%u tag=%#x fmt=%#x va=%#x lr=%#x fmt_str=%s\n",
                     r0, r1, r2, r3, regs[14], fmt ? fmt : "(null)");
         }
-        ArmVarArgs ap{ctx, regs, 0, r3, true, ctx.is_arm64};
+        ArmVarArgs ap = make_arm_varargs(ctx, regs, 0, 3, true);
         std::string s = arm_vformat(ctx, fmt, ap);
         fprintf(stderr, "[android_log p=%u t=%s lr=0x%08x] %s\n",
                 r0, tag?tag:"?", regs[14], s.c_str());
+        if (ctx.is_arm64 && g_dbg_asset_buf && s.find("Build target") != std::string::npos) {
+            const uint8_t *p = ctx.mem.ptr(g_dbg_asset_buf);
+            uint32_t plat = 0;
+            if (g_dbg_asset_len >= 63)
+                std::memcpy(&plat, p + 59, 4);
+            fprintf(stderr, "[dbg-asset] vprint error: dest=0x%llx platLE=%u printed='%s'\n",
+                    (unsigned long long)g_dbg_asset_buf, plat, s.c_str());
+        }
         ret32(0); break;
     }
 
@@ -13651,65 +14700,101 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_PREAD: {
-        /* bionic LP32: pread(fd, buf, count, off_t(32bit) r3) */
-        ssize_t n = (r1) ? pread((int)r0, ctx.mem.ptr(r1), (size_t)r2, (off_t)(int32_t)r3)
-                         : -1;
+        /* bionic LP32: pread(fd, buf, count, off_t(32bit) r3)
+         * AAPCS64: fd=x0, buf=x1, count=x2, off=x3 */
+        void *buf = ctx.is_arm64 ? (void *)ctx.mem.ptr(g_svc_args64[1])
+                                 : (void *)ctx.mem.ptr(r1);
+        size_t cnt = ctx.is_arm64 ? a64_buf_len(g_svc_args64[2]) : (size_t)r2;
+        off_t off = ctx.is_arm64 ? (off_t)(int64_t)g_svc_args64[3]
+                                 : (off_t)(int32_t)r3;
+        ssize_t n = -1;
+        if (buf) {
+            if (ctx.is_arm64)
+                n = a64_guest_pread(ctx.mem, g_svc_args64[1], cnt, (int)r0, off);
+            else
+                n = pread((int)r0, buf, cnt, off);
+        }
         ret32((uint32_t)n);
         break;
     }
     case SVC_PWRITE: {
-        ssize_t n = (r1) ? pwrite((int)r0, ctx.mem.ptr(r1), (size_t)r2, (off_t)(int32_t)r3)
-                         : -1;
+        const void *buf = ctx.is_arm64 ? (const void *)ctx.mem.ptr(g_svc_args64[1])
+                                       : (const void *)ctx.mem.ptr(r1);
+        size_t cnt = ctx.is_arm64 ? a64_buf_len(g_svc_args64[2]) : (size_t)r2;
+        off_t off = ctx.is_arm64 ? (off_t)(int64_t)g_svc_args64[3]
+                                 : (off_t)(int32_t)r3;
+        ssize_t n = (buf) ? pwrite((int)r0, buf, cnt, off) : -1;
         ret32((uint32_t)n);
         break;
     }
     case SVC_PREAD64: {
-        /* pread64(fd, buf, count, off64): 8-byte-aligned offset spills to the
-         * stack (r3 skipped as padding).  [sp]=lo, [sp+4]=hi. */
+        /* pread64(fd, buf, count, off64): LP32 aligns offset onto the stack
+         * (r3 skipped).  AAPCS64: buf=x1, count=x2, off=x3. */
         uint64_t off = 0;
-        if (regs[13]) off = (uint64_t)ctx.mem.read32(regs[13]) |
-                            ((uint64_t)ctx.mem.read32(regs[13] + 4) << 32);
-        ssize_t n = (r1) ? pread((int)r0, ctx.mem.ptr(r1), (size_t)r2, (off_t)off)
-                         : -1;
+        void *buf;
+        size_t cnt;
+        if (ctx.is_arm64) {
+            buf = (void *)ctx.mem.ptr(g_svc_args64[1]);
+            cnt = a64_buf_len(g_svc_args64[2]);
+            off = g_svc_args64[3];
+        } else {
+            if (regs[13]) off = (uint64_t)ctx.mem.read32(regs[13]) |
+                                ((uint64_t)ctx.mem.read32(regs[13] + 4) << 32);
+            buf = (void *)ctx.mem.ptr(r1);
+            cnt = (size_t)r2;
+        }
+        ssize_t n = -1;
+        if (buf) {
+            if (ctx.is_arm64)
+                n = a64_guest_pread(ctx.mem, g_svc_args64[1], cnt, (int)r0, (off_t)off);
+            else
+                n = pread((int)r0, buf, cnt, (off_t)off);
+        }
         if (getenv("LUNARIA_TRACE_FILE")) {
             char lp[96] = {0}, proc[64];
             snprintf(proc, sizeof proc, "/proc/self/fd/%d", (int)r0);
             ssize_t ll = readlink(proc, lp, sizeof(lp) - 1);
             if (ll > 0) lp[ll] = '\0';
-            fprintf(stderr, "[pread64] fd=%d buf=0x%08x cnt=%u off=%llu -> %zd "
-                    "errno=%d sp=0x%08x tid=%u path=%s lr=0x%08x\n",
-                    (int)r0, r1, r2, (unsigned long long)off, n, errno,
-                    regs[13], g_current_tid, lp, regs[14]);
-            if (!r1) {
-                /* NULL destination: dump plausible return addresses off the
-                 * guest stack so the caller can be symbolised offline. */
-                fprintf(stderr, "[pread64] NULL dst — stack:");
-                for (uint32_t i = 0; i < 1200; ++i) {
-                    uint32_t w = ctx.mem.read32(regs[13] + i * 4u);
-                    /* libUE4.so .text only (data/rodata sit far below). */
-                    if (w >= 0x06000000u && w < 0x0e000000u)
-                        fprintf(stderr, " 0x%08x", w);
-                }
-                fprintf(stderr, "\n");
-            }
+            fprintf(stderr, "[pread64] fd=%d buf=0x%llx cnt=%zu off=%llu -> %zd "
+                    "errno=%d tid=%u path=%s lr=0x%08x\n",
+                    (int)r0, (unsigned long long)(ctx.is_arm64 ? g_svc_args64[1] : r1),
+                    cnt, (unsigned long long)off, n, errno,
+                    g_current_tid, lp, regs[14]);
         }
         ret32((uint32_t)n);
         break;
     }
     case SVC_PWRITE64: {
         uint64_t off = 0;
-        if (regs[13]) off = (uint64_t)ctx.mem.read32(regs[13]) |
-                            ((uint64_t)ctx.mem.read32(regs[13] + 4) << 32);
-        ssize_t n = (r1) ? pwrite((int)r0, ctx.mem.ptr(r1), (size_t)r2, (off_t)off)
-                         : -1;
+        const void *buf;
+        size_t cnt;
+        if (ctx.is_arm64) {
+            buf = (const void *)ctx.mem.ptr(g_svc_args64[1]);
+            cnt = a64_buf_len(g_svc_args64[2]);
+            off = g_svc_args64[3];
+        } else {
+            if (regs[13]) off = (uint64_t)ctx.mem.read32(regs[13]) |
+                                ((uint64_t)ctx.mem.read32(regs[13] + 4) << 32);
+            buf = (const void *)ctx.mem.ptr(r1);
+            cnt = (size_t)r2;
+        }
+        ssize_t n = (buf) ? pwrite((int)r0, buf, cnt, (off_t)off) : -1;
         ret32((uint32_t)n);
         break;
     }
     case SVC_FGETS: {
         FILE *f = resolve_file(ctx, r2);
-        if (!f || !r0 || r1 == 0) { ret32(0); break; }
-        char *p = fgets((char*)ctx.mem.ptr(r0), (int)r1, f);
-        ret32(p ? r0 : 0u);
+        GuestVA dst_va = ctx.is_arm64 ? g_svc_args64[0] : (GuestVA)r0;
+        int lim = ctx.is_arm64 ? (int)g_svc_args64[1] : (int)r1;
+        if (!f || !dst_va || lim <= 0) { ret32(0); break; }
+        char *dst = (char *)ctx.mem.ptr(dst_va);
+        char *p = fgets(dst, lim, f);
+        if (ctx.is_arm64) {
+            if (p) retarg0();
+            else ret32(0);
+        } else {
+            ret32(p ? r0 : 0u);
+        }
         break;
     }
     case SVC_FILENO: {
@@ -15190,7 +16275,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_AASSETMGR_OPEN: {
         /* AAssetManager_open(AAssetManager* mgr[r0], const char* filename[r1], int mode[r2]) */
-        const char *fname = r1 ? (const char*)ctx.mem.ptr(r1) : nullptr;
+        const char *fname = ctx.is_arm64
+            ? (g_svc_args64[1] ? (const char *)ctx.mem.ptr(g_svc_args64[1]) : nullptr)
+            : (r1 ? (const char *)ctx.mem.ptr(r1) : nullptr);
         if (!fname) { ret32(0); break; }
         static const char *prefixes[] = {
             "assets/", "base/assets/", "UnityDataAssetPack/assets/", nullptr
@@ -16675,7 +17762,7 @@ public:
             auto sh = g_sighandlers.find(GUEST_SIGILL);
             if (sh != g_sighandlers.end() && sh->second > 1u) {
                 auto &regs = jit->Regs();
-                uint32_t handler = sh->second;
+                uint32_t handler = (uint32_t)sh->second;
                 static int sigill_log = 0;
                 if (sigill_log++ < 8)
                     fprintf(stderr, "[sigill] undefined instr 0x%08x at 0x%08x → "
@@ -19367,14 +20454,24 @@ extern "C" uint32_t arm_exec_native_window_va(void) {
 
 extern "C" void arm_exec_egl_swap(void) {
     if (g_glfw) glfwPollEvents();
-    /* Ensure context is current (Unity 4.x may have released it) */
+    /* Ensure context is current only after Unity released/replaced it.
+     * Re-binding an already-current EGL context between Unity frames makes
+     * Mesa's GLES state tracker restart at TEXTURE0 on this host.  Unity's
+     * renderer caches the active unit and therefore omits the corresponding
+     * glActiveTexture call on the next frame: _MainTex (unit 1) and
+     * _GUIClipTexture (unit 0) then sample the wrong/empty bindings. */
     if (g_egl_ctx != EGL_NO_CONTEXT && g_egl_dpy != EGL_NO_DISPLAY &&
-        g_egl_surf != EGL_NO_SURFACE)
+        g_egl_surf != EGL_NO_SURFACE &&
+        (eglGetCurrentDisplay() != g_egl_dpy ||
+         eglGetCurrentContext() != g_egl_ctx ||
+         eglGetCurrentSurface(EGL_DRAW) != g_egl_surf ||
+         eglGetCurrentSurface(EGL_READ) != g_egl_surf))
         eglMakeCurrent(g_egl_dpy, g_egl_surf, g_egl_surf, g_egl_ctx);
     /* Skip swap if ARM guest already swapped via eglSwapBuffers SVC */
     if (!g_arm_did_swap &&
         g_egl_dpy != EGL_NO_DISPLAY && g_egl_surf != EGL_NO_SURFACE) {
         eglSwapBuffers(g_egl_dpy, g_egl_surf);
+        gl_restore_texture_units();
         ++g_host_egl_swap_count;
         if (getenv("LUNARIA_TRACE_EGL")) {
             static uint64_t n = 0;
@@ -19415,6 +20512,7 @@ extern "C" void arm_exec_svc_ring_dump(void) {
  * heap offsets such as 0x17040 fall inside libc++/libil2cpp ranges and were
  * wrongly redirected into .text (RX stores / null vtables). */
 static uint32_t a64_canon_va(uint64_t va) {
+    /* Image window first — never let a preferred-heap alias steal code VAs. */
     if (a64_is_guest_va(va))
         return (BackingOffset)(va - A64_GUEST_BASE);
     uint32_t lo = (uint32_t)va;
@@ -19467,11 +20565,31 @@ static uint32_t a64_canon_va(uint64_t va) {
     return lo;
 }
 
+/* Pick a preferred high VA that does not collide with the flat image window
+ * or an existing alias.  Returns 0 on exhaustion. */
+static GuestVA a64_mint_preferred(GuestVA preferred) {
+    const uint32_t image_hi = (uint32_t)(A64_GUEST_BASE >> 32);
+    uint32_t hi = (uint32_t)(preferred >> 32);
+    if (preferred && hi != 0 && hi <= 0xffffu && hi != image_hi &&
+        !g_a64_pref_aliases.count(hi))
+        return preferred & ~0xfffull;
+    while (g_a64_mmap_slot < 0xffu) {
+        uint32_t slot = g_a64_mmap_slot++;
+        GuestVA cand = (GuestVA)slot << 40;
+        uint32_t chi = (uint32_t)(cand >> 32);
+        if (chi == 0 || chi == image_hi || chi > 0xffffu) continue;
+        if (g_a64_pref_aliases.count(chi)) continue;
+        return cand;
+    }
+    return 0;
+}
+
 static GuestVA a64_record_pref_alias(GuestVA preferred, BackingOffset backing,
                                      uint32_t raw_len) {
-    uint32_t hi = (uint32_t)(preferred >> 32);
-    if (hi == 0 || hi > 0xffffu)
+    preferred = a64_mint_preferred(preferred);
+    if (!preferred)
         return 0;
+    uint32_t hi = (uint32_t)(preferred >> 32);
     uint32_t size = (raw_len + 4095u) & ~4095u;
     GuestVA guest = preferred & ~0xfffull;
     A64PrefAlias alias;
@@ -19908,6 +21026,11 @@ public:
                            svc_no < SVC_MATH_D1_BASE + SVC_MATH_D1_COUNT);
         auto is_math_d2 = (svc_no >= SVC_MATH_D2_BASE &&
                            svc_no < SVC_MATH_D2_BASE + SVC_MATH_D2_COUNT);
+        /* GLES scalar floats are likewise hard-float on A64.  Softfp handlers
+         * in dispatch_svc read IEEE bits from GPRs via rf(rN). */
+        auto sbits = [&](int vi) -> uint32_t {
+            return (uint32_t)jit64->GetVector((size_t)vi)[0];
+        };
         if (is_math_f1 || is_math_f2 || is_math_d1 || is_math_d2) {
             Dynarmic::A64::Vector v0 = jit64->GetVector(0);
             Dynarmic::A64::Vector v1 = jit64->GetVector(1);
@@ -19922,6 +21045,35 @@ public:
                 x2 = (uint32_t)v1[0];
                 x3 = (uint32_t)(v1[0] >> 32);
             }
+        } else if (svc_no == SVC_GL_ClearColor || svc_no == SVC_GL_BlendColor) {
+            /* (f,f,f,f) in s0..s3 */
+            x0 = sbits(0); x1 = sbits(1); x2 = sbits(2); x3 = sbits(3);
+        } else if (svc_no == SVC_GL_ClearDepthf || svc_no == SVC_GL_LineWidth) {
+            x0 = sbits(0);
+        } else if (svc_no == SVC_GL_DepthRangef || svc_no == SVC_GL_PolygonOffset) {
+            x0 = sbits(0); x1 = sbits(1);
+        } else if (svc_no == SVC_GL_SampleCoverage) {
+            /* (float value, bool invert) — s0 + w1 */
+            x0 = sbits(0);
+            /* x1 already holds invert from GetRegister */
+        } else if (svc_no == SVC_GL_TexParameterf) {
+            /* (target, pname, param) — w0,w1 + s0 */
+            x2 = sbits(0);
+        } else if (svc_no == SVC_GL_Uniform1f || svc_no == SVC_GL_VertexAttrib1f) {
+            /* (loc/idx, f) — w0 + s0 */
+            x1 = sbits(0);
+        } else if (svc_no == SVC_GL_Uniform2f || svc_no == SVC_GL_VertexAttrib2f) {
+            x1 = sbits(0); x2 = sbits(1);
+        } else if (svc_no == SVC_GL_Uniform3f || svc_no == SVC_GL_VertexAttrib3f) {
+            x1 = sbits(0); x2 = sbits(1); x3 = sbits(2);
+        } else if (svc_no == SVC_GL_Uniform4f || svc_no == SVC_GL_VertexAttrib4f) {
+            /* 4th float normally spills; put it in x4 for softfp Uniform4f */
+            x1 = sbits(0); x2 = sbits(1); x3 = sbits(2); x4 = sbits(3);
+        } else if (svc_no == SVC_GL3_ClearBufferfi) {
+            /* (buffer, drawbuffer, depth:f, stencil:i) — w0,w1 + s0 + w2 */
+            uint64_t stencil = x2;
+            x2 = sbits(0);
+            x3 = stencil;
         }
 
         if (getenv("LUNARIA_TRACE_SVC")) {
@@ -19983,6 +21135,7 @@ public:
         g_svc_args64 = {x0, x1, x2, x3, x4, x5, x6, x7};
         g_svc_ret64 = false;
         g_svc_retptr = false;
+        g_svc_ret_arg0 = false;
         dispatch_svc(*ctx, svc_no, regs32);
 
         if (is_math_f1 || is_math_f2) {
@@ -19998,7 +21151,8 @@ public:
             jit64->SetVector(0, v0);
             jit64->SetRegister(0, bits);
         } else if (g_svc_retptr) {
-            jit64->SetRegister(0, regs32[0] ? a64_guest_va(regs32[0]) : 0);
+            jit64->SetRegister(0, g_svc_ret_arg0
+                ? x0 : (regs32[0] ? a64_guest_va(regs32[0]) : 0));
         } else if (g_svc_ret64) {
             jit64->SetRegister(0, (uint64_t)regs32[0] | ((uint64_t)regs32[1] << 32));
         } else {
