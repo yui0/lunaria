@@ -26,6 +26,7 @@ bins = lunaria
 libs = runtime/libpthread.so runtime/libdl.so runtime/libc.so runtime/libandroid.so \
        runtime/liblog.so runtime/libEGL.so runtime/libOpenSLES.so runtime/libjvm.so \
        runtime/libm.so runtime/libz.so runtime/libmediandk.so runtime/libGLESv3.so
+libs += runtime/libvulkan.so
 
 all: $(bins)
 
@@ -107,10 +108,16 @@ runtime/libOpenSLES.so: trace.o
 	$(CC) $(CFLAGS) -Wno-pedantic -fPIC $(CPPFLAGS) $(LDFLAGS) -Isrc/lib -shared trace.o \
 	    src/lib/stub.c -DLUNARIA_STUB_OPENSLES -o $@
 
-runtime/libjvm.so: trace.o src/jvm/jvm.c src/jvm/jni_stubs.c
+DVM_SRC = src/dvm/dex.c src/dvm/dvm.c src/dvm/dvm_runtime.c src/dvm/dvm_jni.c
+DVM_HDR = src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h
+
+# The Dalvik bytecode emulator lives in libjvm.so: it is reached from jvm.c
+# (a JNI call with no host stub) and it calls back out through the same JNI
+# table, so the two have to be in one object.
+runtime/libjvm.so: trace.o src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/jvm.h src/jvm/jni.h $(DVM_SRC) $(DVM_HDR)
 	mkdir -p runtime
 	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE -Wno-pedantic $(LDFLAGS) -shared \
-	    trace.o src/jvm/jvm.c src/jvm/jni_stubs.c -o $@
+	    trace.o src/jvm/jvm.c src/jvm/jni_stubs.c $(DVM_SRC) -lm -o $@
 
 runtime/libm.so:
 	mkdir -p runtime
@@ -127,6 +134,10 @@ runtime/libmediandk.so:
 runtime/libGLESv3.so:
 	mkdir -p runtime
 	$(STUB_SO) -DLUNARIA_STUB_GLESV3 -D_GNU_SOURCE -o $@ -lGLESv2
+
+runtime/libvulkan.so:
+	mkdir -p runtime
+	$(STUB_SO) -DLUNARIA_STUB_VULKAN -o $@
 
 # trick linker to link against unversioned libs
 libdl.so: runtime/libdl.so
@@ -152,12 +163,13 @@ lunaria: loader.o arm_exec.o trace.o libdl.so libpthread.so \
        runtime/libEGL.so runtime/libOpenSLES.so \
        runtime/libjvm.so runtime/libm.so runtime/libz.so \
        runtime/libmediandk.so runtime/libGLESv3.so
+lunaria: runtime/libvulkan.so
 	$(CXX) -std=c++20 -O2 -g \
 	    -L. -Wl,-Y,runtime,-rpath,$(PREFIX)$(LIBDIR)$(RUNTIMEDIR) $(LDFLAGS) \
 	    loader.o arm_exec.o trace.o \
 	    $(DYNARMIC_LIBS) \
 	    -ldl -lpthread -ljvm \
-	    `pkg-config --libs glfw3` -lEGL -lGLESv2 -lz -o $@
+	    `pkg-config --libs glfw3` -lEGL -lGLESv2 -lz -lcrypto -o $@
 
 install-bin: $(bins)
 	install -Dm755 $(bins) -t "$(DESTDIR)$(PREFIX)$(BINDIR)"
@@ -170,10 +182,100 @@ install: install-bin install-lib
 clean:
 	$(RM) $(bins) trace.o arm_exec.o loader.o libdl.so libpthread.so
 	$(RM) -r runtime
-	$(RM) test/test_dynarmic_arm test/test_unity
+	$(RM) test/test_dynarmic_arm test/test_unity test/test_dvm test/dvm_test.dex
+	$(RM) test/libabitest64.so test/libabitest32.so test/abi_test_values.h
+	$(RM) test/abi_pkg/classes.dex
 
 test: lunaria test/libunity.so test/test_dynarmic_arm
 	sh test/run_tests.sh
+
+# --- Dalvik bytecode emulator ---------------------------------------------
+# test/dvm_test.dex is assembled by test/make_dex.py: there is no d8 in this
+# tree, and a real APK only exercises the opcodes that app happens to use.
+test/dvm_test.dex: test/make_dex.py
+	python3 test/make_dex.py $@
+
+# Built with the sanitizers on: the interesting failure mode for an
+# interpreter over third-party bytecode is reading outside the mapping, which
+# a plain wrong-answer check would not catch.
+test/test_dvm: test/dvm_test.c $(DVM_SRC) $(DVM_HDR)
+	$(CC) -std=c11 -g -O1 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -Isrc \
+	    -fsanitize=address,undefined \
+	    test/dvm_test.c $(DVM_SRC:src/dvm/dvm_jni.c=) -lm -o $@
+
+# Pass a real classes.dex as DVM_DEX to also run every method in it.
+DVM_DEX ?=
+dvm-test: test/test_dvm test/dvm_test.dex
+	./test/test_dvm test/dvm_test.dex $(DVM_DEX)
+
+# Guest-side socket exercise: an AArch64 .so with no libc, talking to a local
+# HTTP server through the emulator's socket SVCs (see test/net_test.c).
+# Needs clang with the aarch64 target and lld; both come with the clang
+# package listed in the prerequisites.
+test/libnettest.so: test/net_test.c
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
+	    -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libnettest.so \
+	    -o $@ $<
+
+# The loader exits non-zero after JNI_OnLoad because a bare .so has no game
+# entry point, so the verdict comes from the test's own RESULT line.
+net-test: lunaria test/libnettest.so
+	@python3 test/net_test_server.py & echo $$! > .nettest.pid; \
+	sleep 1; \
+	LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" ./lunaria test/libnettest.so 2>&1 \
+	    | tee .nettest.out | grep -E 'nettest|^\[net\]'; \
+	kill `cat .nettest.pid` 2>/dev/null; rm -f .nettest.pid; \
+	grep -q 'RESULT PASS' .nettest.out; rc=$$?; rm -f .nettest.out; exit $$rc
+
+# Guest-side JNI calling-convention exercise.  The dex declares `native`
+# methods taking jlong / jfloat / jdouble — and more of them than either ABI
+# has argument registers for — and the guest .so checks what actually arrived
+# and what came back.  Built for both ABIs on purpose: armeabi-v7a passes
+# floating point in even-aligned core register pairs (softfp), arm64-v8a in a
+# separate v-register sequence, so one build proves nothing about the other.
+test/abi_test_values.h test/abi_pkg/classes.dex: test/make_abi_dex.py test/make_dex.py
+	python3 test/make_abi_dex.py test/abi_pkg/classes.dex test/abi_test_values.h
+
+# -ffreestanding -nostdlibinc: there is no target sysroot here, so jni.h's
+# <stdint.h> / <stdarg.h> have to come from clang's own resource directory.
+ABI_TEST_CFLAGS = -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 \
+	-fuse-ld=lld -Isrc -Itest -Wall -Wextra -Wno-unused-parameter \
+	-Wl,--unresolved-symbols=ignore-all
+
+test/libabitest64.so: test/abi_test.c test/abi_test_values.h
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) \
+	    -Wl,-soname,libabitest64.so -o $@ $<
+
+test/libabitest32.so: test/abi_test.c test/abi_test_values.h
+	clang -target armv7a-linux-gnueabi -mfloat-abi=softfp -mfpu=vfpv3 \
+	    $(ABI_TEST_CFLAGS) -Wl,-soname,libabitest32.so -o $@ $<
+
+test/libschedtest64.so: test/sched_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) \
+	    -Wl,-soname,libschedtest64.so -o $@ $<
+
+# Scheduler hand-off: a thread parked on a mutex must be woken by the release,
+# not by whether a scheduler pass happens to sample the lock while it is free.
+# armeabi-v7a is not covered — see the comment in test/sched_test.c.
+sched-test: lunaria test/libschedtest64.so
+	@LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" ./lunaria test/libschedtest64.so 2>&1 \
+	    | tee .schedtest.out | grep -E 'schedtest' || true; \
+	rc=0; grep -q 'RESULT PASS' .schedtest.out || rc=1; \
+	rm -f .schedtest.out; exit $$rc
+
+# As with net-test, the loader exits non-zero because a bare .so has no game
+# entry point; the verdict is the test's own RESULT line.
+abi-test: lunaria test/libabitest64.so test/libabitest32.so test/abi_pkg/classes.dex
+	@rc=0; for so in test/libabitest64.so test/libabitest32.so; do \
+	    printf '=== %s\n' "$$so"; \
+	    ANDROID_PACKAGE_CODE_PATH="$(PWD)/test/abi_pkg" \
+	    LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" ./lunaria $$so 2>&1 \
+	        | tee .abitest.out | grep -E 'abitest|^\[dvm\]' || true; \
+	    grep -q 'RESULT PASS' .abitest.out || rc=1; \
+	    grep -q 'VARARGS 11 22 33 44 55 66 ok 1122334455667788' .abitest.out \
+	        || { printf 'FAIL: host mis-formatted the guest log line\n'; rc=1; }; \
+	    rm -f .abitest.out; \
+	done; exit $$rc
 
 # Download a real Unity APK and extract libunity.so for static-analysis tests.
 # Source: Daggerfall Unity Android port (open source, MIT-licensed Unity wrapper)
@@ -249,5 +351,22 @@ $(BTW_APK):
 test/btw_libunity.so: $(BTW_APK)
 	unzip -p $< "base/lib/armeabi-v7a/libunity.so" > $@
 
+# ---------------------------------------------------------------------------
+# Blade & Soul Revolution (UnrealEngineAndroidSamples) — UE4 arm64 APK
+# https://github.com/Abhishrut/UnrealEngineAndroidSamples
+# ---------------------------------------------------------------------------
+BLADE_SOUL_APK_URL = https://raw.githubusercontent.com/Abhishrut/UnrealEngineAndroidSamples/main/Blade%20Soul%20Revolution_v2.00.146.1_apkpure.com.apk
+BLADE_SOUL_APK     = test/blade-soul.apk
+
+fetch-blade-soul: $(BLADE_SOUL_APK)
+	@printf 'Blade & Soul Revolution APK ready: $(BLADE_SOUL_APK)\n'
+
+$(BLADE_SOUL_APK):
+	curl -L --fail --retry 3 "$(BLADE_SOUL_APK_URL)" -o $@
+
+# Aggregate: download all sample APKs used for development / regression.
+fetch: fetch-libunity fetch-btw fetch-blade-soul
+
 .PHONY: all x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
-        clean install install-bin install-lib test fetch-libunity fetch-btw dynarmic-build
+        clean install install-bin install-lib test net-test dvm-test abi-test \
+        fetch fetch-libunity fetch-btw fetch-blade-soul dynarmic-build

@@ -11,20 +11,59 @@ argv0="$0"
 msg() { printf -- '%s: %s\n' "${argv0##*/}" "$@" 1>&2; }
 err() { msg "$@"; exit 1; }
 
-[ -z "$1" ] && err 'usage: <apk>'
-pkgfile="$(realpath "$1")"
+[ -z "$1" ] && err 'usage: <apk-or-xapk>'
+inputfile="$(realpath "$1")"
+pkgfile="$inputfile"
+xapk_dir=""
+xapk_splits=""
+
+# XAPK is an install container. Keep every contained APK byte-for-byte intact:
+# use its base APK as nativeFile and overlay split contents only in the
+# temporary installed-package view created below.
+case "$inputfile" in
+    *.xapk|*.XAPK)
+        xapk_dir="$(mktemp -d)"
+        unzip -q "$inputfile" -d "$xapk_dir" || err "extract xapk failed"
+        _xapk_info="$(python3 - "$xapk_dir" <<'PYEOF'
+import json, os, sys
+root = sys.argv[1]
+with open(os.path.join(root, 'manifest.json'), encoding='utf-8') as f:
+    manifest = json.load(f)
+apks = manifest.get('split_apks') or []
+base = next((a.get('file') for a in apks if a.get('id') == 'base'), None)
+if not base:
+    base = next((a.get('file') for a in apks if a.get('file', '').endswith('.apk')), None)
+if not base or not os.path.isfile(os.path.join(root, base)):
+    raise SystemExit('XAPK manifest has no usable base APK')
+print(base)
+for apk in apks:
+    name = apk.get('file')
+    if name and name != base and os.path.isfile(os.path.join(root, name)):
+        print(name)
+PYEOF
+)" || err "invalid xapk manifest"
+        _xapk_base="$(printf '%s\n' "$_xapk_info" | head -n 1)"
+        xapk_splits="$(printf '%s\n' "$_xapk_info" | tail -n +2)"
+        pkgfile="$xapk_dir/$_xapk_base"
+        msg "xapk base: $_xapk_base"
+        [ -n "$xapk_splits" ] && msg "xapk splits: $(printf '%s' "$xapk_splits" | tr '\n' ' ')"
+        ;;
+esac
 
 # Prefer arm64-v8a (A64 JIT); fall back to armeabi-v7a (A32 JIT).
 # Override with LUNARIA_ARCH=armeabi-v7a|arm64-v8a for comparisons.
 if [ -n "$LUNARIA_ARCH" ]; then
     arch="$LUNARIA_ARCH"
-elif unzip -l "$1" 2>/dev/null | grep -q 'lib/arm64-v8a/'; then
+elif unzip -l "$pkgfile" 2>/dev/null | grep -q 'lib/arm64-v8a/' ||
+     { [ -n "$xapk_splits" ] && printf '%s\n' "$xapk_splits" | while IFS= read -r _s; do
+           unzip -l "$xapk_dir/$_s" 2>/dev/null
+       done | grep -q 'lib/arm64-v8a/'; }; then
     arch="arm64-v8a"
 else
     arch="armeabi-v7a"
 fi
 
-pkgname="$(python3 - "$1" <<'PYEOF'
+pkgname="$(python3 - "$pkgfile" <<'PYEOF'
 import sys, zipfile, struct, re
 
 def parse_axml_package(data):
@@ -102,8 +141,14 @@ PYEOF
 [ -z "$pkgname" ] && err "not a valid apk (missing package name)"
 
 tmpdir="$(mktemp -d)"
-trap 'rm -rf "$tmpdir"' EXIT
-unzip "$1" -d "$tmpdir"
+trap 'rm -rf "$tmpdir"; [ -z "$xapk_dir" ] || rm -rf "$xapk_dir"' EXIT
+unzip -q "$pkgfile" -d "$tmpdir"
+if [ -n "$xapk_splits" ]; then
+    printf '%s\n' "$xapk_splits" | while IFS= read -r _split; do
+        [ -n "$_split" ] || continue
+        unzip -q -n "$xapk_dir/$_split" -d "$tmpdir"
+    done
+fi
 
 # Mono looks for assemblies at <PACKAGE_CODE_PATH>/assets/bin/Data/Managed/mono/2.0/
 # Also needs mono/config in the mono/ directory.
@@ -149,7 +194,15 @@ if [ "$has_legacy_splits" -eq 1 ]; then
     ( cd "$tmpdir" && zip -0 -q -r "$repacked" . -x 'lunaria-legacy-splits.apk' ) || err "repack apk failed"
     export ANDROID_APK_FILE="$repacked"
 else
-    export ANDROID_APK_FILE="$pkgfile"
+    # UE opens ANDROID_APK_FILE with open() after TCHAR↔narrow conversion.
+    # Under the guest C locale, non-ASCII path bytes (e.g. 特許 in this
+    # workspace) become '?' and the open fails — so the in-APK OBB is never
+    # mounted and PreInit dies on the missing .uproject.  Hand the guest an
+    # ASCII path by hard-linking (or copying) into the already-ASCII tmpdir.
+    _apk_guest="$tmpdir/base.apk"
+    ln "$pkgfile" "$_apk_guest" 2>/dev/null || cp -f "$pkgfile" "$_apk_guest" \
+        || err "stage apk for guest open failed"
+    export ANDROID_APK_FILE="$_apk_guest"
 fi
 
 if [ -d "$managed_dir" ]; then
@@ -212,25 +265,113 @@ mkdir -p "$ANDROID_EXTERNAL_OBB_DIR"
 # ("Project file not found" → LaunchAndroid.cpp assert).  Pick up an .obb
 # sitting beside the APK and expose it both under the conventional on-device
 # path and via ANDROID_OBB_MAIN/PATCH (handed to nativeSetObbFilePaths).
+# Only accept package-scoped OBB names (main.<ver>.<pkg>.obb).  A bare
+# main.*.obb fallback would steal a neighbour title's expansion when several
+# APKs share a directory — Blade & Soul sits next to FPSMobile's OBB in
+# test/, and the wrong file then blocks assets/main.obb.png below.
 apkdir="$(dirname "$pkgfile")"
-for _obb in "$apkdir"/main.*."$pkgname".obb "$apkdir"/main.*.obb; do
+for _obb in "$apkdir"/main.*."$pkgname".obb; do
     [ -f "$_obb" ] || continue
     export ANDROID_OBB_MAIN="$_obb"
     break
 done
-for _obb in "$apkdir"/patch.*."$pkgname".obb "$apkdir"/patch.*.obb; do
+for _obb in "$apkdir"/patch.*."$pkgname".obb; do
     [ -f "$_obb" ] || continue
     export ANDROID_OBB_PATCH="$_obb"
     break
 done
+
+# Play Asset Delivery/XAPK packages commonly put the expansion zip in a split
+# APK as assets/main.obb.png.  It is still an ordinary, byte-for-byte OBB zip;
+# the .png suffix merely keeps bundle tooling from treating it specially.  The
+# split has already been overlaid into the temporary installed-package view, so
+# expose that exact file to UE's nativeSetObbFilePaths instead of claiming that
+# the base APK itself contains the OBB.  This neither repacks nor patches any
+# package content.
+if [ -z "$ANDROID_OBB_MAIN" ] && [ -f "$tmpdir/assets/main.obb.png" ]; then
+    export ANDROID_OBB_MAIN="$tmpdir/assets/main.obb.png"
+fi
+if [ -z "$ANDROID_OBB_PATCH" ] && [ -f "$tmpdir/assets/patch.obb.png" ]; then
+    export ANDROID_OBB_PATCH="$tmpdir/assets/patch.obb.png"
+fi
 if [ -n "$ANDROID_OBB_MAIN" ]; then
-    # /sdcard/Android/obb/<pkg>/ layout, for the engine's default search path
+    # /sdcard/Android/obb/<pkg>/ layout, for the engine's default search path.
+    # UE looks for main.<version>.<package>.obb (version comes from
+    # nativeSetObbInfo; lunaria passes 1).  Also keep the raw basename link.
     _obbdir="$ANDROID_EXTERNAL_FILES_DIR/Android/obb/$pkgname"
     mkdir -p "$_obbdir"
     ln -sf "$ANDROID_OBB_MAIN" "$_obbdir/$(basename "$ANDROID_OBB_MAIN")"
+    ln -sf "$ANDROID_OBB_MAIN" "$_obbdir/main.1.$pkgname.obb"
     ln -sf "$ANDROID_OBB_MAIN" "$ANDROID_EXTERNAL_OBB_DIR/$(basename "$ANDROID_OBB_MAIN")"
-    [ -n "$ANDROID_OBB_PATCH" ] && \
+    ln -sf "$ANDROID_OBB_MAIN" "$ANDROID_EXTERNAL_OBB_DIR/main.1.$pkgname.obb"
+    if [ -n "$ANDROID_OBB_PATCH" ]; then
         ln -sf "$ANDROID_OBB_PATCH" "$_obbdir/$(basename "$ANDROID_OBB_PATCH")"
+        ln -sf "$ANDROID_OBB_PATCH" "$_obbdir/patch.1.$pkgname.obb"
+    fi
+    # Stage OBB under the loose UE4Game tree.  With obbInAPK or a mounted
+    # expansion, UE still probes
+    #   <files>/UE4Game/<Project>/<Project>/Content/Paks/*.pak
+    # OBB zip layouts vary — discover the project name from Content/Paks,
+    # never hard-code a title (a fabricated .uproject / fixed Project name
+    # breaks other APKs).
+    #   A) UE4Game/<P>/<P>/Content/Paks  — already device-shaped
+    #   B) <P>/<P>/Content/Paks          — missing UE4Game/
+    #   C) <P>/Content/Paks              — missing outer <P>/ (common on Android)
+    _ue_game="$ANDROID_EXTERNAL_FILES_DIR/UE4Game"
+    mkdir -p "$_ue_game"
+    if ! find "$_ue_game" -type d -path '*/Content/Paks' 2>/dev/null | grep -q .; then
+        _obb_x="$tmpdir/obb_extract"
+        mkdir -p "$_obb_x"
+        if unzip -q -o "$ANDROID_OBB_MAIN" -d "$_obb_x"; then
+            find "$_obb_x" -type d -path '*/Content/Paks' 2>/dev/null | while read -r _paks; do
+                _content=$(dirname "$_paks")
+                [ "$(basename "$_content")" = Content ] || continue
+                _inner=$(dirname "$_content")
+                _proj=$(basename "$_inner")
+                [ -n "$_proj" ] && [ "$_proj" != Content ] || continue
+                _dest="$_ue_game/$_proj/$_proj"
+                if [ -d "$_dest/Content/Paks" ]; then
+                    continue
+                fi
+                mkdir -p "$_ue_game/$_proj"
+                if [ -d "$_inner" ]; then
+                    # Move project tree into UE4Game/<P>/<P>/ (Content + siblings).
+                    mv "$_inner" "$_dest" 2>/dev/null \
+                        || { mkdir -p "$_dest"; cp -a "$_inner/." "$_dest/"; }
+                fi
+                # UE4CommandLine.txt often sits beside the project folder in the OBB.
+                for _cmd in "$_obb_x/UE4CommandLine.txt" \
+                            "$_obb_x/$_proj/UE4CommandLine.txt" \
+                            "$(dirname "$_inner")/UE4CommandLine.txt"; do
+                    if [ -f "$_cmd" ] && [ ! -f "$_ue_game/$_proj/UE4CommandLine.txt" ]; then
+                        cp -f "$_cmd" "$_ue_game/$_proj/UE4CommandLine.txt"
+                    fi
+                done
+                msg "obb staged under $_ue_game/$_proj"
+            done
+        else
+            msg "obb extract failed (continuing with zip mount only)"
+        fi
+    fi
+    # Encrypted-index paks: PreInit opens .uproject before FPakFile mounts, and
+    # ShaderArchive/maps need AES-ECB index decrypt.  Stage the real cooked
+    # assets (including the real .uproject from the pak) as loose files —
+    # host staging only, no fabricated project descriptor.
+    _ue_so=""
+    for _cand in "$tmpdir/lib/$arch/libUE4.so" "$tmpdir/lib/arm64-v8a/libUE4.so" \
+                 "$tmpdir/lib/armeabi-v7a/libUE4.so"; do
+        [ -f "$_cand" ] && _ue_so="$_cand" && break
+    done
+    _stage_py="$(dirname "$argv0")/scripts/ue4_stage_encrypted_paks.py"
+    if [ -f "$_stage_py" ] && [ -n "$_ue_so" ]; then
+        find "$_ue_game" -type d \( -path '*/Content/Paks' -o -path '*/Content/CBPaks' \) \
+            2>/dev/null | while read -r _paks; do
+            # .../UE4Game/<P>/<P>/Content/Paks → out = .../UE4Game/<P>
+            _out=$(dirname "$(dirname "$(dirname "$_paks")")")
+            python3 "$_stage_py" --so "$_ue_so" --paks "$_paks" --out "$_out" \
+                || msg "encrypted pak stage failed for $_paks (continuing)"
+        done
+    fi
     msg "obb: $ANDROID_OBB_MAIN"
 fi
 
@@ -267,4 +408,5 @@ if [ -z "$main_so" ]; then
 fi
 [ -n "$main_so" ] && [ -f "$main_so" ] || err "no main native library in $libdir"
 msg "main lib: $main_so"
-./lunaria "$main_so"
+lunaria_bin="${LUNARIA_BIN:-./lunaria}"
+"$lunaria_bin" "$main_so"

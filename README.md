@@ -1,205 +1,302 @@
-**Lunaria — Translation layer for iOS/Android** 🎮🐧
+<!-- Hallmark · pre-emit critique: P5 H5 E4 S5 R4 V5 -->
 
-**Run Android ARM/x86_64 JNI libraries (especially Unity's `libunity.so`) on Linux** using **dynarmic JIT** emulation! 🚀
+# Lunaria
 
-[![Sponsor](https://img.shields.io/badge/Sponsor%20this%20project-%E2%9D%A4%EF%B8%8F-white?logo=githubsponsors&logoColor=EA4AAA&labelColor=EA4AAA)](https://github.com/sponsors/yui0)
+### Run Android game engines on Linux — without booting Android.
 
----
+[![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-5b5bd6.svg)](LICENSE)
+[![Guests](https://img.shields.io/badge/guest-ARM32%20%7C%20ARM64-20232a.svg)](#how-it-works)
+[![Engines](https://img.shields.io/badge/engines-Unity%20%7C%20Unreal-20232a.svg)](#compatibility)
+[![Sponsor](https://img.shields.io/badge/sponsor-%E2%99%A5-ea4aaa.svg)](https://github.com/sponsors/yui0)
 
-### ✨ Features
-- **Full ARM32 emulation** with dynarmic JIT
-- **Unity & Mono** game support (tested with Unity 4.x/5.x/2023)
-- **Unreal Engine 4** support (UE4 armeabi-v7a — FirstPersonExampleMap renders, 16 000+ frames stable)
-- **Cooperative threading** (guest threads run smoothly)
-- **AssetManager bridge** — reads assets directly from APK + OBB expansion files
-- **OpenGL ES 3 + EGL** passthrough to host (23 GLES3 entry points, full per-thread context isolation)
-- **Headless support** via Xvfb / llvmpipe
-- **Memory-efficient** flat 4 GB guest address space with free-list `munmap`
+Lunaria is an experimental Android-to-Linux translation layer. It loads native
+libraries from an APK or XAPK, executes ARM32/ARM64 code through
+[dynarmic](https://github.com/merryhime/dynarmic), and bridges Android APIs,
+JNI, EGL and OpenGL ES to the Linux host.
 
----
+> [!IMPORTANT]
+> Lunaria is a compatibility project under active development, not a complete
+> Android emulator. Support varies by title and engine version.
 
-### 🛠️ Build Instructions
+![Unreal Engine 4 FirstPersonExampleMap running through Lunaria](screenshot_fpsmobile.png)
 
-**Required packages (Ubuntu/Debian):**
+<p align="center"><sub>UE4 FirstPersonExampleMap · armeabi-v7a · 1280×720 · Mesa llvmpipe</sub></p>
+
+## Why Lunaria
+
+| | What it means |
+|---|---|
+| **Two guest architectures** | ARMv7 and AArch64 execution through dynarmic JIT |
+| **No Android system image** | Launch an `.apk` or `.xapk` directly from Linux |
+| **Real graphics path** | EGL and OpenGL ES 3 calls pass through to the host |
+| **Engine-aware bridges** | JNI, AssetManager, OBB, pthread, OpenSL ES and Android API stubs |
+| **Headless-capable** | Falls back to a surfaceless EGL pbuffer when no X11 window is available |
+| **Built for diagnosis** | Frame capture, JIT profiling, SVC tracing and guest-memory watchpoints |
+
+## Quick start
+
+### 1. Install build dependencies
+
+On Ubuntu or Debian:
+
 ```bash
-sudo apt install libglfw3-dev libegl1-mesa-dev libgles2-mesa-dev \
-                 libbsd-dev libunwind-dev libboost-dev zlib1g-dev
+sudo apt install \
+  build-essential cmake libboost-dev libbsd-dev libunwind-dev \
+  libglfw3-dev libegl1-mesa-dev libgles2-mesa-dev zlib1g-dev
 ```
 
+### 2. Build
+
 ```bash
-make dynarmic-build     # Build dynarmic A32 JIT (requires cmake, libboost-dev)
-make                    # Build lunaria binary + core runtime stubs
+make dynarmic-build
+make -j"$(nproc)"
 ```
 
----
+### 3. Launch a package
 
-### 🎮 Test Games
+```bash
+./lunaria-apk.sh path/to/game.apk
+./lunaria-apk.sh path/to/game.xapk
+```
 
-#### FPSMobile (Unreal Engine 4 / armeabi-v7a) ✅
+The launcher detects `arm64-v8a` or `armeabi-v7a`, finds the main native
+library, prepares an installed-package view, and starts the runtime. For XAPK
+files it reads `manifest.json`, keeps the base APK intact, and overlays the
+split APK contents into that temporary view.
+
+Force a guest architecture when a package contains both:
+
+```bash
+LUNARIA_ARCH=armeabi-v7a ./lunaria-apk.sh game.apk
+LUNARIA_ARCH=arm64-v8a  ./lunaria-apk.sh game.apk
+```
+
+## Compatibility
+
+These are observed milestones, not a general compatibility guarantee.
+
+| Title | Engine / ABI | Current result |
+|---|---|---|
+| **Between Two Worlds** | Unity 2023 IL2CPP · ARMv7 | Playable; reaches the main story scene |
+| **Between Two Worlds** | Unity 2023 IL2CPP · AArch64 | Reaches language selection at about 70 fps on the recorded llvmpipe run |
+| **FPSMobile** | Unreal Engine 4 · ARMv7 | FirstPersonExampleMap renders; 16,000+ swaps observed |
+| **UnitySampleGame** | Unity · ARMv7 | Start screen accepts injected touch; playable 3D scene renders |
+| **TIME LOCKER** | Unity · ARMv7 | Reaches the portrait tutorial gameplay scene |
+| **Black Clover: Asta Fight** | Unity IL2CPP · AArch64 XAPK | Base + split load; Unity splash renders headlessly |
+| **Blade & Soul Revolution** | Unreal Engine 4 · AArch64 | In-APK expansion mounts; reaches RHI, render thread and FBO setup; content streaming stalls before the first frame |
+| **Daggerfall Unity** | Unity Mono · ARMv7 | Mono runtime boots; rendering remains blocked |
+
+<details>
+<summary><strong>Run the open-source test titles</strong></summary>
+
+### FPSMobile / Unreal Engine 4
 
 Source: [Abhishrut/UnrealEngineAndroidSamples](https://github.com/Abhishrut/UnrealEngineAndroidSamples)
 
-Both the APK and its OBB expansion file must be placed in `test/`.
-`lunaria-apk.sh` auto-detects the OBB when it is in the same directory as the APK.
+Place both files in `test/`; the launcher discovers a same-directory OBB
+automatically.
 
 ```bash
-# Download APK + OBB (≈139 MB total)
 curl -L -o test/FPSMobile-armv7.apk \
   "https://raw.githubusercontent.com/Abhishrut/UnrealEngineAndroidSamples/main/FPSMobile-armv7.apk"
 curl -L -o test/main.1.com.YourCompany.FPSMobile.obb \
   "https://raw.githubusercontent.com/Abhishrut/UnrealEngineAndroidSamples/main/main.1.com.YourCompany.FPSMobile.obb"
 
-# Run
-DISPLAY=:0 ./lunaria-apk.sh test/FPSMobile-armv7.apk
+LUNARIA_ARCH=armeabi-v7a ./lunaria-apk.sh test/FPSMobile-armv7.apk
 ```
 
-Expected output after ~60 s of startup:
-```
-[egl] swap#10 draws=+24 clears=+4 viewport=0,0,1280x720
-```
-
-![FPSMobile — FirstPersonExampleMap running on Lunaria](screenshot_fpsmobile.png)
-
-*UE4 FirstPersonExampleMap rendered on Linux via Lunaria (swap #10, llvmpipe).*
-
----
-
-#### Between Two Worlds (Unity 2023 IL2CPP / armeabi-v7a) ✅
+### Between Two Worlds / Unity 2023 IL2CPP
 
 Source: [ShutovKS/Between-two-worlds](https://github.com/ShutovKS/Between-two-worlds/releases/tag/1.0.5)
 
 ```bash
-make fetch-btw          # Downloads test/btw-android.apk automatically
+make fetch-btw
 
-# Or manually:
-curl -L -o test/btw-android.apk \
-  "https://github.com/ShutovKS/Between-two-worlds/releases/download/1.0.5/Android_1.0.5.apk"
-
-DISPLAY=:0 ./lunaria-apk.sh test/btw-android.apk
+LUNARIA_ARCH=armeabi-v7a ./lunaria-apk.sh test/btw-android.apk
+LUNARIA_ARCH=arm64-v8a  ./lunaria-apk.sh test/btw-android.apk
 ```
 
-Status: playable — reaches the main story conversation scene.
-
----
-
-#### Daggerfall Unity (Unity Mono / armeabi-v7a) 🔶
+### Daggerfall Unity / Unity Mono
 
 Source: [Vwing/daggerfall-unity-android](https://github.com/Vwing/daggerfall-unity-android/releases/tag/v1.1.1.8)
 
 ```bash
-make fetch-libunity     # Downloads test/dfu-mono-32bit.apk automatically
-
-# Or manually:
-curl -L -o test/dfu-mono-32bit.apk \
-  "https://github.com/Vwing/daggerfall-unity-android/releases/download/v1.1.1.8/dfu-mono-32bit-v1.1.1.8_mods-supported.apk"
-
-DISPLAY=:0 ./lunaria-apk.sh test/dfu-mono-32bit.apk
+make fetch-libunity
+./lunaria-apk.sh test/dfu-mono-32bit.apk
 ```
 
-Status: boots and loads the Mono runtime; rendering is currently blocked.
+</details>
 
----
+## More games, captured from Lunaria
 
-#### Generic Unity ARM32 APK
+These are gameplay frames read directly from Lunaria's headless EGL
+framebuffer—not splash screens, phone captures, or Android emulator windows.
 
-Any Unity armeabi-v7a APK can be run directly:
+### UnitySampleGame · 3D gameplay
+
+The launcher reaches the title screen, injects a touch on **Start**, and enters
+the playable 3D scene with the character, crystal objective, health HUD, and
+touch controls rendered at 1280×720.
+
+![UnitySampleGame 3D gameplay running through Lunaria](screenshot_unitysample_gameplay.png)
+
+### TIME LOCKER · tutorial gameplay
+
+The portrait build advances beyond the Unity logo into the first interactive
+scene. The player character, score HUD, playfield, and touch tutorial are
+rendered at 720×1280.
+
+<p align="center">
+  <img src="screenshot_timelocker_gameplay.png" width="420" alt="TIME LOCKER tutorial gameplay running through Lunaria">
+</p>
+
+## Capture frames
+
+Capture selected swap indices:
 
 ```bash
-DISPLAY=:0 ./lunaria-apk.sh MyGame.apk
+mkdir -p /tmp/lunaria-shots
+LUNARIA_DUMP_DIR=/tmp/lunaria-shots \
+LUNARIA_DUMP_FRAME=0,60,120 \
+./lunaria-apk.sh game.apk
 ```
 
-![Unity game running on Lunaria](screenshot_01.jpg)
-
-*Unity ARM32 game running on Linux via Lunaria.*
-
----
-
-### 🚀 Headless / Xvfb Mode
-
-If there is no physical display, run with Xvfb (software renderer):
+Or capture every *N* swaps:
 
 ```bash
-Xvfb :99 -screen 0 1280x720x24 &
-DISPLAY=:99 ./lunaria-apk.sh test/FPSMobile-armv7.apk
+LUNARIA_DUMP_DIR=/tmp/lunaria-shots \
+LUNARIA_SCREENSHOT_EVERY=60 \
+./lunaria-apk.sh game.xapk
 ```
 
-Capture a screenshot at a specific swap index:
+Frames are written as PPM. Convert one with:
+
 ```bash
-LUNARIA_DUMP_DIR=/tmp/shots LUNARIA_DUMP_FRAME=10 \
-  DISPLAY=:99 ./lunaria-apk.sh test/FPSMobile-armv7.apk
-# Output: /tmp/shots/frame10.ppm  — convert with ffmpeg -i frame10.ppm out.png
+ffmpeg -i /tmp/lunaria-shots/lunaria_0001.ppm screenshot.png
 ```
 
----
+## How it works
 
-### ⚙️ Environment Variables
+```text
+ APK / XAPK
+     │  extract base, splits, native libraries, assets and OBB
+     ▼
+ Android ELF loader ─── relocations and dependency resolution
+     │
+     ▼
+ dynarmic JIT ───────── ARMv7 or AArch64 guest instructions
+     │
+     ├── SVC bridge ─── libc · pthread · filesystem · Android APIs
+     ├── JNI bridge ─── classes · methods · AssetManager · services
+     └── graphics ───── EGL · OpenGL ES 3 · host Mesa / GPU
+```
 
-| Variable                   | Default  | Description |
-|----------------------------|----------|-------------|
-| `LUNARIA_CALL_TICKS`       | 2G       | Tick limit per JNI call |
-| `LUNARIA_ONLOAD_TICKS`     | 5G       | Tick limit for `JNI_OnLoad` |
-| `LUNARIA_THREAD_TICKS`     | 200M     | Tick slice per guest thread |
-| `LUNARIA_TRACE_SVC`        | off      | Log SVC calls (first 1000) |
-| `LUNARIA_TRACE_BLOCKS`     | 0        | Log JIT block execution |
-| `LUNARIA_DUMP_FRAME`       | off      | Dump PPM at listed swap indices (`0,5,10`) |
-| `LUNARIA_DUMP_DIR`         | `/tmp`   | Screenshot output directory |
-| `LUNARIA_SCREENSHOT_EVERY` | off      | Dump every N swaps |
-| `LUNARIA_WIDTH`/`HEIGHT`   | 1280×720 | Window / EGL surface size |
-| `LUNARIA_TRACE_FUTEX`      | off      | Log futex wait/wake |
-| `LUNARIA_TRACE_JITINIT`    | off      | Trace `mono_jit_init_version` |
-| `GC_DONT_GC`               | 1        | Disable Boehm GC (set by loader) |
+- **ARM32:** a flat 4 GiB guest memory window with fastmem.
+- **ARM64:** guest virtual addresses map one-to-one to host addresses; a
+  high-address image window holds loaded ELFs, trampolines, JNI tables and
+  stacks, enabling dynarmic fastmem.
+- **Native calls:** guest libc, EGL, GLES and JNI calls cross generated
+  `SVC #n` trampolines into host implementations.
+- **Threads:** guest pthreads use cooperative round-robin scheduling with a
+  separate JIT context per worker.
+- **Assets:** `AssetManager` reads DEFLATE/STORE entries from APKs and OBB
+  expansion files.
 
-**Tip:** Tick counts accept `K`/`M`/`G` suffixes: `LUNARIA_ONLOAD_TICKS=5G`
+## Runtime controls
 
----
+Common controls are listed here; the source contains additional narrow
+diagnostic switches used during compatibility work.
 
-### 🏗️ Architecture Overview
+| Variable | Default | Purpose |
+|---|---:|---|
+| `LUNARIA_ARCH` | auto | `armeabi-v7a` or `arm64-v8a` |
+| `LUNARIA_WIDTH` / `LUNARIA_HEIGHT` | `1280` / `720` | Window or EGL surface size |
+| `LUNARIA_PBUFFER` | auto fallback | Set `1` to skip GLFW and force headless EGL |
+| `LUNARIA_MAX_FRAMES` | unlimited | Stop the render loop after *N* frames |
+| `LUNARIA_MEM_TOTAL_MB` | `6144` | RAM reported to the guest |
+| `LUNARIA_HEAP_MB` | `256` | Guest allocation heap size |
+| `LUNARIA_THREAD_TICKS` | `200M` | ARM32 worker scheduling slice |
+| `LUNARIA_A64_THREAD_TICKS` | `20K` | AArch64 worker scheduling slice |
+| `LUNARIA_A64_FASTMEM` | `1` | Set `0` to route memory through callbacks |
+| `LUNARIA_A64_CODE_CACHE_MB` | `128` | Per-JIT translated-code cache |
+| `LUNARIA_DUMP_FRAME` | off | Comma-separated swap indices to capture |
+| `LUNARIA_SCREENSHOT_EVERY` | off | Capture every *N* swaps |
+| `LUNARIA_DUMP_DIR` | `/tmp` | Frame output directory |
+| `LUNARIA_TRACE_SVC` | off | Trace guest-to-host SVC calls |
+| `LUNARIA_A64_PCPROF` | off | Sample and report hot AArch64 guest PCs, per thread |
+| `LUNARIA_A64_PCPROF_EVERY` | `20000` | Samples between profiler reports |
+| `LUNARIA_SCHED_DUMP` | off | Dump every guest thread's state every *N* scheduler passes |
+| `LUNARIA_SCHED_DUMP_STACK` | off | Add a return-address scan of each thread's stack to that dump |
+| `LUNARIA_DUMP_LAST_SVC` | off | Print the recent SVC ring at shutdown |
+| `LUNARIA_DVM` | `1` | Dalvik bytecode emulator: `0` off, `1` run the APK's dex only where no host stub exists, `2` prefer the dex over host stubs |
+| `LUNARIA_DVM_TRACE` | off | Log the methods the emulator declined (`[dvm] miss …`) |
 
-- **Flat 4 GB Memory** — Entire guest 32-bit address space is one `mmap` region (with fastmem)
-- **SVC Trampolines** — All native calls (`libc`, `EGL`, `GLES3`, `JNI`, etc.) are routed through `SVC #n`
-- **Cooperative Threads** — Guest `pthread_create` runs on an auxiliary JIT with round-robin scheduling
-- **Relocations** — Full support for `R_ARM_RELATIVE`, cross-library symbols, non-zero ELF base
-- **Asset Bridge** — `getAssets().open()` reads directly from APK (DEFLATE + STORE) and OBB files
-- **Safety Guards** — Prevents wild jumps, infinite JIT growth, and memory corruption
+Tick values accept `K`, `M`, and `G` suffixes, for example
+`LUNARIA_ONLOAD_TICKS=5G`.
 
----
+## Repository map
 
-### 📁 Project Structure (Key Files)
+| Path | Role |
+|---|---|
+| `src/arm_exec.cpp` | dynarmic engines, SVC dispatch, JNI, EGL/GLES and threading |
+| `src/dvm/` | Dalvik bytecode emulator: runs the APK's own Java from classes*.dex |
+| `src/loader.c` | runtime entry point and Unity render-loop orchestration |
+| `src/linker/` | Android ELF linker adapted for the host |
+| `src/jvm/` | lightweight JVM/JNI object model and stubs |
+| `src/lib/` | host implementations exposed to Android native code |
+| `runtime/` | generated Android-compatible host shared libraries |
+| `lunaria-apk.sh` | APK/XAPK inspection, extraction and launch pipeline |
+| `PROGRESS.md` | detailed compatibility notes and current engineering work |
 
-- `arm_exec.cpp` — Core ARM emulation engine (SVC dispatch, EGL/GLES3, JNI, threading)
-- `lunaria-apk.sh` — APK/OBB launcher script
-- `runtime/` — Host-side stub shared libraries loaded by the guest linker
-- `test/` — Sample APKs and libraries (gitignored large files)
+## Troubleshooting
 
----
+<details>
+<summary><strong>The game reports “project file not found”</strong></summary>
 
-### 🎯 Supported Games
+The title probably expects an OBB expansion file. Put it beside the APK using
+its original name.
 
-| APK | Engine | Status |
-|-----|--------|--------|
-| `FPSMobile-armv7.apk` | UE4 armeabi-v7a | ✅ FirstPersonExampleMap — 24 draw/4 clear/frame, 16 000+ swaps stable |
-| `btw-android.apk` | Unity 2023 IL2CPP | ✅ Playable — main story scene reached |
-| `dfu-mono-32bit.apk` | Unity Mono armeabi-v7a | 🔶 Boots, rendering blocked |
-| Generic Unity ARM32 | Unity any | ✅ Generally supported |
+</details>
 
----
+<details>
+<summary><strong>A runtime stub library is missing</strong></summary>
 
-### 🔧 Troubleshooting
+Build the requested targets explicitly:
 
-- **UE4 "Project file not found"** — The OBB expansion file is missing. Place
-  `main.1.com.YourCompany.FPSMobile.obb` in the same directory as the APK.
-- **`runtime/libmediandk.so: No such file or directory`** — Run
-  `make runtime/libmediandk.so runtime/libGLESv3.so` (not included in default `make`).
-- **Black screen** — Try `LUNARIA_TRACE_EXC=1` or check that the OBB is present.
-- **Slow rendering** — Expected on llvmpipe (software GL). Use a GPU-accelerated host for real-time speed.
-- **Crashes** — Enable `LUNARIA_DUMP_LAST_SVC=1` and share the log.
+```bash
+make runtime/libmediandk.so runtime/libGLESv3.so
+```
 
----
+</details>
 
-**Made with ❤️ for the retro Android gaming & emulation community**
+<details>
+<summary><strong>The screen is black or startup stalls</strong></summary>
 
-Enjoy running your favorite Android games natively on Linux! 🎉
+Check the OBB/split files first, then collect a focused trace:
 
----
+```bash
+LUNARIA_TRACE_EXC=1 LUNARIA_DUMP_LAST_SVC=1 \
+./lunaria-apk.sh game.apk 2>&1 | tee lunaria.log
+```
 
-*Project Lunaria © 2026 Yuichiro Nakada*
+</details>
+
+<details>
+<summary><strong>Rendering is slow</strong></summary>
+
+Mesa llvmpipe is a software renderer and is useful for headless validation,
+not performance testing. Use a GPU-accelerated host EGL/OpenGL stack for
+real-time rendering.
+
+</details>
+
+## Project status
+
+Lunaria is research software. Expect incomplete Android APIs, title-specific
+issues, heavy diagnostic output, and breaking changes. Contributions are most
+useful when they include the title, ABI, engine version, last successful
+milestone, log, and a captured frame.
+
+Licensed under the [Mozilla Public License 2.0](LICENSE).
+
+Project Lunaria © 2026 Yuichiro Nakada.

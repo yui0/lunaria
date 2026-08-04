@@ -15,6 +15,7 @@
 #include "dlfcn.h"
 #include "jvm.h"
 #include "trace.h"
+#include "dvm/dvm_jni.h"
 
 _Static_assert(sizeof(jclass) == sizeof(jobject), "We assume jclass and jobject are both same internally for the call methods");
 
@@ -217,20 +218,81 @@ jvm_assign_default_class(struct jvm *jvm, struct jvm_object *o)
    }
 }
 
+static struct jvm_object*
+jvm_get_object(struct jvm *jvm, const jobject o);
+
 static jobject
 jvm_add_object(struct jvm *jvm, const struct jvm_object *o)
 {
    assert(jvm && o);
 
-   uintptr_t i;
-   for (i = 0; i < ARRAY_SIZE(jvm->objects) && jvm->objects[i].type != JVM_OBJECT_NONE; ++i);
-   assert(i < ARRAY_SIZE(jvm->objects) && "jvm object limit reached!");
+   /* Resume the scan where the last allocation stopped: restarting at 0 every
+    * time made allocation O(n) in a 65536-entry table, which shows up as a
+    * hard slowdown once a few thousand objects are live. */
+   uintptr_t i = jvm->next_object;
+   if (i >= ARRAY_SIZE(jvm->objects))
+      i = 0;
+   uintptr_t scanned = 0;
+   while (scanned < ARRAY_SIZE(jvm->objects) &&
+          jvm->objects[i].type != JVM_OBJECT_NONE) {
+      if (++i >= ARRAY_SIZE(jvm->objects))
+         i = 0;
+      ++scanned;
+   }
+   if (scanned >= ARRAY_SIZE(jvm->objects)) {
+      size_t n[JVM_OBJECT_LAST] = {0};
+      for (size_t k = 0; k < ARRAY_SIZE(jvm->objects); ++k)
+         n[jvm->objects[k].type]++;
+      fprintf(stderr, "[jvm] object table full (%zu slots): opaque=%zu array=%zu "
+              "method=%zu class=%zu string=%zu — a JNI reference is leaking\n",
+              ARRAY_SIZE(jvm->objects), n[JVM_OBJECT_OPAQUE], n[JVM_OBJECT_ARRAY],
+              n[JVM_OBJECT_METHOD], n[JVM_OBJECT_CLASS], n[JVM_OBJECT_STRING]);
+      assert(0 && "jvm object limit reached!");
+      return NULL;
+   }
+   jvm->next_object = i + 1;
    jvm->objects[i] = *o;
+   jvm->objects[i].refs = 1;
 
    if (!jvm->objects[i].this_klass)
       jvm_assign_default_class(jvm, &jvm->objects[i]);
 
    return (jobject)(i + 1);
+}
+
+/* Add a reference to an existing handle (NewGlobalRef / NewLocalRef, or a
+ * second lookup that interned onto an existing object). */
+static jobject
+jvm_ref_object(struct jvm *jvm, jobject object)
+{
+   struct jvm_object *o = jvm_get_object(jvm, object);
+   if (o && o->type != JVM_OBJECT_NONE)
+      ++o->refs;
+   return object;
+}
+
+/* Drop a reference (DeleteLocalRef / DeleteGlobalRef).  Only arrays and
+ * strings release their slot: those are the handle types an app allocates per
+ * call, and unlike classes, methods and the opaque singleton stubs nothing
+ * caches them behind our back.  See the note on jvm_object::refs. */
+static void
+jvm_deref_object(struct jvm *jvm, jobject object)
+{
+   struct jvm_object *o = jvm_get_object(jvm, object);
+   if (!o || o->type == JVM_OBJECT_NONE)
+      return;
+   if (o->refs > 0)
+      --o->refs;
+   if (o->refs > 0)
+      return;
+   if (o->type != JVM_OBJECT_ARRAY && o->type != JVM_OBJECT_STRING) {
+      o->refs = 1; /* pinned for the process lifetime */
+      return;
+   }
+   uintptr_t idx = (uintptr_t)object - 1;
+   jvm_object_release(o);
+   if (idx < jvm->next_object)
+      jvm->next_object = idx;
 }
 
 static jobject
@@ -241,7 +303,7 @@ jvm_add_object_if_not_there(struct jvm *jvm, struct jvm_object *needle)
    jobject o;
    if ((o = jvm_find_object(jvm, needle))) {
       jvm_object_release(needle);
-      return o;
+      return jvm_ref_object(jvm, o);
    }
 
    return jvm_add_object(jvm, needle);
@@ -465,9 +527,8 @@ JNIEnv_NewGlobalRef(JNIEnv* p0, jobject p1)
 {
    assert(p0);
    if (!p1) return NULL;
-   // FIXME: add ref counting
    jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
-   return p1;
+   return jvm_ref_object(jnienv_get_jvm(p0), p1);
 }
 
 static void
@@ -475,6 +536,7 @@ JNIEnv_DeleteGlobalRef(JNIEnv* p0, jobject p1)
 {
    assert(p0);
    jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
+   jvm_deref_object(jnienv_get_jvm(p0), p1);
 }
 
 static void
@@ -482,6 +544,7 @@ JNIEnv_DeleteLocalRef(JNIEnv* p0, jobject p1)
 {
    assert(p0);
    jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
+   jvm_deref_object(jnienv_get_jvm(p0), p1);
 }
 
 static jboolean
@@ -494,10 +557,13 @@ JNIEnv_IsSameObject(JNIEnv* p0, jobject p1, jobject p2)
 static jobject
 JNIEnv_NewLocalRef(JNIEnv* p0, jobject p1)
 {
-   assert(p0 && p1);
-   // FIXME: add ref counting
+   assert(p0);
+   /* NULL is a valid argument: NewLocalRef(NULL) returns NULL.  Unity reaches
+    * this with the result of ExceptionOccurred() when no exception is
+    * pending, so asserting here aborted the process on a normal code path. */
+   if (!p1) return NULL;
    jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
-   return p1;
+   return jvm_ref_object(jnienv_get_jvm(p0), p1);
 }
 
 static jint
@@ -726,12 +792,47 @@ jvm_wrap_method(struct jvm *jvm, jmethodID method_id)
    return wrapper_create(symbol, dlsym(RTLD_DEFAULT, symbol));
 }
 
+/* Hands the call to the Dalvik bytecode emulator when the APK's own dex
+ * defines the method.  Without this, a method with no hand-written stub
+ * silently returned zero — see src/dvm/dvm.h.  Exactly one of `ap` and `jargs`
+ * carries the arguments. */
+static bool
+jvm_dvm_try(JNIEnv *env, jobject self, jmethodID method_id, bool is_static,
+            va_list *ap, const jvalue *jargs, jvalue *out)
+{
+   if (dvm_jni_mode() == DVM_JNI_OFF || !method_id)
+      return false;
+
+   struct jvm *jvm = jnienv_get_jvm(env);
+   struct jvm_object *mo = jvm_get_object(jvm, method_id);
+   if (!mo || mo->type != JVM_OBJECT_METHOD)
+      return false;
+
+   struct jvm_object *ko = jvm_get_object_of_type(jvm, mo->method.klass, JVM_OBJECT_CLASS);
+   if (!ko)
+      return false;
+
+   return dvm_jni_invoke(env, ko->klass.name.data, mo->method.name.data,
+                         mo->method.signature.data, self, is_static,
+                         ap, jargs, out);
+}
+
 static void
 JNIEnv_CallStaticVoidMethodV(JNIEnv* p0, jclass p1, jmethodID p2, va_list p3)
 {
    assert(p0 && p1 && p2);
    union { jobject (*fun)(JNIEnv*, jclass, va_list); void *ptr; } f;
-   if ((f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), p2)))
+   f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), p2);
+   if (!f.ptr || dvm_jni_mode() == DVM_JNI_PREFER) {
+      jvalue rv;
+      va_list copy;
+      va_copy(copy, p3);
+      bool done = jvm_dvm_try(p0, (jobject)p1, p2, true, &copy, NULL, &rv);
+      va_end(copy);
+      if (done)
+         return;
+   }
+   if (f.ptr)
       f.fun(p0, p1, p3);
 }
 
@@ -749,14 +850,33 @@ JNIEnv_CallStaticVoidMethodA(JNIEnv* p0, jclass p1, jmethodID p2, jvalue* p3)
 {
    assert(p0 && p1 && p2);
    union { jobject (*fun)(JNIEnv*, jclass, jvalue*); void *ptr; } f;
-   if ((f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), p2)))
+   f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), p2);
+   if (!f.ptr || dvm_jni_mode() == DVM_JNI_PREFER) {
+      jvalue rv;
+      if (jvm_dvm_try(p0, (jobject)p1, p2, true, NULL, p3, &rv))
+         return;
+   }
+   if (f.ptr)
       f.fun(p0, p1, p3);
 }
 
 static void
 JNIEnv_CallVoidMethodV(JNIEnv* p0, jobject p1, jmethodID p2, va_list p3)
 {
-   JNIEnv_CallStaticVoidMethodV(p0, p1, p2, p3);
+   assert(p0 && p1 && p2);
+   union { jobject (*fun)(JNIEnv*, jobject, va_list); void *ptr; } f;
+   f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), p2);
+   if (!f.ptr || dvm_jni_mode() == DVM_JNI_PREFER) {
+      jvalue rv;
+      va_list copy;
+      va_copy(copy, p3);
+      bool done = jvm_dvm_try(p0, p1, p2, false, &copy, NULL, &rv);
+      va_end(copy);
+      if (done)
+         return;
+   }
+   if (f.ptr)
+      f.fun(p0, p1, p3);
 }
 
 static void
@@ -771,7 +891,16 @@ JNIEnv_CallVoidMethod(JNIEnv* p0, jobject p1, jmethodID p2, ...)
 static void
 JNIEnv_CallVoidMethodA(JNIEnv* p0, jobject p1, jmethodID p2, jvalue* p3)
 {
-   JNIEnv_CallStaticVoidMethodA(p0, p1, p2, p3);
+   assert(p0 && p1 && p2);
+   union { jobject (*fun)(JNIEnv*, jobject, jvalue*); void *ptr; } f;
+   f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), p2);
+   if (!f.ptr || dvm_jni_mode() == DVM_JNI_PREFER) {
+      jvalue rv;
+      if (jvm_dvm_try(p0, p1, p2, false, NULL, p3, &rv))
+         return;
+   }
+   if (f.ptr)
+      f.fun(p0, p1, p3);
 }
 
 static void
@@ -805,12 +934,21 @@ JNIEnv_CallNonvirtualVoidMethodA(JNIEnv* p0, jobject p1, jclass p2, jmethodID p3
 // T == C type of return value
 // C == Type of second argument (jclass for static call, jobject for instance call)
 // D == Default return value
-#define gen_jnienv_method_call(N, T, C, D) \
+#define gen_jnienv_method_call(N, T, C, D, VF, ST) \
    static T \
    JNIEnv_Call##N##MethodV(JNIEnv *p0, C p1, jmethodID method, va_list p3) { \
       assert(p0 && p1 && method); \
       union { T (*fun)(JNIEnv*, C, va_list); void *ptr; } f; \
       f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), method); \
+      if (!f.ptr || dvm_jni_mode() == DVM_JNI_PREFER) { \
+         jvalue rv; \
+         va_list copy; \
+         va_copy(copy, p3); \
+         bool done = jvm_dvm_try(p0, (jobject)p1, method, ST, &copy, NULL, &rv); \
+         va_end(copy); \
+         if (done) \
+            return (T)rv.VF; \
+      } \
       return (f.ptr ? f.fun(p0, p1, p3) : D); \
    } \
    static T \
@@ -818,6 +956,11 @@ JNIEnv_CallNonvirtualVoidMethodA(JNIEnv* p0, jobject p1, jclass p2, jmethodID p3
       assert(p0 && p1 && method); \
       union { T (*fun)(JNIEnv*, C, jvalue*); void *ptr; } f; \
       f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), method); \
+      if (!f.ptr || dvm_jni_mode() == DVM_JNI_PREFER) { \
+         jvalue rv; \
+         if (jvm_dvm_try(p0, (jobject)p1, method, ST, NULL, p3, &rv)) \
+            return (T)rv.VF; \
+      } \
       return (f.ptr ? f.fun(p0, p1, p3) : D); \
    } \
    static T \
@@ -832,19 +975,33 @@ JNIEnv_CallNonvirtualVoidMethodA(JNIEnv* p0, jobject p1, jclass p2, jmethodID p3
 // N == Call method type name (Long, Float, etc...)
 // T == C type of return value
 // D == Default return value
-#define gen_jnienv_nonvirtual_method_call(N, T, D) \
+#define gen_jnienv_nonvirtual_method_call(N, T, D, VF) \
    static T \
    JNIEnv_CallNonvirtual##N##MethodV(JNIEnv *p0, jobject p1, jclass p2, jmethodID method, va_list p4) { \
       assert(p0 && p1 && p2 && method); \
       union { T (*fun)(JNIEnv*, jobject, jclass, va_list); void *ptr; } f; \
-      f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), p2); \
+      f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), method); \
+      if (!f.ptr || dvm_jni_mode() == DVM_JNI_PREFER) { \
+         jvalue rv; \
+         va_list copy; \
+         va_copy(copy, p4); \
+         bool done = jvm_dvm_try(p0, p1, method, false, &copy, NULL, &rv); \
+         va_end(copy); \
+         if (done) \
+            return (T)rv.VF; \
+      } \
       return (f.ptr ? f.fun(p0, p1, p2, p4) : D); \
    } \
    static T \
    JNIEnv_CallNonvirtual##N##MethodA(JNIEnv *p0, jobject p1, jclass p2, jmethodID method, jvalue *p4) { \
       assert(p0 && p1 && p2 && method); \
       union { T (*fun)(JNIEnv*, jobject, jclass, jvalue*); void *ptr; } f; \
-      f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), p2); \
+      f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), method); \
+      if (!f.ptr || dvm_jni_mode() == DVM_JNI_PREFER) { \
+         jvalue rv; \
+         if (jvm_dvm_try(p0, p1, method, false, NULL, p4, &rv)) \
+            return (T)rv.VF; \
+      } \
       return (f.ptr ? f.fun(p0, p1, p2, p4) : D); \
    } \
    static T \
@@ -859,20 +1016,21 @@ JNIEnv_CallNonvirtualVoidMethodA(JNIEnv* p0, jobject p1, jclass p2, jmethodID p3
 // N == Method type name
 // T == C type of return value
 // D == Default return value
-#define gen_jnienv_method(N, T, D) \
-   gen_jnienv_method_call(N, T, jobject, D) \
-   gen_jnienv_method_call(Static##N, T, jclass, D) \
-   gen_jnienv_nonvirtual_method_call(N, T, D)
+// VF == the jvalue member holding this return type
+#define gen_jnienv_method(N, T, D, VF) \
+   gen_jnienv_method_call(N, T, jobject, D, VF, false) \
+   gen_jnienv_method_call(Static##N, T, jclass, D, VF, true) \
+   gen_jnienv_nonvirtual_method_call(N, T, D, VF)
 
-gen_jnienv_method(Object, jobject, NULL/*method*/)
-gen_jnienv_method(Boolean, jboolean, false)
-gen_jnienv_method(Byte, jbyte, 0)
-gen_jnienv_method(Char, jchar, 0)
-gen_jnienv_method(Short, jshort, 0)
-gen_jnienv_method(Int, jint, 0)
-gen_jnienv_method(Long, jlong, 0)
-gen_jnienv_method(Float, jfloat, 0)
-gen_jnienv_method(Double, jdouble, 0)
+gen_jnienv_method(Object, jobject, NULL/*method*/, l)
+gen_jnienv_method(Boolean, jboolean, false, z)
+gen_jnienv_method(Byte, jbyte, 0, b)
+gen_jnienv_method(Char, jchar, 0, c)
+gen_jnienv_method(Short, jshort, 0, s)
+gen_jnienv_method(Int, jint, 0, i)
+gen_jnienv_method(Long, jlong, 0, j)
+gen_jnienv_method(Float, jfloat, 0, f)
+gen_jnienv_method(Double, jdouble, 0, d)
 
 struct jvm_stored_field {
    struct jvm *jvm;

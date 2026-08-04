@@ -1,0 +1,43 @@
+/* Minimal Android libvulkan.so compatibility surface.
+ *
+ * Lunaria currently presents an OpenGL ES device.  Reporting Vulkan as
+ * unavailable is important: returning VK_SUCCESS from a generic stub makes
+ * optional helpers continue with uninitialised handles.  The guest ARM path
+ * implements the same policy in arm_exec.cpp; these exports satisfy native
+ * DT_NEEDED loading and symbol-coverage checks. */
+#include <stddef.h>
+#include <stdint.h>
+
+typedef int32_t VkResult;
+typedef void *VkHandle;
+#define VK_ERROR_INCOMPATIBLE_DRIVER ((VkResult)-9)
+
+void *vkGetInstanceProcAddr(VkHandle instance, const char *name)
+    { (void)instance; (void)name; return NULL; }
+void *vkGetDeviceProcAddr(VkHandle device, const char *name)
+    { (void)device; (void)name; return NULL; }
+
+#define VK_FAIL(name) VkResult name(void) { return VK_ERROR_INCOMPATIBLE_DRIVER; }
+#define VK_NOOP(name) void name(void) {}
+
+VK_FAIL(vkCreateInstance)
+VK_FAIL(vkCreateDevice)
+VK_FAIL(vkCreateShaderModule)
+VK_FAIL(vkCreateRenderPass)
+VK_FAIL(vkCreatePipelineCache)
+VK_FAIL(vkCreateDescriptorSetLayout)
+VK_FAIL(vkCreateGraphicsPipelines)
+VK_FAIL(vkCreatePipelineLayout)
+VK_FAIL(vkGetPipelineCacheData)
+VK_FAIL(vkEnumeratePhysicalDevices)
+
+VK_NOOP(vkDestroyPipelineCache)
+VK_NOOP(vkDestroyShaderModule)
+VK_NOOP(vkDestroyPipeline)
+VK_NOOP(vkDestroyRenderPass)
+VK_NOOP(vkDestroyDevice)
+VK_NOOP(vkDestroyDescriptorSetLayout)
+VK_NOOP(vkDestroyInstance)
+VK_NOOP(vkDestroyPipelineLayout)
+VK_NOOP(vkGetPhysicalDeviceFeatures)
+VK_NOOP(vkGetPhysicalDeviceQueueFamilyProperties)

@@ -184,6 +184,11 @@ uint32_t arm_exec_native_activity_create(uint32_t clazz_handle);
 /* Ensure a fake ANativeWindow exists; return its guest VA (for onNativeWindowCreated). */
 uint32_t arm_exec_native_window_va(void);
 
+/* True if ANDROID_APK_FILE — the package path handed to the guest — contains
+ * this zip entry.  Answers "is the expansion file inside the APK?" without
+ * guessing from which env vars happen to be set. */
+int arm_exec_apk_has_entry(const char *name);
+
 /* -------------------------------------------------------------------------
  * ARM64 (AArch64) execution engine — parallel to the ARM32 engine above.
  * All arm64_exec_* functions mirror their arm_exec_* counterparts but
@@ -212,6 +217,10 @@ int64_t arm64_exec_call(uint64_t fn_va, uint64_t x0, uint64_t x1,
 int64_t arm64_exec_call6(uint64_t fn_va, uint64_t x0, uint64_t x1,
                          uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5);
 
+/* AArch64 call with up to eight integer arguments (x0..x7).  UE4's
+ * GameActivity natives take more than the six arm64_exec_call6 carries. */
+int64_t arm64_exec_call8(uint64_t fn_va, const uint64_t *x, int n);
+
 /* Like arm64_exec_call but with no tick limit. */
 int64_t arm64_exec_call_unlimited(uint64_t fn_va, uint64_t x0, uint64_t x1,
                                   uint64_t x2, uint64_t x3);
@@ -221,6 +230,9 @@ uint64_t arm64_exec_lookup_export(const char *sym);
 
 /* Look up a RegisterNatives-registered native method VA. */
 uint64_t arm64_exec_lookup_native(const char *klass, const char *method);
+/* Tell the A64 scheduler whether the engine itself runs on guest threads
+ * (UE) or only its idle worker pool does (Unity).  See a64_thread_slice(). */
+void arm64_exec_threads_run_engine(int on);
 
 /* Like arm64_exec_lookup_native but also fills sig_out. */
 uint64_t arm64_exec_lookup_native_sig(const char *klass, const char *method,

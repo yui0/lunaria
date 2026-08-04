@@ -1273,17 +1273,30 @@ java_io_File_getAbsolutePath(JNIEnv *env, jobject object, va_list args)
    return jni_file_path_string(env, object);
 }
 
-/* Context.getSystemService(name) → a generic stub service object.  Unity asks
- * for "window"/"audio"/"sensor"; methods it then calls fall through to the
- * default (NULL/0) handlers, which is harmless for headless startup. */
+/* Context.getSystemService(name) → a WindowManager-typed stub.
+ *
+ * Do NOT va_arg(args): Call*MethodA (used by the dvm external hook) passes a
+ * jvalue*, not a real va_list.  Consuming it as va_list corrupts the stub and
+ * AllocObject can return NULL — UE then NPEs on
+ * WindowManager.getDefaultDisplay() every frame.
+ *
+ * Returning android.view.WindowManager (rather than bare Object) makes
+ * invoke-interface getDefaultDisplay resolve to the existing stub.  Other
+ * service names ("audio", "sensor", …) still land on no-op method stubs. */
 jobject
 android_content_Context_getSystemService(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
-   if (args)
-      (void)va_arg(args, jstring); /* consume the service-name argument */
+   (void)args;
    static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/lang/Object"))));
+   if (!sv) {
+      jclass cls = (*env)->FindClass(env, "android/view/WindowManager");
+      if (!cls)
+         cls = (*env)->FindClass(env, "java/lang/Object");
+      if (cls)
+         sv = (*env)->AllocObject(env, cls);
+   }
+   return sv;
 }
 
 /* Context.getPackageManager() → a PackageManager stub. */
@@ -1829,6 +1842,26 @@ jobject java_lang_Object_getSystemService(JNIEnv *env, jobject obj, va_list args
 jobject java_lang_Class_getSystemService(JNIEnv *env, jobject obj, va_list args)
 { return android_content_Context_getSystemService(env, obj, args); }
 
+/* Context.registerReceiver(BroadcastReceiver, IntentFilter[, …]) → null.
+ * UE's Volume/Battery/HeadsetReceiver.startReceiver calls this; without a
+ * stub the dvm path reports an unresolved method.  Returning null matches
+ * "no sticky broadcast" and is enough for those receivers to finish.
+ * A null receiver is tolerated: startReceiver may be invoked before the
+ * platform Activity binding is visible to the caller. */
+jobject
+android_content_Context_registerReceiver(JNIEnv *env, jobject object, va_list args)
+{
+   (void)args;
+   if (!env || !object) return NULL;
+   return NULL;
+}
+jobject android_app_Activity_registerReceiver(JNIEnv *env, jobject obj, va_list args)
+{ return android_content_Context_registerReceiver(env, obj, args); }
+jobject java_lang_Object_registerReceiver(JNIEnv *env, jobject obj, va_list args)
+{ return android_content_Context_registerReceiver(env, obj, args); }
+jobject java_lang_Class_registerReceiver(JNIEnv *env, jobject obj, va_list args)
+{ return android_content_Context_registerReceiver(env, obj, args); }
+
 jobject android_content_Context_getDir(JNIEnv *env, jobject obj, va_list args);
 jobject android_app_Activity_getDir(JNIEnv *env, jobject obj, va_list args)
 { return android_content_Context_getDir(env, obj, args); }
@@ -2055,6 +2088,88 @@ jobject java_lang_Object_getDisplay(JNIEnv *e, jobject o, va_list a)
 jobject java_lang_Class_getDisplay(JNIEnv *e, jobject o, va_list a)
 { return android_hardware_display_DisplayManager_getDisplay(e, o, a); }
 
+/* Activity.getWindowManager() → WindowManager stub.
+ * UE's AndroidThunkJava_GetDeviceOrientation does:
+ *   getWindowManager().getDefaultDisplay().getRotation()
+ * (not getSystemService — that path is a red herring). */
+jobject
+android_app_Activity_getWindowManager(JNIEnv *env, jobject object, va_list args)
+{
+   assert(env && object);
+   (void)args;
+   static jobject sv;
+   if (!sv) {
+      jclass cls = (*env)->FindClass(env, "android/view/WindowManager");
+      if (!cls)
+         cls = (*env)->FindClass(env, "java/lang/Object");
+      if (cls)
+         sv = (*env)->AllocObject(env, cls);
+   }
+   return sv;
+}
+jobject java_lang_Object_getWindowManager(JNIEnv *env, jobject obj, va_list args)
+{ return android_app_Activity_getWindowManager(env, obj, args); }
+jobject java_lang_Class_getWindowManager(JNIEnv *env, jobject obj, va_list args)
+{ return android_app_Activity_getWindowManager(env, obj, args); }
+jobject com_epicgames_ue4_GameActivity_getWindowManager(JNIEnv *env, jobject obj, va_list args)
+{ return android_app_Activity_getWindowManager(env, obj, args); }
+
+/* Activity.getWindow() → Window stub.
+ * AndroidThunkJava_KeepScreenOn does runOnUiThread(() -> getWindow().addFlags/
+ * clearFlags(FLAG_KEEP_SCREEN_ON)).  Without a Window the dex path NPEs inside
+ * the anonymous Runnable and again in the thunk itself. */
+jobject
+android_app_Activity_getWindow(JNIEnv *env, jobject object, va_list args)
+{
+   assert(env && object);
+   (void)args;
+   static jobject sv;
+   if (!sv) {
+      jclass cls = (*env)->FindClass(env, "android/view/Window");
+      if (!cls)
+         cls = (*env)->FindClass(env, "java/lang/Object");
+      if (cls)
+         sv = (*env)->AllocObject(env, cls);
+   }
+   return sv;
+}
+jobject java_lang_Object_getWindow(JNIEnv *env, jobject obj, va_list args)
+{ return android_app_Activity_getWindow(env, obj, args); }
+jobject java_lang_Class_getWindow(JNIEnv *env, jobject obj, va_list args)
+{ return android_app_Activity_getWindow(env, obj, args); }
+jobject com_epicgames_ue4_GameActivity_getWindow(JNIEnv *env, jobject obj, va_list args)
+{ return android_app_Activity_getWindow(env, obj, args); }
+
+/* Window.addFlags / clearFlags — KeepScreenOn only; no host window attrs. */
+#define DEF_WINDOW_FLAGS(name) \
+   void android_view_Window_##name(JNIEnv *e, jobject o, va_list a) \
+   { (void)e; (void)o; (void)a; } \
+   void java_lang_Object_##name(JNIEnv *e, jobject o, va_list a) \
+   { (void)e; (void)o; (void)a; } \
+   void java_lang_Class_##name(JNIEnv *e, jobject o, va_list a) \
+   { (void)e; (void)o; (void)a; } \
+   void android_view_PhoneWindow_##name(JNIEnv *e, jobject o, va_list a) \
+   { (void)e; (void)o; (void)a; }
+DEF_WINDOW_FLAGS(addFlags)
+DEF_WINDOW_FLAGS(clearFlags)
+#undef DEF_WINDOW_FLAGS
+
+/* WindowManager.getDefaultDisplay() — UE's AndroidThunkJava_GetDeviceOrientation
+ * does getWindowManager().getDefaultDisplay().getRotation().  Without
+ * this the dex path NPEs every frame after the first draw. */
+jobject
+android_view_WindowManager_getDefaultDisplay(JNIEnv *e, jobject o, va_list a)
+{
+   (void)o; (void)a;
+   return android_hardware_display_DisplayManager_getDisplay(e, o, a);
+}
+jobject java_lang_Object_getDefaultDisplay(JNIEnv *e, jobject o, va_list a)
+{ return android_view_WindowManager_getDefaultDisplay(e, o, a); }
+jobject java_lang_Class_getDefaultDisplay(JNIEnv *e, jobject o, va_list a)
+{ return android_view_WindowManager_getDefaultDisplay(e, o, a); }
+jobject android_view_WindowManagerImpl_getDefaultDisplay(JNIEnv *e, jobject o, va_list a)
+{ return android_view_WindowManager_getDefaultDisplay(e, o, a); }
+
 /* ---- android.Manifest.permission.READ_PHONE_STATE ---- */
 jstring android_Manifest_permission_READ_PHONE_STATE(JNIEnv *e, jobject o)
 { (void)o; return (*e)->NewStringUTF(e, "android.permission.READ_PHONE_STATE"); }
@@ -2099,6 +2214,9 @@ void java_lang_Class_triggerResizeCall(JNIEnv *e, jobject o, va_list a)
 DEF_VOID3(hideSoftInput)
 DEF_VOID3(startActivityIndicator)
 DEF_VOID3(stopActivityIndicator)
+/* runOnUiThread(Runnable): no-op at the stub layer.  When dvm is active the
+ * bytecode emulator's hook_call_external runs the Runnable inline instead. */
+DEF_VOID3(runOnUiThread)
 #undef DEF_VOID3
 
 /* ---- android.view.Display ---- */

@@ -62,6 +62,16 @@ struct jvm_object {
       JVM_OBJECT_STRING,
       JVM_OBJECT_LAST,
    } type;
+
+   /* Outstanding references; creation counts as one.  DeleteLocalRef and
+    * DeleteGlobalRef were no-ops, so every handle an app made leaked until
+    * the table filled and the process aborted.  Only the two types an app
+    * allocates without bound — arrays and strings — release their slot when
+    * this reaches zero (see jvm_deref_object()).  Classes and methods are
+    * interned and must keep their identity for the process lifetime, and
+    * opaque objects back the singleton stubs in jni_stubs.c, which cache the
+    * jobject in a `static` and would dangle if the slot were recycled. */
+   int refs;
 };
 
 struct jvm_native_method {
@@ -75,6 +85,10 @@ struct jvm {
    // Every other object or class definition is created lazily as needed, only [0] is special.
    // `jobject`'s we return through JNI are actually (index+1) to this array, not pointers.
    struct jvm_object objects[65536];
+
+   // Rotating free-slot hint for jvm_add_object(): allocation resumes here
+   // instead of rescanning the whole table from index 0 on every call.
+   size_t next_object;
 
    // Native methods registered by the application.
    // Nothing special, but there's no need to access this array either really.
