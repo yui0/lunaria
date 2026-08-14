@@ -573,6 +573,11 @@ JNIEnv_EnsureLocalCapacity(JNIEnv* p0, jint p1)
    return 0;
 }
 
+/* Defined below, next to the other call paths. */
+static bool jvm_dvm_try(JNIEnv *env, jobject self, jmethodID method_id,
+                        bool is_static, va_list *ap, const jvalue *jargs,
+                        jvalue *out);
+
 static jobject
 JNIEnv_AllocObject(JNIEnv* p0, jclass p1)
 {
@@ -599,6 +604,16 @@ jvm_class_is(struct jvm *jvm, jclass cls, const char *name)
           !strcmp(ko->klass.name.data, name);
 }
 
+/* NewObject is AllocObject *plus the constructor*.  Skipping the second half
+ * hands the caller an object whose fields are all zero, which is not the
+ * object the class says it builds: Epic's ElectraDecoderVideoH264 picks its
+ * codec in its constructor, so a native NewObject() of it came back with no
+ * codec and the decoder reported "No suitable decoder found" — with nothing
+ * in the log to say a constructor had been dropped.
+ *
+ * The constructor is an ordinary method, so it goes the same way any other
+ * call on the object does: the bytecode VM when the APK's dex defines it, the
+ * host binding otherwise (java.io.File is built host-side and has no dex). */
 static jobject
 JNIEnv_NewObjectV(JNIEnv *p0, jclass p1, jmethodID p2, va_list p3)
 {
@@ -610,7 +625,13 @@ JNIEnv_NewObjectV(JNIEnv *p0, jclass p1, jmethodID p2, va_list p3)
       va_copy(ap2, p3);
       jni_file_bind_ctor(p0, o, p2, ap2);
       va_end(ap2);
+      return o;
    }
+   jvalue rv;
+   va_list copy;
+   va_copy(copy, p3);
+   (void)jvm_dvm_try(p0, o, p2, false, &copy, NULL, &rv);
+   va_end(copy);
    return o;
 }
 
@@ -630,8 +651,12 @@ JNIEnv_NewObjectA(JNIEnv* p0, jclass p1, jmethodID p2, jvalue* p3)
    assert(p0);
    jobject o = JNIEnv_AllocObject(p0, p1);
    struct jvm *jvm = jnienv_get_jvm(p0);
-   if (jvm_class_is(jvm, p1, "java/io/File"))
+   if (jvm_class_is(jvm, p1, "java/io/File")) {
       jni_file_bind_ctor_a(p0, o, p2, p3);
+      return o;
+   }
+   jvalue rv;
+   (void)jvm_dvm_try(p0, o, p2, false, NULL, p3, &rv);
    return o;
 }
 
@@ -770,6 +795,40 @@ jvm_form_symbol(struct jvm *jvm, const struct jvm_method *method, char *symbol, 
    cstr_replace(symbol, "./$", '_');
 }
 
+/* The Android framework hierarchy for the base classes whose methods this file
+ * stubs.  A stub is named after the class that *declares* the method, so
+ * without the chain a call to an inherited method on a subclass finds nothing
+ * and silently returns 0 — Activity.getIntent() called on the APK's own
+ * GameActivity, for instance.  The dex supplies the app's own part of the
+ * chain (dvm_jni_super_name); this table continues it through the framework,
+ * which no dex declares.  These are the real AOSP relationships. */
+static const char *
+jvm_framework_super(const char *name)
+{
+   static const struct { const char *cls, *super; } chain[] = {
+      { "android/app/NativeActivity",       "android/app/Activity" },
+      { "android/app/ListActivity",         "android/app/Activity" },
+      { "android/app/Activity",             "android/view/ContextThemeWrapper" },
+      { "android/view/ContextThemeWrapper", "android/content/ContextWrapper" },
+      { "android/app/Application",          "android/content/ContextWrapper" },
+      { "android/app/Service",              "android/content/ContextWrapper" },
+      { "android/content/ContextWrapper",   "android/content/Context" },
+      { "android/content/Context",          "java/lang/Object" },
+   };
+   /* jvm_make_class() stores names dotted, the dex and this table use slashes;
+    * compare with both separators treated as the same character. */
+   for (size_t i = 0; i < sizeof chain / sizeof chain[0]; ++i) {
+      const char *a = name, *b = chain[i].cls;
+      for (; *a && *b; ++a, ++b) {
+         char ca = (*a == '.') ? '/' : *a;
+         if (ca != *b) break;
+      }
+      if (!*a && !*b)
+         return chain[i].super;
+   }
+   return NULL;
+}
+
 static void*
 jvm_wrap_method(struct jvm *jvm, jmethodID method_id)
 {
@@ -780,6 +839,25 @@ jvm_wrap_method(struct jvm *jvm, jmethodID method_id)
    void *sym;
    if ((sym = wrapper_create(symbol, dlsym(RTLD_DEFAULT, symbol))))
       return sym;
+
+   /* Walk up to the class that declares the method. */
+   {
+      struct jvm_object *ko =
+         jvm_get_object_of_type(jvm, method.klass, JVM_OBJECT_CLASS);
+      const char *name = ko ? ko->klass.name.data : NULL;
+      for (int hops = 0; name && hops < 16; ++hops) {
+         const char *super = dvm_jni_super_name(name);
+         if (!super)
+            super = jvm_framework_super(name);
+         if (!super || !strcmp(super, "java/lang/Object"))
+            break;
+         method.klass = jvm_make_class(jvm, super);
+         jvm_form_symbol(jvm, &method, symbol, sizeof(symbol));
+         if ((sym = wrapper_create(symbol, dlsym(RTLD_DEFAULT, symbol))))
+            return sym;
+         name = super;
+      }
+   }
 
    method.klass = jvm_make_class(jvm, "java/lang/Object");
    jvm_form_symbol(jvm, &method, symbol, sizeof(symbol));
@@ -817,6 +895,58 @@ jvm_dvm_try(JNIEnv *env, jobject self, jmethodID method_id, bool is_static,
                          ap, jargs, out);
 }
 
+/* The host stubs in jni_stubs.c all take their arguments as a `va_list` —
+ * that is the shape the JNI *V* entry points hand them.  The *A* entry points
+ * receive a `jvalue[]` instead, and a `jvalue *` is NOT a `va_list`: handing
+ * one straight to a stub made va_arg() walk whatever the first jvalue happened
+ * to contain as if it were the ABI's argument-area bookkeeping, which segfaults
+ * the moment a stub reads its first parameter.
+ *
+ * A jvalue is an 8-byte union, i.e. exactly the layout of the stack argument
+ * area of a varargs frame.  So a real va_list can be built over the caller's
+ * array by declaring the register save areas already exhausted and pointing the
+ * overflow area at it; va_arg() then reads consecutive 8-byte slots, which is
+ * what a jvalue array is. */
+struct jvm_va_wrap { va_list ap; };
+
+static void
+jvm_va_from_jvalues(struct jvm_va_wrap *v, const jvalue *args)
+{
+   memset(v, 0, sizeof *v);
+#if defined(__x86_64__)
+   struct { unsigned gp_offset, fp_offset; void *overflow, *reg_save; } *t =
+      (void *)&v->ap;
+   t->gp_offset = 6 * 8;         /* all 6 GP argument registers consumed */
+   t->fp_offset = 6 * 8 + 8 * 16;/* all 8 SSE argument registers consumed */
+   t->overflow = (void *)(uintptr_t)args;
+   t->reg_save = NULL;
+#elif defined(__aarch64__)
+   struct { void *stack, *gr_top, *vr_top; int gr_offs, vr_offs; } *t =
+      (void *)&v->ap;
+   t->stack = (void *)(uintptr_t)args;
+   t->gr_offs = 0;               /* 0 == no general regs left */
+   t->vr_offs = 0;               /* 0 == no vector regs left */
+#else
+#  error "jvm_va_from_jvalues: unsupported host ABI"
+#endif
+}
+
+/* Invoke a `T (*)(JNIEnv*, C, va_list)` stub with a jvalue array.  A NULL array
+ * means "no arguments" and is forwarded as a NULL va_list, which is the sentinel
+ * every stub already tests for — synthesising an empty va_list instead would
+ * make those tests pass and the stub read past the end of nothing. */
+#define JVM_CALL_A(f, T, C, p0, p1, args) \
+   ((args) ? ({ struct jvm_va_wrap v_; \
+                jvm_va_from_jvalues(&v_, (args)); \
+                ((T (*)(JNIEnv *, C, va_list))(f))((p0), (p1), v_.ap); }) \
+           : ((T (*)(JNIEnv *, C, void *))(f))((p0), (p1), NULL))
+
+#define JVM_CALL_NV_A(f, T, p0, p1, p2, args) \
+   ((args) ? ({ struct jvm_va_wrap v_; \
+                jvm_va_from_jvalues(&v_, (args)); \
+                ((T (*)(JNIEnv *, jobject, jclass, va_list))(f))((p0), (p1), (p2), v_.ap); }) \
+           : ((T (*)(JNIEnv *, jobject, jclass, void *))(f))((p0), (p1), (p2), NULL))
+
 static void
 JNIEnv_CallStaticVoidMethodV(JNIEnv* p0, jclass p1, jmethodID p2, va_list p3)
 {
@@ -849,15 +979,14 @@ static void
 JNIEnv_CallStaticVoidMethodA(JNIEnv* p0, jclass p1, jmethodID p2, jvalue* p3)
 {
    assert(p0 && p1 && p2);
-   union { jobject (*fun)(JNIEnv*, jclass, jvalue*); void *ptr; } f;
-   f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), p2);
-   if (!f.ptr || dvm_jni_mode() == DVM_JNI_PREFER) {
+   void *fp = jvm_wrap_method(jnienv_get_jvm(p0), p2);
+   if (!fp || dvm_jni_mode() == DVM_JNI_PREFER) {
       jvalue rv;
       if (jvm_dvm_try(p0, (jobject)p1, p2, true, NULL, p3, &rv))
          return;
    }
-   if (f.ptr)
-      f.fun(p0, p1, p3);
+   if (fp)
+      (void)JVM_CALL_A(fp, jobject, jclass, p0, p1, p3);
 }
 
 static void
@@ -892,15 +1021,14 @@ static void
 JNIEnv_CallVoidMethodA(JNIEnv* p0, jobject p1, jmethodID p2, jvalue* p3)
 {
    assert(p0 && p1 && p2);
-   union { jobject (*fun)(JNIEnv*, jobject, jvalue*); void *ptr; } f;
-   f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), p2);
-   if (!f.ptr || dvm_jni_mode() == DVM_JNI_PREFER) {
+   void *fp = jvm_wrap_method(jnienv_get_jvm(p0), p2);
+   if (!fp || dvm_jni_mode() == DVM_JNI_PREFER) {
       jvalue rv;
       if (jvm_dvm_try(p0, p1, p2, false, NULL, p3, &rv))
          return;
    }
-   if (f.ptr)
-      f.fun(p0, p1, p3);
+   if (fp)
+      (void)JVM_CALL_A(fp, jobject, jobject, p0, p1, p3);
 }
 
 static void
@@ -925,9 +1053,9 @@ static void
 JNIEnv_CallNonvirtualVoidMethodA(JNIEnv* p0, jobject p1, jclass p2, jmethodID p3, jvalue* p4)
 {
    assert(p0 && p1 && p2 && p3);
-   union { jobject (*fun)(JNIEnv*, jobject, jclass, jvalue*); void *ptr; } f;
-   if ((f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), p2)))
-      f.fun(p0, p1, p2, p4);
+   void *fp = jvm_wrap_method(jnienv_get_jvm(p0), p2);
+   if (fp)
+      (void)JVM_CALL_NV_A(fp, jobject, p0, p1, p2, p4);
 }
 
 // N == Call method type convention (Long, Float, StaticLong, StaticFloat, etc...)
@@ -954,14 +1082,13 @@ JNIEnv_CallNonvirtualVoidMethodA(JNIEnv* p0, jobject p1, jclass p2, jmethodID p3
    static T \
    JNIEnv_Call##N##MethodA(JNIEnv* p0, C p1, jmethodID method, jvalue* p3) { \
       assert(p0 && p1 && method); \
-      union { T (*fun)(JNIEnv*, C, jvalue*); void *ptr; } f; \
-      f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), method); \
-      if (!f.ptr || dvm_jni_mode() == DVM_JNI_PREFER) { \
+      void *fp = jvm_wrap_method(jnienv_get_jvm(p0), method); \
+      if (!fp || dvm_jni_mode() == DVM_JNI_PREFER) { \
          jvalue rv; \
          if (jvm_dvm_try(p0, (jobject)p1, method, ST, NULL, p3, &rv)) \
             return (T)rv.VF; \
       } \
-      return (f.ptr ? f.fun(p0, p1, p3) : D); \
+      return (fp ? JVM_CALL_A(fp, T, C, p0, p1, p3) : D); \
    } \
    static T \
    JNIEnv_Call##N##Method(JNIEnv* p0, C p1, jmethodID method, ...) { \
@@ -995,14 +1122,13 @@ JNIEnv_CallNonvirtualVoidMethodA(JNIEnv* p0, jobject p1, jclass p2, jmethodID p3
    static T \
    JNIEnv_CallNonvirtual##N##MethodA(JNIEnv *p0, jobject p1, jclass p2, jmethodID method, jvalue *p4) { \
       assert(p0 && p1 && p2 && method); \
-      union { T (*fun)(JNIEnv*, jobject, jclass, jvalue*); void *ptr; } f; \
-      f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), method); \
-      if (!f.ptr || dvm_jni_mode() == DVM_JNI_PREFER) { \
+      void *fp = jvm_wrap_method(jnienv_get_jvm(p0), method); \
+      if (!fp || dvm_jni_mode() == DVM_JNI_PREFER) { \
          jvalue rv; \
          if (jvm_dvm_try(p0, p1, method, false, NULL, p4, &rv)) \
             return (T)rv.VF; \
       } \
-      return (f.ptr ? f.fun(p0, p1, p2, p4) : D); \
+      return (fp ? JVM_CALL_NV_A(fp, T, p0, p1, p2, p4) : D); \
    } \
    static T \
    JNIEnv_CallNonvirtual##N##Method(JNIEnv* p0, jobject p1, jclass p2, jmethodID method, ...) { \
@@ -1075,38 +1201,67 @@ jvm_set_field_bits(struct jvm *jvm, jobject object, jfieldID field, uint64_t bit
    }
 }
 
+/* Name the field before the assert fires.  A NULL object here means some
+ * earlier accessor in the chain (Context.getResources(), …) has no stub and
+ * handed back NULL; without the name the abort says nothing about which one. */
+static void
+jvm_report_field_access(JNIEnv *env, jobject object, jfieldID field, const char *op)
+{
+   if (env && object && field)
+      return;
+   const char *klass = "?", *name = "?";
+   if (env && field) {
+      struct jvm *jvm = jnienv_get_jvm(env);
+      struct jvm_object *m = jvm_get_object_of_type(jvm, field, JVM_OBJECT_METHOD);
+      if (m && m->method.name.data) {
+         name = m->method.name.data;
+         struct jvm_object *k = jvm_get_object_of_type(jvm, m->method.klass, JVM_OBJECT_CLASS);
+         if (k && k->klass.name.data) klass = k->klass.name.data;
+      }
+   }
+   fprintf(stderr, "[jvm] %s %s.%s: %s%s%s is NULL\n", op, klass, name,
+           env ? "" : "env ", object ? "" : "object ", field ? "" : "field ");
+}
+
 // N == Property method type convention (Long, Float, StaticLong, StaticFloat, etc...)
 // T == C type of return value
 // D == Default return value
-#define gen_jnienv_property_call(N, T, D) \
+#define gen_jnienv_property_call(N, T, D, ST) \
    static T \
    JNIEnv_Get##N##Field(JNIEnv *p0, jclass p1, jfieldID method) { \
+      jvm_report_field_access(p0, p1, method, "Get" #N "Field"); \
       assert(p0 && p1 && method); \
       union { T (*fun)(JNIEnv*, jobject); void *ptr; } f; \
       f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), (jmethodID)method); \
       if (f.ptr) return f.fun(p0, p1); \
       uint64_t bits = 0; T value = (D); \
+      if (!(ST) && dvm_jni_field(p0, (jobject)p1, method, false, &bits)) { \
+         memcpy(&value, &bits, sizeof(value)); \
+         return value; \
+      } \
       if (jvm_get_field_bits(jnienv_get_jvm(p0), (jobject)p1, method, &bits)) \
          memcpy(&value, &bits, sizeof(value)); \
       return value; \
    } \
    static void \
    JNIEnv_Set##N##Field(JNIEnv* p0, jclass p1, jfieldID method, T p3) { \
+      jvm_report_field_access(p0, p1, method, "Set" #N "Field"); \
       assert(p0 && p1 && method); \
       union { void (*fun)(JNIEnv*, jobject, T); void *ptr; } f; \
       if ((f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), (jmethodID)method))) \
          f.fun(p0, p1, p3); \
       else { \
          uint64_t bits = 0; memcpy(&bits, &p3, sizeof(p3)); \
-         jvm_set_field_bits(jnienv_get_jvm(p0), (jobject)p1, method, bits); \
+         if ((ST) || !dvm_jni_field(p0, (jobject)p1, method, true, &bits)) \
+            jvm_set_field_bits(jnienv_get_jvm(p0), (jobject)p1, method, bits); \
       } \
    }
 
 // N == Property type name
 // T == C type of return value
 #define gen_jnienv_property(N, T, D) \
-   gen_jnienv_property_call(N, T, D) \
-   gen_jnienv_property_call(Static##N, T, D)
+   gen_jnienv_property_call(N, T, D, 0) \
+   gen_jnienv_property_call(Static##N, T, D, 1)
 
 gen_jnienv_property(Object, jobject, NULL/*method*/)
 gen_jnienv_property(Boolean, jboolean, false)
@@ -1990,6 +2145,34 @@ const char*
 jvm_get_class_name(struct jvm *jvm, jobject object)
 {
    return jvm_get_object_of_type(jvm, object, JVM_OBJECT_CLASS)->klass.name.data;
+}
+
+bool
+jvm_field_info(struct jvm *jvm, jfieldID field, const char **klass,
+               const char **name, const char **type)
+{
+   if (!jvm || !field) return false;
+   struct jvm_object *fo = jvm_get_object(jvm, (jobject)field);
+   if (!fo || fo->type != JVM_OBJECT_METHOD) return false;
+   struct jvm_object *ko =
+      jvm_get_object_of_type(jvm, fo->method.klass, JVM_OBJECT_CLASS);
+   if (!ko || !ko->klass.name.data) return false;
+   if (klass) *klass = ko->klass.name.data;
+   if (name) *name = fo->method.name.data;
+   if (type) *type = fo->method.signature.data;
+   return name && *name && type && *type;
+}
+
+bool
+jvm_method_has_stub(JNIEnv *env, jmethodID method)
+{
+   if (!env || !method)
+      return false;
+   struct jvm *jvm = jnienv_get_jvm(env);
+   struct jvm_object *mo = jvm_get_object(jvm, method);
+   if (!mo || mo->type != JVM_OBJECT_METHOD)
+      return false;
+   return jvm_wrap_method(jvm, method) != NULL;
 }
 
 void*

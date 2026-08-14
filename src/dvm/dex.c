@@ -160,10 +160,11 @@ void dex_close(struct dex_file *d)
  * normalise them into a private copy the first time such a string is read. */
 static bool mutf8_needs_fixup(const uint8_t *s)
 {
-   for (; *s; ++s) {
-      if (s[0] == 0xc0 && s[1] == 0x80) return true;
+   /* c0 80 (the MUTF-8 spelling of U+0000) is left alone: it is already safe
+    * to carry in a C string, and it keeps the character count right.  Only
+    * surrogate pairs have to be folded into real UTF-8. */
+   for (; *s; ++s)
       if (s[0] == 0xed && (s[1] & 0xf0) == 0xa0) return true;  /* high surrogate */
-   }
    return false;
 }
 
@@ -174,12 +175,10 @@ static char *mutf8_to_utf8(const uint8_t *s)
    if (!out) return NULL;
    char *w = out;
    while (*s) {
-      if (s[0] == 0xc0 && s[1] == 0x80) {
-         /* Embedded NUL.  We hand these to C string APIs, so drop it rather
-          * than truncate the rest of the string. */
-         s += 2;
-         continue;
-      }
+      /* c0 80 falls through untouched: dropping it silently shortened the
+       * string by a character, which broke length checks on binary payloads
+       * carried as strings (Play services stores its signing certificates
+       * that way). */
       if (s[0] == 0xed && (s[1] & 0xf0) == 0xa0 &&
           s[3] == 0xed && (s[4] & 0xf0) == 0xb0) {
          uint32_t hi = 0xd800u | (uint32_t)(s[1] & 0x0f) << 6 | (s[2] & 0x3f);

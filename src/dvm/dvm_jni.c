@@ -8,6 +8,8 @@
 
 #include "dvm/dvm_jni.h"
 #include "dvm/dvm_internal.h"
+#include "jvm/jvm.h"
+#include "arm_exec.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +20,7 @@ static bool g_tried;
 static enum dvm_jni_mode g_mode = DVM_JNI_FILL_GAPS;
 static JNIEnv *g_env;               /* the env of the call currently in flight */
 static dvm_guest_native_fn g_guest_native;
+static dvm_guest_library_fn g_guest_library;
 static unsigned g_calls, g_native_calls, g_external_calls;
 
 /* Read on first use, not in vm_get(): the mode decides whether a call site
@@ -36,6 +39,13 @@ enum dvm_jni_mode dvm_jni_mode(void)
 }
 
 void dvm_jni_set_guest_native_caller(dvm_guest_native_fn fn) { g_guest_native = fn; }
+void dvm_jni_set_guest_library_loader(dvm_guest_library_fn fn) { g_guest_library = fn; }
+
+static bool hook_load_library(void *user, struct dvm *vm, const char *name)
+{
+   (void)user; (void)vm;
+   return g_guest_library && g_guest_library(name);
+}
 
 /* ------------------------------------------------------------------------ *
  * Value bridging
@@ -52,6 +62,22 @@ static struct {
 } g_wrappers[512];
 static unsigned g_nwrappers;
 
+static void remember_wrapper(uint32_t host, dvm_ref ref)
+{
+   if (!host || !ref) return;
+   for (unsigned i = 0; i < g_nwrappers; ++i) {
+      if (g_wrappers[i].host == host) {
+         g_wrappers[i].ref = ref;
+         return;
+      }
+   }
+   if (g_nwrappers < sizeof g_wrappers / sizeof g_wrappers[0]) {
+      g_wrappers[g_nwrappers].host = host;
+      g_wrappers[g_nwrappers].ref = ref;
+      ++g_nwrappers;
+   }
+}
+
 static dvm_ref wrapper_for(struct dvm *vm, const char *class_name, uint32_t host)
 {
    if (!host) return 0;
@@ -61,12 +87,90 @@ static dvm_ref wrapper_for(struct dvm *vm, const char *class_name, uint32_t host
    dvm_ref r = dvm_wrap_external(vm, class_name, host);
    if (!r) return 0;
    dvm_pin(vm, r);
-   if (g_nwrappers < sizeof g_wrappers / sizeof g_wrappers[0]) {
-      g_wrappers[g_nwrappers].host = host;
-      g_wrappers[g_nwrappers].ref = r;
-      ++g_nwrappers;
-   }
+   remember_wrapper(host, r);
    return r;
+}
+
+/* Element descriptor and width of a host array class name ("[B" → 'B', 1). */
+static bool host_array_kind(const char *cls, char *kind, size_t *width)
+{
+   if (!cls || cls[0] != '[') return false;
+   char k = cls[1];
+   size_t w;
+   switch (k) {
+      case 'Z': case 'B': w = 1; break;
+      case 'C': case 'S': w = 2; break;
+      case 'I': case 'F': w = 4; break;
+      case 'J': case 'D': w = 8; break;
+      case 'L': case '[': k = 'L'; w = sizeof(void *); break;
+      default: return false;
+   }
+   *kind = k;
+   *width = w;
+   return true;
+}
+
+/* A JNI array argument has to arrive in bytecode as a real array.  Wrapping it
+ * as an opaque handle instead made `array-length` on it throw — Epic's
+ * ElectraDecoderVideoH264.QueueInputBuffer(int, long, byte[]) reads
+ * `data.length`, so every sample it was handed looked like null.
+ *
+ * Primitive arrays are copied; jvm_array owns its storage and a dvm array owns
+ * its own, so the two cannot share one buffer.  Anything a callee writes is
+ * copied back by array_sync_back() once the call returns, which is the same
+ * bargain GetArrayElements(..., isCopy=true) makes. */
+#define ARRAY_REGION(env, dir, kind, o, n, p)                                 \
+   do {                                                                       \
+      switch (kind) {                                                         \
+         case 'Z': (*(env))->dir##BooleanArrayRegion(env, o, 0, n, p); break; \
+         case 'B': (*(env))->dir##ByteArrayRegion(env, o, 0, n, p); break;    \
+         case 'C': (*(env))->dir##CharArrayRegion(env, o, 0, n, p); break;    \
+         case 'S': (*(env))->dir##ShortArrayRegion(env, o, 0, n, p); break;   \
+         case 'I': (*(env))->dir##IntArrayRegion(env, o, 0, n, p); break;     \
+         case 'J': (*(env))->dir##LongArrayRegion(env, o, 0, n, p); break;    \
+         case 'F': (*(env))->dir##FloatArrayRegion(env, o, 0, n, p); break;   \
+         case 'D': (*(env))->dir##DoubleArrayRegion(env, o, 0, n, p); break;  \
+         default: break;                                                      \
+      }                                                                       \
+   } while (0)
+
+/* jvm_get_class_name() takes a *class* handle, not an instance — asking it
+ * about an object gets the zeroed dummy and a NULL name.  Go through
+ * GetObjectClass, which is what holds the instance's class. */
+static const char *class_name_of(JNIEnv *env, jobject o)
+{
+   if (!o) return NULL;
+   jclass c = (*env)->GetObjectClass(env, o);
+   return c ? jvm_get_class_name(jnienv_get_jvm(env), c) : NULL;
+}
+
+static dvm_ref host_array_to_dvm(struct dvm *vm, JNIEnv *env, jobject o)
+{
+   const char *cls = class_name_of(env, o);
+   char kind;
+   size_t width;
+   if (!host_array_kind(cls, &kind, &width) || kind == 'L') return 0;
+
+   jsize n = (*env)->GetArrayLength(env, o);
+   char elem[2] = { kind, 0 };
+   dvm_ref r = dvm_new_array(vm, kind, elem, (uint32_t)(n < 0 ? 0 : n));
+   void *dst = r ? dvm_array_data(vm, r) : NULL;
+   if (dst && n > 0) ARRAY_REGION(env, Get, kind, o, n, dst);
+   return r;
+}
+
+/* The other direction of the copy above, run after the callee returns. */
+static void array_sync_back(struct dvm *vm, JNIEnv *env, jobject o, dvm_ref r)
+{
+   if (!o || !r) return;
+   char kind;
+   size_t width;
+   if (!host_array_kind(class_name_of(env, o), &kind, &width) || kind == 'L')
+      return;
+   void *src = dvm_array_data(vm, r);
+   jsize n = (jsize)dvm_array_length(vm, r);
+   if (src && n > 0 && n == (*env)->GetArrayLength(env, o))
+      ARRAY_REGION(env, Set, kind, o, n, src);
 }
 
 /* jobject → dvm_ref.  A jstring becomes a real VM string so bytecode can call
@@ -75,6 +179,8 @@ static dvm_ref wrapper_for(struct dvm *vm, const char *class_name, uint32_t host
 static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
 {
    if (!o) return 0;
+   dvm_ref arr = host_array_to_dvm(vm, env, o);
+   if (arr) return arr;
    const char *utf = NULL;
    /* GetStringUTFChars asserts on a non-string, so probe the class first. */
    jclass sc = (*env)->GetObjectClass(env, o);
@@ -88,17 +194,56 @@ static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
       (*env)->ReleaseStringUTFChars(env, (jstring)o, utf);
       return r;
    }
-   return wrapper_for(vm, "java/lang/Object", (uint32_t)(uintptr_t)o);
+   /* Wrap it as what it actually is.  Naming every incoming object
+    * "java/lang/Object" threw away the one piece of type information the
+    * stub layer had: bytecode could not dispatch a virtual call on it, an
+    * instanceof against its real class answered false, and any class the VM
+    * implements itself (AssetManager, File, …) was unreachable through an
+    * object that arrived this way. */
+   const char *cn = class_name_of(env, o);
+   return wrapper_for(vm, cn && *cn ? cn : "java/lang/Object",
+                      (uint32_t)(uintptr_t)o);
 }
 
 /* dvm_ref → jobject.  Strings become real jstrings; a wrapper hands back the
  * handle it came in with; anything else becomes an opaque object of the right
  * class, so IsInstanceOf and GetObjectClass on the stub side still work. */
+/* A VM array going back to native, e.g. the byte[] Epic's decoder hands out of
+ * GetOutputBuffer().  Without this it became an opaque object and the caller
+ * read nothing out of it. */
+static jobject dvm_array_to_host(struct dvm *vm, JNIEnv *env, dvm_ref r)
+{
+   struct dvm_object *o = dvm__obj(vm, r);
+   if (!o || o->kind != DVM_OBJ_ARRAY) return NULL;
+
+   jsize n = (jsize)o->length;
+   char kind = o->elem_kind;
+   jobject h = NULL;
+   switch (kind) {
+      case 'Z': h = (*env)->NewBooleanArray(env, n); break;
+      case 'B': h = (*env)->NewByteArray(env, n);    break;
+      case 'C': h = (*env)->NewCharArray(env, n);    break;
+      case 'S': h = (*env)->NewShortArray(env, n);   break;
+      case 'I': h = (*env)->NewIntArray(env, n);     break;
+      case 'J': h = (*env)->NewLongArray(env, n);    break;
+      case 'F': h = (*env)->NewFloatArray(env, n);   break;
+      case 'D': h = (*env)->NewDoubleArray(env, n);  break;
+      default: return NULL;   /* object arrays keep the wrapper path */
+   }
+   if (!h) return NULL;
+   if (n > 0 && o->data) ARRAY_REGION(env, Set, kind, h, n, o->data);
+   o->host_handle = (uint32_t)(uintptr_t)h;
+   return h;
+}
+
 static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
 {
    if (!r) return NULL;
    uint32_t host = dvm_external_handle(vm, r);
    if (host) return (jobject)(uintptr_t)host;
+
+   jobject arr = dvm_array_to_host(vm, env, r);
+   if (arr) return arr;
 
    const char *s = dvm_string_utf8(vm, r);
    if (s) return (jobject)(*env)->NewStringUTF(env, s);
@@ -107,7 +252,13 @@ static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
    jclass cls = (*env)->FindClass(env, c ? c->name : "java/lang/Object");
    jobject o = (*env)->AllocObject(env, cls);
    struct dvm_object *obj = dvm__obj(vm, r);
-   if (obj) obj->host_handle = (uint32_t)(uintptr_t)o;
+   if (obj) {
+      obj->host_handle = (uint32_t)(uintptr_t)o;
+      /* The object can immediately cross back through a native callback.
+       * Record the reverse edge now; otherwise from_jobject() wraps the host
+       * handle as a fresh VM object and loses every instance field. */
+      remember_wrapper(obj->host_handle, r);
+   }
    return o;
 }
 
@@ -203,6 +354,165 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
    JNIEnv *env = g_env;
    if (!env) return false;
 
+   /* Display.getMode() / getSupportedModes().  Android guarantees at least the
+    * mode the display is currently in; the stub layer models a Display as an
+    * opaque object, so both came back null and UE's
+    * AndroidThunkJava_GetSupportedNativeDisplayRefreshRates NPE'd on
+    * modes.length — the engine then believed the device supports no refresh
+    * rate at all.  Build the one mode the emulator presents, taking its
+    * geometry and rate from the very stubs that answer getWidth/getHeight/
+    * getRefreshRate on the same Display. */
+   /* PackageManager.getApplicationInfo(pkg, flags).  Callers reach the
+    * manifest's meta-data through the returned ApplicationInfo's `metaData`
+    * field, which only works if the object is one the VM owns — a host stub
+    * handle has no dvm fields to read.  Build it here so the iget lands on a
+    * real Bundle. */
+   if (!strcmp(method, "getApplicationInfo") &&
+       (strstr(class_name, "PackageManager") || strstr(class_name, "Context"))) {
+      memset(out, 0, sizeof *out);
+      struct dvm_class *ac =
+         dvm_find_class(vm, "android/content/pm/ApplicationInfo");
+      dvm_ref ai = ac ? dvm_new_object(vm, ac) : 0;
+      if (!ai) return false;
+      struct dvm_class *bc = dvm_find_class(vm, "android/os/Bundle");
+      union dvm_value v = { .l = bc ? dvm_new_object(vm, bc) : 0 };
+      (void)dvm_set_field(vm, ai, "metaData", "Landroid/os/Bundle;", v);
+      const char *pkg = getenv("ANDROID_PACKAGE_NAME");
+      v.l = pkg ? dvm_new_string(vm, pkg) : 0;
+      (void)dvm_set_field(vm, ai, "packageName", "Ljava/lang/String;", v);
+      /* An app cannot target a level the device does not have. */
+      v.i = lunaria_sdk_int();
+      (void)dvm_set_field(vm, ai, "targetSdkVersion", "I", v);
+      dvm_pin(vm, ai);
+      out->l = ai;
+      return true;
+   }
+
+   if (!strcmp(method, "getPackageInfo") && strstr(class_name, "PackageManager")) {
+      memset(out, 0, sizeof *out);
+      struct dvm_class *pc = dvm_find_class(vm, "android/content/pm/PackageInfo");
+      struct dvm_class *ac = dvm_find_class(vm, "android/content/pm/ApplicationInfo");
+      dvm_ref pi = pc ? dvm_new_object(vm, pc) : 0;
+      dvm_ref ai = ac ? dvm_new_object(vm, ac) : 0;
+      if (!pi || !ai) return false;
+      union dvm_value v = { .i = lunaria_sdk_int() };
+      (void)dvm_set_field(vm, ai, "targetSdkVersion", "I", v);
+      const char *pkg = getenv("ANDROID_PACKAGE_NAME");
+      v.l = pkg ? dvm_new_string(vm, pkg) : 0;
+      (void)dvm_set_field(vm, ai, "packageName", "Ljava/lang/String;", v);
+      (void)dvm_set_field(vm, pi, "packageName", "Ljava/lang/String;", v);
+      v.l = ai;
+      (void)dvm_set_field(vm, pi, "applicationInfo",
+                          "Landroid/content/pm/ApplicationInfo;", v);
+      /* Straight from the manifest.  versionName was left unset, which reads
+       * back as null — a value the framework never produces, so callers push it
+       * on unchecked (UE's processSystemInfo() puts it in a map and later
+       * CRCs every value, and died on String.getBytes of null). */
+      int32_t vcode = 1;
+      const char *vname = NULL;
+      arm_exec_apk_version(&vcode, &vname);
+      v.i = vcode;
+      (void)dvm_set_field(vm, pi, "versionCode", "I", v);
+      v.l = vname ? dvm_new_string(vm, vname) : 0;
+      (void)dvm_set_field(vm, pi, "versionName", "Ljava/lang/String;", v);
+      dvm_pin(vm, pi);
+      out->l = pi;
+      return true;
+   }
+
+   /* Context.getSystemService(name).  Services used by bytecode must be VM
+    * objects: keeping them as opaque JNI wrappers makes iput/iget state and
+    * virtual dispatch disappear when the object is stored in an app field. */
+   if (!strcmp(method, "getSystemService") && nargs >= 1 && args[0].l) {
+      struct dvm_object *class_arg = dvm__obj(vm, args[0].l);
+      const char *want = (class_arg && class_arg->kind == DVM_OBJ_CLASS &&
+                          class_arg->klass) ? class_arg->klass->name
+                                            : dvm_string_utf8(vm, args[0].l);
+      dvm_ref service = dvm_runtime_system_service(vm, want);
+      if (service) {
+         memset(out, 0, sizeof *out);
+         out->l = service;
+         return true;
+      }
+   }
+
+   /* Context.getSharedPreferences(name, mode).  The host stub answered with a
+    * handle that has no storage behind it, so every read came back null and
+    * the SDKs rebuilt their state from nothing on each call.  The VM owns the
+    * store, keyed by file name, so two lookups of the same name see each
+    * other's writes. */
+   if (!strcmp(method, "getSharedPreferences") && nargs >= 1) {
+      const char *name = args[0].l ? dvm_string_utf8(vm, args[0].l) : NULL;
+      memset(out, 0, sizeof *out);
+      out->l = dvm_runtime_shared_prefs(vm, name ? name : "");
+      if (out->l) dvm_pin(vm, out->l);
+      return out->l != 0;
+   }
+
+   /* PreferenceManager.getDefaultSharedPreferences(context) names its file
+    * after the package, which is the one convention app code relies on. */
+   if (!strcmp(method, "getDefaultSharedPreferences")) {
+      const char *pkg = getenv("ANDROID_PACKAGE_NAME");
+      char name[256];
+      snprintf(name, sizeof name, "%s_preferences", pkg ? pkg : "app");
+      memset(out, 0, sizeof *out);
+      out->l = dvm_runtime_shared_prefs(vm, name);
+      if (out->l) dvm_pin(vm, out->l);
+      return out->l != 0;
+   }
+
+   /* InputDevice.getDeviceIds() is never null on Android — it is an int[] of
+    * the currently attached devices.  Returning null made
+    * AndroidThunkJava_IsGamepadAttached NPE on the array length once per frame.
+    * Lunaria models no InputDevice at all (touch is injected directly), so the
+    * truthful answer is an empty list rather than a fabricated device. */
+   if (!strcmp(class_name, "android/view/InputDevice") &&
+       !strcmp(method, "getDeviceIds")) {
+      memset(out, 0, sizeof *out);
+      out->l = dvm_new_array(vm, 'I', "I", 0);
+      return true;
+   }
+
+   if (!strcmp(class_name, "android/view/Display") &&
+       (!strcmp(method, "getMode") || !strcmp(method, "getSupportedModes"))) {
+      memset(out, 0, sizeof *out);
+      struct dvm_class *mc = dvm_find_class(vm, "android/view/Display$Mode");
+      dvm_ref mode = mc ? dvm_new_object(vm, mc) : 0;
+      if (!mode) return false;
+
+      jobject disp = to_jobject(vm, env, self);
+      jclass dc = (*env)->FindClass(env, class_name);
+      struct { const char *jm, *js, *field, *ft; } probe[] = {
+         { "getWidth",       "()I", "physicalWidth",  "I" },
+         { "getHeight",      "()I", "physicalHeight", "I" },
+         { "getRefreshRate", "()F", "refreshRate",    "F" },
+      };
+      for (size_t i = 0; i < sizeof probe / sizeof probe[0]; ++i) {
+         jmethodID mid = dc ? (*env)->GetMethodID(env, dc, probe[i].jm,
+                                                 probe[i].js) : NULL;
+         union dvm_value v = { 0 };
+         if (mid) {
+            if (probe[i].ft[0] == 'F')
+               v.f = (*env)->CallFloatMethod(env, disp, mid);
+            else
+               v.i = (*env)->CallIntMethod(env, disp, mid);
+         }
+         (void)dvm_set_field(vm, mode, probe[i].field, probe[i].ft, v);
+      }
+      union dvm_value id = { .i = 1 };   /* mode ids are 1-based on Android */
+      (void)dvm_set_field(vm, mode, "modeId", "I", id);
+
+      if (!strcmp(method, "getMode")) {
+         out->l = mode;
+         return true;
+      }
+      dvm_ref arr = dvm_new_array(vm, 'L', "Landroid/view/Display$Mode;", 1);
+      dvm_ref *slots = arr ? dvm_array_data(vm, arr) : NULL;
+      if (slots) slots[0] = mode;
+      out->l = arr;
+      return true;
+   }
+
    jclass cls = (*env)->FindClass(env, class_name);
    if (!cls) return false;
 
@@ -210,6 +520,15 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
    jmethodID mid = is_static ? (*env)->GetStaticMethodID(env, cls, method, sig)
                              : (*env)->GetMethodID(env, cls, method, sig);
    if (!mid) return false;
+
+   /* GetMethodID answers for any name at all — the stub layer builds a method
+    * id from the strings, it does not look anything up.  Calling through one
+    * that has no stub behind it returns zero and reports success, which is
+    * exactly the silent failure this module exists to remove: the caller
+    * cannot tell it from a real zero, and nothing says the method is missing.
+    * Decline instead, so dvm__call_out names it in the unresolved list (and
+    * still yields zero, as it always did). */
+   if (!jvm_method_has_stub(env, mid)) return false;
 
    jvalue jargs[64];
    memset(jargs, 0, sizeof jargs);
@@ -274,6 +593,10 @@ static bool hook_get_external_static(void *user, struct dvm *vm, const char *cla
    (void)user;
    JNIEnv *env = g_env;
    if (!env || !type) return false;
+   /* A static field of a class the device does not have is not a null, it is
+    * a NoClassDefFoundError — the stub layer would answer any name at all.
+    * dvm.c raises it when this hook declines. */
+   if (!dvm_class_exists(vm, class_name)) return false;
    jclass cls = (*env)->FindClass(env, class_name);
    if (!cls) return false;
    jfieldID fid = (*env)->GetStaticFieldID(env, cls, field, type);
@@ -334,6 +657,58 @@ static bool hook_call_native(void *user, struct dvm *vm, const char *class_name,
 }
 
 /* ------------------------------------------------------------------------ *
+ * UE Java package
+ * ------------------------------------------------------------------------ */
+
+/* Epic ships the same GameActivity.java under two packages — com.epicgames.ue4
+ * in UE4 and com.epicgames.unreal from UE5 on — and the class is unchanged
+ * apart from its package.  Every place below that needs the activity must find
+ * whichever one the APK actually carries; pinning one package silently skips
+ * the binding on the other and the thunks then run with a null receiver. */
+static const char *const g_ue_pkgs[] = {
+   "com/epicgames/unreal",
+   "com/epicgames/ue4",
+};
+
+/* JNI-form class name of the loaded GameActivity, or NULL when the APK has
+ * neither (non-UE title).  Filled in on first use; the dex set is fixed once
+ * the VM exists. */
+static const char *ue_activity_class(struct dvm *vm)
+{
+   static const char *cached;
+   static bool looked;
+   if (looked) return cached;
+   looked = true;
+   for (size_t i = 0; i < sizeof g_ue_pkgs / sizeof g_ue_pkgs[0]; ++i) {
+      static char buf[64];
+      snprintf(buf, sizeof buf, "%s/GameActivity", g_ue_pkgs[i]);
+      if (dvm_find_class(vm, buf)) {
+         cached = buf;
+         break;
+      }
+   }
+   return cached;
+}
+
+/* Field descriptor for `class_name` (dotted or JNI form), optionally for one of
+ * its nested classes: ("com.epicgames.unreal.GameActivity", "EAlertDialogType")
+ * → "Lcom/epicgames/unreal/GameActivity$EAlertDialogType;". */
+static void ue_descriptor(const char *class_name, const char *inner,
+                          char *out, size_t cap)
+{
+   size_t o = 0;
+   if (cap) out[o++] = 'L';
+   for (const char *p = class_name; *p && o + 1 < cap; ++p)
+      out[o++] = (*p == '.') ? '/' : *p;
+   if (inner) {
+      if (o + 1 < cap) out[o++] = '$';
+      for (const char *p = inner; *p && o + 1 < cap; ++p) out[o++] = *p;
+   }
+   if (o + 1 < cap) out[o++] = ';';
+   out[o < cap ? o : cap - 1] = '\0';
+}
+
+/* ------------------------------------------------------------------------ *
  * Set-up
  * ------------------------------------------------------------------------ */
 
@@ -351,12 +726,15 @@ builtin_ue_start_receiver(struct dvm *vm, dvm_ref self,
    memset(out, 0, sizeof *out);
    dvm_ref activity = (nargs > 0) ? args[0].l : 0;
    if (!activity) {
-      struct dvm_class *ga = dvm_find_class(vm, "com/epicgames/ue4/GameActivity");
+      const char *aname = ue_activity_class(vm);
+      struct dvm_class *ga = aname ? dvm_find_class(vm, aname) : NULL;
       union dvm_value cur = { 0 };
-      if (ga &&
-          dvm_get_static(vm, ga, "_activity",
-                         "Lcom/epicgames/ue4/GameActivity;", &cur))
-         activity = cur.l;
+      char desc[80];
+      if (ga) {
+         ue_descriptor(aname, NULL, desc, sizeof desc);
+         if (dvm_get_static(vm, ga, "_activity", desc, &cur))
+            activity = cur.l;
+      }
    }
    if (!activity)
       return true;
@@ -394,6 +772,7 @@ static struct dvm *vm_get(void)
       .new_external = hook_new_external,
       .get_external_static = hook_get_external_static,
       .call_native = hook_call_native,
+      .load_library = hook_load_library,
    };
    g_vm = dvm_create(&hooks);
    if (!g_vm) return NULL;
@@ -407,14 +786,16 @@ static struct dvm *vm_get(void)
    }
    {
       static const char *recv[] = {
-         "com/epicgames/ue4/VolumeReceiver",
-         "com/epicgames/ue4/BatteryReceiver",
-         "com/epicgames/ue4/HeadsetReceiver",
+         "VolumeReceiver", "BatteryReceiver", "HeadsetReceiver",
       };
-      for (size_t i = 0; i < sizeof recv / sizeof recv[0]; ++i) {
-         struct dvm_method *m = dvm_lookup(
-            g_vm, recv[i], "startReceiver", "(Landroid/app/Activity;)V");
-         if (m) m->builtin = builtin_ue_start_receiver;
+      for (size_t p = 0; p < sizeof g_ue_pkgs / sizeof g_ue_pkgs[0]; ++p) {
+         for (size_t i = 0; i < sizeof recv / sizeof recv[0]; ++i) {
+            char cls[80];
+            snprintf(cls, sizeof cls, "%s/%s", g_ue_pkgs[p], recv[i]);
+            struct dvm_method *m = dvm_lookup(
+               g_vm, cls, "startReceiver", "(Landroid/app/Activity;)V");
+            if (m) m->builtin = builtin_ue_start_receiver;
+         }
       }
    }
    fprintf(stderr, "[dvm] bytecode emulator ready (%d dex, mode %d)\n", n, (int)g_mode);
@@ -462,7 +843,9 @@ bool dvm_jni_invoke(JNIEnv *env, const char *class_name, const char *method,
    g_env = env;
 
    union dvm_value args[64];
+   jobject host_arrays[64];
    memset(args, 0, sizeof args);
+   memset(host_arrays, 0, sizeof host_arrays);
    for (int i = 0; i < nargs; ++i) {
       char one[256];
       if (!dvm__sig_param(msig, i, one, sizeof one)) break;
@@ -472,6 +855,20 @@ bool dvm_jni_invoke(JNIEnv *env, const char *class_name, const char *method,
       else if (jargs) jv = jargs[i];
       else memset(&jv, 0, sizeof jv);
       args[i] = jvalue_to_dvm(vm, env, one, jv);
+      /* Remember array arguments so what the callee writes gets back to the
+       * caller's buffer (see host_array_to_dvm). */
+      if (one[0] == '[' && jv.l && args[i].l) host_arrays[i] = jv.l;
+      /* An array parameter that arrives as null, or as something the VM could
+       * not see as an array, makes the callee throw on its first .length —
+       * far from here, and with nothing to say why. */
+      if (one[0] == '[' && !host_arrays[i]) {
+         static int arr_diag;
+         if (arr_diag++ < 16)
+            fprintf(stderr, "[dvm] %s.%s%s: array arg %d is %s (host 0x%x, class %s)\n",
+                    class_name, method, msig, i, jv.l ? "unconvertible" : "null",
+                    (unsigned)(uintptr_t)jv.l,
+                    jv.l ? (class_name_of(env, jv.l) ?: "?") : "-");
+      }
    }
 
    dvm_ref dself = 0;
@@ -483,53 +880,11 @@ bool dvm_jni_invoke(JNIEnv *env, const char *class_name, const char *method,
       dself = dvm_new_object(vm, dvm_find_class(vm, class_name));
    }
 
-   /* Android normally constructs GameActivity and runs its Java onCreate
-    * before native startup.  The native-activity loader creates the matching
-    * host object directly, so that lifecycle assignment is the one piece of
-    * Java state which has not happened: UE's generated activity stores itself
-    * in the static `_activity` field and every runOnUiThread thunk reads that
-    * field as its receiver.  Bind it to the stable wrapper the first time the
-    * real activity crosses JNI.  This models the missing platform lifecycle;
-    * it does not special-case or skip the thunk's bytecode. */
-   if (dself && !is_static &&
-       (!strcmp(class_name, "com/epicgames/ue4/GameActivity") ||
-        !strcmp(class_name, "com.epicgames.ue4.GameActivity"))) {
-      struct dvm_class *activity_cls = dvm_find_class(vm, class_name);
-      union dvm_value current = { 0 };
-      if (activity_cls &&
-          dvm_get_static(vm, activity_cls, "_activity",
-                         "Lcom/epicgames/ue4/GameActivity;", &current) &&
-          !current.l) {
-         union dvm_value activity = { .l = dself };
-         (void)dvm_set_static(vm, activity_cls, "_activity",
-                              "Lcom/epicgames/ue4/GameActivity;", activity);
-      }
-      /* The generated constructor also initializes the dialog state to the
-       * enum's None value.  A wrapped platform-created Activity has not run
-       * that constructor in the bytecode VM, so leaving it as Java null makes
-       * the first visibility check look like an active dialog and its UI
-       * Runnable then calls ordinal() on null. */
-      union dvm_value dialog = { 0 };
-      if (activity_cls &&
-          dvm_get_field(vm, dself, "CurrentDialogType",
-                        "Lcom/epicgames/ue4/GameActivity$EAlertDialogType;",
-                        &dialog) && !dialog.l) {
-         struct dvm_class *enum_cls = dvm_find_class(
-            vm, "com/epicgames/ue4/GameActivity$EAlertDialogType");
-         union dvm_value none = { 0 };
-         if (enum_cls &&
-             dvm_get_static(vm, enum_cls, "None",
-                            "Lcom/epicgames/ue4/GameActivity$EAlertDialogType;",
-                            &none) && none.l)
-            (void)dvm_set_field(
-               vm, dself, "CurrentDialogType",
-               "Lcom/epicgames/ue4/GameActivity$EAlertDialogType;", none);
-      }
-   }
-
    union dvm_value ret;
    ++g_calls;
    bool ok = dvm_call(vm, m, dself, args, nargs, &ret);
+   for (int i = 0; i < nargs; ++i)
+      if (host_arrays[i]) array_sync_back(vm, env, host_arrays[i], args[i].l);
    if (!ok) {
       char buf[512];
       dvm_describe_exception(vm, dvm_exception(vm), buf, sizeof buf);
@@ -541,6 +896,80 @@ bool dvm_jni_invoke(JNIEnv *env, const char *class_name, const char *method,
    if (out) *out = dvm_to_jvalue(vm, env, dvm_sig_return_kind(msig), ret);
    g_env = saved;
    return true;
+}
+
+bool dvm_jni_field(JNIEnv *env, jobject obj, jfieldID field, bool set,
+                   uint64_t *bits)
+{
+   struct dvm *vm = vm_get();
+   if (!vm || dvm_jni_mode() == DVM_JNI_OFF || !env || !obj || !field || !bits)
+      return false;
+
+   const char *cls = NULL, *name = NULL, *type = NULL;
+   if (!jvm_field_info(jnienv_get_jvm(env), field, &cls, &name, &type))
+      return false;
+   if (getenv("LUNARIA_TRACE_FIELDS")) {
+      static int n;
+      if (n++ < 200)
+         fprintf(stderr, "[dvm] %s field %s.%s:%s (dex=%d)\n",
+                 set ? "set" : "get", cls, name, type,
+                 dvm_find_class(vm, cls) ? 1 : 0);
+   }
+   /* Only classes the dex defines: everything else keeps the stub layer's
+    * own field storage. */
+   if (!dvm_find_class(vm, cls)) return false;
+
+   dvm_ref self = wrapper_for(vm, cls, (uint32_t)(uintptr_t)obj);
+   if (!self) return false;
+
+   if (set) {
+      union dvm_value v = { 0 };
+      switch (type[0]) {
+         case 'Z': v.i = (*bits & 0xffu) ? 1 : 0; break;
+         case 'B': v.i = (int8_t)*bits; break;
+         case 'C': v.i = (uint16_t)*bits; break;
+         case 'S': v.i = (int16_t)*bits; break;
+         case 'I': v.i = (int32_t)*bits; break;
+         case 'J': v.j = (int64_t)*bits; break;
+         case 'F': { uint32_t u = (uint32_t)*bits; memcpy(&v.f, &u, 4); break; }
+         case 'D': { uint64_t u = *bits; memcpy(&v.d, &u, 8); break; }
+         default:  v.l = from_jobject(vm, env, (jobject)(uintptr_t)*bits); break;
+      }
+      return dvm_set_field(vm, self, name, type, v);
+   }
+
+   union dvm_value v = { 0 };
+   if (!dvm_get_field(vm, self, name, type, &v)) return false;
+   *bits = 0;
+   switch (type[0]) {
+      case 'Z': case 'B': case 'C': case 'S': case 'I':
+         *bits = (uint32_t)v.i; break;
+      case 'J': *bits = (uint64_t)v.j; break;
+      case 'F': { uint32_t u; memcpy(&u, &v.f, 4); *bits = u; break; }
+      case 'D': { uint64_t u; memcpy(&u, &v.d, 8); *bits = u; break; }
+      default:  *bits = (uint64_t)(uintptr_t)to_jobject(vm, env, v.l); break;
+   }
+   return true;
+}
+
+const char *dvm_jni_super_name(const char *class_name)
+{
+   struct dvm *vm = vm_get();
+   if (!vm || !class_name)
+      return NULL;
+   /* Only ask about classes the dex defines: for anything else the VM
+    * synthesises an external class whose super is java/lang/Object, which is
+    * not what the Android framework's hierarchy says. */
+   if (!dvm_class_is_known(vm, class_name))
+      return NULL;
+   struct dvm_class *cls = dvm_find_class(vm, class_name);
+   return cls ? dvm_class_super_name(cls) : NULL;
+}
+
+bool dvm_jni_class_in_dex(const char *class_name)
+{
+   struct dvm *vm = vm_get();
+   return vm && class_name && dvm_class_is_known(vm, class_name);
 }
 
 void dvm_jni_report(void)

@@ -45,5 +45,29 @@ typedef bool (*dvm_guest_native_fn)(const char *class_name, const char *method,
                                     const jvalue *args, int nargs, jvalue *out);
 void dvm_jni_set_guest_native_caller(dvm_guest_native_fn fn);
 
+typedef bool (*dvm_guest_library_fn)(const char *name);
+void dvm_jni_set_guest_library_loader(dvm_guest_library_fn fn);
+
+/* True when the APK's dex declares this class (slash-separated name).  A guest
+ * uses ClassLoader.loadClass() to feature-detect optional Java components; the
+ * emulator must answer "absent" for a class the APK does not ship, or the guest
+ * commits to a code path whose Java half can never run. */
+bool dvm_jni_class_in_dex(const char *class_name);
+
+/* Instance field of an object whose class the APK's dex defines, reached from
+ * native through Get/SetXxxField.  The bytecode VM owns that object's fields,
+ * so a write from native has to land there and not in the stub layer's own
+ * side table — otherwise the two halves disagree about the same field.  `bits`
+ * is the raw value, the way the JNI accessor macros carry it.  False when the
+ * field is not one the VM owns; the caller then keeps its own handling. */
+bool dvm_jni_field(JNIEnv *env, jobject obj, jfieldID field, bool set,
+                   uint64_t *bits);
+
+/* Superclass of a dex-defined class, slash-separated, or NULL when the APK
+ * does not define the class (the framework hierarchy is not in the dex).
+ * The stub layer needs it to resolve an inherited framework method called on
+ * an app's own subclass. */
+const char *dvm_jni_super_name(const char *class_name);
+
 /* Diagnostics for the loader's summary line. */
 void dvm_jni_report(void);

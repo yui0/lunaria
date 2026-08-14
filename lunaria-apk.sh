@@ -17,9 +17,9 @@ pkgfile="$inputfile"
 xapk_dir=""
 xapk_splits=""
 
-# XAPK is an install container. Keep every contained APK byte-for-byte intact:
-# use its base APK as nativeFile and overlay split contents only in the
-# temporary installed-package view created below.
+# XAPK / APKS are split-APK install containers. Keep every contained APK
+# byte-for-byte intact: use the base APK as nativeFile and overlay split
+# contents only in the temporary installed-package view created below.
 case "$inputfile" in
     *.xapk|*.XAPK)
         xapk_dir="$(mktemp -d)"
@@ -47,6 +47,18 @@ PYEOF
         pkgfile="$xapk_dir/$_xapk_base"
         msg "xapk base: $_xapk_base"
         [ -n "$xapk_splits" ] && msg "xapk splits: $(printf '%s' "$xapk_splits" | tr '\n' ' ')"
+        ;;
+    *.apks|*.APKS)
+        # bundletool / SAI format: ZIP of split APKs; base APK is always base.apk.
+        xapk_dir="$(mktemp -d)"
+        unzip -q "$inputfile" -d "$xapk_dir" || err "extract apks failed"
+        _xapk_base="base.apk"
+        [ -f "$xapk_dir/$_xapk_base" ] || err "apks has no base.apk"
+        xapk_splits="$(find "$xapk_dir" -maxdepth 1 -name '*.apk' ! -name 'base.apk' \
+                        -printf '%f\n' | sort)"
+        pkgfile="$xapk_dir/$_xapk_base"
+        msg "apks base: $_xapk_base"
+        [ -n "$xapk_splits" ] && msg "apks splits: $(printf '%s' "$xapk_splits" | tr '\n' ' ')"
         ;;
 esac
 
@@ -232,6 +244,147 @@ fi
 export ANDROID_PACKAGE_CODE_PATH="$tmpdir"
 export ANDROID_PACKAGE_NAME="$pkgname"
 
+# The launcher Activity — the package's real entry point, and what the loader
+# needs to start an APK from its dex rather than from an engine's exported
+# native symbol.  It is the <activity> whose <intent-filter> carries both
+# android.intent.action.MAIN and android.intent.category.LAUNCHER; a name
+# starting with '.' is relative to the package.
+launch_info="$(python3 - "$pkgfile" "$pkgname" <<'PYEOF'
+import sys, zipfile, struct
+
+def parse(data, pkg):
+    if struct.unpack_from('<I', data, 0)[0] != 0x00080003:
+        return None
+    i, strings = 8, []
+    # <activity> currently being walked, and what its intent-filter has said.
+    cur_name = None
+    cur_target = None
+    cur_orientation = None
+    cur_theme = None
+    activity_orientations = {}
+    application_name = None
+    application_theme = None
+    providers = []
+    launch = None
+    depth_activity = -1
+    saw_main = saw_launcher = False
+    depth = 0
+    while i < len(data) - 8:
+        chunk_type, header_size, chunk_size = struct.unpack_from('<HHI', data, i)
+        if chunk_size == 0:
+            break
+        if chunk_type == 0x0001:  # STRING_POOL
+            str_count, _, flags, strings_start = struct.unpack_from('<IIII', data, i + 8)
+            is_utf8 = bool(flags & (1 << 8))
+            offsets_base, strings_base = i + header_size, i + strings_start
+            for k in range(str_count):
+                off = struct.unpack_from('<I', data, offsets_base + k * 4)[0]
+                p = strings_base + off
+                if is_utf8:
+                    s = data[p + 2: p + 2 + data[p + 1]].decode('utf-8', 'replace')
+                else:
+                    slen = struct.unpack_from('<H', data, p)[0]
+                    s = data[p + 2: p + 2 + slen * 2].decode('utf-16-le', 'replace')
+                strings.append(s)
+        elif chunk_type == 0x0102:  # START_ELEMENT
+            depth += 1
+            _, name_idx = struct.unpack_from('<ii', data, i + 16)
+            attr_start, attr_size, attr_count = struct.unpack_from('<HHH', data, i + 24)
+            elem = strings[name_idx] if 0 <= name_idx < len(strings) else ''
+            attrs = {}
+            base = i + 16 + attr_start
+            for a in range(attr_count):
+                ao = base + a * attr_size
+                _, nm, _, _, _, vt, vd = struct.unpack_from('<iiIHBBI', data, ao)
+                aname = strings[nm] if 0 <= nm < len(strings) else ''
+                if vt == 0x03 and 0 <= vd < len(strings):
+                    attrs[aname] = strings[vd]
+                elif vt in (0x01, 0x10, 0x11, 0x12):
+                    attrs[aname] = vd
+            if elem in ('activity', 'activity-alias'):
+                cur_name = attrs.get('name')
+                cur_target = attrs.get('targetActivity')
+                cur_orientation = attrs.get('screenOrientation')
+                cur_theme = attrs.get('theme')
+                depth_activity = depth
+                saw_main = saw_launcher = False
+            elif elem == 'application':
+                application_name = attrs.get('name')
+                application_theme = attrs.get('theme')
+            elif elem == 'provider' and attrs.get('name'):
+                provider = attrs['name']
+                if provider.startswith('.'):
+                    provider = pkg + provider
+                providers.append((provider, str(attrs.get('authorities', ''))))
+            elif elem == 'action' and attrs.get('name') == 'android.intent.action.MAIN':
+                saw_main = True
+            elif elem == 'category' and attrs.get('name') == 'android.intent.category.LAUNCHER':
+                saw_launcher = True
+        elif chunk_type == 0x0103:  # END_ELEMENT
+            if depth == depth_activity:
+                if saw_main and saw_launcher and cur_name:
+                    name = cur_target or cur_name
+                    orientation = cur_orientation
+                    if orientation is None and cur_target:
+                        orientation = activity_orientations.get(cur_target)
+                    name = pkg + name if name.startswith('.') else name
+                    app = application_name
+                    if app and app.startswith('.'):
+                        app = pkg + app
+                    launch = (name, orientation, app, cur_theme or application_theme)
+                if cur_name and cur_orientation is not None:
+                    name = pkg + cur_name if cur_name.startswith('.') else cur_name
+                    activity_orientations[name] = cur_orientation
+                cur_name, cur_target, cur_orientation, cur_theme, depth_activity = None, None, None, None, -1
+            depth -= 1
+        i += chunk_size
+    return launch + (providers,) if launch else None
+
+try:
+    with zipfile.ZipFile(sys.argv[1]) as z:
+        result = parse(z.read('AndroidManifest.xml'), sys.argv[2])
+    if result:
+        name, orientation, application, theme, providers = result
+        encoded_providers = ';'.join(f'{name}|{authority}' for name, authority in providers)
+        print(f"{name}|{'' if orientation is None else orientation}|{application or ''}|{theme or ''}|{encoded_providers}")
+except Exception:
+    pass
+PYEOF
+)"
+launch_activity="${launch_info%%|*}"
+if [ -n "$launch_activity" ]; then
+    export ANDROID_LAUNCH_ACTIVITY="$launch_activity"
+    msg "launcher activity: $launch_activity"
+fi
+launch_rest="${launch_info#*|}"
+launch_orientation="${launch_rest%%|*}"
+launch_app_rest="${launch_rest#*|}"
+launch_application="${launch_app_rest%%|*}"
+launch_theme_rest="${launch_app_rest#*|}"
+launch_theme="${launch_theme_rest%%|*}"
+launch_providers="${launch_theme_rest#*|}"
+case "$launch_orientation" in
+    ?*)
+        ANDROID_SCREEN_ORIENTATION="$launch_orientation"
+        export ANDROID_SCREEN_ORIENTATION
+        msg "screen orientation: $ANDROID_SCREEN_ORIENTATION"
+        ;;
+esac
+if [ -n "$launch_application" ] && [ "$launch_application" != "$launch_app_rest" ]; then
+    export ANDROID_APPLICATION_CLASS="$launch_application"
+    msg "application class: $ANDROID_APPLICATION_CLASS"
+fi
+case "$launch_theme" in
+    ?*)
+        export ANDROID_THEME_RESOURCE="$launch_theme"
+        msg "theme resource: $ANDROID_THEME_RESOURCE"
+        ;;
+esac
+if [ -n "$launch_providers" ] && [ "$launch_providers" != "$launch_app_rest" ]; then
+    export ANDROID_CONTENT_PROVIDERS="$launch_providers"
+    msg "content providers: $(printf '%s' "$launch_providers" | tr ';' '\n' | wc -l)"
+fi
+
 # Portrait / landscape defaults for known titles (override with LUNARIA_WIDTH/HEIGHT)
 case "$pkgname" in
     org.gekoi.timelocker)
@@ -258,6 +411,17 @@ export ANDROID_EXTERNAL_FILES_DIR="$tmpdir/local/files"
 mkdir -p "$ANDROID_EXTERNAL_FILES_DIR"
 export ANDROID_EXTERNAL_OBB_DIR="$PWD/local/data/$pkgname/obb"
 mkdir -p "$ANDROID_EXTERNAL_OBB_DIR"
+
+# Android's credential-protected application data.  Keep this outside the
+# transient APK extraction tree: databases/preferences/files survive process
+# restarts on a device and framework code (notably Room/WorkManager) relies on
+# the directories being distinct from the APK code path.
+export ANDROID_FILES_DIR="$PWD/local/data/$pkgname/files"
+export ANDROID_CACHE_DIR="$PWD/local/data/$pkgname/cache"
+export ANDROID_DATABASES_DIR="$PWD/local/data/$pkgname/databases"
+export ANDROID_NO_BACKUP_DIR="$PWD/local/data/$pkgname/no_backup"
+mkdir -p "$ANDROID_FILES_DIR" "$ANDROID_CACHE_DIR" "$ANDROID_DATABASES_DIR" \
+    "$ANDROID_NO_BACKUP_DIR"
 
 # Expansion files (.obb).  UE4 ships all game content (Content/Paks/*.pak) in
 # main.<ver>.<pkg>.obb, which Google Play installs next to the APK — it is NOT
@@ -308,16 +472,34 @@ if [ -n "$ANDROID_OBB_MAIN" ]; then
         ln -sf "$ANDROID_OBB_PATCH" "$_obbdir/$(basename "$ANDROID_OBB_PATCH")"
         ln -sf "$ANDROID_OBB_PATCH" "$_obbdir/patch.1.$pkgname.obb"
     fi
-    # Stage OBB under the loose UE4Game tree.  With obbInAPK or a mounted
+    # Main engine library — needed both to pick the staging root below and to
+    # pull the pak AES key later.  UE4 ships libUE4.so, UE5 libUnreal.so.
+    _ue_so=""
+    for _cand in "$tmpdir/lib/$arch/libUE4.so"   "$tmpdir/lib/$arch/libUnreal.so" \
+                 "$tmpdir/lib/arm64-v8a/libUE4.so"   "$tmpdir/lib/arm64-v8a/libUnreal.so" \
+                 "$tmpdir/lib/armeabi-v7a/libUE4.so" "$tmpdir/lib/armeabi-v7a/libUnreal.so"; do
+        [ -f "$_cand" ] && _ue_so="$_cand" && break
+    done
+
+    # Stage OBB under the loose external-files tree.  With obbInAPK or a mounted
     # expansion, UE still probes
-    #   <files>/UE4Game/<Project>/<Project>/Content/Paks/*.pak
+    #   <files>/<EngineDir>/<Project>/<Project>/Content/Paks/*.pak
+    # <EngineDir> is "UE4Game" up to UE4 and "UnrealGame" from UE5 on
+    # (FAndroidPlatformFile builds GFilePathBase + that literal).  Reading the
+    # literal out of the engine binary keeps this exact instead of guessing
+    # from the library name or a title list.
     # OBB zip layouts vary — discover the project name from Content/Paks,
     # never hard-code a title (a fabricated .uproject / fixed Project name
     # breaks other APKs).
-    #   A) UE4Game/<P>/<P>/Content/Paks  — already device-shaped
-    #   B) <P>/<P>/Content/Paks          — missing UE4Game/
-    #   C) <P>/Content/Paks              — missing outer <P>/ (common on Android)
-    _ue_game="$ANDROID_EXTERNAL_FILES_DIR/UE4Game"
+    #   A) <EngineDir>/<P>/<P>/Content/Paks  — already device-shaped
+    #   B) <P>/<P>/Content/Paks              — missing <EngineDir>/
+    #   C) <P>/Content/Paks                  — missing outer <P>/ (common on Android)
+    _ue_dirname="UE4Game"
+    if [ -n "$_ue_so" ] && grep -qa -- '/UnrealGame/' "$_ue_so" 2>/dev/null; then
+        _ue_dirname="UnrealGame"
+    fi
+    msg "UE external-files root: $_ue_dirname"
+    _ue_game="$ANDROID_EXTERNAL_FILES_DIR/$_ue_dirname"
     mkdir -p "$_ue_game"
     if ! find "$_ue_game" -type d -path '*/Content/Paks' 2>/dev/null | grep -q .; then
         _obb_x="$tmpdir/obb_extract"
@@ -335,17 +517,36 @@ if [ -n "$ANDROID_OBB_MAIN" ]; then
                 fi
                 mkdir -p "$_ue_game/$_proj"
                 if [ -d "$_inner" ]; then
-                    # Move project tree into UE4Game/<P>/<P>/ (Content + siblings).
+                    # Move project tree into <EngineDir>/<P>/<P>/ (Content + siblings).
                     mv "$_inner" "$_dest" 2>/dev/null \
                         || { mkdir -p "$_dest"; cp -a "$_inner/." "$_dest/"; }
                 fi
-                # UE4CommandLine.txt often sits beside the project folder in the OBB.
-                for _cmd in "$_obb_x/UE4CommandLine.txt" \
-                            "$_obb_x/$_proj/UE4CommandLine.txt" \
-                            "$(dirname "$_inner")/UE4CommandLine.txt"; do
-                    if [ -f "$_cmd" ] && [ ! -f "$_ue_game/$_proj/UE4CommandLine.txt" ]; then
-                        cp -f "$_cmd" "$_ue_game/$_proj/UE4CommandLine.txt"
-                    fi
+                # The staged command line often sits beside the project folder in
+                # the OBB.  UE4 names it UE4CommandLine.txt, UE5 UECommandLine.txt.
+                for _cmdname in UE4CommandLine.txt UECommandLine.txt; do
+                    for _cmd in "$_obb_x/$_cmdname" \
+                                "$_obb_x/$_proj/$_cmdname" \
+                                "$(dirname "$_inner")/$_cmdname"; do
+                        if [ -f "$_cmd" ] && [ ! -f "$_ue_game/$_proj/$_cmdname" ]; then
+                            cp -f "$_cmd" "$_ue_game/$_proj/$_cmdname"
+                        fi
+                    done
+                done
+                # The expansion also carries engine-side staged content next to
+                # the project (Engine/Config/StagedBuild_<P>.ini, ICU data,
+                # Engine/Content/…).  A mounted OBB exposes all of it under the
+                # same root, so move every remaining sibling across instead of
+                # stopping at the project folder — otherwise the engine sees a
+                # staged build with no Engine/ tree.
+                _sib_root="$(dirname "$_inner")"
+                for _sib in "$_sib_root"/*; do
+                    [ -e "$_sib" ] || continue
+                    [ -d "$_sib" ] || continue
+                    _sib_name="$(basename "$_sib")"
+                    [ "$_sib_name" = "$_proj" ] && continue
+                    [ -e "$_ue_game/$_proj/$_sib_name" ] && continue
+                    mv "$_sib" "$_ue_game/$_proj/$_sib_name" 2>/dev/null \
+                        || cp -a "$_sib" "$_ue_game/$_proj/$_sib_name"
                 done
                 msg "obb staged under $_ue_game/$_proj"
             done
@@ -357,19 +558,40 @@ if [ -n "$ANDROID_OBB_MAIN" ]; then
     # ShaderArchive/maps need AES-ECB index decrypt.  Stage the real cooked
     # assets (including the real .uproject from the pak) as loose files —
     # host staging only, no fabricated project descriptor.
-    _ue_so=""
-    for _cand in "$tmpdir/lib/$arch/libUE4.so" "$tmpdir/lib/arm64-v8a/libUE4.so" \
-                 "$tmpdir/lib/armeabi-v7a/libUE4.so"; do
-        [ -f "$_cand" ] && _ue_so="$_cand" && break
-    done
     _stage_py="$(dirname "$argv0")/scripts/ue4_stage_encrypted_paks.py"
     if [ -f "$_stage_py" ] && [ -n "$_ue_so" ]; then
         find "$_ue_game" -type d \( -path '*/Content/Paks' -o -path '*/Content/CBPaks' \) \
             2>/dev/null | while read -r _paks; do
-            # .../UE4Game/<P>/<P>/Content/Paks → out = .../UE4Game/<P>
+            # .../<EngineDir>/<P>/<P>/Content/Paks → out = .../<EngineDir>/<P>
             _out=$(dirname "$(dirname "$(dirname "$_paks")")")
             python3 "$_stage_py" --so "$_ue_so" --paks "$_paks" --out "$_out" \
                 || msg "encrypted pak stage failed for $_paks (continuing)"
+            # UE Curl HTTPS probes several CA paths (Certificates/cacert.pem,
+            # CurlCertificates/ca-bundle.pem, Engine ThirdParty).  Cooked paks
+            # often omit them; install the host trust store so CDN config /
+            # DownloadContent can proceed (emulator-side only).
+            _proj_root="$(dirname "$(dirname "$_paks")")"
+            _ue_root="$(dirname "$_proj_root")"
+            _host_ca=""
+            for _ca in /etc/ssl/certs/ca-certificates.crt \
+                       /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
+                       /etc/ssl/cert.pem; do
+                [ -s "$_ca" ] && _host_ca="$_ca" && break
+            done
+            if [ -n "$_host_ca" ]; then
+                for _dest in \
+                    "$_proj_root/Content/Certificates/cacert.pem" \
+                    "$_proj_root/Content/CurlCertificates/ca-bundle.pem" \
+                    "$_ue_root/Engine/Content/Certificates/ThirdParty/cacert.pem" \
+                    "$ANDROID_EXTERNAL_FILES_DIR/ca-bundle.pem"
+                do
+                    mkdir -p "$(dirname "$_dest")"
+                    if [ ! -s "$_dest" ]; then
+                        cp -f "$_host_ca" "$_dest"
+                        msg "staged host CA → $_dest"
+                    fi
+                done
+            fi
         done
     fi
     msg "obb: $ANDROID_OBB_MAIN"
@@ -389,6 +611,12 @@ if [ -d "$managed_dir" ]; then
 fi
 
 export LD_LIBRARY_PATH="$PWD:$PWD/runtime${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# Run the package's real launcher Activity from dex by default.  Set
+# LUNARIA_DEX_START=0 only when comparing against the legacy, engine-specific
+# native startup path.
+: "${LUNARIA_DEX_START:=1}"
+export LUNARIA_DEX_START
 
 # Standard APK: lib/$arch/  or  App Bundle split APK: base/lib/$arch/
 libdir="$tmpdir/lib/$arch"

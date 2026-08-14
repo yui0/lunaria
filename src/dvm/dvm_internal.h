@@ -132,8 +132,13 @@ struct dvm_dex {
 struct dvm {
    struct dvm_hooks hooks;
 
-   struct dvm_dex *dexes;
-   int ndexes;
+   /* Each dex is its own allocation.  Methods and classes keep a
+    * `struct dex_file *` into it, and dex_of() resolves that pointer back to
+    * its dvm_dex, so the storage must never move — an array grown with
+    * realloc() left those pointers dangling, and constant-pool indices then
+    * resolved against whatever dex happened to land at the old address. */
+   struct dvm_dex **dexes;
+   int ndexes, dexes_cap;
 
    struct dvm_class *class_hash[DVM_CLASS_HASH];
    struct dvm_class **classes;    /* every class, for teardown */
@@ -144,6 +149,44 @@ struct dvm {
    uint32_t free_head;
 
    dvm_ref exception;
+   /* Frames the current exception unwound through, innermost first.  A bare
+    * "NullPointerException: String.length" says nothing about which of the
+    * app's methods hit it; this makes an uncaught throw locatable without
+    * turning on the full call trace. */
+   struct dvm_method *exc_trace[16];
+   int nexc_trace;
+   dvm_ref exc_ref;      /* the object the trace belongs to */
+
+   /* Threads started from bytecode.  A worker's run() is a loop that waits on
+    * a queue, so running it the moment start() is called — before anything has
+    * been queued — is wrong.  They are held here and run once the call that
+    * started them has returned to the JNI boundary, which is the point where
+    * the setting-up work is done.  Each then gets a bounded slice: nothing can
+    * preempt it, so a worker that runs out of work has to be stopped rather
+    * than left spinning. */
+   dvm_ref pending_threads[32];
+   /* Whether each entry came from Thread.start() rather than Handler.post():
+    * a posted Runnable runs on the main thread, and app code asserts on that. */
+   bool pending_is_thread[32];
+   /* Monotonic millisecond stamp before which the entry must not run.  A
+    * postDelayed() whose delay is dropped turns every "do this unless the fast
+    * path beats me to it" timeout into an unconditional one. */
+   uint64_t pending_due_ms[32];
+   int npending;
+   /* The Thread the interpreter is currently inside, or 0 for the main one. */
+   dvm_ref cur_thread;
+   bool draining;
+   bool quiet_uncaught;  /* a parked worker is not an error to report */
+   /* Set when the current thread has parked rather than failed: the unwind
+    * runs to the top of the thread instead of stopping at a catch clause.
+    * See dvm__park() in dvm_runtime.c. */
+   bool parked;
+   uint32_t exc_pc;      /* bytecode offset of the throw, innermost frame */
+   /* The frame currently interpreting bytecode.  Reconstructing the innermost
+    * frame from the unwind mis-attributes a throw whenever an inner frame
+    * catches and rethrows, so the throw stamps itself here instead. */
+   struct dvm_method *cur_method;
+   uint32_t cur_pc;
    int depth;
    int trace;
    uint64_t steps;       /* since dvm_create, for diagnostics */
@@ -164,12 +207,45 @@ struct dvm {
 struct dvm_class *dvm__register_builtin(struct dvm *vm, const char *desc);
 struct dvm_class *dvm__define_primitive(struct dvm *vm, const char *desc);
 struct dvm_class *dvm__class_by_desc(struct dvm *vm, const char *desc);
+bool dvm__class_assignable(struct dvm *vm, struct dvm_class *from,
+                           struct dvm_class *to);
 struct dvm_object *dvm__obj(struct dvm *vm, dvm_ref ref);
 void dvm__throw(struct dvm *vm, const char *class_name, const char *fmt, ...);
 dvm_ref dvm__intern(struct dvm *vm, const char *utf8);
 char dvm__kind_of(const char *desc);
 int dvm__slots_of(char kind);
 bool dvm__sig_param(const char *sig, int idx, char *buf, size_t sz);
+
+/* Dispatch to the host stub layer for a class with no dex definition. */
+bool dvm__call_out(struct dvm *vm, struct dvm_class *cls, const char *name,
+                   const char *sig, bool is_static, bool is_native,
+                   dvm_ref self, const uint32_t *slots, int nslots,
+                   union dvm_value *out);
+
+/* Steps a bytecode-started thread may run before it is considered parked. */
+#define DVM_THREAD_SLICE (2u * 1000u * 1000u)
+
+/* Runs threads queued by Thread.start(); called when the VM returns to JNI. */
+void dvm__run_pending_threads(struct dvm *vm);
+/* Monotonic milliseconds, for pending_due_ms. */
+uint64_t dvm__now_ms(void);
+
+/* The named SharedPreferences file, created on first use.  The store outlives
+ * the objects handed to bytecode, so repeated lookups share one map. */
+dvm_ref dvm_runtime_shared_prefs(struct dvm *vm, const char *name);
+
+/* Context.getSystemService(): the one name↔manager-class mapping.  Every path
+ * that answers getSystemService — bytecode (rt_context) and the JNI bridge —
+ * resolves through these, so they cannot disagree about which services exist. */
+struct dvm_system_service {
+   const char *key;    /* "vibrator_manager" */
+   const char *desc;   /* "Landroid/os/VibratorManager;" */
+};
+const struct dvm_system_service *dvm_runtime_system_services(size_t *count);
+/* Matches a service key, a class descriptor or a bare class name. */
+const struct dvm_system_service *dvm_runtime_find_system_service(const char *key);
+/* The per-service singleton instance, created on first use. */
+dvm_ref dvm_runtime_system_service(struct dvm *vm, const char *key);
 
 /* dvm_runtime.c: installs the built-in classes into a fresh VM. */
 void dvm_runtime_install(struct dvm *vm);

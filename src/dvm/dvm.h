@@ -91,6 +91,10 @@ struct dvm_hooks {
                        const char *method, const char *sig, bool is_static,
                        dvm_ref self, const union dvm_value *args, int nargs,
                        union dvm_value *out);
+
+   /* java.lang.System.loadLibrary().  The bytecode VM owns System, while the
+    * guest ELF loader owns the APK ABI directory and JNI symbol namespace. */
+   bool (*load_library)(void *user, struct dvm *vm, const char *name);
 };
 
 /* --- lifecycle ---------------------------------------------------------- */
@@ -114,6 +118,12 @@ int dvm_add_apk_dir(struct dvm *vm, const char *dir);
 struct dvm_class *dvm_find_class(struct dvm *vm, const char *name);
 bool dvm_class_is_known(struct dvm *vm, const char *name);
 
+/* Whether a class by this name would exist on the device at all: defined by
+ * one of the APK's dexes, or part of the Android framework.  Anything else is
+ * absent, and has to be reported as absent — see the note on the definition.
+ * Accepts "com.foo.Bar", "com/foo/Bar" or "Lcom/foo/Bar;". */
+bool dvm_class_exists(struct dvm *vm, const char *name);
+
 /* `sig` may be NULL to take the first method with a matching name.  Searches
  * superclasses and interfaces. */
 struct dvm_method *dvm_find_method(struct dvm *vm, struct dvm_class *cls,
@@ -125,6 +135,8 @@ struct dvm_method *dvm_lookup(struct dvm *vm, const char *class_name,
 const char *dvm_method_name(const struct dvm_method *m);
 const char *dvm_method_sig(const struct dvm_method *m);
 const char *dvm_class_name(const struct dvm_class *c);
+/* Declared superclass, slash-separated, or NULL for java/lang/Object. */
+const char *dvm_class_super_name(const struct dvm_class *c);
 bool dvm_method_is_static(const struct dvm_method *m);
 
 /* --- invocation --------------------------------------------------------- */

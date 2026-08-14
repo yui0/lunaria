@@ -88,12 +88,61 @@ uint32_t arm_exec_env_va(void);
 /* Poll GLFW events (call from the render loop). */
 void arm_exec_glfw_poll(void);
 
+/* GL_VENDOR / GL_RENDERER / GL_VERSION / GL_SHADING_LANGUAGE_VERSION /
+ * GL_EXTENSIONS of the host GL, cached while a context was current so Java-side
+ * callers on context-less threads get the same answer a device would give.
+ * NULL for anything else. */
+const char *arm_exec_gl_string(unsigned name);
+
+/* Host EGL for the Java android.opengl.EGL14 binding (src/dvm/dvm_runtime.c).
+ * Android drives one EGL from both its native and its Java API; these are the
+ * same operations the guest's EGL SVCs perform, in the same guest handle
+ * space, so a context Java makes current is the one the scheduler restores for
+ * that thread.  Handles: 0 is EGL_NO_*, everything else is opaque. */
+uint32_t arm_exec_egl_get_display(void);
+int      arm_exec_egl_initialize(int32_t *major, int32_t *minor);
+int      arm_exec_egl_choose_config(const int32_t *attribs, uint32_t *out,
+                                    int max, int32_t *num);
+uint32_t arm_exec_egl_create_context(uint32_t share, const int32_t *attribs);
+uint32_t arm_exec_egl_create_pbuffer_surface(void);
+int      arm_exec_egl_make_current(uint32_t draw, uint32_t read, uint32_t ctx);
+int      arm_exec_egl_destroy_context(uint32_t ctx);
+const char *arm_exec_egl_query_string(int name);
+uint32_t arm_exec_egl_get_current_context(void);
+uint32_t arm_exec_egl_get_current_display(void);
+uint32_t arm_exec_egl_get_current_surface(void);
+int      arm_exec_egl_query_context(uint32_t ctx, int attr, int32_t *value);
+int      arm_exec_egl_get_config_attrib(uint32_t cfg, int attr, int32_t *value);
+int      arm_exec_egl_get_error(void);
+
+/* Read one packaged asset by the name AssetManager.open() takes (relative to
+ * assets/, or an absolute path the engine also feeds to AAssetManager).
+ * Returns a malloc'd buffer the caller frees, or NULL when there is no such
+ * asset.  This is the same lookup the native AAsset path uses — APK, split
+ * APKs, OBB and the staged files tree. */
+unsigned char *arm_exec_asset_read(const char *name, size_t *len);
+
 /* Dump current framebuffer to PPM.  path may be NULL → /tmp/lunaria_NNNN.ppm.
  * Returns 1 on success.  Also: F12 in the window, or `touch /tmp/lunaria-shot`. */
 int arm_exec_screenshot(const char *path);
 
 /* Framebuffer / window size (LUNARIA_WIDTH / LUNARIA_HEIGHT, default 1280×720). */
 int arm_exec_fb_width(void);
+/* AndroidManifest meta-data for the bytecode VM's ApplicationInfo.metaData
+ * Bundle.  Returns 0 when absent, else the value kind ('Z','I','F' in *iv or
+ * 'L' in *sv). */
+int arm_exec_apk_meta(const char *key, int32_t *iv, const char **sv);
+const char *arm_exec_apk_meta_keys(void);
+/* The package version from the <manifest> element (PackageInfo.versionCode /
+ * versionName).  Never yields 0 or NULL — see the definition. */
+void arm_exec_apk_version(int32_t *code, const char **name);
+/* resources.arsc name/value lookup used by android.content.res.Resources. */
+uint32_t arm_exec_apk_resource_id(const char *type, const char *name);
+int arm_exec_apk_resource_value(uint32_t id, int32_t *iv, const char **sv);
+/* Resolve an attribute from a compiled style bag, following app-resource
+ * parents.  Returns the Res_value data type, or 0 when absent. */
+int arm_exec_apk_style_value(uint32_t style_id, uint32_t attr_id,
+                             int32_t *iv, const char **sv);
 int arm_exec_fb_height(void);
 
 /* Touch input bridge (GLFW mouse → Android MotionEvent).
@@ -106,6 +155,12 @@ float     arm_exec_touch_x(void);
 float     arm_exec_touch_y(void);
 long long arm_exec_touch_time(void);    /* CLOCK_MONOTONIC ms */
 void      arm_exec_touch_push(int action, float x, float y); /* test injection */
+
+/* NDK input queue for NativeActivity titles (UE).  Creates the queue's pipe on
+ * first call and returns the opaque AInputQueue* the guest will hand back to
+ * AInputQueue_*; the caller publishes it to the native_app_glue as
+ * android_app::pendingInputQueue and sends APP_CMD_INPUT_CHANGED. */
+uint32_t  arm_exec_input_queue_handle(void);
 
 /* Returns 1 if the GLFW window close button was pressed, 0 otherwise. */
 int arm_exec_glfw_should_close(void);

@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <libgen.h>
@@ -28,6 +29,7 @@
 
 /* Exposed from arm_exec.cpp for diagnostic dumps */
 extern void arm_exec_svc_ring_dump(void);
+extern void arm64_exec_svc_ring_dump(void);
 
 /* Load APK-private AArch64 DT_NEEDED libraries before their consumer.  The
  * old A64 path named a handful of Unity/UE libraries explicitly, so a normal
@@ -139,9 +141,16 @@ static void a64_preload_needed(const char *path, const char *dir,
    }
 }
 
+/* Set by the AArch64 run paths so the stall dump reports the A64 JIT state
+ * instead of the (idle) A32 one. */
+static int g_dump_arm64;
+
 static void svc_dump_handler(int sig) {
     (void)sig;
-    arm_exec_svc_ring_dump();
+    if (g_dump_arm64)
+        arm64_exec_svc_ring_dump();
+    else
+        arm_exec_svc_ring_dump();
 }
 
 /* libmono.so @ 0x20000000: mono_defaults struct and key fields */
@@ -368,19 +377,38 @@ jni_sig_params(const char *sig, char *types, int max)
    return n;
 }
 
-/* Parameter types of a GameActivity native, from the APK's dex.  Returns the
- * count, or -1 when the method is not in any dex (then the caller falls back
- * to the layout it knows). */
+/* Parameter types of a GameActivity native.  Returns the count, or -1 when the
+ * method is unknown (then the caller falls back to the layout it knows).
+ *
+ * The signature handed to RegisterNatives comes from the engine binary that is
+ * about to be called, so it is the only description of the frame the callee
+ * actually reads; take it whenever the library registered the method.  The dex
+ * is a fallback for implicitly-bound natives (no RegisterNatives entry) and it
+ * cannot be trusted on its own: a title may still ship a stale
+ * com.epicgames.ue4.GameActivity next to the UE5 com.epicgames.unreal one, and
+ * its older declaration then shifts every argument by a slot — Blade & Soul
+ * Masia declares nativeSetGlobalActivity(Z,L,L,Z,L) in the dex while libUnreal
+ * registers (Z,Z,L,L,Z,L), so APKFilename fell off the end and the engine
+ * mounted no expansion at all. */
 static int
 ue_native_params(const char *method, char *types, int max)
 {
+   static const char *const classes[] = { "com.epicgames.unreal.GameActivity",
+                                          "com.epicgames.ue4.GameActivity" };
    char sig[512];
-   if (!apk_method_signature("com.epicgames.ue4.GameActivity", method,
-                             sig, sizeof sig) &&
-       !apk_method_signature("com.epicgames.unreal.GameActivity", method,
-                             sig, sizeof sig))
-      return -1;
-   return jni_sig_params(sig, types, max);
+   for (size_t i = 0; i < sizeof classes / sizeof classes[0]; ++i) {
+      sig[0] = '\0';
+      if ((arm64_exec_lookup_native_sig(classes[i], method, sig, (int)sizeof sig) ||
+           arm_exec_lookup_native_sig(classes[i], method, sig, (int)sizeof sig)) &&
+          sig[0] == '(') {
+         fprintf(stderr, "[loader] %s.%s%s (registered)\n", classes[i], method, sig);
+         return jni_sig_params(sig, types, max);
+      }
+   }
+   for (size_t i = 0; i < sizeof classes / sizeof classes[0]; ++i)
+      if (apk_method_signature(classes[i], method, sig, sizeof sig))
+         return jni_sig_params(sig, types, max);
+   return -1;
 }
 
 /* UE mounts its expansion file one of two ways, and bOBBinAPK is what selects
@@ -402,6 +430,103 @@ static uint32_t
 ue_obb_in_apk(void)
 {
    return arm_exec_apk_has_entry("assets/main.obb.png") ? 1u : 0u;
+}
+
+/* FAndroidPlatformFile roots the loose project tree at
+ *   <externalFilesDir>/UE4Game/<Project>/     (UE4 and earlier)
+ *   <externalFilesDir>/UnrealGame/<Project>/  (UE5 on)
+ * The engine picks one; the emulator has to recognise whichever the staging
+ * step produced, so keep both in one table. */
+static const char *const ue_files_roots[] = { "UE4Game", "UnrealGame", NULL };
+
+/* UE's ProjectName — the "TSProject" in <EngineDir>/TSProject/TSProject.uproject.
+ * nativeSetObbInfo hands it to the engine, which then builds GFilePathBase-
+ * relative content paths and the OBB names from it.  It is *not* derivable
+ * from the package id: Blade & Soul ships com.netmarble.bnsmasia around a
+ * project called TSProject, so the last package component sends every
+ * subsequent lookup to UE4Game/bnsmasia/… while the expansion staged the tree
+ * under UE4Game/TSProject/.
+ *
+ * UnrealBuildTool bakes the name into GameActivity.java as the ProjectName
+ * field, but it is also right there in the package: assets/UE4CommandLine.txt
+ * is the engine's own command line and starts with the .uproject path.  Read
+ * the name from the same place the engine does, and only fall back to the
+ * package id when a package ships no command line at all. */
+static const char *
+ue_project_name(const char *pkg)
+{
+   static char name[128];
+   if (*name) return name;
+
+   const char *dir = getenv("ANDROID_PACKAGE_CODE_PATH");
+   char line[512];
+   line[0] = '\0';
+   if (dir && *dir) {
+      /* UE4 stages assets/UE4CommandLine.txt; UE5 renamed it to
+       * assets/UECommandLine.txt.  Look for both — otherwise a UE5 package
+       * falls through to the staged-tree scan (or the package id) and the
+       * engine is handed the wrong ProjectName. */
+      static const char *const cmdline_names[] = {
+         "UE4CommandLine.txt", "UECommandLine.txt", NULL
+      };
+      for (int i = 0; cmdline_names[i] && !line[0]; ++i) {
+         char path[PATH_MAX];
+         snprintf(path, sizeof path, "%s/assets/%s", dir, cmdline_names[i]);
+         FILE *f = fopen(path, "rb");
+         if (!f) continue;
+         if (!fgets(line, sizeof line, f)) line[0] = '\0';
+         fclose(f);
+      }
+   }
+   /* "../../../TSProject/TSProject.uproject Map_Start -faketouches …" — take
+    * the first whitespace-delimited token and keep the .uproject basename. */
+   char *sp = line;
+   while (*sp && !isspace((unsigned char)*sp)) ++sp;
+   *sp = '\0';
+   const char *ext = strstr(line, ".uproject");
+   if (ext) {
+      const char *base = line;
+      for (const char *c = line; c < ext; ++c)
+         if (*c == '/' || *c == '\\') base = c + 1;
+      size_t n = (size_t)(ext - base);
+      if (n > 0 && n < sizeof name) {
+         memcpy(name, base, n);
+         name[n] = '\0';
+         fprintf(stderr, "[loader] UE project name %s (from UE4CommandLine.txt)\n", name);
+         return name;
+      }
+   }
+
+   /* No command line in the package: the staged expansion tree names the
+    * project too (<EngineDir>/<P>/<P>/Content/Paks). */
+   const char *ext_files = getenv("ANDROID_EXTERNAL_FILES_DIR");
+   for (int r = 0; ext_files && *ext_files && ue_files_roots[r]; ++r) {
+      char ue[PATH_MAX];
+      snprintf(ue, sizeof ue, "%s/%s", ext_files, ue_files_roots[r]);
+      DIR *d = opendir(ue);
+      if (!d) continue;
+      struct dirent *de;
+      while ((de = readdir(d))) {
+         if (de->d_name[0] == '.') continue;
+         char paks[PATH_MAX];
+         struct stat sb;
+         snprintf(paks, sizeof paks, "%s/%s/%s/Content/Paks",
+                  ue, de->d_name, de->d_name);
+         if (stat(paks, &sb) == 0 && S_ISDIR(sb.st_mode)) {
+            snprintf(name, sizeof name, "%s", de->d_name);
+            closedir(d);
+            fprintf(stderr, "[loader] UE project name %s (from staged %s)\n",
+                    name, ue_files_roots[r]);
+            return name;
+         }
+      }
+      closedir(d);
+   }
+
+   const char *last = pkg ? strrchr(pkg, '.') : NULL;
+   snprintf(name, sizeof name, "%s", last ? last + 1 : (pkg ? pkg : "Game"));
+   fprintf(stderr, "[loader] UE project name %s (guessed from package id)\n", name);
+   return name;
 }
 
 /* Fill `out` with (env, thiz, …) for one of the UE startup natives, matching
@@ -645,6 +770,8 @@ run_ue4_game_arm(struct jvm *jvm)
     * AndroidMain() spins on `while (!GResumeMainInit) Sleep(0.01f)` right after
     * "Controller interface supported"; without nativeResumeMainInit the engine
     * never initialises and every frame presents an empty surface. */
+   uint32_t va_config_rules = arm_exec_lookup_native(
+         "com.epicgames.ue4.GameActivity", "nativeSetConfigRulesVariables");
    uint32_t va_set_global = arm_exec_lookup_native(
          "com.epicgames.ue4.GameActivity", "nativeSetGlobalActivity");
    uint32_t va_set_ver = arm_exec_lookup_native(
@@ -675,14 +802,19 @@ run_ue4_game_arm(struct jvm *jvm)
    if (!obb_main) obb_main = "";
    if (!obb_patch) obb_patch = "";
    uint32_t obb_in_apk = ue_obb_in_apk();
-   /* Prefer staged loose OBB over nested zip-in-APK (see arm64 path). */
-   if (*obb_main && access(obb_main, R_OK) == 0) {
-      if (obb_in_apk)
-         fprintf(stderr, "[loader] prefer loose OBB %s over obbInAPK\n",
-                 obb_main);
-      obb_in_apk = 0;
-   }
+   if (obb_in_apk)
+      fprintf(stderr, "[loader] expansion is in the APK (assets/main.obb.png)\n");
 
+   if (va_config_rules) {
+      /* (env, thiz, String[] KeyValuePairs) — see the arm64 path: FAndroidMisc
+       * parks every thread that needs a config-rules variable until this
+       * arrives, so omitting it deadlocks UE before PreInit. */
+      jclass str_cls = jvm->native.FindClass(&jvm->env, "java/lang/String");
+      jobjectArray kv = jvm->native.NewObjectArray(&jvm->env, 0, str_cls, NULL);
+      uint32_t a[3] = { env, ctx, (uint32_t)(uintptr_t)kv };
+      fprintf(stderr, "[loader] UE4 nativeSetConfigRulesVariables (0 pairs)\n");
+      arm_exec_calln(va_config_rules, a, 3);
+   }
    if (va_set_global) {
       /* (env, thiz, bUseExternalFilesDir, bPublicLogFiles,
        *  internalFilePath, externalFilePath, bOBBinAPK, APKFilename) */
@@ -728,8 +860,7 @@ run_ue4_game_arm(struct jvm *jvm)
    }
    if (va_set_obb) {
       /* (env, thiz, ProjectName, PackageName, Version, PatchVersion, AppType) */
-      const char *proj = strrchr(pkg, '.');
-      proj = proj ? proj + 1 : pkg;
+      const char *proj = ue_project_name(pkg);
       jobject s_proj = jvm->native.NewStringUTF(&jvm->env, proj);
       jobject s_pkg  = jvm->native.NewStringUTF(&jvm->env, pkg);
       jobject s_type = jvm->native.NewStringUTF(&jvm->env, "");
@@ -786,9 +917,21 @@ run_ue4_game_arm(struct jvm *jvm)
             fprintf(stderr, "[loader] UE4 set window@36 pendingWindow@+0x%x = 0x%08x\n",
                     pend, win);
          }
+         /* The input queue reaches the glue the same way the window does:
+          * pendingInputQueue (msgread+0x34 on ILP32) plus APP_CMD_INPUT_CHANGED,
+          * which makes the glue attach it to its looper.  Without it the engine
+          * has no touchscreen at all — AInputQueue_getEvent is the only path a
+          * NativeActivity has for touches. */
+         uint32_t inq = arm_exec_input_queue_handle();
+         if (inq && pipe_off) {
+            arm_exec_write32(instance + pipe_off + 0x34u, inq);
+            fprintf(stderr, "[loader] UE4 pendingInputQueue@+0x%x = 0x%08x\n",
+                    pipe_off + 0x34u, inq);
+         }
          if (msgwrite >= 0) {
-            /* APP_CMD_START=10, RESUME=11, INIT_WINDOW=1, GAINED_FOCUS=6 */
-            static const int8_t cmds[] = { 10, 11, 1, 6 };
+            /* APP_CMD_INPUT_CHANGED=0, START=10, RESUME=11, INIT_WINDOW=1,
+             * GAINED_FOCUS=6 */
+            static const int8_t cmds[] = { 0, 10, 11, 1, 6 };
             for (size_t i = 0; i < sizeof cmds; ++i) {
                int8_t c = cmds[i];
                if (write(msgwrite, &c, 1) != 1)
@@ -865,6 +1008,114 @@ run_ue4_game_arm(struct jvm *jvm)
  * ---------------------------------------------------------------------- */
 /* UE ships the same GameActivity under two packages: com.epicgames.ue4 for
  * UE4 and com.epicgames.unreal for UE5.  Look a native method up in both. */
+/* --- dex-driven startup -------------------------------------------------
+ *
+ * The per-engine startup sequences below exist because there was no bytecode
+ * VM: the loader called, by hand, the `native` methods that the app's own
+ * Activity.onCreate() would have called — in the order we believed they came
+ * in, with arguments reconstructed from the environment.  That is a
+ * transcription of one engine's Java, and it only covers the calls we knew to
+ * transcribe.
+ *
+ * With a dex interpreter the app can make those calls itself, which is both
+ * shorter and engine-agnostic: whatever Activity the APK ships runs its real
+ * onCreate.  This is the default; LUNARIA_DEX_START=0 selects the legacy
+ * hand-written sequence for comparison.  Everything Android itself would
+ * do — creating the ANativeActivity, the window, the APP_CMD_* deliveries —
+ * stays with the loader either way; that is the platform's job, not the app's.
+ */
+static int
+dex_start_requested(void)
+{
+   const char *e = getenv("LUNARIA_DEX_START");
+   return !e || !*e || strcmp(e, "0") != 0;
+}
+
+/* First of `cands` that the APK's dex actually defines, or NULL. */
+static const char *
+dex_first_defined_class(const char *const *cands)
+{
+   for (int i = 0; cands[i]; ++i)
+      if (dvm_jni_class_in_dex(cands[i]))
+         return cands[i];
+   return NULL;
+}
+
+/* Epic renamed the package at UE5 (com.epicgames.ue4 → com.epicgames.unreal). */
+static const char *
+ue_activity_dex_class(void)
+{
+   static const char *const cands[] = {
+      "com/epicgames/unreal/GameActivity",
+      "com/epicgames/ue4/GameActivity",
+      NULL
+   };
+   return dex_first_defined_class(cands);
+}
+
+static int dex_call_lifecycle(struct jvm *jvm, jobject self, const char *cls,
+                              const char *method, const char *sig,
+                              int takes_null_arg);
+
+static jobject
+ue_start_dex_application(struct jvm *jvm)
+{
+   static const char *const cands[] = {
+      "com/epicgames/unreal/GameApplication",
+      "com/epicgames/ue4/GameApplication",
+      NULL
+   };
+   const char *cls = dex_first_defined_class(cands);
+   if (!cls) return NULL;
+
+   jclass k = jvm->native.FindClass(&jvm->env, cls);
+   jmethodID ctor = k ? jvm->native.GetMethodID(&jvm->env, k, "<init>", "()V")
+                      : NULL;
+   jobject app = (k && ctor)
+      ? jvm->native.NewObjectA(&jvm->env, k, ctor, NULL) : NULL;
+   if (!app) {
+      fprintf(stderr, "[loader] dex startup: cannot construct %s\n", cls);
+      return NULL;
+   }
+
+   /* ActivityThread attaches an application Context before onCreate.  The
+    * framework Context is intentionally plain; the Application wrapper keeps
+    * it as its base and obtains package services through it. */
+   jclass ck = jvm->native.FindClass(&jvm->env, "android/content/Context");
+   jobject context = ck ? jvm->native.AllocObject(&jvm->env, ck) : NULL;
+   jmethodID attach = jvm->native.GetMethodID(
+      &jvm->env, k, "attachBaseContext", "(Landroid/content/Context;)V");
+   if (attach && context) {
+      jvalue a = { .l = context };
+      fprintf(stderr, "[loader] dex startup: %s.attachBaseContext(Context)\n",
+              cls);
+      jvm->native.CallVoidMethodA(&jvm->env, app, attach, &a);
+   }
+   (void)dex_call_lifecycle(jvm, app, cls, "onCreate", "()V", 0);
+   return app;
+}
+
+/* Calls one no-argument (or single-null-argument) lifecycle method through the
+ * ordinary JNI entry points, which route into the bytecode VM whenever the dex
+ * defines the method.  Returns 0 when there is no such method. */
+static int
+dex_call_lifecycle(struct jvm *jvm, jobject self, const char *cls,
+                   const char *method, const char *sig, int takes_null_arg)
+{
+   jclass k = jvm->native.FindClass(&jvm->env, cls);
+   jmethodID m = k ? jvm->native.GetMethodID(&jvm->env, k, method, sig) : NULL;
+   if (!m)
+      return 0;
+   fprintf(stderr, "[loader] dex startup: %s.%s%s\n", cls, method, sig);
+   if (takes_null_arg) {
+      jvalue arg = { .l = NULL }; /* a fresh launch has no savedInstanceState */
+      jvm->native.CallVoidMethodA(&jvm->env, self, m, &arg);
+   } else {
+      jvm->native.CallVoidMethodA(&jvm->env, self, m, NULL);
+   }
+   return 1;
+}
+
 static uint64_t
 ue4_native64(const char *method)
 {
@@ -889,8 +1140,36 @@ run_ue4_game_arm64(struct jvm *jvm)
    if (!arm64_exec_host_egl_init())
       fprintf(stderr, "[loader] arm64 host EGL init failed\n");
 
-   jobject activity = jvm->native.AllocObject(&jvm->env,
-         jvm->native.FindClass(&jvm->env, "com/epicgames/ue4/GameActivity"));
+   const char *dex_cls = dex_start_requested() ? ue_activity_dex_class() : NULL;
+   jobject activity = NULL;
+   jobject application = NULL;
+   if (dex_cls) {
+      /* Android creates and starts the manifest Application before it
+       * instantiates the first Activity. */
+      application = ue_start_dex_application(jvm);
+      /* ActivityThread instantiates an Activity by running its no-argument
+       * constructor before delivering onCreate.  AllocObject alone skips all
+       * instance field initialisers and produces an object Android can never
+       * produce; in UE that leaves ProcessSystemInfoLock null. */
+      jclass activity_class = jvm->native.FindClass(&jvm->env, dex_cls);
+      jmethodID ctor = activity_class
+         ? jvm->native.GetMethodID(&jvm->env, activity_class, "<init>", "()V")
+         : NULL;
+      if (activity_class && ctor)
+         activity = jvm->native.NewObjectA(&jvm->env, activity_class, ctor, NULL);
+      if (!activity)
+         errx(EXIT_FAILURE, "dex startup: cannot construct %s", dex_cls);
+      if (application) {
+         jclass ac = jvm->native.FindClass(&jvm->env, "android/app/Activity");
+         jfieldID af = ac ? jvm->native.GetFieldID(
+            &jvm->env, ac, "application", "Landroid/app/Application;") : NULL;
+         if (af)
+            jvm->native.SetObjectField(&jvm->env, activity, af, application);
+      }
+   }
+   if (!activity)
+      activity = jvm->native.AllocObject(&jvm->env,
+            jvm->native.FindClass(&jvm->env, "com/epicgames/ue4/GameActivity"));
    if (!activity)
       activity = jvm->native.AllocObject(&jvm->env,
             jvm->native.FindClass(&jvm->env, "com/epicgames/unreal/GameActivity"));
@@ -926,6 +1205,7 @@ run_ue4_game_arm64(struct jvm *jvm)
     * FEngineLoop::PreInit never runs and every frame presents an empty
     * surface.  The A32 path has always done this — the A64 path went straight
     * from onCreate to the pump loop, so the engine never initialised. */
+   uint64_t va_config_rules   = ue4_native64("nativeSetConfigRulesVariables");
    uint64_t va_set_global     = ue4_native64("nativeSetGlobalActivity");
    uint64_t va_set_ver        = ue4_native64("nativeSetAndroidVersionInformation");
    uint64_t va_set_obb        = ue4_native64("nativeSetObbInfo");
@@ -947,20 +1227,38 @@ run_ue4_game_arm64(struct jvm *jvm)
    if (!ext) ext = "/tmp";
    if (!obb_main) obb_main = "";
    if (!obb_patch) obb_patch = "";
-   uint64_t obb_in_apk = ue_obb_in_apk();
-   /* Prefer a staged loose OBB (lunaria-apk.sh exports ANDROID_OBB_MAIN to
-    * the extracted assets/main.obb.png) over nested zip-in-APK mounting.
-    * With obbInAPK=1 alone, UE's in-APK OBB reader has left Content/Paks
-    * unresolved (host access → -1) and the scene empty — only post-process
-    * of black RTs.  Passing the real file via nativeSetObbFilePaths mounts
-    * the expansion the same way a Play Store OBB would. */
-   if (*obb_main && access(obb_main, R_OK) == 0) {
-      if (obb_in_apk)
-         fprintf(stderr, "[loader] prefer loose OBB %s over obbInAPK\n",
-                 obb_main);
-      obb_in_apk = 0;
+   /* LUNARIA_DEX_START: let GameActivity.onCreate() issue these calls itself,
+    * from the APK's own bytecode, instead of the transcription below.  The
+    * transcription only runs for the entry points onCreate did not reach. */
+   if (dex_start_requested()) {
+      if (!dex_cls) {
+         fprintf(stderr, "[loader] dex startup: no GameActivity in the dex — "
+                         "using the built-in startup sequence\n");
+      } else if (dex_call_lifecycle(jvm, activity, dex_cls, "onCreate",
+                                    "(Landroid/os/Bundle;)V", 1)) {
+         va_config_rules = va_set_global = va_set_ver = 0;
+         va_set_obb = va_set_obb_paths = 0;
+         arm64_exec_run_pending_threads();
+      }
    }
 
+   uint64_t obb_in_apk = ue_obb_in_apk();
+   if (obb_in_apk)
+      fprintf(stderr, "[loader] expansion is in the APK (assets/main.obb.png)\n");
+
+   if (va_config_rules) {
+      /* (env, thiz, String[] KeyValuePairs) — GameActivity evaluates
+       * configrules.txt in onCreate and hands the result to the engine.
+       * FAndroidMisc blocks every thread that needs a config-rules variable
+       * until this lands ("thread waiting for configrules to be set"), so
+       * skipping it deadlocks UE before PreInit.  A device whose APK has no
+       * matching rules passes an empty array; do the same. */
+      jclass str_cls = jvm->native.FindClass(&jvm->env, "java/lang/String");
+      jobjectArray kv = jvm->native.NewObjectArray(&jvm->env, 0, str_cls, NULL);
+      uint64_t a[3] = { env, ctx, (uint64_t)(uintptr_t)kv };
+      fprintf(stderr, "[loader] UE arm64 nativeSetConfigRulesVariables (0 pairs)\n");
+      arm64_exec_call8(va_config_rules, a, 3);
+   }
    if (va_set_global) {
       /* (env, thiz, [bUseExternalFilesDir], [bPublicLogFiles],
        *  internalFilePath, externalFilePath, [bOBBinAPK], [APKFilename]). */
@@ -1024,8 +1322,7 @@ run_ue4_game_arm64(struct jvm *jvm)
    }
    if (va_set_obb) {
       /* (env, thiz, ProjectName, PackageName, Version, PatchVersion, AppType) */
-      const char *proj = strrchr(pkg, '.');
-      proj = proj ? proj + 1 : pkg;
+      const char *proj = ue_project_name(pkg);
       uint64_t strs[3] = {
          (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env, proj),
          (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env, pkg),
@@ -1049,6 +1346,15 @@ run_ue4_game_arm64(struct jvm *jvm)
    arm64_exec_call_unlimited(va_oncreate, act_va, 0, 0, 0);
    arm64_exec_run_pending_threads();
    fprintf(stderr, "[loader] UE arm64 onCreate returned\n");
+
+   /* ActivityThread delivers the visible Java lifecycle after onCreate.
+    * APP_CMD_START/RESUME below are the NativeActivity half of that same
+    * transition, not replacements for these callbacks. */
+   if (dex_cls) {
+      dex_call_lifecycle(jvm, activity, dex_cls, "onStart",  "()V", 0);
+      dex_call_lifecycle(jvm, activity, dex_cls, "onResume", "()V", 0);
+      arm64_exec_run_pending_threads();
+   }
 
    /* Deliver APP_CMD_* via the android_app command pipe.  Calling
     * activity->callbacks->onNativeWindowCreated directly would block on the
@@ -1095,9 +1401,19 @@ run_ue4_game_arm64(struct jvm *jvm)
             fprintf(stderr, "[loader] UE arm64 window@+0x48 pendingWindow@+0x%llx = 0x%llx\n",
                     (unsigned long long)pend, (unsigned long long)win_va);
          }
+         /* Same for the input queue: pendingInputQueue (msgread+0x50 on LP64)
+          * plus APP_CMD_INPUT_CHANGED makes the glue attach it to its looper.
+          * A NativeActivity has no other path for touches. */
+         uint32_t inq = arm_exec_input_queue_handle();
+         if (inq && pipe_off) {
+            arm64_exec_write64(instance_va + pipe_off + 0x50u, (uint64_t)inq);
+            fprintf(stderr, "[loader] UE arm64 pendingInputQueue@+0x%x = 0x%08x\n",
+                    pipe_off + 0x50u, inq);
+         }
          if (msgwrite >= 0) {
-            /* APP_CMD_START=10, RESUME=11, INIT_WINDOW=1, GAINED_FOCUS=6 */
-            static const int8_t cmds[] = { 10, 11, 1, 6 };
+            /* APP_CMD_INPUT_CHANGED=0, START=10, RESUME=11, INIT_WINDOW=1,
+             * GAINED_FOCUS=6 */
+            static const int8_t cmds[] = { 0, 10, 11, 1, 6 };
             for (size_t i = 0; i < sizeof cmds; ++i) {
                int8_t c = cmds[i];
                if (write(msgwrite, &c, 1) != 1)
@@ -1136,6 +1452,7 @@ run_ue4_game_arm64(struct jvm *jvm)
       arm64_exec_run_pending_threads();
    }
 
+   g_dump_arm64 = 1;
    signal(SIGUSR1, svc_dump_handler);
    signal(SIGALRM, svc_dump_handler);
    alarm(30);
@@ -1247,6 +1564,7 @@ run_unity_game_arm64(struct jvm *jvm)
    arm64_exec_run_pending_threads();
 
    fprintf(stderr, "[loader] arm64 entering Unity render loop\n");
+   g_dump_arm64 = 1;
    signal(SIGUSR1, svc_dump_handler);
    signal(SIGALRM, svc_dump_handler);
    alarm(30);
@@ -1307,6 +1625,224 @@ run_unity_game_arm64(struct jvm *jvm)
    return EXIT_SUCCESS;
 }
 
+/* Start the package the way Android does: construct the launcher Activity and
+ * run its lifecycle out of the dex.  `ANDROID_LAUNCH_ACTIVITY` comes from
+ * lunaria-apk.sh, which already parses the APK's AndroidManifest.
+ *
+ * This is the engine-agnostic path.  It carries no knowledge of Unity or
+ * Unreal: whatever the APK's Activity does in onCreate — loading its native
+ * libraries, building its player object, calling its own JNI methods — is its
+ * own bytecode running.  What it does not do is drive rendering: an app that
+ * draws through a GLSurfaceView is driven by callbacks from a real Android
+ * framework, which lunaria does not yet deliver.  So this gets the package
+ * started and pumped; frames only appear for apps whose native side presents
+ * through the EGL bridge on its own thread.
+ */
+static int
+start_manifest_providers(struct jvm *jvm, jobject context)
+{
+   const char *encoded = getenv("ANDROID_CONTENT_PROVIDERS");
+   if (!encoded || !*encoded) return 0;
+   char *providers = strdup(encoded);
+   if (!providers) return 0;
+   int started = 0;
+   char *save = NULL;
+   for (char *entry = strtok_r(providers, ";", &save); entry;
+        entry = strtok_r(NULL, ";", &save)) {
+      char *authority = strchr(entry, '|');
+      if (authority) *authority++ = '\0';
+      char cls[256];
+      size_t n = 0;
+      for (const char *p = entry; *p && n + 1 < sizeof cls; ++p)
+         cls[n++] = (*p == '.') ? '/' : *p;
+      cls[n] = '\0';
+      if (!*cls || !dvm_jni_class_in_dex(cls)) continue;
+
+      jclass provider_class = jvm->native.FindClass(&jvm->env, cls);
+      jmethodID ctor = provider_class ? jvm->native.GetMethodID(
+         &jvm->env, provider_class, "<init>", "()V") : NULL;
+      jobject provider = (provider_class && ctor) ? jvm->native.NewObjectA(
+         &jvm->env, provider_class, ctor, NULL) : NULL;
+      if (!provider) {
+         fprintf(stderr, "[loader] content provider: cannot construct %s\n", cls);
+         continue;
+      }
+
+      jclass info_class = jvm->native.FindClass(&jvm->env,
+                                                 "android/content/pm/ProviderInfo");
+      jobject info = info_class
+         ? jvm->native.AllocObject(&jvm->env, info_class) : NULL;
+      if (info && authority) {
+         jfieldID field = jvm->native.GetFieldID(&jvm->env, info_class,
+                                                  "authority",
+                                                  "Ljava/lang/String;");
+         jstring value = jvm->native.NewStringUTF(&jvm->env, authority);
+         if (field && value)
+            jvm->native.SetObjectField(&jvm->env, info, field, value);
+      }
+      if (info) {
+         jfieldID grant = jvm->native.GetFieldID(&jvm->env, info_class,
+                                                  "grantUriPermissions", "Z");
+         if (grant)
+            jvm->native.SetBooleanField(&jvm->env, info, grant, JNI_TRUE);
+      }
+      jmethodID attach = jvm->native.GetMethodID(
+         &jvm->env, provider_class, "attachInfo",
+         "(Landroid/content/Context;Landroid/content/pm/ProviderInfo;)V");
+      if (attach) {
+         jvalue args[2] = { { .l = context }, { .l = info } };
+         jvm->native.CallVoidMethodA(&jvm->env, provider, attach, args);
+      }
+      if (dex_call_lifecycle(jvm, provider, cls, "onCreate", "()Z", 0)) {
+         fprintf(stderr, "[loader] content provider: started %s\n", cls);
+         ++started;
+      }
+   }
+   free(providers);
+   return started;
+}
+
+static int
+run_dex_activity_arm64(struct jvm *jvm)
+{
+   const char *act = getenv("ANDROID_LAUNCH_ACTIVITY");
+   if (!act || !*act) {
+      fprintf(stderr, "[loader] dex startup: ANDROID_LAUNCH_ACTIVITY unset\n");
+      return EXIT_FAILURE;
+   }
+   /* The manifest gives a dotted name; the VM and JNI want slashes. */
+   char cls[256];
+   size_t n = 0;
+   for (const char *p = act; *p && n + 1 < sizeof cls; ++p)
+      cls[n++] = (*p == '.') ? '/' : *p;
+   cls[n] = '\0';
+
+   if (!dvm_jni_class_in_dex(cls)) {
+      fprintf(stderr, "[loader] dex startup: %s is not in any dex\n", cls);
+      return EXIT_FAILURE;
+   }
+
+   if (!arm64_exec_host_egl_init())
+      fprintf(stderr, "[loader] arm64 host EGL init failed\n");
+
+   /* ActivityThread first creates the process Application and attaches a base
+    * Context.  Activity.getApplication() is therefore non-null even when the
+    * manifest uses the default android.app.Application. */
+   jclass context_class = jvm->native.FindClass(&jvm->env,
+                                                 "android/content/Context");
+   jobject base_context = context_class
+      ? jvm->native.AllocObject(&jvm->env, context_class) : NULL;
+   const char *app_env = getenv("ANDROID_APPLICATION_CLASS");
+   char app_cls[256] = "android/app/Application";
+   if (app_env && *app_env) {
+      size_t an = 0;
+      for (const char *p = app_env; *p && an + 1 < sizeof app_cls; ++p)
+         app_cls[an++] = (*p == '.') ? '/' : *p;
+      app_cls[an] = '\0';
+   }
+   jclass application_class = jvm->native.FindClass(&jvm->env, app_cls);
+   jobject application = NULL;
+   if (application_class && dvm_jni_class_in_dex(app_cls)) {
+      jmethodID app_ctor = jvm->native.GetMethodID(&jvm->env,
+                                      application_class, "<init>", "()V");
+      if (app_ctor)
+         application = jvm->native.NewObjectA(&jvm->env, application_class,
+                                               app_ctor, NULL);
+   }
+   if (!application) {
+      application_class = jvm->native.FindClass(&jvm->env,
+                                                 "android/app/Application");
+      application = application_class
+         ? jvm->native.AllocObject(&jvm->env, application_class) : NULL;
+   }
+   if (application && base_context) {
+      jmethodID attach = jvm->native.GetMethodID(
+         &jvm->env, application_class, "attachBaseContext",
+         "(Landroid/content/Context;)V");
+      if (attach) {
+         jvalue arg = { .l = base_context };
+         jvm->native.CallVoidMethodA(&jvm->env, application, attach, &arg);
+      }
+   }
+   /* ActivityThread installs all manifest providers before delivering the
+    * process Application.onCreate().  Firebase and AndroidX Startup rely on
+    * this ordering for process-wide initialisation. */
+   start_manifest_providers(jvm, application ? application : base_context);
+
+   if (application && app_env && *app_env && dvm_jni_class_in_dex(app_cls))
+      (void)dex_call_lifecycle(jvm, application, app_cls, "onCreate", "()V", 0);
+
+   /* ActivityThread uses Instrumentation.newActivity(), which invokes the
+    * launcher's no-argument constructor before attach()/onCreate().  Using
+    * AllocObject here created an object Android can never create: every Java
+    * field initializer in ComponentActivity, FragmentActivity, AppCompat and
+    * the application class was skipped.  The first super.onCreate() then saw
+    * null SavedStateRegistryController/FragmentController fields. */
+   jclass activity_class = jvm->native.FindClass(&jvm->env, cls);
+   jmethodID ctor = activity_class
+      ? jvm->native.GetMethodID(&jvm->env, activity_class, "<init>", "()V")
+      : NULL;
+   jobject activity = (activity_class && ctor)
+      ? jvm->native.NewObjectA(&jvm->env, activity_class, ctor, NULL) : NULL;
+   if (!activity) {
+      fprintf(stderr, "[loader] dex startup: cannot construct %s\n", cls);
+      return EXIT_FAILURE;
+   }
+
+   /* Activity.attach() establishes both ContextWrapper.mBase and the process
+    * Application before any lifecycle callback.  The host framework exposes
+    * those two observable pieces directly. */
+   if (base_context) {
+      jmethodID attach = jvm->native.GetMethodID(
+         &jvm->env, activity_class, "attachBaseContext",
+         "(Landroid/content/Context;)V");
+      if (attach) {
+         jvalue arg = { .l = base_context };
+         jvm->native.CallVoidMethodA(&jvm->env, activity, attach, &arg);
+      }
+   }
+   if (application) {
+      jclass platform_activity = jvm->native.FindClass(&jvm->env,
+                                                        "android/app/Activity");
+      jfieldID app_field = platform_activity ? jvm->native.GetFieldID(
+         &jvm->env, platform_activity, "application",
+         "Landroid/app/Application;") : NULL;
+      if (app_field)
+         jvm->native.SetObjectField(&jvm->env, activity, app_field, application);
+   }
+
+   if (!dex_call_lifecycle(jvm, activity, cls, "onCreate",
+                           "(Landroid/os/Bundle;)V", 1)) {
+      fprintf(stderr, "[loader] dex startup: %s has no onCreate\n", cls);
+      return EXIT_FAILURE;
+   }
+   arm64_exec_run_pending_threads();
+   /* onStart/onResume are what make an Activity visible and running; an app
+    * that starts its render thread in onResume never starts without them. */
+   dex_call_lifecycle(jvm, activity, cls, "onStart",  "()V", 0);
+   dex_call_lifecycle(jvm, activity, cls, "onResume", "()V", 0);
+   arm64_exec_run_pending_threads();
+
+   int max_frames = 0;
+   { const char *mf = getenv("LUNARIA_MAX_FRAMES"); if (mf && *mf) max_frames = atoi(mf); }
+   fprintf(stderr, "[loader] dex startup: entering pump loop (max_frames=%d)\n",
+           max_frames);
+   for (int frame = 0; max_frames <= 0 || frame < max_frames; ++frame) {
+      if (arm_exec_guest_abort_count() > 0) {
+         fprintf(stderr, "[loader] guest abort — stopping dex loop (frame %d)\n", frame);
+         break;
+      }
+      arm64_exec_run_pending_threads();
+      arm64_exec_egl_swap();
+      arm64_exec_glfw_poll();
+      if (frame < 5 || frame % 50 == 0)
+         fprintf(stderr, "[loader] dex pump frame %d\n", frame);
+      if (arm64_exec_glfw_should_close()) break;
+      usleep(16000);
+   }
+   return EXIT_SUCCESS;
+}
+
 static int
 run_jni_game_arm64(struct jvm *jvm)
 {
@@ -1316,6 +1852,12 @@ run_jni_game_arm64(struct jvm *jvm)
    /* UnityPlayer.initJni path (IL2CPP / Mono) */
    if (arm64_exec_lookup_native("com.unity3d.player.UnityPlayer", "initJni"))
       return run_unity_game_arm64(jvm);
+   /* Neither engine's native entry point is exported.  An ordinary Android
+    * app has none: its entry point is the launcher Activity, in the dex.  With
+    * a bytecode VM that is runnable, so start it the way Android does instead
+    * of giving up on the package. */
+   if (run_dex_activity_arm64(jvm) == EXIT_SUCCESS)
+      return EXIT_SUCCESS;
    fprintf(stderr, "[loader] arm64: no known entry point\n");
    return EXIT_FAILURE;
 }

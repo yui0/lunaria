@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ------------------------------------------------------------------------ *
  * Descriptors
@@ -213,6 +214,14 @@ dvm_ref dvm_new_string_n(struct dvm *vm, const char *utf8, size_t len)
    if (len) memcpy(o->utf8, utf8, len);
    o->utf8[len] = '\0';
    o->utf8_len = (uint32_t)len;
+   {
+      const char *want = getenv("LUNARIA_DVM_STRWATCH");
+      if (want && strstr(o->utf8, want))
+         fprintf(stderr, "[dvm] new-string \"%.200s\" in %s.%s\n", o->utf8,
+                 vm->cur_method && vm->cur_method->cls
+                    ? vm->cur_method->cls->name : "?",
+                 vm->cur_method ? vm->cur_method->name : "?");
+   }
    return r;
 }
 
@@ -419,11 +428,11 @@ struct dvm_class *dvm__class_by_desc(struct dvm *vm, const char *desc)
 
    /* A dex definition wins; then a built-in; then a host-backed stub. */
    for (int i = 0; i < vm->ndexes; ++i) {
-      int idx = dex_find_class(&vm->dexes[i].file, desc);
+      int idx = dex_find_class(&vm->dexes[i]->file, desc);
       if (idx < 0) continue;
       c = class_register(vm, desc);
       if (!c) return NULL;
-      if (!class_load_from_dex(vm, c, &vm->dexes[i], (uint32_t)idx)) {
+      if (!class_load_from_dex(vm, c, vm->dexes[i], (uint32_t)idx)) {
          c->external = true;
          c->init_state = 2;
       }
@@ -455,12 +464,48 @@ bool dvm_class_is_known(struct dvm *vm, const char *name)
    char desc[512];
    name_to_desc(name, desc, sizeof desc);
    for (int i = 0; i < vm->ndexes; ++i)
-      if (dex_find_class(&vm->dexes[i].file, desc) >= 0) return true;
+      if (dex_find_class(&vm->dexes[i]->file, desc) >= 0) return true;
    struct dvm_class *c = class_lookup(vm, desc);
    return c && !c->external;
 }
 
+/* Does this class exist on the device we present?
+ *
+ * The app's own classes are in its dexes and the platform's are in the
+ * framework; a name in neither is one the device does not have either.  That
+ * distinction is not cosmetic: app code *probes* for optional classes and
+ * expects the absent ones to say so.  AppsFlyer asks
+ * Class.forName("com.miui.referrer.api.GetAppsReferrerClient") to find out
+ * whether it is running on a Xiaomi device, and every name resolving to a
+ * usable class told it yes — so it went on to use a vendor SDK that is not
+ * there, and GameActivity.afStart died before AppsFlyer was ever started.
+ *
+ * Framework names get the benefit of the doubt whether or not the emulator
+ * models them: on a device they are present, and the stub layer answers for
+ * them. */
+bool dvm_class_exists(struct dvm *vm, const char *name)
+{
+   static const char *const framework[] = {
+      "java/", "javax/", "sun/", "jdk/", "libcore/", "dalvik/", "kotlin/",
+      "android/", "com/android/", "org/json/", "org/w3c/", "org/xml/",
+      "org/apache/http/", "org/xmlpull/",
+   };
+   if (!name || !*name) return false;
+   char desc[512];
+   name_to_desc(name, desc, sizeof desc);
+   if (desc[0] == '[') return true;   /* array of anything */
+   if (dvm_class_is_known(vm, desc)) return true;
+   const char *n = desc[0] == 'L' ? desc + 1 : desc;
+   for (size_t i = 0; i < sizeof framework / sizeof *framework; ++i)
+      if (!strncmp(n, framework[i], strlen(framework[i]))) return true;
+   return false;
+}
+
 const char *dvm_class_name(const struct dvm_class *c) { return c ? c->name : "?"; }
+const char *dvm_class_super_name(const struct dvm_class *c)
+{
+   return (c && c->super) ? c->super->name : NULL;
+}
 const char *dvm_method_name(const struct dvm_method *m) { return m ? m->name : "?"; }
 const char *dvm_method_sig(const struct dvm_method *m) { return m ? m->sig : "?"; }
 bool dvm_method_is_static(const struct dvm_method *m)
@@ -679,12 +724,18 @@ void dvm__throw(struct dvm *vm, const char *class_name, const char *fmt, ...)
       if (o && !o->utf8 && msg[0]) o->utf8 = strdup(msg);   /* always readable */
    }
    vm->exception = e;
+   vm->exc_ref = e;
+   vm->nexc_trace = 0;   /* a fresh throw starts a fresh unwind path */
+   if (vm->cur_method) {
+      vm->exc_trace[vm->nexc_trace++] = vm->cur_method;
+      vm->exc_pc = vm->cur_pc;
+   }
    if (vm->trace)
       fprintf(stderr, "[dvm] throw %s: %s\n", class_name, msg);
 }
 
 dvm_ref dvm_exception(struct dvm *vm) { return vm->exception; }
-void dvm_clear_exception(struct dvm *vm) { vm->exception = 0; }
+void dvm_clear_exception(struct dvm *vm) { vm->exception = 0; vm->parked = false; }
 
 void dvm_describe_exception(struct dvm *vm, dvm_ref exc, char *buf, size_t sz)
 {
@@ -753,7 +804,16 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
 
 bool dvm_init_class(struct dvm *vm, struct dvm_class *cls)
 {
-   if (!cls || cls->init_state) return true;
+   if (!cls) return true;
+   /* A class whose <clinit> threw stays erroneous: every later use has to fail
+    * too, because its static fields were never assigned.  Reporting success
+    * once the first attempt is over hands out nulls that look like data. */
+   if (cls->init_state == 3) {
+      dvm__throw(vm, "java/lang/NoClassDefFoundError",
+                 "%s failed to initialise", cls->name);
+      return false;
+   }
+   if (cls->init_state) return true;
    cls->init_state = 1;
 
    if (cls->super) dvm_init_class(vm, cls->super);
@@ -801,7 +861,12 @@ bool dvm_init_class(struct dvm *vm, struct dvm_class *cls)
       if (vm->trace) fprintf(stderr, "[dvm] <clinit> %s\n", cls->name);
       union dvm_value ret;
       if (!invoke(vm, clinit, 0, NULL, 0, &ret)) {
-         cls->init_state = 2;   /* do not retry: Java would leave it erroneous */
+         char why[512] = "";
+         if (vm->exception)
+            dvm_describe_exception(vm, vm->exception, why, sizeof why);
+         fprintf(stderr, "[dvm] <clinit> %s failed: %s\n", cls->name,
+                 why[0] ? why : "no exception");
+         cls->init_state = 3;   /* erroneous: never retried, never usable */
          return false;
       }
    }
@@ -908,6 +973,12 @@ static bool iface_assignable(struct dvm *vm, struct dvm_class *from,
    return false;
 }
 
+bool dvm__class_assignable(struct dvm *vm, struct dvm_class *from,
+                           struct dvm_class *to)
+{
+   return class_assignable(vm, from, to);
+}
+
 static bool class_assignable(struct dvm *vm, struct dvm_class *from,
                              struct dvm_class *to)
 {
@@ -918,10 +989,13 @@ static bool class_assignable(struct dvm *vm, struct dvm_class *from,
    if (iface_assignable(vm, from, to)) return true;
    if (from->is_array && to->is_array)
       return class_assignable(vm, from->elem, to->elem);
-   /* An external class has no hierarchy we can see; the host stub layer
-    * answers those.  Refusing here would turn a working cast into a
-    * ClassCastException, so be permissive in exactly that case. */
-   return from->external || to->external;
+   /* Unknown hierarchy is not evidence of assignability.  Returning true for
+    * every external class makes `x instanceof InternalSentinel` succeed for
+    * arbitrary objects; lock-free queues then mistake real tasks for their
+    * private marker objects and spin forever.  Exact classes and every known
+    * superclass/interface were handled above, so the only sound answer left
+    * is false. */
+   return false;
 }
 
 /* Resolves the target of an invoke-virtual / -interface at the receiver's
@@ -952,14 +1026,18 @@ static void note_missing(struct dvm *vm, const char *what)
    fprintf(stderr, "[dvm] unresolved: %s\n", what);
 }
 
-static bool call_out(struct dvm *vm, struct dvm_class *cls, const char *name,
-                     const char *sig, bool is_static, bool is_native,
-                     dvm_ref self, const uint32_t *slots, int nslots,
-                     union dvm_value *out)
+bool dvm__call_out(struct dvm *vm, struct dvm_class *cls, const char *name,
+                   const char *sig, bool is_static, bool is_native,
+                   dvm_ref self, const uint32_t *slots, int nslots,
+                   union dvm_value *out)
 {
    union dvm_value args[64];
    int nargs = slots_to_values(sig, slots, nslots, args, 64);
    memset(out, 0, sizeof *out);
+
+   if (getenv("LUNARIA_DVM_OUTTRACE"))
+      fprintf(stderr, "[out] %s.%s%s%s\n", cls->name, name, sig,
+              is_native ? " (native)" : "");
 
    if (is_native && vm->hooks.call_native &&
        vm->hooks.call_native(vm->hooks.user, vm, cls->name, name, sig,
@@ -1024,6 +1102,41 @@ static int find_handler(struct dvm *vm, struct dvm_method *m, uint32_t pc,
    return -1;
 }
 
+/* A cooperative park is an interpreter unwind token, not a Java
+ * InterruptedException.  It must bypass typed catch clauses, but it still has
+ * to execute encoded catch-all handlers: javac/d8 use those for finally, and
+ * skipping them leaves executor locks/active-task slots permanently held. */
+static int find_catchall_handler(struct dvm_method *m, uint32_t pc,
+                                 uint32_t *out_pc)
+{
+   const struct dex_code *code = &m->code;
+   if (!code->tries_size || !code->tries || !m->dex) return -1;
+   for (uint32_t i = 0; i < code->tries_size; ++i) {
+      const uint8_t *t = code->tries + (size_t)i * 8u;
+      uint32_t start;
+      uint16_t count, hoff;
+      memcpy(&start, t, 4);
+      memcpy(&count, t + 4, 2);
+      memcpy(&hoff, t + 6, 2);
+      if (pc < start || pc >= start + count) continue;
+      size_t p = (size_t)(code->handlers - m->dex->p) + hoff;
+      int32_t size;
+      p = dex_sleb(m->dex, p, &size);
+      int npairs = size < 0 ? -size : size;
+      for (int k = 0; k < npairs; ++k) {
+         uint32_t ignored;
+         p = dex_uleb(m->dex, p, &ignored);
+         p = dex_uleb(m->dex, p, &ignored);
+      }
+      if (size <= 0) {
+         p = dex_uleb(m->dex, p, out_pc);
+         (void)p;
+         return 0;
+      }
+   }
+   return -1;
+}
+
 /* Reads the 35c/3rc argument registers into `slots`. */
 static int gather_args(const uint16_t *insns, uint32_t nins, uint32_t pc, bool range,
                        uint32_t *regs, uint32_t nregs, uint32_t *slots)
@@ -1065,7 +1178,7 @@ static struct dvm_class *resolve_type(struct dvm *vm, struct dvm_dex *dd, uint32
 static struct dvm_dex *dex_of(struct dvm *vm, struct dex_file *f)
 {
    for (int i = 0; i < vm->ndexes; ++i)
-      if (&vm->dexes[i].file == f) return &vm->dexes[i];
+      if (&vm->dexes[i]->file == f) return vm->dexes[i];
    return NULL;
 }
 
@@ -1122,11 +1235,28 @@ static struct dvm_field *resolve_field(struct dvm *vm, struct dvm_dex *dd,
    return f;
 }
 
+static int dex_index(struct dvm *vm, struct dvm_dex *dd)
+{
+   for (int i = 0; i < vm->ndexes; ++i)
+      if (vm->dexes[i] == dd) return i;
+   return -1;
+}
+
 static dvm_ref const_string(struct dvm *vm, struct dvm_dex *dd, uint32_t idx)
 {
    if (dd->string_cache && idx < dd->file.string_ids_size && dd->string_cache[idx])
       return dd->string_cache[idx];
    const char *s = dex_string(&dd->file, idx);
+   {
+      const char *want = getenv("LUNARIA_DVM_STRWATCH");
+      if (want && s && strstr(s, want))
+         fprintf(stderr, "[dvm] const-string[%u] = \"%s\" in %s.%s (dex %d)\n",
+                 idx, s,
+                 vm->cur_method && vm->cur_method->cls
+                    ? vm->cur_method->cls->name : "?",
+                 vm->cur_method ? vm->cur_method->name : "?",
+                 dex_index(vm, dd));
+   }
    dvm_ref r = dvm__intern(vm, s ? s : "");
    if (dd->string_cache && idx < dd->file.string_ids_size)
       dd->string_cache[idx] = r;
@@ -1178,13 +1308,19 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
 
    bool is_static = (m->access & DEX_ACC_STATIC) != 0;
    if (!is_static && !self && !(m->access & DEX_ACC_NATIVE)) {
-      dvm__throw(vm, "java/lang/NullPointerException", "%s.%s", m->cls->name, m->name);
+      /* "self" marks the callee-side check, so a null receiver can be told
+       * apart from the call-site one below. */
+      dvm__throw(vm, "java/lang/NullPointerException", "self %s.%s%s",
+                 m->cls->name, m->name, m->sig ? m->sig : "");
       return false;
    }
 
    if (is_static && m->cls) dvm_init_class(vm, m->cls);
 
-   if (vm->trace)
+   const char *trace_class = getenv("LUNARIA_DVM_TRACE_CLASS");
+   bool trace_this = !trace_class ||
+      (m->cls && m->cls->name && strstr(m->cls->name, trace_class));
+   if (vm->trace && trace_this)
       fprintf(stderr, "[dvm] %*scall %s.%s%s\n", vm->depth * 2, "",
               m->cls ? m->cls->name : "?", m->name, m->sig ? m->sig : "");
 
@@ -1200,7 +1336,7 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
    if (!m->has_code) {
       bool native = (m->access & DEX_ACC_NATIVE) != 0;
       ++vm->depth;
-      bool ok = call_out(vm, m->cls, m->name, m->sig, is_static, native,
+      bool ok = dvm__call_out(vm, m->cls, m->name, m->sig, is_static, native,
                          self, slots, nslots, out);
       --vm->depth;
       return ok && !vm->exception;
@@ -1230,6 +1366,11 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
    bool ok = execute(vm, &fr, out);
    --vm->depth;
 
+   /* Record the frames the exception passes on its way out, innermost first. */
+   if (!ok && vm->exception && m != vm->exc_trace[0] &&
+       vm->nexc_trace < (int)(sizeof vm->exc_trace / sizeof vm->exc_trace[0]))
+      vm->exc_trace[vm->nexc_trace++] = m;
+
    if (regs != stackbuf) free(regs);
    return ok;
 }
@@ -1237,11 +1378,25 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
 static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
 {
    struct dvm_method *m = fr->m;
+   const char *trace_class = getenv("LUNARIA_DVM_TRACE_CLASS");
+   bool trace_this = !trace_class ||
+      (m->cls && m->cls->name && strstr(m->cls->name, trace_class));
    const uint16_t *insns = m->code.insns;
    uint32_t nins = m->code.insns_size;
    uint32_t nregs = fr->nregs;
    uint32_t *r = fr->regs;
    struct dvm_dex *dd = dex_of(vm, m->dex);
+   if (m->dex && !dd) {
+      /* Every constant-pool index in this method is meaningless without its
+       * own dex; resolving against another one silently returns the wrong
+       * class and method.  Fail loudly instead. */
+      static bool warned;
+      if (!warned) {
+         warned = true;
+         fprintf(stderr, "[dvm] %s.%s: dex not registered — constant pool "
+                 "cannot be resolved\n", m->cls ? m->cls->name : "?", m->name);
+      }
+   }
    char sigbuf[1024];
 
    memset(out, 0, sizeof *out);
@@ -1271,9 +1426,12 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
       uint32_t pc = fr->pc;
       uint16_t u0 = insns[pc];
       uint8_t op = OPCODE(u0);
+      vm->cur_method = m;
+      vm->cur_pc = pc;
 
-      if (vm->trace >= 2)
-         fprintf(stderr, "[dvm]   %s.%s @%04x op=%02x\n", m->cls->name, m->name, pc, op);
+      if (vm->trace >= 2 && trace_this)
+         fprintf(stderr, "[dvm]   %s.%s @%04x op=%02x words=%04x,%04x,%04x\n",
+                 m->cls->name, m->name, pc, op, u0, IU(1), IU(2));
 
       switch (op) {
       case 0x00: /* nop, and the payload pseudo-ops when reached by accident */
@@ -1322,7 +1480,9 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          break;
       case 0x0d: /* move-exception */
          REQ(AA(u0));
-         r[AA(u0)] = vm->exception;
+         /* The handler entry already cleared the pending exception; the
+          * object itself is kept in exc_ref for exactly this instruction. */
+         r[AA(u0)] = vm->exception ? vm->exception : vm->exc_ref;
          vm->exception = 0;
          fr->pc += 1;
          break;
@@ -1517,7 +1677,24 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          if (!r[AA(u0)]) {
             dvm__throw(vm, "java/lang/NullPointerException", "throw null");
          } else {
+            /* An explicit throw skips dvm__throw, so stamp the origin here or
+             * the backtrace would attribute it to whichever frame unwinds
+             * first.  A rethrow of the same object — the `move-exception;
+             * monitor-exit; throw` shape a synchronized block compiles to —
+             * must keep the origin it already has, or the frame that really
+             * failed is lost. */
             vm->exception = r[AA(u0)];
+            if (vm->exc_ref != r[AA(u0)]) {
+               vm->exc_ref = r[AA(u0)];
+               vm->nexc_trace = 0;
+               vm->exc_trace[vm->nexc_trace++] = m;
+               vm->exc_pc = pc;
+            } else if (vm->nexc_trace <
+                       (int)(sizeof vm->exc_trace / sizeof vm->exc_trace[0]) &&
+                       (vm->nexc_trace == 0 ||
+                        vm->exc_trace[vm->nexc_trace - 1] != m)) {
+               vm->exc_trace[vm->nexc_trace++] = m;
+            }
          }
          goto exception;
 
@@ -1700,7 +1877,10 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          union dvm_value v = { 0 };
          if (f && o->slots && f->slot < (o->cls ? o->cls->islots : 0))
             v = o->slots[f->slot];
-         (void)ft;
+         if (vm->trace && op == 0x54)
+            fprintf(stderr, "[dvm] %*siget-object @%x.%s:%s -> @%x\n",
+                    vm->depth * 2, "", r[B4(u0)], fn ? fn : "?",
+                    ft ? ft : "?", v.l);
          if (op == 0x53) { REQ(A4(u0) + 1); sw(r, A4(u0), v.ju); }
          else r[A4(u0)] = v.u;
          fr->pc += 2;
@@ -1721,6 +1901,10 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          else v.u = r[A4(u0)];
          if (f && o->slots && f->slot < (o->cls ? o->cls->islots : 0))
             o->slots[f->slot] = v;
+         if (vm->trace && op == 0x5b)
+            fprintf(stderr, "[dvm] %*siput-object @%x.%s:%s <- @%x\n",
+                    vm->depth * 2, "", r[B4(u0)], fn ? fn : "?",
+                    ft ? ft : "?", v.l);
          fr->pc += 2;
          break;
       }
@@ -1733,12 +1917,29 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
                                   : NULL;
          union dvm_value v = { 0 };
          if (f) {
-            dvm_init_class(vm, f->cls);
+            /* A <clinit> that throws leaves the class erroneous and its static
+             * fields unset; reading one anyway hands the app a null it can
+             * only fail on later, far from the cause. */
+            if (!dvm_init_class(vm, f->cls)) goto exception;
             if (f->cls->sslots && f->slot < f->cls->nsslots)
                v = f->cls->sslots[f->slot];
          } else if (fc && fn && vm->hooks.get_external_static) {
-            (void)vm->hooks.get_external_static(vm->hooks.user, vm, fc->name, fn, ft, &v);
+            /* Nothing defines this class — not a dex, not a builtin, not the
+             * host stubs.  A device raises NoClassDefFoundError here, and app
+             * code guards for it: AppsFlyer probes for Xiaomi's install
+             * referrer exactly this way.  Answering null instead turns a
+             * handled absence into an NPE one call later. */
+            if (!vm->hooks.get_external_static(vm->hooks.user, vm, fc->name, fn,
+                                               ft, &v)) {
+               dvm__throw(vm, "java/lang/NoClassDefFoundError", "%s.%s",
+                          fc->name, fn);
+               goto exception;
+            }
          }
+         if (vm->trace && op == 0x62)
+            fprintf(stderr, "[dvm] %*ssget-object %s.%s:%s -> @%x\n",
+                    vm->depth * 2, "", fc ? fc->name : "?", fn ? fn : "?",
+                    ft ? ft : "?", v.l);
          if (op == 0x61) { REQ(AA(u0) + 1); sw(r, AA(u0), v.ju); }
          else r[AA(u0)] = v.u;
          fr->pc += 2;
@@ -1753,10 +1954,14 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          if (op == 0x68) { REQ(AA(u0) + 1); v.ju = rw(r, AA(u0)); }
          else v.u = r[AA(u0)];
          if (f) {
-            dvm_init_class(vm, f->cls);
+            if (!dvm_init_class(vm, f->cls)) goto exception;
             if (f->cls->sslots && f->slot < f->cls->nsslots)
                f->cls->sslots[f->slot] = v;
          }
+         if (vm->trace && op == 0x69)
+            fprintf(stderr, "[dvm] %*ssput-object %s.%s:%s <- @%x\n",
+                    vm->depth * 2, "", fc ? fc->name : "?", fn ? fn : "?",
+                    ft ? ft : "?", v.l);
          fr->pc += 2;
          break;
       }
@@ -1789,8 +1994,15 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             argslots = slots + 1;
             nargslots = n - 1;
             if (!self) {
-               dvm__throw(vm, "java/lang/NullPointerException", "%s.%s",
-                          cls ? cls->name : "?", name ? name : "?");
+               /* The method index pins which constant-pool entry resolved to
+                * this name, which matters when the resolution itself looks
+                * wrong. */
+               dvm__throw(vm, "java/lang/NullPointerException",
+                          "receiver %s.%s meth@%u (insns@0x%lx w0=%04x w1=%04x)",
+                          cls ? cls->name : "?", name ? name : "?", midx,
+                          dd ? (unsigned long)((const uint8_t *)insns - dd->file.p)
+                             : 0UL,
+                          (unsigned)insns[pc], (unsigned)IU(1));
                goto exception;
             }
          }
@@ -1798,6 +2010,18 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          /* invoke-virtual / -interface re-dispatch on the receiver. */
          if (target && (kind == 0x6e || kind == 0x72))
             target = virtual_target(vm, self, target);
+         else if (!target && self && (kind == 0x6e || kind == 0x72)) {
+            /* The declared type carries no such method — an interface whose
+             * definition is not in the dex, or one modelled here without it.
+             * Dispatch is on the receiver, so look there before giving up and
+             * handing the call to the host stubs, which would answer null.
+             * Iterable.iterator() reached this path constantly: the sequence
+             * types Kotlin's split() builds implement it, but the interface
+             * itself declares nothing the VM can see. */
+            struct dvm_object *ro = dvm__obj(vm, self);
+            if (ro && ro->cls)
+               target = dvm_find_method(vm, ro->cls, name, sigbuf);
+         }
 
          union dvm_value ret;
          bool ok;
@@ -1805,7 +2029,7 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             ok = invoke(vm, target, self, argslots, nargslots, &ret);
          } else if (cls && name) {
             ++vm->depth;
-            ok = call_out(vm, cls, name, sigbuf,
+            ok = dvm__call_out(vm, cls, name, sigbuf,
                           is_static, false, self, argslots, nargslots, &ret);
             --vm->depth;
             ok = ok && !vm->exception;
@@ -2155,7 +2379,32 @@ exception:
             dvm__throw(vm, "java/lang/Error", "internal: no exception object");
          struct dvm_object *eo = dvm__obj(vm, vm->exception);
          uint32_t handler;
+         /* A parked thread is not a failure the app can handle: it is a
+          * thread that would be waiting inside the platform right now.  The
+          * unwind therefore passes catch clauses by and ends the thread — a
+          * dispatcher's `catch (InterruptedException e) { continue; }` would
+          * otherwise put it straight back on the empty queue it just parked
+          * on, and spin for the whole time slice. */
+         if (vm->parked) {
+            if (find_catchall_handler(m, fr->pc, &handler) == 0) {
+               vm->exc_ref = vm->exception;
+               vm->exception = 0;
+               fr->pc = handler;
+               continue;
+            }
+            return false;
+         }
          if (find_handler(vm, m, fr->pc, eo ? eo->cls : NULL, &handler) == 0) {
+            /* Dalvik clears the pending exception when control reaches the
+             * handler; move-exception only *retrieves* it, and dx omits that
+             * instruction entirely when the catch variable is unused.  Leaving
+             * the exception set meant such a handler ran with the throw still
+             * pending, so the first call it made returned "exception" and the
+             * caught error escaped anyway — `catch (ClassNotFoundException e)`
+             * blocks that merely log were the common shape.  Keep the object
+             * reachable for a move-exception that does follow. */
+            vm->exc_ref = vm->exception;
+            vm->exception = 0;
             fr->pc = handler;
             continue;
          }
@@ -2170,6 +2419,108 @@ exception:
  * Public entry points
  * ------------------------------------------------------------------------ */
 
+/* Runs the threads bytecode started during the call that just finished.  The
+ * slice is deliberately small: a dispatcher loop that has drained its queue
+ * would otherwise spin against the ordinary step limit and stall the frame. */
+uint64_t dvm__now_ms(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+void dvm__run_pending_threads(struct dvm *vm)
+{
+   if (vm->draining || !vm->npending) return;
+   vm->draining = true;
+   uint64_t saved_limit = vm->step_limit;
+   bool saved_quiet = vm->quiet_uncaught;
+
+   for (int round = 0; vm->npending && round < 8; ++round) {
+      dvm_ref list[32];
+      bool is_thread[32];
+      /* Entries whose delay has not elapsed stay queued for a later drain. */
+      uint64_t now = dvm__now_ms();
+      int n = 0, keep = 0;
+      for (int i = 0; i < vm->npending; ++i) {
+         if (vm->pending_due_ms[i] > now) {
+            vm->pending_threads[keep] = vm->pending_threads[i];
+            vm->pending_is_thread[keep] = vm->pending_is_thread[i];
+            vm->pending_due_ms[keep] = vm->pending_due_ms[i];
+            ++keep;
+            continue;
+         }
+         list[n] = vm->pending_threads[i];
+         is_thread[n] = vm->pending_is_thread[i];
+         ++n;
+      }
+      vm->npending = keep;
+      if (!n) break;
+      /* Newly-started work gets the first slice.  This mirrors the local LIFO
+       * queues used by Android/JVM work-stealing pools and prevents a Future's
+       * producer from sitting behind a full set of already-idle daemon worker
+       * loops in this single-host-thread VM.  Every entry is still run once in
+       * the round, so older work cannot starve. */
+      for (int i = n - 1; i >= 0; --i) {
+         struct dvm_class *c = dvm_object_class(vm, list[i]);
+         struct dvm_method *run = c ? dvm_find_method(vm, c, "run", "()V") : NULL;
+         if (run && (run->has_code || run->builtin)) {
+            union dvm_value ret;
+            uint64_t before = vm->steps;
+            vm->step_limit = DVM_THREAD_SLICE;
+            vm->quiet_uncaught = true;
+            /* A Runnable handed to Handler.post() runs on the main thread; one
+             * started with Thread.start() runs as itself.  App code asserts on
+             * the difference, so Thread.currentThread() has to follow it. */
+            dvm_ref saved_thread = vm->cur_thread;
+            vm->cur_thread = is_thread[i] ? list[i] : 0;
+            bool ok = dvm_call(vm, run, list[i], NULL, 0, &ret);
+            vm->cur_thread = saved_thread;
+            vm->quiet_uncaught = saved_quiet;
+            vm->step_limit = saved_limit;
+            char how[256];
+            how[0] = '\0';
+            if (!ok && vm->exception)
+               dvm_describe_exception(vm, vm->exception, how, sizeof how);
+            dvm_clear_exception(vm);
+            static int log_n = 0;
+            /* The cap keeps startup readable; a trace run wants every one of
+               them, because a runnable that keeps re-queueing is the symptom. */
+            const bool report = (log_n++ < 24 || vm->trace);
+            if (report)
+               fprintf(stderr, "[dvm] thread %s.run() ran %llu steps%s%s\n",
+                       run->cls ? run->cls->name : "?",
+                       (unsigned long long)(vm->steps - before),
+                       how[0] ? " — " : "", how[0] ? how : "");
+            /* A Runnable that died of an exception is the interesting case, and
+             * the class of the Runnable says nothing about where it died — the
+             * throw is usually several frames down inside an SDK.  Print the
+             * unwind path for it exactly as dvm_call() does for an uncaught
+             * exception on the main thread. */
+            if (report && how[0])
+               for (int f_i = 0; f_i < vm->nexc_trace; ++f_i) {
+                  struct dvm_method *f = vm->exc_trace[f_i];
+                  if (!f) continue;
+                  if (f_i == 0)
+                     fprintf(stderr, "[dvm]   at %s.%s%s +0x%x\n",
+                             f->cls ? f->cls->name : "?", f->name,
+                             f->sig ? f->sig : "", vm->exc_pc * 2);
+                  else
+                     fprintf(stderr, "[dvm]   at %s.%s%s\n",
+                             f->cls ? f->cls->name : "?", f->name,
+                             f->sig ? f->sig : "");
+               }
+            vm->nexc_trace = 0;
+         }
+         dvm_unpin(vm, list[i]);
+      }
+   }
+
+   vm->step_limit = saved_limit;
+   vm->quiet_uncaught = saved_quiet;
+   vm->draining = false;
+}
+
 bool dvm_call(struct dvm *vm, struct dvm_method *m, dvm_ref self,
               const union dvm_value *args, int nargs, union dvm_value *out)
 {
@@ -2181,14 +2532,29 @@ bool dvm_call(struct dvm *vm, struct dvm_method *m, dvm_ref self,
    uint32_t slots[256];
    int n = values_to_slots(m->sig, args, nargs, slots, 256);
    vm->exception = 0;
-   if (!vm->depth) vm->call_steps = 0;
+   /* Cleared on the way in, not on the way out: the unwind path belongs to the
+    * call that just failed, and the caller (dvm__run_pending_threads(), which
+    * reports a Runnable that died) needs to read it after invoke() returns. */
+   vm->nexc_trace = 0;
+   if (!vm->depth) { vm->call_steps = 0; vm->parked = false; }
    bool ok = invoke(vm, m, self, slots, n, out);
-   if (!ok && vm->exception) {
+   if (!ok && vm->exception && !vm->quiet_uncaught) {
       char buf[512];
       dvm_describe_exception(vm, vm->exception, buf, sizeof buf);
       fprintf(stderr, "[dvm] uncaught %s in %s.%s\n", buf,
               m->cls ? m->cls->name : "?", m->name);
+      for (int i = 0; i < vm->nexc_trace; ++i) {
+         struct dvm_method *f = vm->exc_trace[i];
+         if (i == 0)
+            fprintf(stderr, "[dvm]   at %s.%s%s +0x%x\n",
+                    f->cls ? f->cls->name : "?", f->name,
+                    f->sig ? f->sig : "", vm->exc_pc * 2);
+         else
+            fprintf(stderr, "[dvm]   at %s.%s%s\n",
+                    f->cls ? f->cls->name : "?", f->name, f->sig ? f->sig : "");
+      }
    }
+   if (!vm->depth) dvm__run_pending_threads(vm);
    return ok;
 }
 
@@ -2237,11 +2603,12 @@ void dvm_destroy(struct dvm *vm)
    free(vm->classes);
 
    for (int i = 0; i < vm->ndexes; ++i) {
-      free(vm->dexes[i].type_cache);
-      free(vm->dexes[i].method_cache);
-      free(vm->dexes[i].field_cache);
-      free(vm->dexes[i].string_cache);
-      dex_close(&vm->dexes[i].file);
+      free(vm->dexes[i]->type_cache);
+      free(vm->dexes[i]->method_cache);
+      free(vm->dexes[i]->field_cache);
+      free(vm->dexes[i]->string_cache);
+      dex_close(&vm->dexes[i]->file);
+      free(vm->dexes[i]);
    }
    free(vm->dexes);
 
@@ -2258,20 +2625,26 @@ void dvm_destroy(struct dvm *vm)
 
 bool dvm_add_dex(struct dvm *vm, const char *path)
 {
-   struct dvm_dex *n = realloc(vm->dexes, (size_t)(vm->ndexes + 1) * sizeof *n);
-   if (!n) return false;
-   vm->dexes = n;
-   struct dvm_dex *dd = &vm->dexes[vm->ndexes];
-   memset(dd, 0, sizeof *dd);
-   if (!dex_open(&dd->file, path))
+   if (vm->ndexes == vm->dexes_cap) {
+      int cap = vm->dexes_cap ? vm->dexes_cap * 2 : 8;
+      struct dvm_dex **n = realloc(vm->dexes, (size_t)cap * sizeof *n);
+      if (!n) return false;
+      vm->dexes = n;
+      vm->dexes_cap = cap;
+   }
+   struct dvm_dex *dd = calloc(1, sizeof *dd);
+   if (!dd) return false;
+   if (!dex_open(&dd->file, path)) {
+      free(dd);
       return false;
+   }
 
    dd->type_cache   = calloc(dd->file.type_ids_size + 1u, sizeof *dd->type_cache);
    dd->method_cache = calloc(dd->file.method_ids_size + 1u, sizeof *dd->method_cache);
    dd->field_cache  = calloc(dd->file.field_ids_size + 1u, sizeof *dd->field_cache);
    dd->string_cache = calloc(dd->file.string_ids_size + 1u, sizeof *dd->string_cache);
 
-   ++vm->ndexes;
+   vm->dexes[vm->ndexes++] = dd;
    fprintf(stderr, "[dvm] loaded %s: %u classes, %u methods\n",
            path, dd->file.class_defs_size, dd->file.method_ids_size);
    return true;

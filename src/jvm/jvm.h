@@ -23,6 +23,27 @@ static inline const char *lunaria_apk_mount_path(void)
    return getenv("ANDROID_PACKAGE_CODE_PATH");
 }
 
+/* The Android platform version this emulator presents.
+ *
+ * It has to be one number: an app reads it through Build.VERSION.SDK_INT,
+ * through the `ro.build.version.sdk` system property from native code, and
+ * through ApplicationInfo.targetSdkVersion, and it compares what it gets.  It
+ * used to be spelled out separately in four places — 31 in the JNI stubs, 31
+ * in the dvm and arm_exec property tables, and 15 in the host libc shim — so a
+ * guest that asked twice could be told two different things.
+ *
+ * LUNARIA_SDK_INT overrides it (LUNARIA_ANDROID_RELEASE overrides the matching
+ * release string), which is how you check whether a behaviour is gated on the
+ * platform version rather than broken.  The default is Android 12, which is
+ * also the oldest level the runtime is built to answer for: below it the
+ * platform APIs the stubs implement no longer match what an app of that
+ * vintage expects, so a lower setting is a diagnostic, not a configuration. */
+#define LUNARIA_SDK_INT_DEFAULT 31   /* Android 12 */
+#define LUNARIA_SDK_INT_FLOOR   31   /* Android 12 — supported floor */
+
+int lunaria_sdk_int(void);
+const char *lunaria_android_release(void);
+
 struct jvm_string {
    const char *data;
    size_t size;
@@ -108,6 +129,20 @@ struct jvm {
 
 const char*
 jvm_get_class_name(struct jvm *jvm, jobject object);
+
+/* Whether the stub layer actually implements `method` — i.e. whether a stub
+ * symbol resolves for it, here or on one of its superclasses.  Without this a
+ * caller cannot tell a stub that legitimately returned 0/null from a method
+ * that was never implemented: both come back as zero, and the second is the
+ * silent failure this emulator keeps having to hunt down. */
+bool
+jvm_method_has_stub(JNIEnv *env, jmethodID method);
+
+/* Declaring class, name and descriptor behind a jfieldID.  A field id is a
+ * method object here; this is how a caller outside jvm.c can read it. */
+bool
+jvm_field_info(struct jvm *jvm, jfieldID field, const char **klass,
+               const char **name, const char **type);
 
 void*
 jvm_get_native_method(struct jvm *jvm, const char *klass, const char *method);

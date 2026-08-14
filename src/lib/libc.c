@@ -58,8 +58,17 @@ __system_property_get(const char *name, char *value)
 {
    verbose("%s", name);
 
-   if (!strcmp(name, "ro.build.version.sdk"))
-      return snprintf(value, PROP_VALUE_MAX, "%d", 15);
+   /* Keep this in step with lunaria_sdk_int() in libjvm.so: libc.so is loaded
+    * by the guest linker and cannot call into it, but a guest that reads the
+    * property here and Build.VERSION.SDK_INT there must not get two different
+    * platforms.  (It used to answer 15 — Android 4.0 — while everything else
+    * said 31.)  See jvm.h for LUNARIA_SDK_INT. */
+   if (!strcmp(name, "ro.build.version.sdk")) {
+      const char *e = getenv("LUNARIA_SDK_INT");
+      long v = (e && *e) ? strtol(e, NULL, 10) : 0;
+      if (v < 1 || v > 99) v = 31; /* LUNARIA_SDK_INT_DEFAULT */
+      return snprintf(value, PROP_VALUE_MAX, "%ld", v);
+   }
 
    *value = 0;
    return 0;

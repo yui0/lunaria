@@ -230,6 +230,13 @@ diagnostic switches used during compatibility work.
 | `LUNARIA_DUMP_LAST_SVC` | off | Print the recent SVC ring at shutdown |
 | `LUNARIA_DVM` | `1` | Dalvik bytecode emulator: `0` off, `1` run the APK's dex only where no host stub exists, `2` prefer the dex over host stubs |
 | `LUNARIA_DVM_TRACE` | off | Log the methods the emulator declined (`[dvm] miss …`) |
+| `LUNARIA_DEX_START` | on | Run the APK's Activity lifecycle from dex; set to `0` only to compare with the legacy hand-written startup sequence |
+
+An APK with no engine entry point (no `ANativeActivity_onCreate`, no
+`UnityPlayer.initJni`) is now started from its launcher Activity instead of
+being rejected: `lunaria-apk.sh` reads it out of the manifest and passes it as
+`ANDROID_LAUNCH_ACTIVITY`, and the loader runs its `onCreate`/`onStart`/
+`onResume` through the bytecode VM.
 
 Tick values accept `K`, `M`, and `G` suffixes, for example
 `LUNARIA_ONLOAD_TICKS=5G`.

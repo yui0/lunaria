@@ -108,8 +108,10 @@ runtime/libOpenSLES.so: trace.o
 	$(CC) $(CFLAGS) -Wno-pedantic -fPIC $(CPPFLAGS) $(LDFLAGS) -Isrc/lib -shared trace.o \
 	    src/lib/stub.c -DLUNARIA_STUB_OPENSLES -o $@
 
-DVM_SRC = src/dvm/dex.c src/dvm/dvm.c src/dvm/dvm_runtime.c src/dvm/dvm_jni.c
-DVM_HDR = src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h
+DVM_SRC = src/dvm/dex.c src/dvm/dvm.c src/dvm/dvm_runtime.c src/dvm/dvm_jni.c \
+          src/dvm/dvm_net.c src/dvm/dvm_media.c
+DVM_HDR = src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
+          src/dvm/dvm_net.h src/dvm/dvm_media.h
 
 # The Dalvik bytecode emulator lives in libjvm.so: it is reached from jvm.c
 # (a JNI call with no host stub) and it calls back out through the same JNI
@@ -117,7 +119,8 @@ DVM_HDR = src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h
 runtime/libjvm.so: trace.o src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/jvm.h src/jvm/jni.h $(DVM_SRC) $(DVM_HDR)
 	mkdir -p runtime
 	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE -Wno-pedantic $(LDFLAGS) -shared \
-	    trace.o src/jvm/jvm.c src/jvm/jni_stubs.c $(DVM_SRC) -lm -o $@
+	    trace.o src/jvm/jvm.c src/jvm/jni_stubs.c $(DVM_SRC) -lm -lssl -lcrypto -licuuc \
+	    -lGLESv2 -lz -o $@
 
 runtime/libm.so:
 	mkdir -p runtime
@@ -198,10 +201,14 @@ test/dvm_test.dex: test/make_dex.py
 # Built with the sanitizers on: the interesting failure mode for an
 # interpreter over third-party bytecode is reading outside the mapping, which
 # a plain wrong-answer check would not catch.
+# Sanitizers are on by default but need libasan at link time; pass
+# DVM_TEST_SAN= to build without them where that runtime is not installed.
+DVM_TEST_SAN ?= -fsanitize=address,undefined
 test/test_dvm: test/dvm_test.c $(DVM_SRC) $(DVM_HDR)
 	$(CC) -std=c11 -g -O1 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -Isrc \
-	    -fsanitize=address,undefined \
-	    test/dvm_test.c $(DVM_SRC:src/dvm/dvm_jni.c=) -lm -o $@
+	    $(DVM_TEST_SAN) \
+	    test/dvm_test.c $(DVM_SRC:src/dvm/dvm_jni.c=) -lm -lssl -lcrypto \
+	    -lGLESv2 -o $@
 
 # Pass a real classes.dex as DVM_DEX to also run every method in it.
 DVM_DEX ?=
@@ -226,6 +233,20 @@ net-test: lunaria test/libnettest.so
 	    | tee .nettest.out | grep -E 'nettest|^\[net\]'; \
 	kill `cat .nettest.pid` 2>/dev/null; rm -f .nettest.pid; \
 	grep -q 'RESULT PASS' .nettest.out; rc=$$?; rm -f .nettest.out; exit $$rc
+
+# Guest-side POSIX exercise: regex, scandir (whose filter and comparator are
+# guest functions) and process_vm_readv, all through the guest's own struct
+# layouts — see test/posix_test.c.  Needs clang with the aarch64 target and
+# lld, as net-test does.
+test/libposixtest.so: test/posix_test.c
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
+	    -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libposixtest.so \
+	    -o $@ $<
+
+posix-test: lunaria test/libposixtest.so
+	@LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" ./lunaria test/libposixtest.so 2>&1 \
+	    | tee .posixtest.out | grep -E 'posixtest|unresolved'; \
+	grep -q 'RESULT PASS' .posixtest.out; rc=$$?; rm -f .posixtest.out; exit $$rc
 
 # Guest-side JNI calling-convention exercise.  The dex declares `native`
 # methods taking jlong / jfloat / jdouble — and more of them than either ABI
@@ -364,9 +385,37 @@ fetch-blade-soul: $(BLADE_SOUL_APK)
 $(BLADE_SOUL_APK):
 	curl -L --fail --retry 3 "$(BLADE_SOUL_APK_URL)" -o $@
 
+# ---------------------------------------------------------------------------
+# openh264 — the H.264 decoder behind android.media.MediaCodec
+#
+# Cisco publishes these binaries itself and pays the H.264 patent royalties for
+# them, which is what makes them usable here; a decoder we compiled ourselves
+# would not carry that.  So the binary is downloaded, never vendored, and
+# loaded with dlopen() at run time: no build- or link-time dependency, and an
+# emulator without it reports "no decoder" instead of pretending to have one.
+# https://github.com/cisco/openh264 — BSD-2-Clause source, binaries per
+# http://www.openh264.org/BINARY_LICENSE.txt
+# ---------------------------------------------------------------------------
+OPENH264_VERSION = 2.5.1
+OPENH264_ABI     = 7
+OPENH264_ARCH   ?= linux64
+OPENH264_URL     = http://ciscobinary.openh264.org/libopenh264-$(OPENH264_VERSION)-$(OPENH264_ARCH).$(OPENH264_ABI).so.bz2
+OPENH264_SO      = runtime/libopenh264.so
+
+fetch-openh264: $(OPENH264_SO)
+	@printf 'openh264 ready: $(OPENH264_SO)\n'
+
+$(OPENH264_SO):
+	mkdir -p runtime
+	curl -L --fail --retry 3 "$(OPENH264_URL)" -o $@.bz2
+	bunzip2 -c $@.bz2 > $@
+	$(RM) $@.bz2
+
 # Aggregate: download all sample APKs used for development / regression.
-fetch: fetch-libunity fetch-btw fetch-blade-soul
+fetch: fetch-libunity fetch-btw fetch-blade-soul fetch-openh264
 
 .PHONY: all x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
         clean install install-bin install-lib test net-test dvm-test abi-test \
-        fetch fetch-libunity fetch-btw fetch-blade-soul dynarmic-build
+        posix-test \
+        fetch fetch-libunity fetch-btw fetch-blade-soul fetch-openh264 \
+        dynarmic-build

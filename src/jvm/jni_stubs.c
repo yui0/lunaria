@@ -668,6 +668,143 @@ static void motion_trace(const char *m)
    if (n < 60) { fprintf(stderr, "[motion] %s\n", m); ++n; }
 }
 
+/* ------------------------------------------------------------------------ *
+ * android.util.Log
+ *
+ * Every Android app logs through this class, and the SDKs a title bundles
+ * (Netmarble, AppsFlyer, CrashSight, Epic's own GameActivity) narrate what they
+ * are doing there and nowhere else.  With no implementation the calls returned
+ * 0 and the text was dropped on the floor, so the Java half of a run was mute.
+ * The platform writes to logcat; here stderr is the log, next to the emulator's
+ * own trace.
+ * ------------------------------------------------------------------------ */
+
+static jint
+android_log_write(JNIEnv *env, char level, va_list args)
+{
+   if (!args) return 0;
+   const char *tag = (*env)->GetStringUTFChars(env, va_arg(args, jstring), NULL);
+   /* Log.w(String, Throwable) has no message argument; GetStringUTFChars
+    * answers NULL for a non-string handle rather than misreading it. */
+   const char *msg = (*env)->GetStringUTFChars(env, va_arg(args, jstring), NULL);
+   fprintf(stderr, "[java %c/%s] %s\n", level, tag ? tag : "?", msg ? msg : "");
+   return (jint)((tag ? strlen(tag) : 0) + (msg ? strlen(msg) : 0) + 2);
+}
+
+jint android_util_Log_v(JNIEnv *env, jobject o, va_list a)
+{ (void)o; return android_log_write(env, 'V', a); }
+jint android_util_Log_d(JNIEnv *env, jobject o, va_list a)
+{ (void)o; return android_log_write(env, 'D', a); }
+jint android_util_Log_i(JNIEnv *env, jobject o, va_list a)
+{ (void)o; return android_log_write(env, 'I', a); }
+jint android_util_Log_w(JNIEnv *env, jobject o, va_list a)
+{ (void)o; return android_log_write(env, 'W', a); }
+jint android_util_Log_e(JNIEnv *env, jobject o, va_list a)
+{ (void)o; return android_log_write(env, 'E', a); }
+jint android_util_Log_wtf(JNIEnv *env, jobject o, va_list a)
+{ (void)o; return android_log_write(env, 'F', a); }
+
+/* println(int priority, String tag, String msg): the priority comes first. */
+jint
+android_util_Log_println(JNIEnv *env, jobject object, va_list args)
+{
+   (void)object;
+   if (!args) return 0;
+   int prio = va_arg(args, jint);
+   static const char lv[] = "??VDIWEF";
+   return android_log_write(env, lv[(prio >= 2 && prio <= 7) ? prio : 0], args);
+}
+
+/* isLoggable(tag, level): the emulator prints every level, so say so. */
+jboolean
+android_util_Log_isLoggable(JNIEnv *env, jobject object, va_list args)
+{
+   (void)env; (void)object; (void)args;
+   return JNI_TRUE;
+}
+
+jstring
+android_util_Log_getStackTraceString(JNIEnv *env, jobject object, va_list args)
+{
+   (void)object; (void)args;
+   return (*env)->NewStringUTF(env, "");
+}
+
+/* ------------------------------------------------------------------------ *
+ * android.opengl.GLESxx.glGetString
+ *
+ * Epic's ElectraTextureSample picks its bitmap-renderer path by reading
+ * GL_VERSION from Java and calling String.contains() on it.  Without this the
+ * call returned null and Initialize() died in the constructor with an NPE, so
+ * video playback never came up at all.  The answer comes from the host GL,
+ * cached while a context was current — the Java caller runs on the game thread,
+ * which has none.
+ * ------------------------------------------------------------------------ */
+
+static jstring
+android_gl_get_string(JNIEnv *env, va_list args)
+{
+   if (!args) return NULL;
+   unsigned name = (unsigned)va_arg(args, jint);
+   const char *s = arm_exec_gl_string(name);
+   return s ? (*env)->NewStringUTF(env, s) : NULL;
+}
+
+jstring android_opengl_GLES10_glGetString(JNIEnv *env, jobject o, va_list a)
+{ (void)o; return android_gl_get_string(env, a); }
+jstring android_opengl_GLES20_glGetString(JNIEnv *env, jobject o, va_list a)
+{ (void)o; return android_gl_get_string(env, a); }
+jstring android_opengl_GLES30_glGetString(JNIEnv *env, jobject o, va_list a)
+{ (void)o; return android_gl_get_string(env, a); }
+jstring android_opengl_GLES31_glGetString(JNIEnv *env, jobject o, va_list a)
+{ (void)o; return android_gl_get_string(env, a); }
+jstring android_opengl_GLES32_glGetString(JNIEnv *env, jobject o, va_list a)
+{ (void)o; return android_gl_get_string(env, a); }
+
+/* The single answer to "which Android is this?".  See jvm.h for why there is
+ * exactly one. */
+int
+lunaria_sdk_int(void)
+{
+   static int cached;
+   if (!cached) {
+      const char *e = getenv("LUNARIA_SDK_INT");
+      long v = (e && *e) ? strtol(e, NULL, 10) : 0;
+      if (v < 1 || v > 99) v = LUNARIA_SDK_INT_DEFAULT;
+      cached = (int)v;
+      if (cached != LUNARIA_SDK_INT_DEFAULT)
+         fprintf(stderr, "[jvm] Android API level %d (LUNARIA_SDK_INT)%s\n",
+                 cached,
+                 cached < LUNARIA_SDK_INT_FLOOR
+                    ? " — below the supported floor (API 31 / Android 12)" : "");
+   }
+   return cached;
+}
+
+/* Build.VERSION.RELEASE for that level.  Apps parse this string (an integer
+ * major version is what every release since 4.4 actually reports), so it has
+ * to agree with SDK_INT rather than being a fixed literal. */
+const char *
+lunaria_android_release(void)
+{
+   static const char *cached;
+   if (cached) return cached;
+   const char *e = getenv("LUNARIA_ANDROID_RELEASE");
+   if (e && *e) return (cached = e);
+   static const struct { int sdk; const char *release; } map[] = {
+      { 27, "8.1" }, { 28, "9" },  { 29, "10" }, { 30, "11" }, { 31, "12" },
+      { 32, "12" },  { 33, "13" }, { 34, "14" }, { 35, "15" }, { 36, "16" },
+   };
+   const int sdk = lunaria_sdk_int();
+   for (size_t i = 0; i < sizeof map / sizeof map[0]; ++i)
+      if (map[i].sdk == sdk) return (cached = map[i].release);
+   /* Outside the table: report the level itself rather than a version that
+    * contradicts it. */
+   static char buf[16];
+   snprintf(buf, sizeof buf, "%d", sdk);
+   return (cached = buf);
+}
+
 jstring
 android_os_Build_MANUFACTURER(JNIEnv *env, jobject object)
 {
@@ -703,15 +840,14 @@ jstring
 android_os_Build_VERSION_RELEASE(JNIEnv *env, jobject object)
 {
    assert(env && object);
-   // XXX: lunaria version, but we may need to fake this if apps rely on this
-   return (*env)->NewStringUTF(env, "12.0");
+   return (*env)->NewStringUTF(env, lunaria_android_release());
 }
 
 jint
 android_os_Build_VERSION_SDK_INT(JNIEnv *env, jobject object)
 {
    assert(env && object);
-   return 31; /* Android 12 — Unity 2023 requires API 22+ for GLES3 and modern GL init */
+   return lunaria_sdk_int();
 }
 
 jstring
@@ -740,7 +876,11 @@ jstring
 android_content_pm_PackageInfo_versionName(JNIEnv *env, jobject object)
 {
    assert(env && object);
-   return (*env)->NewStringUTF(env, "1.1");
+   /* The installed package's own version, not a literal: native code and
+    * bytecode compare what they read here against the manifest. */
+   const char *name = NULL;
+   arm_exec_apk_version(NULL, &name);
+   return (*env)->NewStringUTF(env, name ? name : "1.0");
 }
 
 jobject
@@ -767,7 +907,7 @@ android_content_Context_getFilesDir(JNIEnv *env, jobject object, va_list args)
    static jobject sv;
    if (!sv) {
       sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"));
-      const char *p = getenv("ANDROID_PACKAGE_CODE_PATH");
+      const char *p = getenv("ANDROID_FILES_DIR");
       if (!p || !*p)
          p = getenv("ANDROID_EXTERNAL_FILES_DIR");
       jni_file_set_path(sv, (p && *p) ? p : "/tmp");
@@ -1273,30 +1413,63 @@ java_io_File_getAbsolutePath(JNIEnv *env, jobject object, va_list args)
    return jni_file_path_string(env, object);
 }
 
-/* Context.getSystemService(name) → a WindowManager-typed stub.
+/* Context.getSystemService(name).
  *
- * Do NOT va_arg(args): Call*MethodA (used by the dvm external hook) passes a
- * jvalue*, not a real va_list.  Consuming it as va_list corrupts the stub and
- * AllocObject can return NULL — UE then NPEs on
- * WindowManager.getDefaultDisplay() every frame.
- *
- * Returning android.view.WindowManager (rather than bare Object) makes
- * invoke-interface getDefaultDisplay resolve to the existing stub.  Other
- * service names ("audio", "sensor", …) still land on no-op method stubs. */
+ * The JNI A-entry bridge converts jvalue[] into a real va_list before reaching
+ * host stubs, so inspect the service name and preserve Android's runtime type.
+ * Returning one WindowManager for every name made casts such as
+ * (InputManager)getSystemService(INPUT_SERVICE) lose the receiver at the
+ * dvm/JNI boundary and fail later with a misleading null-receiver exception. */
 jobject
 android_content_Context_getSystemService(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
-   (void)args;
-   static jobject sv;
-   if (!sv) {
-      jclass cls = (*env)->FindClass(env, "android/view/WindowManager");
-      if (!cls)
-         cls = (*env)->FindClass(env, "java/lang/Object");
-      if (cls)
-         sv = (*env)->AllocObject(env, cls);
+   if (!args)
+      return NULL;
+
+   jstring service = va_arg(args, jstring);
+   const char *name = service ? (*env)->GetStringUTFChars(env, service, NULL) : NULL;
+   if (!name)
+      return NULL;
+
+   struct service_entry {
+      const char *name;
+      const char *class_name;
+      jobject instance;
+   };
+   static struct service_entry services[] = {
+      { "window",       "android/view/WindowManager", NULL },
+      { "input",        "android/hardware/input/InputManager", NULL },
+      { "sensor",       "android/hardware/SensorManager", NULL },
+      { "connectivity", "android/net/ConnectivityManager", NULL },
+      { "activity",     "android/app/ActivityManager", NULL },
+      { "audio",        "android/media/AudioManager", NULL },
+      { "wifi",         "android/net/wifi/WifiManager", NULL },
+      { "notification", "android/app/NotificationManager", NULL },
+      { "display",      "android/hardware/display/DisplayManager", NULL },
+      { "power",        "android/os/PowerManager", NULL },
+      { "vibrator",     "android/os/Vibrator", NULL },
+      { "vibrator_manager", "android/os/VibratorManager", NULL },
+      { "input_method", "android/view/inputmethod/InputMethodManager", NULL },
+      { "clipboard",    "android/content/ClipboardManager", NULL },
+      { "user",         "android/os/UserManager", NULL },
+      { "jobscheduler", "android/app/job/JobScheduler", NULL },
+   };
+
+   jobject result = NULL;
+   for (size_t i = 0; i < sizeof services / sizeof services[0]; ++i) {
+      if (strcmp(name, services[i].name))
+         continue;
+      if (!services[i].instance) {
+         jclass cls = (*env)->FindClass(env, services[i].class_name);
+         if (cls)
+            services[i].instance = (*env)->AllocObject(env, cls);
+      }
+      result = services[i].instance;
+      break;
    }
-   return sv;
+   (*env)->ReleaseStringUTFChars(env, service, name);
+   return result;
 }
 
 /* Context.getPackageManager() → a PackageManager stub. */
@@ -1327,7 +1500,9 @@ jint
 android_content_pm_PackageInfo_versionCode(JNIEnv *env, jobject object)
 {
    assert(env && object);
-   return 1;
+   int32_t code = 1;
+   arm_exec_apk_version(&code, NULL);
+   return code;
 }
 
 /* android.os.Process.setThreadPriority(int tid, int priority) or (int priority).
@@ -1436,6 +1611,114 @@ android_content_Context_getSharedPreferences(JNIEnv *env, jobject object, va_lis
                (*env)->FindClass(env, "android/content/SharedPreferences"))));
 }
 
+/* Context.getResources() → Resources → Configuration.
+ *
+ * Both UE (FAndroidMisc locale/orientation queries) and the Netmarble SDK walk
+ * Context.getResources().getConfiguration() and then read fields off the
+ * result.  With getResources() unimplemented the chain yielded a NULL
+ * Configuration and the very next GetObjectField aborted the process, so this
+ * has to be a real object, not a missing method. */
+jobject
+android_content_res_Resources_getConfiguration(JNIEnv *env, jobject object, va_list args)
+{
+   (void)object; (void)args;
+   static jobject sv;
+   return (sv ? sv : (sv = (*env)->AllocObject(env,
+               (*env)->FindClass(env, "android/content/res/Configuration"))));
+}
+
+void android_view_Display_fillMetrics(JNIEnv *e, jobject out); /* defined below */
+
+jobject
+android_content_res_Resources_getDisplayMetrics(JNIEnv *env, jobject object, va_list args)
+{
+   (void)object; (void)args;
+   static jobject sv;
+   if (!sv) {
+      sv = (*env)->AllocObject(env, (*env)->FindClass(env, "android/util/DisplayMetrics"));
+      android_view_Display_fillMetrics(env, sv);
+   }
+   return sv;
+}
+
+jobject
+android_content_Context_getResources(JNIEnv *env, jobject object, va_list args)
+{
+   (void)object; (void)args;
+   static jobject sv;
+   return (sv ? sv : (sv = (*env)->AllocObject(env,
+               (*env)->FindClass(env, "android/content/res/Resources"))));
+}
+
+/* Context.getAssets().
+ *
+ * There was no stub at all, so bytecode asking its own Activity for the asset
+ * manager got null — Epic's GameActivity says as much on every start ("No
+ * reference to asset manager found!") and every Java-side reader of a packaged
+ * asset was dead before it began.  The native side has its own AAssetManager,
+ * which is why this went unnoticed; the object handed back here is what the
+ * VM's own AssetManager implementation hangs off. */
+jobject
+android_content_Context_getAssets(JNIEnv *env, jobject object, va_list args)
+{
+   (void)object; (void)args;
+   static jobject sv;
+   return (sv ? sv : (sv = (*env)->AllocObject(env,
+               (*env)->FindClass(env, "android/content/res/AssetManager"))));
+}
+
+/* Configuration fields.  These are read through GetObjectField/GetIntField,
+ * which resolve `<class>_<field>` the same way methods do, so a field reads as
+ * a (JNIEnv*, jobject) getter. */
+jobject
+android_content_res_Configuration_locale(JNIEnv *env, jobject object)
+{
+   (void)object;
+   return java_util_Locale_getDefault(env, NULL);
+}
+
+/* Configuration.ORIENTATION_PORTRAIT == 1, ORIENTATION_LANDSCAPE == 2. */
+jint
+android_content_res_Configuration_orientation(JNIEnv *env, jobject object)
+{
+   (void)env; (void)object;
+   return arm_exec_fb_width() >= arm_exec_fb_height() ? 2 : 1;
+}
+
+/* SCREENLAYOUT_SIZE_NORMAL | SCREENLAYOUT_LONG_NO | SCREENLAYOUT_LAYOUTDIR_LTR */
+jint android_content_res_Configuration_screenLayout(JNIEnv *env, jobject o)
+{ (void)env; (void)o; return 0x02 | 0x10 | 0x40; }
+/* fillMetrics() reports mdpi, so dp == px. */
+jint android_content_res_Configuration_screenWidthDp(JNIEnv *env, jobject o)
+{ (void)env; (void)o; return arm_exec_fb_width(); }
+jint android_content_res_Configuration_screenHeightDp(JNIEnv *env, jobject o)
+{ (void)env; (void)o; return arm_exec_fb_height(); }
+jint android_content_res_Configuration_smallestScreenWidthDp(JNIEnv *env, jobject o)
+{
+   (void)env; (void)o;
+   const int w = arm_exec_fb_width(), h = arm_exec_fb_height();
+   return w < h ? w : h;
+}
+jint android_content_res_Configuration_densityDpi(JNIEnv *env, jobject o)
+{ (void)env; (void)o; return 160; }
+jfloat android_content_res_Configuration_fontScale(JNIEnv *env, jobject o)
+{ (void)env; (void)o; return 1.0f; }
+/* UI_MODE_TYPE_NORMAL | UI_MODE_NIGHT_NO */
+jint android_content_res_Configuration_uiMode(JNIEnv *env, jobject o)
+{ (void)env; (void)o; return 0x01 | 0x10; }
+/* No SIM: mcc/mnc are 0 on a device without a mobile network. */
+jint android_content_res_Configuration_mcc(JNIEnv *env, jobject o)
+{ (void)env; (void)o; return 0; }
+jint android_content_res_Configuration_mnc(JNIEnv *env, jobject o)
+{ (void)env; (void)o; return 0; }
+/* KEYBOARD_NOKEYS / TOUCHSCREEN_FINGER / NAVIGATION_NONAV */
+jint android_content_res_Configuration_keyboard(JNIEnv *env, jobject o)
+{ (void)env; (void)o; return 1; }
+jint android_content_res_Configuration_touchscreen(JNIEnv *env, jobject o)
+{ (void)env; (void)o; return 3; }
+jint android_content_res_Configuration_navigation(JNIEnv *env, jobject o)
+{ (void)env; (void)o; return 1; }
+
 jobject
 android_content_SharedPreferences_edit(JNIEnv *env, jobject object, va_list args)
 {
@@ -1489,20 +1772,25 @@ android_content_SharedPreferences_getAll(JNIEnv *env, jobject object, va_list ar
 
 /* ApplicationInfo.minSdkVersion / targetSdkVersion — int fields read by Unity's
  * startup to log "Min/Target API Level".  When unimplemented they returned 0,
- * which Unity treats as an unconfigured app.  Report real Android 12 levels so
- * the engine takes its normal (modern-API) code path. */
+ * which Unity treats as an unconfigured app.  Report levels consistent with
+ * the platform version so the engine takes its normal (modern-API) path. */
 jint
 android_content_pm_ApplicationInfo_minSdkVersion(JNIEnv *env, jobject object)
 {
    (void)env; (void)object;
-   return 22; /* Unity 2023 minimum supported API level */
+   /* Unity 2023's floor, but never above what the platform reports: an app
+    * whose minSdk exceeds the device's SDK_INT could not have been installed. */
+   const int sdk = lunaria_sdk_int();
+   return sdk < 22 ? sdk : 22;
 }
 
 jint
 android_content_pm_ApplicationInfo_targetSdkVersion(JNIEnv *env, jobject object)
 {
    (void)env; (void)object;
-   return 31; /* Android 12 — matches android_os_Build_VERSION_SDK_INT */
+   /* An app targeting a level the device does not have does not exist, so this
+    * tracks Build.VERSION.SDK_INT. */
+   return lunaria_sdk_int();
 }
 
 /* AlertDialog.Builder fluent setters — each returns the builder itself so the
@@ -1842,6 +2130,25 @@ jobject java_lang_Object_getSystemService(JNIEnv *env, jobject obj, va_list args
 jobject java_lang_Class_getSystemService(JNIEnv *env, jobject obj, va_list args)
 { return android_content_Context_getSystemService(env, obj, args); }
 
+/* getResources() is inherited the same way.  Without these aliases the dex
+ * bytecode's `Landroid/app/Activity;->getResources()` resolved to nothing and
+ * handed back null, so GameActivity.AndroidThunkJava_GetDeviceOrientation threw
+ * an NPE on Resources.getConfiguration and the engine lost its orientation. */
+jobject android_app_Activity_getResources(JNIEnv *env, jobject obj, va_list args)
+{ return android_content_Context_getResources(env, obj, args); }
+jobject java_lang_Object_getResources(JNIEnv *env, jobject obj, va_list args)
+{ return android_content_Context_getResources(env, obj, args); }
+jobject java_lang_Class_getResources(JNIEnv *env, jobject obj, va_list args)
+{ return android_content_Context_getResources(env, obj, args); }
+
+/* …and so is getAssets(): the call site names Activity or NativeActivity. */
+jobject android_app_Activity_getAssets(JNIEnv *env, jobject obj, va_list args)
+{ return android_content_Context_getAssets(env, obj, args); }
+jobject java_lang_Object_getAssets(JNIEnv *env, jobject obj, va_list args)
+{ return android_content_Context_getAssets(env, obj, args); }
+jobject java_lang_Class_getAssets(JNIEnv *env, jobject obj, va_list args)
+{ return android_content_Context_getAssets(env, obj, args); }
+
 /* Context.registerReceiver(BroadcastReceiver, IntentFilter[, …]) → null.
  * UE's Volume/Battery/HeadsetReceiver.startReceiver calls this; without a
  * stub the dvm path reports an unresolved method.  Returning null matches
@@ -1983,24 +2290,67 @@ DEF_ORIENT(SCREEN_ORIENTATION_FULL_USER,        13)
 DEF_ORIENT(SCREEN_ORIENTATION_LOCKED,           14)
 #undef DEF_ORIENT
 
-/* Activity.setRequestedOrientation(int) — no-op in headless emulation. */
-void android_app_Activity_setRequestedOrientation(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; }
-void java_lang_Object_setRequestedOrientation(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; }
-void java_lang_Class_setRequestedOrientation(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; }
+/* Activity orientation is process-local Android framework state.  Seed each
+ * Activity from its manifest value, then preserve setRequestedOrientation()
+ * calls instead of returning a title-specific constant. */
+#define JNI_ACTIVITY_MAX 65536u
+static int16_t g_activity_orientation[JNI_ACTIVITY_MAX];
+static bool g_activity_orientation_initialized;
 
-/* Activity.getRequestedOrientation() — Time Locker manifest uses
- * screenOrientation=sensorPortrait (7).  Without a stub CallIntMethod
- * returns 0 (LANDSCAPE), which can skew Unity's Screen.orientation /
- * camera setup relative to our portrait FB. */
+static jint
+activity_manifest_orientation(void)
+{
+   const char *value = getenv("ANDROID_SCREEN_ORIENTATION");
+   if (value && *value)
+      return (jint)strtol(value, NULL, 10);
+   return arm_exec_fb_width() >= arm_exec_fb_height()
+      ? 0 /* SCREEN_ORIENTATION_LANDSCAPE */
+      : 1 /* SCREEN_ORIENTATION_PORTRAIT */;
+}
+
+static void
+activity_orientation_init(void)
+{
+   if (g_activity_orientation_initialized)
+      return;
+   for (size_t i = 0; i < JNI_ACTIVITY_MAX; ++i)
+      g_activity_orientation[i] = INT16_MIN;
+   g_activity_orientation_initialized = true;
+}
+
+static void
+activity_set_requested_orientation(jobject activity, jint orientation)
+{
+   activity_orientation_init();
+   const uintptr_t index = (uintptr_t)activity;
+   if (index < JNI_ACTIVITY_MAX)
+      g_activity_orientation[index] = (int16_t)orientation;
+}
+
+static jint
+activity_get_requested_orientation(jobject activity)
+{
+   activity_orientation_init();
+   const uintptr_t index = (uintptr_t)activity;
+   jint orientation = activity_manifest_orientation();
+   if (index < JNI_ACTIVITY_MAX && g_activity_orientation[index] != INT16_MIN)
+      orientation = g_activity_orientation[index];
+   return orientation;
+}
+
+void android_app_Activity_setRequestedOrientation(JNIEnv *e, jobject o, va_list a)
+{ (void)e; activity_set_requested_orientation(o, va_arg(a, jint)); }
+void java_lang_Object_setRequestedOrientation(JNIEnv *e, jobject o, va_list a)
+{ android_app_Activity_setRequestedOrientation(e, o, a); }
+void java_lang_Class_setRequestedOrientation(JNIEnv *e, jobject o, va_list a)
+{ android_app_Activity_setRequestedOrientation(e, o, a); }
+
 jint android_app_Activity_getRequestedOrientation(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 7; /* SCREEN_ORIENTATION_SENSOR_PORTRAIT */ }
+{ (void)e; (void)a; return activity_get_requested_orientation(o); }
 jint java_lang_Object_getRequestedOrientation(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 7; }
+{ return android_app_Activity_getRequestedOrientation(e, o, a); }
 jint java_lang_Class_getRequestedOrientation(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 7; }
+{ return android_app_Activity_getRequestedOrientation(e, o, a); }
 
 /* ---- android.os.Build string fields ---- */
 jstring android_os_Build_DEVICE(JNIEnv *e, jobject o)
@@ -2059,6 +2409,20 @@ jstring java_lang_Object_getDeviceId(JNIEnv *e, jobject o, va_list a)
 { return android_telephony_TelephonyManager_getDeviceId(e, o, a); }
 jstring java_lang_Class_getDeviceId(JNIEnv *e, jobject o, va_list a)
 { return android_telephony_TelephonyManager_getDeviceId(e, o, a); }
+
+/* Context.getAttributionTag() — API 30+.  Play services reflects for it and
+ * calls straight through when the platform level says it exists, so an
+ * emulator reporting API 30+ has to answer.  null is what a context with no
+ * attribution tag returns, which is every context unless the app sets one. */
+jstring
+android_content_Context_getAttributionTag(JNIEnv *env, jobject object, va_list args)
+{ (void)env; (void)object; (void)args; return NULL; }
+jstring java_lang_Object_getAttributionTag(JNIEnv *e, jobject o, va_list a)
+{ return android_content_Context_getAttributionTag(e, o, a); }
+jstring java_lang_Class_getAttributionTag(JNIEnv *e, jobject o, va_list a)
+{ return android_content_Context_getAttributionTag(e, o, a); }
+jstring android_app_Activity_getAttributionTag(JNIEnv *e, jobject o, va_list a)
+{ return android_content_Context_getAttributionTag(e, o, a); }
 
 /* ---- android.content.Context.getContentResolver() → stub ---- */
 jobject
@@ -2187,6 +2551,91 @@ jobject java_lang_Object_put(JNIEnv *e, jobject o, va_list a)
 jobject java_lang_Class_put(JNIEnv *e, jobject o, va_list a)
 { (void)e; (void)o; (void)a; return NULL; }
 
+/* Activity.isFinishing() — Netmarble cancelNotification / checkActivity.
+ * Without a host stub the DVM reports a miss and treats the call as falsey
+ * only by accident; return JNI_FALSE so the activity looks alive. */
+jboolean android_app_Activity_isFinishing(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return JNI_FALSE; }
+jboolean com_epicgames_ue4_GameActivity_isFinishing(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return JNI_FALSE; }
+jboolean java_lang_Object_isFinishing(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return JNI_FALSE; }
+
+/* Context.getApplicationContext() — return the Activity/Context itself.
+ * Enough for SDK checks that only need a non-null Context; GameActivity is
+ * looked up under both the android.app and com.epicgames.ue4 names. */
+jobject android_content_Context_getApplicationContext(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)a; return o; }
+jobject android_app_Activity_getApplicationContext(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)a; return o; }
+jobject com_epicgames_ue4_GameActivity_getApplicationContext(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)a; return o; }
+jobject java_lang_Object_getApplicationContext(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)a; return o; }
+
+/* GameActivity.AndroidThunkJava_GetAndroidId() — UE FAndroidMisc::GetDeviceId.
+ * Blade & Soul CDN URL (CBCdnConfigManager::SetConfingURL) appends this; without
+ * a host stub CallObjectMethod returns null and the request path can stall
+ * before curl ever calls getaddrinfo. */
+jstring
+com_epicgames_ue4_GameActivity_AndroidThunkJava_GetAndroidId(JNIEnv *e, jobject o, va_list a)
+{
+   (void)o; (void)a;
+   static int once;
+   if (!once) {
+      once = 1;
+      fprintf(stderr, "[arm_jni] AndroidThunkJava_GetAndroidId -> berry000000000000\n");
+   }
+   return (*e)->NewStringUTF(e, "berry000000000000");
+}
+jstring java_lang_Object_AndroidThunkJava_GetAndroidId(JNIEnv *e, jobject o, va_list a)
+{ return com_epicgames_ue4_GameActivity_AndroidThunkJava_GetAndroidId(e, o, a); }
+
+/* GameActivity.AndroidThunkJava_GetNetworkConnectionType() — UE ENetworkConnectionType.
+ * WiFi=3 (None=0, Airplane=1, Cell=2, WiFi=3).  Dex bytecode walks
+ * ConnectivityManager; stub short-circuits so patch/CDN does not see offline. */
+jint
+com_epicgames_ue4_GameActivity_AndroidThunkJava_GetNetworkConnectionType(JNIEnv *e, jobject o, va_list a)
+{
+   (void)e; (void)o; (void)a;
+   static int once;
+   if (!once) {
+      once = 1;
+      fprintf(stderr, "[arm_jni] AndroidThunkJava_GetNetworkConnectionType -> WiFi(3)\n");
+   }
+   return 3; /* ENetworkConnectionType::WiFi */
+}
+jint java_lang_Object_AndroidThunkJava_GetNetworkConnectionType(JNIEnv *e, jobject o, va_list a)
+{ return com_epicgames_ue4_GameActivity_AndroidThunkJava_GetNetworkConnectionType(e, o, a); }
+
+/* ConnectivityManager / NetworkInfo — used if dex GetNetworkConnectionType runs. */
+jobject
+android_net_ConnectivityManager_getActiveNetworkInfo(JNIEnv *e, jobject o, va_list a)
+{
+   (void)o; (void)a;
+   static jobject sv;
+   if (!sv) {
+      jclass cls = (*e)->FindClass(e, "android/net/NetworkInfo");
+      if (!cls) cls = (*e)->FindClass(e, "java/lang/Object");
+      if (cls) sv = (*e)->AllocObject(e, cls);
+   }
+   return sv;
+}
+jobject java_lang_Object_getActiveNetworkInfo(JNIEnv *e, jobject o, va_list a)
+{ return android_net_ConnectivityManager_getActiveNetworkInfo(e, o, a); }
+jobject java_lang_Class_getActiveNetworkInfo(JNIEnv *e, jobject o, va_list a)
+{ return android_net_ConnectivityManager_getActiveNetworkInfo(e, o, a); }
+
+jboolean android_net_NetworkInfo_isConnected(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return JNI_TRUE; }
+
+jboolean android_net_NetworkInfo_isAvailable(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return JNI_TRUE; }
+
+/* android.net.ConnectivityManager.TYPE_WIFI == 1 */
+jint android_net_NetworkInfo_getType(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return 1; }
+
 /* ---- Activity.getSplashMode() → 0 (no splash) ---- */
 jint android_app_Activity_getSplashMode(JNIEnv *e, jobject o, va_list a)
 { (void)e; (void)o; (void)a; return 0; }
@@ -2242,11 +2691,52 @@ jint java_lang_Class_getHeight(JNIEnv *e, jobject o, va_list a)
 { (void)e; (void)o; (void)a; return arm_exec_fb_height(); }
 
 jint android_view_Display_getRotation(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 0; } /* ROTATION_0 */
+{
+   (void)e; (void)o; (void)a;
+   /* The emulated device's natural orientation is portrait.  Rotation and
+    * DisplayMetrics must describe the same current display: UE polls this
+    * every frame and swaps its render dimensions when they disagree. */
+   return arm_exec_fb_width() > arm_exec_fb_height()
+      ? 1 /* ROTATION_90 */ : 0 /* ROTATION_0 */;
+}
 jint java_lang_Object_getRotation(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 0; }
+{ return android_view_Display_getRotation(e, o, a); }
 jint java_lang_Class_getRotation(JNIEnv *e, jobject o, va_list a)
+{ return android_view_Display_getRotation(e, o, a); }
+
+/* Display refresh timing.  Frame pacers (Google's Swappy, which UE links as
+ * libswappy.so) derive the vsync period as 1e9 / getRefreshRate(); with the
+ * method unimplemented the rate came back 0, the period became infinite and the
+ * pacer never decided a frame was due — the RHI thread parked inside
+ * SwappyGL_swap forever.  Report the 60 Hz the emulator actually presents at,
+ * with the offsets a typical device reports. */
+#define LUNA_REFRESH_HZ 60.0f
+#define LUNA_REFRESH_NS 16666667LL
+
+jfloat android_view_Display_getRefreshRate(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return LUNA_REFRESH_HZ; }
+jfloat java_lang_Object_getRefreshRate(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return LUNA_REFRESH_HZ; }
+jfloat java_lang_Class_getRefreshRate(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return LUNA_REFRESH_HZ; }
+
+/* Time from vsync to when the app's buffer is sampled; 0 is a valid answer and
+ * is what devices without a measured offset report. */
+jlong android_view_Display_getAppVsyncOffsetNanos(JNIEnv *e, jobject o, va_list a)
 { (void)e; (void)o; (void)a; return 0; }
+jlong java_lang_Object_getAppVsyncOffsetNanos(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return 0; }
+jlong java_lang_Class_getAppVsyncOffsetNanos(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return 0; }
+
+/* Latest a buffer may be queued and still make the next vsync: one frame minus
+ * the compositor's slack. */
+jlong android_view_Display_getPresentationDeadlineNanos(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return LUNA_REFRESH_NS + 1000000LL; }
+jlong java_lang_Object_getPresentationDeadlineNanos(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return LUNA_REFRESH_NS + 1000000LL; }
+jlong java_lang_Class_getPresentationDeadlineNanos(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return LUNA_REFRESH_NS + 1000000LL; }
 
 /* Display.getRealMetrics(DisplayMetrics outMetrics) — populate w/h/density.
  * Unity reads widthPixels/heightPixels/xdpi/ydpi/density from the outMetrics
@@ -2302,6 +2792,59 @@ void java_lang_Object_getMetrics(JNIEnv *e, jobject o, va_list a)
 { android_view_Display_getMetrics(e, o, a); }
 void java_lang_Class_getMetrics(JNIEnv *e, jobject o, va_list a)
 { android_view_Display_getMetrics(e, o, a); }
+
+/* Display.getRealSize(Point out) / getSize(Point out).  The Point form is the
+ * one most engines use to size their swapchain; it was missing while
+ * getRealMetrics was present, so a caller that asked for the size this way got
+ * an untouched 0x0 Point.  Same numbers as fillMetrics — one screen. */
+static void
+android_view_Display_fillPoint(JNIEnv *e, jobject out)
+{
+   if (!e || !out) return;
+   jclass cls = (*e)->FindClass(e, "android/graphics/Point");
+   if (!cls) return;
+   jfieldID fx = (*e)->GetFieldID(e, cls, "x", "I");
+   jfieldID fy = (*e)->GetFieldID(e, cls, "y", "I");
+   if (fx) (*e)->SetIntField(e, out, fx, arm_exec_fb_width());
+   if (fy) (*e)->SetIntField(e, out, fy, arm_exec_fb_height());
+}
+
+void
+android_view_Display_getRealSize(JNIEnv *e, jobject o, va_list a)
+{
+   (void)o;
+   if (!a) return;
+   android_view_Display_fillPoint(e, va_arg(a, jobject));
+}
+void android_view_Display_getSize(JNIEnv *e, jobject o, va_list a)
+{ android_view_Display_getRealSize(e, o, a); }
+void java_lang_Object_getRealSize(JNIEnv *e, jobject o, va_list a)
+{ android_view_Display_getRealSize(e, o, a); }
+void java_lang_Class_getRealSize(JNIEnv *e, jobject o, va_list a)
+{ android_view_Display_getRealSize(e, o, a); }
+void java_lang_Object_getSize(JNIEnv *e, jobject o, va_list a)
+{ android_view_Display_getRealSize(e, o, a); }
+void java_lang_Class_getSize(JNIEnv *e, jobject o, va_list a)
+{ android_view_Display_getRealSize(e, o, a); }
+
+/* PowerManager thermal API (API 29+).  The emulator never throttles, so the
+ * status is permanently THERMAL_STATUS_NONE and a registered listener is never
+ * called back — but the calls themselves have to exist, because a game that
+ * cannot register its listener dies in its device-capability setup. */
+jint android_os_PowerManager_getCurrentThermalStatus(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return 0; /* THERMAL_STATUS_NONE */ }
+void android_os_PowerManager_addThermalStatusListener(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; }
+void android_os_PowerManager_removeThermalStatusListener(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; }
+jfloat android_os_PowerManager_getThermalHeadroom(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return 0.0f; }
+
+/* Debug.isDebuggerConnected(): nothing is attached to the guest. */
+jint android_os_Debug_isDebuggerConnected(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return JNI_FALSE; }
+jint android_os_Debug_waitingForDebugger(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return JNI_FALSE; }
 
 jmethodID
 com_unity3d_player_ReflectionHelper_getMethodID(JNIEnv *env, jobject object, jvalue *values)
