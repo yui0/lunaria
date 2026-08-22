@@ -175,7 +175,16 @@ struct dvm {
    int npending;
    /* The Thread the interpreter is currently inside, or 0 for the main one. */
    dvm_ref cur_thread;
-   bool draining;
+   /* How many drains of the pending queue are on the stack.  This used to be a
+    * flat re-entrancy lock, which made every blocking wait inside a Runnable
+    * unsatisfiable: the work being waited for sits in this same queue, so a
+    * drain that refuses to nest can never deliver it.  Volley's
+    * NetworkDispatcher could not run while a Netmarble SDK call sat in
+    * CountDownLatch.await() for its response, so the wait burned its whole
+    * 15 s timeout with the VM frozen and the request "failed".  The entry
+    * being executed is taken off the pending list before it runs, so a nested
+    * drain cannot re-enter it — only the depth needs a bound. */
+   int drain_depth;
    bool quiet_uncaught;  /* a parked worker is not an error to report */
    /* Set when the current thread has parked rather than failed: the unwind
     * runs to the top of the thread instead of stopping at a catch clause.
@@ -187,6 +196,12 @@ struct dvm {
     * catches and rethrows, so the throw stamps itself here instead. */
    struct dvm_method *cur_method;
    uint32_t cur_pc;
+   /* The bytecode methods currently on the interpreter's stack, outermost
+    * first.  Frames live on the C stack, so without this there is nothing to
+    * build Thread.getStackTrace() from — and SDKs log their own API calls by
+    * reading the caller's name out of that trace. */
+   struct dvm_method *callstack[128];
+   int ncallstack;
    int depth;
    int trace;
    uint64_t steps;       /* since dvm_create, for diagnostics */
@@ -225,8 +240,59 @@ bool dvm__call_out(struct dvm *vm, struct dvm_class *cls, const char *name,
 /* Steps a bytecode-started thread may run before it is considered parked. */
 #define DVM_THREAD_SLICE (2u * 1000u * 1000u)
 
+/* Bytes moved is progress, so it resets the slice.
+ *
+ * The step limit is there to catch code that loops without getting anywhere.
+ * A loop that is reading a socket and writing a file is getting somewhere, and
+ * the amount of bytecode it runs is set by the size of what it is moving —
+ * the game's content download is 13.7 GB, which is orders of magnitude past
+ * any fixed step budget.  Aborting that call throws java.lang.Error into
+ * AsyncTask.doInBackground() and the app reports a failed download; on a
+ * device the task simply runs until it is done.  So an I/O builtin that
+ * actually transferred bytes clears the counter, and a spin that transfers
+ * nothing still trips it. */
+#define DVM_IO_PROGRESS_BYTES 4096u
+static inline void dvm__note_io_progress(struct dvm *vm, size_t bytes) {
+   /* Only a bulk transfer counts.  Incidental I/O — a preference file, a log
+    * line, a small config read — happens on every other call, and clearing the
+    * budget for those would disable the limit everywhere and let one Runnable
+    * hold the VM for as long as it likes. */
+   if (vm && bytes >= DVM_IO_PROGRESS_BYTES) vm->call_steps = 0;
+}
+
+/* Nesting bound for dvm__run_pending_threads().  Each level is a Runnable that
+ * blocked waiting for another one, and each costs C stack, so the queue is
+ * allowed to unwrap a chain of waits but not an unbounded one. */
+#define DVM_DRAIN_MAX_DEPTH 8
+
+/* How many queued Runnables one drain may run before returning to its caller.
+ * The old drain ran every due entry up to eight times over; this keeps a
+ * comparable budget while taking the entries one at a time. */
+#define DVM_DRAIN_MAX_RUNS 64
+
+/* The emulator's own widget presentation layer: dispatches the clicks the
+ * overlay collected and republishes the document when the view tree changed.
+ * Runs from the pending-queue drain because that is this VM's main looper —
+ * the thread every other posted callback already runs on. */
+void dvm__ui_tick(struct dvm *vm);
+
 /* Runs threads queued by Thread.start(); called when the VM returns to JNI. */
 void dvm__run_pending_threads(struct dvm *vm);
+/* Same queue, for a thread that is blocked waiting on another one: this form
+ * is allowed to nest, because what it waits for is queued here too. */
+void dvm__drain_for_wait(struct dvm *vm);
+bool dvm__queue_runnable_at(struct dvm *vm, dvm_ref r, bool as_thread,
+                            int64_t delay_ms);
+/* LUNARIA_DVM_SCHED: scheduler-only tracing (what the pending queue ran, and
+ * what a blocked wait was able to make progress on). */
+bool dvm__sched_trace(void);
+/* Same switch, filtered by class name: LUNARIA_DVM_SCHED=<substring>. */
+bool dvm__sched_trace_for(const char *class_name);
+
+/* How long a thread that parked waits before the queue retries it.  It is
+ * blocked on something another thread has to produce, so the retry only has to
+ * be frequent enough that the producer's result is picked up promptly. */
+#define DVM_PARK_RETRY_MS 8
 /* Monotonic milliseconds, for pending_due_ms. */
 uint64_t dvm__now_ms(void);
 

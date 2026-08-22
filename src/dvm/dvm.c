@@ -1363,7 +1363,11 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
 
    struct frame fr = { .m = m, .regs = regs, .nregs = nregs, .pc = 0 };
    ++vm->depth;
+   bool pushed = vm->ncallstack <
+                 (int)(sizeof vm->callstack / sizeof vm->callstack[0]);
+   if (pushed) vm->callstack[vm->ncallstack++] = m;
    bool ok = execute(vm, &fr, out);
+   if (pushed) --vm->ncallstack;
    --vm->depth;
 
    /* Record the frames the exception passes on its way out, innermost first. */
@@ -2429,39 +2433,95 @@ uint64_t dvm__now_ms(void)
    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
-void dvm__run_pending_threads(struct dvm *vm)
+/* Scheduler-only tracing.  LUNARIA_DVM_TRACE prints every bytecode call, which
+ * is far too slow to reach a startup step several minutes in; this answers the
+ * one question a blocked wait raises — what the queue was allowed to run. */
+bool dvm__sched_trace(void)
 {
-   if (vm->draining || !vm->npending) return;
-   vm->draining = true;
+   static int on = -1;
+   if (on < 0) {
+      const char *s = getenv("LUNARIA_DVM_SCHED");
+      on = s && *s && strcmp(s, "0") ? 1 : 0;
+   }
+   return on == 1;
+}
+
+/* Volley parks its dispatchers on an empty queue and re-queues them every few
+ * milliseconds, so an unfiltered scheduler trace is six hundred thousand lines
+ * of the same two classes — enough fprintf to change what the run does, which
+ * is the one thing a diagnostic must not do.  LUNARIA_DVM_SCHED=<substring>
+ * keeps only the classes whose name contains it; =1 keeps everything. */
+bool dvm__sched_trace_for(const char *class_name)
+{
+   if (!dvm__sched_trace()) return false;
+   static const char *filter = (const char *)-1;
+   if (filter == (const char *)-1) {
+      const char *s = getenv("LUNARIA_DVM_SCHED");
+      filter = (s && strcmp(s, "1") && strcmp(s, "on")) ? s : NULL;
+   }
+   if (!filter) return true;
+   return class_name && strstr(class_name, filter) != NULL;
+}
+
+/* `nested` separates the two callers.  The drain at a call boundary is
+ * housekeeping and must stay flat: letting it re-enter turns every Runnable
+ * that starts another into unbounded recursion.  A blocking wait is the
+ * opposite case — the work it waits for is in this very queue, so refusing to
+ * nest makes the wait unsatisfiable by construction. */
+static void drain_pending(struct dvm *vm, bool nested)
+{
+   if (!vm->npending) return;
+   if (!nested && vm->drain_depth) return;
+   if (vm->drain_depth >= DVM_DRAIN_MAX_DEPTH) {
+      if (dvm__sched_trace())
+         fprintf(stderr, "[sched] drain refused: depth=%d pending=%d\n",
+                 vm->drain_depth, vm->npending);
+      return;
+   }
+   ++vm->drain_depth;
    uint64_t saved_limit = vm->step_limit;
    bool saved_quiet = vm->quiet_uncaught;
 
-   for (int round = 0; vm->npending && round < 8; ++round) {
-      dvm_ref list[32];
-      bool is_thread[32];
-      /* Entries whose delay has not elapsed stay queued for a later drain. */
+   /* One entry is taken from the queue at a time, immediately before it runs.
+    *
+    * This used to detach every due entry up front and then run the batch.  A
+    * Runnable that blocks then made the rest of its own batch unreachable: the
+    * entries were already off the queue, so the nested drain its wait performs
+    * could not see them.  Volley's NetworkDispatcher sat in exactly that hole
+    * — dispatcher and requester were picked up by the same drain, the
+    * requester ran first and waited, and the dispatcher that would have served
+    * it was invisible until the wait had timed out (15 s, every time).
+    *
+    * `runs` bounds the work one drain does so a runnable that re-queues itself
+    * with no delay cannot spin here forever. */
+   for (int runs = 0; runs < DVM_DRAIN_MAX_RUNS; ++runs) {
+      /* Oldest due entry first.  Taking one at a time means the choice is a
+       * scheduling policy rather than an ordering within a batch, and
+       * newest-first starves under it: a daemon that parks is re-queued at the
+       * tail and would be picked again immediately, forever, while the work it
+       * is waiting for sits in front of it.  Idle daemons carry
+       * DVM_PARK_RETRY_MS, so they are not due most of the time and cannot
+       * crowd out freshly started work either.  Entries whose delay has not
+       * elapsed stay queued for a later drain. */
       uint64_t now = dvm__now_ms();
-      int n = 0, keep = 0;
-      for (int i = 0; i < vm->npending; ++i) {
-         if (vm->pending_due_ms[i] > now) {
-            vm->pending_threads[keep] = vm->pending_threads[i];
-            vm->pending_is_thread[keep] = vm->pending_is_thread[i];
-            vm->pending_due_ms[keep] = vm->pending_due_ms[i];
-            ++keep;
-            continue;
-         }
-         list[n] = vm->pending_threads[i];
-         is_thread[n] = vm->pending_is_thread[i];
-         ++n;
+      int pick = -1;
+      for (int i = 0; i < vm->npending; ++i)
+         if (vm->pending_due_ms[i] <= now) { pick = i; break; }
+      if (pick < 0) break;
+
+      dvm_ref entry = vm->pending_threads[pick];
+      bool entry_is_thread = vm->pending_is_thread[pick];
+      for (int i = pick; i + 1 < vm->npending; ++i) {
+         vm->pending_threads[i] = vm->pending_threads[i + 1];
+         vm->pending_is_thread[i] = vm->pending_is_thread[i + 1];
+         vm->pending_due_ms[i] = vm->pending_due_ms[i + 1];
       }
-      vm->npending = keep;
-      if (!n) break;
-      /* Newly-started work gets the first slice.  This mirrors the local LIFO
-       * queues used by Android/JVM work-stealing pools and prevents a Future's
-       * producer from sitting behind a full set of already-idle daemon worker
-       * loops in this single-host-thread VM.  Every entry is still run once in
-       * the round, so older work cannot starve. */
-      for (int i = n - 1; i >= 0; --i) {
+      --vm->npending;
+
+      dvm_ref list[1] = { entry };
+      bool is_thread[1] = { entry_is_thread };
+      {
+         const int i = 0;
          struct dvm_class *c = dvm_object_class(vm, list[i]);
          struct dvm_method *run = c ? dvm_find_method(vm, c, "run", "()V") : NULL;
          if (run && (run->has_code || run->builtin)) {
@@ -2482,7 +2542,28 @@ void dvm__run_pending_threads(struct dvm *vm)
             how[0] = '\0';
             if (!ok && vm->exception)
                dvm_describe_exception(vm, vm->exception, how, sizeof how);
+            /* A thread that parked has not finished: it is blocked inside the
+             * platform on something another thread must produce — a Volley
+             * dispatcher sitting in BlockingQueue.take() before the first
+             * request is added is the standard shape.  Dropping it ended the
+             * thread for good, so every request queued afterwards had no
+             * consumer and the caller waiting on the response timed out.  Put
+             * it back, so a later drain retries the wait the way the blocked
+             * thread would have resumed on a real runtime. */
+            const bool parked_here = vm->parked;
             dvm_clear_exception(vm);
+            if (parked_here) {
+               bool requeued = dvm__queue_runnable_at(vm, list[i], is_thread[i],
+                                                      DVM_PARK_RETRY_MS);
+               if (dvm__sched_trace_for(run->cls ? run->cls->name : NULL))
+                  fprintf(stderr, "[sched] parked %s.run() depth=%d %s\n",
+                          run->cls ? run->cls->name : "?", vm->drain_depth,
+                          requeued ? "requeued" : "DROPPED (queue full)");
+            } else if (dvm__sched_trace_for(run->cls ? run->cls->name : NULL)) {
+               fprintf(stderr, "[sched] ran %s.run() depth=%d steps=%llu\n",
+                       run->cls ? run->cls->name : "?", vm->drain_depth,
+                       (unsigned long long)(vm->steps - before));
+            }
             static int log_n = 0;
             /* The cap keeps startup readable; a trace run wants every one of
                them, because a runnable that keeps re-queueing is the symptom. */
@@ -2518,8 +2599,17 @@ void dvm__run_pending_threads(struct dvm *vm)
 
    vm->step_limit = saved_limit;
    vm->quiet_uncaught = saved_quiet;
-   vm->draining = false;
+   --vm->drain_depth;
 }
+
+void dvm__run_pending_threads(struct dvm *vm)
+{
+   drain_pending(vm, false);
+   /* Only at the top: a nested drain is inside somebody's Runnable, and a
+    * click callback dispatched there would run underneath a wait. */
+   if (vm->drain_depth == 0) dvm__ui_tick(vm);
+}
+void dvm__drain_for_wait(struct dvm *vm) { drain_pending(vm, true); }
 
 bool dvm_call(struct dvm *vm, struct dvm_method *m, dvm_ref self,
               const union dvm_value *args, int nargs, union dvm_value *out)
@@ -2554,7 +2644,18 @@ bool dvm_call(struct dvm *vm, struct dvm_method *m, dvm_ref self,
                     f->cls ? f->cls->name : "?", f->name, f->sig ? f->sig : "");
       }
    }
-   if (!vm->depth) dvm__run_pending_threads(vm);
+   if (!vm->depth) {
+      /* vm->parked describes the call that just returned — "this thread is
+       * blocked inside the platform", which its caller has to act on.  The
+       * drain below runs other Runnables and each clears the flag on its way
+       * out, so a thread that parked was reported as having finished normally
+       * and was dropped instead of re-queued.  Volley's NetworkDispatchers
+       * disappeared exactly this way whenever the drain had anything else to
+       * run, leaving later requests with no consumer. */
+      const bool parked_here = vm->parked;
+      dvm__run_pending_threads(vm);
+      vm->parked = parked_here;
+   }
    return ok;
 }
 
@@ -2647,6 +2748,48 @@ bool dvm_add_dex(struct dvm *vm, const char *path)
    vm->dexes[vm->ndexes++] = dd;
    fprintf(stderr, "[dvm] loaded %s: %u classes, %u methods\n",
            path, dd->file.class_defs_size, dd->file.method_ids_size);
+   return true;
+}
+
+bool dvm_add_dex_memory(struct dvm *vm, const void *data, size_t len,
+                        const char *name)
+{
+   if (!vm || !data || len < 112u /* dex header */) return false;
+   if (memcmp(data, "dex\n", 4) != 0) {
+      fprintf(stderr, "[dvm] %s: not a dex (magic %.4s)\n",
+              name ? name : "in-memory dex", (const char *)data);
+      return false;
+   }
+   if (vm->ndexes == vm->dexes_cap) {
+      int cap = vm->dexes_cap ? vm->dexes_cap * 2 : 8;
+      struct dvm_dex **n = realloc(vm->dexes, (size_t)cap * sizeof *n);
+      if (!n) return false;
+      vm->dexes = n;
+      vm->dexes_cap = cap;
+   }
+   struct dvm_dex *dd = calloc(1, sizeof *dd);
+   if (!dd) return false;
+   /* The buffer belongs to whoever handed it over (guest memory, for an
+    * InMemoryDexClassLoader), so keep our own copy for dex_close() to free. */
+   uint8_t *copy = malloc(len);
+   if (!copy) { free(dd); return false; }
+   memcpy(copy, data, len);
+   if (!dex_open_memory(&dd->file, copy, len, name ? name : "in-memory dex")) {
+      free(copy);
+      free(dd);
+      return false;
+   }
+   dd->file.owned = copy;
+
+   dd->type_cache   = calloc(dd->file.type_ids_size + 1u, sizeof *dd->type_cache);
+   dd->method_cache = calloc(dd->file.method_ids_size + 1u, sizeof *dd->method_cache);
+   dd->field_cache  = calloc(dd->file.field_ids_size + 1u, sizeof *dd->field_cache);
+   dd->string_cache = calloc(dd->file.string_ids_size + 1u, sizeof *dd->string_cache);
+
+   vm->dexes[vm->ndexes++] = dd;
+   fprintf(stderr, "[dvm] loaded %s (%zu bytes): %u classes, %u methods\n",
+           name ? name : "in-memory dex", len,
+           dd->file.class_defs_size, dd->file.method_ids_size);
    return true;
 }
 

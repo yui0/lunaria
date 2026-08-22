@@ -320,6 +320,15 @@ bool lm_sink_take(struct lm_sink *s, const uint8_t **rgba, int *w, int *h)
    return true;
 }
 
+bool lm_sink_peek(const struct lm_sink *s, const uint8_t **rgba, int *w, int *h)
+{
+   if (!s || !s->rgba || s->w <= 0 || s->h <= 0) return false;
+   if (rgba) *rgba = s->rgba;
+   if (w) *w = s->w;
+   if (h) *h = s->h;
+   return true;
+}
+
 int64_t lm_sink_timestamp(const struct lm_sink *s)
 {
    return s ? s->ts_ns : 0;
@@ -888,4 +897,601 @@ void lm_codec_release_output(struct lm_codec *c, int idx, bool render,
               idx, (int)render, (void *)sink);
    o->busy = false;
    o->ready = false;
+}
+
+/* ------------------------------------------------------------------------ *
+ * MP4 demuxing
+ *
+ * The moov box is read into memory whole (it is the index, tens of KB); the
+ * media data stays on disk and samples are pread() on demand.  Everything the
+ * players need is derived once at open() into a flat per-track sample table,
+ * because both MediaExtractor and MediaPlayer walk samples in order and asking
+ * the chunk tables per sample would be quadratic.
+ * ------------------------------------------------------------------------ */
+
+#define LM_MP4_MAX_TRACKS 8
+
+struct lm_mp4_sample {
+   int64_t  offset;
+   uint32_t size;
+   int64_t  pts_us;
+   bool     sync;
+};
+
+struct lm_mp4_track {
+   char     mime[32];
+   uint32_t timescale;
+   int64_t  duration_us;
+   int      width, height;
+   int      rate, channels;
+   uint8_t *csd;
+   size_t   csd_len;
+   int      nal_len;                 /* AVC length-prefix width, 0 = not AVC */
+   struct lm_mp4_sample *s;
+   int      ns;
+};
+
+struct lm_mp4 {
+   int      fd;                      /* our own dup() */
+   int64_t  base;
+   struct lm_mp4_track t[LM_MP4_MAX_TRACKS];
+   int      nt;
+   uint8_t *buf;                     /* the sample handed to the last caller */
+   size_t   buf_cap;
+};
+
+static uint32_t rd32(const uint8_t *p) {
+   return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+          ((uint32_t)p[2] << 8) | p[3];
+}
+static uint16_t rd16(const uint8_t *p) {
+   return (uint16_t)(((uint32_t)p[0] << 8) | p[1]);
+}
+static uint64_t rd64(const uint8_t *p) {
+   return ((uint64_t)rd32(p) << 32) | rd32(p + 4);
+}
+
+/* Walks the children of one box body, calling `fn` per child. */
+struct lm_box_walk {
+   void (*fn)(void *ctx, const char *type, const uint8_t *body, size_t len);
+   void *ctx;
+};
+
+static void lm_box_children(const uint8_t *p, size_t len,
+                            const struct lm_box_walk *w)
+{
+   size_t off = 0;
+   while (off + 8 <= len) {
+      uint64_t size = rd32(p + off);
+      char type[5] = { (char)p[off + 4], (char)p[off + 5],
+                       (char)p[off + 6], (char)p[off + 7], 0 };
+      size_t hdr = 8;
+      if (size == 1) {
+         if (off + 16 > len) return;
+         size = rd64(p + off + 8);
+         hdr = 16;
+      } else if (size == 0) {
+         size = len - off;
+      }
+      if (size < hdr || off + size > len) return;
+      w->fn(w->ctx, type, p + off + hdr, (size_t)size - hdr);
+      off += (size_t)size;
+   }
+}
+
+/* --- one track's sample tables, as read out of stbl ---------------------- */
+struct lm_stbl {
+   struct lm_mp4_track *tr;
+   /* stts */
+   const uint8_t *stts; uint32_t stts_n;
+   /* ctts */
+   const uint8_t *ctts; uint32_t ctts_n; int ctts_ver;
+   /* stss */
+   const uint8_t *stss; uint32_t stss_n;
+   /* stsz */
+   const uint8_t *stsz; uint32_t stsz_n; uint32_t stsz_fixed;
+   /* stsc */
+   const uint8_t *stsc; uint32_t stsc_n;
+   /* stco / co64 */
+   const uint8_t *stco; uint32_t stco_n; bool co64;
+};
+
+static void lm_avcc_to_csd(struct lm_mp4_track *tr, const uint8_t *p, size_t len)
+{
+   if (len < 7) return;
+   tr->nal_len = (p[4] & 3) + 1;
+   size_t off = 5;
+   uint8_t *out = NULL;
+   size_t used = 0;
+   int nsets = p[off++] & 0x1f;                    /* SPS */
+   for (int round = 0; round < 2; ++round) {
+      for (int i = 0; i < nsets && off + 2 <= len; ++i) {
+         size_t n = rd16(p + off);
+         off += 2;
+         if (off + n > len) return;
+         uint8_t *grown = realloc(out, used + 4 + n);
+         if (!grown) { free(out); return; }
+         out = grown;
+         out[used] = 0; out[used + 1] = 0; out[used + 2] = 0; out[used + 3] = 1;
+         memcpy(out + used + 4, p + off, n);
+         used += 4 + n;
+         off += n;
+      }
+      if (round == 0) {
+         if (off >= len) break;
+         nsets = p[off++];                          /* PPS */
+      }
+   }
+   free(tr->csd);
+   tr->csd = out;
+   tr->csd_len = used;
+}
+
+/* esds → AudioSpecificConfig (the DecoderSpecificInfo, tag 0x05). */
+static void lm_esds_to_csd(struct lm_mp4_track *tr, const uint8_t *p, size_t len)
+{
+   size_t off = 4;                                 /* version + flags */
+   while (off + 2 <= len) {
+      uint8_t tag = p[off++];
+      size_t size = 0;
+      for (int i = 0; i < 4 && off < len; ++i) {
+         uint8_t b = p[off++];
+         size = (size << 7) | (b & 0x7f);
+         if (!(b & 0x80)) break;
+      }
+      if (off + size > len) return;
+      if (tag == 0x03) {                           /* ES_Descriptor */
+         off += 3;                                 /* ES_ID + flags */
+         continue;
+      }
+      if (tag == 0x04) {                           /* DecoderConfigDescriptor */
+         off += 13;
+         continue;
+      }
+      if (tag == 0x05) {                           /* DecoderSpecificInfo */
+         uint8_t *csd = malloc(size ? size : 1);
+         if (!csd) return;
+         memcpy(csd, p + off, size);
+         free(tr->csd);
+         tr->csd = csd;
+         tr->csd_len = size;
+         return;
+      }
+      off += size;
+   }
+}
+
+static void lm_stsd_child(void *ctx, const char *type, const uint8_t *body,
+                          size_t len)
+{
+   struct lm_mp4_track *tr = ctx;
+   if (!strcmp(type, "avcC")) lm_avcc_to_csd(tr, body, len);
+   else if (!strcmp(type, "esds")) lm_esds_to_csd(tr, body, len);
+}
+
+static void lm_stsd_entry(void *ctx, const char *type, const uint8_t *body,
+                          size_t len)
+{
+   struct lm_mp4_track *tr = ctx;
+   struct lm_box_walk w = { lm_stsd_child, tr };
+   if (!strcmp(type, "avc1") || !strcmp(type, "avc3")) {
+      snprintf(tr->mime, sizeof tr->mime, "video/avc");
+      if (len >= 32) {
+         tr->width  = rd16(body + 24);
+         tr->height = rd16(body + 26);
+      }
+      if (len > 78) lm_box_children(body + 78, len - 78, &w);
+   } else if (!strcmp(type, "hvc1") || !strcmp(type, "hev1")) {
+      snprintf(tr->mime, sizeof tr->mime, "video/hevc");
+      if (len >= 32) {
+         tr->width  = rd16(body + 24);
+         tr->height = rd16(body + 26);
+      }
+   } else if (!strcmp(type, "mp4a")) {
+      snprintf(tr->mime, sizeof tr->mime, "audio/mp4a-latm");
+      if (len >= 28) {
+         tr->channels = rd16(body + 16);
+         tr->rate     = rd16(body + 24);            /* 16.16, integer part */
+      }
+      if (len > 28) lm_box_children(body + 28, len - 28, &w);
+   }
+}
+
+static void lm_stbl_child(void *ctx, const char *type, const uint8_t *body,
+                          size_t len)
+{
+   struct lm_stbl *st = ctx;
+   if (!strcmp(type, "stsd")) {
+      if (len < 8) return;
+      struct lm_box_walk w = { lm_stsd_entry, st->tr };
+      lm_box_children(body + 8, len - 8, &w);
+   } else if (!strcmp(type, "stts") && len >= 8) {
+      st->stts = body + 8; st->stts_n = rd32(body + 4);
+      if (st->stts_n > (len - 8) / 8) st->stts_n = (uint32_t)(len - 8) / 8;
+   } else if (!strcmp(type, "ctts") && len >= 8) {
+      st->ctts = body + 8; st->ctts_n = rd32(body + 4); st->ctts_ver = body[0];
+      if (st->ctts_n > (len - 8) / 8) st->ctts_n = (uint32_t)(len - 8) / 8;
+   } else if (!strcmp(type, "stss") && len >= 8) {
+      st->stss = body + 8; st->stss_n = rd32(body + 4);
+      if (st->stss_n > (len - 8) / 4) st->stss_n = (uint32_t)(len - 8) / 4;
+   } else if (!strcmp(type, "stsz") && len >= 12) {
+      st->stsz_fixed = rd32(body + 4);
+      st->stsz_n = rd32(body + 8);
+      st->stsz = body + 12;
+      if (!st->stsz_fixed && st->stsz_n > (len - 12) / 4)
+         st->stsz_n = (uint32_t)(len - 12) / 4;
+   } else if (!strcmp(type, "stsc") && len >= 8) {
+      st->stsc = body + 8; st->stsc_n = rd32(body + 4);
+      if (st->stsc_n > (len - 8) / 12) st->stsc_n = (uint32_t)(len - 8) / 12;
+   } else if (!strcmp(type, "stco") && len >= 8) {
+      st->stco = body + 8; st->stco_n = rd32(body + 4); st->co64 = false;
+      if (st->stco_n > (len - 8) / 4) st->stco_n = (uint32_t)(len - 8) / 4;
+   } else if (!strcmp(type, "co64") && len >= 8) {
+      st->stco = body + 8; st->stco_n = rd32(body + 4); st->co64 = true;
+      if (st->stco_n > (len - 8) / 8) st->stco_n = (uint32_t)(len - 8) / 8;
+   }
+}
+
+/* Flattens the chunk/size/time tables into one entry per sample. */
+static void lm_stbl_build(struct lm_stbl *st)
+{
+   struct lm_mp4_track *tr = st->tr;
+   uint32_t n = st->stsz_fixed ? 0 : st->stsz_n;
+   if (st->stsz_fixed) {
+      /* Every sample the same size: the count comes from the time table. */
+      for (uint32_t i = 0; i < st->stts_n; ++i)
+         n += rd32(st->stts + i * 8);
+   }
+   if (!n || !st->stco_n || !st->stsc_n) return;
+   struct lm_mp4_sample *s = calloc(n, sizeof *s);
+   if (!s) return;
+
+   /* offsets: walk chunks, taking samples-per-chunk from stsc */
+   uint32_t sample = 0, entry = 0;
+   for (uint32_t chunk = 0; chunk < st->stco_n && sample < n; ++chunk) {
+      while (entry + 1 < st->stsc_n &&
+             rd32(st->stsc + (entry + 1) * 12) <= chunk + 1)
+         ++entry;
+      uint32_t per = rd32(st->stsc + entry * 12 + 4);
+      int64_t off = st->co64 ? (int64_t)rd64(st->stco + chunk * 8)
+                            : (int64_t)rd32(st->stco + chunk * 4);
+      for (uint32_t k = 0; k < per && sample < n; ++k) {
+         uint32_t size = st->stsz_fixed ? st->stsz_fixed
+                                        : rd32(st->stsz + sample * 4);
+         s[sample].offset = off;
+         s[sample].size   = size;
+         off += size;
+         ++sample;
+      }
+   }
+   uint32_t count = sample;
+
+   /* decode times from stts, shifted by the ctts composition offset */
+   uint32_t ts = tr->timescale ? tr->timescale : 1000;
+   int64_t dts = 0;
+   sample = 0;
+   for (uint32_t i = 0; i < st->stts_n && sample < count; ++i) {
+      uint32_t cnt = rd32(st->stts + i * 8);
+      uint32_t delta = rd32(st->stts + i * 8 + 4);
+      for (uint32_t k = 0; k < cnt && sample < count; ++k) {
+         s[sample].pts_us = (int64_t)((double)dts * 1000000.0 / (double)ts);
+         dts += delta;
+         ++sample;
+      }
+   }
+   if (st->ctts) {
+      sample = 0;
+      for (uint32_t i = 0; i < st->ctts_n && sample < count; ++i) {
+         uint32_t cnt = rd32(st->ctts + i * 8);
+         int64_t coff = st->ctts_ver ? (int32_t)rd32(st->ctts + i * 8 + 4)
+                                     : (int64_t)rd32(st->ctts + i * 8 + 4);
+         for (uint32_t k = 0; k < cnt && sample < count; ++k) {
+            s[sample].pts_us += (int64_t)((double)coff * 1000000.0 / (double)ts);
+            ++sample;
+         }
+      }
+   }
+
+   /* stss lists the sync samples; without it every sample is one */
+   if (st->stss) {
+      for (uint32_t i = 0; i < st->stss_n; ++i) {
+         uint32_t idx = rd32(st->stss + i * 4);
+         if (idx >= 1 && idx <= count) s[idx - 1].sync = true;
+      }
+   } else {
+      for (uint32_t i = 0; i < count; ++i) s[i].sync = true;
+   }
+
+   tr->s = s;
+   tr->ns = (int)count;
+}
+
+struct lm_trak_ctx {
+   struct lm_mp4_track *tr;
+   bool wanted;                       /* a handler type we can decode */
+};
+
+static void lm_minf_child(void *ctx, const char *type, const uint8_t *body,
+                          size_t len)
+{
+   struct lm_trak_ctx *tc = ctx;
+   if (strcmp(type, "stbl")) return;
+   struct lm_stbl st = { .tr = tc->tr };
+   struct lm_box_walk w = { lm_stbl_child, &st };
+   lm_box_children(body, len, &w);
+   lm_stbl_build(&st);
+}
+
+static void lm_mdia_child(void *ctx, const char *type, const uint8_t *body,
+                          size_t len)
+{
+   struct lm_trak_ctx *tc = ctx;
+   if (!strcmp(type, "mdhd") && len >= 20) {
+      if (body[0] == 1 && len >= 32) {
+         tc->tr->timescale = rd32(body + 20);
+         uint64_t dur = rd64(body + 24);
+         if (tc->tr->timescale)
+            tc->tr->duration_us =
+               (int64_t)((double)dur * 1000000.0 / (double)tc->tr->timescale);
+      } else {
+         tc->tr->timescale = rd32(body + 12);
+         uint32_t dur = rd32(body + 16);
+         if (tc->tr->timescale)
+            tc->tr->duration_us =
+               (int64_t)((double)dur * 1000000.0 / (double)tc->tr->timescale);
+      }
+   } else if (!strcmp(type, "hdlr") && len >= 12) {
+      tc->wanted = !memcmp(body + 8, "vide", 4) || !memcmp(body + 8, "soun", 4);
+   } else if (!strcmp(type, "minf")) {
+      struct lm_box_walk w = { lm_minf_child, tc };
+      lm_box_children(body, len, &w);
+   }
+}
+
+static void lm_trak_child(void *ctx, const char *type, const uint8_t *body,
+                          size_t len)
+{
+   struct lm_trak_ctx *tc = ctx;
+   if (!strcmp(type, "mdia")) {
+      struct lm_box_walk w = { lm_mdia_child, tc };
+      lm_box_children(body, len, &w);
+   }
+}
+
+static void lm_moov_child(void *ctx, const char *type, const uint8_t *body,
+                          size_t len)
+{
+   struct lm_mp4 *m = ctx;
+   if (strcmp(type, "trak") || m->nt >= LM_MP4_MAX_TRACKS) return;
+   struct lm_trak_ctx tc = { .tr = &m->t[m->nt] };
+   struct lm_box_walk w = { lm_trak_child, &tc };
+   lm_box_children(body, len, &w);
+   if (tc.wanted && tc.tr->mime[0] && tc.tr->ns > 0) {
+      ++m->nt;
+   } else {
+      free(tc.tr->csd);
+      free(tc.tr->s);
+      memset(tc.tr, 0, sizeof *tc.tr);
+   }
+}
+
+static bool lm_read_at(int fd, int64_t off, void *dst, size_t len)
+{
+   size_t done = 0;
+   while (done < len) {
+      ssize_t n = pread(fd, (char *)dst + done, len - done, (off_t)(off + (int64_t)done));
+      if (n <= 0) return false;
+      done += (size_t)n;
+   }
+   return true;
+}
+
+struct lm_mp4 *lm_mp4_open(int fd, int64_t offset, int64_t length)
+{
+   if (fd < 0) return NULL;
+   int64_t end = length > 0 ? offset + length : INT64_MAX;
+
+   /* Find moov by walking the top-level boxes; mdat is skipped, not read. */
+   uint8_t *moov = NULL;
+   size_t moov_len = 0;
+   for (int64_t pos = offset; pos + 8 <= end; ) {
+      uint8_t hdr[16];
+      if (!lm_read_at(fd, pos, hdr, 8)) break;
+      uint64_t size = rd32(hdr);
+      size_t hlen = 8;
+      if (size == 1) {
+         if (!lm_read_at(fd, pos, hdr, 16)) break;
+         size = rd64(hdr + 8);
+         hlen = 16;
+      }
+      if (size < hlen) break;
+      if (!memcmp(hdr + 4, "moov", 4)) {
+         moov_len = (size_t)(size - hlen);
+         if (moov_len > 64u * 1024u * 1024u) break;
+         moov = malloc(moov_len ? moov_len : 1);
+         if (!moov) break;
+         if (!lm_read_at(fd, pos + (int64_t)hlen, moov, moov_len)) {
+            free(moov);
+            moov = NULL;
+         }
+         break;
+      }
+      pos += (int64_t)size;
+   }
+   if (!moov) {
+      if (trace_media()) fprintf(stderr, "[media] mp4: no moov box\n");
+      return NULL;
+   }
+
+   struct lm_mp4 *m = calloc(1, sizeof *m);
+   if (!m) { free(moov); return NULL; }
+   m->fd = dup(fd);
+   m->base = offset;
+   struct lm_box_walk w = { lm_moov_child, m };
+   lm_box_children(moov, moov_len, &w);
+   free(moov);
+
+   if (!m->nt) { lm_mp4_free(m); return NULL; }
+   if (trace_media()) {
+      fprintf(stderr, "[media] mp4: %d track(s)\n", m->nt);
+      for (int i = 0; i < m->nt; ++i)
+         fprintf(stderr, "[media]   #%d %s %dx%d %d samples %lldus csd=%zu\n",
+                 i, m->t[i].mime, m->t[i].width, m->t[i].height, m->t[i].ns,
+                 (long long)m->t[i].duration_us, m->t[i].csd_len);
+   }
+   return m;
+}
+
+void lm_mp4_free(struct lm_mp4 *m)
+{
+   if (!m) return;
+   for (int i = 0; i < LM_MP4_MAX_TRACKS; ++i) {
+      free(m->t[i].csd);
+      free(m->t[i].s);
+   }
+   if (m->fd >= 0) close(m->fd);
+   free(m->buf);
+   free(m);
+}
+
+int lm_mp4_tracks(const struct lm_mp4 *m) { return m ? m->nt : 0; }
+
+static const struct lm_mp4_track *track_of(const struct lm_mp4 *m, int t)
+{
+   if (!m || t < 0 || t >= m->nt) return NULL;
+   return &m->t[t];
+}
+
+const char *lm_mp4_mime(const struct lm_mp4 *m, int t)
+{
+   const struct lm_mp4_track *tr = track_of(m, t);
+   return tr ? tr->mime : NULL;
+}
+
+int64_t lm_mp4_duration_us(const struct lm_mp4 *m, int t)
+{
+   const struct lm_mp4_track *tr = track_of(m, t);
+   return tr ? tr->duration_us : 0;
+}
+
+void lm_mp4_video_size(const struct lm_mp4 *m, int t, int *w, int *h)
+{
+   const struct lm_mp4_track *tr = track_of(m, t);
+   if (w) *w = tr ? tr->width : 0;
+   if (h) *h = tr ? tr->height : 0;
+}
+
+void lm_mp4_audio_format(const struct lm_mp4 *m, int t, int *rate, int *channels)
+{
+   const struct lm_mp4_track *tr = track_of(m, t);
+   if (rate) *rate = tr ? tr->rate : 0;
+   if (channels) *channels = tr ? tr->channels : 0;
+}
+
+const uint8_t *lm_mp4_csd(const struct lm_mp4 *m, int t, size_t *len)
+{
+   const struct lm_mp4_track *tr = track_of(m, t);
+   if (len) *len = tr ? tr->csd_len : 0;
+   return tr ? tr->csd : NULL;
+}
+
+int lm_mp4_samples(const struct lm_mp4 *m, int t)
+{
+   const struct lm_mp4_track *tr = track_of(m, t);
+   return tr ? tr->ns : 0;
+}
+
+const uint8_t *lm_mp4_sample(struct lm_mp4 *m, int t, int i, size_t *len,
+                             int64_t *pts_us, bool *sync)
+{
+   const struct lm_mp4_track *tr = track_of(m, t);
+   if (!tr || i < 0 || i >= tr->ns) return NULL;
+   const struct lm_mp4_sample *s = &tr->s[i];
+   if (pts_us) *pts_us = s->pts_us;
+   if (sync) *sync = s->sync;
+
+   size_t need = s->size;
+   if (need > m->buf_cap) {
+      uint8_t *grown = realloc(m->buf, need);
+      if (!grown) return NULL;
+      m->buf = grown;
+      m->buf_cap = need;
+   }
+   if (!lm_read_at(m->fd, s->offset, m->buf, need)) return NULL;
+
+   /* AVC in MP4 prefixes each NAL with its length; a decoder wants Annex-B
+    * start codes.  The 4-byte case is a rewrite in place; narrower prefixes
+    * change the size, so those are expanded into the same buffer only when it
+    * is big enough to hold the growth. */
+   if (tr->nal_len > 0 && tr->nal_len <= 4) {
+      int nl = tr->nal_len;
+      if (nl == 4) {
+         size_t off = 0;
+         while (off + 4 <= need) {
+            uint32_t n = rd32(m->buf + off);
+            m->buf[off] = 0; m->buf[off + 1] = 0;
+            m->buf[off + 2] = 0; m->buf[off + 3] = 1;
+            if (n > need - off - 4) break;
+            off += 4 + n;
+         }
+      } else {
+         /* count NALs to size the expansion */
+         size_t off = 0, nnal = 0;
+         while (off + (size_t)nl <= need) {
+            uint32_t n = 0;
+            for (int k = 0; k < nl; ++k) n = (n << 8) | m->buf[off + k];
+            ++nnal;
+            if (n > need - off - (size_t)nl) break;
+            off += (size_t)nl + n;
+         }
+         size_t grow = need + nnal * (size_t)(4 - nl);
+         if (grow > m->buf_cap) {
+            uint8_t *grown = realloc(m->buf, grow);
+            if (!grown) return NULL;
+            m->buf = grown;
+            m->buf_cap = grow;
+         }
+         /* rewrite from the back so the moves do not overlap destructively */
+         size_t src = need, dst = grow;
+         /* walk forward once to record the NAL starts */
+         size_t starts[512];
+         size_t sizes[512];
+         size_t count = 0;
+         off = 0;
+         while (off + (size_t)nl <= need && count < 512) {
+            uint32_t n = 0;
+            for (int k = 0; k < nl; ++k) n = (n << 8) | m->buf[off + k];
+            if (n > need - off - (size_t)nl) break;
+            starts[count] = off + (size_t)nl;
+            sizes[count] = n;
+            ++count;
+            off += (size_t)nl + n;
+         }
+         for (size_t k = count; k-- > 0; ) {
+            dst -= sizes[k];
+            memmove(m->buf + dst, m->buf + starts[k], sizes[k]);
+            dst -= 4;
+            m->buf[dst] = 0; m->buf[dst + 1] = 0;
+            m->buf[dst + 2] = 0; m->buf[dst + 3] = 1;
+         }
+         (void)src;
+         need = grow - dst;
+         if (dst) memmove(m->buf, m->buf + dst, need);
+      }
+   }
+   if (len) *len = need;
+   return m->buf;
+}
+
+int lm_mp4_sync_sample_at(const struct lm_mp4 *m, int t, int64_t us)
+{
+   const struct lm_mp4_track *tr = track_of(m, t);
+   if (!tr || tr->ns <= 0) return 0;
+   int best = 0;
+   for (int i = 0; i < tr->ns; ++i) {
+      if (!tr->s[i].sync) continue;
+      if (tr->s[i].pts_us <= us) best = i;
+      else break;
+   }
+   return best;
 }

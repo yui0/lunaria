@@ -43,6 +43,9 @@ void lm_sink_push(struct lm_sink *s, const uint8_t *rgba, int w, int h,
  * pointer stays valid until the next push. */
 bool lm_sink_take(struct lm_sink *s, const uint8_t **rgba, int *w, int *h);
 
+/* Last frame still in the sink (even after take() cleared pending). */
+bool lm_sink_peek(const struct lm_sink *s, const uint8_t **rgba, int *w, int *h);
+
 /* Presentation time of the frame the last take() handed out, in nanoseconds —
  * SurfaceTexture.getTimestamp(). */
 int64_t lm_sink_timestamp(const struct lm_sink *s);
@@ -106,6 +109,47 @@ void lm_codec_release_output(struct lm_codec *c, int idx, bool render,
  * Java side of MediaCodec can log on the same switch. */
 bool lm_media_trace(void);
 
+struct dvm;
+/* Advance every MediaPlayer that is currently playing.  Called from the host
+ * pump loop so intro movies decode between native isPlaying polls. */
+void dvm_media_pump_active(struct dvm *vm);
+
 /* Audio decoders answer these instead of a picture size. */
 void lm_codec_audio_format(const struct lm_codec *c, int *rate, int *channels);
 bool lm_codec_is_video(const struct lm_codec *c);
+
+/* --- MP4 demuxing -------------------------------------------------------- *
+ *
+ * android.media.MediaExtractor and android.media.MediaPlayer are both handed a
+ * file descriptor and expected to know what is in it: how many tracks, their
+ * formats, and where every sample starts.  That is a container question, not a
+ * codec question, so it lives here next to the bitstream code and knows
+ * nothing about the dvm heap.
+ *
+ * Only the ISO base media format (MP4/M4A/MOV) is read — the one UE4 ships its
+ * movies in.  A file this cannot parse opens as zero tracks, which is what a
+ * device reports for a container it does not support. */
+struct lm_mp4;
+
+/* `fd` is borrowed for the lifetime of the demuxer (it is dup()ed inside).
+ * `length` <= 0 means "to the end of the file". */
+struct lm_mp4 *lm_mp4_open(int fd, int64_t offset, int64_t length);
+void lm_mp4_free(struct lm_mp4 *m);
+
+int lm_mp4_tracks(const struct lm_mp4 *m);
+/* "video/avc", "audio/mp4a-latm", … — the MediaFormat KEY_MIME of track `t`. */
+const char *lm_mp4_mime(const struct lm_mp4 *m, int t);
+int64_t lm_mp4_duration_us(const struct lm_mp4 *m, int t);
+void lm_mp4_video_size(const struct lm_mp4 *m, int t, int *w, int *h);
+void lm_mp4_audio_format(const struct lm_mp4 *m, int t, int *rate, int *channels);
+/* csd-0: Annex-B SPS/PPS for AVC, the AudioSpecificConfig for AAC. */
+const uint8_t *lm_mp4_csd(const struct lm_mp4 *m, int t, size_t *len);
+int lm_mp4_samples(const struct lm_mp4 *m, int t);
+
+/* Sample `i` of track `t`, read from the file into the demuxer's own buffer
+ * (valid until the next call).  AVC samples come back as Annex-B so a decoder
+ * fed straight from here needs no further framing. */
+const uint8_t *lm_mp4_sample(struct lm_mp4 *m, int t, int i, size_t *len,
+                             int64_t *pts_us, bool *sync);
+/* Index of the last sync sample at or before `us` — where a seek lands. */
+int lm_mp4_sync_sample_at(const struct lm_mp4 *m, int t, int64_t us);

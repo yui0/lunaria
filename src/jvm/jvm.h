@@ -125,7 +125,21 @@ struct jvm {
    // NOTE: These are pointers, and JNI interface passes pointers to these pointers!
    JNIEnv env; // points to native
    JavaVM vm; // points to invoke
+
+   /* The pending JNI exception.  A JNI caller finds out that a call failed by
+    * asking ExceptionCheck()/ExceptionOccurred(), not by the return value —
+    * ClassLoader.loadClass() answering "null, and no exception" tells the
+    * caller the class loaded and *is* null, which is not a thing that can
+    * happen on a device.  libswappy reads exactly this to decide whether to
+    * fall back to its own embedded dex. */
+   jthrowable pending_exception;
+   char pending_exception_class[128];
+   char pending_exception_msg[256];
 };
+
+/* Raise a JNI exception of `class_name` ("java/lang/ClassNotFoundException")
+ * with `msg`, as ThrowNew would.  Safe to call from the JNI stubs. */
+void jvm_throw_new(struct jvm *jvm, const char *class_name, const char *msg);
 
 const char*
 jvm_get_class_name(struct jvm *jvm, jobject object);

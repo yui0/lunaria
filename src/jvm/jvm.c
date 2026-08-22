@@ -444,20 +444,100 @@ JNIEnv_ToReflectedMethod(JNIEnv* p0, jclass p1, jmethodID p2, jboolean p3)
    return NULL;
 }
 
+static const char *jvm_framework_super(const char *name);
+
+/* Class names reach this layer both dotted (jvm_make_class) and slashed (the
+ * dex, and every literal in this file).  They name the same class. */
+static bool
+jvm_name_eq(const char *a, const char *b)
+{
+   if (!a || !b)
+      return false;
+   for (; *a && *b; ++a, ++b) {
+      char ca = (*a == '.') ? '/' : *a;
+      char cb = (*b == '.') ? '/' : *b;
+      if (ca != cb)
+         return false;
+   }
+   return !*a && !*b;
+}
+
+static void
+jvm_name_slashed(const char *name, char *out, size_t n)
+{
+   size_t i = 0;
+   for (; name && name[i] && i + 1 < n; ++i)
+      out[i] = (name[i] == '.') ? '/' : name[i];
+   out[i] = '\0';
+}
+
+/* One hop up the hierarchy: the dex for the app's own classes, the framework
+ * table for the platform's.  NULL at java/lang/Object or when neither knows. */
+static const char *
+jvm_super_of(const char *name)
+{
+   char slashed[512];
+   jvm_name_slashed(name, slashed, sizeof slashed);
+   const char *super = dvm_jni_super_name(slashed);
+   if (!super)
+      super = jvm_framework_super(slashed);
+   return super;
+}
+
+/* `sub instanceof sup`, decided from the declared hierarchy rather than from
+ * a name match.  A name match alone answers "no" for every inherited
+ * relationship: Play Core asks whether the activity it was handed is an
+ * android.content.Context, and got "no" for an object that is one through
+ * NativeActivity → Activity → ContextThemeWrapper → ContextWrapper. */
+static bool
+jvm_name_assignable(const char *sub, const char *sup)
+{
+   if (!sub || !sup)
+      return false;
+   if (jvm_name_eq(sup, "java/lang/Object"))
+      return true;
+   char sub_s[512], sup_s[512];
+   jvm_name_slashed(sub, sub_s, sizeof sub_s);
+   jvm_name_slashed(sup, sup_s, sizeof sup_s);
+   /* Interfaces only exist in the dex's view, so ask the VM first. */
+   if (dvm_jni_class_assignable(sub_s, sup_s))
+      return true;
+   const char *name = sub_s;
+   for (int hops = 0; name && hops < 32; ++hops) {
+      if (jvm_name_eq(name, sup_s))
+         return true;
+      name = jvm_super_of(name);
+   }
+   return false;
+}
+
 static jclass
 JNIEnv_GetSuperclass(JNIEnv* p0, jclass p1)
 {
    assert(p0 && p1);
-   verbose("FIXME: unimplemented");
-   return NULL;
+   struct jvm *jvm = jnienv_get_jvm(p0);
+   struct jvm_object *ko = jvm_get_object(jvm, p1);
+   const char *name = ko ? ko->klass.name.data : NULL;
+   const char *super = name ? jvm_super_of(name) : NULL;
+   /* java/lang/Object (and an interface) has no superclass — that is NULL by
+    * the JNI spec, not a failure. */
+   if (!super)
+      return NULL;
+   return jvm_make_class(jvm, super);
 }
 
 static jboolean
 JNIEnv_IsAssignableFrom(JNIEnv* p0, jclass p1, jclass p2)
 {
    assert(p0 && p1 && p2);
-   verbose("FIXME: unimplemented");
-   return 0;
+   struct jvm *jvm = jnienv_get_jvm(p0);
+   struct jvm_object *from = jvm_get_object(jvm, p1);
+   struct jvm_object *to = jvm_get_object(jvm, p2);
+   if (p1 == p2)
+      return true;
+   if (!from || !to)
+      return false;
+   return jvm_name_assignable(from->klass.name.data, to->klass.name.data);
 }
 
 static jobject
@@ -472,33 +552,75 @@ static jint
 JNIEnv_Throw(JNIEnv* p0, jthrowable p1)
 {
    assert(p0 && p1);
+   struct jvm *jvm = jnienv_get_jvm(p0);
+   jvm->pending_exception = p1;
+   const char *cls = jvm_get_class_name(jvm, p1);
+   snprintf(jvm->pending_exception_class, sizeof jvm->pending_exception_class,
+            "%s", cls ? cls : "java/lang/Throwable");
+   jvm->pending_exception_msg[0] = '\0';
    return 0;
 }
 
 static jint
 JNIEnv_ThrowNew(JNIEnv* p0, jclass p1, const char* p2)
 {
-   assert(p0 && p1 && p2);
+   assert(p0 && p1);
+   struct jvm *jvm = jnienv_get_jvm(p0);
+   jobject e = p0[0]->AllocObject(p0, p1);
+   /* AllocObject can only fail if the class handle is bad; the exception
+    * still has to become pending, so fall back to the class object itself. */
+   jvm->pending_exception = e ? e : (jthrowable)p1;
+   const char *cls = jvm_get_class_name(jvm, p1);
+   snprintf(jvm->pending_exception_class, sizeof jvm->pending_exception_class,
+            "%s", cls ? cls : "java/lang/Throwable");
+   snprintf(jvm->pending_exception_msg, sizeof jvm->pending_exception_msg,
+            "%s", p2 ? p2 : "");
    return 0;
+}
+
+void
+jvm_throw_new(struct jvm *jvm, const char *class_name, const char *msg)
+{
+   if (!jvm || !class_name) return;
+   JNIEnv *env = &jvm->env;
+   jclass cls = env[0]->FindClass(env, class_name);
+   if (cls) {
+      JNIEnv_ThrowNew(env, cls, msg);
+      return;
+   }
+   jvm->pending_exception = (jthrowable)(uintptr_t)1;
+   snprintf(jvm->pending_exception_class, sizeof jvm->pending_exception_class,
+            "%s", class_name);
+   snprintf(jvm->pending_exception_msg, sizeof jvm->pending_exception_msg,
+            "%s", msg ? msg : "");
 }
 
 static jthrowable
 JNIEnv_ExceptionOccurred(JNIEnv* p0)
 {
    assert(p0);
-   return NULL;
+   return jnienv_get_jvm(p0)->pending_exception;
 }
 
 static void
 JNIEnv_ExceptionDescribe(JNIEnv* p0)
 {
    assert(p0);
+   struct jvm *jvm = jnienv_get_jvm(p0);
+   if (!jvm->pending_exception) return;
+   fprintf(stderr, "[jvm] exception: %s%s%s\n", jvm->pending_exception_class,
+           jvm->pending_exception_msg[0] ? ": " : "",
+           jvm->pending_exception_msg);
 }
 
 static void
 JNIEnv_ExceptionClear(JNIEnv* p0)
 {
    assert(p0);
+   struct jvm *jvm = jnienv_get_jvm(p0);
+   jvm->pending_exception = NULL;
+   jvm->pending_exception_class[0] = '\0';
+   jvm->pending_exception_msg[0] = '\0';
 }
 
 static void
@@ -687,21 +809,14 @@ JNIEnv_IsInstanceOf(JNIEnv* p0, jobject p1, jclass p2)
    verbose("%s instanceof %s", oc, tc);
    { static int n; if (n < 24) { fprintf(stderr, "[isinst] %s instanceof %s\n", oc, tc); ++n; } }
 
-   if (jvm_get_object(jnienv_get_jvm(p0), p1)->this_klass == p2 || !strcmp(oc, tc))
+   if (jvm_get_object(jnienv_get_jvm(p0), p1)->this_klass == p2 || jvm_name_eq(oc, tc))
       return true;
-   /* Everything is an Object */
-   if (!strcmp(tc, "java/lang/Object"))
-      return true;
-   /* Minimal inheritance: MotionEvent / KeyEvent extend InputEvent.  Do NOT
-    * blanket-match on class-name substrings — Unity's nativeInjectEvent asks
-    * `event instanceof KeyEvent` FIRST, and a false positive here routed every
-    * touch down the key-event path (KeyCharacterMap.load) so getX/getY were
-    * never read and taps did nothing. */
-   if ((strstr(oc, "MotionEvent") || strstr(oc, "KeyEvent")) &&
-       strstr(tc, "InputEvent"))
-      return true;
-
-   return false;
+   /* The declared hierarchy — dex for the app's classes, the framework table
+    * for the platform's.  Never a substring match on the names: Unity's
+    * nativeInjectEvent asks `event instanceof KeyEvent` FIRST, and one false
+    * positive there routed every touch down the key-event path so getX/getY
+    * were never read and taps did nothing. */
+   return jvm_name_assignable(oc, tc);
 }
 
 /* ---- java.lang.StringBuilder (built into libjvm.so so dlsym always finds it) ----
@@ -814,6 +929,21 @@ jvm_framework_super(const char *name)
       { "android/app/Service",              "android/content/ContextWrapper" },
       { "android/content/ContextWrapper",   "android/content/Context" },
       { "android/content/Context",          "java/lang/Object" },
+      { "android/view/MotionEvent",         "android/view/InputEvent" },
+      { "android/view/KeyEvent",            "android/view/InputEvent" },
+      { "android/view/InputEvent",          "java/lang/Object" },
+      { "android/view/SurfaceView",         "android/view/View" },
+      { "android/view/View",                "java/lang/Object" },
+      { "android/os/Bundle",                "android/os/BaseBundle" },
+      { "android/os/BaseBundle",            "java/lang/Object" },
+      { "java/lang/String",                 "java/lang/Object" },
+      { "java/lang/Integer",                "java/lang/Number" },
+      { "java/lang/Long",                   "java/lang/Number" },
+      { "java/lang/Short",                  "java/lang/Number" },
+      { "java/lang/Byte",                   "java/lang/Number" },
+      { "java/lang/Float",                  "java/lang/Number" },
+      { "java/lang/Double",                 "java/lang/Number" },
+      { "java/lang/Number",                 "java/lang/Object" },
    };
    /* jvm_make_class() stores names dotted, the dex and this table use slashes;
     * compare with both separators treated as the same character. */
@@ -1230,12 +1360,25 @@ jvm_report_field_access(JNIEnv *env, jobject object, jfieldID field, const char 
    static T \
    JNIEnv_Get##N##Field(JNIEnv *p0, jclass p1, jfieldID method) { \
       jvm_report_field_access(p0, p1, method, "Get" #N "Field"); \
-      assert(p0 && p1 && method); \
+      /* A field read through a null reference is a NullPointerException on a \
+       * device — the calling thread unwinds and the process lives.  Aborting \
+       * the emulator turns one unimplemented getter several frames upstream \
+       * (Context.getResources() answering null) into a dead process, and \
+       * hides which getter that was. */ \
+      if (!p0 || !p1 || !method) { \
+         if (p0) jvm_throw_new(jnienv_get_jvm(p0), \
+                               "java/lang/NullPointerException", \
+                               "field access on a null reference"); \
+         return (D); \
+      } \
       union { T (*fun)(JNIEnv*, jobject); void *ptr; } f; \
       f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), (jmethodID)method); \
       if (f.ptr) return f.fun(p0, p1); \
       uint64_t bits = 0; T value = (D); \
-      if (!(ST) && dvm_jni_field(p0, (jobject)p1, method, false, &bits)) { \
+      /* Static and instance fields both live in the bytecode VM when the dex \
+       * defines the class; only the accessor differs. */ \
+      if (((ST) ? dvm_jni_static_field(p0, (jclass)p1, method, false, &bits) \
+                : dvm_jni_field(p0, (jobject)p1, method, false, &bits))) { \
          memcpy(&value, &bits, sizeof(value)); \
          return value; \
       } \
@@ -1246,13 +1389,19 @@ jvm_report_field_access(JNIEnv *env, jobject object, jfieldID field, const char 
    static void \
    JNIEnv_Set##N##Field(JNIEnv* p0, jclass p1, jfieldID method, T p3) { \
       jvm_report_field_access(p0, p1, method, "Set" #N "Field"); \
-      assert(p0 && p1 && method); \
+      if (!p0 || !p1 || !method) { \
+         if (p0) jvm_throw_new(jnienv_get_jvm(p0), \
+                               "java/lang/NullPointerException", \
+                               "field store through a null reference"); \
+         return; \
+      } \
       union { void (*fun)(JNIEnv*, jobject, T); void *ptr; } f; \
       if ((f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), (jmethodID)method))) \
          f.fun(p0, p1, p3); \
       else { \
          uint64_t bits = 0; memcpy(&bits, &p3, sizeof(p3)); \
-         if ((ST) || !dvm_jni_field(p0, (jobject)p1, method, true, &bits)) \
+         if (!((ST) ? dvm_jni_static_field(p0, (jclass)p1, method, true, &bits) \
+                    : dvm_jni_field(p0, (jobject)p1, method, true, &bits))) \
             jvm_set_field_bits(jnienv_get_jvm(p0), (jobject)p1, method, bits); \
       } \
    }
@@ -1809,7 +1958,7 @@ static jboolean
 JNIEnv_ExceptionCheck(JNIEnv* p0)
 {
    assert(p0);
-   return 0;
+   return jnienv_get_jvm(p0)->pending_exception ? JNI_TRUE : JNI_FALSE;
 }
 
 static jobject

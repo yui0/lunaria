@@ -211,6 +211,8 @@ static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
 /* A VM array going back to native, e.g. the byte[] Epic's decoder hands out of
  * GetOutputBuffer().  Without this it became an opaque object and the caller
  * read nothing out of it. */
+static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r);
+
 static jobject dvm_array_to_host(struct dvm *vm, JNIEnv *env, dvm_ref r)
 {
    struct dvm_object *o = dvm__obj(vm, r);
@@ -228,7 +230,31 @@ static jobject dvm_array_to_host(struct dvm *vm, JNIEnv *env, dvm_ref r)
       case 'J': h = (*env)->NewLongArray(env, n);    break;
       case 'F': h = (*env)->NewFloatArray(env, n);   break;
       case 'D': h = (*env)->NewDoubleArray(env, n);  break;
-      default: return NULL;   /* object arrays keep the wrapper path */
+      /* Object arrays.  Falling through to the plain-object wrapper turned an
+       * array into a bare java.lang.Object: GetArrayLength() then answered 0
+       * and the caller concluded the method had returned nothing.  UE's
+       * FJavaAndroidMediaPlayer::GetVideoTracks() is exactly that shape — it
+       * reads MediaPlayer14.GetVideoTracks()'s VideoTrackInfo[] through
+       * GetArrayLength/GetObjectArrayElement — so every movie came back with
+       * zero video tracks, SelectedVideoTrack stayed INDEX_NONE and
+       * FAndroidMediaPlayer::TickFetch never fetched a frame. */
+      default: {
+         const char *elem = (o->cls && o->cls->elem && o->cls->elem->name)
+            ? o->cls->elem->name : "java/lang/Object";
+         jclass ec = (*env)->FindClass(env, elem);
+         if (!ec) ec = (*env)->FindClass(env, "java/lang/Object");
+         h = (*env)->NewObjectArray(env, n, ec, NULL);
+         if (!h) return NULL;
+         /* Bind the handle before converting the elements: an element that
+          * refers back to this array then finds it instead of building a
+          * second one. */
+         o->host_handle = (uint32_t)(uintptr_t)h;
+         const dvm_ref *items = (const dvm_ref *)o->data;
+         for (jsize i = 0; items && i < n; ++i)
+            (*env)->SetObjectArrayElement(env, (jobjectArray)h, i,
+                                          to_jobject(vm, env, items[i]));
+         return h;
+      }
    }
    if (!h) return NULL;
    if (n > 0 && o->data) ARRAY_REGION(env, Set, kind, h, n, o->data);
@@ -325,6 +351,126 @@ static jvalue va_next(va_list *ap, const char *desc)
  * Hooks: bytecode calling out
  * ------------------------------------------------------------------------ */
 
+/* ApplicationInfo's on-disk layout: where the installer put the base APK and,
+ * for an app shipped as an App Bundle, each split it also wrote.
+ *
+ * An install-time asset pack is nothing but one of those splits, and Play Core
+ * resolves a pack by walking splitNames/splitSourceDirs — with both fields null
+ * it reports "No splits are found or app cannot be found in package manager"
+ * and then "Pack not found with pack name: <pack>".  The launcher hands the set
+ * over in ANDROID_SPLIT_APKS as "name|path;name|path". */
+/* Builds the two parallel String[]s the framework exposes for installed
+ * splits.  Returns how many there are; 0 leaves both refs untouched. */
+static size_t dvm_build_split_arrays(struct dvm *vm, dvm_ref *out_names,
+                                     dvm_ref *out_dirs)
+{
+   /* Off by default, and not because reporting them is wrong — it is the
+    * truthful answer, and the launcher now knows it.  It used to be off
+    * because Cross Worlds stopped at AndroidThunkJava_GooglePAD_Available once
+    * Play Core could see the splits; that is no longer true (the title now
+    * reaches the same render loop either way, and further).  What is still
+    * missing is the other half: Play Core resolves an install-time pack by
+    * walking these arrays and then asking AssetPackStorage for its directory,
+    * which the emulator does not answer — "Pack not found with pack name" is
+    * what the app gets.  LUNARIA_REPORT_SPLITS=1 turns reporting on for work
+    * on that half. */
+   const char *on = getenv("LUNARIA_REPORT_SPLITS");
+   if (!on || !*on || !strcmp(on, "0")) return 0;
+   const char *splits = getenv("ANDROID_SPLIT_APKS");
+   size_t n = 0;
+   for (const char *p = splits; p && *p; ) {
+      const char *end = strchr(p, ';');
+      if (!end) end = p + strlen(p);
+      if (strchr(p, '|') && strchr(p, '|') < end) ++n;
+      p = (*end == ';') ? end + 1 : end;
+   }
+   /* A package installed from a single APK genuinely has no split arrays;
+    * only describe them when the launcher actually installed splits. */
+   if (!n) return 0;
+   dvm_ref names = dvm_new_array(vm, 'L', "Ljava/lang/String;", (uint32_t)n);
+   dvm_ref dirs  = dvm_new_array(vm, 'L', "Ljava/lang/String;", (uint32_t)n);
+   dvm_ref *nslot = names ? dvm_array_data(vm, names) : NULL;
+   dvm_ref *dslot = dirs  ? dvm_array_data(vm, dirs)  : NULL;
+   if (!nslot || !dslot) return 0;
+   /* Collect first, then sort by name.  The framework keeps splitNames sorted
+    * and Play Core depends on it: it locates a pack with
+    * Arrays.binarySearch(splitNames, pack) and indexes splitSourceDirs with
+    * whatever comes back, so the two arrays must agree index for index and be
+    * in the order a binary search expects.  The launcher lists the splits in
+    * install order, which is not that order. */
+   struct split_ent { const char *name; size_t nlen; const char *dir; size_t dlen; };
+   struct split_ent e[64];
+   size_t i = 0;
+   for (const char *p = splits; *p && i < n && i < 64; ) {
+      const char *bar = strchr(p, '|');
+      const char *end = strchr(p, ';');
+      if (!end) end = p + strlen(p);
+      if (bar && bar < end) {
+         e[i].name = p;       e[i].nlen = (size_t)(bar - p);
+         e[i].dir  = bar + 1; e[i].dlen = (size_t)(end - bar - 1);
+         ++i;
+      }
+      p = (*end == ';') ? end + 1 : end;
+   }
+   n = i;
+   for (size_t a = 1; a < n; ++a) {           /* insertion sort; n is tiny */
+      for (size_t b = a; b > 0; --b) {
+         size_t la = e[b - 1].nlen, lb = e[b].nlen, m = la < lb ? la : lb;
+         int c = strncmp(e[b - 1].name, e[b].name, m);
+         if (c == 0) c = la < lb ? -1 : la > lb ? 1 : 0;
+         if (c <= 0) break;
+         struct split_ent t = e[b - 1]; e[b - 1] = e[b]; e[b] = t;
+      }
+   }
+   for (i = 0; i < n; ++i) {
+      nslot[i] = dvm_new_string_n(vm, e[i].name, e[i].nlen);
+      dslot[i] = dvm_new_string_n(vm, e[i].dir,  e[i].dlen);
+   }
+   *out_names = names;
+   *out_dirs  = dirs;
+   return n;
+}
+
+static void dvm_fill_application_info_paths(struct dvm *vm, dvm_ref ai)
+{
+   /* Deliberately not filling sourceDir / publicSourceDir / dataDir here.
+    * They are just as null-and-wrong as the split fields were, but once they
+    * hold real values the Netmarble SDK takes a different path through
+    * Context: getCacheDir().getAbsolutePath() came back empty ("/cashinfo.json"
+    * instead of <cache>/cashinfo.json) and getResources().getConfiguration()
+    * returned null.  That is its own bug in the Context/Resources stubs and
+    * wants its own investigation — describing the splits does not depend on
+    * it. */
+   union dvm_value v;
+   dvm_ref names = 0, dirs = 0;
+   if (!dvm_build_split_arrays(vm, &names, &dirs)) return;
+   v.l = names;
+   (void)dvm_set_field(vm, ai, "splitNames", "[Ljava/lang/String;", v);
+   v.l = dirs;
+   (void)dvm_set_field(vm, ai, "splitSourceDirs", "[Ljava/lang/String;", v);
+   (void)dvm_set_field(vm, ai, "splitPublicSourceDirs", "[Ljava/lang/String;", v);
+}
+
+/* Is this PackageManager query about the app that is running?
+ *
+ * A device answers getPackageInfo()/getApplicationInfo() for a package it does
+ * not have with NameNotFoundException.  The emulator used to answer *every*
+ * name with the running app's own record, so a library probing for another
+ * package found one — with the wrong signature and the wrong version.  That is
+ * a worse answer than "not installed": Google's client library reads it as
+ * SERVICE_INVALID ("requires Google Play services, but their signature is
+ * invalid") instead of SERVICE_MISSING, and an SDK that has a documented
+ * no-Play-services path never takes it. */
+static bool pm_query_is_self(struct dvm *vm, const union dvm_value *args,
+                             int nargs)
+{
+   if (nargs < 1 || !args[0].l) return true;   /* null name: the caller's own */
+   const char *want = dvm_string_utf8(vm, args[0].l);
+   if (!want || !*want) return true;
+   const char *self = getenv("ANDROID_PACKAGE_NAME");
+   return self && !strcmp(want, self);
+}
+
 static bool hook_call_external(void *user, struct dvm *vm, const char *class_name,
                                const char *method, const char *sig, dvm_ref self,
                                const union dvm_value *args, int nargs,
@@ -370,6 +516,13 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
    if (!strcmp(method, "getApplicationInfo") &&
        (strstr(class_name, "PackageManager") || strstr(class_name, "Context"))) {
       memset(out, 0, sizeof *out);
+      if (!pm_query_is_self(vm, args, nargs)) {
+         /* Handled — the pending exception is the answer, so do not fall
+          * through to the "no such external method" path. */
+         dvm__throw(vm, "android/content/pm/PackageManager$NameNotFoundException",
+                    "%s", args[0].l ? dvm_string_utf8(vm, args[0].l) : "");
+         return true;
+      }
       struct dvm_class *ac =
          dvm_find_class(vm, "android/content/pm/ApplicationInfo");
       dvm_ref ai = ac ? dvm_new_object(vm, ac) : 0;
@@ -383,6 +536,7 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
       /* An app cannot target a level the device does not have. */
       v.i = lunaria_sdk_int();
       (void)dvm_set_field(vm, ai, "targetSdkVersion", "I", v);
+      dvm_fill_application_info_paths(vm, ai);
       dvm_pin(vm, ai);
       out->l = ai;
       return true;
@@ -390,13 +544,37 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
 
    if (!strcmp(method, "getPackageInfo") && strstr(class_name, "PackageManager")) {
       memset(out, 0, sizeof *out);
+      if (!pm_query_is_self(vm, args, nargs)) {
+         /* Handled — the pending exception is the answer, so do not fall
+          * through to the "no such external method" path. */
+         dvm__throw(vm, "android/content/pm/PackageManager$NameNotFoundException",
+                    "%s", args[0].l ? dvm_string_utf8(vm, args[0].l) : "");
+         return true;
+      }
       struct dvm_class *pc = dvm_find_class(vm, "android/content/pm/PackageInfo");
       struct dvm_class *ac = dvm_find_class(vm, "android/content/pm/ApplicationInfo");
       dvm_ref pi = pc ? dvm_new_object(vm, pc) : 0;
       dvm_ref ai = ac ? dvm_new_object(vm, ac) : 0;
       if (!pi || !ai) return false;
+      dvm_fill_application_info_paths(vm, ai);
       union dvm_value v = { .i = lunaria_sdk_int() };
       (void)dvm_set_field(vm, ai, "targetSdkVersion", "I", v);
+      /* Same ApplicationInfo the getApplicationInfo path builds: manifest
+       * meta-data is read straight off pi.applicationInfo.metaData. */
+      {
+         struct dvm_class *bc = dvm_find_class(vm, "android/os/Bundle");
+         union dvm_value bv = { .l = bc ? dvm_new_object(vm, bc) : 0 };
+         if (bv.l) (void)dvm_set_field(vm, ai, "metaData", "Landroid/os/Bundle;", bv);
+      }
+      /* Play Core's SplitInstallInfoProvider reads the installed split set off
+       * PackageInfo, not off ApplicationInfo. */
+      {
+         dvm_ref sn = 0, sd = 0;
+         if (dvm_build_split_arrays(vm, &sn, &sd)) {
+            union dvm_value sv = { .l = sn };
+            (void)dvm_set_field(vm, pi, "splitNames", "[Ljava/lang/String;", sv);
+         }
+      }
       const char *pkg = getenv("ANDROID_PACKAGE_NAME");
       v.l = pkg ? dvm_new_string(vm, pkg) : 0;
       (void)dvm_set_field(vm, ai, "packageName", "Ljava/lang/String;", v);
@@ -470,6 +648,20 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
        !strcmp(method, "getDeviceIds")) {
       memset(out, 0, sizeof *out);
       out->l = dvm_new_array(vm, 'I', "I", 0);
+      return true;
+   }
+
+   /* DisplayManager.register/unregisterDisplayListener.  The emulator presents
+    * a single display whose one mode (see getSupportedModes below) never
+    * changes, and a display that never appears, disappears or reconfigures
+    * itself delivers no callbacks — so accepting the registration is the whole
+    * of the work here.  Reporting the method as missing instead is what is
+    * wrong: SwappyDisplayManager calls it from startListening(), and an
+    * unresolved call there reads as "this device has no display service". */
+   if (!strcmp(class_name, "android/hardware/display/DisplayManager") &&
+       (!strcmp(method, "registerDisplayListener") ||
+        !strcmp(method, "unregisterDisplayListener"))) {
+      memset(out, 0, sizeof *out);
       return true;
    }
 
@@ -952,6 +1144,57 @@ bool dvm_jni_field(JNIEnv *env, jobject obj, jfieldID field, bool set,
    return true;
 }
 
+bool dvm_jni_static_field(JNIEnv *env, jclass cls_ref, jfieldID field, bool set,
+                          uint64_t *bits)
+{
+   struct dvm *vm = vm_get();
+   if (!vm || dvm_jni_mode() == DVM_JNI_OFF || !env || !field || !bits)
+      return false;
+
+   const char *cls = NULL, *name = NULL, *type = NULL;
+   if (!jvm_field_info(jnienv_get_jvm(env), field, &cls, &name, &type))
+      return false;
+   (void)cls_ref; /* the field id already names the class it belongs to */
+   if (getenv("LUNARIA_TRACE_FIELDS")) {
+      static int n;
+      if (n++ < 200)
+         fprintf(stderr, "[dvm] %s static field %s.%s:%s (dex=%d)\n",
+                 set ? "set" : "get", cls, name, type,
+                 dvm_find_class(vm, cls) ? 1 : 0);
+   }
+   struct dvm_class *k = dvm_find_class(vm, cls);
+   if (!k) return false;   /* not ours: the stub layer keeps its own storage */
+
+   if (set) {
+      union dvm_value v = { 0 };
+      switch (type[0]) {
+         case 'Z': v.i = (*bits & 0xffu) ? 1 : 0; break;
+         case 'B': v.i = (int8_t)*bits; break;
+         case 'C': v.i = (uint16_t)*bits; break;
+         case 'S': v.i = (int16_t)*bits; break;
+         case 'I': v.i = (int32_t)*bits; break;
+         case 'J': v.j = (int64_t)*bits; break;
+         case 'F': { uint32_t u = (uint32_t)*bits; memcpy(&v.f, &u, 4); break; }
+         case 'D': { uint64_t u = *bits; memcpy(&v.d, &u, 8); break; }
+         default:  v.l = from_jobject(vm, env, (jobject)(uintptr_t)*bits); break;
+      }
+      return dvm_set_static(vm, k, name, type, v);
+   }
+
+   union dvm_value v = { 0 };
+   if (!dvm_get_static(vm, k, name, type, &v)) return false;
+   *bits = 0;
+   switch (type[0]) {
+      case 'Z': case 'B': case 'C': case 'S': case 'I':
+         *bits = (uint32_t)v.i; break;
+      case 'J': *bits = (uint64_t)v.j; break;
+      case 'F': { uint32_t u; memcpy(&u, &v.f, 4); *bits = u; break; }
+      case 'D': { uint64_t u; memcpy(&u, &v.d, 8); *bits = u; break; }
+      default:  *bits = (uint64_t)(uintptr_t)to_jobject(vm, env, v.l); break;
+   }
+   return true;
+}
+
 const char *dvm_jni_super_name(const char *class_name)
 {
    struct dvm *vm = vm_get();
@@ -966,10 +1209,44 @@ const char *dvm_jni_super_name(const char *class_name)
    return cls ? dvm_class_super_name(cls) : NULL;
 }
 
+bool dvm_jni_class_assignable(const char *sub, const char *sup)
+{
+   struct dvm *vm = vm_get();
+   if (!vm || !sub || !sup)
+      return false;
+   /* Only answer for classes a dex actually defines.  For anything else the
+    * VM synthesises an external class whose super is java/lang/Object and
+    * whose interface list is empty, and class_assignable() would then report
+    * "not assignable" for a relationship the framework really has. */
+   if (!dvm_class_is_known(vm, sub) || !dvm_class_is_known(vm, sup))
+      return false;
+   struct dvm_class *a = dvm_find_class(vm, sub);
+   struct dvm_class *b = dvm_find_class(vm, sup);
+   if (!a || !b)
+      return false;
+   return dvm__class_assignable(vm, a, b);
+}
+
 bool dvm_jni_class_in_dex(const char *class_name)
 {
    struct dvm *vm = vm_get();
    return vm && class_name && dvm_class_is_known(vm, class_name);
+}
+
+bool dvm_jni_method_in_dex(const char *class_name, const char *method,
+                           const char *sig)
+{
+   struct dvm *vm = vm_get();
+   if (dvm_jni_mode() == DVM_JNI_OFF || !vm || !class_name || !method)
+      return false;
+   struct dvm_method *m = find(vm, class_name, method, sig);
+   return m && m->has_code;
+}
+
+bool dvm_jni_add_dex_memory(const void *data, size_t len, const char *name)
+{
+   struct dvm *vm = vm_get();
+   return vm && dvm_add_dex_memory(vm, data, len, name);
 }
 
 void dvm_jni_report(void)
@@ -979,4 +1256,9 @@ void dvm_jni_report(void)
                    "%llu instructions\n",
            g_calls, g_external_calls, g_native_calls,
            (unsigned long long)dvm_instructions(g_vm));
+}
+
+struct dvm *dvm_jni_vm(void)
+{
+   return vm_get();
 }

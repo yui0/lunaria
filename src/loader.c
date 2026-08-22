@@ -20,11 +20,13 @@
 #include <limits.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <time.h>
 #include "linker/dlfcn.h"
 #include "linker/linker.h"
 #include "jvm/jvm.h"
 #include "arm_exec.h"
 #include "dvm/dvm_jni.h"
+#include "dvm/dvm_media.h"
 #include <link.h>
 
 /* Exposed from arm_exec.cpp for diagnostic dumps */
@@ -141,9 +143,113 @@ static void a64_preload_needed(const char *path, const char *dir,
    }
 }
 
+/* LUNARIA_TOUCH_TEST replay, shared by the pump loops.
+ *
+ * x,y[;x,y...] taps, one after another: LUNARIA_TOUCH_FRAME is the first
+ * tap's DOWN frame, LUNARIA_TOUCH_HOLD its length, LUNARIA_TOUCH_GAP the wait
+ * before the next.  Injection goes through arm_exec_touch_push(), which routes
+ * through the emulator's own window layer first, so these taps can press a
+ * dialog the emulator is showing as well as reach the guest.
+ *
+ * More than one point because a dialog is more than one press: a terms gate
+ * wants a checkbox and then Confirm, in that order. */
+static void touch_test_tick(int frame_count)
+{
+#define TT_MAX 8
+   static float tt_x[TT_MAX], tt_y[TT_MAX];
+   static int tt_n = -1, tt_frame = 60, tt_hold = 10, tt_gap = 60;
+   if (tt_n < 0) {
+      tt_n = 0;
+      const char *tt = getenv("LUNARIA_TOUCH_TEST");
+      for (const char *p = tt; p && *p && tt_n < TT_MAX; ) {
+         float x = -1, y = -1;
+         if (sscanf(p, "%f,%f", &x, &y) == 2 && x >= 0 && y >= 0) {
+            tt_x[tt_n] = x; tt_y[tt_n] = y; ++tt_n;
+         }
+         const char *semi = strchr(p, ';');
+         if (!semi) break;
+         p = semi + 1;
+      }
+      const char *tf = getenv("LUNARIA_TOUCH_FRAME");
+      if (tf) { int v = atoi(tf); if (v > 0) tt_frame = v; }
+      const char *th = getenv("LUNARIA_TOUCH_HOLD");
+      if (th) { int v = atoi(th); if (v > 0) tt_hold = v; }
+      const char *tg = getenv("LUNARIA_TOUCH_GAP");
+      if (tg) { int v = atoi(tg); if (v > 0) tt_gap = v; }
+   }
+   if (tt_n <= 0) return;
+   const int stride = tt_hold + tt_gap;
+   for (int t = 0; t < tt_n; ++t) {
+      const int down = tt_frame + t * stride;
+      if (frame_count == down) {
+         arm_exec_touch_push(0, tt_x[t], tt_y[t]);  /* ACTION_DOWN */
+         fprintf(stderr, "[loader] TOUCH_TEST[%d] DOWN (%.0f,%.0f) frame %d\n",
+                 t, tt_x[t], tt_y[t], frame_count);
+      }
+      /* ACTION_MOVE every frame while held: Unity keeps the touch active */
+      if (frame_count > down && frame_count < down + tt_hold)
+         arm_exec_touch_push(2, tt_x[t], tt_y[t]);
+      if (frame_count == down + tt_hold) {
+         arm_exec_touch_push(1, tt_x[t], tt_y[t]);  /* ACTION_UP */
+         fprintf(stderr, "[loader] TOUCH_TEST[%d] UP (%.0f,%.0f) frame %d (hold=%d)\n",
+                 t, tt_x[t], tt_y[t], frame_count, tt_hold);
+      }
+   }
+#undef TT_MAX
+}
+
 /* Set by the AArch64 run paths so the stall dump reports the A64 JIT state
  * instead of the (idle) A32 one. */
 static int g_dump_arm64;
+
+/* A guest that stops presenting is the shape every "it just sits there" bug
+ * takes, and it is invisible from the outside: the pump loop keeps spinning
+ * at full speed with nothing behind it.  Watch the guest's own present count
+ * and, when it stops moving, dump the guest thread state from the pump loop
+ * itself.  The same dump used to be reachable only through SIGUSR1, which
+ * runs the (decidedly not async-signal-safe) dumper on whatever thread the
+ * signal lands on and takes the process down with it.
+ *
+ * LUNARIA_STALL_S seconds with no present triggers a report; 0 disables. */
+static void stall_watch_tick(void)
+{
+   static double next_s = -1.0;   /* -1: not configured yet, 0: disabled */
+   static uint64_t last_swaps;
+   static double last_change;
+   static int reports;
+
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   const double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+
+   if (next_s < 0.0) {
+      const char *e = getenv("LUNARIA_STALL_S");
+      next_s = e && *e ? atof(e) : 10.0;
+      if (next_s < 0.0) next_s = 0.0;
+      last_change = now;
+   }
+   if (next_s == 0.0) return;
+
+   const uint64_t swaps = arm_exec_guest_swap_count();
+   if (swaps != last_swaps) {
+      last_swaps = swaps;
+      last_change = now;
+      reports = 0;
+      return;
+   }
+   /* Nothing to say before the guest has presented at all: startup legitimately
+    * takes tens of seconds, and the pump loop is the only thing running. */
+   if (swaps == 0 || now - last_change < next_s) return;
+   if (reports >= 8) return;
+
+   fprintf(stderr, "[stall] guest has not presented for %.1fs "
+           "(%llu presents so far) — dumping guest threads #%d "
+           "(LUNARIA_STALL_S=0 to silence)\n",
+           now - last_change, (unsigned long long)swaps, reports);
+   ++reports;
+   arm64_exec_svc_ring_dump();
+   last_change = now;   /* re-arm, so a long stall reports periodically */
+}
 
 static void svc_dump_handler(int sig) {
     (void)sig;
@@ -732,6 +838,160 @@ run_jni_game(struct jvm *jvm)
    return EXIT_SUCCESS;
 }
 
+/* --- host frame pump pacing ----------------------------------------------
+ *
+ * The pump has two jobs: present at a steady rate, and service host window
+ * events.  Running the guest is the cooperative scheduler's job.  The loops
+ * below used to conflate the two — one scheduler pass, then a flat
+ * usleep(16000) — and a pass ends as soon as every runnable thread has had its
+ * slice, which during loading is a fraction of a millisecond.  Measured on a
+ * Cross Worlds startup, guest code ran 114 ms out of 6.7 s of wall time: the
+ * emulator was idle 98% of the time and everything before the first frame took
+ * roughly fifty times longer than the work in it warrants.
+ *
+ * A device runs the engine threads continuously between vsyncs, so do the
+ * same: keep scheduling until the frame budget is spent, and sleep out the
+ * remainder only when a pass executed no guest code at all — that is, when
+ * every guest thread is parked on a cond/futex/mutex/fd and there is genuinely
+ * nothing to run.
+ */
+static uint64_t
+pump_now_us(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
+
+static void
+pump_run_frame(void (*run_threads)(void))
+{
+   static uint64_t budget_us = 0;
+   static uint64_t va_get_clock = 0;
+   static uint64_t va_tick_fetch = 0;
+   static uint64_t va_tick_render = 0;
+   static uint64_t va_tick_pre_engine = 0;
+   static uint64_t va_tick_post_engine = 0;
+   static uint64_t va_tick_input = 0;
+   static uint64_t va_tick_output = 0;
+   static int ue_media_tick_dbg = 0;
+   static int ue_media_tick_inited = 0;
+   static int ue_media_tick_use_a64 = 0;
+
+   if (!ue_media_tick_inited) {
+      /* UE4 video playback uses FMediaClock/FJavaAndroidMediaPlayer to
+       * eventually call MediaPlayer14.updateVideoFrame/getVideoLastFrame.
+       * On Lunaria bring-up the media clock path can miss frames, leaving
+       * the movie texture white. Tick the clock explicitly to re-enter the
+       * native→JNI→SurfaceTexture consumer pipeline. */
+      ue_media_tick_dbg = getenv("LUNARIA_TRACE_MEDIA") ? 1 : 0;
+
+      /* Resolve for the currently active guest arch. */
+      va_get_clock   = arm_exec_lookup_export("_ZN12FMediaModule8GetClockEv");
+      va_tick_fetch  = arm_exec_lookup_export("_ZN11FMediaClock9TickFetchEv");
+      va_tick_render = arm_exec_lookup_export("_ZN11FMediaClock10TickRenderEv");
+      va_tick_pre_engine =
+         arm_exec_lookup_export("_ZN12FMediaModule13TickPreEngineEv");
+      va_tick_post_engine =
+         arm_exec_lookup_export("_ZN12FMediaModule14TickPostEngineEv");
+      va_tick_input = arm_exec_lookup_export("_ZN11FMediaClock9TickInputEv");
+      va_tick_output = arm_exec_lookup_export("_ZN11FMediaClock10TickOutputEv");
+
+      if (!va_get_clock && !va_tick_fetch && !va_tick_render &&
+          !va_tick_pre_engine && !va_tick_post_engine &&
+          !va_tick_input && !va_tick_output) {
+         /* arm64: arm_exec_lookup_export reads the 32-bit dynsym only. */
+         va_get_clock   = arm64_exec_lookup_export("_ZN12FMediaModule8GetClockEv");
+         va_tick_fetch  = arm64_exec_lookup_export("_ZN11FMediaClock9TickFetchEv");
+         va_tick_render = arm64_exec_lookup_export("_ZN11FMediaClock10TickRenderEv");
+         va_tick_pre_engine =
+            arm64_exec_lookup_export("_ZN12FMediaModule13TickPreEngineEv");
+         va_tick_post_engine =
+            arm64_exec_lookup_export("_ZN12FMediaModule14TickPostEngineEv");
+         va_tick_input = arm64_exec_lookup_export("_ZN11FMediaClock9TickInputEv");
+         va_tick_output = arm64_exec_lookup_export("_ZN11FMediaClock10TickOutputEv");
+         ue_media_tick_use_a64 = 1;
+      }
+
+      ue_media_tick_inited = 1;
+      if (ue_media_tick_dbg) {
+         fprintf(stderr,
+                 "[media] UE clock symbols: getClock=0x%llx tickFetch=0x%llx tickRender=0x%llx (a64=%d)\n",
+                 (unsigned long long)va_get_clock,
+                 (unsigned long long)va_tick_fetch,
+                 (unsigned long long)va_tick_render,
+                 ue_media_tick_use_a64);
+      }
+   }
+   if (!budget_us) {
+      const char *e = getenv("LUNARIA_FRAME_US");
+      long v = (e && *e) ? atol(e) : 16000;
+      budget_us = v > 0 ? (uint64_t)v : 16000;
+   }
+   const uint64_t deadline = pump_now_us() + budget_us;
+   for (;;) {
+      const uint64_t before = arm_exec_sched_ticks();
+      run_threads();
+      const uint64_t now = pump_now_us();
+      if (now >= deadline)
+         break;
+      if (arm_exec_sched_ticks() != before)
+         continue;   /* the guest is working — let it have the whole frame */
+      /* Everything is parked.  Wait in small steps so that a wakeup which
+       * becomes visible mid-frame is not held back until the next one. */
+      usleep((deadline - now > 1000ull) ? 1000u : (useconds_t)(deadline - now));
+   }
+   {
+      struct dvm *vm = dvm_jni_vm();
+      if (vm) dvm_media_pump_active(vm);
+
+      /* Drive UE's media clock even when the guest happens to be waiting
+       * on other task graph work; this is the root of "updateVideoFrame
+       * isn't called during playback". */
+      if (va_get_clock) {
+         uint64_t clk = ue_media_tick_use_a64
+            ? (uint64_t)arm64_exec_call(va_get_clock, 0, 0, 0, 0)
+            : (uint64_t)arm_exec_call((uint32_t)va_get_clock, 0, 0, 0, 0);
+
+         if (clk) {
+            /* Also tick the media module stage that usually prepares clocks
+             * and sinks; on Lunaria the engine's pre-engine stage can miss
+             * the media task graph. */
+            if (va_tick_pre_engine) {
+               if (ue_media_tick_use_a64)
+                  (void)arm64_exec_call(va_tick_pre_engine, 0, 0, 0, 0);
+               else
+                  (void)arm_exec_call((uint32_t)va_tick_pre_engine, 0, 0, 0, 0);
+            }
+            if (va_tick_post_engine) {
+               if (ue_media_tick_use_a64)
+                  (void)arm64_exec_call(va_tick_post_engine, 0, 0, 0, 0);
+               else
+                  (void)arm_exec_call((uint32_t)va_tick_post_engine, 0, 0, 0, 0);
+            }
+         }
+
+         if (clk) {
+            if (ue_media_tick_use_a64) {
+               if (va_tick_input)  (void)arm64_exec_call(va_tick_input, clk, 0, 0, 0);
+               if (va_tick_fetch)  (void)arm64_exec_call(va_tick_fetch, clk, 0, 0, 0);
+               if (va_tick_output) (void)arm64_exec_call(va_tick_output, clk, 0, 0, 0);
+               if (va_tick_render) (void)arm64_exec_call(va_tick_render, clk, 0, 0, 0);
+            } else {
+               if (va_tick_input)  (void)arm_exec_call((uint32_t)va_tick_input, (uint32_t)clk, 0, 0, 0);
+               if (va_tick_fetch)  (void)arm_exec_call((uint32_t)va_tick_fetch, (uint32_t)clk, 0, 0, 0);
+               if (va_tick_output) (void)arm_exec_call((uint32_t)va_tick_output, (uint32_t)clk, 0, 0, 0);
+               if (va_tick_render) (void)arm_exec_call((uint32_t)va_tick_render, (uint32_t)clk, 0, 0, 0);
+            }
+         } else if (ue_media_tick_dbg) {
+            fprintf(stderr, "[media] UE clock pointer is 0\n");
+            /* Disable printing after first failure. */
+            ue_media_tick_dbg = 0;
+         }
+      }
+   }
+}
+
 static int
 run_ue4_game_arm(struct jvm *jvm)
 {
@@ -992,13 +1252,12 @@ run_ue4_game_arm(struct jvm *jvm)
          fprintf(stderr, "[loader] guest abort — stopping UE4 loop (frame %d)\n", frame);
          break;
       }
-      arm_exec_run_pending_threads();
+      pump_run_frame(arm_exec_run_pending_threads);
       arm_exec_egl_swap();
       arm_exec_glfw_poll();
       if (frame < 5 || frame % 50 == 0)
          fprintf(stderr, "[loader] UE4 pump frame %d\n", frame);
       if (arm_exec_glfw_should_close()) break;
-      usleep(16000);
    }
    return EXIT_SUCCESS;
 }
@@ -1056,6 +1315,7 @@ ue_activity_dex_class(void)
 static int dex_call_lifecycle(struct jvm *jvm, jobject self, const char *cls,
                               const char *method, const char *sig,
                               int takes_null_arg);
+static int start_manifest_providers(struct jvm *jvm, jobject context);
 
 static jobject
 ue_start_dex_application(struct jvm *jvm)
@@ -1091,6 +1351,10 @@ ue_start_dex_application(struct jvm *jvm)
               cls);
       jvm->native.CallVoidMethodA(&jvm->env, app, attach, &a);
    }
+   /* ActivityThread installs ContentProviders after attachBaseContext and
+    * before Application.onCreate.  FirebaseInitProvider.initializeApp lives
+    * here — skipping it left FirebaseApp.getInstance() throwing later. */
+   start_manifest_providers(jvm, app);
    (void)dex_call_lifecycle(jvm, app, cls, "onCreate", "()V", 0);
    return app;
 }
@@ -1467,16 +1731,33 @@ run_ue4_game_arm64(struct jvm *jvm)
          fprintf(stderr, "[loader] guest abort — stopping UE arm64 loop (frame %d)\n", frame);
          break;
       }
-      arm64_exec_run_pending_threads();
+      touch_test_tick(frame);
+      /* SetDesiredViewSize resized the surface.  Deliver the surfaceChanged
+       * the engine would have got on a device, or it keeps mapping input
+       * against the size it was told at startup. */
+      {
+         int nw = 0, nh = 0;
+         if (arm_exec_take_view_resize(&nw, &nh) && nw > 0 && nh > 0) {
+            if (va_set_win)
+               arm64_exec_call(va_set_win, env, ctx, (nh > nw) ? 1u : 0u, 0);
+            if (va_set_surf) {
+               fprintf(stderr, "[loader] UE arm64 nativeSetSurfaceViewInfo "
+                       "%dx%d (view resized)\n", nw, nh);
+               arm64_exec_call(va_set_surf, env, ctx, (uint64_t)nw,
+                               (uint64_t)nh);
+            }
+         }
+      }
+      pump_run_frame(arm64_exec_run_pending_threads);
       /* The engine renders on its own thread and swaps through the EGL
        * bridge; present here too so a frame reaches the window even when the
        * guest's swap goes through the Java surface path. */
       arm64_exec_egl_swap();
       arm64_exec_glfw_poll();
+      stall_watch_tick();
       if (frame < 5 || frame % 50 == 0)
          fprintf(stderr, "[loader] UE arm64 pump frame %d\n", frame);
       if (arm64_exec_glfw_should_close()) break;
-      usleep(16000);
    }
    return EXIT_SUCCESS;
 }
@@ -1832,13 +2113,12 @@ run_dex_activity_arm64(struct jvm *jvm)
          fprintf(stderr, "[loader] guest abort — stopping dex loop (frame %d)\n", frame);
          break;
       }
-      arm64_exec_run_pending_threads();
+      pump_run_frame(arm64_exec_run_pending_threads);
       arm64_exec_egl_swap();
       arm64_exec_glfw_poll();
       if (frame < 5 || frame % 50 == 0)
          fprintf(stderr, "[loader] dex pump frame %d\n", frame);
       if (arm64_exec_glfw_should_close()) break;
-      usleep(16000);
    }
    return EXIT_SUCCESS;
 }
@@ -2044,48 +2324,24 @@ run_jni_game_arm(struct jvm *jvm)
                  max_frames);
          break;
       }
-      /* LUNARIA_TOUCH_TEST=x,y: auto DOWN/UP (default frames 60/70).
-       * LUNARIA_TOUCH_FRAME=N  : DOWN frame (UP = N + hold).
-       * LUNARIA_TOUCH_HOLD=N   : hold duration in frames (default 10).
-       *                          Each frame during the hold injects ACTION_MOVE
-       *                          so Unity sees a continuous touch. */
+      /* フォーカス再送: 実機では surfaceChanged 後に focus が届く。
+       * ループ前の nativeFocusChanged はエンジン初期化で上書きされる
+       * 疑いがあるため、タップ前に再送して入力ゲートを開く */
       {
-         static float tt_x = -1, tt_y = -1; static int tt_parsed = 0;
-         static int tt_frame = 60, tt_hold = 10;
+         static int tt_frame = 60, tt_parsed = 0;
          if (!tt_parsed) {
             tt_parsed = 1;
-            const char *tt = getenv("LUNARIA_TOUCH_TEST");
-            if (tt) sscanf(tt, "%f,%f", &tt_x, &tt_y);
             const char *tf = getenv("LUNARIA_TOUCH_FRAME");
             if (tf) { int v = atoi(tf); if (v > 0) tt_frame = v; }
-            const char *th = getenv("LUNARIA_TOUCH_HOLD");
-            if (th) { int v = atoi(th); if (v > 0) tt_hold = v; }
          }
-         if (tt_x >= 0) {
-            /* フォーカス再送: 実機では surfaceChanged 後に focus が届く。
-             * ループ前の nativeFocusChanged はエンジン初期化で上書きされる
-             * 疑いがあるため、タップ前に再送して入力ゲートを開く */
-            if (frame_count == tt_frame - 10 && tt_frame > 10 && va_focus) {
-               arm_exec_call(va_focus, env, ctx, 1, 0);
-               fprintf(stderr, "[loader] nativeFocusChanged(1) re-sent (frame %d)\n",
-                       frame_count);
-            }
-            if (frame_count == tt_frame) {
-               arm_exec_touch_push(0, tt_x, tt_y);  /* ACTION_DOWN */
-               fprintf(stderr, "[loader] TOUCH_TEST DOWN (%.0f,%.0f) frame %d\n",
-                       tt_x, tt_y, frame_count);
-            }
-            /* ACTION_MOVE: send every frame while held so Unity keeps the touch active */
-            if (frame_count > tt_frame && frame_count < tt_frame + tt_hold) {
-               arm_exec_touch_push(2, tt_x, tt_y);
-            }
-            if (frame_count == tt_frame + tt_hold) {
-               arm_exec_touch_push(1, tt_x, tt_y);  /* ACTION_UP */
-               fprintf(stderr, "[loader] TOUCH_TEST UP (%.0f,%.0f) frame %d (hold=%d)\n",
-                       tt_x, tt_y, frame_count, tt_hold);
-            }
+         if (getenv("LUNARIA_TOUCH_TEST") && frame_count == tt_frame - 10 &&
+             tt_frame > 10 && va_focus) {
+            arm_exec_call(va_focus, env, ctx, 1, 0);
+            fprintf(stderr, "[loader] nativeFocusChanged(1) re-sent (frame %d)\n",
+                    frame_count);
          }
       }
+      touch_test_tick(frame_count);
       /* GLFW マウス → MotionEvent 注入 (UnityPlayer.onTouchEvent 相当)。
        * MotionEvent の中身 (action/x/y) は libjvm-android.c の JNI getter が
        * arm_exec_touch_* アクセサ経由で読む。1 フレーム 1 イベント: 実機の

@@ -24,6 +24,7 @@
 
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 /* LUNARIA_DVM: 0 disables the emulator, 1 (default) runs dex bytecode only
  * where no host stub exists, 2 prefers dex bytecode over host stubs. */
@@ -54,6 +55,19 @@ void dvm_jni_set_guest_library_loader(dvm_guest_library_fn fn);
  * commits to a code path whose Java half can never run. */
 bool dvm_jni_class_in_dex(const char *class_name);
 
+/* True when the APK's dex carries bytecode for this method (`sig` may be NULL
+ * to match on the name alone).  A canned answer in the stub layer must never
+ * take precedence over Java the APK actually ships: the app's own
+ * implementation is the one the rest of the app agrees with.  Ask this first,
+ * and keep the stub only for titles that do not ship the method. */
+bool dvm_jni_method_in_dex(const char *class_name, const char *method,
+                           const char *sig);
+
+/* Register a dex the guest loaded at runtime (InMemoryDexClassLoader over a
+ * direct ByteBuffer, or a DexClassLoader over a file).  See
+ * dvm_add_dex_memory(). */
+bool dvm_jni_add_dex_memory(const void *data, size_t len, const char *name);
+
 /* Instance field of an object whose class the APK's dex defines, reached from
  * native through Get/SetXxxField.  The bytecode VM owns that object's fields,
  * so a write from native has to land there and not in the stub layer's own
@@ -63,11 +77,28 @@ bool dvm_jni_class_in_dex(const char *class_name);
 bool dvm_jni_field(JNIEnv *env, jobject obj, jfieldID field, bool set,
                    uint64_t *bits);
 
+/* The same for a *static* field.  The dex owns these too: GameActivity's
+ * <clinit> fills ANDROID_BUILD_VERSION from Build.VERSION.SDK_INT, and native
+ * code reads it back with GetStaticIntField.  Answering from the stub layer's
+ * side table instead reported 0 — an Android older than 1.0 — and the engine
+ * then disabled every feature gated on the OS version. */
+bool dvm_jni_static_field(JNIEnv *env, jclass cls, jfieldID field, bool set,
+                          uint64_t *bits);
+
 /* Superclass of a dex-defined class, slash-separated, or NULL when the APK
  * does not define the class (the framework hierarchy is not in the dex).
  * The stub layer needs it to resolve an inherited framework method called on
  * an app's own subclass. */
 const char *dvm_jni_super_name(const char *class_name);
 
+/* Assignability as the dex declares it, interfaces included (`sub instanceof
+ * sup`).  Both names are slash-separated.  False when either class is not one
+ * the dex defines — the caller then continues through the framework
+ * hierarchy, which no dex declares. */
+bool dvm_jni_class_assignable(const char *sub, const char *sup);
+
 /* Diagnostics for the loader's summary line. */
 void dvm_jni_report(void);
+
+struct dvm;
+struct dvm *dvm_jni_vm(void);

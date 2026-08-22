@@ -73,23 +73,49 @@ static ssize_t stream_write(struct stream *s, const void *buf, size_t len)
    return (ssize_t)done;
 }
 
+/* How long a body read may stall in total before it is called a failure.  The
+ * socket carries the caller's own SO_RCVTIMEO, so each attempt returns after
+ * that; this bounds how many of those in a row are tolerated. */
+#define HTTP_READ_STALL_MS 120000
+
 static ssize_t stream_read(struct stream *s, void *buf, size_t len)
 {
+   long waited_ms = 0;
    for (;;) {
       ssize_t n;
       if (s->ssl) {
+         ERR_clear_error();
+         errno = 0;
          n = SSL_read(s->ssl, buf, (int)len);
-         if (n <= 0) {
-            int e = SSL_get_error(s->ssl, (int)n);
-            /* A server that closes without close_notify is common enough that
-             * treating it as a read error would truncate valid replies. */
-            if (e == SSL_ERROR_ZERO_RETURN || e == SSL_ERROR_SYSCALL) return 0;
-            return -1;
+         if (n > 0) return n;
+         int e = SSL_get_error(s->ssl, (int)n);
+         /* A read that timed out has not ended anything: the body is still
+          * owed bytes.  Reporting it as end of stream is how a multi-gigabyte
+          * download came back truncated and then failed its MD5 check — the
+          * transfer looked like it had finished successfully.  The timeout
+          * arrives as WANT_READ, or as SYSCALL with EAGAIN under the socket's
+          * SO_RCVTIMEO, so both go back around. */
+         if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE ||
+             (e == SSL_ERROR_SYSCALL &&
+              (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))) {
+            if (waited_ms >= HTTP_READ_STALL_MS) { errno = ETIMEDOUT; return -1; }
+            waited_ms += 1000;
+            continue;
          }
-         return n;
+         /* Only a genuine end of connection is end of body: close_notify, or a
+          * peer that just went away (SYSCALL with nothing to report).  Anything
+          * else is an error and has to be reported as one. */
+         if (e == SSL_ERROR_ZERO_RETURN) return 0;
+         if (e == SSL_ERROR_SYSCALL && errno == 0) return 0;
+         return -1;
       }
       n = read(s->fd, buf, len);
       if (n < 0 && errno == EINTR) continue;
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+         if (waited_ms >= HTTP_READ_STALL_MS) { errno = ETIMEDOUT; return -1; }
+         waited_ms += 1000;
+         continue;
+      }
       return n;
    }
 }
@@ -358,6 +384,8 @@ static bool dechunk(const uint8_t *src, size_t len, struct buf *out)
  * One exchange, no redirect handling
  * ------------------------------------------------------------------------ */
 
+static void http_stream_done(struct dvm_http_response *r);
+
 static bool exchange(const char *method, const struct url *u,
                      const struct dvm_http_header *headers, int nheaders,
                      const uint8_t *body, size_t body_len, int timeout_ms,
@@ -408,11 +436,14 @@ static bool exchange(const char *method, const struct url *u,
       return false;
    }
 
+   /* Read only as far as the end of the headers.  Everything after that is
+    * the caller's to pull, one buffer at a time, through dvm_http_read(). */
    struct buf raw = { 0 };
    uint8_t chunk[16384];
+   const char *hdr_end = NULL;
+   size_t sep = 4;
    for (;;) {
       ssize_t n = stream_read(&s, chunk, sizeof chunk);
-      if (n == 0) break;
       if (n < 0) {
          snprintf(out->error, sizeof out->error, "read from %s failed: %s",
                   u->host, strerror(errno));
@@ -420,27 +451,32 @@ static bool exchange(const char *method, const struct url *u,
          stream_close(&s);
          return false;
       }
-      if (!buf_add(&raw, chunk, (size_t)n)) {
+      if (n > 0 && !buf_add(&raw, chunk, (size_t)n)) {
          snprintf(out->error, sizeof out->error, "out of memory");
          free(raw.p);
          stream_close(&s);
          return false;
       }
+      /* buf_add keeps the buffer NUL-terminated, so the searches below stay
+       * inside it even before the whole response has arrived. */
+      if (raw.p) {
+         hdr_end = strstr((const char *)raw.p, "\r\n\r\n");
+         sep = 4;
+         if (!hdr_end) {
+            hdr_end = strstr((const char *)raw.p, "\n\n");
+            sep = 2;
+         }
+      }
+      if (hdr_end || n == 0) break;
    }
-   stream_close(&s);
 
    /* Status line */
    const char *p = (const char *)raw.p;
-   const char *hdr_end = raw.p ? strstr(p, "\r\n\r\n") : NULL;
-   size_t sep = 4;
-   if (!hdr_end && raw.p) {
-      hdr_end = strstr(p, "\n\n");
-      sep = 2;
-   }
    if (!hdr_end) {
       snprintf(out->error, sizeof out->error, "%s: truncated response",
                u->host);
       free(raw.p);
+      stream_close(&s);
       return false;
    }
    const char *eol = strchr(p, '\n');
@@ -448,6 +484,7 @@ static bool exchange(const char *method, const struct url *u,
       snprintf(out->error, sizeof out->error, "%s: not an HTTP response",
                u->host);
       free(raw.p);
+      stream_close(&s);
       return false;
    }
    const char *sp = memchr(p, ' ', (size_t)(eol - p));
@@ -469,31 +506,173 @@ static bool exchange(const char *method, const struct url *u,
       hp = e + 1;
    }
 
+   /* Hand the leftover bytes and the still-open connection to the reader. */
    const uint8_t *bstart = (const uint8_t *)hdr_end + sep;
    size_t blen = raw.len - (size_t)(bstart - raw.p);
+   out->pre = malloc(blen + 1);
+   if (!out->pre) {
+      snprintf(out->error, sizeof out->error, "out of memory");
+      free(raw.p);
+      stream_close(&s);
+      return false;
+   }
+   memcpy(out->pre, bstart, blen);
+   out->pre[blen] = '\0';
+   out->pre_len = blen;
+   out->pre_pos = 0;
+   free(raw.p);
+
    const char *te = header_get(out, "Transfer-Encoding");
-   if (te && strcasestr(te, "chunked")) {
-      struct buf dec = { 0 };
-      if (!dechunk(bstart, blen, &dec)) {
-         /* A truncated chunked stream still carries usable bytes. */
-         fprintf(stderr, "[http] %s: malformed chunked body\n", u->host);
+   out->chunked = te && strcasestr(te, "chunked");
+   const char *cl = header_get(out, "Content-Length");
+   out->content_length = cl ? strtoll(cl, NULL, 10) : -1;
+   if (out->chunked) out->content_length = -1;
+
+   struct stream *held = malloc(sizeof *held);
+   if (!held) {
+      snprintf(out->error, sizeof out->error, "out of memory");
+      stream_close(&s);
+      return false;
+   }
+   *held = s;
+   out->stream = held;
+   /* A body that is already complete needs no more of the connection. */
+   if (out->content_length >= 0 && (long long)out->pre_len >= out->content_length) {
+      out->pre_len = (size_t)out->content_length;
+      http_stream_done(out);
+   }
+   return true;
+}
+
+/* Closes the connection behind a response and forgets it.  Reads after this
+ * are served from whatever is still buffered, then report end of body. */
+static void http_stream_done(struct dvm_http_response *r)
+{
+   if (!r || !r->stream) return;
+   stream_close((struct stream *)r->stream);
+   free(r->stream);
+   r->stream = NULL;
+}
+
+long dvm_http_read(struct dvm_http_response *r, void *buf, size_t n)
+{
+   if (!r || !buf || !n) return 0;
+
+   /* Chunked framing is only used here by the small JSON APIs, and decoding it
+    * incrementally would buy nothing: decode it once and serve from there. */
+   if (r->chunked) {
+      if (!r->body && !dvm_http_slurp(r)) return -1;
+      size_t left = r->body_len > (size_t)r->body_read
+                        ? r->body_len - (size_t)r->body_read : 0;
+      if (!left) return 0;
+      if (n > left) n = left;
+      memcpy(buf, r->body + r->body_read, n);
+      r->body_read += (long long)n;
+      return (long)n;
+   }
+
+   size_t done = 0;
+   /* Bytes that arrived in the same read as the headers come first. */
+   if (r->pre_pos < r->pre_len) {
+      size_t take = r->pre_len - r->pre_pos;
+      if (take > n) take = n;
+      memcpy(buf, r->pre + r->pre_pos, take);
+      r->pre_pos += take;
+      done += take;
+   }
+   while (done < n && r->stream) {
+      if (r->content_length >= 0 &&
+          r->body_read + (long long)done >= r->content_length)
+         break;
+      size_t want = n - done;
+      if (r->content_length >= 0) {
+         long long left = r->content_length - (r->body_read + (long long)done);
+         if ((long long)want > left) want = (size_t)left;
       }
-      out->body = dec.p;
-      out->body_len = dec.len;
-   } else {
-      const char *cl = header_get(out, "Content-Length");
-      if (cl) {
-         size_t want = strtoul(cl, NULL, 10);
-         if (want < blen) blen = want;
+      ssize_t got = stream_read((struct stream *)r->stream,
+                                (uint8_t *)buf + done, want);
+      if (got < 0) {
+         snprintf(r->error, sizeof r->error, "read failed: %s",
+                  strerror(errno));
+         http_stream_done(r);
+         return done ? (long)done : -1;
       }
-      out->body = malloc(blen + 1);
-      if (out->body) {
-         memcpy(out->body, bstart, blen);
-         out->body[blen] = '\0';
-         out->body_len = blen;
+      if (got == 0) {           /* peer closed */
+         http_stream_done(r);
+         break;
+      }
+      done += (size_t)got;
+   }
+   r->body_read += (long long)done;
+   if (r->content_length >= 0 && r->body_read >= r->content_length)
+      http_stream_done(r);
+   /* Short of what the headers promised, with the connection gone: the body is
+    * truncated.  Saying "end of stream" here would hand the caller a partial
+    * file it believes is complete — which is what a download does with it. */
+   if (!done && !r->stream && r->content_length >= 0 &&
+       r->body_read < r->content_length) {
+      snprintf(r->error, sizeof r->error,
+               "body truncated: %lld of %lld bytes",
+               r->body_read, r->content_length);
+      return -1;
+   }
+   return (long)done;
+}
+
+bool dvm_http_slurp(struct dvm_http_response *r)
+{
+   if (!r) return false;
+   if (r->body) return true;
+
+   struct buf all = { 0 };
+   /* Chunked bodies have to be collected raw and decoded afterwards, so this
+    * path reads the connection directly rather than through dvm_http_read. */
+   if (r->pre_pos < r->pre_len &&
+       !buf_add(&all, r->pre + r->pre_pos, r->pre_len - r->pre_pos)) {
+      free(all.p);
+      return false;
+   }
+   r->pre_pos = r->pre_len;
+   uint8_t chunk[16384];
+   while (r->stream) {
+      if (!r->chunked && r->content_length >= 0 &&
+          (long long)all.len >= r->content_length)
+         break;
+      ssize_t got = stream_read((struct stream *)r->stream, chunk, sizeof chunk);
+      if (got < 0) {
+         snprintf(r->error, sizeof r->error, "read failed: %s",
+                  strerror(errno));
+         http_stream_done(r);
+         free(all.p);
+         return false;
+      }
+      if (got == 0) { http_stream_done(r); break; }
+      if (!buf_add(&all, chunk, (size_t)got)) {
+         http_stream_done(r);
+         free(all.p);
+         return false;
       }
    }
-   free(raw.p);
+   http_stream_done(r);
+
+   if (r->chunked) {
+      struct buf dec = { 0 };
+      if (!dechunk(all.p, all.len, &dec))
+         fprintf(stderr, "[http] malformed chunked body\n");
+      free(all.p);
+      r->body = dec.p;
+      r->body_len = dec.len;
+   } else {
+      if (r->content_length >= 0 && (long long)all.len > r->content_length)
+         all.len = (size_t)r->content_length;
+      r->body = all.p;
+      r->body_len = all.len;
+   }
+   if (!r->body) {
+      r->body = malloc(1);
+      if (r->body) r->body[0] = '\0';
+      r->body_len = 0;
+   }
    return true;
 }
 
@@ -568,10 +747,17 @@ bool dvm_http_perform(const char *method, const char *url,
 void dvm_http_response_free(struct dvm_http_response *r)
 {
    if (!r) return;
+   http_stream_done(r);
+   free(r->pre);
+   r->pre = NULL;
+   r->pre_len = r->pre_pos = 0;
    headers_free(r->headers, r->nheaders);
    r->headers = NULL;
    r->nheaders = 0;
    free(r->body);
    r->body = NULL;
    r->body_len = 0;
+   r->body_read = 0;
+   r->content_length = -1;
+   r->chunked = false;
 }

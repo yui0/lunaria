@@ -105,6 +105,14 @@ void dvm_destroy(struct dvm *vm);
 /* Adds one classes*.dex.  Later files do not override classes already
  * defined, which matches the multidex lookup order. */
 bool dvm_add_dex(struct dvm *vm, const char *path);
+/* Adds a dex the app handed to a ClassLoader at runtime rather than one that
+ * came out of the APK: dalvik.system.InMemoryDexClassLoader over a direct
+ * ByteBuffer, or DexClassLoader/PathClassLoader over a file it just wrote.
+ * A native library that ships its own Java (libswappy.so carries the
+ * com.google.androidgamesdk classes as a dex inside the .so) reaches its
+ * bytecode only this way.  The bytes are copied; `name` is for diagnostics. */
+bool dvm_add_dex_memory(struct dvm *vm, const void *data, size_t len,
+                        const char *name);
 /* Adds classes.dex, classes2.dex, … from an unpacked APK directory (and from
  * its base/ subdirectory, which is where an App Bundle split keeps them).
  * Returns how many were loaded. */

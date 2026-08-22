@@ -26,9 +26,21 @@ struct dvm_http_response {
    int status;                      /* -1 when the exchange never completed */
    struct dvm_http_header *headers;
    int nheaders;
-   uint8_t *body;
+   uint8_t *body;                   /* only once slurped; NULL while streaming */
    size_t body_len;
    char error[512];                 /* empty on success */
+
+   /* The exchange stops at the end of the headers and leaves the connection
+    * open, so the body is read as the caller consumes it.  Buffering it whole
+    * is not an option for this workload: the game downloads its content as
+    * pak files of several gigabytes each, and a response that has to fit in
+    * memory first stops the emulator dead at the first one. */
+   void *stream;                    /* struct stream *, NULL once finished */
+   uint8_t *pre;                    /* body bytes read along with the headers */
+   size_t pre_len, pre_pos;
+   long long content_length;        /* from the header; -1 when absent */
+   long long body_read;             /* handed to the caller so far */
+   bool chunked;
 };
 
 /* Performs one exchange.  `headers` are sent as given, minus the ones this
@@ -42,3 +54,14 @@ bool dvm_http_perform(const char *method, const char *url,
                       struct dvm_http_response *out);
 
 void dvm_http_response_free(struct dvm_http_response *r);
+
+/* Reads the next piece of the body.  Returns 0 at end of body, -1 on a
+ * transport error.  A chunked response is decoded whole on the first call
+ * (server-side chunking is only used here for small API replies); a
+ * Content-Length response streams straight off the socket. */
+long dvm_http_read(struct dvm_http_response *r, void *buf, size_t n);
+
+/* Reads whatever is left of the body into r->body / r->body_len, for the
+ * callers that want it as one array (error bodies, small API replies).
+ * Returns false only on a transport error. */
+bool dvm_http_slurp(struct dvm_http_response *r);

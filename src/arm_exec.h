@@ -115,6 +115,9 @@ int      arm_exec_egl_query_context(uint32_t ctx, int attr, int32_t *value);
 int      arm_exec_egl_get_config_attrib(uint32_t cfg, int attr, int32_t *value);
 int      arm_exec_egl_get_error(void);
 
+/* Upload decoded RGBA into a guest GL_TEXTURE_2D on the current context. */
+void     arm_exec_upload_texture_rgba(int tex, const uint8_t *rgba, int w, int h);
+
 /* Read one packaged asset by the name AssetManager.open() takes (relative to
  * assets/, or an absolute path the engine also feeds to AAssetManager).
  * Returns a malloc'd buffer the caller frees, or NULL when there is no such
@@ -133,6 +136,11 @@ int arm_exec_fb_width(void);
  * 'L' in *sv). */
 int arm_exec_apk_meta(const char *key, int32_t *iv, const char **sv);
 const char *arm_exec_apk_meta_keys(void);
+/* The audio output the emulator actually presents, as AudioManager reports it
+ * (PROPERTY_OUTPUT_FRAMES_PER_BUFFER / PROPERTY_OUTPUT_SAMPLE_RATE).  An app
+ * that asks Java for these must get the same numbers the OpenSL ES pump runs
+ * at, or it sizes its mixer for a device that is not here. */
+void arm_exec_audio_output_params(int32_t *frames_per_buffer, int32_t *rate);
 /* The package version from the <manifest> element (PackageInfo.versionCode /
  * versionName).  Never yields 0 or NULL — see the definition. */
 void arm_exec_apk_version(int32_t *code, const char **name);
@@ -167,6 +175,12 @@ int arm_exec_glfw_should_close(void);
 
 /* Run all pthread_create-queued ARM thread functions inline (up to 8 passes). */
 void arm_exec_run_pending_threads(void);
+
+/* Guest instructions retired by the cooperative scheduler so far (A32 + A64).
+ * The host frame pump compares the value across a scheduler pass to tell "the
+ * guest had work to do" from "every guest thread is parked"; see the pump
+ * loops in loader.c. */
+uint64_t arm_exec_sched_ticks(void);
 
 /* Pre-create Mono generic JIT trampolines before initJni maps mscorlib. */
 void arm_exec_ensure_mono_trampolines(void);
@@ -216,6 +230,11 @@ uint32_t arm_exec_heap_used(void);
 
 /* How many times guest abort() has been called (mono g_assert, etc.). */
 uint64_t arm_exec_guest_abort_count(void);
+
+/* Consumes a pending SetDesiredViewSize change: returns 1 once per resize and
+ * fills *w/*h with the new view size, so the pump can deliver the engine's
+ * surfaceChanged notification. */
+int arm_exec_take_view_resize(int *w, int *h);
 
 /* Return the directory of the main ARM library (set when arm_exec_jni_onload
  * is first called).  Used by libjvm-java.c findLibrary to return full paths. */
@@ -341,6 +360,9 @@ int arm64_exec_glfw_should_close(void);
 
 /* Dump recent SVC ring for diagnostics. */
 void arm64_exec_svc_ring_dump(void);
+/* Presents the guest itself drove through the EGL bridge.  The pump loop
+ * watches this to notice that the guest has stopped producing frames. */
+uint64_t arm_exec_guest_swap_count(void);
 
 #ifdef __cplusplus
 }
