@@ -66,6 +66,7 @@
 #include <GLES2/gl2.h>
 
 #include "luna_overlay.h"
+#include "luna_splash.h"
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 #define GLFW_EXPOSE_NATIVE_X11
@@ -6050,6 +6051,9 @@ static std::vector<void*> g_gl_syncs;
 
 // Counts presents the guest drove through the EGL bridge.
 static uint64_t g_guest_egl_swap_count = 0;
+/* Latched false once the boot screen comes down, so the SVC dispatch stops
+ * paying for it entirely rather than calling across into libjvm.so forever. */
+static bool g_splash_up = true;
 
 /* EGL_ANDROID_get_frame_timestamps.
  *
@@ -8215,6 +8219,8 @@ static uint32_t ensure_fake_anative_window(ArmExecCtx &ctx) {
 }
 
 // Initialize host-side EGL + GLES2 context and make it current.
+static void splash_present_frame(void);
+
 static bool init_host_egl() {
     if (g_egl_ctx != EGL_NO_CONTEXT) {
         // Already created — just make current
@@ -8340,8 +8346,53 @@ static bool init_host_egl() {
             g_fb_w = (int)sw;
             g_fb_h = (int)sh;
         }
+        /* First moment anything can be drawn, and the start of the long gap
+         * the boot screen exists to fill.  LUNARIA_SPLASH=0 turns it off. */
+        const char *splash = lunaria_env("LUNARIA_SPLASH");
+        if (!splash || strcmp(splash, "0") != 0) {
+            luna_splash_set_presenter(splash_present_frame);
+            luna_splash_begin();
+        }
     }
     return ok == EGL_TRUE;
+}
+
+/* Draws one frame of the emulator's boot screen.
+ *
+ * The splash lives in libjvm.so (with the dex loader that feeds it) and the
+ * EGL objects live here, so this is the callback the splash is given.  It runs
+ * on whichever thread happened to reach a progress point — a guest thread
+ * inside an SVC, or the dex loader with no guest instruction executing at all —
+ * so it takes the surface, draws, swaps, and puts back whatever binding the
+ * caller had.  The trylock in luna_splash_pump() is what keeps two guest
+ * threads out of here at once; EGL would reject the second's makeCurrent on a
+ * surface the first still holds. */
+static void splash_present_frame(void) {
+    if (g_egl_dpy == EGL_NO_DISPLAY || g_egl_surf == EGL_NO_SURFACE ||
+        g_egl_ctx == EGL_NO_CONTEXT)
+        return;
+    /* Once the guest has taken the surface the boot screen is over: two
+     * threads cannot hold one EGL surface, and by then the guest is drawing
+     * its own frames anyway. */
+    if (g_guest_egl_swap_count > 0) {
+        luna_splash_end("guest is presenting");
+        return;
+    }
+    EGLDisplay prev_dpy = eglGetCurrentDisplay();
+    EGLContext prev_ctx = eglGetCurrentContext();
+    EGLSurface prev_draw = eglGetCurrentSurface(EGL_DRAW);
+    EGLSurface prev_read = eglGetCurrentSurface(EGL_READ);
+    if (prev_ctx != g_egl_ctx &&
+        !eglMakeCurrent(g_egl_dpy, g_egl_surf, g_egl_surf, g_egl_ctx))
+        return;
+    luna_overlay_present_ex(g_fb_w, g_fb_h, /*clear=*/true);
+    /* The boot screen answers the same capture trigger every other frame does,
+     * so LUNARIA_SHOT_TRIGGER can grab it mid-boot.  Before the swap, like the
+     * guest's own path: after one, the back buffer's contents are undefined. */
+    maybe_dump_screenshot(0, false);
+    eglSwapBuffers(g_egl_dpy, g_egl_surf);
+    if (prev_ctx != g_egl_ctx && prev_dpy != EGL_NO_DISPLAY)
+        (void)eglMakeCurrent(prev_dpy, prev_draw, prev_read, prev_ctx);
 }
 
 /* Read EGL attrib list from guest memory into a host vector.
@@ -8662,6 +8713,11 @@ static int egl_host_make_current(uint32_t draw_h, uint32_t read_h,
     if (ok) {
         g_egl_tid_ctx[g_current_tid] = ctx_h;
         g_egl_bound_handle = ctx_h;
+        /* The guest has taken the window surface.  One EGL surface cannot be
+         * current on two threads, so the boot screen has to stop drawing here
+         * — before its first swap, not after it. */
+        if (draw != EGL_NO_SURFACE)
+            luna_splash_end("guest took the surface");
     }
     {
         static int n = 0;
@@ -12851,6 +12907,19 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                         svc_no, r0, r1, r2, lr);
         }
     }
+    /* The boot screen's frames.  Almost all of boot is guest execution, so the
+     * SVC stream is where the animation gets its cadence; luna_splash_pump()
+     * rate-limits to one frame per ~16 ms and returns immediately once the
+     * screen is down, which is the state for the whole of the run after boot.
+     * The counter keeps even that check off the hot path. */
+    if (__builtin_expect(g_splash_up, 0)) {
+        static uint32_t splash_ctr = 0;
+        if (++splash_ctr >= 2048u) {
+            splash_ctr = 0;
+            if (luna_splash_active()) luna_splash_pump();
+            else g_splash_up = false;
+        }
+    }
     // Cooperative scheduling fallback: specific SVCs (futex, sem_wait, nanosleep) already schedule worker threads.
     if (g_current_tid == 0 && !g_scheduling && !g_threads.empty()) {
         static uint32_t svc_sched_ctr = 0;
@@ -16210,6 +16279,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         // Damage rectangles are a compositor hint; presenting the whole
         // surface satisfies the call (and is what a single-buffered host does).
         ++g_guest_egl_swap_count;
+        /* The guest has a frame of its own now, so the emulator's boot screen
+         * has done its job and the surface is the guest's from here. */
+        luna_splash_end("guest presented its first frame");
         if (lunaria_env("LUNARIA_TRACE_EGL")) {
             static uint64_t n = 0;
             if (n < 20 || (n % 500) == 0)
@@ -29436,6 +29508,8 @@ extern "C" int arm_exec_jni_onload(const char *path, struct jvm *jvm) {
         fprintf(stderr,"arm_exec: JNI_OnLoad not found in %s\n", path);
         return -1; }
 
+    luna_splash_progress(LUNA_SPLASH_JNI_MARK);
+    luna_splash_stage("running JNI_OnLoad");
     fprintf(stderr,"[arm_exec] executing JNI_OnLoad @ 0x%08x (%s)\n",
             jni_onload_va, (jni_onload_va&1)?"Thumb":"ARM");
     g_svc_ring_pos = 0;
@@ -32271,9 +32345,21 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
             uint32_t count = (uint32_t)(init_array_sz / 8);
             fprintf(stderr, "[arm64] running %u INIT_ARRAY ctors from 0x%llx (%s)\n",
                     count, (unsigned long long)init_array_va, path);
+            const char *lib = strrchr(path, '/');
+            lib = lib ? lib + 1 : path;
             for (uint32_t k = 0; k < count; ++k) {
                 uint64_t fn = 0;
                 std::memcpy(&fn, ctx.mem.ptr(init_array_va + (uint64_t)k * 8), 8);
+                /* 1610 of these for libUE4.so, and each can run arbitrary guest
+                 * code: without a count on screen this phase is the longest
+                 * stretch of boot that looks like nothing happening. */
+                if ((k & 63u) == 0u) {
+                    luna_splash_progress(LUNA_SPLASH_LINK_FLOOR +
+                        (LUNA_SPLASH_LINK_CEIL - LUNA_SPLASH_LINK_FLOOR) *
+                        ((float)k / (float)(count ? count : 1)));
+                    luna_splash_stage("%s — static initialisers %u of %u",
+                                      lib, k, count);
+                }
                 run_ctor(fn, "ctor", k, count);
             }
         }
@@ -32587,6 +32673,10 @@ extern "C" int arm64_exec_jni_onload(const char *path, struct jvm *jvm) {
     uint64_t jni_onload_va = 0;
     fprintf(stderr, "[arm64] loading main library: %s at base=0x%llx\n",
             path, (unsigned long long)main_base);
+    {
+        const char *lib = strrchr(path, '/');
+        luna_splash_stage("linking %s", lib ? lib + 1 : path);
+    }
     g_a64_loading_main = true;
     bool main_ok = load_elf64(*g_ctx, path, jni_onload_va, main_base, false);
     g_a64_loading_main = false;
@@ -32597,6 +32687,8 @@ extern "C" int arm64_exec_jni_onload(const char *path, struct jvm *jvm) {
         fprintf(stderr, "[arm64] JNI_OnLoad not found in %s\n", path);
         return -1;
     }
+    luna_splash_progress(LUNA_SPLASH_JNI_MARK);
+    luna_splash_stage("running JNI_OnLoad");
     fprintf(stderr, "[arm64] executing JNI_OnLoad @ 0x%llx\n",
             (unsigned long long)jni_onload_va);
     int64_t ver = run_arm64(*g_ctx, jni_onload_va,

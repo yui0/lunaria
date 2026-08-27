@@ -25,6 +25,7 @@
 #include "linker/linker.h"
 #include "jvm/jvm.h"
 #include "arm_exec.h"
+#include "luna_splash.h"
 #include "dvm/dvm_jni.h"
 #include "dvm/dvm_media.h"
 #include <link.h>
@@ -1246,6 +1247,8 @@ run_ue4_game_arm(struct jvm *jvm)
     * exits on guest abort and on the window close button, and
     * LUNARIA_MAX_FRAMES caps it for scripted runs. */
 
+   luna_splash_progress(LUNA_SPLASH_WAIT_MARK);
+   luna_splash_stage("waiting for the engine's first frame");
    fprintf(stderr, "[loader] UE4 entering pump loop (max_frames=%d)\n", max_frames);
    for (int frame = 0; max_frames <= 0 || frame < max_frames; ++frame) {
       if (arm_exec_guest_abort_count() > 0) {
@@ -1725,6 +1728,8 @@ run_ue4_game_arm64(struct jvm *jvm)
    { const char *mf = getenv("LUNARIA_MAX_FRAMES"); if (mf && *mf) max_frames = atoi(mf); }
    /* No default cap — see the A32 pump loop. */
 
+   luna_splash_progress(LUNA_SPLASH_WAIT_MARK);
+   luna_splash_stage("waiting for the engine's first frame");
    fprintf(stderr, "[loader] UE arm64 entering pump loop (max_frames=%d)\n", max_frames);
    for (int frame = 0; max_frames <= 0 || frame < max_frames; ++frame) {
       if (arm_exec_guest_abort_count() > 0) {
@@ -2106,6 +2111,8 @@ run_dex_activity_arm64(struct jvm *jvm)
 
    int max_frames = 0;
    { const char *mf = getenv("LUNARIA_MAX_FRAMES"); if (mf && *mf) max_frames = atoi(mf); }
+   luna_splash_progress(LUNA_SPLASH_WAIT_MARK);
+   luna_splash_stage("waiting for the app's first frame");
    fprintf(stderr, "[loader] dex startup: entering pump loop (max_frames=%d)\n",
            max_frames);
    for (int frame = 0; max_frames <= 0 || frame < max_frames; ++frame) {

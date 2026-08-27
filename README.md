@@ -31,6 +31,7 @@ JNI, EGL and OpenGL ES to the Linux host.
 | **Real graphics path** | EGL and OpenGL ES 3 calls pass through to the host |
 | **Engine-aware bridges** | JNI, AssetManager, OBB, pthread, OpenSL ES and Android API stubs |
 | **Headless-capable** | Falls back to a surfaceless EGL pbuffer when no X11 window is available |
+| **A boot screen** | Shows what the emulator is loading instead of a black rectangle |
 | **Built for diagnosis** | Frame capture, JIT profiling, SVC tracing and guest-memory watchpoints |
 
 ## Quick start
@@ -52,6 +53,10 @@ make dynarmic-build
 make -j"$(nproc)"
 ```
 
+The build fetches [luna-ui](https://github.com/Berry-OS/luna-ui) — the
+header-only HTML/CSS engine the emulator's own UI and boot screen are drawn
+with — into `luna-ui/` on first use. `make fetch-luna-ui` does it on its own.
+
 ### 3. Launch a package
 
 ```bash
@@ -63,6 +68,24 @@ The launcher detects `arm64-v8a` or `armeabi-v7a`, finds the main native
 library, prepares an installed-package view, and starts the runtime. For XAPK
 files it reads `manifest.json`, keeps the base APK intact, and overlays the
 split APK contents into that temporary view.
+
+### While it loads
+
+A large title spends a long time between the launcher's last message and its
+first frame — Blade & Soul Revolution links a 200 MB library, runs 1,610 static
+initialisers and compiles 28 MB of dex across four files before the engine
+starts. Lunaria draws its own screen over that gap, so the wait shows what is
+happening rather than a black rectangle:
+
+![Lunaria's boot screen, compiling classes3.dex](screenshot_bootscreen.png)
+
+<p align="center"><sub>Captured from the headless EGL framebuffer during a real
+Blade &amp; Soul Revolution boot · the moon, its halo and its terminator are CSS
+animations rendered by luna-ui</sub></p>
+
+The screen comes down the moment the guest takes the surface. `LUNARIA_SPLASH=0`
+turns it off, and `make splash-test` renders it on its own, without booting a
+title.
 
 Force a guest architecture when a package contains both:
 
@@ -83,7 +106,7 @@ These are observed milestones, not a general compatibility guarantee.
 | **UnitySampleGame** | Unity · ARMv7 | Start screen accepts injected touch; playable 3D scene renders |
 | **TIME LOCKER** | Unity · ARMv7 | Reaches the portrait tutorial gameplay scene |
 | **Black Clover: Asta Fight** | Unity IL2CPP · AArch64 XAPK | Base + split load; Unity splash renders headlessly |
-| **Blade & Soul Revolution** | Unreal Engine 4 · AArch64 | In-APK expansion mounts; reaches RHI, render thread and FBO setup; content streaming stalls before the first frame |
+| **Blade & Soul Revolution** | Unreal Engine 4 · AArch64 | In-APK expansion mounts; the four dex files load, the SDK's audio-focus and account setup complete, and the engine reaches RHI, render thread and FBO setup; content streaming still stalls before the first frame |
 | **Daggerfall Unity** | Unity Mono · ARMv7 | Mono runtime boots; rendering remains blocked |
 
 <details>
@@ -228,6 +251,7 @@ diagnostic switches used during compatibility work.
 | `LUNARIA_SCHED_DUMP` | off | Dump every guest thread's state every *N* scheduler passes |
 | `LUNARIA_SCHED_DUMP_STACK` | off | Add a return-address scan of each thread's stack to that dump |
 | `LUNARIA_DUMP_LAST_SVC` | off | Print the recent SVC ring at shutdown |
+| `LUNARIA_SPLASH` | `1` | Boot screen; set `0` to leave the surface untouched until the guest draws |
 | `LUNARIA_DVM` | `1` | Dalvik bytecode emulator: `0` off, `1` run the APK's dex only where no host stub exists, `2` prefer the dex over host stubs |
 | `LUNARIA_DVM_TRACE` | off | Log the methods the emulator declined (`[dvm] miss …`) |
 | `LUNARIA_DEX_START` | on | Run the APK's Activity lifecycle from dex; set to `0` only to compare with the legacy hand-written startup sequence |
@@ -248,6 +272,8 @@ Tick values accept `K`, `M`, and `G` suffixes, for example
 | `src/arm_exec.cpp` | dynarmic engines, SVC dispatch, JNI, EGL/GLES and threading |
 | `src/dvm/` | Dalvik bytecode emulator: runs the APK's own Java from classes*.dex |
 | `src/loader.c` | runtime entry point and Unity render-loop orchestration |
+| `src/luna_overlay.c` | the emulator's own UI surface, drawn with luna-ui and composited over the guest frame |
+| `src/luna_splash.c` | the boot screen: an animated CSS document with the loader's progress |
 | `src/linker/` | Android ELF linker adapted for the host |
 | `src/jvm/` | lightweight JVM/JNI object model and stubs |
 | `src/lib/` | host implementations exposed to Android native code |

@@ -53,6 +53,7 @@ static int g_ptr_count;
 static pthread_mutex_t g_ptr_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static luna_overlay_click_fn g_click_fn;
+static luna_overlay_frame_fn g_frame_fn;
 
 /* luna-ui's input path asks the app runner to schedule a repaint.  With
  * LUNA_UI_NO_PLATFORM there is no runner, and the symbol is the embedder's to
@@ -93,11 +94,18 @@ static void *overlay_get_proc(const char *name)
    return p;
 }
 
+/* Seconds since the overlay came up.  Zero-based rather than raw monotonic:
+ * a CSS animation's timeline starts when the document appears, and starting it
+ * at the host's uptime leaves the float with no precision left to resolve a
+ * frame. */
 static double overlay_now(void)
 {
+   static double epoch;
    struct timespec ts;
    clock_gettime(CLOCK_MONOTONIC, &ts);
-   return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+   double t = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+   if (epoch == 0.0) epoch = t;
+   return t - epoch;
 }
 
 /* The overlay used to share the guest's context and put its state back
@@ -164,10 +172,98 @@ static bool overlay_context_create(void)
    return true;
 }
 
+/* The faces the overlay draws with.
+ *
+ * Left to itself luna-ui scans /usr/share/fonts and scores what it finds; on
+ * a host whose only sans family is Liberation that scan came back with
+ * LiberationSans-Italic, and the whole emulator UI — dialogs and boot screen
+ * alike — rendered in italic.  An oblique face is never the right answer for a
+ * UI that did not ask for one, so the overlay names the faces it wants and
+ * only falls back to the scan when none of them is installed. */
+static unsigned char *overlay_read_file(const char *path, size_t *out_size)
+{
+   FILE *f = fopen(path, "rb");
+   if (!f) return NULL;
+   if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+   long n = ftell(f);
+   if (n <= 0) { fclose(f); return NULL; }
+   rewind(f);
+   unsigned char *buf = malloc((size_t)n);
+   if (!buf) { fclose(f); return NULL; }
+   size_t got = fread(buf, 1, (size_t)n, f);
+   fclose(f);
+   if (got != (size_t)n) { free(buf); return NULL; }
+   if (out_size) *out_size = got;
+   return buf;
+}
+
+static unsigned char *overlay_load_font(int role, size_t *out_size)
+{
+   static const char *const regular[] = {
+      "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+      "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+      "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+      "/usr/share/fonts/TTF/DejaVuSans.ttf",
+      NULL
+   };
+   static const char *const bold[] = {
+      "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+      "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+      "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+      "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+      NULL
+   };
+   static const char *const mono[] = {
+      "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+      "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+      "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+      NULL
+   };
+   const char *const *list = NULL;
+   switch (role) {
+   case LUNA_FONT_REGULAR: list = regular; break;
+   case LUNA_FONT_BOLD:    list = bold;    break;
+   case LUNA_FONT_MONO:    list = mono;    break;
+   /* CJK, symbols and brands have no sensible fixed path: let the scan
+    * answer those, and the engine falls back cleanly when it finds none. */
+   default: return NULL;
+   }
+   for (int i = 0; list[i]; ++i) {
+      unsigned char *buf = overlay_read_file(list[i], out_size);
+      if (buf) return buf;
+   }
+   return NULL;
+}
+
+/* luna-ui's own clock.
+ *
+ * With LUNA_UI_NO_PLATFORM the engine has no host to ask for the time, and its
+ * fallback is clock() — process CPU time.  It stamps every animation's start
+ * with that, while luna_update() is handed whatever clock the embedder uses;
+ * those two disagreeing by the host's uptime made every finite @keyframes
+ * animation read as having finished before its first frame (the boot screen's
+ * moon appeared already risen), and left the infinite ones at an arbitrary
+ * phase.  Supplying get_time is what makes both ends of the comparison the
+ * same clock — the one overlay_now() returns. */
+static double overlay_platform_time(void) { return overlay_now(); }
+
+static void overlay_set_platform(void)
+{
+   LunaPlatform platform;
+   memset(&platform, 0, sizeof platform);
+   platform.get_time = overlay_platform_time;
+   platform.get_proc = overlay_get_proc;
+   platform.load_font = overlay_load_font;
+   platform.struct_size = (uint32_t)sizeof platform;
+   luna_set_platform(&platform);
+}
+
 static bool overlay_start(int w, int h)
 {
    if (g_ready) return true;
    if (g_failed) return false;
+
+   overlay_set_platform();
 
    /* The engine's shader set differs between desktop GL and GLES; ask the
     * context which one this is rather than assuming.  Lunaria runs on both:
@@ -213,6 +309,11 @@ void luna_overlay_set_document(const char *html, const char *css)
 void luna_overlay_set_click_handler(luna_overlay_click_fn fn)
 {
    g_click_fn = fn;
+}
+
+void luna_overlay_set_frame_handler(luna_overlay_frame_fn fn)
+{
+   g_frame_fn = fn;
 }
 
 /* luna-ui hands the clicked element back; its DOM id is the only thing the
@@ -299,6 +400,11 @@ bool luna_overlay_active(void)
 
 void luna_overlay_present(int w, int h)
 {
+   luna_overlay_present_ex(w, h, false);
+}
+
+void luna_overlay_present_ex(int w, int h, bool clear)
+{
    if (!luna_overlay_active() || w <= 0 || h <= 0) return;
 
    EGLDisplay dpy = eglGetCurrentDisplay();
@@ -358,11 +464,23 @@ void luna_overlay_present(int w, int h)
 
       overlay_drain_pointer();
 
+      /* The document is live at this point, which is the only moment a caller
+       * may mutate it: the boot screen pushes its stage line and its progress
+       * here instead of republishing the page. */
+      if (g_frame_fn) g_frame_fn();
+
       /* Composited over the guest's finished frame: no clear, and the
-       * document's own background is whatever its CSS paints. */
+       * document's own background is whatever its CSS paints.  With `clear`
+       * there is no such frame — the surface holds whatever the driver last
+       * left in it — so the page is given a known ground to paint on. */
       glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
       glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
       glViewport(0, 0, w, h);
+      if (clear) {
+         glDisable(GL_SCISSOR_TEST);
+         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+      }
       glDisable(GL_DEPTH_TEST);
       glDisable(GL_CULL_FACE);
       glDisable(GL_SCISSOR_TEST);

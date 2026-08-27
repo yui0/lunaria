@@ -8,8 +8,12 @@ dynarmic JIT によりエミュレート実行するローダー。
 ```sh
 make dynarmic-build   # dynarmic A32 JIT (要: cmake, libboost-dev)
 make                  # lunaria 本体 + runtime/*.so
+make fetch-luna-ui    # エミュレータ UI / 起動画面が使う luna-ui ヘッダを取得
 make fetch-libunity   # テスト用 APK を取得し test/ に ARM ライブラリを展開
 ```
+
+`luna-ui` は `make` が初回に自動取得するため、通常 `fetch-luna-ui` を明示的に
+実行する必要はない。
 
 必要パッケージ (Ubuntu): `libglfw3-dev libegl1-mesa-dev libgles2-mesa-dev
 libbsd-dev libunwind-dev libboost-dev zlib1g-dev`
@@ -29,6 +33,19 @@ bash lunaria-apk.sh test/btw-android.apk
 
 ヘッドレス環境では `Xvfb :99 & DISPLAY=:99 ...` で実行できる。
 
+### 起動画面
+
+大きなタイトルはランチャーの最後のメッセージから最初のフレームまでが長い。
+Blade & Soul Revolution の場合、200MB のライブラリのリンク、1,610 個の静的
+初期化子、4 ファイル計 28MB の dex コンパイルが先に走る。その間 Lunaria は
+自前の起動画面を描画し、いま何を読み込んでいるかを表示する。月・その光輪・
+明暗境界線はすべて luna-ui が描画する CSS アニメーション。
+
+![Lunaria の起動画面](screenshot_bootscreen.png)
+
+ゲストがサーフェスを取得した時点で画面は消える。`LUNARIA_SPLASH=0` で無効化、
+`make splash-test` でタイトルを起動せずに単体描画できる。
+
 ### 環境変数
 
 | 変数 | 既定値 | 意味 |
@@ -42,6 +59,7 @@ bash lunaria-apk.sh test/btw-android.apk
 | `LUNARIA_TRACE_FUTEX` | off | futex WAIT の woken / timeout を各 64 件までログ |
 | `LUNARIA_TRACE_JITINIT` | off | `mono_jit_init_version` (guest 0x2013407c) 突入を呼び出し元付きでログ |
 | `GC_DONT_GC` | 1 (ローダが設定) | Boehm GC を無効化 (協調スレッドでは STW 不可) |
+| `LUNARIA_SPLASH` | 1 | 起動画面。`0` でゲストが描くまでサーフェスに触れない |
 | `LUNARIA_DVM` | 1 | Dalvik バイトコードエミュレータ。`0`=無効、`1`=ホストスタブが無いメソッドだけ dex を実行、`2`=dex を優先 |
 | `LUNARIA_DVM_TRACE` | off | エミュレータが引き受けなかったメソッドを `[dvm] miss …` でログ |
 

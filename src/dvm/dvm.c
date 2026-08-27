@@ -10,8 +10,10 @@
  */
 
 #include "dvm/dvm_internal.h"
+#include "luna_splash.h"
 
 #include <math.h>
+#include <sys/stat.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2748,6 +2750,14 @@ bool dvm_add_dex(struct dvm *vm, const char *path)
    vm->dexes[vm->ndexes++] = dd;
    fprintf(stderr, "[dvm] loaded %s: %u classes, %u methods\n",
            path, dd->file.class_defs_size, dd->file.method_ids_size);
+   /* The boot screen's only phase with a real denominator.  Reported after the
+    * parse, because that is the work the person watching is waiting on. */
+   {
+      struct stat st;
+      luna_splash_dex_loaded(path, dd->file.class_defs_size,
+                             dd->file.method_ids_size,
+                             stat(path, &st) == 0 ? (uint64_t)st.st_size : 0);
+   }
    return true;
 }
 
@@ -2797,6 +2807,29 @@ int dvm_add_apk_dir(struct dvm *vm, const char *dir)
 {
    static const char *const subdirs[] = { "", "base/" };
    int loaded = 0;
+   /* A first pass that only stats: the boot screen needs to know how much
+    * bytecode there is before the first file is parsed, and this title's four
+    * dexes differ by 3 MB, so a bar counting files would move in uneven
+    * jumps. */
+   {
+      int files = 0;
+      uint64_t bytes = 0;
+      for (size_t s = 0; s < sizeof subdirs / sizeof subdirs[0]; ++s) {
+         for (int i = 0; i < 64; ++i) {
+            char path[1024];
+            struct stat st;
+            if (i == 0) snprintf(path, sizeof path, "%s/%sclasses.dex", dir, subdirs[s]);
+            else snprintf(path, sizeof path, "%s/%sclasses%d.dex", dir, subdirs[s], i + 1);
+            if (stat(path, &st) != 0) {
+               if (i == 0) continue;
+               break;
+            }
+            ++files;
+            bytes += (uint64_t)st.st_size;
+         }
+      }
+      luna_splash_dex_total(files, bytes);
+   }
    for (size_t s = 0; s < sizeof subdirs / sizeof subdirs[0]; ++s) {
       for (int i = 0; i < 64; ++i) {
          char path[1024];

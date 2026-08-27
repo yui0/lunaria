@@ -1,0 +1,25 @@
+# Build products
+/lunaria
+/runtime/
+/libdl.so
+/libpthread.so
+*.o
+
+# Fetched, never vendored: see the fetch-* targets in the Makefile.
+/luna-ui/
+/test/*.apk
+/test/*.obb
+/test/*.so
+/test/test_dynarmic_arm
+/test/test_unity
+/test/test_dvm
+/test/test_splash
+/test/dvm_test.dex
+/test/abi_pkg/classes.dex
+/test/abi_test_values.h
+/test/libabitest32.so
+/test/libabitest64.so
+/dynarmic/build/
+
+# An installed-package view, written next to the binary at launch.
+/local/

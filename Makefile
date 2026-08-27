@@ -113,14 +113,55 @@ DVM_SRC = src/dvm/dex.c src/dvm/dvm.c src/dvm/dvm_runtime.c src/dvm/dvm_jni.c \
 DVM_HDR = src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
           src/dvm/dvm_net.h src/dvm/dvm_media.h
 
+# luna-ui: the HTML/CSS engine src/luna_overlay.c draws the emulator's own UI
+# with.  It is header-only and lives in its own repository, so it is fetched
+# rather than vendored -- the same treatment openh264 and the sample APKs get.
+# The headers are a build-time dependency: $(LUNA_UI_HDR) is a prerequisite of
+# the object that includes it, so a plain `make` fetches them once.
+LUNA_UI_DIR ?= luna-ui
+LUNA_UI_RAW  = https://raw.githubusercontent.com/Berry-OS/luna-ui/master
+LUNA_UI_HDRS = luna-ui.h cssparser.h stb_truetype.h stb_image.h stb_image_write.h
+LUNA_UI_HDR  = $(LUNA_UI_DIR)/luna-ui.h
+
+fetch-luna-ui: $(LUNA_UI_HDR)
+	@printf 'luna-ui headers ready: $(LUNA_UI_DIR)\n'
+
+$(LUNA_UI_HDR):
+	mkdir -p $(LUNA_UI_DIR)
+	for h in $(LUNA_UI_HDRS); do \
+	    curl -L --fail --retry 3 "$(LUNA_UI_RAW)/$$h" -o "$(LUNA_UI_DIR)/$$h" || exit 1; \
+	done
+
+# luna_overlay.o lives in libjvm.so rather than in the executable: the widget
+# layer that publishes documents (src/dvm/dvm_runtime.c) is compiled into this
+# library, and the presenter that draws them (src/arm_exec.cpp) links against
+# it, so one copy here gives both sides the same overlay state.
+LUNA_UI_CFLAGS = -I$(LUNA_UI_DIR) \
+	-Wno-pedantic -Wno-unused-function -Wno-sign-compare \
+	-Wno-missing-field-initializers -Wno-cast-align -Wno-float-equal \
+	-Wno-stack-usage -Wno-array-bounds -Wno-strict-overflow
+
+luna_overlay.o: src/luna_overlay.c src/luna_overlay.h $(LUNA_UI_HDR)
+	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE $(LUNA_UI_CFLAGS) \
+	    -c src/luna_overlay.c -o $@
+
+# The boot screen.  It calls luna-ui but does not define its implementation —
+# luna_overlay.o is the one translation unit that does, and both land in
+# libjvm.so, so the engine is linked once.
+luna_splash.o: src/luna_splash.c src/luna_splash.h src/luna_overlay.h $(LUNA_UI_HDR)
+	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE $(LUNA_UI_CFLAGS) \
+	    -c src/luna_splash.c -o $@
+
 # The Dalvik bytecode emulator lives in libjvm.so: it is reached from jvm.c
 # (a JNI call with no host stub) and it calls back out through the same JNI
 # table, so the two have to be in one object.
-runtime/libjvm.so: trace.o src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/jvm.h src/jvm/jni.h $(DVM_SRC) $(DVM_HDR)
+runtime/libjvm.so: trace.o luna_overlay.o luna_splash.o src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/jvm.h src/jvm/jni.h $(DVM_SRC) $(DVM_HDR)
 	mkdir -p runtime
 	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE -Wno-pedantic $(LDFLAGS) -shared \
-	    trace.o src/jvm/jvm.c src/jvm/jni_stubs.c $(DVM_SRC) -lm -lssl -lcrypto -licuuc \
-	    -lGLESv2 -lz -o $@
+	    trace.o luna_overlay.o luna_splash.o src/jvm/jvm.c src/jvm/jni_stubs.c \
+	    $(DVM_SRC) \
+	    -lm -lssl -lcrypto -licuuc \
+	    -lEGL -lGLESv2 -lz -o $@
 
 runtime/libm.so:
 	mkdir -p runtime
@@ -183,9 +224,11 @@ install-lib: $(libs)
 install: install-bin install-lib
 
 clean:
-	$(RM) $(bins) trace.o arm_exec.o loader.o libdl.so libpthread.so
+	$(RM) $(bins) trace.o arm_exec.o loader.o luna_overlay.o luna_splash.o \
+	    libdl.so libpthread.so
 	$(RM) -r runtime
 	$(RM) test/test_dynarmic_arm test/test_unity test/test_dvm test/dvm_test.dex
+	$(RM) test/test_splash
 	$(RM) test/libabitest64.so test/libabitest32.so test/abi_test_values.h
 	$(RM) test/abi_pkg/classes.dex
 
@@ -212,6 +255,18 @@ test/test_dvm: test/dvm_test.c $(DVM_SRC) $(DVM_HDR)
 
 # Pass a real classes.dex as DVM_DEX to also run every method in it.
 DVM_DEX ?=
+# The boot screen, rendered headlessly so it can be looked at without waiting
+# through a real title's boot.
+test/test_splash: test/splash_test.c luna_overlay.o luna_splash.o \
+                  src/luna_overlay.h src/luna_splash.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -Wno-pedantic \
+	    test/splash_test.c luna_overlay.o luna_splash.o \
+	    -lEGL -lGLESv2 -lm -o $@
+
+splash-test: test/test_splash
+	mkdir -p /tmp/lunaria-splash
+	./test/test_splash 12 /tmp/lunaria-splash
+
 dvm-test: test/test_dvm test/dvm_test.dex
 	./test/test_dvm test/dvm_test.dex $(DVM_DEX)
 
@@ -416,6 +471,7 @@ fetch: fetch-libunity fetch-btw fetch-blade-soul fetch-openh264
 
 .PHONY: all x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
         clean install install-bin install-lib test net-test dvm-test abi-test \
-        posix-test \
+        posix-test splash-test \
         fetch fetch-libunity fetch-btw fetch-blade-soul fetch-openh264 \
+        fetch-luna-ui \
         dynarmic-build

@@ -20874,6 +20874,256 @@ static bool audio_getStreamMaxVolume(struct dvm *vm, dvm_ref self,
    RETI(15);
 }
 
+/* android.accounts.Account is a two-string value object — the pair that names
+ * an account on the device.  It has no behaviour beyond carrying them, but the
+ * constructor has to store them: unresolved, every Account the guest built
+ * came back with null name and type, and the AccountManager-shaped code that
+ * reads them (Google Play services' sign-in probe, here) treated that as a
+ * malformed account rather than as an absent one. */
+static bool account_init(struct dvm *vm, dvm_ref self,
+                         const union dvm_value *args, int nargs,
+                         union dvm_value *out)
+{
+   if (nargs < 2 || !ARG(0).l || !ARG(1).l) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException",
+                 "the name and type must not be empty");
+      return false;
+   }
+   union dvm_value name = { .l = ARG(0).l }, type = { .l = ARG(1).l };
+   (void)dvm_set_field(vm, self, "name", "Ljava/lang/String;", name);
+   (void)dvm_set_field(vm, self, "type", "Ljava/lang/String;", type);
+   RETV();
+}
+
+static bool account_toString(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value name = { 0 }, type = { 0 };
+   (void)dvm_get_field(vm, self, "name", "Ljava/lang/String;", &name);
+   (void)dvm_get_field(vm, self, "type", "Ljava/lang/String;", &type);
+   char buf[256];
+   snprintf(buf, sizeof buf, "Account {name=%s, type=%s}",
+            name.l ? dvm_string_utf8(vm, name.l) : "null",
+            type.l ? dvm_string_utf8(vm, type.l) : "null");
+   RETL(dvm_new_string(vm, buf));
+}
+
+static const struct rt_field rt_account_fields[] = {
+   { "name", "Ljava/lang/String;" },
+   { "type", "Ljava/lang/String;" },
+   F_END,
+};
+
+static const struct rt_method rt_account[] = {
+   M("<init>", "(Ljava/lang/String;Ljava/lang/String;)V", account_init),
+   M("toString", "()Ljava/lang/String;", account_toString),
+   M_END,
+};
+
+/* android.media.AudioAttributes and its Builder.
+ *
+ * Every Builder setter returns the builder, which is what makes the chained
+ * form the API is always written in work.  With the class absent the VM
+ * resolved the whole chain to nothing and handed back a null reference from
+ * the first setUsage(), so the very next link — setContentType() — threw
+ * NullPointerException and took the caller's whole method with it.  In this
+ * title that caller is UE4's GameActivity audio-focus setup, which is why
+ * `[dvm] unresolved: AudioAttributes$Builder.setUsage` and an NPE inside
+ * GameActivity$16.run() were the same failure reported twice.
+ *
+ * The attributes themselves are advisory routing hints: Lunaria mixes
+ * everything to one OpenSL ES output, so what they must do is round-trip.  A
+ * caller that sets a usage and reads it back gets what it set. */
+static bool aattr_builder_set_int(struct dvm *vm, dvm_ref self,
+                                  const char *field,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+   union dvm_value v = { .i = nargs > 0 ? ARG(0).i : 0 };
+   (void)dvm_set_field(vm, self, field, "I", v);
+   RETL(self);
+}
+
+#define AATTR_SET(fn, field)                                                 \
+static bool fn(struct dvm *vm, dvm_ref self, const union dvm_value *args,   \
+               int nargs, union dvm_value *out)                             \
+{ return aattr_builder_set_int(vm, self, field, args, nargs, out); }
+
+AATTR_SET(aattr_set_usage, "usage")
+AATTR_SET(aattr_set_content_type, "contentType")
+AATTR_SET(aattr_set_flags, "flags")
+AATTR_SET(aattr_set_legacy_stream, "legacyStreamType")
+AATTR_SET(aattr_set_capture_policy, "capturePolicy")
+#undef AATTR_SET
+
+static const struct rt_field rt_audio_attributes_fields[] = {
+   { "usage", "I" }, { "contentType", "I" }, { "flags", "I" },
+   { "legacyStreamType", "I" }, { "capturePolicy", "I" }, F_END,
+};
+
+/* build() copies the accumulated fields onto a fresh AudioAttributes: the
+ * builder is reusable on Android, so the two objects must not share state. */
+static bool aattr_build(struct dvm *vm, dvm_ref self,
+                        const union dvm_value *args, int nargs,
+                        union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/media/AudioAttributes;");
+   dvm_ref attrs = c ? dvm_new_object(vm, c) : 0;
+   if (!attrs) RETL(0);
+   for (int i = 0; rt_audio_attributes_fields[i].name; ++i) {
+      union dvm_value v = { 0 };
+      (void)dvm_get_field(vm, self, rt_audio_attributes_fields[i].name, "I", &v);
+      (void)dvm_set_field(vm, attrs, rt_audio_attributes_fields[i].name, "I", v);
+   }
+   RETL(attrs);
+}
+
+static const struct rt_method rt_audio_attributes_builder[] = {
+   M("<init>", "()V", nop_void),
+   M("setUsage", "(I)Landroid/media/AudioAttributes$Builder;", aattr_set_usage),
+   M("setContentType", "(I)Landroid/media/AudioAttributes$Builder;",
+     aattr_set_content_type),
+   M("setFlags", "(I)Landroid/media/AudioAttributes$Builder;", aattr_set_flags),
+   M("setLegacyStreamType", "(I)Landroid/media/AudioAttributes$Builder;",
+     aattr_set_legacy_stream),
+   M("setAllowedCapturePolicy", "(I)Landroid/media/AudioAttributes$Builder;",
+     aattr_set_capture_policy),
+   M("setHapticChannelsMuted", "(Z)Landroid/media/AudioAttributes$Builder;",
+     return_self),
+   M("build", "()Landroid/media/AudioAttributes;", aattr_build),
+   M_END,
+};
+
+#define AATTR_GET(fn, field)                                                 \
+static bool fn(struct dvm *vm, dvm_ref self, const union dvm_value *args,   \
+               int nargs, union dvm_value *out)                             \
+{ (void)args; (void)nargs; union dvm_value v = { 0 };                       \
+  (void)dvm_get_field(vm, self, field, "I", &v); RETI(v.i); }
+
+AATTR_GET(aattr_get_usage, "usage")
+AATTR_GET(aattr_get_content_type, "contentType")
+AATTR_GET(aattr_get_flags, "flags")
+#undef AATTR_GET
+
+static const struct rt_method rt_audio_attributes[] = {
+   M("getUsage", "()I", aattr_get_usage),
+   M("getContentType", "()I", aattr_get_content_type),
+   M("getFlags", "()I", aattr_get_flags),
+   M("getVolumeControlStream", "()I", ret_zero),
+   M_END,
+};
+
+/* android.media.AudioFocusRequest.Builder — the API 26+ form of the same
+ * request, and the one GameActivity uses on a modern target SDK.  It carries
+ * the AudioAttributes built above. */
+static bool afr_set_attributes(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   union dvm_value v = { .l = nargs > 0 ? ARG(0).l : 0 };
+   (void)dvm_set_field(vm, self, "attributes",
+                       "Landroid/media/AudioAttributes;", v);
+   RETL(self);
+}
+
+static bool afr_set_listener(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   union dvm_value v = { .l = nargs > 0 ? ARG(0).l : 0 };
+   (void)dvm_set_field(vm, self, "focusListener",
+                       "Landroid/media/AudioManager$OnAudioFocusChangeListener;",
+                       v);
+   RETL(self);
+}
+
+static bool afr_build(struct dvm *vm, dvm_ref self,
+                      const union dvm_value *args, int nargs,
+                      union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   struct dvm_class *c =
+      dvm__class_by_desc(vm, "Landroid/media/AudioFocusRequest;");
+   dvm_ref req = c ? dvm_new_object(vm, c) : 0;
+   if (!req) RETL(0);
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "attributes",
+                       "Landroid/media/AudioAttributes;", &v);
+   (void)dvm_set_field(vm, req, "attributes",
+                       "Landroid/media/AudioAttributes;", v);
+   v.l = 0;
+   (void)dvm_get_field(vm, self, "focusListener",
+                       "Landroid/media/AudioManager$OnAudioFocusChangeListener;",
+                       &v);
+   (void)dvm_set_field(vm, req, "focusListener",
+                       "Landroid/media/AudioManager$OnAudioFocusChangeListener;",
+                       v);
+   RETL(req);
+}
+
+static const struct rt_field rt_audio_focus_request_fields[] = {
+   { "attributes", "Landroid/media/AudioAttributes;" },
+   { "focusListener",
+     "Landroid/media/AudioManager$OnAudioFocusChangeListener;" },
+   { "focusGain", "I" },
+   F_END,
+};
+
+static const struct rt_method rt_audio_focus_request_builder[] = {
+   M("<init>", "(I)V", nop_void),
+   M("<init>", "(Landroid/media/AudioFocusRequest;)V", nop_void),
+   M("setAudioAttributes",
+     "(Landroid/media/AudioAttributes;)Landroid/media/AudioFocusRequest$Builder;",
+     afr_set_attributes),
+   M("setOnAudioFocusChangeListener",
+     "(Landroid/media/AudioManager$OnAudioFocusChangeListener;)"
+     "Landroid/media/AudioFocusRequest$Builder;", afr_set_listener),
+   M("setOnAudioFocusChangeListener",
+     "(Landroid/media/AudioManager$OnAudioFocusChangeListener;"
+     "Landroid/os/Handler;)Landroid/media/AudioFocusRequest$Builder;",
+     afr_set_listener),
+   M("setWillPauseWhenDucked", "(Z)Landroid/media/AudioFocusRequest$Builder;",
+     return_self),
+   M("setAcceptsDelayedFocusGain",
+     "(Z)Landroid/media/AudioFocusRequest$Builder;", return_self),
+   M("setFocusGain", "(I)Landroid/media/AudioFocusRequest$Builder;",
+     return_self),
+   M("build", "()Landroid/media/AudioFocusRequest;", afr_build),
+   M_END,
+};
+
+static bool afr_get_attributes(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "attributes",
+                       "Landroid/media/AudioAttributes;", &v);
+   RETL(v.l);
+}
+
+static const struct rt_method rt_audio_focus_request[] = {
+   M("getAudioAttributes", "()Landroid/media/AudioAttributes;",
+     afr_get_attributes),
+   M_END,
+};
+
+/* Audio focus.  Nothing else on this host competes for the output, so the
+ * request always succeeds — AUDIOFOCUS_REQUEST_GRANTED (1).  Answering 0
+ * (FAILED) is what a game reads as "another app owns the speaker", and the
+ * well-behaved response to that is to stay silent. */
+static bool audio_requestFocus(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)vm; (void)self; (void)args; (void)nargs;
+   RETI(1);            /* AUDIOFOCUS_REQUEST_GRANTED */
+}
+
 static const struct rt_method rt_audio_manager[] = {
    M("getProperty", "(Ljava/lang/String;)Ljava/lang/String;", audio_getProperty),
    M("getStreamVolume", "(I)I", audio_getStreamVolume),
@@ -20881,6 +21131,18 @@ static const struct rt_method rt_audio_manager[] = {
    M("getStreamMinVolume", "(I)I", ret_zero),
    M("getMode", "()I", ret_zero),
    M("isMusicActive", "()Z", ret_false),
+   M("requestAudioFocus",
+     "(Landroid/media/AudioManager$OnAudioFocusChangeListener;II)I",
+     audio_requestFocus),
+   M("requestAudioFocus", "(Landroid/media/AudioFocusRequest;)I",
+     audio_requestFocus),
+   M("abandonAudioFocus",
+     "(Landroid/media/AudioManager$OnAudioFocusChangeListener;)I",
+     audio_requestFocus),
+   M("abandonAudioFocusRequest", "(Landroid/media/AudioFocusRequest;)I",
+     audio_requestFocus),
+   M("setMode", "(I)V", nop_void),
+   M("setSpeakerphoneOn", "(Z)V", nop_void),
    M_END,
 };
 
@@ -23093,6 +23355,8 @@ static const struct rt_field rt_view_fields[] = {
    { "cornerRadius", "I" },
    { "centerInParent", "I" }, { "alignParentBottom", "I" },
    { "disabled", "Z" },
+   { "windowToken", "Landroid/os/IBinder;" },
+   { "attachListener", "Landroid/view/View$OnAttachStateChangeListener;" },
    F_END,
 };
 
@@ -23108,6 +23372,122 @@ static bool view_get_hit_rect(struct dvm *vm, dvm_ref self,
          (void)dvm_set_field(vm, ARG(0).l, names[i], "I", v);
       }
    }
+   RETV();
+}
+
+/* getLocationInWindow()/getLocationOnScreen() write the view's origin into a
+ * two-element int[].  Missing, they left the caller's array at its zeroed
+ * initial value, which is indistinguishable from "this view is at the top-left
+ * corner" — androidx's popup and tooltip placement reads exactly this pair to
+ * decide where to put a window, so every anchored popup was positioned against
+ * the wrong origin instead of against its anchor.  Lunaria's surface is the
+ * whole display, so window and screen coordinates are the same space. */
+static bool view_get_location(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   dvm_ref arr = nargs ? ARG(0).l : 0;
+   if (!arr) {
+      dvm__throw(vm, "java/lang/NullPointerException",
+                 "getLocationInWindow: null location array");
+      return false;
+   }
+   if (dvm_array_length(vm, arr) < 2) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException",
+                 "location array must have at least two elements");
+      return false;
+   }
+   int32_t *xy = dvm_array_data(vm, arr);
+   if (!xy) RETV();
+   /* Absolute position is the sum of left/top up the parent chain: a child's
+    * own left/top are relative to its parent, which is why reading just this
+    * view's fields would answer with the offset inside the parent rather than
+    * with a window coordinate. */
+   int32_t x = 0, y = 0;
+   dvm_ref v = self;
+   for (int guard = 0; v && guard < 32; ++guard) {
+      union dvm_value l = { 0 }, t = { 0 };
+      (void)dvm_get_field(vm, v, "left", "I", &l);
+      (void)dvm_get_field(vm, v, "top", "I", &t);
+      x += l.i;
+      y += t.i;
+      union dvm_value parent = { 0 };
+      (void)dvm_get_field(vm, v, "parent", "Landroid/view/ViewParent;",
+                          &parent);
+      v = parent.l;
+   }
+   xy[0] = x;
+   xy[1] = y;
+   RETV();
+}
+
+/* A window token identifies the window a view is attached to; the framework
+ * passes it to WindowManager and to the input-method manager.  Answering 0
+ * means "not attached to a window", and a caller that checks reasonably
+ * concludes it must not show anything yet — which is how an SDK dialog that
+ * guards its show() on getWindowToken() != null silently never appeared.
+ * There is one window here, so one token object, created on demand and kept on
+ * the view's root. */
+static bool view_get_window_token(struct dvm *vm, dvm_ref self,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   dvm_ref root = self;
+   for (int guard = 0; guard < 32; ++guard) {
+      union dvm_value parent = { 0 };
+      (void)dvm_get_field(vm, root, "parent", "Landroid/view/ViewParent;",
+                          &parent);
+      if (!parent.l) break;
+      root = parent.l;
+   }
+   union dvm_value tok = { 0 };
+   (void)dvm_get_field(vm, root, "windowToken", "Landroid/os/IBinder;", &tok);
+   if (!tok.l) {
+      struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/os/IBinder;");
+      tok.l = c ? dvm_new_object(vm, c) : 0;
+      if (tok.l)
+         (void)dvm_set_field(vm, root, "windowToken", "Landroid/os/IBinder;",
+                             tok);
+   }
+   RETL(tok.l);
+}
+
+/* View.addOnAttachStateChangeListener().  A view handed to this overlay is
+ * attached for as long as it exists — there is no detach — so the listener is
+ * called back immediately with onViewAttachedToWindow() and then kept only so
+ * remove() has something to remove.  Dropping the call entirely is what left
+ * androidx's popup code waiting for an attach that never came. */
+static bool view_add_attach_listener(struct dvm *vm, dvm_ref self,
+                                     const union dvm_value *args, int nargs,
+                                     union dvm_value *out)
+{
+   (void)out;
+   dvm_ref listener = nargs ? ARG(0).l : 0;
+   if (!listener) RETV();
+   union dvm_value v = { .l = listener };
+   (void)dvm_set_field(vm, self, "attachListener",
+                       "Landroid/view/View$OnAttachStateChangeListener;", v);
+   struct dvm_class *c = dvm_object_class(vm, listener);
+   struct dvm_method *m =
+      c ? dvm_find_method(vm, c, "onViewAttachedToWindow",
+                          "(Landroid/view/View;)V") : NULL;
+   if (m) {
+      union dvm_value a = { .l = self }, ignored = { 0 };
+      if (!dvm_call(vm, m, listener, &a, 1, &ignored))
+         dvm_clear_exception(vm);
+   }
+   RETV();
+}
+
+static bool view_remove_attach_listener(struct dvm *vm, dvm_ref self,
+                                        const union dvm_value *args, int nargs,
+                                        union dvm_value *out)
+{
+   (void)args; (void)nargs; (void)out;
+   union dvm_value none = { 0 };
+   (void)dvm_set_field(vm, self, "attachListener",
+                       "Landroid/view/View$OnAttachStateChangeListener;", none);
    RETV();
 }
 
@@ -23510,6 +23890,18 @@ static const struct rt_method rt_view[] = {
      "(Landroid/view/View$OnSystemUiVisibilityChangeListener;)V", nop_void),
    M("setOnFocusChangeListener", "(Landroid/view/View$OnFocusChangeListener;)V",
      nop_void),
+   M("getLocationInWindow", "([I)V", view_get_location),
+   M("getLocationOnScreen", "([I)V", view_get_location),
+   M("getWindowToken", "()Landroid/os/IBinder;", view_get_window_token),
+   M("getApplicationWindowToken", "()Landroid/os/IBinder;",
+     view_get_window_token),
+   M("addOnAttachStateChangeListener",
+     "(Landroid/view/View$OnAttachStateChangeListener;)V",
+     view_add_attach_listener),
+   M("removeOnAttachStateChangeListener",
+     "(Landroid/view/View$OnAttachStateChangeListener;)V",
+     view_remove_attach_listener),
+   M("isAttachedToWindow", "()Z", ret_true),
    M_END,
 };
 
@@ -31320,6 +31712,16 @@ static const struct rt_class rt_classes[] = {
      rt_activity_manager, NULL, NULL },
    { "Landroid/media/AudioManager;", "Ljava/lang/Object;",
      rt_audio_manager, NULL, NULL },
+   { "Landroid/media/AudioAttributes;", "Ljava/lang/Object;",
+     rt_audio_attributes, rt_audio_attributes_fields, NULL },
+   { "Landroid/media/AudioAttributes$Builder;", "Ljava/lang/Object;",
+     rt_audio_attributes_builder, rt_audio_attributes_fields, NULL },
+   { "Landroid/media/AudioFocusRequest;", "Ljava/lang/Object;",
+     rt_audio_focus_request, rt_audio_focus_request_fields, NULL },
+   { "Landroid/media/AudioFocusRequest$Builder;", "Ljava/lang/Object;",
+     rt_audio_focus_request_builder, rt_audio_focus_request_fields, NULL },
+   { "Landroid/accounts/Account;", "Ljava/lang/Object;",
+     rt_account, rt_account_fields, NULL },
    { "Landroid/app/ActivityManager$MemoryInfo;", "Ljava/lang/Object;",
      rt_activity_memory_info, rt_activity_memory_fields, NULL },
    { "Landroid/app/ActivityManager$RunningAppProcessInfo;", "Ljava/lang/Object;",

@@ -46,11 +46,25 @@ bool luna_overlay_pointer(double x, double y, int action);
  * strings are copied and the document is parsed on the thread that presents. */
 void luna_overlay_set_document(const char *html, const char *css);
 
+/* Draws the overlay as the only content on the surface: clears first, because
+ * there is no guest frame underneath to composite over.  This is what the boot
+ * screen uses, before the guest has produced anything.  `luna_overlay_present`
+ * is this with `clear` false. */
+void luna_overlay_present_ex(int w, int h, bool clear);
+
 /* Called with the DOM id of an element the user clicked, from the thread that
  * presents the overlay.  The emulator's widget layer uses it to find the guest
  * View the element stands for. */
 typedef void (*luna_overlay_click_fn)(const char *id);
 void luna_overlay_set_click_handler(luna_overlay_click_fn fn);
+
+/* Called on the presenting thread, with the document parsed and luna-ui's
+ * state live, immediately before the frame is drawn.  It is the only place a
+ * caller may touch luna-ui's element API: the boot screen updates its text and
+ * its progress bar here rather than by republishing the document, which would
+ * restart every CSS animation on the page. */
+typedef void (*luna_overlay_frame_fn)(void);
+void luna_overlay_set_frame_handler(luna_overlay_frame_fn fn);
 
 /* Releases the GL objects and the document.  Safe to call without a context;
  * it only forgets state in that case. */
