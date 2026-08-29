@@ -115,6 +115,13 @@ int      arm_exec_egl_query_context(uint32_t ctx, int attr, int32_t *value);
 int      arm_exec_egl_get_config_attrib(uint32_t cfg, int attr, int32_t *value);
 int      arm_exec_egl_get_error(void);
 
+/* Overlay (and any other host path) that calls eglMakeCurrent itself must
+ * drop the scheduler's binding ledger, or the next slice would restore from
+ * a stale handle.  After restoring the guest binding, call
+ * arm_exec_egl_note_current instead so the next slice skips eglMakeCurrent. */
+void     arm_exec_egl_invalidate_current(void);
+void     arm_exec_egl_note_current(void *egl_ctx, void *egl_draw_surf);
+
 /* Upload decoded RGBA into a guest GL_TEXTURE_2D on the current context. */
 void     arm_exec_upload_texture_rgba(int tex, const uint8_t *rgba, int w, int h);
 
@@ -124,6 +131,10 @@ void     arm_exec_upload_texture_rgba(int tex, const uint8_t *rgba, int w, int h
  * asset.  This is the same lookup the native AAsset path uses — APK, split
  * APKs, OBB and the staged files tree. */
 unsigned char *arm_exec_asset_read(const char *name, size_t *len);
+/* Read a named member from a guest-visible zip/jar/apk.  Unlike the asset
+ * helper this honours the archive argument and does not add assets/ prefixes. */
+unsigned char *arm_exec_zip_read(const char *archive, const char *name,
+                                 size_t *len);
 
 /* Dump current framebuffer to PPM.  path may be NULL → /tmp/lunaria_NNNN.ppm.
  * Returns 1 on success.  Also: F12 in the window, or `touch /tmp/lunaria-shot`. */
@@ -131,6 +142,20 @@ int arm_exec_screenshot(const char *path);
 
 /* Framebuffer / window size (LUNARIA_WIDTH / LUNARIA_HEIGHT, default 1280×720). */
 int arm_exec_fb_width(void);
+/* Resolves an absolute guest path into the host path it names, applying the
+ * guest's filesystem namespace (Android roots, external storage, app data).
+ * Returns `path` itself when no rewrite applies, otherwise `buf`.  Callers
+ * that touch the host filesystem on the guest's behalf must go through this:
+ * without it an Android path such as "/etc" aliases the host's. */
+const char *arm_exec_map_guest_path(const char *path, char *buf, size_t bufsz);
+
+/* Reports a guest operation that destroys something under a directory lunaria
+ * staged — the extracted expansion, or the app's data.  Those are the two
+ * trees the emulator cannot rebuild for free, so their removal is an event to
+ * see happen rather than to deduce later from an empty directory. */
+void arm_exec_note_destructive(const char *what, const char *host_path,
+                               const char *dest);
+
 /* AndroidManifest meta-data for the bytecode VM's ApplicationInfo.metaData
  * Bundle.  Returns 0 when absent, else the value kind ('Z','I','F' in *iv or
  * 'L' in *sv). */
@@ -172,6 +197,7 @@ uint32_t  arm_exec_input_queue_handle(void);
 
 /* Returns 1 if the GLFW window close button was pressed, 0 otherwise. */
 int arm_exec_glfw_should_close(void);
+void arm_exec_request_quit(void);
 
 /* Run all pthread_create-queued ARM thread functions inline (up to 8 passes). */
 void arm_exec_run_pending_threads(void);
@@ -181,6 +207,10 @@ void arm_exec_run_pending_threads(void);
  * guest had work to do" from "every guest thread is parked"; see the pump
  * loops in loader.c. */
 uint64_t arm_exec_sched_ticks(void);
+/* Guest instructions the JIT has translated (not executed).  Compare with
+ * arm_exec_sched_ticks(): translating far more than the guest runs means the
+ * emulator is recompiling, not working. */
+uint64_t arm_exec_translated_insn(void);
 
 /* Pre-create Mono generic JIT trampolines before initJni maps mscorlib. */
 void arm_exec_ensure_mono_trampolines(void);
@@ -232,13 +262,19 @@ uint32_t arm_exec_heap_used(void);
 uint64_t arm_exec_guest_abort_count(void);
 
 /* Consumes a pending SetDesiredViewSize change: returns 1 once per resize and
- * fills *w/*h with the new view size, so the pump can deliver the engine's
+ * fills the width/height outputs with the new view size, so the pump can deliver the engine's
  * surfaceChanged notification. */
 int arm_exec_take_view_resize(int *w, int *h);
 
 /* Return the directory of the main ARM library (set when arm_exec_jni_onload
  * is first called).  Used by libjvm-java.c findLibrary to return full paths. */
 const char *arm_exec_get_main_lib_dir(void);
+
+/* Set the APK process native-library directory without loading a library.
+ * Android starts ordinary applications in Java and only loads native code
+ * when System.loadLibrary() is reached; that startup path has no "main .so"
+ * from which the directory could otherwise be inferred. */
+void arm_exec_set_main_lib_dir(const char *dir);
 
 /* Reset saved callee-saved registers (R4-R11) to zero.
  * Call after a run that may have corrupted ARM state (stack overflow / exception).

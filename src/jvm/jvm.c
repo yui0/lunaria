@@ -6,21 +6,45 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+#include <time.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <assert.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include "dlfcn.h"
 #include "jvm.h"
 #include "trace.h"
 #include "dvm/dvm_jni.h"
+#include "dvm/dvm.h"
+#include "arm.h"
 
 _Static_assert(sizeof(jclass) == sizeof(jobject), "We assume jclass and jobject are both same internally for the call methods");
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
 #define container_of(ptr, type, member) ((type *)((char *)(1 ? (ptr) : &((type *)0)->member) - offsetof(type, member)))
+
+#define JVM_UNIMPLEMENTED() do {                                             \
+   static atomic_flag warned = ATOMIC_FLAG_INIT;                             \
+   if (!atomic_flag_test_and_set_explicit(&warned, memory_order_relaxed))     \
+      fprintf(stderr, "[jvm] unimplemented JNI entry: %s\n", __func__);      \
+} while (0)
+
+static pthread_mutex_t g_jni_monitor_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_jni_monitor_cond  = PTHREAD_COND_INITIALIZER;
+static _Atomic uint64_t g_next_jni_monitor_token = 1;
+static _Thread_local uint64_t g_jni_monitor_token;
+
+static uint64_t jni_monitor_token(void)
+{
+   if (!g_jni_monitor_token)
+      g_jni_monitor_token = atomic_fetch_add_explicit(
+         &g_next_jni_monitor_token, 1, memory_order_relaxed);
+   return g_jni_monitor_token;
+}
 
 static inline char*
 ccopy(const char *str, const size_t len, const bool null_terminate)
@@ -247,12 +271,45 @@ jvm_add_object(struct jvm *jvm, const struct jvm_object *o)
               "method=%zu class=%zu string=%zu — a JNI reference is leaking\n",
               ARRAY_SIZE(jvm->objects), n[JVM_OBJECT_OPAQUE], n[JVM_OBJECT_ARRAY],
               n[JVM_OBJECT_METHOD], n[JVM_OBJECT_CLASS], n[JVM_OBJECT_STRING]);
+      /* Which class the leaked handles belong to.  "65,000 opaque objects"
+       * names the symptom; the class names the caller. */
+      {
+         struct { const char *name; size_t n; } tally[256] = {0};
+         size_t ntally = 0;
+         for (size_t k = 0; k < ARRAY_SIZE(jvm->objects); ++k) {
+            if (jvm->objects[k].type != JVM_OBJECT_OPAQUE) continue;
+            struct jvm_object *ko =
+               jvm_get_object(jvm, jvm->objects[k].this_klass);
+            const char *nm = (ko && ko->type == JVM_OBJECT_CLASS &&
+                              ko->klass.name.data) ? ko->klass.name.data : "?";
+            size_t t = 0;
+            while (t < ntally && strcmp(tally[t].name, nm)) ++t;
+            if (t == ntally) {
+               if (ntally == ARRAY_SIZE(tally)) continue;
+               tally[ntally++].name = nm;
+            }
+            ++tally[t].n;
+         }
+         for (size_t shown = 0; shown < 12; ++shown) {
+            size_t best = 0;
+            for (size_t t = 1; t < ntally; ++t)
+               if (tally[t].n > tally[best].n) best = t;
+            if (!ntally || !tally[best].n) break;
+            fprintf(stderr, "[jvm]   %8zu  %s\n", tally[best].n,
+                    tally[best].name);
+            tally[best].n = 0;
+         }
+      }
       assert(0 && "jvm object limit reached!");
       return NULL;
    }
    jvm->next_object = i + 1;
    jvm->objects[i] = *o;
    jvm->objects[i].refs = 1;
+   /* Slots are recycled, so a stale stub pointer from the previous tenant
+    * would otherwise be handed to a different method. */
+   jvm->wrap_cached[i] = false;
+   jvm->wrap_cache[i] = NULL;
 
    if (!jvm->objects[i].this_klass)
       jvm_assign_default_class(jvm, &jvm->objects[i]);
@@ -382,14 +439,14 @@ static jint
 JNIEnv_GetVersion(JNIEnv * p0)
 {
    assert(p0);
-   return 0;
+   return JNI_VERSION_1_6;
 }
 
 static jclass
 JNIEnv_DefineClass(JNIEnv* p0, const char* p1, jobject p2, const jbyte* p3, jsize p4)
 {
    assert(p0 && p1 && p2);
-   verbose("FIXME: unimplemented");
+   JVM_UNIMPLEMENTED();
    return NULL;
 }
 
@@ -423,7 +480,11 @@ JNIEnv_FindClass(JNIEnv* p0, const char* p1)
 static jmethodID
 JNIEnv_FromReflectedMethod(JNIEnv* p0, jobject p1)
 {
-   assert(p0 && p1);
+   assert(p0);
+   /* JNI: a null java.lang.reflect.Method yields a null jmethodID.  Aborting
+    * here turned a failed ReflectionHelper.getMethodID (NoSuchMethodError /
+    * null Member) into a host process kill before the guest could catch it. */
+   if (!p1) return NULL;
    jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
    return p1;
 }
@@ -431,7 +492,8 @@ JNIEnv_FromReflectedMethod(JNIEnv* p0, jobject p1)
 static jfieldID
 JNIEnv_FromReflectedField(JNIEnv* p0, jobject p1)
 {
-   assert(p0 && p1);
+   assert(p0);
+   if (!p1) return NULL;
    jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
    return p1;
 }
@@ -440,7 +502,7 @@ static jobject
 JNIEnv_ToReflectedMethod(JNIEnv* p0, jclass p1, jmethodID p2, jboolean p3)
 {
    assert(p0 && p1 && p2);
-   verbose("FIXME: unimplemented");
+   JVM_UNIMPLEMENTED();
    return NULL;
 }
 
@@ -544,7 +606,7 @@ static jobject
 JNIEnv_ToReflectedField(JNIEnv* p0, jclass p1, jfieldID p2, jboolean p3)
 {
    assert(p0 && p1 && p2);
-   verbose("FIXME: unimplemented");
+   JVM_UNIMPLEMENTED();
    return NULL;
 }
 
@@ -712,8 +774,15 @@ JNIEnv_AllocObject(JNIEnv* p0, jclass p1)
       verbose("AllocObject: NULL class (unimplemented stub?) — using generic Object class");
       p1 = jvm_make_class(jnienv_get_jvm(p0), "java/lang/Object");
    }
+   /* Every allocation denotes a new Java object.  Opaque objects used to go
+    * through the value-interning path, whose equality key is just type and
+    * class.  That made every File share one identity (and therefore one path)
+    * and every Proxy share one native callback — and every X509Certificate
+    * from getAcceptedIssuers() collapse to one handle, so getEncoded() could
+    * not find the DER bytes UnityTLS needs.  Classes and method IDs are
+    * interned values; ordinary object instances must never be. */
    struct jvm_object o = { .this_klass = p1, .type = JVM_OBJECT_OPAQUE };
-   return jvm_add_object_if_not_there(jnienv_get_jvm(p0), &o);
+   return jvm_add_object(jnienv_get_jvm(p0), &o);
 }
 
 static bool
@@ -960,7 +1029,7 @@ jvm_framework_super(const char *name)
 }
 
 static void*
-jvm_wrap_method(struct jvm *jvm, jmethodID method_id)
+jvm_wrap_method_uncached(struct jvm *jvm, jmethodID method_id)
 {
    char symbol[255];
    struct jvm_method method = jvm_get_object_of_type(jvm, method_id, JVM_OBJECT_METHOD)->method;
@@ -998,6 +1067,62 @@ jvm_wrap_method(struct jvm *jvm, jmethodID method_id)
    method.klass = jvm_make_class(jvm, "java/lang/Class");
    jvm_form_symbol(jvm, &method, symbol, sizeof(symbol));
    return wrapper_create(symbol, dlsym(RTLD_DEFAULT, symbol));
+}
+
+/* How much work the cache is saving: resolves that actually ran, the time they
+ * took, and how many calls were answered from the table.  Reported by
+ * jvm_wrap_stats() so LUNARIA_JNI_TIME can print it next to the per-method
+ * figures. */
+static unsigned long long g_wrap_resolves, g_wrap_resolve_ns, g_wrap_hits;
+
+void jvm_wrap_stats(unsigned long long *resolves, unsigned long long *ns,
+                    unsigned long long *hits)
+{
+   if (resolves) *resolves = g_wrap_resolves;
+   if (ns)       *ns       = g_wrap_resolve_ns;
+   if (hits)     *hits     = g_wrap_hits;
+}
+
+static unsigned long long wrap_now_ns(void)
+{
+   struct timespec t;
+   clock_gettime(CLOCK_MONOTONIC, &t);
+   return (unsigned long long)t.tv_sec * 1000000000ull + (unsigned long long)t.tv_nsec;
+}
+
+/* See jvm::wrap_cache. */
+static void*
+jvm_wrap_method(struct jvm *jvm, jmethodID method_id)
+{
+   const uintptr_t idx = (uintptr_t)method_id;
+   /* LUNARIA_JNI_WRAP_CACHE=0 goes back to resolving on every call — the
+    * comparison point if a title ever behaves differently with the cache. */
+   static int off = -1;
+   if (off < 0) {
+      const char *e = getenv("LUNARIA_JNI_WRAP_CACHE");
+      off = (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N')) ? 1 : 0;
+   }
+   const bool cacheable = !off && jvm && idx > 0 && idx <= ARRAY_SIZE(jvm->objects);
+   if (cacheable) {
+      const unsigned epoch = dvm_jni_dex_epoch();
+      if (jvm->wrap_epoch != epoch) {
+         memset(jvm->wrap_cached, 0, sizeof jvm->wrap_cached);
+         jvm->wrap_epoch = epoch;
+      }
+      if (jvm->wrap_cached[idx - 1]) {
+         ++g_wrap_hits;
+         return jvm->wrap_cache[idx - 1];
+      }
+   }
+   const unsigned long long t0 = wrap_now_ns();
+   void *r = jvm_wrap_method_uncached(jvm, method_id);
+   g_wrap_resolve_ns += wrap_now_ns() - t0;
+   ++g_wrap_resolves;
+   if (cacheable) {
+      jvm->wrap_cache[idx - 1] = r;
+      jvm->wrap_cached[idx - 1] = true;
+   }
+   return r;
 }
 
 /* Hands the call to the Dalvik bytecode emulator when the APK's own dex
@@ -1484,7 +1609,7 @@ static jsize
 JNIEnv_GetStringLength(JNIEnv* p0, jstring p1)
 {
    assert(p0 && p1);
-   verbose("FIXME: unimplemented");
+   JVM_UNIMPLEMENTED();
    return 0;
 }
 
@@ -1492,7 +1617,7 @@ static const jchar*
 JNIEnv_GetStringChars(JNIEnv* p0, jstring p1, jboolean* p2)
 {
    assert(p0 && p1);
-   verbose("FIXME: unimplemented");
+   JVM_UNIMPLEMENTED();
    return NULL;
 }
 
@@ -1537,10 +1662,37 @@ JNIEnv_GetArrayLength(JNIEnv* p0, jarray p1)
    return jvm_get_object_of_type(jnienv_get_jvm(p0), p1, JVM_OBJECT_ARRAY)->array.size;
 }
 
+static void
+JNIEnv_SetObjectArrayElement(JNIEnv* p0, jobjectArray p1, jsize p2, jobject p3);
+
 static jobjectArray
 JNIEnv_NewObjectArray(JNIEnv* p0, jsize p1, jclass p2, jobject p3)
 {
-   return jvm_new_array(jnienv_get_jvm(p0), p1, sizeof(jobject), "[Ljava/lang/Object;");
+   struct jvm *jvm = jnienv_get_jvm(p0);
+   /* Element class decides the array's runtime class.  Hard-coding
+    * Object[] made every NewObjectArray look like [Ljava.lang.Object; —
+    * IsInstanceOf against String[] failed, and the dex bridge then
+    * wrapped the handle as a non-array so array-length threw NPE. */
+   const char *elem = p2 ? jvm_get_class_name(jvm, p2) : NULL;
+   char desc[512];
+   if (elem && elem[0] == '[') {
+      snprintf(desc, sizeof desc, "[%s", elem);
+   } else {
+      char slash[480];
+      size_t i = 0;
+      const char *e = elem && *elem ? elem : "java/lang/Object";
+      for (; e[i] && i + 1 < sizeof slash; ++i)
+         slash[i] = (e[i] == '.') ? '/' : e[i];
+      slash[i] = '\0';
+      snprintf(desc, sizeof desc, "[L%s;", slash);
+   }
+   jobjectArray arr = (jobjectArray)jvm_new_array(jvm, (size_t)(p1 < 0 ? 0 : p1),
+                                                   sizeof(jobject), desc);
+   if (arr && p3 && p1 > 0) {
+      for (jsize i = 0; i < p1; ++i)
+         JNIEnv_SetObjectArrayElement(p0, arr, i, p3);
+   }
+   return arr;
 }
 
 static jbooleanArray
@@ -1877,16 +2029,50 @@ static jint
 JNIEnv_MonitorEnter(JNIEnv* p0, jobject p1)
 {
    assert(p0 && p1);
-   verbose("FIXME: unimplemented");
-   return 0;
+   struct jvm *jvm = jnienv_get_jvm(p0);
+   struct jvm_object *o = jvm_get_object(jvm, p1);
+   if (!o) return JNI_ERR;
+   const uint64_t me = jni_monitor_token();
+
+   pthread_mutex_lock(&g_jni_monitor_mutex);
+   while (o->monitor_owner && o->monitor_owner != me) {
+      struct dvm *dvm = dvm_current();
+      unsigned gil_depth = dvm ? dvm_gil_unlock_all(dvm) : 0;
+      unsigned arm_depth = arm_lock_unlock_all();
+      pthread_cond_wait(&g_jni_monitor_cond, &g_jni_monitor_mutex);
+      pthread_mutex_unlock(&g_jni_monitor_mutex);
+      if (dvm) dvm_gil_relock(dvm, gil_depth);
+      arm_lock_relock(arm_depth);
+      pthread_mutex_lock(&g_jni_monitor_mutex);
+      o = jvm_get_object(jvm, p1);
+      if (!o) { pthread_mutex_unlock(&g_jni_monitor_mutex); return JNI_ERR; }
+   }
+   o->monitor_owner = me;
+   ++o->monitor_depth;
+   pthread_mutex_unlock(&g_jni_monitor_mutex);
+   return JNI_OK;
 }
 
 static jint
 JNIEnv_MonitorExit(JNIEnv* p0, jobject p1)
 {
    assert(p0 && p1);
-   verbose("FIXME: unimplemented");
-   return 0;
+   struct jvm_object *o = jvm_get_object(jnienv_get_jvm(p0), p1);
+   const uint64_t me = jni_monitor_token();
+   pthread_mutex_lock(&g_jni_monitor_mutex);
+   if (!o || o->monitor_owner != me || !o->monitor_depth) {
+      pthread_mutex_unlock(&g_jni_monitor_mutex);
+      jvm_throw_new(jnienv_get_jvm(p0),
+                    "java/lang/IllegalMonitorStateException",
+                    "JNI MonitorExit without ownership");
+      return JNI_ERR;
+   }
+   if (!--o->monitor_depth) {
+      o->monitor_owner = 0;
+      pthread_cond_signal(&g_jni_monitor_cond);
+   }
+   pthread_mutex_unlock(&g_jni_monitor_mutex);
+   return JNI_OK;
 }
 
 static jint
@@ -1902,14 +2088,14 @@ static void
 JNIEnv_GetStringRegion(JNIEnv* p0, jstring p1, jsize p2, jsize p3, jchar* p4)
 {
    assert(p0 && p1);
-   verbose("FIXME: unimplemented");
+   JVM_UNIMPLEMENTED();
 }
 
 static void
 JNIEnv_GetStringUTFRegion(JNIEnv* p0, jstring p1, jsize p2, jsize p3, char* p4)
 {
    assert(p0 && p1);
-   verbose("FIXME: unimplemented");
+   JVM_UNIMPLEMENTED();
 }
 
 static void*
@@ -1929,7 +2115,7 @@ static const jchar*
 JNIEnv_GetStringCritical(JNIEnv* p0, jstring p1, jboolean* p2)
 {
    assert(p0 && p1);
-   verbose("FIXME: unimplemented");
+   JVM_UNIMPLEMENTED();
    return NULL;
 }
 
@@ -1943,7 +2129,7 @@ static jweak
 JNIEnv_NewWeakGlobalRef(JNIEnv* p0, jobject p1)
 {
    assert(p0 && p1);
-   verbose("FIXME: unimplemented");
+   JVM_UNIMPLEMENTED();
    return NULL;
 }
 
@@ -1951,7 +2137,7 @@ static void
 JNIEnv_DeleteWeakGlobalRef(JNIEnv* p0, jweak p1)
 {
    assert(p0 && p1);
-   verbose("FIXME: unimplemented");
+   JVM_UNIMPLEMENTED();
 }
 
 static jboolean
@@ -1965,7 +2151,7 @@ static jobject
 JNIEnv_NewDirectByteBuffer(JNIEnv* p0, void* p1, jlong p2)
 {
    assert(p0 && p1);
-   verbose("FIXME: unimplemented");
+   JVM_UNIMPLEMENTED();
    return NULL;
 }
 
@@ -1973,7 +2159,7 @@ static void*
 JNIEnv_GetDirectBufferAddress(JNIEnv* p0, jobject p1)
 {
    assert(p0 && p1);
-   verbose("FIXME: unimplemented");
+   JVM_UNIMPLEMENTED();
    return NULL;
 }
 
@@ -1981,7 +2167,7 @@ static jlong
 JNIEnv_GetDirectBufferCapacity(JNIEnv* p0, jobject p1)
 {
    assert(p0 && p1);
-   verbose("FIXME: unimplemented");
+   JVM_UNIMPLEMENTED();
    return 0;
 }
 
@@ -2294,6 +2480,17 @@ const char*
 jvm_get_class_name(struct jvm *jvm, jobject object)
 {
    return jvm_get_object_of_type(jvm, object, JVM_OBJECT_CLASS)->klass.name.data;
+}
+
+/* Like jvm_get_class_name, but NULL when `object` is not itself a Class —
+ * used by the dex bridge to tell a Class argument from an instance. */
+const char *
+jvm_described_class_name(struct jvm *jvm, jobject object)
+{
+   if (!jvm || !object) return NULL;
+   struct jvm_object *o = jvm_get_object(jvm, object);
+   if (!o || o->type != JVM_OBJECT_CLASS) return NULL;
+   return o->klass.name.data;
 }
 
 bool

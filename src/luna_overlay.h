@@ -23,6 +23,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -43,8 +44,21 @@ bool luna_overlay_pointer(double x, double y, int action);
 
 /* Replaces the overlay document.  `css` may be NULL to keep the current sheet.
  * Passing NULL html takes the overlay down.  Safe to call from any thread: the
- * strings are copied and the document is parsed on the thread that presents. */
+ * strings are copied and the document is parsed on the thread that presents.
+ *
+ * Guest widgets (dialogs, etc.) use this path.  While a guest document is up
+ * it takes priority over the JIT status card below. */
 void luna_overlay_set_document(const char *html, const char *css);
+
+/* Boot / JIT status card.  Shown only when no guest document is up, so a
+ * terms-of-service dialog is never covered by "Translating ARM".  Does not
+ * steal pointer input.  NULL html clears the card. */
+void luna_overlay_set_status(const char *html, const char *css);
+
+/* True while the status card (not a guest document) is what present() would
+ * draw.  The mid-compile presenter uses this to decide whether a host swap
+ * is showing the progress UI. */
+bool luna_overlay_status_showing(void);
 
 /* Called with the DOM id of an element the user clicked, from the thread that
  * presents the overlay.  The emulator's widget layer uses it to find the guest
@@ -52,9 +66,19 @@ void luna_overlay_set_document(const char *html, const char *css);
 typedef void (*luna_overlay_click_fn)(const char *id);
 void luna_overlay_set_click_handler(luna_overlay_click_fn fn);
 
+/* Called on the presenting thread, with the document parsed and luna-ui's
+ * state live, immediately before the frame is drawn.  It is the only place a
+ * caller may touch luna-ui's element API.  The boot card updates its text and
+ * its progress bar here rather than by republishing the document, which would
+ * restart every CSS animation on the page. */
+typedef void (*luna_overlay_frame_fn)(void);
+void luna_overlay_set_frame_handler(luna_overlay_frame_fn fn);
+
 /* Releases the GL objects and the document.  Safe to call without a context;
  * it only forgets state in that case. */
 void luna_overlay_shutdown(void);
+
+
 
 #ifdef __cplusplus
 }

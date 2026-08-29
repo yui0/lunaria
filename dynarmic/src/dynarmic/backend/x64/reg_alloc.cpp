@@ -6,6 +6,7 @@
 #include "dynarmic/backend/x64/reg_alloc.h"
 
 #include <algorithm>
+#include <bit>
 #include <numeric>
 #include <utility>
 
@@ -143,6 +144,14 @@ bool HostLocInfo::ContainsValue(const IR::Inst* inst) const {
     return std::find(values.begin(), values.end(), inst) != values.end();
 }
 
+/* True when ReleaseAll() would leave this location exactly as it is, so the
+ * scan in EndOfAllocScope() can drop it. */
+bool HostLocInfo::IsInert() const {
+    return is_being_used_count == 0 && !is_scratch && !is_set_last_use
+        && current_references == 0 && accumulated_uses == 0
+        && total_uses == 0 && values.empty();
+}
+
 size_t HostLocInfo::GetMaxBitWidth() const {
     return max_bit_width;
 }
@@ -257,7 +266,10 @@ RegAlloc::RegAlloc(BlockOfCode& code, std::vector<HostLoc> gpr_order, std::vecto
         : gpr_order(gpr_order)
         , xmm_order(xmm_order)
         , hostloc_info(NonSpillHostLocCount + SpillCount)
-        , code(code) {}
+        , code(code) {
+    static_assert(NonSpillHostLocCount + SpillCount <= 128,
+                  "touched_locs is a 128-bit mask over the host locations");
+}
 
 RegAlloc::ArgumentInfo RegAlloc::GetArgumentInfo(IR::Inst* inst) {
     ArgumentInfo ret = {Argument{*this}, Argument{*this}, Argument{*this}, Argument{*this}};
@@ -504,8 +516,15 @@ void RegAlloc::ReleaseStackSpace(size_t stack_space) {
 }
 
 void RegAlloc::EndOfAllocScope() {
-    for (auto& iter : hostloc_info) {
-        iter.ReleaseAll();
+    for (size_t w = 0; w < touched_locs.size(); w++) {
+        u64 bits = touched_locs[w];
+        while (bits) {
+            const size_t i = (w << 6) + static_cast<size_t>(std::countr_zero(bits));
+            bits &= bits - 1;
+            hostloc_info[i].ReleaseAll();
+            if (hostloc_info[i].IsInert())
+                touched_locs[w] &= ~(u64(1) << (i & 63));
+        }
     }
 }
 
@@ -540,12 +559,16 @@ HostLoc RegAlloc::SelectARegister(const std::vector<HostLoc>& desired_locations)
 }
 
 std::optional<HostLoc> RegAlloc::ValueLocation(const IR::Inst* value) const {
-    for (size_t i = 0; i < hostloc_info.size(); i++) {
-        if (hostloc_info[i].ContainsValue(value)) {
-            return static_cast<HostLoc>(i);
+    for (size_t w = 0; w < touched_locs.size(); w++) {
+        u64 bits = touched_locs[w];
+        while (bits) {
+            const size_t i = (w << 6) + static_cast<size_t>(std::countr_zero(bits));
+            bits &= bits - 1;
+            if (hostloc_info[i].ContainsValue(value)) {
+                return static_cast<HostLoc>(i);
+            }
         }
     }
-
     return std::nullopt;
 }
 
@@ -667,6 +690,7 @@ HostLoc RegAlloc::FindFreeSpill() const {
 
 HostLocInfo& RegAlloc::LocInfo(HostLoc loc) {
     ASSERT(loc != HostLoc::RSP && loc != HostLoc::R15);
+    MarkTouched(loc);
     return hostloc_info[static_cast<size_t>(loc)];
 }
 

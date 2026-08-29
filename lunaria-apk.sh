@@ -32,7 +32,11 @@ xapk_splits=""
 cache_dir=""
 cache_hit=0
 if [ -z "$LUNARIA_NO_CACHE" ]; then
-    _key="$(printf '%s|%s' "$inputfile" \
+    # Include the installed-tree format.  Launcher fixes that change how
+    # split assets are materialised must never silently reuse an older tree.
+    _cache_format=5
+    _key="$(printf '%s|%s|%s' "$inputfile" \
+        "$_cache_format" \
         "$(stat -c '%s|%Y' "$inputfile" 2>/dev/null)" | sha1sum | cut -c1-16)"
     cache_dir="${LUNARIA_CACHE_DIR:-${TMPDIR:-/tmp}/lunaria-cache}/$_key"
     if [ -f "$cache_dir/.ready" ]; then
@@ -229,12 +233,21 @@ else
 fi
 if [ "$cache_hit" -eq 0 ]; then
     mkdir -p "$tmpdir"
-    unzip -q "$pkgfile" -d "$tmpdir"
+    # An unpack that fails has to stop the run.  Without the check a truncated
+    # package still reached the end of setup and got stamped .ready, so every
+    # later run reused a tree whose OBB was half a file — the engine then found
+    # no .uproject and put up "Failed to open descriptor file".  The tree looks
+    # complete from the outside, so nothing recovers from it by itself.
+    unzip -q "$pkgfile" -d "$tmpdir" \
+        || err "failed to unpack $pkgfile (incomplete or corrupt archive)"
     if [ -n "$xapk_splits" ]; then
-        printf '%s\n' "$xapk_splits" | while IFS= read -r _split; do
+        printf '%s\n' "$xapk_splits" > "$tmpdir/.splits"
+        while IFS= read -r _split; do
             [ -n "$_split" ] || continue
-            unzip -q -n "$xapk_dir/$_split" -d "$tmpdir"
-        done
+            unzip -q -n "$xapk_dir/$_split" -d "$tmpdir" \
+                || err "failed to unpack split $_split"
+        done < "$tmpdir/.splits"
+        rm -f "$tmpdir/.splits"
     fi
 fi
 
@@ -243,60 +256,15 @@ fi
 # Create symlinks so Mono finds everything via the extracted dir.
 managed_dir="$tmpdir/assets/bin/Data/Managed"
 
-# Keep the input APK byte-for-byte intact by default: repacking Play Asset
-# Delivery entries changes bundle bytes/order and makes Addressables reject
-# otherwise valid content.  Legacy Unity players, however, require the old
-# `name.split0..N` convention to be materialised as one regular asset.
-has_legacy_splits=0
-if find "$tmpdir/assets/bin/Data" -type f -name '*.split[0-9]*' -print -quit 2>/dev/null | grep -q .; then
-    python3 - "$tmpdir/assets/bin/Data" <<'PYEOF'
-import os, sys
-root = sys.argv[1]
-joined = 0
-for dirpath, _, files in os.walk(root):
-    bases = {}
-    for name in files:
-        base, marker, suffix = name.rpartition('.split')
-        if marker and suffix.isdigit():
-            bases.setdefault(base, []).append((int(suffix), name))
-    for base, parts in bases.items():
-        parts.sort()
-        if [n for n, _ in parts] != list(range(len(parts))):
-            continue
-        with open(os.path.join(dirpath, base), 'wb') as out:
-            for _, name in parts:
-                with open(os.path.join(dirpath, name), 'rb') as part:
-                    while chunk := part.read(1 << 20):
-                        out.write(chunk)
-                os.unlink(os.path.join(dirpath, name))
-        joined += 1
-print(f"[lunaria-apk] joined {joined} legacy split asset(s)", file=sys.stderr)
-PYEOF
-    has_legacy_splits=1
-fi
-
-# Detecting split files before joining is sufficient: this temporary archive
-# is solely for the legacy split-file convention.  A cached tree already has
-# the join done, so the *.split files are gone and the detection above says
-# "no" — the repacked archive next to it is what records the earlier answer.
-if [ -f "$tmpdir/lunaria-legacy-splits.apk" ]; then
-    export ANDROID_APK_FILE="$tmpdir/lunaria-legacy-splits.apk"
-elif [ "$has_legacy_splits" -eq 1 ]; then
-    repacked="$tmpdir/lunaria-legacy-splits.apk"
-    ( cd "$tmpdir" && zip -0 -q -r "$repacked" . -x 'lunaria-legacy-splits.apk' ) || err "repack apk failed"
-    export ANDROID_APK_FILE="$repacked"
-else
-    # UE opens ANDROID_APK_FILE with open() after TCHAR↔narrow conversion.
-    # Under the guest C locale, non-ASCII path bytes (e.g. 特許 in this
-    # workspace) become '?' and the open fails — so the in-APK OBB is never
-    # mounted and PreInit dies on the missing .uproject.  Hand the guest an
-    # ASCII path by hard-linking (or copying) into the already-ASCII tmpdir.
-    _apk_guest="$tmpdir/base.apk"
-    [ -f "$_apk_guest" ] || ln "$pkgfile" "$_apk_guest" 2>/dev/null \
-        || cp -f "$pkgfile" "$_apk_guest" \
-        || err "stage apk for guest open failed"
-    export ANDROID_APK_FILE="$_apk_guest"
-fi
+# The installed package view keeps split assets exactly as shipped.  Lunaria's
+# AssetManager/open bridge concatenates name.split0..N lazily when the guest
+# asks for the logical asset, matching Android without rewriting or repacking
+# any APK.  Keep an ASCII path for native engines that open the base APK.
+_apk_guest="$tmpdir/base.apk"
+[ -f "$_apk_guest" ] || ln "$pkgfile" "$_apk_guest" 2>/dev/null \
+    || cp -f "$pkgfile" "$_apk_guest" \
+    || err "stage apk for guest open failed"
+export ANDROID_APK_FILE="$_apk_guest"
 
 if [ -d "$managed_dir" ]; then
     # Mono's mono_assembly_load_corlib() searches for corlib at
@@ -415,6 +383,9 @@ def parse(data, pkg):
     application_name = None
     application_theme = None
     providers = []
+    permissions = []
+    cur_provider = None
+    depth_provider = -1
     launch = None
     depth_activity = -1
     saw_main = saw_launcher = False
@@ -465,12 +436,23 @@ def parse(data, pkg):
                 provider = attrs['name']
                 if provider.startswith('.'):
                     provider = pkg + provider
-                providers.append((provider, str(attrs.get('authorities', ''))))
+                cur_provider = [provider, str(attrs.get('authorities', '')), []]
+                depth_provider = depth
+            elif elem == 'uses-permission' and attrs.get('name'):
+                permissions.append(str(attrs['name']))
+            elif elem == 'meta-data' and cur_provider is not None:
+                key = attrs.get('name')
+                value = attrs.get('resource', attrs.get('value'))
+                if key is not None and value is not None:
+                    cur_provider[2].append((str(key), str(value)))
             elif elem == 'action' and attrs.get('name') == 'android.intent.action.MAIN':
                 saw_main = True
             elif elem == 'category' and attrs.get('name') == 'android.intent.category.LAUNCHER':
                 saw_launcher = True
         elif chunk_type == 0x0103:  # END_ELEMENT
+            if depth == depth_provider and cur_provider is not None:
+                providers.append(cur_provider)
+                cur_provider, depth_provider = None, -1
             if depth == depth_activity:
                 if saw_main and saw_launcher and cur_name:
                     name = cur_target or cur_name
@@ -488,15 +470,18 @@ def parse(data, pkg):
                 cur_name, cur_target, cur_orientation, cur_theme, depth_activity = None, None, None, None, -1
             depth -= 1
         i += chunk_size
-    return launch + (providers,) if launch else None
+    return launch + (providers, permissions) if launch else None
 
 try:
     with zipfile.ZipFile(sys.argv[1]) as z:
         result = parse(z.read('AndroidManifest.xml'), sys.argv[2])
     if result:
-        name, orientation, application, theme, providers = result
-        encoded_providers = ';'.join(f'{name}|{authority}' for name, authority in providers)
-        print(f"{name}|{'' if orientation is None else orientation}|{application or ''}|{theme or ''}|{encoded_providers}")
+        name, orientation, application, theme, providers, permissions = result
+        encoded_providers = ';'.join(
+            f"{name}|{authority}|" + ','.join(f'{key}~{value}' for key, value in metadata)
+            for name, authority, metadata in providers)
+        encoded_permissions = ','.join(permissions)
+        print(f"{name}|{'' if orientation is None else orientation}|{application or ''}|{theme or ''}|{encoded_providers}#{encoded_permissions}")
 except Exception:
     pass
 PYEOF
@@ -512,7 +497,9 @@ launch_app_rest="${launch_rest#*|}"
 launch_application="${launch_app_rest%%|*}"
 launch_theme_rest="${launch_app_rest#*|}"
 launch_theme="${launch_theme_rest%%|*}"
-launch_providers="${launch_theme_rest#*|}"
+launch_install_info="${launch_theme_rest#*|}"
+launch_providers="${launch_install_info%%#*}"
+launch_permissions="${launch_install_info#*#}"
 case "$launch_orientation" in
     ?*)
         ANDROID_SCREEN_ORIENTATION="$launch_orientation"
@@ -534,6 +521,10 @@ if [ -n "$launch_providers" ] && [ "$launch_providers" != "$launch_app_rest" ]; 
     export ANDROID_CONTENT_PROVIDERS="$launch_providers"
     msg "content providers: $(printf '%s' "$launch_providers" | tr ';' '\n' | wc -l)"
 fi
+if [ -n "$launch_permissions" ] && [ "$launch_permissions" != "$launch_install_info" ]; then
+    export ANDROID_REQUESTED_PERMISSIONS="$launch_permissions"
+    msg "requested permissions: $(printf '%s' "$launch_permissions" | tr ',' '\n' | wc -l)"
+fi
 
 # Portrait / landscape defaults for known titles (override with LUNARIA_WIDTH/HEIGHT)
 case "$pkgname" in
@@ -549,32 +540,70 @@ case "$pkgname" in
         ;;
 esac
 
-# Unity の nativeFile へ渡す実 APK ファイル。上で split 結合済みの
-# lunaria-joined.apk を優先（元 APK は ANDROID 用参照として残さない）。
-# 展開ディレクトリは AssetManager ブリッジ/Mono 用に維持。
+# Unity nativeFile receives the byte-for-byte base APK staged above.  Split
+# assets remain in the installed-package directory for the AssetManager/open
+# bridge; no joined or repacked APK is created.
 if [ -z "$ANDROID_APK_FILE" ] || [ ! -f "$ANDROID_APK_FILE" ]; then
     export ANDROID_APK_FILE="$pkgfile"
 fi
 
-# persistentDataPath / getExternalFilesDir
-export ANDROID_EXTERNAL_FILES_DIR="$tmpdir/local/files"
+# persistentDataPath / getExternalFilesDir.
+#
+# Deliberately outside the package cache.  This is where a title puts the
+# content it downloads at runtime, and Cross Worlds downloads 13.7 GB into it.
+# While it lived under $cache_dir/inst, anything that rebuilt the cache — a
+# newer launcher format, a corrupt tree, an interrupted unpack — silently threw
+# all of that away, and the next run started the patcher again from nothing.
+# The cache holds what was derived from the APK and can be derived again; this
+# holds what only exists because it was downloaded once.
+# LUNARIA_DATA_ROOT relocates everything the guest writes.  The default keeps
+# it beside the launcher, which is convenient but inherits whatever the source
+# tree's path happens to be — and a guest that mishandles a non-ASCII path
+# component then fails for a reason that has nothing to do with the guest.
+#
+# It is also remembered.  What lives under it is the one thing the launcher
+# cannot recreate: this title downloads 13.7 GB the first time it runs, and a
+# run that forgets where that went does not find it — it downloads the lot
+# again.  So the first run that names a root writes it down, and every later
+# run picks it up without being told.  Pass a new one to move; pass the
+# default explicitly (LUNARIA_DATA_ROOT="$PWD") to go back.
+_root_memo="${0%/*}/.lunaria-data-root"
+if [ -n "$LUNARIA_DATA_ROOT" ]; then
+    printf '%s\n' "$LUNARIA_DATA_ROOT" > "$_root_memo" 2>/dev/null || :
+elif [ -r "$_root_memo" ]; then
+    LUNARIA_DATA_ROOT="$(cat "$_root_memo")"
+    [ -d "$LUNARIA_DATA_ROOT" ] || LUNARIA_DATA_ROOT=""
+    [ -n "$LUNARIA_DATA_ROOT" ] && msg "data root (remembered): $LUNARIA_DATA_ROOT"
+fi
+: "${LUNARIA_DATA_ROOT:=$PWD}"
+export ANDROID_EXTERNAL_FILES_DIR="$LUNARIA_DATA_ROOT/local/data/$pkgname/external/files"
 mkdir -p "$ANDROID_EXTERNAL_FILES_DIR"
-export ANDROID_EXTERNAL_OBB_DIR="$PWD/local/data/$pkgname/obb"
+# One migration for trees staged by earlier launchers, so an existing install
+# is not re-downloaded just because this moved.
+if [ -n "$cache_dir" ] && [ -d "$tmpdir/local/files" ] &&
+   ! find "$ANDROID_EXTERNAL_FILES_DIR" -mindepth 1 -maxdepth 1 2>/dev/null | grep -q .; then
+    msg "moving staged external files out of the package cache"
+    (cd "$tmpdir/local/files" && tar cf - .) | (cd "$ANDROID_EXTERNAL_FILES_DIR" && tar xf -) \
+        && rm -rf "$tmpdir/local/files"
+fi
+export ANDROID_EXTERNAL_OBB_DIR="$LUNARIA_DATA_ROOT/local/data/$pkgname/obb"
 mkdir -p "$ANDROID_EXTERNAL_OBB_DIR"
 
 # Android's credential-protected application data.  Keep this outside the
 # transient APK extraction tree: databases/preferences/files survive process
 # restarts on a device and framework code (notably Room/WorkManager) relies on
 # the directories being distinct from the APK code path.
-export ANDROID_FILES_DIR="$PWD/local/data/$pkgname/files"
-export ANDROID_CACHE_DIR="$PWD/local/data/$pkgname/cache"
-export ANDROID_DATABASES_DIR="$PWD/local/data/$pkgname/databases"
-export ANDROID_NO_BACKUP_DIR="$PWD/local/data/$pkgname/no_backup"
+export ANDROID_FILES_DIR="$LUNARIA_DATA_ROOT/local/data/$pkgname/files"
+export ANDROID_CACHE_DIR="$LUNARIA_DATA_ROOT/local/data/$pkgname/cache"
+export ANDROID_CODE_CACHE_DIR="$LUNARIA_DATA_ROOT/local/data/$pkgname/code_cache"
+export ANDROID_DATABASES_DIR="$LUNARIA_DATA_ROOT/local/data/$pkgname/databases"
+export ANDROID_NO_BACKUP_DIR="$LUNARIA_DATA_ROOT/local/data/$pkgname/no_backup"
 # SharedPreferences, in the same place and the same XML a device keeps them in.
 # They persist across launches: an SDK that writes the account it just created
 # here has to find it again next time, or every launch is a new user.
-export ANDROID_PREFS_DIR="$PWD/local/data/$pkgname/shared_prefs"
-mkdir -p "$ANDROID_FILES_DIR" "$ANDROID_CACHE_DIR" "$ANDROID_DATABASES_DIR" \
+export ANDROID_PREFS_DIR="$LUNARIA_DATA_ROOT/local/data/$pkgname/shared_prefs"
+mkdir -p "$ANDROID_FILES_DIR" "$ANDROID_CACHE_DIR" "$ANDROID_CODE_CACHE_DIR" \
+    "$ANDROID_DATABASES_DIR" \
     "$ANDROID_NO_BACKUP_DIR" "$ANDROID_PREFS_DIR"
 
 # Expansion files (.obb).  UE4 ships all game content (Content/Paks/*.pak) in
@@ -713,8 +742,13 @@ if [ -n "$ANDROID_OBB_MAIN" ]; then
     # assets (including the real .uproject from the pak) as loose files —
     # host staging only, no fabricated project descriptor.
     _stage_py="$(dirname "$argv0")/scripts/ue4_stage_encrypted_paks.py"
-    if [ "$cache_hit" -eq 1 ]; then
-        _stage_py=""   # already staged into the cached tree
+    # Skip it when the tree it writes into already has its output.  The test
+    # used to be "did we hit the package cache", which stopped being the right
+    # question once the external-files tree moved out of that cache: a cached
+    # package with a freshly created external tree would have skipped the
+    # staging that fills it.  Ask the tree itself instead.
+    if [ -f "$_ue_game/.staged-encrypted-paks" ]; then
+        _stage_py=""
     fi
     if [ -f "$_stage_py" ] && [ -n "$_ue_so" ]; then
         find "$_ue_game" -type d \( -path '*/Content/Paks' -o -path '*/Content/CBPaks' \) \
@@ -723,6 +757,7 @@ if [ -n "$ANDROID_OBB_MAIN" ]; then
             _out=$(dirname "$(dirname "$(dirname "$_paks")")")
             python3 "$_stage_py" --so "$_ue_so" --paks "$_paks" --out "$_out" \
                 || msg "encrypted pak stage failed for $_paks (continuing)"
+            : > "$_ue_game/.staged-encrypted-paks"
             # UE Curl HTTPS probes several CA paths (Certificates/cacert.pem,
             # CurlCertificates/ca-bundle.pem, Engine ThirdParty).  Cooked paks
             # often omit them; install the host trust store so CDN config /
@@ -789,9 +824,20 @@ for cand in libunity.so libUE4.so libUnreal.so libmain.so; do
     fi
 done
 if [ -z "$main_so" ]; then
-    main_so="$(find "$libdir" -maxdepth 1 -name 'lib*.so' ! -name 'libc++_shared.so' | head -1)"
+    # No engine-native entry point: Android starts the manifest Activity in
+    # bytecode and lets System.loadLibrary() load JNI code in application
+    # order.  Choosing the first lib*.so is both unordered and incorrect.
+    export ANDROID_NATIVE_LIB_DIR="$libdir"
+    case "$arch" in
+        arm64-v8a) main_so="--apk-process-arm64" ;;
+        armeabi-v7a) main_so="--apk-process-arm32" ;;
+    esac
 fi
-[ -n "$main_so" ] && [ -f "$main_so" ] || err "no main native library in $libdir"
+[ -n "$main_so" ] || err "no startup path for $arch"
+case "$main_so" in
+    --apk-process-*) : ;;
+    *) [ -f "$main_so" ] || err "no main native library in $libdir" ;;
+esac
 msg "main lib: $main_so"
 
 # The package is fully unpacked and staged: record what was derived from it and
@@ -800,15 +846,20 @@ msg "main lib: $main_so"
 if [ -n "$cache_dir" ] && { [ "$cache_hit" -eq 0 ] || [ "$_need_write_derived" -eq 1 ]; }; then
     # These values carry spaces, '|' and ';' (the provider list is one long
     # field), so each has to come back out of the file as a single word.
-    _q() { printf "%s='%s'\n" "$1" "$(printf '%s' "$2" | sed "s/'/'\\\\''/g")"; }
-    {
-        _q arch "$arch"
-        _q pkgname "$pkgname"
-        _q launch_info "$launch_info"
-        # xapk_splits is deliberately not cached: it is one file name per line
-        # and the manifest read that produces it is already cheap.
-    } > "$derived"
+    python3 - "$arch" "$pkgname" "$launch_info" > "$derived" <<'PYEOF'
+import shlex, sys
+for key, value in zip(('arch', 'pkgname', 'launch_info'), sys.argv[1:]):
+    print(f'{key}={shlex.quote(value)}')
+PYEOF
+    # xapk_splits is deliberately not cached: it is one file name per line
+    # and the manifest read that produces it is already cheap.
     if [ "$cache_hit" -eq 0 ]; then
+        # Only stamp a tree the whole of setup actually produced.  derived.env
+        # is written by the python above and is the last thing staging makes,
+        # so an empty one means a step before it failed — and a stamped broken
+        # tree is worse than no cache at all, because it never rebuilds.
+        [ -s "$derived" ] \
+            || err "staging did not complete; not caching $cache_dir"
         : > "$cache_dir/.ready"
         msg "package cached: $cache_dir"
     else
@@ -817,6 +868,11 @@ if [ -n "$cache_dir" ] && { [ "$cache_hit" -eq 0 ] || [ "$_need_write_derived" -
 fi
 
 lunaria_bin="${LUNARIA_BIN:-./lunaria}"
+
+# Cold-start JIT can spend a long stretch translating with a blank window.
+# The luna-ui progress card is on by default; LUNARIA_JIT_UI=0 turns it off.
+: "${LUNARIA_JIT_UI:=1}"
+export LUNARIA_JIT_UI
 
 # A signal aimed at this script (Ctrl-C, `timeout`) has to reach the emulator.
 # Run it in the background and forward, rather than leaving an orphan behind:

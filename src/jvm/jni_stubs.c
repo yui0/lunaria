@@ -27,12 +27,32 @@
 #include "jvm.h"
 #include "arm_exec.h"
 #include "guest_mem.h"
+#include "dvm/dvm_jni.h"
 
 extern void arm_exec_drain_gl_thread_jobs(void);
 const char *arm_exec_get_main_lib_dir(void);
 
 #define JNI_FILE_PATHS_MAX 65536u
 static char *g_file_paths[JNI_FILE_PATHS_MAX];
+static jobject g_current_activity;
+
+void
+jni_set_current_activity(JNIEnv *env, jobject activity)
+{
+   g_current_activity = activity;
+   /* IronSource (and many other Unity plugins) read the public static field
+    * UnityPlayer.currentActivity via sget, not the currentActivity() accessor
+    * stub.  Mirror the process Activity into that field whenever it is set,
+    * the same way UnityPlayer itself does after attach. */
+   if (env && activity)
+      dvm_jni_bind_unity_activity(env, activity);
+}
+
+jobject
+jni_get_current_activity(void)
+{
+   return g_current_activity;
+}
 
 void
 jni_file_set_path(jobject file, const char *path)
@@ -58,12 +78,18 @@ jni_file_get_path(jobject file)
 static void
 jni_file_join(char *out, size_t outsz, const char *parent, const char *child)
 {
+   /* Match java.io.UnixFileSystem.resolve: empty parent → child alone.
+    * Inserting '/' here made absolute paths out of relative names. */
    if (!parent || !*parent) {
       snprintf(out, outsz, "%s", child ? child : "");
       return;
    }
    if (!child || !*child) {
       snprintf(out, outsz, "%s", parent);
+      return;
+   }
+   if (child[0] == '/') {
+      snprintf(out, outsz, "%s", child);
       return;
    }
    const size_t plen = strlen(parent);
@@ -895,6 +921,8 @@ android_content_Context_getExternalFilesDir(JNIEnv *env, jobject object, va_list
       sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"));
       const char *p = getenv("ANDROID_EXTERNAL_FILES_DIR");
       jni_file_set_path(sv, (p && *p) ? p : "/tmp");
+      fprintf(stderr, "[jni_file] Context.getExternalFilesDir -> h=0x%lx path=%s\n",
+              (unsigned long)(uintptr_t)sv, jni_file_get_path(sv));
    }
    return sv;
 }
@@ -911,6 +939,8 @@ android_content_Context_getFilesDir(JNIEnv *env, jobject object, va_list args)
       if (!p || !*p)
          p = getenv("ANDROID_EXTERNAL_FILES_DIR");
       jni_file_set_path(sv, (p && *p) ? p : "/tmp");
+      fprintf(stderr, "[jni_file] Context.getFilesDir -> h=0x%lx path=%s\n",
+              (unsigned long)(uintptr_t)sv, jni_file_get_path(sv));
    }
    return sv;
 }
@@ -941,6 +971,35 @@ android_content_pm_ApplicationInfo_sourceDir(JNIEnv *env, jobject object)
    assert(env && object);
    const char *apk = lunaria_apk_mount_path();
    return (*env)->NewStringUTF(env, (apk && *apk) ? apk : "");
+}
+
+jstring
+android_content_pm_ApplicationInfo_publicSourceDir(JNIEnv *env, jobject object)
+{
+   return android_content_pm_ApplicationInfo_sourceDir(env, object);
+}
+
+/* ApplicationInfo.dataDir is the package's private data root (the parent of
+ * Context.getFilesDir()), never an empty string. */
+jstring
+android_content_pm_ApplicationInfo_dataDir(JNIEnv *env, jobject object)
+{
+   assert(env && object);
+   const char *files = getenv("ANDROID_FILES_DIR");
+   char path[PATH_MAX];
+   snprintf(path, sizeof path, "%s", (files && *files) ? files : "/tmp/lunaria-files");
+   size_t n = strlen(path);
+   if (n >= 6 && !strcmp(path + n - 6, "/files"))
+      path[n - 6] = '\0';
+   return (*env)->NewStringUTF(env, path);
+}
+
+jstring
+android_content_pm_ApplicationInfo_nativeLibraryDir(JNIEnv *env, jobject object)
+{
+   assert(env && object);
+   const char *path = getenv("ANDROID_NATIVE_LIB_DIR");
+   return (*env)->NewStringUTF(env, (path && *path) ? path : "");
 }
 
 jobject
@@ -2846,36 +2905,61 @@ jint android_os_Debug_isDebuggerConnected(JNIEnv *e, jobject o, va_list a)
 jint android_os_Debug_waitingForDebugger(JNIEnv *e, jobject o, va_list a)
 { (void)e; (void)o; (void)a; return JNI_FALSE; }
 
-jmethodID
-com_unity3d_player_ReflectionHelper_getMethodID(JNIEnv *env, jobject object, jvalue *values)
+/* Dex: (Class,String,String,Z)->Method / Field.  Must take va_list like every
+ * other Call* stub — CallStaticObjectMethodA builds a fake va_list over the
+ * jvalue array; a jvalue*-taking body read that struct as a pointer and
+ * returned null, so Unity's AndroidAgent never got getInstance. */
+jobject
+com_unity3d_player_ReflectionHelper_getMethodID(JNIEnv *env, jobject object,
+                                                va_list args)
 {
    assert(env && object);
-   /* Fake-JVM stand-in for the Java method (not a RegisterNatives entry).
-    * Call*MethodA used to pass nullptr — guard so a missed marshal cannot
-    * take down the host.  Dex: (Class,String,String,Z)->Method.
-    * Caller must provide 4 jvalues (Z may be 0); unit tests do the same. */
-   if (!values || !values[0].l || !values[1].l || !values[2].l)
+   jclass clazz = va_arg(args, jclass);
+   jstring name = va_arg(args, jstring);
+   jstring sig = va_arg(args, jstring);
+   jboolean is_static = (jboolean)va_arg(args, int);
+   if (!clazz || !name || !sig) return NULL;
+   const char *utf1 = (*env)->GetStringUTFChars(env, name, NULL);
+   const char *utf2 = (*env)->GetStringUTFChars(env, sig, NULL);
+   if (!utf1 || !utf2) {
+      if (utf1) (*env)->ReleaseStringUTFChars(env, name, utf1);
+      if (utf2) (*env)->ReleaseStringUTFChars(env, sig, utf2);
       return NULL;
-   const char *utf1 = (*env)->GetStringUTFChars(env, values[1].l, NULL);
-   const char *utf2 = (*env)->GetStringUTFChars(env, values[2].l, NULL);
-   if (!utf1 || !utf2) return NULL;
-   if (values[3].z)
-      return (*env)->GetStaticMethodID(env, (jclass)values[0].l, utf1, utf2);
-   return (*env)->GetMethodID(env, (jclass)values[0].l, utf1, utf2);
+   }
+   /* Unity immediately FromReflectedMethod()'s the result.  In this JVM a
+    * jmethodID is already a Method-shaped object, so returning it matches
+    * FromReflectedMethod's identity conversion. */
+   jobject mid = is_static
+      ? (jobject)(*env)->GetStaticMethodID(env, clazz, utf1, utf2)
+      : (jobject)(*env)->GetMethodID(env, clazz, utf1, utf2);
+   (*env)->ReleaseStringUTFChars(env, name, utf1);
+   (*env)->ReleaseStringUTFChars(env, sig, utf2);
+   return mid;
 }
 
-jfieldID
-com_unity3d_player_ReflectionHelper_getFieldID(JNIEnv *env, jobject object, jvalue *values)
+jobject
+com_unity3d_player_ReflectionHelper_getFieldID(JNIEnv *env, jobject object,
+                                               va_list args)
 {
    assert(env && object);
-   if (!values || !values[0].l || !values[1].l || !values[2].l)
+   jclass clazz = va_arg(args, jclass);
+   jstring name = va_arg(args, jstring);
+   jstring sig = va_arg(args, jstring);
+   jboolean is_static = (jboolean)va_arg(args, int);
+   if (!clazz || !name || !sig) return NULL;
+   const char *utf1 = (*env)->GetStringUTFChars(env, name, NULL);
+   const char *utf2 = (*env)->GetStringUTFChars(env, sig, NULL);
+   if (!utf1 || !utf2) {
+      if (utf1) (*env)->ReleaseStringUTFChars(env, name, utf1);
+      if (utf2) (*env)->ReleaseStringUTFChars(env, sig, utf2);
       return NULL;
-   const char *utf1 = (*env)->GetStringUTFChars(env, values[1].l, NULL);
-   const char *utf2 = (*env)->GetStringUTFChars(env, values[2].l, NULL);
-   if (!utf1 || !utf2) return NULL;
-   if (values[3].z)
-      return (*env)->GetStaticFieldID(env, (jclass)values[0].l, utf1, utf2);
-   return (*env)->GetFieldID(env, (jclass)values[0].l, utf1, utf2);
+   }
+   jobject fid = is_static
+      ? (jobject)(*env)->GetStaticFieldID(env, clazz, utf1, utf2)
+      : (jobject)(*env)->GetFieldID(env, clazz, utf1, utf2);
+   (*env)->ReleaseStringUTFChars(env, name, utf1);
+   (*env)->ReleaseStringUTFChars(env, sig, utf2);
+   return fid;
 }
 
 /* Unity queues callbacks from native threads to run on the Java main thread.
@@ -2901,20 +2985,16 @@ com_unity3d_player_UnityPlayer_executeGLThreadJobs(JNIEnv *env, jobject object, 
    arm_exec_drain_gl_thread_jobs();
 }
 
-/* UnityPlayer.currentActivity — a public static Activity field that Unity reads
- * to obtain the host Activity for getPackageName()/getSystemService()/window
- * queries.  When this was unimplemented it returned NULL, so the engine took the
- * GetObjectClass(NULL)→generic-Object fallback and re-probed the activity (and the
- * crash-report receiver below) on *every* nativeRender frame — part of the churn
- * behind the black screen.  Hand back the same Activity stub the loader allocates
- * for initJni: jvm_add_object_if_not_there() dedups opaque objects by class, so
- * AllocObject(Activity) yields the identical handle the loader passes as `context`,
- * keeping the downstream Context.* shims (getPackageName etc.) consistent. */
+/* UnityPlayer.currentActivity is the Activity instance launched by the process,
+ * not an arbitrary instance of android.app.Activity.  Identity matters to
+ * window state, lifecycle state, and fields installed by the application's
+ * constructor. */
 jobject
 com_unity3d_player_UnityPlayer_currentActivity(JNIEnv *env, jobject object)
 {
+   (void)env;
    (void)object;
-   return (*env)->AllocObject(env, (*env)->FindClass(env, "android/app/Activity"));
+   return g_current_activity;
 }
 
 /* PlayAssetDeliveryUnityWrapper.init(UnityPlayer, Context) — static factory that

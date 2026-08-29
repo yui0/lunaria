@@ -44,6 +44,7 @@ public:
     void ReleaseAll();
 
     bool ContainsValue(const IR::Inst* inst) const;
+    bool IsInert() const;
     size_t GetMaxBitWidth() const;
 
     void AddValue(IR::Inst* inst);
@@ -174,6 +175,20 @@ private:
     HostLoc FindFreeSpill() const;
 
     std::vector<HostLocInfo> hostloc_info;
+    /* Which host locations may not be inert.  There are 96 of them — 32
+     * registers and 64 spill slots — and almost all the spill slots stay
+     * untouched for a whole block, yet EndOfAllocScope() and ValueLocation()
+     * walked all 96 for every microinstruction: 7 KB of scattered reads each
+     * time, which measured as the single largest cost of compiling a block.
+     * A location can only stop being inert through the non-const LocInfo()
+     * below, so setting a bit there covers every way one is used.  The bit is
+     * conservative — set does not prove non-inert — and is cleared again when
+     * EndOfAllocScope() finds the location empty. */
+    std::array<u64, 2> touched_locs{};
+    void MarkTouched(HostLoc loc) {
+        const size_t i = static_cast<size_t>(loc);
+        touched_locs[i >> 6] |= u64(1) << (i & 63);
+    }
     HostLocInfo& LocInfo(HostLoc loc);
     const HostLocInfo& LocInfo(HostLoc loc) const;
 

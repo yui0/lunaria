@@ -11,6 +11,7 @@
 #include "jvm/jvm.h"
 #include "arm_exec.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,7 +19,24 @@
 static struct dvm *g_vm;
 static bool g_tried;
 static enum dvm_jni_mode g_mode = DVM_JNI_FILL_GAPS;
-static JNIEnv *g_env;               /* the env of the call currently in flight */
+/* The env of the call currently in flight *on this thread*.
+ *
+ * A framework call from bytecode goes back out through this env, and it used
+ * to be one global set for the duration of a guest→VM call.  That held while
+ * the VM only ever ran underneath such a call.  Bytecode on a host thread of
+ * its own does not start from one: the global was NULL there, and every
+ * framework call it made was reported as an unresolved method — Log.d(),
+ * Context.getAssets(), Activity.registerReceiver().  The SDK initialisation
+ * that made those calls then failed for want of a JNIEnv rather than for want
+ * of an implementation.
+ *
+ * There is one env in the process, so remember it and let a thread with no
+ * call of its own use it. */
+static _Thread_local JNIEnv *g_env;
+static JNIEnv *g_env_any;
+
+/* The env to make outward calls through: this thread's, or the process's. */
+static JNIEnv *current_env(void) { return g_env ? g_env : g_env_any; }
 static dvm_guest_native_fn g_guest_native;
 static dvm_guest_library_fn g_guest_library;
 static unsigned g_calls, g_native_calls, g_external_calls;
@@ -56,33 +74,84 @@ static bool hook_load_library(void *user, struct dvm *vm, const char *name)
  * once per lifecycle event: a fresh wrapper per call would reset those fields
  * between calls, which looks exactly like the silent-zero behaviour this
  * module exists to remove. */
-static struct {
+struct dvm_wrapper {
    uint32_t host;
    dvm_ref ref;
-} g_wrappers[512];
-static unsigned g_nwrappers;
+};
+
+/* Host handles are integer keys allocated throughout the process lifetime.
+ * A fixed, linearly searched array made every bridge crossing O(n), then lost
+ * identity completely after 8192 objects.  Keep an open-addressed table: it
+ * has no per-entry allocation or lock (all access is under the DVM GIL), and
+ * grows before probing becomes expensive. */
+static struct dvm_wrapper *g_wrappers;
+static size_t g_wrapper_cap, g_nwrappers;
+
+static size_t wrapper_hash(uint32_t host)
+{
+   uint32_t x = host;
+   x ^= x >> 16;
+   x *= UINT32_C(0x7feb352d);
+   x ^= x >> 15;
+   x *= UINT32_C(0x846ca68b);
+   x ^= x >> 16;
+   return (size_t)x;
+}
+
+static struct dvm_wrapper *wrapper_slot(struct dvm_wrapper *table, size_t cap,
+                                        uint32_t host)
+{
+   if (!table || !cap) return NULL;
+   size_t i = wrapper_hash(host) & (cap - 1);
+   while (table[i].host && table[i].host != host)
+      i = (i + 1) & (cap - 1);
+   return &table[i];
+}
+
+static bool wrapper_reserve(void)
+{
+   if (g_wrapper_cap && (g_nwrappers + 1) * 10 < g_wrapper_cap * 7)
+      return true;
+   size_t cap = g_wrapper_cap ? g_wrapper_cap * 2 : 1024;
+   struct dvm_wrapper *table = calloc(cap, sizeof *table);
+   if (!table) return false;
+   for (size_t i = 0; i < g_wrapper_cap; ++i) {
+      if (!g_wrappers[i].host) continue;
+      struct dvm_wrapper *slot = wrapper_slot(table, cap, g_wrappers[i].host);
+      *slot = g_wrappers[i];
+   }
+   free(g_wrappers);
+   g_wrappers = table;
+   g_wrapper_cap = cap;
+   return true;
+}
+
+static dvm_ref find_wrapper(uint32_t host)
+{
+   struct dvm_wrapper *slot = wrapper_slot(g_wrappers, g_wrapper_cap, host);
+   return slot && slot->host == host ? slot->ref : 0;
+}
 
 static void remember_wrapper(uint32_t host, dvm_ref ref)
 {
    if (!host || !ref) return;
-   for (unsigned i = 0; i < g_nwrappers; ++i) {
-      if (g_wrappers[i].host == host) {
-         g_wrappers[i].ref = ref;
-         return;
-      }
+   if (!wrapper_reserve()) {
+      static int warned;
+      if (warned++ < 4) fprintf(stderr,
+         "[dvm] cannot grow wrapper table (%zu entries) — host 0x%x loses "
+         "instance state across JNI\n", g_nwrappers, host);
+      return;
    }
-   if (g_nwrappers < sizeof g_wrappers / sizeof g_wrappers[0]) {
-      g_wrappers[g_nwrappers].host = host;
-      g_wrappers[g_nwrappers].ref = ref;
-      ++g_nwrappers;
-   }
+   struct dvm_wrapper *slot = wrapper_slot(g_wrappers, g_wrapper_cap, host);
+   if (!slot->host) { slot->host = host; ++g_nwrappers; }
+   slot->ref = ref;
 }
 
 static dvm_ref wrapper_for(struct dvm *vm, const char *class_name, uint32_t host)
 {
    if (!host) return 0;
-   for (unsigned i = 0; i < g_nwrappers; ++i)
-      if (g_wrappers[i].host == host) return g_wrappers[i].ref;
+   dvm_ref old = find_wrapper(host);
+   if (old) return old;
 
    dvm_ref r = dvm_wrap_external(vm, class_name, host);
    if (!r) return 0;
@@ -144,22 +213,51 @@ static const char *class_name_of(JNIEnv *env, jobject o)
    return c ? jvm_get_class_name(jnienv_get_jvm(env), c) : NULL;
 }
 
+static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o);
+
 static dvm_ref host_array_to_dvm(struct dvm *vm, JNIEnv *env, jobject o)
 {
    const char *cls = class_name_of(env, o);
    char kind;
    size_t width;
-   if (!host_array_kind(cls, &kind, &width) || kind == 'L') return 0;
+   if (!host_array_kind(cls, &kind, &width)) return 0;
 
    jsize n = (*env)->GetArrayLength(env, o);
+   if (n < 0) n = 0;
+
+   if (kind == 'L') {
+      /* Object arrays used to fall through to an opaque wrapper, so
+       * array-length threw NPE (IronSource AndroidBridge.init(String,String[])).
+       * Element descriptor is the host class name with the leading '[' removed,
+       * dots normalised to slashes for dvm__class_by_desc. */
+      char ed[256];
+      const char *rest = cls + 1;
+      size_t i = 0;
+      for (; rest[i] && i + 1 < sizeof ed; ++i)
+         ed[i] = (rest[i] == '.') ? '/' : rest[i];
+      ed[i] = '\0';
+      dvm_ref r = dvm_new_array(vm, 'L', ed[0] ? ed : "Ljava/lang/Object;",
+                                (uint32_t)n);
+      dvm_ref *slots = r ? dvm_array_data(vm, r) : NULL;
+      for (jsize ei = 0; slots && ei < n; ++ei) {
+         jobject el = (*env)->GetObjectArrayElement(env, (jobjectArray)o, ei);
+         slots[ei] = from_jobject(vm, env, el);
+         if (slots[ei]) dvm_pin(vm, slots[ei]);
+      }
+      struct dvm_object *ao = r ? dvm__obj(vm, r) : NULL;
+      if (ao) ao->host_handle = (uint32_t)(uintptr_t)o;
+      return r;
+   }
+
    char elem[2] = { kind, 0 };
-   dvm_ref r = dvm_new_array(vm, kind, elem, (uint32_t)(n < 0 ? 0 : n));
+   dvm_ref r = dvm_new_array(vm, kind, elem, (uint32_t)n);
    void *dst = r ? dvm_array_data(vm, r) : NULL;
    if (dst && n > 0) ARRAY_REGION(env, Get, kind, o, n, dst);
    return r;
 }
 
-/* The other direction of the copy above, run after the callee returns. */
+/* The other direction of the copy above, run after the callee returns.
+ * (Object arrays are identity-bound via host_handle; no bulk copy-back.) */
 static void array_sync_back(struct dvm *vm, JNIEnv *env, jobject o, dvm_ref r)
 {
    if (!o || !r) return;
@@ -174,13 +272,31 @@ static void array_sync_back(struct dvm *vm, JNIEnv *env, jobject o, dvm_ref r)
 }
 
 /* jobject → dvm_ref.  A jstring becomes a real VM string so bytecode can call
- * length()/equals() on it; anything else is wrapped so its identity survives
- * the round trip back to the stub layer. */
+ * length()/equals() on it; a Class becomes the VM's Class for that type so
+ * getDeclaredMethods()/getMethod() see the dex methods of the class the
+ * handle names, not java.lang.Class's own table; anything else is wrapped so
+ * its identity survives the round trip back to the stub layer. */
 static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
 {
    if (!o) return 0;
    dvm_ref arr = host_array_to_dvm(vm, env, o);
    if (arr) return arr;
+   /* Class arguments (FindClass / GetObjectClass results) must stay Class
+    * objects in the VM.  Wrapping them as instances of java.lang.Class made
+    * ReflectionHelper.getMethodID walk Class's own methods and miss every
+    * getInstance()/setConsent() on the type Unity actually asked about. */
+   {
+      struct jvm *jvm = jnienv_get_jvm(env);
+      const char *described = jvm_described_class_name(jvm, o);
+      if (described && *described) {
+         struct dvm_class *c = dvm_find_class(vm, described);
+         if (c) {
+            dvm_ref r = dvm_class_object(vm, c);
+            if (r) dvm_pin(vm, r);
+            return r;
+         }
+      }
+   }
    const char *utf = NULL;
    /* GetStringUTFChars asserts on a non-string, so probe the class first. */
    jclass sc = (*env)->GetObjectClass(env, o);
@@ -275,6 +391,51 @@ static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
    if (s) return (jobject)(*env)->NewStringUTF(env, s);
 
    struct dvm_class *c = dvm_object_class(vm, r);
+   /* reflect.Method / Field must become real jmethodID / jfieldID objects.
+    * AllocObject left an empty opaque; FromReflectedMethod then handed that
+    * opaque to Call*Method, which rejected it (not JVM_OBJECT_METHOD). */
+   if (c && c->name &&
+       (!strcmp(c->name, "java/lang/reflect/Method") ||
+        !strcmp(c->name, "java/lang/reflect/Constructor") ||
+        !strcmp(c->name, "java/lang/reflect/Field"))) {
+      union dvm_value ownerv = { 0 }, namev = { 0 }, sigv = { 0 }, accv = { 0 };
+      (void)dvm_get_field(vm, r, "owner", "Ljava/lang/Class;", &ownerv);
+      (void)dvm_get_field(vm, r, "name", "Ljava/lang/String;", &namev);
+      (void)dvm_get_field(vm, r, "sig", "Ljava/lang/String;", &sigv);
+      (void)dvm_get_field(vm, r, "access", "I", &accv);
+      struct dvm_object *oo = dvm__obj(vm, ownerv.l);
+      const char *cname = (oo && oo->kind == DVM_OBJ_CLASS && oo->klass)
+                             ? oo->klass->name
+                             : NULL;
+      const char *nm = dvm_string_utf8(vm, namev.l);
+      const char *sg = dvm_string_utf8(vm, sigv.l);
+      if (cname && nm && sg) {
+         jclass jc = (*env)->FindClass(env, cname);
+         if (jc) {
+            const bool is_static = (accv.i & 0x0008) != 0;
+            jobject id;
+            if (!strcmp(c->name, "java/lang/reflect/Field"))
+               id = is_static
+                  ? (jobject)(*env)->GetStaticFieldID(env, jc, nm, sg)
+                  : (jobject)(*env)->GetFieldID(env, jc, nm, sg);
+            else if (nm[0] == '<' && !strcmp(nm, "<init>"))
+               id = (jobject)(*env)->GetMethodID(env, jc, nm, sg);
+            else
+               id = is_static
+                  ? (jobject)(*env)->GetStaticMethodID(env, jc, nm, sg)
+                  : (jobject)(*env)->GetMethodID(env, jc, nm, sg);
+            if (id) {
+               struct dvm_object *obj = dvm__obj(vm, r);
+               if (obj) {
+                  obj->host_handle = (uint32_t)(uintptr_t)id;
+                  remember_wrapper(obj->host_handle, r);
+               }
+               return id;
+            }
+         }
+      }
+   }
+
    jclass cls = (*env)->FindClass(env, c ? c->name : "java/lang/Object");
    jobject o = (*env)->AllocObject(env, cls);
    struct dvm_object *obj = dvm__obj(vm, r);
@@ -433,15 +594,26 @@ static size_t dvm_build_split_arrays(struct dvm *vm, dvm_ref *out_names,
 
 static void dvm_fill_application_info_paths(struct dvm *vm, dvm_ref ai)
 {
-   /* Deliberately not filling sourceDir / publicSourceDir / dataDir here.
-    * They are just as null-and-wrong as the split fields were, but once they
-    * hold real values the Netmarble SDK takes a different path through
-    * Context: getCacheDir().getAbsolutePath() came back empty ("/cashinfo.json"
-    * instead of <cache>/cashinfo.json) and getResources().getConfiguration()
-    * returned null.  That is its own bug in the Context/Resources stubs and
-    * wants its own investigation — describing the splits does not depend on
-    * it. */
    union dvm_value v;
+   const char *source = lunaria_apk_mount_path();
+   v.l = dvm_new_string(vm, source ? source : "");
+   (void)dvm_set_field(vm, ai, "sourceDir", "Ljava/lang/String;", v);
+   (void)dvm_set_field(vm, ai, "publicSourceDir", "Ljava/lang/String;", v);
+
+   const char *files = getenv("ANDROID_FILES_DIR");
+   char data_dir[PATH_MAX];
+   snprintf(data_dir, sizeof data_dir, "%s",
+            (files && *files) ? files : "/tmp/lunaria-files");
+   size_t data_len = strlen(data_dir);
+   if (data_len >= 6 && !strcmp(data_dir + data_len - 6, "/files"))
+      data_dir[data_len - 6] = '\0';
+   v.l = dvm_new_string(vm, data_dir);
+   (void)dvm_set_field(vm, ai, "dataDir", "Ljava/lang/String;", v);
+
+   const char *lib_dir = getenv("ANDROID_NATIVE_LIB_DIR");
+   v.l = dvm_new_string(vm, lib_dir ? lib_dir : "");
+   (void)dvm_set_field(vm, ai, "nativeLibraryDir", "Ljava/lang/String;", v);
+
    dvm_ref names = 0, dirs = 0;
    if (!dvm_build_split_arrays(vm, &names, &dirs)) return;
    v.l = names;
@@ -486,6 +658,16 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
    if (!strcmp(method, "runOnUiThread")) {
       memset(out, 0, sizeof *out);
       if (nargs > 0 && args[0].l) {
+         /* From a thread of its own, this has to become a post: the whole
+          * point of the call is "not on my thread, on the UI one", and an SDK
+          * that uses it to put a dialog up checks that it ended up there.
+          * Running it inline was right while the VM had a single thread and
+          * every caller already was the main one; with bytecode on host
+          * threads it would run the UI work on the caller's thread instead. */
+         if (dvm_on_bytecode_thread()) {
+            (void)dvm__queue_runnable_at(vm, args[0].l, false, 0);
+            return true;
+         }
          struct dvm_class *rc = dvm_object_class(vm, args[0].l);
          struct dvm_method *run = rc ? dvm_find_method(vm, rc, "run", "()V") : NULL;
          if (run) {
@@ -497,7 +679,7 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
        * missing Activity.runOnUiThread stub (note_missing). */
       return true;
    }
-   JNIEnv *env = g_env;
+   JNIEnv *env = current_env();
    if (!env) return false;
 
    /* Display.getMode() / getSupportedModes().  Android guarantees at least the
@@ -769,7 +951,7 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
 static dvm_ref hook_new_external(void *user, struct dvm *vm, const char *class_name)
 {
    (void)user;
-   JNIEnv *env = g_env;
+   JNIEnv *env = current_env();
    if (!env) return 0;
    jclass cls = (*env)->FindClass(env, class_name);
    if (!cls) return 0;
@@ -783,8 +965,19 @@ static bool hook_get_external_static(void *user, struct dvm *vm, const char *cla
                                      union dvm_value *out)
 {
    (void)user;
-   JNIEnv *env = g_env;
+   JNIEnv *env = current_env();
    if (!env || !type) return false;
+   /* UnityPlayer.currentActivity is a dex field, but the host publishes the
+    * process Activity through jni_set_current_activity().  Prefer that over
+    * a null sslot / recursive GetStaticObjectField. */
+   if (field && class_name && !strcmp(field, "currentActivity") &&
+       strstr(class_name, "UnityPlayer")) {
+      jobject a = jni_get_current_activity();
+      if (!a) return false;
+      memset(out, 0, sizeof *out);
+      out->l = from_jobject(vm, env, a);
+      return out->l != 0;
+   }
    /* A static field of a class the device does not have is not a null, it is
     * a NoClassDefFoundError — the stub layer would answer any name at all.
     * dvm.c raises it when this hook declines. */
@@ -815,19 +1008,19 @@ static bool hook_call_native(void *user, struct dvm *vm, const char *class_name,
                              union dvm_value *out)
 {
    (void)user;
-   if (!g_guest_native || !g_env) return false;
+   if (!g_guest_native || !current_env()) return false;
 
    jvalue jargs[64];
    memset(jargs, 0, sizeof jargs);
    for (int i = 0; i < nargs && i < 64; ++i) {
       char one[256];
       if (!dvm__sig_param(sig, i, one, sizeof one)) break;
-      jargs[i] = dvm_to_jvalue(vm, g_env, dvm__kind_of(one), args[i]);
+      jargs[i] = dvm_to_jvalue(vm, current_env(), dvm__kind_of(one), args[i]);
    }
 
    jvalue ret;
    memset(&ret, 0, sizeof ret);
-   jobject jself = self ? to_jobject(vm, g_env, self) : NULL;
+   jobject jself = self ? to_jobject(vm, current_env(), self) : NULL;
    if (!g_guest_native(class_name, method, sig, is_static, jself, jargs, nargs, &ret))
       return false;
 
@@ -843,7 +1036,7 @@ static bool hook_call_native(void *user, struct dvm *vm, const char *class_name,
       case 'J': out->j = ret.j; break;
       case 'F': out->f = ret.f; break;
       case 'D': out->d = ret.d; break;
-      default:  out->l = from_jobject(vm, g_env, ret.l); break;
+      default:  out->l = from_jobject(vm, current_env(), ret.l); break;
    }
    return true;
 }
@@ -1008,7 +1201,7 @@ static struct dvm_method *find(struct dvm *vm, const char *class_name,
    return dvm_lookup(vm, class_name, method, NULL);
 }
 
-bool dvm_jni_invoke(JNIEnv *env, const char *class_name, const char *method,
+bool dvm_jni_invoke_locked(JNIEnv *env, const char *class_name, const char *method,
                     const char *sig, jobject self, bool is_static,
                     va_list *ap, const jvalue *jargs, jvalue *out)
 {
@@ -1033,6 +1226,7 @@ bool dvm_jni_invoke(JNIEnv *env, const char *class_name, const char *method,
 
    JNIEnv *saved = g_env;
    g_env = env;
+   if (env) g_env_any = env;
 
    union dvm_value args[64];
    jobject host_arrays[64];
@@ -1090,7 +1284,18 @@ bool dvm_jni_invoke(JNIEnv *env, const char *class_name, const char *method,
    return true;
 }
 
-bool dvm_jni_field(JNIEnv *env, jobject obj, jfieldID field, bool set,
+bool dvm_jni_invoke(JNIEnv *env, const char *class_name, const char *method,
+                    const char *sig, jobject self, bool is_static,
+                    va_list *ap, const jvalue *jargs, jvalue *out)
+{
+   struct dvm *vm = vm_get();
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   bool r = dvm_jni_invoke_locked(env, class_name, method, sig, self, is_static, ap, jargs, out);
+   dvm_gil_leave_to_guest(vm, cookie);
+   return r;
+}
+
+bool dvm_jni_field_locked(JNIEnv *env, jobject obj, jfieldID field, bool set,
                    uint64_t *bits)
 {
    struct dvm *vm = vm_get();
@@ -1144,7 +1349,17 @@ bool dvm_jni_field(JNIEnv *env, jobject obj, jfieldID field, bool set,
    return true;
 }
 
-bool dvm_jni_static_field(JNIEnv *env, jclass cls_ref, jfieldID field, bool set,
+bool dvm_jni_field(JNIEnv *env, jobject obj, jfieldID field, bool set,
+                   uint64_t *bits)
+{
+   struct dvm *vm = vm_get();
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   bool r = dvm_jni_field_locked(env, obj, field, set, bits);
+   dvm_gil_leave_to_guest(vm, cookie);
+   return r;
+}
+
+bool dvm_jni_static_field_locked(JNIEnv *env, jclass cls_ref, jfieldID field, bool set,
                           uint64_t *bits)
 {
    struct dvm *vm = vm_get();
@@ -1195,7 +1410,17 @@ bool dvm_jni_static_field(JNIEnv *env, jclass cls_ref, jfieldID field, bool set,
    return true;
 }
 
-const char *dvm_jni_super_name(const char *class_name)
+bool dvm_jni_static_field(JNIEnv *env, jclass cls_ref, jfieldID field, bool set,
+                          uint64_t *bits)
+{
+   struct dvm *vm = vm_get();
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   bool r = dvm_jni_static_field_locked(env, cls_ref, field, set, bits);
+   dvm_gil_leave_to_guest(vm, cookie);
+   return r;
+}
+
+const char * dvm_jni_super_name_locked(const char *class_name)
 {
    struct dvm *vm = vm_get();
    if (!vm || !class_name)
@@ -1209,7 +1434,16 @@ const char *dvm_jni_super_name(const char *class_name)
    return cls ? dvm_class_super_name(cls) : NULL;
 }
 
-bool dvm_jni_class_assignable(const char *sub, const char *sup)
+const char * dvm_jni_super_name(const char *class_name)
+{
+   struct dvm *vm = vm_get();
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   const char * r = dvm_jni_super_name_locked(class_name);
+   dvm_gil_leave_to_guest(vm, cookie);
+   return r;
+}
+
+bool dvm_jni_class_assignable_locked(const char *sub, const char *sup)
 {
    struct dvm *vm = vm_get();
    if (!vm || !sub || !sup)
@@ -1227,13 +1461,31 @@ bool dvm_jni_class_assignable(const char *sub, const char *sup)
    return dvm__class_assignable(vm, a, b);
 }
 
-bool dvm_jni_class_in_dex(const char *class_name)
+bool dvm_jni_class_assignable(const char *sub, const char *sup)
+{
+   struct dvm *vm = vm_get();
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   bool r = dvm_jni_class_assignable_locked(sub, sup);
+   dvm_gil_leave_to_guest(vm, cookie);
+   return r;
+}
+
+bool dvm_jni_class_in_dex_locked(const char *class_name)
 {
    struct dvm *vm = vm_get();
    return vm && class_name && dvm_class_is_known(vm, class_name);
 }
 
-bool dvm_jni_method_in_dex(const char *class_name, const char *method,
+bool dvm_jni_class_in_dex(const char *class_name)
+{
+   struct dvm *vm = vm_get();
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   bool r = dvm_jni_class_in_dex_locked(class_name);
+   dvm_gil_leave_to_guest(vm, cookie);
+   return r;
+}
+
+bool dvm_jni_method_in_dex_locked(const char *class_name, const char *method,
                            const char *sig)
 {
    struct dvm *vm = vm_get();
@@ -1243,10 +1495,36 @@ bool dvm_jni_method_in_dex(const char *class_name, const char *method,
    return m && m->has_code;
 }
 
-bool dvm_jni_add_dex_memory(const void *data, size_t len, const char *name)
+bool dvm_jni_method_in_dex(const char *class_name, const char *method,
+                           const char *sig)
+{
+   struct dvm *vm = vm_get();
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   bool r = dvm_jni_method_in_dex_locked(class_name, method, sig);
+   dvm_gil_leave_to_guest(vm, cookie);
+   return r;
+}
+
+bool dvm_jni_add_dex_memory_locked(const void *data, size_t len, const char *name)
 {
    struct dvm *vm = vm_get();
    return vm && dvm_add_dex_memory(vm, data, len, name);
+}
+
+/* Bumped whenever a dex arrives.  Callers that memoise anything derived from
+ * the class hierarchy — jvm_wrap_method()'s stub resolution walks it — compare
+ * this and drop what they cached. */
+static unsigned g_dex_epoch;
+unsigned dvm_jni_dex_epoch(void) { return g_dex_epoch; }
+
+bool dvm_jni_add_dex_memory(const void *data, size_t len, const char *name)
+{
+   struct dvm *vm = vm_get();
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   bool r = dvm_jni_add_dex_memory_locked(data, len, name);
+   dvm_gil_leave_to_guest(vm, cookie);
+   if (r) ++g_dex_epoch;
+   return r;
 }
 
 void dvm_jni_report(void)
@@ -1261,4 +1539,32 @@ void dvm_jni_report(void)
 struct dvm *dvm_jni_vm(void)
 {
    return vm_get();
+}
+
+void dvm_jni_bind_unity_activity(JNIEnv *env, jobject activity)
+{
+   struct dvm *vm = vm_get();
+   if (!vm || !env || !activity) return;
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   struct dvm_class *up =
+      dvm_find_class(vm, "com/unity3d/player/UnityPlayer");
+   if (!up) {
+      dvm_gil_leave_to_guest(vm, cookie);
+      return;
+   }
+   dvm_ref act = from_jobject(vm, env, activity);
+   if (!act) {
+      dvm_gil_leave_to_guest(vm, cookie);
+      return;
+   }
+   dvm_pin(vm, act);
+   union dvm_value v = { .l = act };
+   bool ok = dvm_set_static(vm, up, "currentActivity",
+                            "Landroid/app/Activity;", v);
+   static int once;
+   if (once++ < 4)
+      fprintf(stderr,
+              "[dvm] UnityPlayer.currentActivity := host 0x%x → @%x (%s)\n",
+              (unsigned)(uintptr_t)activity, act, ok ? "ok" : "no-field");
+   dvm_gil_leave_to_guest(vm, cookie);
 }

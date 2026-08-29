@@ -4,6 +4,10 @@
  */
 
 #include <cstring>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 
@@ -25,6 +29,27 @@
 #include "dynarmic/ir/opt/passes.h"
 
 namespace Dynarmic::A64 {
+
+/* JIT compilation counters.  Process-wide on purpose: an engine pool has one
+ * Jit per host thread and the question is what the process spends on
+ * translation, not what one engine does.
+ *
+ * Count and wall time are always accumulated (cheap atomics) so the emulator
+ * can put a progress card on screen while a cold start spends a minute in the
+ * emitter.  The translate/opt/emit breakdown stays behind LUNARIA_JIT_STATS. */
+static std::atomic<uint64_t> g_compiles{0};
+static std::atomic<uint64_t> g_compile_ns{0};
+static std::atomic<uint64_t> g_cache_evacuations{0};
+static std::atomic<uint64_t> g_translate_ns{0};
+static std::atomic<uint64_t> g_opt_ns{0};
+static std::atomic<uint64_t> g_emit_ns{0};
+static std::atomic<uint64_t> g_ir_insts{0};
+
+using ProgressHook = void (*)(uint64_t compiles, uint64_t compile_ns);
+static std::atomic<ProgressHook> g_progress_hook{nullptr};
+static std::atomic<uint64_t> g_hook_last_ns{0};
+static std::atomic<uint64_t> g_hook_last_compiles{0};
+
 
 using namespace Backend::X64;
 
@@ -260,18 +285,77 @@ private:
         if (auto block = emitter.GetBasicBlock(current_location))
             return block->entrypoint;
 
+        /* Compiling is invisible from outside the JIT, and a run that spends
+         * its first minute in the emitter looks exactly like a run whose guest
+         * simply has a lot to do.  Always count compiles and wall time; the
+         * phase breakdown and the 20k-line log stay behind LUNARIA_JIT_STATS.
+         * A registered progress hook (throttled) lets the emulator paint a
+         * status card while this thread is stuck here. */
+        static const bool stats = [] {
+            const char *e = std::getenv("LUNARIA_JIT_STATS");
+            return e && *e && *e != '0';
+        }();
+        struct CompileTimer {
+            bool detail;
+            std::chrono::steady_clock::time_point t0;
+            explicit CompileTimer(bool d)
+                : detail(d), t0(std::chrono::steady_clock::now()) {}
+            ~CompileTimer() {
+                const auto dt = std::chrono::steady_clock::now() - t0;
+                const uint64_t ns = (uint64_t)std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(dt).count();
+                const uint64_t total_ns = g_compile_ns.fetch_add(ns) + ns;
+                const uint64_t n = g_compiles.fetch_add(1) + 1;
+                if (detail && n % 20000 == 0)
+                    std::fprintf(stderr,
+                                 "[jit] %llu compiles, %.1f s compiling "
+                                 "(%.1f us each: translate %.1f, opt %.1f, "
+                                 "emit %.1f), %.1f IR insts each, "
+                                 "%llu cache evacuations\n",
+                                 (unsigned long long)n,
+                                 (double)total_ns / 1e9,
+                                 (double)total_ns / 1e3 / (double)n,
+                                 (double)g_translate_ns / 1e3 / (double)n,
+                                 (double)g_opt_ns / 1e3 / (double)n,
+                                 (double)g_emit_ns / 1e3 / (double)n,
+                                 (double)g_ir_insts / (double)n,
+                                 (unsigned long long)g_cache_evacuations);
+                ProgressHook hook = g_progress_hook.load(std::memory_order_relaxed);
+                if (!hook) return;
+                /* ~10 Hz or every 256 blocks — enough for a progress bar,
+                 * cheap enough not to matter inside the emitter. */
+                const uint64_t now_ns = (uint64_t)std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+                uint64_t last_ns = g_hook_last_ns.load(std::memory_order_relaxed);
+                uint64_t last_n = g_hook_last_compiles.load(std::memory_order_relaxed);
+                if (n - last_n < 256 && now_ns - last_ns < 100'000'000ull)
+                    return;
+                if (!g_hook_last_ns.compare_exchange_strong(
+                        last_ns, now_ns, std::memory_order_relaxed))
+                    return;
+                g_hook_last_compiles.store(n, std::memory_order_relaxed);
+                hook(n, total_ns);
+            }
+        } compile_timer{stats};
+
         constexpr size_t MINIMUM_REMAINING_CODESIZE = 1 * 1024 * 1024;
         if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE) {
             // Immediately evacuate cache
+            ++g_cache_evacuations;
             invalidate_entire_cache = true;
             PerformRequestedCacheInvalidation(HaltReason::CacheInvalidation);
         }
         block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
 
         // JIT Compile
+        const auto phase_now = [] { return std::chrono::steady_clock::now(); };
+        const auto phase_t0 = phase_now();
         const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
         IR::Block ir_block = A64::Translate(A64::LocationDescriptor{current_location}, get_code,
                                             {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+        const auto phase_t1 = phase_now();
         Optimization::PolyfillPass(ir_block, polyfill_options);
         Optimization::A64CallbackConfigPass(ir_block, conf);
         Optimization::NamingPass(ir_block);
@@ -287,7 +371,19 @@ private:
             Optimization::A64MergeInterpretBlocksPass(ir_block, conf.callbacks);
         }
         Optimization::VerificationPass(ir_block);
-        return emitter.Emit(ir_block).entrypoint;
+        const auto phase_t2 = phase_now();
+        const auto entry = emitter.Emit(ir_block).entrypoint;
+        if (stats) {
+            const auto ns = [](auto a, auto b) {
+                return (uint64_t)std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(b - a).count();
+            };
+            g_translate_ns += ns(phase_t0, phase_t1);
+            g_opt_ns += ns(phase_t1, phase_t2);
+            g_emit_ns += ns(phase_t2, phase_now());
+            g_ir_insts += ir_block.size();
+        }
+        return entry;
     }
 
     void PerformRequestedCacheInvalidation(HaltReason hr) {
@@ -446,4 +542,24 @@ std::vector<std::string> Jit::Disassemble() const {
     return impl->Disassemble();
 }
 
+/* C ABI for the emulator's progress UI.  `extern "C"` inside the namespace
+ * still exports the unmangled names; keeping the bodies here lets them read
+ * the file-local atomics without widening their linkage. */
+extern "C" {
+
+uint64_t dynarmic_a64_compile_count(void) {
+    return g_compiles.load(std::memory_order_relaxed);
+}
+
+uint64_t dynarmic_a64_compile_ns(void) {
+    return g_compile_ns.load(std::memory_order_relaxed);
+}
+
+void dynarmic_a64_set_progress_hook(void (*fn)(uint64_t, uint64_t)) {
+    g_progress_hook.store(fn, std::memory_order_relaxed);
+}
+
+}
+
 }  // namespace Dynarmic::A64
+

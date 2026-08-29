@@ -10,13 +10,61 @@
  */
 
 #include "dvm/dvm_internal.h"
+#include "luna_boot.h"
+#include "arm.h"
 
+#include <errno.h>
 #include <math.h>
+#include <sys/stat.h>
+#include <pthread.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+/* getenv() is a linear walk of the environment, comparing every entry: this
+ * process runs with a large one, and the interpreter used to call it on paths
+ * taken once per method call and once per string created.  Host profiles of a
+ * Cross Worlds load screen found the emulator inside getenv() as often as
+ * inside the bytecode loop itself.
+ *
+ * The answer cannot change while the process runs, so each site looks it up
+ * once into an atomic slot.  The sentinel is the address of an object rather
+ * than a cast integer, so the slot has a constant initialiser and NULL stays
+ * available as a real answer ("the variable is not set").  Two threads racing
+ * on a cold slot both call getenv() and store the same pointer, so neither
+ * side needs a lock; reading a warm slot costs one relaxed load. */
+static const char dvm__env_unread_marker;
+#define DVM_ENV_UNREAD (&dvm__env_unread_marker)
+
+static const char *dvm__env_once(_Atomic(const char *) *slot, const char *name)
+{
+   const char *v = atomic_load_explicit(slot, memory_order_relaxed);
+   if (v == DVM_ENV_UNREAD) {
+      v = getenv(name);
+      atomic_store_explicit(slot, v, memory_order_relaxed);
+   }
+   return v;
+}
+
+/* The three the hot paths ask for. */
+static const char *dvm__env_strwatch(void)
+{
+   static _Atomic(const char *) slot = DVM_ENV_UNREAD;
+   return dvm__env_once(&slot, "LUNARIA_DVM_STRWATCH");
+}
+static const char *dvm__env_outtrace(void)
+{
+   static _Atomic(const char *) slot = DVM_ENV_UNREAD;
+   return dvm__env_once(&slot, "LUNARIA_DVM_OUTTRACE");
+}
+static const char *dvm__env_trace_class(void)
+{
+   static _Atomic(const char *) slot = DVM_ENV_UNREAD;
+   return dvm__env_once(&slot, "LUNARIA_DVM_TRACE_CLASS");
+}
 
 /* ------------------------------------------------------------------------ *
  * Descriptors
@@ -126,10 +174,29 @@ static void name_to_desc(const char *name, char *buf, size_t sz)
  * Heap
  * ------------------------------------------------------------------------ */
 
+/* The slot a reference names.  Objects live in fixed-size blocks and the
+ * blocks are never moved or freed while the VM runs.
+ *
+ * The heap used to be one array grown with realloc(), which is fine while a
+ * single thread interprets: nobody can allocate between one statement of a
+ * built-in method and the next.  With bytecode running on host threads that
+ * stops being true — a built-in holding `struct dvm_object *o` across a call
+ * that lets another thread run would find `o` pointing into a freed block the
+ * moment that thread allocated past the capacity.  Growing by block keeps
+ * every pointer ever handed out valid for the life of the VM, which is what
+ * makes those built-ins correct without auditing every one of them.
+ *
+ * Only the block table moves, and no caller ever holds a pointer into it. */
+static struct dvm_object *heap_slot(struct dvm *vm, dvm_ref ref)
+{
+   uint32_t i = ref - 1u;
+   return &vm->heap_blocks[i / DVM_HEAP_BLOCK][i % DVM_HEAP_BLOCK];
+}
+
 struct dvm_object *dvm__obj(struct dvm *vm, dvm_ref ref)
 {
    if (!ref || ref > vm->heap_size) return NULL;
-   struct dvm_object *o = &vm->heap[ref - 1];
+   struct dvm_object *o = heap_slot(vm, ref);
    return o->live ? o : NULL;
 }
 
@@ -137,21 +204,24 @@ static dvm_ref heap_alloc(struct dvm *vm)
 {
    if (vm->free_head) {
       dvm_ref r = vm->free_head;
-      vm->free_head = vm->heap[r - 1].next_free;
-      memset(&vm->heap[r - 1], 0, sizeof vm->heap[r - 1]);
-      vm->heap[r - 1].live = true;
+      struct dvm_object *o = heap_slot(vm, r);
+      vm->free_head = o->next_free;
+      memset(o, 0, sizeof *o);
+      o->live = true;
       return r;
    }
    if (vm->heap_size == vm->heap_cap) {
-      uint32_t cap = vm->heap_cap ? vm->heap_cap * 2u : 4096u;
-      struct dvm_object *n = realloc(vm->heap, (size_t)cap * sizeof *n);
-      if (!n) return 0;
-      memset(n + vm->heap_cap, 0, (size_t)(cap - vm->heap_cap) * sizeof *n);
-      vm->heap = n;
-      vm->heap_cap = cap;
+      struct dvm_object **t =
+         realloc(vm->heap_blocks, (size_t)(vm->heap_nblocks + 1) * sizeof *t);
+      if (!t) return 0;
+      vm->heap_blocks = t;
+      struct dvm_object *blk = calloc(DVM_HEAP_BLOCK, sizeof *blk);
+      if (!blk) return 0;
+      vm->heap_blocks[vm->heap_nblocks++] = blk;
+      vm->heap_cap += DVM_HEAP_BLOCK;
    }
    dvm_ref r = ++vm->heap_size;
-   vm->heap[r - 1].live = true;
+   heap_slot(vm, r)->live = true;
    return r;
 }
 
@@ -191,7 +261,7 @@ dvm_ref dvm_new_object(struct dvm *vm, struct dvm_class *cls)
    if (!cls) return 0;
    dvm_ref r = heap_alloc(vm);
    if (!r) return 0;
-   struct dvm_object *o = &vm->heap[r - 1];
+   struct dvm_object *o = heap_slot(vm, r);
    o->cls = cls;
    o->kind = DVM_OBJ_PLAIN;
    if (cls->islots > 0) {
@@ -206,7 +276,7 @@ dvm_ref dvm_new_string_n(struct dvm *vm, const char *utf8, size_t len)
    struct dvm_class *cls = dvm__class_by_desc(vm, "Ljava/lang/String;");
    dvm_ref r = heap_alloc(vm);
    if (!r) return 0;
-   struct dvm_object *o = &vm->heap[r - 1];
+   struct dvm_object *o = heap_slot(vm, r);
    o->cls = cls;
    o->kind = DVM_OBJ_STRING;
    o->utf8 = malloc(len + 1);
@@ -215,7 +285,7 @@ dvm_ref dvm_new_string_n(struct dvm *vm, const char *utf8, size_t len)
    o->utf8[len] = '\0';
    o->utf8_len = (uint32_t)len;
    {
-      const char *want = getenv("LUNARIA_DVM_STRWATCH");
+      const char *want = dvm__env_strwatch();
       if (want && strstr(o->utf8, want))
          fprintf(stderr, "[dvm] new-string \"%.200s\" in %s.%s\n", o->utf8,
                  vm->cur_method && vm->cur_method->cls
@@ -248,7 +318,7 @@ dvm_ref dvm_new_array(struct dvm *vm, char elem, const char *elem_desc, uint32_t
 
    dvm_ref r = heap_alloc(vm);
    if (!r) return 0;
-   struct dvm_object *o = &vm->heap[r - 1];
+   struct dvm_object *o = heap_slot(vm, r);
    o->cls = cls;
    o->kind = DVM_OBJ_ARRAY;
    o->length = length;
@@ -290,7 +360,7 @@ dvm_ref dvm_wrap_external(struct dvm *vm, const char *class_name, uint32_t host_
    struct dvm_class *cls = dvm__class_by_desc(vm, desc);
    dvm_ref r = heap_alloc(vm);
    if (!r) return 0;
-   struct dvm_object *o = &vm->heap[r - 1];
+   struct dvm_object *o = heap_slot(vm, r);
    o->cls = cls;
    o->kind = DVM_OBJ_EXTERNAL;
    o->host_handle = host_handle;
@@ -406,6 +476,8 @@ static bool class_load_from_dex(struct dvm *vm, struct dvm_class *c,
 /* Finds or creates the class for a descriptor.  Never returns NULL for a
  * well-formed descriptor: an unknown class becomes an `external` placeholder
  * whose methods route to the host stub layer. */
+static void note_missing(struct dvm *vm, const char *what);
+
 struct dvm_class *dvm__class_by_desc(struct dvm *vm, const char *desc)
 {
    if (!desc || !*desc) return NULL;
@@ -445,10 +517,47 @@ struct dvm_class *dvm__class_by_desc(struct dvm *vm, const char *desc)
    c = class_register(vm, desc);
    if (!c) return NULL;
    c->external = true;
+   c->synthesized = true;
    c->init_state = 2;
    c->super = strcmp(desc, "Ljava/lang/Object;")
                 ? dvm__class_by_desc(vm, "Ljava/lang/Object;") : NULL;
    return c;
+}
+
+/* Is this descriptor in one of the namespaces a device provides?
+ *
+ * The stub above is how framework classes the emulator has not modelled yet
+ * still answer calls, and for java/, android/ and their neighbours that is a
+ * reasonable fiction: the class exists on a device whether or not this
+ * emulator knows it.  For a class in the *application's* own namespace it is
+ * not: the APK is the only place such a class can come from, so if no dex
+ * defines it, it does not exist — and pretending otherwise changes what the
+ * app does.  See the NoClassDefFoundError in new-instance. */
+static bool desc_is_platform(const char *desc)
+{
+   static const char *const ns[] = {
+      "Ljava/", "Ljavax/", "Landroid/", "Landroidx/", "Ldalvik/", "Llibcore/",
+      "Lsun/", "Lcom/android/", "Lorg/apache/", "Lorg/json/", "Lorg/w3c/",
+      "Lorg/xml/", "Lorg/xmlpull/", "Ljunit/",
+   };
+   if (!desc) return true;
+   if (desc[0] == '[') return true;             /* arrays are synthesised */
+   for (size_t i = 0; i < sizeof ns / sizeof ns[0]; ++i)
+      if (!strncmp(desc, ns[i], strlen(ns[i]))) return true;
+   return false;
+}
+
+/* The class the dex names is nowhere: not in the APK, not in the platform,
+ * not implemented here.  Reported once per name, because the app's own
+ * handling of it (a try/catch around an optional plugin) is normal and this
+ * is only interesting when it is not. */
+static bool class_absent(struct dvm *vm, struct dvm_class *c)
+{
+   if (!c || !c->synthesized || desc_is_platform(c->desc)) return false;
+   char what[512];
+   snprintf(what, sizeof what, "class %s", c->name ? c->name : c->desc);
+   note_missing(vm, what);
+   return true;
 }
 
 struct dvm_class *dvm_find_class(struct dvm *vm, const char *name)
@@ -646,19 +755,117 @@ static struct dvm_method *class_own_method(struct dvm_class *c, const char *name
    return NULL;
 }
 
+/* --- resolved-method cache ------------------------------------------------
+ *
+ * dvm_find_method() walks the superclass chain and then every interface,
+ * comparing a name and a signature with strcmp at each step.  virtual_target()
+ * calls it for every invoke-virtual whose receiver is not exactly the class
+ * the call site named — which, in ordinary object-oriented code, is most of
+ * them — so the walk ran millions of times a second and showed up in host
+ * profiles as strcmp.  A device resolves a virtual call through a vtable slot
+ * decided once; this is the same idea, one table per class.
+ *
+ * Only methods that were found are remembered.  A lookup that fails is the
+ * path that ends in the host stubs, and a class can still be given its
+ * superclass link after it has been registered, so a remembered "no such
+ * method" could outlive the reason it was true.  A method array, by contrast,
+ * is allocated once when the class is built and never grows, so a cached
+ * pointer into it stays valid for the life of the class.
+ *
+ * Like every other mutation of a class this happens under the interpreter
+ * lock, so the table needs no synchronisation of its own. */
+static uint32_t mcache_hash(const char *name, const char *sig)
+{
+   uint32_t h = 2166136261u;
+   for (const char *p = name; *p; ++p) h = (h ^ (unsigned char)*p) * 16777619u;
+   if (sig) {
+      h = (h ^ 0xffu) * 16777619u;
+      for (const char *p = sig; *p; ++p) h = (h ^ (unsigned char)*p) * 16777619u;
+   }
+   return h | 1u;   /* zero means "empty slot" */
+}
+
+static bool mcache_key_eq(const struct dvm_mcache_slot *s, uint32_t h,
+                          const char *name, const char *sig)
+{
+   if (s->hash != h) return false;
+   if (strcmp(s->name, name)) return false;
+   if ((sig == NULL) != (s->sig == NULL)) return false;
+   return sig == NULL || !strcmp(s->sig, sig);
+}
+
+static struct dvm_method *mcache_get(const struct dvm_class *c, uint32_t h,
+                                     const char *name, const char *sig)
+{
+   if (!c->mcache) return NULL;
+   const uint32_t mask = c->mcache_cap - 1u;
+   for (uint32_t i = h & mask, n = 0; n <= mask; i = (i + 1u) & mask, ++n) {
+      const struct dvm_mcache_slot *s = &c->mcache[i];
+      if (!s->hash) return NULL;                 /* probe ends at a free slot */
+      if (mcache_key_eq(s, h, name, sig)) return s->m;
+   }
+   return NULL;
+}
+
+static void mcache_insert(struct dvm_mcache_slot *tab, uint32_t cap,
+                          const struct dvm_mcache_slot *e)
+{
+   const uint32_t mask = cap - 1u;
+   uint32_t i = e->hash & mask;
+   while (tab[i].hash) i = (i + 1u) & mask;
+   tab[i] = *e;
+}
+
+/* The key is stored as the strings the *found method* owns, never as the
+ * caller's.  A call site resolves its signature into a scratch buffer on the
+ * interpreter's C stack, and remembering that pointer would leave the table
+ * comparing against a stack frame that has since been reused.  The method's
+ * own name and signature are allocated with the class, compare equal to the
+ * query by construction, and live exactly as long as the entry does.  A
+ * lookup with no signature (the wildcard) is stored as one. */
+static void mcache_put(struct dvm_class *c, uint32_t h, const char *name,
+                       const char *sig, struct dvm_method *m)
+{
+   /* Equal by content to the query — class_own_method() matched them with
+    * strcmp — so the hash computed from the query still describes the key.
+    * The one exception is a method declared with no signature at all, which
+    * matches any query: there is nothing to key that on, so it is not cached. */
+   if (!m->name || (sig && !m->sig)) return;
+   name = m->name;
+   sig  = sig ? m->sig : NULL;
+   if (c->mcache_len + 1u > c->mcache_cap - c->mcache_cap / 4u) {
+      const uint32_t cap = c->mcache_cap ? c->mcache_cap * 2u : 16u;
+      struct dvm_mcache_slot *tab = calloc(cap, sizeof *tab);
+      if (!tab) return;                          /* a cache, not a ledger */
+      for (uint32_t i = 0; i < c->mcache_cap; ++i)
+         if (c->mcache[i].hash) mcache_insert(tab, cap, &c->mcache[i]);
+      free(c->mcache);
+      c->mcache = tab;
+      c->mcache_cap = cap;
+   }
+   struct dvm_mcache_slot e = { h, name, sig, m };
+   mcache_insert(c->mcache, c->mcache_cap, &e);
+   ++c->mcache_len;
+}
+
 struct dvm_method *dvm_find_method(struct dvm *vm, struct dvm_class *cls,
                                    const char *name, const char *sig)
 {
+   if (!cls) return NULL;
+   const uint32_t h = mcache_hash(name, sig);
+   struct dvm_method *hit = mcache_get(cls, h, name, sig);
+   if (hit) return hit;
+
    for (struct dvm_class *c = cls; c; c = c->super) {
       struct dvm_method *m = class_own_method(c, name, sig);
-      if (m) return m;
+      if (m) { mcache_put(cls, h, name, sig, m); return m; }
    }
    /* Default methods live on the interface. */
    for (struct dvm_class *c = cls; c; c = c->super) {
       for (int i = 0; i < c->nifaces; ++i) {
          if (!c->ifaces[i]) continue;
          struct dvm_method *m = dvm_find_method(vm, c->ifaces[i], name, sig);
-         if (m && m->has_code) return m;
+         if (m && m->has_code) { mcache_put(cls, h, name, sig, m); return m; }
       }
    }
    return NULL;
@@ -701,8 +908,113 @@ static struct dvm_field *class_find_field(struct dvm_class *cls, const char *nam
  * Exceptions
  * ------------------------------------------------------------------------ */
 
+/* How many exceptions the VM has raised.  A library that probes for something
+ * optional throws once; one that is stuck in a retry loop throws thousands of
+ * times a second, and the two are indistinguishable from a profile alone. */
+static unsigned long long g_throws;
+
+/* And what they are.  The class alone is not enough — a NullPointerException
+ * says nothing about which of the app's methods keeps hitting it — so the
+ * throwing method is part of the key.  A fixed table: this is a tally for the
+ * profile report, not a log. */
+#define DVM_THROW_TALLY 64
+static struct {
+   const char *cls;
+   const char *method;
+   const char *in;
+   unsigned long long n;
+} g_throw_tally[DVM_THROW_TALLY];
+
+static void throw_tally(struct dvm *vm, const char *class_name)
+{
+   const struct dvm_method *m =
+      atomic_load_explicit(&vm->cur_method, memory_order_relaxed);
+   const char *meth = m ? m->name : "?";
+   const char *in   = (m && m->cls) ? m->cls->name : "?";
+   for (int i = 0; i < DVM_THROW_TALLY; ++i) {
+      if (!g_throw_tally[i].cls) {
+         g_throw_tally[i].cls = class_name;
+         g_throw_tally[i].method = meth;
+         g_throw_tally[i].in = in;
+         g_throw_tally[i].n = 1;
+         return;
+      }
+      if (g_throw_tally[i].cls == class_name &&
+          g_throw_tally[i].method == meth && g_throw_tally[i].in == in) {
+         ++g_throw_tally[i].n;
+         return;
+      }
+   }
+}
+
+/* An exception storm reports itself.
+ *
+ * A library that probes for something optional throws once and carries on; one
+ * whose retry path this emulator has broken throws thousands of times a second
+ * and looks, from outside, exactly like a slow loading screen.  The AppsFlyer
+ * SDK spent an entire Cross Worlds load doing that because the VM's regex
+ * engine rejected \p{C}, and nothing said so.
+ *
+ * So the rate is watched with no environment variable to remember: one counter
+ * on the throw path, checked every 1024 throws, and a report — with the top
+ * throwers — when it is high enough that something is wrong.  Reports are
+ * rate-limited to one per ten seconds so the storm cannot become its own.
+ * LUNARIA_DVM_THROWS=1 prints every throw instead, for when the summary has
+ * named the culprit and the detail is what is wanted. */
+/* Set by the storm report, consumed by the next throw. */
+static bool g_throw_want_stack;
+
+static void throw_storm_watch(void)
+{
+   static unsigned long long since;
+   static double last_check, last_report;
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   const double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+   if (!last_check) { last_check = last_report = now; return; }
+
+   if (++since < 1024u) return;
+   const double window = now - last_check;
+   const double rate = window > 0.0 ? (double)since / window : 0.0;
+   since = 0;
+   last_check = now;
+   if (rate < 200.0 || now - last_report < 10.0) return;
+   last_report = now;
+
+   fprintf(stderr, "[dvm] exception storm: %.0f/s — a retry loop, not "
+           "ordinary error handling.  Most frequent since the last report:\n",
+           rate);
+   /* And who is driving it.  The tally names the method that throws; the loop
+    * is whatever keeps calling it, which only the call stack shows.  Asking
+    * for the next throw's stack costs one flag test on the throw path and one
+    * print per report. */
+   g_throw_want_stack = true;
+   for (int shown = 0; shown < 3; ++shown) {
+      int best = -1;
+      for (int i = 0; i < DVM_THROW_TALLY; ++i)
+         if (g_throw_tally[i].cls && g_throw_tally[i].n &&
+             (best < 0 || g_throw_tally[i].n > g_throw_tally[best].n))
+            best = i;
+      if (best < 0) break;
+      fprintf(stderr, "[dvm]   %8llu  %s thrown in %s.%s\n",
+              g_throw_tally[best].n, g_throw_tally[best].cls,
+              g_throw_tally[best].in, g_throw_tally[best].method);
+      g_throw_tally[best].n = 0;
+   }
+   memset(g_throw_tally, 0, sizeof g_throw_tally);
+}
+
+static const char *dvm__env_throws(void)
+{
+   static _Atomic(const char *) slot = DVM_ENV_UNREAD;
+   return dvm__env_once(&slot, "LUNARIA_DVM_THROWS");
+}
+
 void dvm__throw(struct dvm *vm, const char *class_name, const char *fmt, ...)
 {
+   ++g_throws;
+   if (vm) throw_tally(vm, class_name);
+   throw_storm_watch();
    char msg[512];
    if (fmt) {
       va_list ap;
@@ -711,6 +1023,26 @@ void dvm__throw(struct dvm *vm, const char *class_name, const char *fmt, ...)
       va_end(ap);
    } else {
       msg[0] = '\0';
+   }
+
+   if (g_throw_want_stack && vm) {
+      g_throw_want_stack = false;
+      fprintf(stderr, "[dvm]   the loop, innermost first:\n");
+      for (int i = vm->ncallstack - 1, shown = 0; i >= 0 && shown < 10;
+           --i, ++shown) {
+         const struct dvm_method *f = vm->callstack[i];
+         if (!f) continue;
+         fprintf(stderr, "[dvm]     #%d %s.%s%s\n", shown,
+                 f->cls ? f->cls->name : "?", f->name, f->sig ? f->sig : "");
+      }
+   }
+
+   if (dvm__env_throws()) {
+      const struct dvm_method *m =
+         vm ? atomic_load_explicit(&vm->cur_method, memory_order_relaxed) : NULL;
+      fprintf(stderr, "[dvm] throw %s: %s (in %s.%s)\n", class_name, msg,
+              (m && m->cls && m->cls->name) ? m->cls->name : "?",
+              m ? m->name : "?");
    }
 
    char desc[256];
@@ -739,15 +1071,33 @@ void dvm_clear_exception(struct dvm *vm) { vm->exception = 0; vm->parked = false
 
 void dvm_describe_exception(struct dvm *vm, dvm_ref exc, char *buf, size_t sz)
 {
-   struct dvm_object *o = dvm__obj(vm, exc);
-   if (!o) { snprintf(buf, sz, "(no exception)"); return; }
-   const char *cn = o->cls ? o->cls->name : "java/lang/Throwable";
-   union dvm_value msg = { 0 };
-   const char *text = NULL;
-   if (dvm_get_field(vm, exc, "detailMessage", "Ljava/lang/String;", &msg) && msg.l)
-      text = dvm_string_utf8(vm, msg.l);
-   if (!text) text = o->utf8;
-   snprintf(buf, sz, "%s%s%s", cn, text ? ": " : "", text ? text : "");
+   /* Follow the cause chain.  Wrapping is how library code reports a failure —
+    * `catch (Throwable t) { throw new RuntimeException(t); }` — and the
+    * wrapper carries no message at all, so stopping at the outermost throwable
+    * prints "java/lang/RuntimeException" and says nothing about what went
+    * wrong.  The cause is the part worth reading. */
+   size_t at = 0;
+   for (int hop = 0; hop < 8 && exc; ++hop) {
+      struct dvm_object *o = dvm__obj(vm, exc);
+      if (!o) break;
+      const char *cn = o->cls ? o->cls->name : "java/lang/Throwable";
+      union dvm_value msg = { 0 };
+      const char *text = NULL;
+      if (dvm_get_field(vm, exc, "detailMessage", "Ljava/lang/String;", &msg) &&
+          msg.l)
+         text = dvm_string_utf8(vm, msg.l);
+      if (!text) text = o->utf8;
+      if (at >= sz) return;
+      at += (size_t)snprintf(buf + at, sz - at, "%s%s%s%s",
+                             hop ? " <- " : "", cn,
+                             text ? ": " : "", text ? text : "");
+      union dvm_value cause = { 0 };
+      if (!dvm_get_field(vm, exc, "cause", "Ljava/lang/Throwable;", &cause) ||
+          cause.l == exc)
+         return;
+      exc = cause.l;
+   }
+   if (!at && at < sz) snprintf(buf, sz, "(no exception)");
 }
 
 /* ------------------------------------------------------------------------ *
@@ -968,7 +1318,12 @@ static bool iface_assignable(struct dvm *vm, struct dvm_class *from,
 {
    for (struct dvm_class *c = from; c; c = c->super)
       for (int i = 0; i < c->nifaces; ++i)
-         if (c->ifaces[i] && class_assignable(vm, c->ifaces[i], to))
+         /* A class that lists itself teaches this walk nothing and never ends:
+          * the recursion comes straight back here and the process dies of a
+          * stack overflow rather than of a wrong answer.  Java has no such
+          * declaration, but a builtin table can be written with one. */
+         if (c->ifaces[i] && c->ifaces[i] != c && c->ifaces[i] != from &&
+             class_assignable(vm, c->ifaces[i], to))
             return true;
    return false;
 }
@@ -1035,14 +1390,38 @@ bool dvm__call_out(struct dvm *vm, struct dvm_class *cls, const char *name,
    int nargs = slots_to_values(sig, slots, nslots, args, 64);
    memset(out, 0, sizeof *out);
 
-   if (getenv("LUNARIA_DVM_OUTTRACE"))
+   if (dvm__env_outtrace())
       fprintf(stderr, "[out] %s.%s%s%s\n", cls->name, name, sig,
               is_native ? " (native)" : "");
 
-   if (is_native && vm->hooks.call_native &&
-       vm->hooks.call_native(vm->hooks.user, vm, cls->name, name, sig,
-                             is_static, self, args, nargs, out))
-      return true;
+   /* Interface / abstract methods on a Proxy instance never have bytecode;
+    * they must reach the InvocationHandler rather than the unresolved stub. */
+   if (!is_static && self &&
+       dvm_proxy_try_invoke(vm, self, cls, name, sig, args, nargs, out))
+      return !vm->exception;
+
+   if (is_native && vm->hooks.call_native) {
+      /* A native implemented in guest code runs without the interpreter lock,
+       * the way a real JNI transition does.
+       *
+       * Lock order in the emulator is: interpreter lock outside, ARM execution
+       * lock (src/arm.h) inside.  Guest native code takes the execution lock
+       * at every SVC, so a thread that carried the interpreter lock in here
+       * would hold the two in the opposite order to the scheduler, which yields
+       * the interpreter lock from inside the execution lock — and the two
+       * deadlock, with the pump inside dvm_gil_acquire() and the Java thread
+       * inside arm_lock_acquire().
+       *
+       * This is the boundary to do it at, not the SVC entry point: by the time
+       * an SVC fires, control is already inside arbitrary native code, and the
+       * dvm's own builtins (which are C and do need the lock) fire SVCs too.
+       * Here the two kinds are still distinguishable. */
+      unsigned gil = dvm_gil_unlock_all(vm);
+      bool ok = vm->hooks.call_native(vm->hooks.user, vm, cls->name, name, sig,
+                                      is_static, self, args, nargs, out);
+      dvm_gil_relock(vm, gil);
+      if (ok) return true;
+   }
 
    if (vm->hooks.call_external &&
        vm->hooks.call_external(vm->hooks.user, vm, cls->name, name, sig,
@@ -1187,6 +1566,36 @@ static struct dvm_method *resolve_method(struct dvm *vm, struct dvm_dex *dd,
                                          const char **out_name, char *sigbuf,
                                          size_t sigsz)
 {
+   /* The cache is consulted first, because everything below it is the
+    * expensive half: dex_proto_signature() builds the descriptor string out of
+    * the proto's parameter type ids, and dvm__class_by_desc() hashes and
+    * compares the class descriptor.  Both used to run on every single invoke
+    * instruction and only then was the cached answer returned, so the cache
+    * saved the lookup and paid for the parsing — profiles of a Cross Worlds
+    * load screen sat in dex_proto_signature() through the interpreter.
+    *
+    * A resolved method already knows the three things the caller wanted out of
+    * the constant pool: its class, its name and its signature.  The referenced
+    * class may be a subclass of the declaring one, which is what the caller
+    * wants anyway — dispatch is on the receiver and the error messages name
+    * the method that was actually found. */
+   if (dd->method_cache && idx < dd->file.method_ids_size && dd->method_cache[idx]) {
+      struct dvm_method *m = dd->method_cache[idx];
+      *out_cls  = m->cls;
+      *out_name = m->name;
+      if (sigbuf && sigsz) {
+         if (m->sig) {
+            size_t n = strlen(m->sig);
+            if (n >= sigsz) n = sigsz - 1u;
+            memcpy(sigbuf, m->sig, n);
+            sigbuf[n] = '\0';
+         } else {
+            sigbuf[0] = '\0';
+         }
+      }
+      return m;
+   }
+
    struct dex_method_id mid;
    if (!dex_method_id(&dd->file, idx, &mid)) return NULL;
    const char *cd = dex_type(&dd->file, mid.class_idx);
@@ -1198,9 +1607,6 @@ static struct dvm_method *resolve_method(struct dvm *vm, struct dvm_dex *dd,
    *out_cls = cls;
    *out_name = name;
    if (!cls) return NULL;
-
-   if (dd->method_cache && idx < dd->file.method_ids_size && dd->method_cache[idx])
-      return dd->method_cache[idx];
 
    struct dvm_method *m = dvm_find_method(vm, cls, name, sigbuf);
    if (m && dd->method_cache && idx < dd->file.method_ids_size)
@@ -1248,7 +1654,7 @@ static dvm_ref const_string(struct dvm *vm, struct dvm_dex *dd, uint32_t idx)
       return dd->string_cache[idx];
    const char *s = dex_string(&dd->file, idx);
    {
-      const char *want = getenv("LUNARIA_DVM_STRWATCH");
+      const char *want = dvm__env_strwatch();
       if (want && s && strstr(s, want))
          fprintf(stderr, "[dvm] const-string[%u] = \"%s\" in %s.%s (dex %d)\n",
                  idx, s,
@@ -1278,6 +1684,11 @@ static dvm_ref class_object(struct dvm *vm, struct dvm_class *cls)
    return r;
 }
 
+dvm_ref dvm_class_object(struct dvm *vm, struct dvm_class *cls)
+{
+   return class_object(vm, cls);
+}
+
 /* Array element access shared by aget/aput. */
 static bool array_check(struct dvm *vm, struct dvm_object *a, uint32_t idx)
 {
@@ -1294,6 +1705,141 @@ static bool array_check(struct dvm *vm, struct dvm_object *a, uint32_t idx)
 }
 
 static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out);
+static _Thread_local struct dvm_method *g_builtin_method;
+static _Thread_local uint64_t g_monitor_thread_token;
+static _Atomic uint64_t g_next_monitor_thread_token = 1;
+
+static uint64_t monitor_thread_token(void)
+{
+   if (!g_monitor_thread_token)
+      g_monitor_thread_token = atomic_fetch_add_explicit(
+         &g_next_monitor_thread_token, 1, memory_order_relaxed);
+   return g_monitor_thread_token;
+}
+
+static uintptr_t monitor_channel(dvm_ref ref, unsigned kind)
+{
+   return ((uintptr_t)ref << 2) | (uintptr_t)kind;
+}
+
+static uint64_t monitor_now_ms(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+bool dvm__monitor_try_enter(struct dvm *vm, dvm_ref ref)
+{
+   struct dvm_object *o = dvm__obj(vm, ref);
+   if (!o) {
+      dvm__throw(vm, "java/lang/NullPointerException", "monitor-enter null");
+      return false;
+   }
+   const uint64_t me = monitor_thread_token();
+   if (o->monitor_owner && o->monitor_owner != me) return false;
+   o->monitor_owner = me;
+   ++o->monitor_depth;
+   return true;
+}
+
+bool dvm__monitor_enter(struct dvm *vm, dvm_ref ref)
+{
+   for (;;) {
+      if (dvm__monitor_try_enter(vm, ref)) return true;
+      if (vm->exception) return false;
+      /* Notification is the mechanism.  The long timeout only permits state
+       * validation if a producer disappears; it never grants ownership. */
+      dvm_gil_wait_for(vm, monitor_channel(ref, 1), 60000u);
+   }
+}
+
+bool dvm__monitor_exit(struct dvm *vm, dvm_ref ref)
+{
+   struct dvm_object *o = dvm__obj(vm, ref);
+   const uint64_t me = monitor_thread_token();
+   if (!o || o->monitor_owner != me || !o->monitor_depth) {
+      dvm__throw(vm, "java/lang/IllegalMonitorStateException",
+                 "monitor-exit without ownership");
+      return false;
+   }
+   if (--o->monitor_depth) return true;
+   o->monitor_owner = 0;
+   dvm_gil_notify_one_for(monitor_channel(ref, 1));
+   return true;
+}
+
+bool dvm__monitor_wait(struct dvm *vm, dvm_ref ref, uint64_t timeout_ms,
+                       bool *notified)
+{
+   struct dvm_object *o = dvm__obj(vm, ref);
+   const uint64_t me = monitor_thread_token();
+   if (!o || o->monitor_owner != me || !o->monitor_depth) {
+      dvm__throw(vm, "java/lang/IllegalMonitorStateException",
+                 "wait without monitor ownership");
+      return false;
+   }
+   const uint32_t saved_depth = o->monitor_depth;
+   const uint64_t seen = o->monitor_seq;
+   const uint64_t deadline = timeout_ms ? monitor_now_ms() + timeout_ms : 0;
+   o->monitor_owner = 0;
+   o->monitor_depth = 0;
+   dvm_gil_notify_one_for(monitor_channel(ref, 1));
+
+   bool signalled = false;
+   for (;;) {
+      uint64_t now = monitor_now_ms();
+      if (deadline && now >= deadline) break;
+      uint64_t left = deadline ? deadline - now : 60000u;
+      if (left > 60000u) left = 60000u;
+      dvm_gil_wait_for(vm, monitor_channel(ref, 2), (unsigned)left);
+      o = dvm__obj(vm, ref);
+      if (!o) {
+         dvm__throw(vm, "java/lang/NullPointerException", "waited object freed");
+         return false;
+      }
+      if (o->monitor_seq != seen) { signalled = true; break; }
+   }
+   if (!dvm__monitor_enter(vm, ref)) return false;
+   o = dvm__obj(vm, ref);
+   o->monitor_depth = saved_depth;
+   if (notified) *notified = signalled;
+   return true;
+}
+
+bool dvm__monitor_notify(struct dvm *vm, dvm_ref ref, bool all)
+{
+   struct dvm_object *o = dvm__obj(vm, ref);
+   if (!o || o->monitor_owner != monitor_thread_token() || !o->monitor_depth) {
+      dvm__throw(vm, "java/lang/IllegalMonitorStateException",
+                 "notify without monitor ownership");
+      return false;
+   }
+   ++o->monitor_seq;
+   if (all) dvm_gil_notify_for(monitor_channel(ref, 2));
+   else     dvm_gil_notify_one_for(monitor_channel(ref, 2));
+   return true;
+}
+
+bool dvm__monitor_state(struct dvm *vm, dvm_ref ref, bool current,
+                        uint32_t *depth)
+{
+   struct dvm_object *o = dvm__obj(vm, ref);
+   if (depth) *depth = o ? o->monitor_depth : 0;
+   if (!o || !o->monitor_owner) return false;
+   return !current || o->monitor_owner == monitor_thread_token();
+}
+
+void dvm__warn_placeholder(struct dvm *vm)
+{
+   (void)vm;
+   struct dvm_method *m = g_builtin_method;
+   if (!m || m->placeholder_warned) return;
+   m->placeholder_warned = true;
+   fprintf(stderr, "[dvm] placeholder no-op invoked: %s.%s%s\n",
+           m->cls && m->cls->name ? m->cls->name : "?",
+           m->name ? m->name : "?", m->sig ? m->sig : "");
+}
 
 static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
                    const uint32_t *slots, int nslots, union dvm_value *out)
@@ -1317,7 +1863,14 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
 
    if (is_static && m->cls) dvm_init_class(vm, m->cls);
 
-   const char *trace_class = getenv("LUNARIA_DVM_TRACE_CLASS");
+   const bool synchronized = (m->access & DEX_ACC_SYNCHRONIZED) != 0;
+   dvm_ref monitor = 0;
+   if (synchronized) {
+      monitor = is_static ? class_object(vm, m->cls) : self;
+      if (!dvm__monitor_enter(vm, monitor)) return false;
+   }
+
+   const char *trace_class = dvm__env_trace_class();
    bool trace_this = !trace_class ||
       (m->cls && m->cls->name && strstr(m->cls->name, trace_class));
    if (vm->trace && trace_this)
@@ -1328,8 +1881,12 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
       union dvm_value args[64];
       int nargs = slots_to_values(m->sig, slots, nslots, args, 64);
       ++vm->depth;
+      struct dvm_method *previous_builtin = g_builtin_method;
+      g_builtin_method = m;
       bool ok = m->builtin(vm, self, args, nargs, out);
+      g_builtin_method = previous_builtin;
       --vm->depth;
+      if (synchronized && !dvm__monitor_exit(vm, monitor)) ok = false;
       return ok && !vm->exception;
    }
 
@@ -1339,6 +1896,7 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
       bool ok = dvm__call_out(vm, m->cls, m->name, m->sig, is_static, native,
                          self, slots, nslots, out);
       --vm->depth;
+      if (synchronized && !dvm__monitor_exit(vm, monitor)) ok = false;
       return ok && !vm->exception;
    }
 
@@ -1350,6 +1908,7 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
    uint32_t *regs = nregs <= 64 ? stackbuf : calloc(nregs ? nregs : 1, sizeof *regs);
    if (!regs) {
       dvm__throw(vm, "java/lang/OutOfMemoryError", "%u registers", nregs);
+      if (synchronized) (void)dvm__monitor_exit(vm, monitor);
       return false;
    }
    memset(regs, 0, (size_t)nregs * sizeof *regs);
@@ -1376,13 +1935,14 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
       vm->exc_trace[vm->nexc_trace++] = m;
 
    if (regs != stackbuf) free(regs);
+   if (synchronized && !dvm__monitor_exit(vm, monitor)) ok = false;
    return ok;
 }
 
 static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
 {
    struct dvm_method *m = fr->m;
-   const char *trace_class = getenv("LUNARIA_DVM_TRACE_CLASS");
+   const char *trace_class = dvm__env_trace_class();
    bool trace_this = !trace_class ||
       (m->cls && m->cls->name && strstr(m->cls->name, trace_class));
    const uint16_t *insns = m->code.insns;
@@ -1420,9 +1980,23 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          goto exception;
       }
       ++vm->steps;
+      /* Offer the lock up periodically.  Nothing preempts bytecode, so without
+       * this a thread in a long loop starves every other one for as long as it
+       * runs.  The top of the dispatch loop is the one place in a call where
+       * nothing but frames, registers and dex mappings are live, and none of
+       * those move when another thread allocates. */
+      if ((vm->steps & (DVM_GIL_YIELD_STEPS - 1)) == 0) dvm_gil_yield(vm);
       if (vm->step_limit && ++vm->call_steps > vm->step_limit) {
-         fprintf(stderr, "[dvm] step limit reached in %s.%s — aborting the call\n",
-                 m->cls->name, m->name);
+         fprintf(stderr, "[dvm] step limit reached in %s.%s — aborting the call "
+                 "(%llu steps, depth=%d, limit=%llu); call stack:\n",
+                 m->cls->name, m->name, (unsigned long long)vm->call_steps,
+                 vm->depth, (unsigned long long)vm->step_limit);
+         for (int i = vm->ncallstack - 1, shown = 0; i >= 0 && shown < 12; --i, ++shown) {
+            const struct dvm_method *f = vm->callstack[i];
+            if (!f) continue;
+            fprintf(stderr, "[dvm]   #%d %s.%s%s\n", shown,
+                    f->cls ? f->cls->name : "?", f->name, f->sig ? f->sig : "");
+         }
          dvm__throw(vm, "java/lang/Error", "dvm step limit");
          goto exception;
       }
@@ -1567,10 +2141,14 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          fr->pc += 2;
          break;
 
-      /* --- monitors: the VM is single-threaded per call, so these are no-ops.
-       * Guest threads never enter bytecode concurrently — a JNI call runs to
-       * completion on the calling thread. */
-      case 0x1d: case 0x1e:
+      case 0x1d: /* monitor-enter */
+         REQ(AA(u0));
+         if (!dvm__monitor_enter(vm, r[AA(u0)])) goto exception;
+         fr->pc += 1;
+         break;
+      case 0x1e: /* monitor-exit */
+         REQ(AA(u0));
+         if (!dvm__monitor_exit(vm, r[AA(u0)])) goto exception;
          fr->pc += 1;
          break;
 
@@ -1608,7 +2186,11 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
       case 0x22: { /* new-instance */
          REQ(AA(u0));
          struct dvm_class *t = dd ? resolve_type(vm, dd, IU(1)) : NULL;
-         if (!t) { dvm__throw(vm, "java/lang/NoClassDefFoundError", NULL); goto exception; }
+         if (!t || class_absent(vm, t)) {
+            dvm__throw(vm, "java/lang/NoClassDefFoundError", "%s",
+                       t && t->name ? t->name : "?");
+            goto exception;
+         }
          dvm_init_class(vm, t);
          if (t->external && vm->hooks.new_external) {
             uint32_t h = vm->hooks.new_external(vm->hooks.user, vm, t->name);
@@ -1872,7 +2454,17 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
                                   : NULL;
          struct dvm_object *o = dvm__obj(vm, r[B4(u0)]);
          if (!o) {
-            dvm__throw(vm, "java/lang/NullPointerException", "iget %s", fn ? fn : "?");
+            /* Name the field's declaring class as well.  Obfuscated code
+             * reuses one identifier for dozens of unrelated fields, so
+             * "iget getMonetizationNetwork" fits every link of a chain like
+             * a.b.c.d and says nothing about which one is null. */
+            /* The bytecode offset as well: one method can read the same
+             * field name from several places, and the offset is what maps the
+             * report back to a single instruction in the dex. */
+            dvm__throw(vm, "java/lang/NullPointerException",
+                       "iget %s.%s:%s at %s.%s@%04x",
+                       fc && fc->name ? fc->name : "?", fn ? fn : "?",
+                       ft ? ft : "?", m->cls ? m->cls->name : "?", m->name, pc);
             goto exception;
          }
          /* A field the object does not have belongs to a host-backed class;
@@ -1897,7 +2489,10 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
                                   : NULL;
          struct dvm_object *o = dvm__obj(vm, r[B4(u0)]);
          if (!o) {
-            dvm__throw(vm, "java/lang/NullPointerException", "iput %s", fn ? fn : "?");
+            dvm__throw(vm, "java/lang/NullPointerException",
+                       "iput %s.%s:%s at %s.%s@%04x",
+                       fc && fc->name ? fc->name : "?", fn ? fn : "?",
+                       ft ? ft : "?", m->cls ? m->cls->name : "?", m->name, pc);
             goto exception;
          }
          union dvm_value v = { 0 };
@@ -1927,6 +2522,20 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             if (!dvm_init_class(vm, f->cls)) goto exception;
             if (f->cls->sslots && f->slot < f->cls->nsslots)
                v = f->cls->sslots[f->slot];
+            /* Dex static that the host publishes after attach (e.g.
+             * UnityPlayer.currentActivity).  A null sslot here is not "no
+             * field" — ask the external hook before handing out null. */
+            if (op == 0x62 && !v.l && fc && fn && ft &&
+                !strcmp(fn, "currentActivity") &&
+                vm->hooks.get_external_static) {
+               union dvm_value host = { 0 };
+               if (vm->hooks.get_external_static(vm->hooks.user, vm, fc->name,
+                                                   fn, ft, &host) && host.l) {
+                  v = host;
+                  if (f->cls->sslots && f->slot < f->cls->nsslots)
+                     f->cls->sslots[f->slot] = v;
+               }
+            }
          } else if (fc && fn && vm->hooks.get_external_static) {
             /* Nothing defines this class — not a dex, not a builtin, not the
              * host stubs.  A device raises NoClassDefFoundError here, and app
@@ -1982,6 +2591,10 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          struct dvm_method *target =
             dd ? resolve_method(vm, dd, midx, &cls, &name, sigbuf, sizeof sigbuf) : NULL;
 
+         if (vm->trace >= 2 && trace_this)
+            fprintf(stderr, "[dvm]     invoke %s.%s%s\n",
+                    cls ? cls->name : "?", name ? name : "?", sigbuf);
+
          uint32_t slots[256];
          int n = gather_args(insns, nins, pc, range, r, nregs, slots);
 
@@ -2031,6 +2644,14 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          bool ok;
          if (target) {
             ok = invoke(vm, target, self, argslots, nargslots, &ret);
+         } else if (cls && class_absent(vm, cls)) {
+            /* Same as new-instance: the call names a class the APK does not
+             * carry and the platform does not have.  Answering it with a stub
+             * that returns zero tells the app the optional component is there
+             * and it keeps using it. */
+            dvm__throw(vm, "java/lang/NoClassDefFoundError", "%s",
+                       cls->name ? cls->name : "?");
+            goto exception;
          } else if (cls && name) {
             ++vm->depth;
             ok = dvm__call_out(vm, cls, name, sigbuf,
@@ -2505,8 +3126,12 @@ static void drain_pending(struct dvm *vm, bool nested)
        * elapsed stay queued for a later drain. */
       uint64_t now = dvm__now_ms();
       int pick = -1;
-      for (int i = 0; i < vm->npending; ++i)
+      for (int i = 0; i < vm->npending; ++i) {
+         /* Background Looper.loop() owns its tagged entries. */
+         if (!vm->pending_is_thread[i] && vm->pending_looper[i])
+            continue;
          if (vm->pending_due_ms[i] <= now) { pick = i; break; }
+      }
       if (pick < 0) break;
 
       dvm_ref entry = vm->pending_threads[pick];
@@ -2515,6 +3140,7 @@ static void drain_pending(struct dvm *vm, bool nested)
          vm->pending_threads[i] = vm->pending_threads[i + 1];
          vm->pending_is_thread[i] = vm->pending_is_thread[i + 1];
          vm->pending_due_ms[i] = vm->pending_due_ms[i + 1];
+         vm->pending_looper[i] = vm->pending_looper[i + 1];
       }
       --vm->npending;
 
@@ -2527,6 +3153,17 @@ static void drain_pending(struct dvm *vm, bool nested)
          if (run && (run->has_code || run->builtin)) {
             union dvm_value ret;
             uint64_t before = vm->steps;
+            /* The Runnable gets a slice of its own, so it starts from zero.
+             * call_steps is only reset by dvm_call() at depth 0, and a drain
+             * runs nested inside whatever call asked to wait — so without this
+             * the Runnable inherits every step that call had already spent and
+             * blows the slice on its first instruction.  It surfaced once
+             * Thread.sleep() stopped holding the ARM execution lock: the Java
+             * wait loops around it started really turning, and each turn
+             * drains, so a long-running JNI call reached the limit within a
+             * couple of Runnables. */
+            uint64_t saved_steps = vm->call_steps;
+            vm->call_steps = 0;
             vm->step_limit = DVM_THREAD_SLICE;
             vm->quiet_uncaught = true;
             /* A Runnable handed to Handler.post() runs on the main thread; one
@@ -2538,6 +3175,7 @@ static void drain_pending(struct dvm *vm, bool nested)
             vm->cur_thread = saved_thread;
             vm->quiet_uncaught = saved_quiet;
             vm->step_limit = saved_limit;
+            vm->call_steps = saved_steps;
             char how[256];
             how[0] = '\0';
             if (!ok && vm->exception)
@@ -2611,6 +3249,506 @@ void dvm__run_pending_threads(struct dvm *vm)
 }
 void dvm__drain_for_wait(struct dvm *vm) { drain_pending(vm, true); }
 
+
+/* ------------------------------------------------------------------------ *
+ * The global interpreter lock, and the thread state it hands over
+ *
+ * See the commentary above dvm_gil_acquire() in dvm.h for why this exists.
+ * ------------------------------------------------------------------------ */
+
+#define TS_COPY(dst, src, f) ((dst)->f = (src)->f)
+
+void dvm__tstate_save(struct dvm *vm, struct dvm_tstate *t)
+{
+   TS_COPY(t, vm, exception);
+   TS_COPY(t, vm, nexc_trace);
+   TS_COPY(t, vm, exc_ref);
+   TS_COPY(t, vm, exc_pc);
+   TS_COPY(t, vm, cur_thread);
+   TS_COPY(t, vm, drain_depth);
+   TS_COPY(t, vm, quiet_uncaught);
+   TS_COPY(t, vm, parked);
+   TS_COPY(t, vm, cur_method);
+   TS_COPY(t, vm, cur_pc);
+   TS_COPY(t, vm, ncallstack);
+   TS_COPY(t, vm, depth);
+   TS_COPY(t, vm, call_steps);
+   TS_COPY(t, vm, step_limit);
+   memcpy(t->exc_trace, vm->exc_trace, sizeof t->exc_trace);
+   /* Only the live part: the array is 128 entries and this copy happens on
+    * every handover, so copying the tail would cost more than the switch. */
+   int n = vm->ncallstack;
+   if (n < 0) n = 0;
+   if (n > (int)(sizeof t->callstack / sizeof t->callstack[0]))
+      n = (int)(sizeof t->callstack / sizeof t->callstack[0]);
+   memcpy(t->callstack, vm->callstack, (size_t)n * sizeof t->callstack[0]);
+}
+
+void dvm__tstate_load(struct dvm *vm, const struct dvm_tstate *t)
+{
+   TS_COPY(vm, t, exception);
+   TS_COPY(vm, t, nexc_trace);
+   TS_COPY(vm, t, exc_ref);
+   TS_COPY(vm, t, exc_pc);
+   TS_COPY(vm, t, cur_thread);
+   TS_COPY(vm, t, drain_depth);
+   TS_COPY(vm, t, quiet_uncaught);
+   TS_COPY(vm, t, parked);
+   TS_COPY(vm, t, cur_method);
+   TS_COPY(vm, t, cur_pc);
+   TS_COPY(vm, t, ncallstack);
+   TS_COPY(vm, t, depth);
+   TS_COPY(vm, t, call_steps);
+   TS_COPY(vm, t, step_limit);
+   memcpy(vm->exc_trace, t->exc_trace, sizeof vm->exc_trace);
+   int n = t->ncallstack;
+   if (n < 0) n = 0;
+   if (n > (int)(sizeof t->callstack / sizeof t->callstack[0]))
+      n = (int)(sizeof t->callstack / sizeof t->callstack[0]);
+   memcpy(vm->callstack, t->callstack, (size_t)n * sizeof t->callstack[0]);
+}
+
+#undef TS_COPY
+
+/* Per-thread copy of the above.  A thread that has never held the lock has no
+ * saved state, and inheriting the previous holder's would give it that
+ * thread's call stack and pending exception. */
+static _Thread_local struct dvm_tstate g_tstate;
+static _Thread_local bool g_tstate_valid;
+
+/* Whether this host thread exists to run bytecode, as opposed to being the one
+ * that drives the frame pump and the guest CPU.  The difference matters
+ * wherever a wait has to be kept short so the emulator keeps running: on a
+ * thread of its own, a Thread.sleep(500) can simply take 500 ms. */
+static _Thread_local bool g_is_bytecode_thread;
+
+bool dvm_on_bytecode_thread(void) { return g_is_bytecode_thread; }
+void dvm__mark_bytecode_thread(void) { g_is_bytecode_thread = true; }
+
+void dvm__tstate_reset(struct dvm *vm)
+{
+   /* Zero throughout, including the step limit: that budget exists to bound a
+    * call the VM cannot preempt, and a thread with its own stack is preempted
+    * every DVM_GIL_YIELD_STEPS instructions instead.  A caller that wants a
+    * budget sets one after this returns.
+    *
+    * Installed into the VM as well as saved, because the fields still hold
+    * whatever the previous holder of the lock left in them — this thread has
+    * no saved state to load, which is exactly why it is calling this. */
+   memset(&g_tstate, 0, sizeof g_tstate);
+   g_tstate_valid = true;
+   if (vm) dvm__tstate_load(vm, &g_tstate);
+}
+
+static struct {
+   pthread_mutex_t m;
+   pthread_cond_t cv;
+   pthread_t owner;
+   _Atomic unsigned depth; /* 0 = nobody holds it */
+   /* Threads blocked in acquire.  dvm_gil_yield() is called from the
+    * interpreter's dispatch loop and from the guest scheduler's spin, both of
+    * them hot; with nobody waiting there is nothing to hand the lock to, and
+    * the handover would cost a thread-state save and load for nothing. */
+   _Atomic unsigned waiters;
+   /* Handed out in the order it was asked for, for the same reason the ARM
+    * execution lock is (src/arm.c).  Every wait in this VM is "give the lock
+    * up and take it again until somebody else makes my condition true" — a
+    * java.util.concurrent queue's take(), a Thread.sleep() poll loop.  With an
+    * unfair lock the thread that just released it is the one already running,
+    * so it wins the race back every time and the thread it is waiting for
+    * never gets in: a UE modal box looping `Thread.sleep(100)` on an engine
+    * worker held the interpreter for good while every bytecode thread sat in
+    * dvm_gil_acquire(), and the frame pump waited on the worker.
+    *
+    * The queue is explicit rather than a ticket counter over a shared condvar:
+    * with a shared one every release has to be a broadcast, because only the
+    * holder of the next ticket may proceed, so each hand-off woke every waiter
+    * and all but one went straight back to sleep.  One condvar per waiter lets
+    * the releaser signal exactly the thread whose turn it is.
+    *
+    * Recursion depth is a thread-local, so a recursive acquire and "do I hold
+    * it?" - both on the hot JNI path - cost nothing at all. */
+} g_gil = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0, 0 };
+
+struct dvm_gil_waiter {
+   pthread_cond_t         cv;
+   struct dvm_gil_waiter *next;
+   bool                   go;   /* the lock has been handed to me */
+};
+static struct dvm_gil_waiter *g_gil_head, *g_gil_tail;
+static __thread unsigned      t_gil_depth;
+
+/* The one VM in the process.  Callers outside this module — the frame pump,
+ * the guest scheduler — have to offer the lock up without having been handed a
+ * `struct dvm *` to do it with. */
+static struct dvm *g_gil_vm;
+
+/* Only written while g_gil.m is held, so plain counters are enough.
+ *
+ * Two different questions, and the first one alone is misleading.  The summed
+ * wait is over every thread, so eight idle consumers correctly blocked on
+ * empty queues add eight seconds of "wait" per second of wall time and nothing
+ * is wrong.  What says whether the interpreter is actually the bottleneck is
+ * how much of the wall clock *somebody holds the lock* — at 100% the VM is
+ * saturated and every waiter is a real queue; at 20% the waiters are idle and
+ * the sum is just counting their idleness. */
+static _Atomic unsigned long long g_gil_wait_ns;     /* summed over threads */
+static _Atomic unsigned long long g_gil_held_ns;     /* wall time with an owner */
+static _Atomic unsigned long long g_gil_max_wait_ns; /* worst single wait */
+static struct timespec    g_gil_held_since;
+unsigned long long dvm_gil_wait_ns(void)
+{
+   return atomic_load_explicit(&g_gil_wait_ns, memory_order_relaxed);
+}
+unsigned long long dvm_gil_held_ns(void)
+{
+   return atomic_load_explicit(&g_gil_held_ns, memory_order_relaxed);
+}
+unsigned long long dvm_gil_max_wait_ns(void)
+{
+   return atomic_exchange_explicit(&g_gil_max_wait_ns, 0,
+                                   memory_order_relaxed);
+}
+static unsigned long long gil_ns_since(const struct timespec *a,
+                                       const struct timespec *b)
+{
+   return (unsigned long long)(b->tv_sec - a->tv_sec) * 1000000000ull
+        + (unsigned long long)(b->tv_nsec - a->tv_nsec);
+}
+
+/* Signalled whenever a thread changes something another thread might be
+ * blocked on: a queue gains an item, a latch is counted down, a permit is
+ * handed over.  See dvm_gil_wait(). */
+static pthread_cond_t g_gil_change = PTHREAD_COND_INITIALIZER;
+/* Protected by g_gil.m.  The sequence turns the condvar into an event: a
+ * notification that lands between dropping GIL and entering timedwait is
+ * observed instead of being lost. */
+static unsigned long long g_gil_change_seq;
+
+/* Targeted waiters keep independent queues from waking one another.  A Timer
+ * per in-flight operation is common Java code; broadcasting one global event
+ * to all of them turns a harmless enqueue into an O(thread count) GIL storm.
+ *
+ * Waiters live on their sleeping thread's stack.  Registration, notification
+ * and removal all happen under g_gil.m, and the notifier only sets `ready`, so
+ * it never retains a stack pointer after the waiter removes itself. */
+struct dvm_event_waiter {
+   pthread_cond_t cv;
+   struct dvm_event_waiter *next;
+   uintptr_t channel;
+   bool ready;
+};
+static struct dvm_event_waiter *g_event_waiters;
+
+void dvm_gil_notify(void)
+{
+   pthread_mutex_lock(&g_gil.m);
+   ++g_gil_change_seq;
+   pthread_cond_broadcast(&g_gil_change);
+   pthread_mutex_unlock(&g_gil.m);
+}
+
+void dvm_gil_notify_for(uintptr_t channel)
+{
+   if (!channel) { dvm_gil_notify(); return; }
+   pthread_mutex_lock(&g_gil.m);
+   for (struct dvm_event_waiter *w = g_event_waiters; w; w = w->next) {
+      if (w->channel != channel) continue;
+      w->ready = true;
+      pthread_cond_signal(&w->cv);
+   }
+   pthread_mutex_unlock(&g_gil.m);
+}
+
+void dvm_gil_notify_one_for(uintptr_t channel)
+{
+   if (!channel) { dvm_gil_notify(); return; }
+   pthread_mutex_lock(&g_gil.m);
+   for (struct dvm_event_waiter *w = g_event_waiters; w; w = w->next) {
+      if (w->channel != channel) continue;
+      w->ready = true;
+      pthread_cond_signal(&w->cv);
+      break;
+   }
+   pthread_mutex_unlock(&g_gil.m);
+}
+
+/* Wait for such a change, or for `ms` to pass, without holding the
+ * interpreter lock.
+ *
+ * The blocking primitives used to do this by hand: drop the lock, usleep(1000),
+ * take it again, re-check.  With one bytecode thread that is a poll; with the
+ * eight a UE title's Java side runs it is eight threads taking a *global* lock
+ * a thousand times a second each, and the lock is handed out in ticket order,
+ * so a JNI call arriving from guest code queues behind all of them.  Measured
+ * on Cross Worlds: 22.6 seconds of accumulated wait in a 5-second window, and
+ * 4.1 ms for an average CallIntMethodV.
+ *
+ * The timeout stays as a backstop rather than the mechanism — a notify can be
+ * missed in the window between releasing the lock and taking g_gil.m, and the
+ * callers all re-check their own condition — but it is 20 ms rather than 1,
+ * so an idle waiter costs fifty lock acquisitions a second instead of a
+ * thousand, and a waiter with a producer is woken at once instead of on the
+ * next tick. */
+/* Take the interpreter lock from a context that is holding the ARM execution
+ * lock — every JNI entry point reached from a guest SVC is one.
+ *
+ * Lock order in the emulator is interpreter-outside, execution-inside (see the
+ * call_native boundary above).  A thread that already holds the execution lock
+ * therefore cannot simply block on the interpreter lock: it would hold the two
+ * in the opposite order to a bytecode thread and the pair deadlocks.  So the
+ * execution lock is given up first, the interpreter lock is taken, and the
+ * execution lock is taken again — which is also exactly what a real JNI
+ * transition does when it re-enters the VM. */
+/* Take the lock only if it is free.  Never blocks, so it cannot invert the
+ * lock order and needs no dance with the execution lock. */
+static bool gil_tryacquire(struct dvm *vm)
+{
+   if (t_gil_depth) { ++t_gil_depth; return true; }
+   bool got = false;
+   pthread_mutex_lock(&g_gil.m);
+   /* Free *and* nobody queued: barging past a waiter would undo the fairness
+    * the queue exists for. */
+   if (!atomic_load_explicit(&g_gil.depth, memory_order_relaxed) &&
+       !g_gil_head) {
+      atomic_store_explicit(&g_gil.depth, 1, memory_order_relaxed);
+      g_gil.owner = pthread_self();
+      clock_gettime(CLOCK_MONOTONIC, &g_gil_held_since);
+      got = true;
+   }
+   pthread_mutex_unlock(&g_gil.m);
+   if (got) {
+      t_gil_depth = 1;
+      if (!g_tstate_valid) dvm__tstate_reset(vm);
+      else                 dvm__tstate_load(vm, &g_tstate);
+   }
+   return got;
+}
+
+unsigned dvm_gil_enter_from_guest(struct dvm *vm)
+{
+   /* No VM at all — a title with no classes*.dex runs with bytecode emulation
+    * off, and its JNI entry points still come through here. */
+   if (!vm) return 0u;
+   if (dvm_gil_held(vm)) return 0u;      /* already ours: nothing to order */
+   /* The common case by far: no Java thread is inside the VM, so the lock is
+    * free and this costs one mutex.  Dropping and re-taking the execution lock
+    * unconditionally would be three lock operations per JNI call — and the
+    * execution lock is a ticket, so re-taking it means going to the back of
+    * the queue and sleeping.  UnitySampleGame, which calls into Java every
+    * frame, lost four fifths of its frame rate to exactly that. */
+   if (gil_tryacquire(vm)) return 1u;
+   unsigned ael = arm_lock_unlock_all();
+   dvm_gil_acquire(vm);
+   arm_lock_relock(ael);
+   return 1u;
+}
+
+void dvm_gil_leave_to_guest(struct dvm *vm, unsigned cookie)
+{
+   /* Releasing never blocks, so the execution lock can stay where it is. */
+   if (!vm || !cookie) return;
+   dvm_gil_release(vm);
+}
+
+void dvm_gil_wait(struct dvm *vm, unsigned ms)
+{
+   /* Snapshot while still owning GIL.  A producer cannot change a VM
+    * condition until this thread releases GIL, so any later condition change
+    * also advances the sequence. */
+   pthread_mutex_lock(&g_gil.m);
+   unsigned long long seen = g_gil_change_seq;
+   pthread_mutex_unlock(&g_gil.m);
+
+   unsigned d = dvm_gil_unlock_all(vm);
+   struct timespec ts;
+   clock_gettime(CLOCK_REALTIME, &ts);
+   ts.tv_sec  += (time_t)(ms / 1000u);
+   ts.tv_nsec += (long)(ms % 1000u) * 1000000L;
+   if (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ++ts.tv_sec; }
+   pthread_mutex_lock(&g_gil.m);
+   while (g_gil_change_seq == seen) {
+      int rc = pthread_cond_timedwait(&g_gil_change, &g_gil.m, &ts);
+      if (rc != 0) break;
+   }
+   pthread_mutex_unlock(&g_gil.m);
+   dvm_gil_relock(vm, d);
+}
+
+void dvm_gil_wait_for(struct dvm *vm, uintptr_t channel, unsigned ms)
+{
+   if (!channel) { dvm_gil_wait(vm, ms); return; }
+
+   struct dvm_event_waiter w;
+   pthread_cond_init(&w.cv, NULL);
+   w.channel = channel;
+   w.ready = false;
+
+   /* Register before dropping GIL.  A producer cannot change the protected VM
+    * state before GIL is released, so it cannot notify in the registration
+    * gap.  This gives condvars event semantics without a polling timeout. */
+   pthread_mutex_lock(&g_gil.m);
+   w.next = g_event_waiters;
+   g_event_waiters = &w;
+   pthread_mutex_unlock(&g_gil.m);
+
+   unsigned d = dvm_gil_unlock_all(vm);
+   struct timespec ts;
+   clock_gettime(CLOCK_REALTIME, &ts);
+   ts.tv_sec  += (time_t)(ms / 1000u);
+   ts.tv_nsec += (long)(ms % 1000u) * 1000000L;
+   if (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ++ts.tv_sec; }
+
+   pthread_mutex_lock(&g_gil.m);
+   while (!w.ready) {
+      int rc = pthread_cond_timedwait(&w.cv, &g_gil.m, &ts);
+      if (rc != 0) break;
+   }
+   struct dvm_event_waiter **link = &g_event_waiters;
+   while (*link && *link != &w) link = &(*link)->next;
+   if (*link) *link = w.next;
+   pthread_mutex_unlock(&g_gil.m);
+
+   pthread_cond_destroy(&w.cv);
+   dvm_gil_relock(vm, d);
+}
+
+struct dvm *dvm_current(void) { return g_gil_vm; }
+
+bool dvm_gil_held(struct dvm *vm)
+{
+   (void)vm;
+   return t_gil_depth != 0u;
+}
+
+void dvm_gil_acquire(struct dvm *vm)
+{
+   if (t_gil_depth) { ++t_gil_depth; return; }
+
+   /* Keep the global lock order GIL -> AEL at the primitive boundary.
+    *
+    * Most callers are pure bytecode threads and do not own the ARM execution
+    * lock.  A Java -> native -> Java callback is different: the native half
+    * can return to dvm__call_out() while its callback SVC still owns AEL, and
+    * the old dvm_gil_relock() then waited here without dropping AEL.  At the
+    * same time the pump could own GIL and be re-taking AEL after a JNI call:
+    * a real ABBA deadlock.
+    *
+    * Preserve the uncontended hot path.  Taking a free GIL cannot wait and is
+    * therefore safe while AEL is held.  On contention, release every recursive
+    * AEL level before joining the FIFO GIL queue and restore it only after GIL
+    * ownership has been handed to us.  Putting this here, rather than in each
+    * callback path, makes the ordering invariant apply to every current and
+    * future GIL acquisition. */
+   if (gil_tryacquire(vm)) return;
+   unsigned ael_depth = arm_lock_unlock_all();
+
+   pthread_mutex_lock(&g_gil.m);
+   if (!atomic_load_explicit(&g_gil.depth, memory_order_relaxed) &&
+       !g_gil_head) {
+      atomic_store_explicit(&g_gil.depth, 1, memory_order_relaxed);
+   } else {
+      /* The waiter lives on this thread's stack.  Safe: the releaser only
+       * touches it under g_gil.m, and this thread does not leave the wait
+       * until it has been dequeued under the same mutex. */
+      struct dvm_gil_waiter w;
+      pthread_cond_init(&w.cv, NULL);
+      w.next = NULL;
+      w.go   = false;
+      if (g_gil_tail) g_gil_tail->next = &w; else g_gil_head = &w;
+      g_gil_tail = &w;
+      atomic_fetch_add_explicit(&g_gil.waiters, 1, memory_order_relaxed);
+      struct timespec w0, w1;
+      clock_gettime(CLOCK_MONOTONIC, &w0);
+      while (!w.go)
+         pthread_cond_wait(&w.cv, &g_gil.m);
+      clock_gettime(CLOCK_MONOTONIC, &w1);
+      atomic_fetch_sub_explicit(&g_gil.waiters, 1, memory_order_relaxed);
+      pthread_cond_destroy(&w.cv);
+      const unsigned long long d = gil_ns_since(&w0, &w1);
+      atomic_fetch_add_explicit(&g_gil_wait_ns, d, memory_order_relaxed);
+      unsigned long long old = atomic_load_explicit(
+         &g_gil_max_wait_ns, memory_order_relaxed);
+      while (old < d && !atomic_compare_exchange_weak_explicit(
+               &g_gil_max_wait_ns, &old, d,
+               memory_order_relaxed, memory_order_relaxed)) {}
+      /* g_gil.depth stayed 1: the releaser handed ownership straight over. */
+   }
+   g_gil.owner = pthread_self();
+   clock_gettime(CLOCK_MONOTONIC, &g_gil_held_since);
+   pthread_mutex_unlock(&g_gil.m);
+   t_gil_depth = 1;
+   /* Nobody else can be interpreting now, so the VM's per-thread fields are
+    * free for this thread to install its own into.
+    *
+    * A thread that has never held the lock has nothing saved, and the fields
+    * still hold the previous holder's — its call stack, its pending exception
+    * and the steps it has already spent.  Leaving them was survivable while a
+    * new thread always called dvm__tstate_reset() before it first interpreted;
+    * it stopped being so once threads take the lock more often, and a freshly
+    * started java/lang/Thread inherited a call_steps that was already at the
+    * limit, so its first method aborted with "step limit reached". */
+   if (!g_tstate_valid) dvm__tstate_reset(vm);
+   else                 dvm__tstate_load(vm, &g_tstate);
+
+   arm_lock_relock(ael_depth);
+}
+
+void dvm_gil_release(struct dvm *vm)
+{
+   if (!t_gil_depth) return;      /* not ours to release */
+   if (--t_gil_depth) return;     /* still held by an outer acquire */
+   /* Still the owner here — g_gil.depth is only cleared below — so this reads
+    * a VM no other thread can be touching. */
+   dvm__tstate_save(vm, &g_tstate);
+   g_tstate_valid = true;
+   pthread_mutex_lock(&g_gil.m);
+   {
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      atomic_fetch_add_explicit(&g_gil_held_ns,
+                                gil_ns_since(&g_gil_held_since, &now),
+                                memory_order_relaxed);
+   }
+   struct dvm_gil_waiter *w = g_gil_head;
+   if (w) {
+      g_gil_head = w->next;
+      if (!g_gil_head) g_gil_tail = NULL;
+      w->go = true;
+      pthread_cond_signal(&w->cv);
+   } else {
+      atomic_store_explicit(&g_gil.depth, 0, memory_order_release);
+   }
+   pthread_mutex_unlock(&g_gil.m);
+}
+
+unsigned dvm_gil_unlock_all(struct dvm *vm)
+{
+   unsigned d = t_gil_depth;
+   if (d) {
+      t_gil_depth = 1u;
+      dvm_gil_release(vm);
+   }
+   return d;
+}
+
+void dvm_gil_relock(struct dvm *vm, unsigned depth)
+{
+   if (!depth) return;
+   dvm_gil_acquire(vm);
+   t_gil_depth = depth;
+}
+
+void dvm_gil_yield(struct dvm *vm)
+{
+   if (!atomic_load_explicit(&g_gil.waiters, memory_order_relaxed)) return;
+   unsigned d = dvm_gil_unlock_all(vm);
+   if (!d) return;
+   /* No sched_yield(): dvm_gil_acquire() queues this thread behind everyone
+    * who was already waiting, which is the hand-off this call is asking for. */
+   dvm_gil_relock(vm, d);
+}
+
 bool dvm_call(struct dvm *vm, struct dvm_method *m, dvm_ref self,
               const union dvm_value *args, int nargs, union dvm_value *out)
 {
@@ -2663,6 +3801,140 @@ bool dvm_call(struct dvm *vm, struct dvm_method *m, dvm_ref self,
  * Lifecycle
  * ------------------------------------------------------------------------ */
 
+/* Is anybody inside the VM at this instant?  Read without the mutex: the
+ * profiler below only needs to tell work from idleness, and a sample that
+ * lands exactly on a hand-off may go either way without changing the shape of
+ * the answer. */
+static bool gil_busy(void)
+{
+   return atomic_load_explicit(&g_gil.depth, memory_order_acquire) != 0u;
+}
+
+/* ---- Where the Java side spends its time (LUNARIA_DVM_PROF) --------------
+ *
+ * The interpreter-lock line in the [slice] report says how much of the wall
+ * clock the VM is busy.  It does not say what it is busy with, and "the VM is
+ * busy 98% of a loading screen" is a claim about the app's threads that has to
+ * be checked before anything can be fixed.
+ *
+ * A sampler thread reads the method the interpreter is standing on every few
+ * milliseconds and counts it.  The interpreter pays nothing for this beyond
+ * the store to cur_method it already did, and only the sampler touches the
+ * table, so there is no lock anywhere.  Methods and classes are freed only in
+ * dvm_destroy(), so a sampled pointer stays valid for as long as the sampler
+ * runs.
+ *
+ * A sample taken while nobody holds the interpreter lock is idle time: the
+ * method pointer is then whatever ran last, and attributing to it would make
+ * an idle VM look like a busy one.  Those are counted separately, so the
+ * report distinguishes "Java is the bottleneck" from "Java is asleep".
+ *
+ * LUNARIA_DVM_PROF=<seconds between reports> (=1 means the 5 s default). */
+#define DVM_PROF_SLOTS 4096u
+static struct { struct dvm_method *m; unsigned long long n; } g_prof[DVM_PROF_SLOTS];
+static unsigned long long g_prof_busy, g_prof_idle;
+
+static void prof_count(struct dvm_method *m)
+{
+   size_t h = ((size_t)(uintptr_t)m >> 4) & (DVM_PROF_SLOTS - 1u);
+   for (unsigned i = 0; i < DVM_PROF_SLOTS; ++i) {
+      size_t k = (h + i) & (DVM_PROF_SLOTS - 1u);
+      if (g_prof[k].m == m || !g_prof[k].m) {
+         g_prof[k].m = m;
+         ++g_prof[k].n;
+         return;
+      }
+   }
+   /* Table full: the count is a profile, not a ledger — drop the sample. */
+}
+
+static int prof_cmp(const void *a, const void *b)
+{
+   unsigned long long x = ((const struct { struct dvm_method *m;
+                                           unsigned long long n; } *)a)->n;
+   unsigned long long y = ((const struct { struct dvm_method *m;
+                                           unsigned long long n; } *)b)->n;
+   return x < y ? 1 : x > y ? -1 : 0;
+}
+
+static void prof_report(void)
+{
+   const unsigned long long total = g_prof_busy + g_prof_idle;
+   if (!total) return;
+   qsort(g_prof, DVM_PROF_SLOTS, sizeof g_prof[0], prof_cmp);
+   {
+      static unsigned long long steps_last, throws_last;
+      const struct dvm *vm = g_gil_vm;
+      const unsigned long long steps = vm ? vm->steps : 0ull;
+      fprintf(stderr, "[dvmprof] %llu samples: %.0f%% in the VM, %.0f%% idle, "
+              "%.1fM bytecodes/s, %llu exceptions\n",
+              total, 100.0 * (double)g_prof_busy / (double)total,
+              100.0 * (double)g_prof_idle / (double)total,
+              (double)(steps - steps_last) / 1e6 /
+                 ((double)total * 0.002),
+              g_throws - throws_last);
+      steps_last = steps;
+      throws_last = g_throws;
+      for (int shown = 0; shown < 5; ++shown) {
+         int best = -1;
+         for (int i = 0; i < DVM_THROW_TALLY; ++i)
+            if (g_throw_tally[i].cls && g_throw_tally[i].n &&
+                (best < 0 || g_throw_tally[i].n > g_throw_tally[best].n))
+               best = i;
+         if (best < 0) break;
+         fprintf(stderr, "[dvmprof]   %8llu  %s thrown in %s.%s\n",
+                 g_throw_tally[best].n, g_throw_tally[best].cls,
+                 g_throw_tally[best].in, g_throw_tally[best].method);
+         g_throw_tally[best].n = 0;
+      }
+      memset(g_throw_tally, 0, sizeof g_throw_tally);
+   }
+   for (unsigned i = 0; i < DVM_PROF_SLOTS && i < 15u; ++i) {
+      if (!g_prof[i].m || !g_prof[i].n) break;
+      const struct dvm_method *m = g_prof[i].m;
+      fprintf(stderr, "[dvmprof]   %5.1f%%  %s.%s\n",
+              100.0 * (double)g_prof[i].n / (double)total,
+              m->cls && m->cls->name ? m->cls->name : "?", m->name);
+   }
+   memset(g_prof, 0, sizeof g_prof);
+   g_prof_busy = g_prof_idle = 0;
+}
+
+static void *prof_thread(void *arg)
+{
+   const double every = *(const double *)arg;
+   free(arg);
+   struct timespec tick = { 0, 2 * 1000 * 1000 };   /* 2 ms */
+   double waited = 0.0;
+   for (;;) {
+      nanosleep(&tick, NULL);
+      waited += 0.002;
+      struct dvm *vm = g_gil_vm;
+      struct dvm_method *m =
+         vm ? atomic_load_explicit(&vm->cur_method, memory_order_relaxed) : NULL;
+      if (m && gil_busy()) { ++g_prof_busy; prof_count(m); }
+      else                      ++g_prof_idle;
+      if (waited >= every) { prof_report(); waited = 0.0; }
+   }
+   return NULL;
+}
+
+static void prof_start(void)
+{
+   const char *e = getenv("LUNARIA_DVM_PROF");
+   if (!e || !*e || !strcmp(e, "0")) return;
+   double every = atof(e);
+   if (every < 0.5) every = 5.0;
+   double *arg = malloc(sizeof *arg);
+   if (!arg) return;
+   *arg = every;
+   pthread_t th;
+   if (pthread_create(&th, NULL, prof_thread, arg) != 0) { free(arg); return; }
+   pthread_detach(th);
+   fprintf(stderr, "[dvmprof] sampling the interpreter every 2 ms, "
+                   "reporting every %.1f s\n", every);
+}
+
 struct dvm *dvm_create(const struct dvm_hooks *hooks)
 {
    struct dvm *vm = calloc(1, sizeof *vm);
@@ -2674,25 +3946,50 @@ struct dvm *dvm_create(const struct dvm_hooks *hooks)
    if (t) vm->trace = atoi(t);
 
    dvm_runtime_install(vm);
+   g_gil_vm = vm;
+   prof_start();
+   /* The thread that creates the VM is the one the emulator runs its frame
+    * pump and its guest CPU on.  It used to take the interpreter lock here and
+    * keep it, giving it up only at chosen points — which bought the lock order
+    * (interpreter outside, execution inside) for free, but meant the lock was
+    * held 99-100% of the wall clock while the ARM JIT ran, so a Java thread
+    * only ever ran in the gaps and a JNI call from the guest waited behind
+    * every one of them (worst single wait measured: 416 ms).
+    *
+    * Now nobody holds it by default: each entry into the VM takes it for its
+    * own duration (dvm_gil_enter_from_guest, which drops the execution lock
+    * first so the order still holds).  The Java side and the guest CPU then
+    * run at the same time on different host threads.
+    * LUNARIA_DVM_GIL_HOLD=1 restores the old behaviour for comparison. */
+   if (getenv("LUNARIA_DVM_GIL_HOLD")) {
+      fprintf(stderr, "[dvm] pump holds the interpreter lock "
+                      "(LUNARIA_DVM_GIL_HOLD)\n");
+      dvm_gil_acquire(vm);
+   }
    return vm;
 }
 
 void dvm_destroy(struct dvm *vm)
 {
    if (!vm) return;
+   /* A pending apply() must reach the disk before the process goes away. */
+   dvm_prefs_flush(vm);
 
    for (uint32_t i = 0; i < vm->heap_size; ++i) {
-      free(vm->heap[i].utf8);
-      free(vm->heap[i].data);
-      free(vm->heap[i].slots);
+      struct dvm_object *o = heap_slot(vm, i + 1u);
+      free(o->utf8);
+      free(o->data);
+      free(o->slots);
    }
-   free(vm->heap);
+   for (uint32_t b = 0; b < vm->heap_nblocks; ++b) free(vm->heap_blocks[b]);
+   free(vm->heap_blocks);
 
    for (int i = 0; i < vm->nclasses; ++i) {
       struct dvm_class *c = vm->classes[i];
       for (int k = 0; k < c->nmethods; ++k)
          free(c->methods[k].sig);
       free(c->methods);
+      free(c->mcache);
       free(c->ifields);
       free(c->sfields);
       free(c->sslots);
@@ -2748,6 +4045,14 @@ bool dvm_add_dex(struct dvm *vm, const char *path)
    vm->dexes[vm->ndexes++] = dd;
    fprintf(stderr, "[dvm] loaded %s: %u classes, %u methods\n",
            path, dd->file.class_defs_size, dd->file.method_ids_size);
+   /* The boot card's only phase with a real denominator.  Reported after the
+    * parse, because that is the work the person watching was waiting on. */
+   {
+      struct stat st;
+      luna_boot_dex_loaded(path, dd->file.class_defs_size,
+                           dd->file.method_ids_size,
+                           stat(path, &st) == 0 ? (uint64_t)st.st_size : 0);
+   }
    return true;
 }
 
@@ -2797,6 +4102,28 @@ int dvm_add_apk_dir(struct dvm *vm, const char *dir)
 {
    static const char *const subdirs[] = { "", "base/" };
    int loaded = 0;
+   /* A first pass that only stats.  The boot card needs the total before the
+    * first file is parsed, and the files differ by megabytes, so a bar
+    * counting files rather than bytes would move in uneven jumps. */
+   {
+      int files = 0;
+      uint64_t bytes = 0;
+      for (size_t s = 0; s < sizeof subdirs / sizeof subdirs[0]; ++s) {
+         for (int i = 0; i < 64; ++i) {
+            char path[1024];
+            struct stat st;
+            if (i == 0) snprintf(path, sizeof path, "%s/%sclasses.dex", dir, subdirs[s]);
+            else snprintf(path, sizeof path, "%s/%sclasses%d.dex", dir, subdirs[s], i + 1);
+            if (stat(path, &st) != 0) {
+               if (i == 0) continue;
+               break;
+            }
+            ++files;
+            bytes += (uint64_t)st.st_size;
+         }
+      }
+      luna_boot_dex_total(files, bytes);
+   }
    for (size_t s = 0; s < sizeof subdirs / sizeof subdirs[0]; ++s) {
       for (int i = 0; i < 64; ++i) {
          char path[1024];

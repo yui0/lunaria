@@ -13,6 +13,7 @@
 
 #include "dvm/dvm.h"
 
+#include <stdatomic.h>
 #include <string.h>
 
 /* A built-in method: implemented in C, but visible to bytecode exactly like a
@@ -41,9 +42,19 @@ struct dvm_method {
    struct dex_code code;
    bool has_code;
    dvm_builtin_fn builtin;
+   bool placeholder_warned; /* a no-op scaffold has reported itself once */
    int arg_slots;      /* parameter registers, excluding `this` */
    int arg_count;      /* declared parameters */
    char ret_kind;
+};
+
+/* One resolved lookup, cached on the class it was asked of.  `hash` is zero
+ * in an unused slot, so the table needs no separate occupancy word. */
+struct dvm_mcache_slot {
+   uint32_t hash;
+   const char *name;
+   const char *sig;          /* NULL matches any signature, as in the lookup */
+   struct dvm_method *m;
 };
 
 struct dvm_class {
@@ -57,6 +68,11 @@ struct dvm_class {
    struct dex_file *dex;
    uint32_t class_def_idx;
    uint32_t static_values_off;
+   /* Generic metadata for builtins comes from the Android boot class path,
+    * which is not a dex in this VM.  DEX classes read their Signature
+    * annotation instead. */
+   const char *runtime_signature;
+   dvm_ref type_parameters; /* cached TypeVariable[] for stable identity */
 
    struct dvm_field *ifields;
    int nifields;
@@ -75,11 +91,22 @@ struct dvm_class {
    bool is_primitive;
    bool is_interface;
    bool external;              /* no dex definition: host stubs own it */
+   /* Invented by dvm__class_by_desc()'s last resort: no dex defines it and the
+    * emulator does not implement it either.  For the platform's namespaces
+    * that is a stub standing in for something a device really has; for the
+    * application's own namespace it is a class that does not exist, and
+    * bytecode that names it must be told so.  See new-instance in dvm.c. */
+   bool synthesized;
    char elem_kind;             /* arrays */
    struct dvm_class *elem;     /* arrays */
 
    dvm_ref class_object;       /* the java.lang.Class instance, made lazily */
    struct dvm_class *hash_next;
+
+   /* Methods already looked up on this class — see dvm_find_method(). */
+   struct dvm_mcache_slot *mcache;
+   uint32_t mcache_cap;        /* a power of two, or 0 before the first put */
+   uint32_t mcache_len;
 };
 
 enum dvm_obj_kind {
@@ -111,10 +138,22 @@ struct dvm_object {
    /* instance fields */
    union dvm_value *slots;
 
+   /* Java object monitor.  VM state is inspected while GIL is held; waits
+    * release GIL through dvm_gil_wait_for(), so no host mutex is needed per
+    * object.  The owner is a small process-local thread token, not pthread_t,
+    * keeping this representation plain C and comparable. */
+   uint64_t monitor_owner;
+   uint32_t monitor_depth;
+   uint64_t monitor_seq;
+
    /* Free-list link; also marks a dead slot when `cls` is NULL. */
    uint32_t next_free;
    bool live;
 };
+
+/* Objects per heap block.  Big enough that growth is rare, small enough that
+ * a VM which allocates a handful of objects does not reserve a megabyte. */
+#define DVM_HEAP_BLOCK 4096u
 
 #define DVM_MAX_FRAMES 256
 #define DVM_CLASS_HASH 1024
@@ -144,7 +183,9 @@ struct dvm {
    struct dvm_class **classes;    /* every class, for teardown */
    int nclasses, classes_cap;
 
-   struct dvm_object *heap;
+   /* Objects, in blocks that never move — see heap_slot() in dvm.c. */
+   struct dvm_object **heap_blocks;
+   uint32_t heap_nblocks;
    uint32_t heap_size, heap_cap;
    uint32_t free_head;
 
@@ -157,21 +198,25 @@ struct dvm {
    int nexc_trace;
    dvm_ref exc_ref;      /* the object the trace belongs to */
 
-   /* Threads started from bytecode.  A worker's run() is a loop that waits on
-    * a queue, so running it the moment start() is called — before anything has
-    * been queued — is wrong.  They are held here and run once the call that
-    * started them has returned to the JNI boundary, which is the point where
-    * the setting-up work is done.  Each then gets a bounded slice: nothing can
-    * preempt it, so a worker that runs out of work has to be stopped rather
-    * than left spinning. */
-   dvm_ref pending_threads[32];
+   /* Handler / Looper posts, and Thread.start fallback when a host thread
+    * cannot be created (LUNARIA_DVM_THREADS=0 or pthread_create failure).
+    * Executor workers go through Thread.start → host threads; they must not
+    * live here — that filled a 32-slot queue at Cross Worlds title and made
+    * growing it to 256 look like a fix for what was a mis-routed Executor. */
+#define DVM_PENDING_MAX 256
+   dvm_ref pending_threads[DVM_PENDING_MAX];
    /* Whether each entry came from Thread.start() rather than Handler.post():
     * a posted Runnable runs on the main thread, and app code asserts on that. */
-   bool pending_is_thread[32];
+   bool pending_is_thread[DVM_PENDING_MAX];
    /* Monotonic millisecond stamp before which the entry must not run.  A
     * postDelayed() whose delay is dropped turns every "do this unless the fast
     * path beats me to it" timeout into an unconditional one. */
-   uint64_t pending_due_ms[32];
+   uint64_t pending_due_ms[DVM_PENDING_MAX];
+   /* Handler.post target Looper.  0 = main drain (also Thread.start).  A
+    * background Looper.loop() only takes entries tagged with its own ref —
+    * otherwise SwappyDisplayManager$LooperThread greedily runs every posted
+    * Runnable on the wrong thread and holds the interpreter lock for them. */
+   dvm_ref pending_looper[DVM_PENDING_MAX];
    int npending;
    /* The Thread the interpreter is currently inside, or 0 for the main one. */
    dvm_ref cur_thread;
@@ -194,7 +239,10 @@ struct dvm {
    /* The frame currently interpreting bytecode.  Reconstructing the innermost
     * frame from the unwind mis-attributes a throw whenever an inner frame
     * catches and rethrows, so the throw stamps itself here instead. */
-   struct dvm_method *cur_method;
+   /* Atomic because the sampling profiler in dvm.c reads it from its own
+    * thread while the interpreter writes it; the write is a relaxed store of
+    * a pointer, which is what it already was. */
+   struct dvm_method *_Atomic cur_method;
    uint32_t cur_pc;
    /* The bytecode methods currently on the interpreter's stack, outermost
     * first.  Frames live on the C stack, so without this there is nothing to
@@ -218,6 +266,39 @@ struct dvm {
    int nmissing, missing_cap;
 };
 
+/* The interpreter state that belongs to a thread rather than to the VM.
+ *
+ * The fields stay on `struct dvm` where the interpreter and the thousands of
+ * built-in methods already read them by name; only one thread interprets at a
+ * time, so the lock hands them over by saving the outgoing thread's copy and
+ * loading the incoming one's.  That is what keeps this change out of the
+ * built-in class library entirely — see dvm_gil_acquire() in dvm.h. */
+struct dvm_tstate {
+   dvm_ref exception;
+   struct dvm_method *exc_trace[16];
+   int nexc_trace;
+   dvm_ref exc_ref;
+   uint32_t exc_pc;
+   dvm_ref cur_thread;
+   int drain_depth;
+   bool quiet_uncaught;
+   bool parked;
+   struct dvm_method *cur_method;
+   uint32_t cur_pc;
+   struct dvm_method *callstack[128];
+   int ncallstack;
+   int depth;
+   uint64_t call_steps;
+   uint64_t step_limit;
+};
+void dvm__tstate_save(struct dvm *vm, struct dvm_tstate *t);
+void dvm__tstate_load(struct dvm *vm, const struct dvm_tstate *t);
+/* A thread that has not interpreted yet starts from the VM's defaults rather
+ * than from whatever the previous holder of the lock left behind. */
+void dvm__tstate_reset(struct dvm *vm);
+/* Marks the calling host thread as one started for bytecode. */
+void dvm__mark_bytecode_thread(void);
+
 /* dvm.c */
 struct dvm_class *dvm__register_builtin(struct dvm *vm, const char *desc);
 struct dvm_class *dvm__define_primitive(struct dvm *vm, const char *desc);
@@ -226,6 +307,15 @@ bool dvm__class_assignable(struct dvm *vm, struct dvm_class *from,
                            struct dvm_class *to);
 struct dvm_object *dvm__obj(struct dvm *vm, dvm_ref ref);
 void dvm__throw(struct dvm *vm, const char *class_name, const char *fmt, ...);
+void dvm__warn_placeholder(struct dvm *vm);
+bool dvm__monitor_enter(struct dvm *vm, dvm_ref ref);
+bool dvm__monitor_try_enter(struct dvm *vm, dvm_ref ref);
+bool dvm__monitor_exit(struct dvm *vm, dvm_ref ref);
+bool dvm__monitor_wait(struct dvm *vm, dvm_ref ref, uint64_t timeout_ms,
+                       bool *notified);
+bool dvm__monitor_notify(struct dvm *vm, dvm_ref ref, bool all);
+bool dvm__monitor_state(struct dvm *vm, dvm_ref ref, bool current,
+                        uint32_t *depth);
 dvm_ref dvm__intern(struct dvm *vm, const char *utf8);
 char dvm__kind_of(const char *desc);
 int dvm__slots_of(char kind);
@@ -236,6 +326,13 @@ bool dvm__call_out(struct dvm *vm, struct dvm_class *cls, const char *name,
                    const char *sig, bool is_static, bool is_native,
                    dvm_ref self, const uint32_t *slots, int nslots,
                    union dvm_value *out);
+
+/* java.lang.reflect.Proxy: if `self` is a Proxy/$ProxyN instance, forward the
+ * call through its InvocationHandler and return true.  Otherwise false. */
+bool dvm_proxy_try_invoke(struct dvm *vm, dvm_ref self, struct dvm_class *cls,
+                          const char *name, const char *sig,
+                          const union dvm_value *args, int nargs,
+                          union dvm_value *out);
 
 /* Steps a bytecode-started thread may run before it is considered parked. */
 #define DVM_THREAD_SLICE (2u * 1000u * 1000u)
@@ -251,6 +348,26 @@ bool dvm__call_out(struct dvm *vm, struct dvm_class *cls, const char *name,
  * device the task simply runs until it is done.  So an I/O builtin that
  * actually transferred bytes clears the counter, and a spin that transfers
  * nothing still trips it. */
+/* How often the interpreter offers the lock to a waiting thread, in bytecode
+ * instructions.  Must be a power of two — the check is on the hot path and is
+ * written as a mask.  At a few hundred million instructions a second this is a
+ * hand-off opportunity roughly every hundred microseconds, which is far below
+ * a frame and far above the cost of the hand-off itself. */
+#define DVM_GIL_YIELD_STEPS 32768u
+
+/* Longest a blocking primitive waits for something only another thread can
+ * produce.  A thread with its own stack may legitimately wait forever, but a
+ * wait on something that will never arrive would keep that thread and
+ * everything it references alive for the rest of the run, so the wait ends and
+ * says so rather than becoming a leak nobody can see. */
+#define DVM_BLOCK_MAX_MS 30000u
+
+/* Whether any bytecode thread other than the pending queue could still produce
+ * a result.  The blocking primitives used to answer this with "is the pending
+ * queue empty", which stopped being the same question once bytecode ran on
+ * host threads. */
+bool dvm__other_threads_live(void);
+
 #define DVM_IO_PROGRESS_BYTES 4096u
 static inline void dvm__note_io_progress(struct dvm *vm, size_t bytes) {
    /* Only a bulk transfer counts.  Incidental I/O — a preference file, a log

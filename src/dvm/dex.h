@@ -63,6 +63,14 @@ struct dex_file {
     * which case the entry owns a converted copy (see `fixups`). */
    const char **strings;
    char **fixups;
+
+   /* descriptor → class_def index, built on the first lookup.  Without it
+    * dex_find_class() is a strcmp against every class in the file, and
+    * dvm_class_is_known() runs that over every dex — which the JNI bridge
+    * does on each Call*Method.  With three dexes and 16,500 classes that was
+    * the single largest non-guest cost in a profile of world loading. */
+   uint32_t *cls_hash;      /* open addressing; 0 empty, else index + 1 */
+   uint32_t  cls_hash_cap;  /* power of two */
 };
 
 struct dex_method_id {
@@ -155,6 +163,15 @@ const char *dex_type(struct dex_file *d, uint32_t idx);
 bool dex_method_id(const struct dex_file *d, uint32_t idx, struct dex_method_id *out);
 bool dex_field_id(const struct dex_file *d, uint32_t idx, struct dex_field_id *out);
 bool dex_class_def(const struct dex_file *d, uint32_t idx, struct dex_class_def *out);
+
+/* Concatenates the string fragments in a class' dalvik.annotation.Signature
+ * annotation.  The annotation is how the generic reflection API obtains
+ * information erased from the ordinary superclass/type pools. */
+bool dex_class_signature(struct dex_file *d, uint32_t class_def_idx,
+                         char *out, size_t out_sz);
+/* Declaring/enclosing class recorded by EnclosingClass or EnclosingMethod. */
+const char *dex_class_enclosing_type(struct dex_file *d,
+                                     uint32_t class_def_idx);
 
 /* Shorty of a proto: return type first, then one char per parameter. */
 const char *dex_proto_shorty(struct dex_file *d, uint32_t proto_idx);

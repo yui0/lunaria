@@ -256,20 +256,27 @@ static bool connect_to(const struct url *u, int timeout_ms, struct stream *s,
    }
 
    int fd = -1;
-   for (struct addrinfo *a = res; a; a = a->ai_next) {
-      fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
-      if (fd < 0) continue;
-      struct timeval tv = {
-         .tv_sec = timeout_ms / 1000,
-         .tv_usec = (timeout_ms % 1000) * 1000,
-      };
-      if (timeout_ms > 0) {
-         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+   /* Try IPv4 first when both families are present — same rationale as the
+    * guest getaddrinfo reorder in arm_exec (avoid blackhole AAAA stalls). */
+   for (int pass = 0; pass < 2 && fd < 0; ++pass) {
+      for (struct addrinfo *a = res; a; a = a->ai_next) {
+         const bool is_v4 = a->ai_family == AF_INET;
+         if (pass == 0 && !is_v4) continue;
+         if (pass == 1 && is_v4) continue;
+         fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+         if (fd < 0) continue;
+         struct timeval tv = {
+            .tv_sec = timeout_ms / 1000,
+            .tv_usec = (timeout_ms % 1000) * 1000,
+         };
+         if (timeout_ms > 0) {
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+         }
+         if (!connect(fd, a->ai_addr, a->ai_addrlen)) break;
+         close(fd);
+         fd = -1;
       }
-      if (!connect(fd, a->ai_addr, a->ai_addrlen)) break;
-      close(fd);
-      fd = -1;
    }
    freeaddrinfo(res);
    if (fd < 0) {
@@ -554,6 +561,18 @@ static void http_stream_done(struct dvm_http_response *r)
    r->stream = NULL;
 }
 
+size_t dvm_http_avail(const struct dvm_http_response *r)
+{
+   if (!r) return 0;
+   if (r->chunked)
+      return r->body && r->body_len > (size_t)r->body_read
+                ? r->body_len - (size_t)r->body_read : 0;
+   size_t n = 0;
+   if (r->pre_pos < r->pre_len) n += r->pre_len - r->pre_pos;
+   if (r->ra_pos < r->ra_len)   n += r->ra_len - r->ra_pos;
+   return n;
+}
+
 long dvm_http_read(struct dvm_http_response *r, void *buf, size_t n)
 {
    if (!r || !buf || !n) return 0;
@@ -580,6 +599,14 @@ long dvm_http_read(struct dvm_http_response *r, void *buf, size_t n)
       r->pre_pos += take;
       done += take;
    }
+   /* Then whatever the last socket read pulled ahead of what was asked for. */
+   if (done < n && r->ra_pos < r->ra_len) {
+      size_t take = r->ra_len - r->ra_pos;
+      if (take > n - done) take = n - done;
+      memcpy((uint8_t *)buf + done, r->ra + r->ra_pos, take);
+      r->ra_pos += take;
+      done += take;
+   }
    while (done < n && r->stream) {
       if (r->content_length >= 0 &&
           r->body_read + (long long)done >= r->content_length)
@@ -588,6 +615,48 @@ long dvm_http_read(struct dvm_http_response *r, void *buf, size_t n)
       if (r->content_length >= 0) {
          long long left = r->content_length - (r->body_read + (long long)done);
          if ((long long)want > left) want = (size_t)left;
+      }
+      /* Read into the read-ahead buffer whenever the caller's request is
+       * smaller than it, so one socket read covers many of them.  A big
+       * request goes straight into the caller's buffer — nothing to gain by
+       * copying it twice. */
+      if (!r->ra_cap) {
+         r->ra_cap = 8u << 20;
+         r->ra = malloc(r->ra_cap);
+         if (!r->ra) r->ra_cap = 0;
+      }
+      if (r->ra_cap && want < r->ra_cap && r->content_length >= 0) {
+         size_t fill = r->ra_cap;
+         long long left = r->content_length - (r->body_read + (long long)done);
+         if ((long long)fill > left) fill = (size_t)left;
+         /* Fill it, rather than stopping at whatever one read returned: a TLS
+          * stream hands back a record at a time (16 KiB), and one guest read
+          * per record is most of the hand-off cost back again.  Bounded by
+          * Content-Length, so this never waits for bytes the body does not
+          * have — which is also why a close-terminated body does not come
+          * here at all. */
+         r->ra_len = 0;
+         r->ra_pos = 0;
+         bool closed = false;
+         while (r->ra_len < fill) {
+            ssize_t got = stream_read((struct stream *)r->stream,
+                                      r->ra + r->ra_len, fill - r->ra_len);
+            if (got < 0) {
+               snprintf(r->error, sizeof r->error, "read failed: %s",
+                        strerror(errno));
+               http_stream_done(r);
+               return done ? (long)done : -1;
+            }
+            if (got == 0) { closed = true; break; }
+            r->ra_len += (size_t)got;
+         }
+         if (!r->ra_len) { if (closed) http_stream_done(r); break; }
+         size_t take = r->ra_len < want ? r->ra_len : want;
+         memcpy((uint8_t *)buf + done, r->ra, take);
+         r->ra_pos = take;
+         done += take;
+         if (closed) http_stream_done(r);
+         continue;
       }
       ssize_t got = stream_read((struct stream *)r->stream,
                                 (uint8_t *)buf + done, want);
@@ -609,8 +678,8 @@ long dvm_http_read(struct dvm_http_response *r, void *buf, size_t n)
    /* Short of what the headers promised, with the connection gone: the body is
     * truncated.  Saying "end of stream" here would hand the caller a partial
     * file it believes is complete — which is what a download does with it. */
-   if (!done && !r->stream && r->content_length >= 0 &&
-       r->body_read < r->content_length) {
+   if (!done && !r->stream && r->ra_pos >= r->ra_len &&
+       r->content_length >= 0 && r->body_read < r->content_length) {
       snprintf(r->error, sizeof r->error,
                "body truncated: %lld of %lld bytes",
                r->body_read, r->content_length);
@@ -751,6 +820,9 @@ void dvm_http_response_free(struct dvm_http_response *r)
    free(r->pre);
    r->pre = NULL;
    r->pre_len = r->pre_pos = 0;
+   free(r->ra);
+   r->ra = NULL;
+   r->ra_len = r->ra_pos = r->ra_cap = 0;
    headers_free(r->headers, r->nheaders);
    r->headers = NULL;
    r->nheaders = 0;

@@ -29,6 +29,32 @@ bash lunaria-apk.sh test/btw-android.apk
 
 ヘッドレス環境では `Xvfb :99 & DISPLAY=:99 ...` で実行できる。
 
+### 起動カード
+
+大きなタイトルはランチャーの最後のメッセージから最初のフレームまでが長い。
+Blade & Soul Revolution の場合、200MB のライブラリのリンク、数万ブロックの
+ARM 翻訳、4 ファイル計 28MB の dex コンパイルが先に走る。その間 Lunaria は
+自前のカードを描画し、いま何を処理しているかを表示する。月・その光輪・
+明暗境界線はすべて luna-ui が描画する CSS アニメーション。
+
+![Lunaria の起動カード](screenshot_lunaria_bootcard.png)
+
+ゲストがサーフェスを取得した時点でカードは消え、ゲストのダイアログが出て
+いる間はそちらが優先される。`LUNARIA_JIT_UI=0` で無効化、
+`make boot-card-test` でタイトルを起動せずに単体描画できる。
+
+### 起動ムービーについて
+
+Lunaria の H.264 デコードは openh264 で、これは Constrained Baseline しか
+読めない。タイトルのスプラッシュムービーは Main / High プロファイル
+（CABAC・B フレームあり）であることが多く、Blade & Soul Revolution も
+そうなのでデコードできない。
+
+エミュレータはこれを検出し（16 アクセスユニット連続で 1 枚も出てこない）、
+ゲストに `MEDIA_ERROR_UNSUPPORTED` を返すのでエンジンはムービーを飛ばして
+起動を続ける。以前は「絶対にフレームが出ないムービーを再生し続ける」状態に
+なり、それを待つタイトルは白画面のまま永久に止まっていた。
+
 ### 環境変数
 
 | 変数 | 既定値 | 意味 |
@@ -42,6 +68,7 @@ bash lunaria-apk.sh test/btw-android.apk
 | `LUNARIA_TRACE_FUTEX` | off | futex WAIT の woken / timeout を各 64 件までログ |
 | `LUNARIA_TRACE_JITINIT` | off | `mono_jit_init_version` (guest 0x2013407c) 突入を呼び出し元付きでログ |
 | `GC_DONT_GC` | 1 (ローダが設定) | Boehm GC を無効化 (協調スレッドでは STW 不可) |
+| `LUNARIA_JIT_UI` | 1 | 起動カード（月・翻訳状況・dex コンパイル状況）。`0` で無効 |
 | `LUNARIA_DVM` | 1 | Dalvik バイトコードエミュレータ。`0`=無効、`1`=ホストスタブが無いメソッドだけ dex を実行、`2`=dex を優先 |
 | `LUNARIA_DVM_TRACE` | off | エミュレータが引き受けなかったメソッドを `[dvm] miss …` でログ |
 

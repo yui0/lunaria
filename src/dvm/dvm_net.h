@@ -41,6 +41,15 @@ struct dvm_http_response {
    long long content_length;        /* from the header; -1 when absent */
    long long body_read;             /* handed to the caller so far */
    bool chunked;
+
+   /* Read-ahead.  A guest that copies a file reads it in its own small buffer;
+    * one socket read per guest read is one interpreter-lock turn per guest
+    * read, and the lock turns over once per rendered frame.  That capped the
+    * patch download at the guest's buffer times the frame rate (~0.5 MB/s
+    * measured).  Filling a big buffer once and serving the guest's reads out
+    * of it takes the socket — and the lock hand-off — out of the inner loop. */
+   uint8_t *ra;
+   size_t ra_len, ra_pos, ra_cap;
 };
 
 /* Performs one exchange.  `headers` are sent as given, minus the ones this
@@ -60,6 +69,11 @@ void dvm_http_response_free(struct dvm_http_response *r);
  * (server-side chunking is only used here for small API replies); a
  * Content-Length response streams straight off the socket. */
 long dvm_http_read(struct dvm_http_response *r, void *buf, size_t n);
+
+/* Bytes dvm_http_read() can return without touching the socket.  A caller that
+ * drops a lock around the read uses this to skip doing so when it would not
+ * block. */
+size_t dvm_http_avail(const struct dvm_http_response *r);
 
 /* Reads whatever is left of the body into r->body / r->body_len, for the
  * callers that want it as one array (error bodies, small API replies).

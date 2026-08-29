@@ -17,6 +17,13 @@
 
 namespace Dynarmic::Optimization {
 
+/* The pass exists only to fire an assert.  A release build compiles those out
+ * (NDEBUG), so every block still paid for a full walk of its microinstructions
+ * and a std::map node per value — with no way left to report anything.  That
+ * is not free at this rate: a UE title compiles 600k blocks while it starts. */
+#if defined(NDEBUG) || defined(MCL_IGNORE_ASSERTS)
+void VerificationPass(const IR::Block&) {}
+#else
 void VerificationPass(const IR::Block& block) {
     for (const auto& inst : block) {
         for (size_t i = 0; i < inst.NumArgs(); i++) {
@@ -43,5 +50,6 @@ void VerificationPass(const IR::Block& block) {
         ASSERT(pair.first->UseCount() == pair.second);
     }
 }
+#endif
 
 }  // namespace Dynarmic::Optimization

@@ -147,6 +147,7 @@ void dex_close(struct dex_file *d)
       free(d->fixups);
    }
    free(d->strings);
+   free(d->cls_hash);
    free(d->path);
    free(d->owned);
    memset(d, 0, sizeof *d);
@@ -319,11 +320,50 @@ bool dex_proto_signature(struct dex_file *d, uint32_t proto_idx,
    return true;
 }
 
+static uint32_t dex_desc_hash(const char *s)
+{
+   uint32_t h = 2166136261u;                 /* FNV-1a */
+   for (; *s; ++s) { h ^= (unsigned char)*s; h *= 16777619u; }
+   return h;
+}
+
+static const char *dex_class_desc(struct dex_file *d, uint32_t i)
+{
+   return dex_type(d, dex_u32_at(d, d->class_defs_off + (size_t)i * 32u));
+}
+
 int dex_find_class(struct dex_file *d, const char *descriptor)
 {
+   if (!descriptor) return -1;
+   if (!d->cls_hash && d->class_defs_size) {
+      uint32_t cap = 64;
+      while (cap < d->class_defs_size * 2u) cap <<= 1;
+      uint32_t *h = calloc(cap, sizeof *h);
+      if (h) {
+         for (uint32_t i = 0; i < d->class_defs_size; ++i) {
+            const char *t = dex_class_desc(d, i);
+            if (!t) continue;
+            uint32_t m = cap - 1u, k = dex_desc_hash(t) & m;
+            while (h[k]) k = (k + 1u) & m;
+            h[k] = i + 1u;
+         }
+         d->cls_hash = h;
+         d->cls_hash_cap = cap;
+      }
+   }
+   if (d->cls_hash) {
+      uint32_t m = d->cls_hash_cap - 1u, k = dex_desc_hash(descriptor) & m;
+      while (d->cls_hash[k]) {
+         uint32_t i = d->cls_hash[k] - 1u;
+         const char *t = dex_class_desc(d, i);
+         if (t && !strcmp(t, descriptor)) return (int)i;
+         k = (k + 1u) & m;
+      }
+      return -1;
+   }
+   /* No memory for the index: the scan still answers, just slowly. */
    for (uint32_t i = 0; i < d->class_defs_size; ++i) {
-      uint32_t ti = dex_u32_at(d, d->class_defs_off + (size_t)i * 32u);
-      const char *t = dex_type(d, ti);
+      const char *t = dex_class_desc(d, i);
       if (t && !strcmp(t, descriptor))
          return (int)i;
    }
@@ -444,6 +484,173 @@ int dex_interfaces(const struct dex_file *d, uint32_t interfaces_off,
    for (uint32_t i = 0; i < n && (int)i < max; ++i)
       out[i] = dex_u16_at(d, interfaces_off + 4u + (size_t)i * 2u);
    return (int)n;
+}
+
+/* Read the unsigned pool index carried by an encoded_value. */
+static bool dex_value_index(const struct dex_file *d, size_t *p,
+                            uint8_t hdr, uint32_t *out)
+{
+   uint32_t n = (uint32_t)(hdr >> 5) + 1u;
+   if (n > 4 || *p > d->len || n > d->len - *p) return false;
+   uint32_t v = 0;
+   for (uint32_t i = 0; i < n; ++i)
+      v |= (uint32_t)d->p[*p + i] << (8u * i);
+   *p += n;
+   *out = v;
+   return true;
+}
+
+/* Skip one encoded_value without trusting any offset or element count from
+ * the third-party dex. */
+static bool dex_skip_value(const struct dex_file *d, size_t *p)
+{
+   if (*p >= d->len) return false;
+   uint8_t hdr = d->p[(*p)++];
+   uint32_t type = hdr & 0x1fu;
+   if (type == DEX_VALUE_NULL || type == DEX_VALUE_BOOLEAN) return true;
+   if (type == DEX_VALUE_ARRAY) {
+      uint32_t n;
+      size_t q = dex_uleb(d, *p, &n);
+      if (q <= *p || q > d->len) return false;
+      *p = q;
+      for (uint32_t i = 0; i < n; ++i)
+         if (!dex_skip_value(d, p)) return false;
+      return true;
+   }
+   if (type == DEX_VALUE_ANNOTATION) {
+      uint32_t ignored, n;
+      size_t q = dex_uleb(d, *p, &ignored);
+      q = dex_uleb(d, q, &n);
+      if (q <= *p || q > d->len) return false;
+      *p = q;
+      for (uint32_t i = 0; i < n; ++i) {
+         q = dex_uleb(d, *p, &ignored);
+         if (q <= *p || q > d->len) return false;
+         *p = q;
+         if (!dex_skip_value(d, p)) return false;
+      }
+      return true;
+   }
+   uint32_t n = (uint32_t)(hdr >> 5) + 1u;
+   if (*p > d->len || n > d->len - *p) return false;
+   *p += n;
+   return true;
+}
+
+bool dex_class_signature(struct dex_file *d, uint32_t class_def_idx,
+                         char *out, size_t out_sz)
+{
+   if (!out || !out_sz) return false;
+   out[0] = '\0';
+   struct dex_class_def cd;
+   if (!dex_class_def(d, class_def_idx, &cd) || !cd.annotations_off ||
+       (uint64_t)cd.annotations_off + 16u > d->len)
+      return false;
+
+   /* annotations_directory_item begins with class_annotations_off. */
+   uint32_t set_off = dex_u32_at(d, cd.annotations_off);
+   if (!set_off || (uint64_t)set_off + 4u > d->len) return false;
+   uint32_t count = dex_u32_at(d, set_off);
+   if ((uint64_t)set_off + 4u + (uint64_t)count * 4u > d->len) return false;
+
+   for (uint32_t ai = 0; ai < count; ++ai) {
+      uint32_t ann_off = dex_u32_at(d, set_off + 4u + (size_t)ai * 4u);
+      if (!ann_off || ann_off >= d->len) continue;
+      size_t p = (size_t)ann_off + 1u; /* visibility byte */
+      uint32_t type_idx, elements;
+      p = dex_uleb(d, p, &type_idx);
+      p = dex_uleb(d, p, &elements);
+      const char *ann_type = dex_type(d, type_idx);
+      if (!ann_type) continue;
+
+      for (uint32_t ei = 0; ei < elements; ++ei) {
+         uint32_t name_idx;
+         size_t q = dex_uleb(d, p, &name_idx);
+         if (q <= p || q >= d->len) return false;
+         p = q;
+         const char *name = dex_string(d, name_idx);
+         if (strcmp(ann_type, "Ldalvik/annotation/Signature;") ||
+             !name || strcmp(name, "value")) {
+            if (!dex_skip_value(d, &p)) return false;
+            continue;
+         }
+
+         uint8_t hdr = d->p[p++];
+         if ((hdr & 0x1fu) != DEX_VALUE_ARRAY) return false;
+         uint32_t fragments;
+         q = dex_uleb(d, p, &fragments);
+         if (q <= p || q > d->len) return false;
+         p = q;
+         size_t used = 0;
+         for (uint32_t fi = 0; fi < fragments; ++fi) {
+            if (p >= d->len) return false;
+            uint8_t fh = d->p[p++];
+            if ((fh & 0x1fu) != DEX_VALUE_STRING) return false;
+            uint32_t string_idx;
+            if (!dex_value_index(d, &p, fh, &string_idx)) return false;
+            const char *fragment = dex_string(d, string_idx);
+            if (!fragment) return false;
+            size_t n = strlen(fragment);
+            if (n >= out_sz - used) { out[0] = '\0'; return false; }
+            memcpy(out + used, fragment, n);
+            used += n;
+            out[used] = '\0';
+         }
+         return used != 0;
+      }
+   }
+   return false;
+}
+
+const char *dex_class_enclosing_type(struct dex_file *d,
+                                     uint32_t class_def_idx)
+{
+   struct dex_class_def cd;
+   if (!dex_class_def(d, class_def_idx, &cd) || !cd.annotations_off ||
+       (uint64_t)cd.annotations_off + 16u > d->len)
+      return NULL;
+   uint32_t set_off = dex_u32_at(d, cd.annotations_off);
+   if (!set_off || (uint64_t)set_off + 4u > d->len) return NULL;
+   uint32_t count = dex_u32_at(d, set_off);
+   if ((uint64_t)set_off + 4u + (uint64_t)count * 4u > d->len) return NULL;
+
+   for (uint32_t ai = 0; ai < count; ++ai) {
+      uint32_t ann_off = dex_u32_at(d, set_off + 4u + (size_t)ai * 4u);
+      if (!ann_off || ann_off >= d->len) continue;
+      size_t p = (size_t)ann_off + 1u;
+      uint32_t type_idx, elements;
+      p = dex_uleb(d, p, &type_idx);
+      p = dex_uleb(d, p, &elements);
+      const char *ann_type = dex_type(d, type_idx);
+      bool enclosing_class = ann_type &&
+         !strcmp(ann_type, "Ldalvik/annotation/EnclosingClass;");
+      bool enclosing_method = ann_type &&
+         !strcmp(ann_type, "Ldalvik/annotation/EnclosingMethod;");
+      for (uint32_t ei = 0; ei < elements; ++ei) {
+         uint32_t name_idx;
+         size_t q = dex_uleb(d, p, &name_idx);
+         if (q <= p || q >= d->len) return NULL;
+         p = q;
+         const char *name = dex_string(d, name_idx);
+         if ((!enclosing_class && !enclosing_method) || !name ||
+             strcmp(name, "value")) {
+            if (!dex_skip_value(d, &p)) return NULL;
+            continue;
+         }
+         uint8_t hdr = d->p[p++];
+         uint32_t idx;
+         if (!dex_value_index(d, &p, hdr, &idx)) return NULL;
+         if (enclosing_class && (hdr & 0x1fu) == DEX_VALUE_TYPE)
+            return dex_type(d, idx);
+         if (enclosing_method && (hdr & 0x1fu) == DEX_VALUE_METHOD) {
+            struct dex_method_id method;
+            if (dex_method_id(d, idx, &method))
+               return dex_type(d, method.class_idx);
+         }
+         return NULL;
+      }
+   }
+   return NULL;
 }
 
 /* --- encoded values ----------------------------------------------------- */

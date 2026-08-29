@@ -167,6 +167,8 @@ void dvm_describe_exception(struct dvm *vm, dvm_ref exc, char *buf, size_t sz);
 /* --- heap --------------------------------------------------------------- */
 
 dvm_ref dvm_new_object(struct dvm *vm, struct dvm_class *cls);
+/* The java.lang.Class instance that describes `cls` (made once, pinned). */
+dvm_ref dvm_class_object(struct dvm *vm, struct dvm_class *cls);
 dvm_ref dvm_new_string(struct dvm *vm, const char *utf8);
 dvm_ref dvm_new_string_n(struct dvm *vm, const char *utf8, size_t len);
 /* Element kind is one of Z B C S I J F D L. */
@@ -204,6 +206,11 @@ bool dvm_set_static(struct dvm *vm, struct dvm_class *cls, const char *name,
 void dvm_set_trace(struct dvm *vm, int level);
 /* Instructions executed since creation. */
 uint64_t dvm_instructions(const struct dvm *vm);
+
+/* Write out any preferences an apply() left pending.  The frame pump calls
+ * this, which is where a device's asynchronous write would land. */
+void dvm_prefs_flush(struct dvm *vm);
+
 /* Caps runaway bytecode (a spin loop in Java would otherwise hang the pump
  * loop, which is cooperative).  0 disables.  Default 200M. */
 void dvm_set_step_limit(struct dvm *vm, uint64_t limit);
@@ -215,3 +222,92 @@ int dvm_sig_arg_slots(const char *sig);
 int dvm_sig_arg_count(const char *sig);
 /* Return-type descriptor character of a signature ('V' when void). */
 char dvm_sig_return_kind(const char *sig);
+
+/* --- threads ------------------------------------------------------------ *
+ *
+ * Bytecode threads run on host threads, one at a time, under a global
+ * interpreter lock.
+ *
+ * Until now the VM interpreted a single thread: Thread.start() queued the
+ * Runnable and a later drain ran it to completion, or to a step budget.  That
+ * is workable for a worker that services a queue and returns, and wrong for
+ * one that blocks — the frames of a bytecode call live on the host C stack, so
+ * a thread sitting inside a socket read cannot be set aside, and it holds not
+ * just the VM but the whole emulator.  The game's patcher downloads 13.7 GB in
+ * one doInBackground(); every second of that was a second the engine did not
+ * render, and the step budget that kept the freeze bounded aborted the copy
+ * instead ("step limit reached in DownloadAsyncTask.doInBackground").
+ *
+ * A host thread per bytecode thread gives each its own C stack, so blocking is
+ * something a thread does rather than something the VM does.  The lock keeps
+ * exactly one of them interpreting at a time, which is what lets the heap, the
+ * class table and the emulator's own single-threaded guest scheduler stay as
+ * they are: this buys concurrency across blocking calls, not parallelism.
+ *
+ * Whoever executes VM or guest code holds the lock.  A blocking host call —
+ * a socket read, a file write, a sleep — drops it around the part that blocks
+ * and takes it back afterwards, and so does the frame pump between frames.
+ * Anything read out of the VM before a release has to be read again after it:
+ * another thread may have moved the heap in between.
+ */
+
+/* Recursive: a native that releases the lock around one blocking call may be
+ * nested inside another that already holds it. */
+void dvm_gil_acquire(struct dvm *vm);
+void dvm_gil_release(struct dvm *vm);
+/* True when this host thread holds the lock. */
+bool dvm_gil_held(struct dvm *vm);
+
+/* Drops the lock for the duration of a blocking host call.  `depth` receives
+ * the recursion count so the matching re-acquire restores it exactly.  Between
+ * the two, this thread must not touch the VM at all. */
+unsigned dvm_gil_unlock_all(struct dvm *vm);
+void dvm_gil_relock(struct dvm *vm, unsigned depth);
+
+/* Hands the lock to a thread that is waiting for it, if there is one, and
+ * takes it back.  This is what makes the lock fair: a thread interpreting a
+ * long loop, and a guest thread spinning in the emulator's own scheduler, both
+ * hold the lock for as long as they run, so each has to offer it up.  Callers
+ * must have nothing live across it that points into the heap — another thread
+ * may allocate, and the heap moves when it grows. */
+void dvm_gil_yield(struct dvm *vm);
+
+/* Total wall time, across every thread, spent blocked in dvm_gil_acquire().
+ * The interpreter lock is the emulator's other global serialisation point (the
+ * ARM execution lock is the first), and a JNI call from guest code has to take
+ * it; without a number for it, "the guest is slow" and "the guest is queued
+ * behind eight Java threads" look the same. */
+unsigned long long dvm_gil_wait_ns(void);
+/* Wall time during which some thread held the interpreter lock, and the worst
+ * single wait since the last read.  The summed wait above counts idle threads
+ * correctly blocked on empty queues; these two say whether the lock is
+ * saturated and whether anybody was starved by it. */
+unsigned long long dvm_gil_held_ns(void);
+unsigned long long dvm_gil_max_wait_ns(void);
+
+/* Block until another thread calls dvm_gil_notify() or `ms` elapses, without
+ * holding the interpreter lock; the lock is taken again before returning.
+ * Callers must re-check their own condition — the timeout is a backstop, not
+ * the mechanism. */
+void dvm_gil_wait(struct dvm *vm, unsigned ms);
+/* As above, but wake only for changes to `channel`.  Channels are opaque
+ * non-zero values; a queue's dvm_ref is a convenient stable identifier. */
+void dvm_gil_wait_for(struct dvm *vm, uintptr_t channel, unsigned ms);
+
+/* Enter/leave the VM from guest code that holds the ARM execution lock; see
+ * the definition for the lock-order argument.  The cookie is opaque and must
+ * be handed back to the matching leave. */
+unsigned dvm_gil_enter_from_guest(struct dvm *vm);
+void     dvm_gil_leave_to_guest(struct dvm *vm, unsigned cookie);
+void dvm_gil_notify(void);
+void dvm_gil_notify_for(uintptr_t channel);
+void dvm_gil_notify_one_for(uintptr_t channel);
+
+/* The VM this process created, for callers that have to offer the lock up
+ * without one to hand (the frame pump, the guest scheduler).  NULL before
+ * dvm_create(). */
+struct dvm *dvm_current(void);
+
+/* True on a host thread started for bytecode, false on the one that drives the
+ * frame pump and the guest CPU.  A wait on the latter has to stay short. */
+bool dvm_on_bytecode_thread(void);

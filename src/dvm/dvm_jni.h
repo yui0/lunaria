@@ -67,6 +67,9 @@ bool dvm_jni_method_in_dex(const char *class_name, const char *method,
  * direct ByteBuffer, or a DexClassLoader over a file).  See
  * dvm_add_dex_memory(). */
 bool dvm_jni_add_dex_memory(const void *data, size_t len, const char *name);
+/* Bumped whenever a dex arrives; anything memoised from the class hierarchy
+ * has to be dropped when this changes. */
+unsigned dvm_jni_dex_epoch(void);
 
 /* Instance field of an object whose class the APK's dex defines, reached from
  * native through Get/SetXxxField.  The bytecode VM owns that object's fields,
@@ -100,5 +103,24 @@ bool dvm_jni_class_assignable(const char *sub, const char *sup);
 /* Diagnostics for the loader's summary line. */
 void dvm_jni_report(void);
 
+/* Publish the process Activity into UnityPlayer.currentActivity (static field
+ * in the APK dex).  Plugins such as IronSource read that field via sget. */
+void dvm_jni_bind_unity_activity(JNIEnv *env, jobject activity);
+
 struct dvm;
 struct dvm *dvm_jni_vm(void);
+/* Write out any preferences an apply() left pending; declared in dvm.h too,
+ * and repeated here because the frame pump calls it and does not (and cannot)
+ * include the interpreter's own header. */
+void dvm_prefs_flush(struct dvm *vm);
+
+/* The interpreter lock, for callers that cannot include dvm.h.
+ *
+ * dvm/dex.h declares dex_uleb() and dex_string(); loader.c has its own
+ * functions by those names for the manifest reader it runs before any VM
+ * exists, so pulling dvm.h in there is a redeclaration.  These two are the
+ * whole of what the frame pump needs — see the commentary on dvm_gil_acquire()
+ * in dvm.h for what the lock is and when to give it up. */
+struct dvm;
+struct dvm *dvm_current(void);
+void dvm_gil_yield(struct dvm *vm);

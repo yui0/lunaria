@@ -44,6 +44,11 @@ void OpenFile() {
 }
 }  // anonymous namespace
 
+bool PerfMapEnabled() {
+    static const bool enabled = std::getenv("PERF_BUILDID_DIR") != nullptr;
+    return enabled;
+}
+
 namespace detail {
 void PerfMapRegister(const void* start, const void* end, std::string_view friendly_name) {
     if (start == end) {
@@ -86,6 +91,10 @@ namespace Dynarmic::Backend::X64 {
 namespace detail {
 void PerfMapRegister(const void*, const void*, std::string_view) {}
 }  // namespace detail
+
+bool PerfMapEnabled() {
+    return false;
+}
 
 void PerfMapClear() {}
 

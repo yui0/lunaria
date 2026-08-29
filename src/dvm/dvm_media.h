@@ -118,6 +118,13 @@ void dvm_media_pump_active(struct dvm *vm);
 void lm_codec_audio_format(const struct lm_codec *c, int *rate, int *channels);
 bool lm_codec_is_video(const struct lm_codec *c);
 
+/* True once the decoder has refused enough of this stream, with nothing ever
+ * decoded, that it will not read it at all — a Main/High profile movie handed
+ * to openh264's Constrained Baseline decoder, in practice.  A player must turn
+ * this into an error for its listener rather than go on "playing" a movie that
+ * will never produce a frame. */
+bool lm_codec_undecodable(const struct lm_codec *c);
+
 /* --- MP4 demuxing -------------------------------------------------------- *
  *
  * android.media.MediaExtractor and android.media.MediaPlayer are both handed a

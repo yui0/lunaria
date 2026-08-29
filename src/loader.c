@@ -202,6 +202,105 @@ static void touch_test_tick(int frame_count)
  * instead of the (idle) A32 one. */
 static int g_dump_arm64;
 
+/* Throughput, once every LUNARIA_PERF_S seconds (0 disables).
+ *
+ * "Slower than a phone" is the whole of the report most of the time, and
+ * answering it needs three numbers side by side: how often the host pump
+ * turns, how often the guest actually presents, and how many guest
+ * instructions were retired to get there.  Which of the three moved tells the
+ * difference between the emulator starving the guest, the guest starving
+ * itself on a lock, and the host GL being the bottleneck — and it costs two
+ * counter reads a frame, so it is on by default rather than behind a trace
+ * flag nobody sets until the run has already been thrown away. */
+/* Where a pump frame's wall clock goes.
+ *
+ * "20 frames a second" is the symptom; it says nothing about whether the
+ * emulator was running guest code, presenting, or waiting.  Each stage of the
+ * frame adds its own time here and the totals are reported next to [perf], so
+ * a frame that costs 50 ms can be read as "16 ms of guest, 30 ms of swap"
+ * rather than guessed at. */
+enum frame_stage {
+   FRAME_STAGE_SCHED,      /* run_threads(): guest code and its SVCs */
+   FRAME_STAGE_IDLE,       /* every guest thread parked: the frame's own sleep */
+   FRAME_STAGE_MEDIA,      /* the media clock and the pending-preferences write */
+   FRAME_STAGE_SWAP,       /* eglSwapBuffers on the host */
+   FRAME_STAGE_INPUT,      /* window system events */
+   FRAME_STAGE_LAST
+};
+static uint64_t g_frame_stage_ns[FRAME_STAGE_LAST];
+static const char *const g_frame_stage_name[FRAME_STAGE_LAST] = {
+   "sched", "idle", "media", "swap", "input"
+};
+
+static uint64_t frame_now_ns(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void frame_stage_add(enum frame_stage st, uint64_t t0)
+{
+   g_frame_stage_ns[st] += frame_now_ns() - t0;
+}
+
+static void frame_stage_report(double window, unsigned long long frames)
+{
+   uint64_t tot = 0;
+   for (int i = 0; i < FRAME_STAGE_LAST; ++i) tot += g_frame_stage_ns[i];
+   if (!tot || !frames) return;
+   fprintf(stderr, "[frame]   %.1f ms each, of which", window * 1e3 / (double)frames);
+   for (int i = 0; i < FRAME_STAGE_LAST; ++i)
+      fprintf(stderr, " %s=%.1f", g_frame_stage_name[i],
+              (double)g_frame_stage_ns[i] / 1e6 / (double)frames);
+   fprintf(stderr, " ms (%.0f%% of the frame accounted for)\n",
+           100.0 * (double)tot / (window * 1e9));
+   for (int i = 0; i < FRAME_STAGE_LAST; ++i) g_frame_stage_ns[i] = 0;
+}
+
+static void perf_tick(void)
+{
+   static double every = -1.0;      /* -1: not configured, 0: disabled */
+   static double t0, last;
+   static uint64_t last_frames, last_presents, last_ticks, last_xlat;
+   static uint64_t frames;
+
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   const double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+
+   ++frames;
+   if (every < 0.0) {
+      const char *e = getenv("LUNARIA_PERF_S");
+      every = e && *e ? atof(e) : 10.0;
+      if (every < 0.0) every = 0.0;
+      t0 = last = now;
+   }
+   if (every == 0.0 || now - last < every) return;
+
+   const uint64_t presents = arm_exec_guest_swap_count();
+   const uint64_t gticks   = arm_exec_sched_ticks();
+   const uint64_t xlat     = arm_exec_translated_insn();
+   const double   dt       = now - last;
+
+   fprintf(stderr,
+           "[perf] t=%.0fs pump=%llu (%.1f/s) present=%llu (%.1f/s) "
+           "guest=%.0fM insn (%.1f Mips) xlat=%.1fM (%.1f M/s)\n",
+           now - t0,
+           (unsigned long long)frames, (double)(frames - last_frames) / dt,
+           (unsigned long long)presents, (double)(presents - last_presents) / dt,
+           (double)gticks / 1e6, (double)(gticks - last_ticks) / dt / 1e6,
+           (double)xlat / 1e6, (double)(xlat - last_xlat) / dt / 1e6);
+
+   frame_stage_report(dt, frames - last_frames);
+
+   last = now;
+   last_frames = frames;
+   last_presents = presents;
+   last_ticks = gticks;
+   last_xlat = xlat;
+}
+
 /* A guest that stops presenting is the shape every "it just sits there" bug
  * takes, and it is invisible from the outside: the pump loop keeps spinning
  * at full speed with nothing behind it.  Watch the guest's own present count
@@ -249,6 +348,24 @@ static void stall_watch_tick(void)
    ++reports;
    arm64_exec_svc_ring_dump();
    last_change = now;   /* re-arm, so a long stall reports periodically */
+}
+
+/* The other half of the same diagnostic: a guest that is presenting happily
+ * while the game itself has stopped getting anywhere never trips the stall
+ * watch, and that is exactly the shape of "the engine renders but the title
+ * waits forever".  Touch /tmp/lunaria-threads and the next frame says what
+ * every guest thread is doing.  Polled from the pump rather than raised by a
+ * signal because the dump is not async-signal-safe — the handler route took
+ * the process down instead of printing. */
+static void thread_dump_request_tick(void)
+{
+   static int every;
+   if (++every < 30) return;   /* ~twice a second at 60 fps */
+   every = 0;
+   if (access("/tmp/lunaria-threads", F_OK) != 0) return;
+   unlink("/tmp/lunaria-threads");
+   fprintf(stderr, "[threads] dump requested\n");
+   arm64_exec_svc_ring_dump();
 }
 
 static void svc_dump_handler(int sig) {
@@ -931,7 +1048,9 @@ pump_run_frame(void (*run_threads)(void))
    const uint64_t deadline = pump_now_us() + budget_us;
    for (;;) {
       const uint64_t before = arm_exec_sched_ticks();
+      const uint64_t t_sched = frame_now_ns();
       run_threads();
+      frame_stage_add(FRAME_STAGE_SCHED, t_sched);
       const uint64_t now = pump_now_us();
       if (now >= deadline)
          break;
@@ -939,11 +1058,17 @@ pump_run_frame(void (*run_threads)(void))
          continue;   /* the guest is working — let it have the whole frame */
       /* Everything is parked.  Wait in small steps so that a wakeup which
        * becomes visible mid-frame is not held back until the next one. */
+      const uint64_t t_idle = frame_now_ns();
       usleep((deadline - now > 1000ull) ? 1000u : (useconds_t)(deadline - now));
+      frame_stage_add(FRAME_STAGE_IDLE, t_idle);
    }
+   const uint64_t t_media = frame_now_ns();
    {
       struct dvm *vm = dvm_jni_vm();
       if (vm) dvm_media_pump_active(vm);
+      /* Preferences an apply() left pending: on a device the framework writes
+       * them behind the caller's back, and this is that writer. */
+      if (vm) dvm_prefs_flush(vm);
 
       /* Drive UE's media clock even when the guest happens to be waiting
        * on other task graph work; this is the root of "updateVideoFrame
@@ -990,6 +1115,7 @@ pump_run_frame(void (*run_threads)(void))
          }
       }
    }
+   frame_stage_add(FRAME_STAGE_MEDIA, t_media);
 }
 
 static int
@@ -1255,6 +1381,7 @@ run_ue4_game_arm(struct jvm *jvm)
       pump_run_frame(arm_exec_run_pending_threads);
       arm_exec_egl_swap();
       arm_exec_glfw_poll();
+      perf_tick();
       if (frame < 5 || frame % 50 == 0)
          fprintf(stderr, "[loader] UE4 pump frame %d\n", frame);
       if (arm_exec_glfw_should_close()) break;
@@ -1440,6 +1567,7 @@ run_ue4_game_arm64(struct jvm *jvm)
    if (!activity)
       activity = jvm->native.AllocObject(&jvm->env,
             jvm->native.FindClass(&jvm->env, "android/app/NativeActivity"));
+   jni_set_current_activity(&jvm->env, activity);
    uint64_t act_va = arm64_exec_native_activity_create((uint64_t)(uintptr_t)activity);
    if (!act_va)
       errx(EXIT_FAILURE, "UE arm64: failed to allocate ANativeActivity");
@@ -1611,15 +1739,6 @@ run_ue4_game_arm64(struct jvm *jvm)
    arm64_exec_run_pending_threads();
    fprintf(stderr, "[loader] UE arm64 onCreate returned\n");
 
-   /* ActivityThread delivers the visible Java lifecycle after onCreate.
-    * APP_CMD_START/RESUME below are the NativeActivity half of that same
-    * transition, not replacements for these callbacks. */
-   if (dex_cls) {
-      dex_call_lifecycle(jvm, activity, dex_cls, "onStart",  "()V", 0);
-      dex_call_lifecycle(jvm, activity, dex_cls, "onResume", "()V", 0);
-      arm64_exec_run_pending_threads();
-   }
-
    /* Deliver APP_CMD_* via the android_app command pipe.  Calling
     * activity->callbacks->onNativeWindowCreated directly would block on the
     * glue's condition variable until android_main drains the command, which
@@ -1688,6 +1807,26 @@ run_ue4_game_arm64(struct jvm *jvm)
       }
    }
 
+   /* NativeActivity's real superclass methods deliver the native START and
+    * RESUME callbacks while the Java lifecycle call is on the stack, and its
+    * SurfaceView can deliver INIT_WINDOW before GameActivity.onResume reaches
+    * nativeResumeMainInit().  Our bytecode-side NativeActivity methods are
+    * framework stubs, so the command block above is that missing superclass /
+    * window-manager work and must precede the app's lifecycle continuation.
+    *
+    * Doing this afterwards creates a circular wait which no Android device
+    * has: Cross Worlds' nativeResumeMainInit sets GResumeMainInit and waits
+    * for AndroidMain to finish its first phase, while AndroidMain is waiting
+    * for INIT_WINDOW which the loader planned to send only after onResume
+    * returned.  The callback's 120-second safety limit eventually broke the
+    * cycle, making every title-to-game transition look like slow emulation.
+    * Preserve the causal order instead of shortening or bypassing the wait. */
+   if (dex_cls) {
+      dex_call_lifecycle(jvm, activity, dex_cls, "onStart",  "()V", 0);
+      dex_call_lifecycle(jvm, activity, dex_cls, "onResume", "()V", 0);
+      arm64_exec_run_pending_threads();
+   }
+
    int w = arm64_exec_fb_width(), h = arm64_exec_fb_height();
    if (va_set_win) {
       /* (env, thiz, jboolean bIsPortrait, jint DepthBufferPreference).
@@ -1752,9 +1891,21 @@ run_ue4_game_arm64(struct jvm *jvm)
       /* The engine renders on its own thread and swaps through the EGL
        * bridge; present here too so a frame reaches the window even when the
        * guest's swap goes through the Java surface path. */
-      arm64_exec_egl_swap();
-      arm64_exec_glfw_poll();
+      {
+         const uint64_t t_swap = frame_now_ns();
+         arm64_exec_egl_swap();
+         frame_stage_add(FRAME_STAGE_SWAP, t_swap);
+         const uint64_t t_input = frame_now_ns();
+         arm64_exec_glfw_poll();
+         frame_stage_add(FRAME_STAGE_INPUT, t_input);
+      }
+      /* The frame is presented and nothing is half-done: hand the interpreter
+       * lock to any bytecode thread waiting for it before starting the next
+       * one.  This is the pump's share of keeping the lock fair. */
+      dvm_gil_yield(dvm_current());
       stall_watch_tick();
+      perf_tick();
+      thread_dump_request_tick();
       if (frame < 5 || frame % 50 == 0)
          fprintf(stderr, "[loader] UE arm64 pump frame %d\n", frame);
       if (arm64_exec_glfw_should_close()) break;
@@ -1762,17 +1913,48 @@ run_ue4_game_arm64(struct jvm *jvm)
    return EXIT_SUCCESS;
 }
 
+static uint64_t
+arm64_lookup_native_two(const char *primary, const char *fallback,
+                        const char *name)
+{
+   uint64_t va = arm64_exec_lookup_native(primary, name);
+   return va ? va : arm64_exec_lookup_native(fallback, name);
+}
+
+static uint64_t
+arm64_lookup_native_sig_two(const char *primary, const char *fallback,
+                            const char *name, char *sig, size_t sig_size)
+{
+   uint64_t va = arm64_exec_lookup_native_sig(primary, name, sig, sig_size);
+   return va ? va : arm64_exec_lookup_native_sig(fallback, name, sig, sig_size);
+}
+
+static uint32_t
+arm_lookup_native_two(const char *primary, const char *fallback,
+                      const char *name)
+{
+   uint32_t va = arm_exec_lookup_native(primary, name);
+   return va ? va : arm_exec_lookup_native(fallback, name);
+}
+
+static uint32_t
+arm_lookup_native_sig_two(const char *primary, const char *fallback,
+                          const char *name, char *sig, size_t sig_size)
+{
+   uint32_t va = arm_exec_lookup_native_sig(primary, name, sig, sig_size);
+   return va ? va : arm_exec_lookup_native_sig(fallback, name, sig, sig_size);
+}
+
 static int
-run_unity_game_arm64(struct jvm *jvm)
+run_unity_game_arm64(struct jvm *jvm, jobject existing_context,
+                     int call_init_jni)
 {
    static const char *cls     = "com.unity3d.player.UnityPlayer";
    static const char *cls_svc = "com.unity3d.player.UnityPlayerForActivityOrService";
 
-#define LOOKUP2(name) \
-   (arm64_exec_lookup_native(cls, name) ?: arm64_exec_lookup_native(cls_svc, name))
+#define LOOKUP2(name) arm64_lookup_native_two(cls, cls_svc, name)
 #define LOOKUP2_SIG(name, sig_buf) \
-   (arm64_exec_lookup_native_sig(cls, name, sig_buf, sizeof(sig_buf)) ?: \
-    arm64_exec_lookup_native_sig(cls_svc, name, sig_buf, sizeof(sig_buf)))
+   arm64_lookup_native_sig_two(cls, cls_svc, name, sig_buf, sizeof(sig_buf))
 
    uint64_t va_init_jni = arm64_exec_lookup_native(cls, "initJni");
    uint64_t va_done     = LOOKUP2("nativeDone");
@@ -1793,9 +1975,11 @@ run_unity_game_arm64(struct jvm *jvm)
       errx(EXIT_FAILURE, "not a unity jni lib (arm64)");
 
    uint64_t env = arm64_exec_env_va();
-   const jobject context = jvm->native.AllocObject(&jvm->env,
-         jvm->native.FindClass(&jvm->env, "android/app/Activity"));
+   const jobject context = existing_context ? existing_context
+      : jvm->native.AllocObject(&jvm->env,
+            jvm->native.FindClass(&jvm->env, "android/app/Activity"));
    uint64_t ctx = (uint64_t)(uintptr_t)context;
+   jni_set_current_activity(&jvm->env, context);
 
    if (va_file) {
       const char *apk = lunaria_apk_mount_path();
@@ -1807,11 +1991,15 @@ run_unity_game_arm64(struct jvm *jvm)
       }
    }
 
-   fprintf(stderr, "[loader] arm64 calling initJni (va=0x%llx)...\n",
-           (unsigned long long)va_init_jni);
-   arm64_exec_call(va_init_jni, env, ctx, ctx, 0);
-   arm64_exec_run_pending_threads();
-   fprintf(stderr, "[loader] arm64 initJni done\n");
+   if (call_init_jni) {
+      fprintf(stderr, "[loader] arm64 calling initJni (va=0x%llx)...\n",
+              (unsigned long long)va_init_jni);
+      arm64_exec_call(va_init_jni, env, ctx, ctx, 0);
+      arm64_exec_run_pending_threads();
+      fprintf(stderr, "[loader] arm64 initJni done\n");
+   } else {
+      fprintf(stderr, "[loader] arm64 Unity was initialized by the Activity\n");
+   }
 
    if (!arm64_exec_host_egl_init())
       fprintf(stderr, "[loader] arm64 host EGL re-init failed\n");
@@ -1932,6 +2120,8 @@ start_manifest_providers(struct jvm *jvm, jobject context)
         entry = strtok_r(NULL, ";", &save)) {
       char *authority = strchr(entry, '|');
       if (authority) *authority++ = '\0';
+      char *metadata = authority ? strchr(authority, '|') : NULL;
+      if (metadata) *metadata++ = '\0';
       char cls[256];
       size_t n = 0;
       for (const char *p = entry; *p && n + 1 < sizeof cls; ++p)
@@ -1960,6 +2150,53 @@ start_manifest_providers(struct jvm *jvm, jobject context)
          jstring value = jvm->native.NewStringUTF(&jvm->env, authority);
          if (field && value)
             jvm->native.SetObjectField(&jvm->env, info, field, value);
+      }
+      if (info && metadata && *metadata) {
+         jclass bundle_class = jvm->native.FindClass(&jvm->env,
+                                                       "android/os/Bundle");
+         jmethodID bundle_ctor = bundle_class ? jvm->native.GetMethodID(
+            &jvm->env, bundle_class, "<init>", "()V") : NULL;
+         jobject bundle = (bundle_class && bundle_ctor)
+            ? jvm->native.NewObjectA(&jvm->env, bundle_class, bundle_ctor, NULL)
+            : NULL;
+         if (bundle) {
+            char *meta_save = NULL;
+            for (char *pair = strtok_r(metadata, ",", &meta_save); pair;
+                 pair = strtok_r(NULL, ",", &meta_save)) {
+               char *value = strchr(pair, '~');
+               if (!value) continue;
+               *value++ = '\0';
+               char *end = NULL;
+               long iv = strtol(value, &end, 0);
+               if (end && *end == '\0') {
+                  jmethodID put = jvm->native.GetMethodID(
+                     &jvm->env, bundle_class, "putInt",
+                     "(Ljava/lang/String;I)V");
+                  if (put) {
+                     jvalue a[2] = {
+                        { .l = jvm->native.NewStringUTF(&jvm->env, pair) },
+                        { .i = (jint)iv }
+                     };
+                     jvm->native.CallVoidMethodA(&jvm->env, bundle, put, a);
+                  }
+               } else {
+                  jmethodID put = jvm->native.GetMethodID(
+                     &jvm->env, bundle_class, "putString",
+                     "(Ljava/lang/String;Ljava/lang/String;)V");
+                  if (put) {
+                     jvalue a[2] = {
+                        { .l = jvm->native.NewStringUTF(&jvm->env, pair) },
+                        { .l = jvm->native.NewStringUTF(&jvm->env, value) }
+                     };
+                     jvm->native.CallVoidMethodA(&jvm->env, bundle, put, a);
+                  }
+               }
+            }
+            jfieldID field = jvm->native.GetFieldID(
+               &jvm->env, info_class, "metaData", "Landroid/os/Bundle;");
+            if (field)
+               jvm->native.SetObjectField(&jvm->env, info, field, bundle);
+         }
       }
       if (info) {
          jfieldID grant = jvm->native.GetFieldID(&jvm->env, info_class,
@@ -2069,6 +2306,7 @@ run_dex_activity_arm64(struct jvm *jvm)
       fprintf(stderr, "[loader] dex startup: cannot construct %s\n", cls);
       return EXIT_FAILURE;
    }
+   jni_set_current_activity(&jvm->env, activity);
 
    /* Activity.attach() establishes both ContextWrapper.mBase and the process
     * Application before any lifecycle callback.  The host framework exposes
@@ -2104,6 +2342,15 @@ run_dex_activity_arm64(struct jvm *jvm)
    dex_call_lifecycle(jvm, activity, cls, "onResume", "()V", 0);
    arm64_exec_run_pending_threads();
 
+   /* A GLSurfaceView receives surfaceCreated/surfaceChanged from Android's
+    * window manager after onResume.  The host has no framework compositor to
+    * emit those callbacks, so connect the already-initialised Unity player to
+    * the host Surface here.  The Activity has already called initJni through
+    * its own bytecode; doing that a second time corrupts Unity global state. */
+   if (arm64_exec_lookup_native("com.unity3d.player.UnityPlayer",
+                                "nativeRender"))
+      return run_unity_game_arm64(jvm, activity, 0);
+
    int max_frames = 0;
    { const char *mf = getenv("LUNARIA_MAX_FRAMES"); if (mf && *mf) max_frames = atoi(mf); }
    fprintf(stderr, "[loader] dex startup: entering pump loop (max_frames=%d)\n",
@@ -2116,6 +2363,7 @@ run_dex_activity_arm64(struct jvm *jvm)
       pump_run_frame(arm64_exec_run_pending_threads);
       arm64_exec_egl_swap();
       arm64_exec_glfw_poll();
+      perf_tick();
       if (frame < 5 || frame % 50 == 0)
          fprintf(stderr, "[loader] dex pump frame %d\n", frame);
       if (arm64_exec_glfw_should_close()) break;
@@ -2131,7 +2379,7 @@ run_jni_game_arm64(struct jvm *jvm)
       return run_ue4_game_arm64(jvm);
    /* UnityPlayer.initJni path (IL2CPP / Mono) */
    if (arm64_exec_lookup_native("com.unity3d.player.UnityPlayer", "initJni"))
-      return run_unity_game_arm64(jvm);
+      return run_unity_game_arm64(jvm, NULL, 1);
    /* Neither engine's native entry point is exported.  An ordinary Android
     * app has none: its entry point is the launcher Activity, in the dex.  With
     * a bytecode VM that is runnable, so start it the way Android does instead
@@ -2156,11 +2404,9 @@ run_jni_game_arm(struct jvm *jvm)
    static const char *cls_svc  = "com.unity3d.player.UnityPlayerForActivityOrService";
 
    /* Helper: look up from primary class, fall back to the service class */
-#define LOOKUP2(name) \
-   (arm_exec_lookup_native(cls, name) ?: arm_exec_lookup_native(cls_svc, name))
+#define LOOKUP2(name) arm_lookup_native_two(cls, cls_svc, name)
 #define LOOKUP2_SIG(name, sig_buf) \
-   (arm_exec_lookup_native_sig(cls, name, sig_buf, sizeof(sig_buf)) ?: \
-    arm_exec_lookup_native_sig(cls_svc, name, sig_buf, sizeof(sig_buf)))
+   arm_lookup_native_sig_two(cls, cls_svc, name, sig_buf, sizeof(sig_buf))
 
    uint32_t va_init_jni = arm_exec_lookup_native(cls, "initJni");
    uint32_t va_done     = LOOKUP2("nativeDone");
@@ -2184,6 +2430,7 @@ run_jni_game_arm(struct jvm *jvm)
    uint32_t env = arm_exec_env_va();
    const jobject context = jvm->native.AllocObject(&jvm->env, jvm->native.FindClass(&jvm->env, "android/app/Activity"));
    uint32_t ctx = (uint32_t)(uintptr_t)context;
+   jni_set_current_activity(&jvm->env, context);
    uint32_t mono_root = mono_export_call("mono_get_root_domain");
 
    /* JIT trampolines must exist before initJni — Unity 4.x maps mscorlib inside
@@ -2502,6 +2749,38 @@ main(int argc, const char *argv[])
       errx(EXIT_FAILURE, "usage: <elf file or jni library>");
 
    printf("loading module: %s\n", argv[1]);
+
+   /* An ordinary Android application has no native process entry point.
+    * ActivityThread starts its Application/Activity bytecode first, and the
+    * app loads each JNI library itself with System.loadLibrary().  Requiring
+    * an arbitrary .so here inverted that order and also rejected APKs whose
+    * alphabetically first helper library had no JNI_OnLoad. */
+   if (!strcmp(argv[1], "--apk-process-arm64") ||
+       !strcmp(argv[1], "--apk-process-arm32")) {
+      const int is_a64 = !strcmp(argv[1], "--apk-process-arm64");
+      const char *libdir = getenv("ANDROID_NATIVE_LIB_DIR");
+      if (!libdir || !*libdir)
+         errx(EXIT_FAILURE, "ANDROID_NATIVE_LIB_DIR is required for APK process startup");
+
+      static struct jvm jvm;
+      jvm_init(&jvm);
+      int init_ok = is_a64 ? arm64_exec_context_init(&jvm)
+                           : arm_exec_context_init(&jvm);
+      if (init_ok < 0)
+         errx(EXIT_FAILURE, "%s context init failed",
+              is_a64 ? "arm64" : "arm32");
+      arm_exec_set_main_lib_dir(libdir);
+      if (!arm_exec_host_egl_init())
+         fprintf(stderr, "[loader] early APK-process host EGL init failed\n");
+
+      int ret = is_a64 ? run_dex_activity_arm64(&jvm)
+                       : EXIT_FAILURE;
+      if (!is_a64)
+         fprintf(stderr, "[loader] ARM32 APK-process startup is not implemented yet\n");
+      jvm_release(&jvm);
+      printf("exiting\n");
+      return ret;
+   }
 
    /* ARM64 ELF: use A64 dynarmic emulation path */
    if (arm64_elf_is_arm64(argv[1])) {

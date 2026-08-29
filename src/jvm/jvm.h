@@ -93,6 +93,12 @@ struct jvm_object {
     * opaque objects back the singleton stubs in jni_stubs.c, which cache the
     * jobject in a `static` and would dangle if the slot were recycled. */
    int refs;
+
+   /* JNI MonitorEnter/Exit state.  Access is serialized by the bridge's
+    * monitor mutex; the small owner token avoids depending on pthread_t's
+    * representation in this public C structure. */
+   uint64_t monitor_owner;
+   uint32_t monitor_depth;
 };
 
 struct jvm_native_method {
@@ -135,6 +141,29 @@ struct jvm {
    jthrowable pending_exception;
    char pending_exception_class[128];
    char pending_exception_msg[256];
+   /* jvm_wrap_method() resolves a method to its hand-written stub by forming a
+    * symbol name and asking dlsym(RTLD_DEFAULT) for it, walking up the class
+    * hierarchy when the derived class has no stub of its own.  That is up to
+    * eighteen dlsym misses — each one a search of every loaded object — plus a
+    * dvm_jni_super_name() per hop, which takes the interpreter lock and walks
+    * the dex.  It used to do all of that on *every* JNI call: this UE title
+    * polls MediaPlayer.getCurrentPosition two thousand times a second, and
+    * each call spent about 42 us here before the method body even started.
+    *
+    * The answer depends only on the method object and the class hierarchy,
+    * both fixed once the dexes are in, so resolve it once per method id.  NULL
+    * is a real answer — "no stub, hand it to the dvm" — so the resolved flag
+    * is separate, and the whole table is dropped when a dex arrives.
+    *
+    * Deliberately last in the struct.  Putting it between objects[] and
+    * next_object made the emulator fault at the first bytecode call, which
+    * means something writes past the end of objects[] and has been landing on
+    * the fields that follow it.  That is worth finding, but it is not this
+    * change's to fix; appending leaves every existing offset relationship
+    * exactly as it was. */
+   void    *wrap_cache[65536];
+   bool     wrap_cached[65536];
+   unsigned wrap_epoch;
 };
 
 /* Raise a JNI exception of `class_name` ("java/lang/ClassNotFoundException")
@@ -143,6 +172,11 @@ void jvm_throw_new(struct jvm *jvm, const char *class_name, const char *msg);
 
 const char*
 jvm_get_class_name(struct jvm *jvm, jobject object);
+
+/* Binary name of the class a Class object describes, or NULL if `object` is
+ * not a Class.  Distinct from GetObjectClass(instance) → class name. */
+const char *
+jvm_described_class_name(struct jvm *jvm, jobject object);
 
 /* Whether the stub layer actually implements `method` — i.e. whether a stub
  * symbol resolves for it, here or on one of its superclasses.  Without this a
@@ -173,5 +207,11 @@ jnienv_get_jvm(JNIEnv *env);
 /* Per-File path storage (java/io/File). jobject handles index this table. */
 void jni_file_set_path(jobject file, const char *path);
 const char *jni_file_get_path(jobject file);
+void jni_set_current_activity(JNIEnv *env, jobject activity);
+jobject jni_get_current_activity(void);
 void jni_file_bind_ctor(JNIEnv *env, jobject file, jmethodID ctor, va_list ap);
 void jni_file_bind_ctor_a(JNIEnv *env, jobject file, jmethodID ctor, const jvalue *args);
+
+/* Diagnostics for the JNI stub-resolution cache (see jvm::wrap_cache). */
+void jvm_wrap_stats(unsigned long long *resolves, unsigned long long *ns,
+                    unsigned long long *hits);

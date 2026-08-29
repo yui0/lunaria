@@ -19,8 +19,10 @@
 #include "luna-ui.h"
 
 #include "luna_overlay.h"
+#include "arm_exec.h"
 
 #include <dlfcn.h>
+#include <math.h>
 #include <pthread.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -31,8 +33,10 @@
 
 static bool  g_ready;          /* luna_init() has run against a live context */
 static bool  g_failed;         /* …and failed; do not retry every frame */
-static char *g_html;
+static char *g_html;           /* guest widget document (dialogs, …) */
 static char *g_css;
+static char *g_status_html;    /* JIT / boot status card */
+static char *g_status_css;
 static bool  g_doc_dirty;
 static bool  g_from_files;   /* LUNARIA_UI_TEST names an HTML file */
 static int   g_w, g_h;
@@ -53,6 +57,7 @@ static int g_ptr_count;
 static pthread_mutex_t g_ptr_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static luna_overlay_click_fn g_click_fn;
+static luna_overlay_frame_fn g_frame_fn;
 
 /* luna-ui's input path asks the app runner to schedule a repaint.  With
  * LUNA_UI_NO_PLATFORM there is no runner, and the symbol is the embedder's to
@@ -93,11 +98,17 @@ static void *overlay_get_proc(const char *name)
    return p;
 }
 
+/* Seconds since the overlay came up.  Zero-based rather than raw monotonic: a
+ * CSS animation's timeline starts when the document appears, and a float
+ * carrying the host's uptime has no precision left to resolve a frame. */
 static double overlay_now(void)
 {
+   static double epoch;
    struct timespec ts;
    clock_gettime(CLOCK_MONOTONIC, &ts);
-   return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+   double t = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+   if (epoch == 0.0) epoch = t;
+   return t - epoch;
 }
 
 /* The overlay used to share the guest's context and put its state back
@@ -164,10 +175,96 @@ static bool overlay_context_create(void)
    return true;
 }
 
+/* The faces the overlay draws with.
+ *
+ * Left to itself luna-ui scans /usr/share/fonts and scores what it finds; on a
+ * host whose only sans family is Liberation that scan comes back with
+ * LiberationSans-Italic, and the whole emulator UI — dialogs and boot card
+ * alike — renders in italic.  An oblique face is never the right answer for a
+ * UI that did not ask for one, so name the faces we want and let the scan
+ * answer only when none of them is installed. */
+static unsigned char *overlay_read_file(const char *path, size_t *out_size)
+{
+   FILE *f = fopen(path, "rb");
+   if (!f) return NULL;
+   if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+   long n = ftell(f);
+   if (n <= 0) { fclose(f); return NULL; }
+   rewind(f);
+   unsigned char *buf = malloc((size_t)n);
+   if (!buf) { fclose(f); return NULL; }
+   size_t got = fread(buf, 1, (size_t)n, f);
+   fclose(f);
+   if (got != (size_t)n) { free(buf); return NULL; }
+   if (out_size) *out_size = got;
+   return buf;
+}
+
+static unsigned char *overlay_load_font(int role, size_t *out_size)
+{
+   static const char *const regular[] = {
+      "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+      "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+      "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+      "/usr/share/fonts/TTF/DejaVuSans.ttf",
+      NULL
+   };
+   static const char *const bold[] = {
+      "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+      "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+      "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+      "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+      NULL
+   };
+   static const char *const mono[] = {
+      "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+      "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+      "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+      NULL
+   };
+   const char *const *list = NULL;
+   switch (role) {
+   case LUNA_FONT_REGULAR: list = regular; break;
+   case LUNA_FONT_BOLD:    list = bold;    break;
+   case LUNA_FONT_MONO:    list = mono;    break;
+   /* CJK, symbols and brands have no sensible fixed path: let the scan answer
+    * those, and the engine falls back cleanly when it finds none. */
+   default: return NULL;
+   }
+   for (int i = 0; list[i]; ++i) {
+      unsigned char *buf = overlay_read_file(list[i], out_size);
+      if (buf) return buf;
+   }
+   return NULL;
+}
+
+/* luna-ui's own clock.
+ *
+ * With no platform the engine falls back to clock() — process CPU time — and
+ * stamps every animation's start with it, while luna_update() is handed the
+ * clock the embedder uses.  Those two disagreeing by the host's uptime made
+ * every finite @keyframes animation read as already finished on its first
+ * frame, and left the infinite ones at an arbitrary phase.  Supplying get_time
+ * is what makes both ends of the comparison the same clock. */
+static double overlay_platform_time(void) { return overlay_now(); }
+
+static void overlay_set_platform(void)
+{
+   LunaPlatform platform;
+   memset(&platform, 0, sizeof platform);
+   platform.get_time = overlay_platform_time;
+   platform.get_proc = overlay_get_proc;
+   platform.load_font = overlay_load_font;
+   platform.struct_size = (uint32_t)sizeof platform;
+   luna_set_platform(&platform);
+}
+
 static bool overlay_start(int w, int h)
 {
    if (g_ready) return true;
    if (g_failed) return false;
+
+   overlay_set_platform();
 
    /* The engine's shader set differs between desktop GL and GLES; ask the
     * context which one this is rather than assuming.  Lunaria runs on both:
@@ -210,9 +307,41 @@ void luna_overlay_set_document(const char *html, const char *css)
    pthread_mutex_unlock(&g_doc_lock);
 }
 
+void luna_overlay_set_status(const char *html, const char *css)
+{
+   pthread_mutex_lock(&g_doc_lock);
+   free(g_status_html);
+   g_status_html = html ? strdup(html) : NULL;
+   if (css) {
+      free(g_status_css);
+      g_status_css = strdup(css);
+   } else if (!html) {
+      free(g_status_css);
+      g_status_css = NULL;
+   }
+   /* Only dirty the parsed document when the status card is what we would
+    * show — a guest dialog owns the parsed tree and must not be rebuilt from
+    * a progress-bar rewrite. */
+   if (!g_html) g_doc_dirty = true;
+   pthread_mutex_unlock(&g_doc_lock);
+}
+
+bool luna_overlay_status_showing(void)
+{
+   pthread_mutex_lock(&g_doc_lock);
+   bool showing = g_html == NULL && g_status_html != NULL;
+   pthread_mutex_unlock(&g_doc_lock);
+   return showing && !g_failed;
+}
+
 void luna_overlay_set_click_handler(luna_overlay_click_fn fn)
 {
    g_click_fn = fn;
+}
+
+void luna_overlay_set_frame_handler(luna_overlay_frame_fn fn)
+{
+   g_frame_fn = fn;
 }
 
 /* luna-ui hands the clicked element back; its DOM id is the only thing the
@@ -292,7 +421,7 @@ bool luna_overlay_active(void)
 {
    overlay_maybe_test_card();
    pthread_mutex_lock(&g_doc_lock);
-   bool up = g_html != NULL;
+   bool up = g_html != NULL || g_status_html != NULL;
    pthread_mutex_unlock(&g_doc_lock);
    return up && !g_failed;
 }
@@ -318,6 +447,8 @@ void luna_overlay_present(int w, int h)
       g_failed = true;
       return;
    }
+   /* Guest binding is gone until we restore below. */
+   arm_exec_egl_invalidate_current();
 
    if (overlay_start(w, h)) {
       luna_invalidate_gl_state();
@@ -327,12 +458,17 @@ void luna_overlay_present(int w, int h)
          luna_resize((float)w, (float)h);
       }
       pthread_mutex_lock(&g_doc_lock);
+      /* Guest widgets win.  The status card is only the document when nothing
+       * from the Android View layer is up. */
+      const char *html = g_html ? g_html : g_status_html;
+      const char *css  = g_html ? g_css  : g_status_css;
+      const bool status_only = g_html == NULL && g_status_html != NULL;
       if (g_doc_dirty) {
          g_doc_dirty = false;
          /* Styles are resolved while the HTML is parsed, so the sheet has to
           * be in place first. */
          luna_reset_css();
-         if (g_from_files) {
+         if (g_from_files && g_html) {
             const char *path = getenv("LUNARIA_UI_TEST");
             char css_path[1024], base[1024];
             snprintf(base, sizeof base, "%s", path);
@@ -347,9 +483,9 @@ void luna_overlay_present(int w, int h)
                fprintf(stderr, "[overlay] no css at %s\n", css_path);
             if (!luna_load_html_file(path))
                fprintf(stderr, "[overlay] failed to load %s\n", path);
-         } else {
-            if (g_css) luna_parse_css(g_css);
-            luna_parse_html(g_html);
+         } else if (html) {
+            if (css) luna_parse_css(css);
+            luna_parse_html(html);
          }
          luna_resize((float)w, (float)h);
          overlay_wire_clicks();
@@ -358,11 +494,25 @@ void luna_overlay_present(int w, int h)
 
       overlay_drain_pointer();
 
+      /* The document is parsed and luna-ui's state is live here, which is the
+       * only moment a caller may mutate it.  The boot card pushes its stage
+       * line and its progress through this instead of republishing the page:
+       * a reparse restarts every @keyframes timeline on it. */
+      if (g_frame_fn) g_frame_fn();
+
       /* Composited over the guest's finished frame: no clear, and the
-       * document's own background is whatever its CSS paints. */
+       * document's own background is whatever its CSS paints.  The status
+       * card is the whole frame before the guest has drawn anything, so it
+       * clears to its own ink first — otherwise the previous swap's undefined
+       * back buffer shows through. */
       glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
       glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
       glViewport(0, 0, w, h);
+      if (status_only) {
+         glDisable(GL_SCISSOR_TEST);
+         glClearColor(0.043f, 0.059f, 0.078f, 1.f); /* #0b0f14 */
+         glClear(GL_COLOR_BUFFER_BIT);
+      }
       glDisable(GL_DEPTH_TEST);
       glDisable(GL_CULL_FACE);
       glDisable(GL_SCISSOR_TEST);
@@ -384,15 +534,19 @@ void luna_overlay_present(int w, int h)
    if (!eglMakeCurrent(dpy, draw, read, guest_ctx))
       fprintf(stderr, "[overlay] failed to restore the guest context (0x%04x)\n",
               (unsigned)eglGetError());
+   else
+      arm_exec_egl_note_current(guest_ctx, draw);
 }
 
 /* A shown Android dialog is modal: the window above takes every touch, and
- * the application below sees none of them.  So while a document is up the
- * overlay consumes the event unconditionally — there is no hit test to do,
- * and doing one here would read luna-ui's layout from the wrong thread. */
+ * the application below sees none of them.  The JIT status card is not a
+ * dialog — it must not eat the touches a title needs once it starts drawing. */
 bool luna_overlay_pointer(double x, double y, int action)
 {
-   if (!luna_overlay_active()) return false;
+   pthread_mutex_lock(&g_doc_lock);
+   bool guest = g_html != NULL;
+   pthread_mutex_unlock(&g_doc_lock);
+   if (!guest || g_failed) return false;
    pthread_mutex_lock(&g_ptr_lock);
    if (g_ptr_count < (int)(sizeof g_ptr_queue / sizeof g_ptr_queue[0])) {
       g_ptr_queue[g_ptr_count].x = x;
@@ -410,5 +564,7 @@ void luna_overlay_shutdown(void)
    g_ready = false;
    free(g_html);
    free(g_css);
-   g_html = g_css = NULL;
+   free(g_status_html);
+   free(g_status_css);
+   g_html = g_css = g_status_html = g_status_css = NULL;
 }

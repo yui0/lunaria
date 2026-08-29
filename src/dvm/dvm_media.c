@@ -380,7 +380,31 @@ struct lm_codec {
    bool announced_format;   /* the one INFO_OUTPUT_FORMAT_CHANGED was handed out */
    bool got_eos;            /* an input buffer carried END_OF_STREAM */
    bool sent_eos;
+
+   /* A decoder that cannot decode this stream at all.
+    *
+    * openh264 decodes Constrained Baseline; a title's startup movie is
+    * routinely Main or High with CABAC and B-frames, and the avcC's
+    * profile_compatibility byte cannot be trusted to say so (Blade & Soul's
+    * splash claims constraint_set1 and still carries B-frames).  There is no
+    * honest static test, so the test is the decode itself: every access unit
+    * comes back a bitstream error and no picture is ever produced.
+    *
+    * Reporting that matters more than it looks.  The old behaviour was to log
+    * each error and carry on, so the player kept "playing" a movie that would
+    * never show a frame — and an engine waiting on that movie waits for ever.
+    * That is the whole of Blade & Soul Revolution's boot: a white screen at a
+    * steady 21 fps, with nothing wrong anywhere the log was looking. */
+   int  dec_errors;         /* consecutive errors with nothing decoded yet */
+   bool produced_picture;   /* …until the first picture comes out */
+   bool undecodable;        /* give up: this decoder cannot read this stream */
 };
+
+/* How many access units to let fail before calling it.  A stream that starts
+ * on a non-IDR frame legitimately errors until the first keyframe, so this has
+ * to be past any plausible run of those, and still well inside the fraction of
+ * a second an engine spends waiting before it notices a stall. */
+#define LM_DECODE_GIVE_UP 16
 
 static bool is_aac_mime(const char *mime)
 {
@@ -492,9 +516,23 @@ static bool decode_au(struct lm_codec *c, const uint8_t *data, size_t len,
          fprintf(stderr, "[media] openh264 decode state 0x%x (%zu bytes)\n",
                  st, len);
       /* A concealed or dropped picture is not a codec failure; the next AU
-       * usually recovers.  Only report it. */
+       * usually recovers.  Only report it — unless nothing has ever decoded,
+       * in which case this is not a dropped frame, it is a stream the decoder
+       * cannot read.  See lm_codec::undecodable. */
+      if (!c->produced_picture && !c->undecodable &&
+          ++c->dec_errors >= LM_DECODE_GIVE_UP) {
+         c->undecodable = true;
+         fprintf(stderr,
+                 "[media] this H.264 stream is not decodable here: %d access "
+                 "units, no picture.  openh264 decodes Constrained Baseline, "
+                 "and Main/High with CABAC or B-frames is not that — reporting "
+                 "the stream unsupported so the caller stops waiting on it.\n",
+                 c->dec_errors);
+      }
    }
    if (info.iBufferStatus != 1) return true;   /* nothing came out this time */
+   c->produced_picture = true;
+   c->dec_errors = 0;
 
    const struct SSysMEMBuffer *b = &info.UsrData.sSystemBuffer;
    int w = b->iWidth, h = b->iHeight;
@@ -695,6 +733,11 @@ void lm_codec_audio_format(const struct lm_codec *c, int *rate, int *channels)
 {
    if (rate) *rate = c ? c->rate : 0;
    if (channels) *channels = c ? c->channels : 0;
+}
+
+bool lm_codec_undecodable(const struct lm_codec *c)
+{
+   return c && c->undecodable;
 }
 
 bool lm_codec_is_video(const struct lm_codec *c)
