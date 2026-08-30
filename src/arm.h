@@ -60,6 +60,28 @@ unsigned long long arm_lock_held_ns(void);
 unsigned long long arm_lock_wait_ns(void);
 unsigned long long arm_lock_max_wait_ns(void);
 
+/* Which caller the lock was held *for*.
+ *
+ * "held 100% of the last 5s" says the emulator is serialised but not by what,
+ * and the two candidates — a long SVC handler and the scheduler pass — are
+ * fixed in completely different places.  A hold is labelled by the thread that
+ * takes it (0 = unlabelled) and the time is charged to that label when the
+ * outermost release happens, so the report can name the handler rather than
+ * the lock.  One thread-local store per acquire and one relaxed add per
+ * release: cheap enough to leave on. */
+#define ARM_LOCK_TAG_MAX 4160u
+/* SVC numbers occupy 0..4095 (see SVC_TIME_MAX), so they are labelled at +1 and
+ * 0 stays "unlabelled".  The named holders live above that range. */
+#define ARM_LOCK_TAG_SVC(n) ((unsigned)(n) + 1u)
+#define ARM_LOCK_TAG_SCHED  4097u   /* a scheduler pass */
+#define ARM_LOCK_TAG_SLICE  4098u   /* an engine's slice prologue/epilogue */
+#define ARM_LOCK_TAG_CLAIM  4099u   /* a worker looking for a thread to run */
+#define ARM_LOCK_TAG_CB     4100u   /* a host-initiated guest callback */
+/* Returns the label that was in force, so a nested holder can put it back. */
+unsigned arm_lock_tag(unsigned tag);
+/* Read-and-clear one label's charged time, for a windowed report. */
+unsigned long long arm_lock_tag_take_ns(unsigned tag);
+
 /* True once more than one A64 engine runs guest threads at the same time.
  *
  * The emulator outside guest code is written as a single thread that may be
@@ -97,13 +119,27 @@ void arm_set_parallel_engines(bool on);
 #include <unordered_map>
 #include <vector>
 
-// Cached getenv — literal address is the cache key.
-//
-// With more than one A64 engine the SVC path and the scheduler call this from
- // several host threads at once.  An unlocked unordered_map then races its
- // buckets and the host allocator reports "corrupted size vs. prev_size".
-inline std::unordered_map<const void *, const char *> g_env_cache;
-inline std::shared_mutex g_env_cache_mu;
+/* Cached getenv — the literal's address is the cache key.
+ *
+ * Every engine calls this from inside SVC handlers, so it is on the hot path
+ * of the whole emulator: an unlocked unordered_map raced its buckets (the host
+ * allocator reported "corrupted size vs. prev_size"), and the shared_mutex
+ * that replaced it turned every lookup into a contended atomic on one cache
+ * line shared by four engines.
+ *
+ * A fixed open-addressed table needs neither.  The only mutation is publishing
+ * a slot that was empty, the key is a pointer the caller already owns, and two
+ * threads racing to insert the same literal both compute the same value from
+ * getenv — so a released store of the value before the key, and an acquired
+ * load of the key before the value, is the whole of the synchronisation.  It
+ * is also plain C apart from the atomics. */
+#define LUNARIA_ENV_CACHE_SLOTS 512u   /* power of two, ~40 distinct literals */
+inline std::atomic<const void *> g_env_key[LUNARIA_ENV_CACHE_SLOTS];
+inline std::atomic<const char *> g_env_val[LUNARIA_ENV_CACHE_SLOTS];
+/* Bumped by lunaria_env_invalidate() so a cached miss cannot outlive our own
+ * setenv().  Compared, not cleared: clearing would race the readers. */
+inline std::atomic<unsigned> g_env_generation{1};
+inline std::atomic<unsigned> g_env_slot_gen[LUNARIA_ENV_CACHE_SLOTS];
 /* Scope guard for the ARM execution lock (src/arm.c).  The lock itself is
  * common C; this is only the C++ convenience for holding it across a block. */
 namespace {
@@ -144,21 +180,39 @@ struct ArmLockDropped {
 }  // namespace
 
 inline const char *lunaria_env(const char *lit) {
-    {
-        std::shared_lock<std::shared_mutex> lk(g_env_cache_mu);
-        auto it = g_env_cache.find((const void *)lit);
-        if (it != g_env_cache.end()) return it->second;
+    const unsigned gen = g_env_generation.load(std::memory_order_relaxed);
+    /* The key is an address, and the addresses of distinct literals differ in
+     * their low bits far more than in their high ones. */
+    unsigned h = (unsigned)(((uintptr_t)lit >> 4) * 2654435761u);
+    for (unsigned probe = 0; probe < LUNARIA_ENV_CACHE_SLOTS; ++probe) {
+        const unsigned i = (h + probe) & (LUNARIA_ENV_CACHE_SLOTS - 1u);
+        const void *k = g_env_key[i].load(std::memory_order_acquire);
+        if (k && k != (const void *)lit) continue;   /* another literal's slot */
+        if (!k) {
+            /* Claim the slot before filling it: filling first would let the
+             * thread that lost the race overwrite the winner's value. */
+            const void *expected = nullptr;
+            if (!g_env_key[i].compare_exchange_strong(
+                    expected, (const void *)lit,
+                    std::memory_order_release, std::memory_order_acquire) &&
+                expected != (const void *)lit)
+                continue;                           /* somebody else took it */
+        }
+        /* The slot is ours (or already was).  A generation that does not match
+         * means "not filled yet" and "filled before an invalidate" alike, and
+         * both are answered the same way. */
+        if (g_env_slot_gen[i].load(std::memory_order_acquire) == gen)
+            return g_env_val[i].load(std::memory_order_relaxed);
+        const char *v = getenv(lit);
+        g_env_val[i].store(v, std::memory_order_relaxed);
+        g_env_slot_gen[i].store(gen, std::memory_order_release);
+        return v;
     }
-    const char *v = getenv(lit);
-    std::unique_lock<std::shared_mutex> lk(g_env_cache_mu);
-    auto [it, inserted] = g_env_cache.emplace((const void *)lit, v);
-    (void)inserted;
-    return it->second;
+    return getenv(lit);                             /* table full: still right */
 }
 // Call after any setenv() we perform ourselves.
 inline void lunaria_env_invalidate(void) {
-    std::unique_lock<std::shared_mutex> lk(g_env_cache_mu);
-    g_env_cache.clear();
+    g_env_generation.fetch_add(1u, std::memory_order_relaxed);
 }
 
 // Virtual address layout (32-bit guest VA; A64 relocates tramp/stack).
@@ -2091,6 +2145,9 @@ constexpr uint32_t SVC_CLOCK_NANOSLEEP            = SVC31_BASE + 395u;
  * stream, so an unflushed write is still sitting in the host's buffer when the
  * guest goes on to read the file back. */
 constexpr uint32_t SVC_LIBC_FFLUSH                = SVC31_BASE + 396u;
+/* ANativeWindow::query for the fake native window.  Keeping the policy in the
+ * host avoids baking an incomplete, version-specific switch into guest code. */
+constexpr uint32_t SVC_ANW_QUERY                  = SVC31_BASE + 397u;
 
 /* Which SVC a JNINativeInterface slot dispatches to.  Identity up to 221;
  * beyond that the historical numbering is four short, so name every slot. */
@@ -2122,7 +2179,7 @@ static_assert(SVC_PTHREAD_SETNAME > SVC_GL3_GenTransformFeedbacks,
  * numbers after it live past SVC_SIGPROCMASK, so their trampolines were never
  * built and the unknown-symbol pool — which starts here — handed the same
  * addresses out to dlsym'd names it did not implement. */
-constexpr uint32_t SVC_TRAMP_TOTAL        = SVC_LIBC_FFLUSH + 1u;
+constexpr uint32_t SVC_TRAMP_TOTAL        = SVC_ANW_QUERY + 1u;
 static_assert(SVC_TRAMP_TOTAL > SVC_PROCESS_VM_READV &&
               SVC_TRAMP_TOTAL > SVC_ACFG_INT_END &&
               SVC_TRAMP_TOTAL > SVC_GL3_GenTransformFeedbacks &&

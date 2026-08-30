@@ -48,6 +48,17 @@ struct arm_lock_waiter {
 };
 static struct arm_lock_waiter *g_head, *g_tail;
 
+/* One waiter node per host thread, not one per wait.
+ *
+ * A thread can only be queued once — arm_lock_acquire() returns immediately
+ * when it already holds the lock — so the node is a property of the thread and
+ * not of the call.  It used to live on the stack and have its condition
+ * variable created and destroyed on every contended acquire, which is a pair
+ * of futex-backed allocations on the hottest path the emulator has: with the
+ * lock held all the time, every SVC pays it. */
+static __thread struct arm_lock_waiter t_waiter;
+static __thread bool                   t_waiter_ready;
+
 /* How much of the wall clock somebody holds the lock, and how long the threads
  * that wanted it had to wait.  The two answer different questions, and the
  * summed wait alone is misleading: it counts every waiter, so eight threads
@@ -57,6 +68,25 @@ static struct arm_lock_waiter *g_head, *g_tail;
  * relaxed load and store, and a counter that is never torn. */
 static _Atomic unsigned long long g_held_ns, g_wait_ns, g_max_wait_ns;
 static struct timespec    g_held_since;
+
+/* Hold time charged to the label the owner set (see arm_lock_tag).  The table
+ * is fixed and indexed directly: a label is an SVC number or one of the few
+ * reserved ids below it, so there is nothing to allocate and nothing to lock. */
+static _Atomic unsigned long long g_tag_ns[ARM_LOCK_TAG_MAX];
+static __thread unsigned t_tag;
+
+unsigned arm_lock_tag(unsigned tag)
+{
+   const unsigned prev = t_tag;
+   t_tag = tag < ARM_LOCK_TAG_MAX ? tag : 0u;
+   return prev;
+}
+
+unsigned long long arm_lock_tag_take_ns(unsigned tag)
+{
+   if (tag >= ARM_LOCK_TAG_MAX) return 0ull;
+   return atomic_exchange_explicit(&g_tag_ns[tag], 0ull, memory_order_relaxed);
+}
 
 static unsigned long long arm_now_ns(void)
 {
@@ -87,19 +117,22 @@ void arm_lock_acquire(void)
       g_locked = true;
       clock_gettime(CLOCK_MONOTONIC, &g_held_since);
    } else {
-      /* The waiter lives on this thread's stack.  That is safe: the releaser
-       * only touches it while holding g_m, and this thread does not return
-       * from the wait until it has been dequeued under the same mutex. */
-      struct arm_lock_waiter w;
-      pthread_cond_init(&w.cv, NULL);
-      w.next = NULL;
-      w.go   = false;
-      if (g_tail) g_tail->next = &w; else g_head = &w;
-      g_tail = &w;
+      /* The releaser only touches the node while holding g_m, and this thread
+       * does not return from the wait until it has been dequeued under the
+       * same mutex, so the node is free again by the time we leave. */
+      struct arm_lock_waiter *w = &t_waiter;
+      if (!t_waiter_ready) {
+         pthread_cond_init(&w->cv, NULL);
+         t_waiter_ready = true;
+      }
+      w->next = NULL;
+      w->go   = false;
+      if (g_tail) g_tail->next = w; else g_head = w;
+      g_tail = w;
       atomic_fetch_add_explicit(&g_waiters, 1u, memory_order_relaxed);
       const unsigned long long t0 = arm_now_ns();
-      while (!w.go)
-         pthread_cond_wait(&w.cv, &g_m);
+      while (!w->go)
+         pthread_cond_wait(&w->cv, &g_m);
       const unsigned long long waited = arm_now_ns() - t0;
       atomic_fetch_add_explicit(&g_wait_ns, waited, memory_order_relaxed);
       unsigned long long worst =
@@ -108,7 +141,6 @@ void arm_lock_acquire(void)
       if (waited > worst)
          atomic_store_explicit(&g_max_wait_ns, waited, memory_order_relaxed);
       atomic_fetch_sub_explicit(&g_waiters, 1u, memory_order_relaxed);
-      pthread_cond_destroy(&w.cv);
       /* g_locked stayed true: the releaser handed ownership straight over. */
    }
    pthread_mutex_unlock(&g_m);
@@ -122,12 +154,12 @@ void arm_lock_release(void)
    pthread_mutex_lock(&g_m);
    struct timespec now;
    clock_gettime(CLOCK_MONOTONIC, &now);
-   atomic_fetch_add_explicit(
-      &g_held_ns,
+   const unsigned long long mine =
       (unsigned long long)(now.tv_sec - g_held_since.tv_sec) * 1000000000ull +
-         (unsigned long long)now.tv_nsec -
-         (unsigned long long)g_held_since.tv_nsec,
-      memory_order_relaxed);
+      (unsigned long long)now.tv_nsec -
+      (unsigned long long)g_held_since.tv_nsec;
+   atomic_fetch_add_explicit(&g_held_ns, mine, memory_order_relaxed);
+   atomic_fetch_add_explicit(&g_tag_ns[t_tag], mine, memory_order_relaxed);
    struct arm_lock_waiter *w = g_head;
    if (w) {
       g_head = w->next;

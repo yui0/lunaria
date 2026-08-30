@@ -22075,8 +22075,15 @@ static bool mplayer_isPlaying(struct dvm *vm, dvm_ref self,
                               union dvm_value *out)
 {
    (void)args; (void)nargs;
+   /* A state read, for the same reason getCurrentPosition() is one: on a
+    * device the player decodes on its own thread and isPlaying() only reports
+    * whether that thread is running.  Decoding from the query made the cost of
+    * asking depend on how often it was asked — UE4's MediaPlayer14 asks once
+    * per tick from two threads, and each ask was a full decode-and-convert
+    * (1.4 ms measured), which is most of a frame.  The frame pump ticks every
+    * active player itself (dvm_media_pump_active), so nothing is lost: end of
+    * stream is noticed there. */
    struct rt_player *p = player_of(vm, self);
-   if (p) player_tick(vm, self, p);
    RETI(p && p->playing ? 1 : 0);
 }
 
