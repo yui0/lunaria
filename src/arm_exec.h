@@ -195,6 +195,13 @@ void      arm_exec_touch_push(int action, float x, float y); /* test injection *
  * android_app::pendingInputQueue and sends APP_CMD_INPUT_CHANGED. */
 uint32_t  arm_exec_input_queue_handle(void);
 
+/* The host clipboard, shared by the emulator's input method and the guest's
+ * android.content.ClipboardManager — a device has one clipboard, so this is
+ * it.  arm_exec_clipboard_get() returns a malloc'd UTF-8 string the caller
+ * frees; it is never NULL. */
+void  arm_exec_clipboard_set(const char *utf8);
+char *arm_exec_clipboard_get(void);
+
 /* Returns 1 if the GLFW window close button was pressed, 0 otherwise. */
 int arm_exec_glfw_should_close(void);
 void arm_exec_request_quit(void);

@@ -217,6 +217,13 @@ struct dvm {
     * otherwise SwappyDisplayManager$LooperThread greedily runs every posted
     * Runnable on the wrong thread and holds the interpreter lock for them. */
    dvm_ref pending_looper[DVM_PENDING_MAX];
+   /* The Handler an entry was posted through, and the token it carried.
+    * Handler.removeCallbacksAndMessages(token) is defined in terms of both —
+    * "this handler's pending posts and messages, keeping only those whose
+    * token differs" — so with neither recorded the call had nothing to key on
+    * and did nothing.  A Thread.start() entry has no handler and no token. */
+   dvm_ref pending_owner[DVM_PENDING_MAX];
+   dvm_ref pending_token[DVM_PENDING_MAX];
    int npending;
    /* The Thread the interpreter is currently inside, or 0 for the main one. */
    dvm_ref cur_thread;

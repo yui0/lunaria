@@ -25,6 +25,7 @@
 #include "arm.h"
 #include "guest_mem.h"
 #include "jvm/jvm.h"
+#include "luna_ime.h"
 
 #include <GLES2/gl2.h>
 #include <GLES3/gl3.h>
@@ -82,6 +83,36 @@ static bool view_set_enabled(struct dvm *vm, dvm_ref self,
 static bool view_is_enabled(struct dvm *vm, dvm_ref self,
                             const union dvm_value *args, int nargs,
                             union dvm_value *out);
+/* The emulator's input method (luna_ime.c) reaches the guest through these;
+ * they are defined with the widget layer, below the tables that name them.
+ * See the "input method" section there for what the platform actually does
+ * when an app asks for a soft keyboard. */
+#define RT_BUILTIN_DECL(fn)                                                  \
+   static bool fn(struct dvm *vm, dvm_ref self,                              \
+                  const union dvm_value *args, int nargs,                    \
+                  union dvm_value *out)
+RT_BUILTIN_DECL(imm_show_soft_input);
+RT_BUILTIN_DECL(imm_hide_soft_input);
+RT_BUILTIN_DECL(imm_is_active);
+RT_BUILTIN_DECL(view_get_width);
+RT_BUILTIN_DECL(view_get_height);
+RT_BUILTIN_DECL(view_get_drawing_rect);
+RT_BUILTIN_DECL(view_get_visible_display_frame);
+RT_BUILTIN_DECL(view_request_layout);
+RT_BUILTIN_DECL(view_clear_focus);
+RT_BUILTIN_DECL(rect_width);
+RT_BUILTIN_DECL(rect_height);
+RT_BUILTIN_DECL(text_set_width);
+RT_BUILTIN_DECL(text_set_selection);
+#undef RT_BUILTIN_DECL
+/* Every ViewTreeObserver an app hung a global-layout listener on.  A layout
+ * pass is what tells an application its window changed shape, and the input
+ * method coming up is the one thing in this emulator that changes it. */
+#define RT_MAX_LAYOUT_OBSERVERS 16
+static dvm_ref g_layout_observers[RT_MAX_LAYOUT_OBSERVERS];
+static int g_nlayout_observers;
+static bool g_layout_pass_pending;
+
 /* Defined with the rest of the platform pieces, near the class table. */
 static void rt_set_int(struct dvm *vm, dvm_ref obj, const char *name,
                        int32_t value);
@@ -116,6 +147,14 @@ static bool t_sleep(struct dvm *vm, dvm_ref self,
 static bool list_add(struct dvm *vm, dvm_ref self,
                      const union dvm_value *args, int nargs,
                      union dvm_value *out);
+/* Application.ActivityLifecycleCallbacks registration; defined with the
+ * Activity tables further down, and named by both Application and Activity. */
+static bool app_register_lifecycle(struct dvm *vm, dvm_ref self,
+                                   const union dvm_value *args, int nargs,
+                                   union dvm_value *out);
+static bool app_unregister_lifecycle(struct dvm *vm, dvm_ref self,
+                                     const union dvm_value *args, int nargs,
+                                     union dvm_value *out);
 static bool list_iterator(struct dvm *vm, dvm_ref self,
                           const union dvm_value *args, int nargs,
                           union dvm_value *out);
@@ -265,6 +304,27 @@ static bool nop_void(struct dvm *vm, dvm_ref self, const union dvm_value *args,
 {
    dvm__warn_placeholder(vm);
    (void)self; (void)args; (void)nargs; (void)out;
+   RETV();
+}
+
+/* A method that does nothing *because doing nothing is the whole behaviour* —
+ * not because nobody has implemented it yet.
+ *
+ * These are two different facts about a build and the log could not tell them
+ * apart: `nop_void` reports itself as a placeholder the guest cannot see
+ * through, which is the right thing to say about Paint.setTextSize() and
+ * exactly the wrong thing to say about ContentProvider.<init>(), whose body on
+ * a device is `{}`.  Mixing them buries the ones worth fixing under the ones
+ * that are already finished, so an empty method that is *supposed* to be empty
+ * says so here and stays out of the placeholder list.
+ *
+ * Use it only where the emptiness is justified in a comment at the use site:
+ * either the framework method really is empty, or the work it names is
+ * genuinely done elsewhere in this emulator. */
+static bool empty_void(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                       int nargs, union dvm_value *out)
+{
+   (void)vm; (void)self; (void)args; (void)nargs; (void)out;
    RETV();
 }
 
@@ -530,6 +590,25 @@ static bool s_compareTo(struct dvm *vm, dvm_ref self, const union dvm_value *arg
 {
    const char *a = dvm_string_utf8(vm, self), *b = dvm_string_utf8(vm, ARG(0).l);
    RETI(strcmp(a ? a : "", b ? b : ""));
+}
+
+/* Case-insensitive ordering.  Only ASCII case is folded: strings here are
+ * UTF-8, and folding a multi-byte sequence byte by byte would compare the
+ * wrong thing.  That matches the ordering callers actually rely on (header
+ * names, file extensions, locale-independent keys). */
+static bool s_compareToIgnoreCase(struct dvm *vm, dvm_ref self,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+   const char *a = dvm_string_utf8(vm, self), *b = dvm_string_utf8(vm, ARG(0).l);
+   const unsigned char *x = (const unsigned char *)(a ? a : "");
+   const unsigned char *y = (const unsigned char *)(b ? b : "");
+   for (; *x && *y; ++x, ++y) {
+      int ca = *x >= 'A' && *x <= 'Z' ? *x + 32 : *x;
+      int cb = *y >= 'A' && *y <= 'Z' ? *y + 32 : *y;
+      if (ca != cb) RETI(ca - cb);
+   }
+   RETI((int)*x - (int)*y);
 }
 
 /* indexOf/lastIndexOf come in a char form and a String form whose first
@@ -1343,6 +1422,47 @@ static bool box_equals(struct dvm *vm, dvm_ref self,
        !strcmp(a->name, "java/lang/Double"))
       RETI(av.ju == bv.ju);
    RETI(av.u == bv.u);
+}
+
+/* Comparable.compareTo() for the boxes.  Every box has a natural ordering on
+ * the platform, and a caller that holds one as a Comparable reaches the erased
+ * (Object) form.  Widths follow box_equals(): only Long and Double carry two
+ * register words; Character is unsigned and Boolean orders false before true.
+ * A box of a different class has no ordering against this one — the platform
+ * throws ClassCastException rather than inventing one. */
+static bool box_compareTo(struct dvm *vm, dvm_ref self,
+                          const union dvm_value *args, int nargs,
+                          union dvm_value *out)
+{
+   (void)nargs;
+   dvm_ref other = ARG(0).l;
+   struct dvm_class *a = dvm_object_class(vm, self);
+   struct dvm_class *b = dvm_object_class(vm, other);
+   if (!a || !b || strcmp(a->name, b->name)) {
+      dvm__throw(vm, "java/lang/ClassCastException", "%s cannot be compared to %s",
+                 a ? a->name : "null", b ? b->name : "null");
+      return false;
+   }
+   union dvm_value av = box_get(vm, self), bv = box_get(vm, other);
+   if (!strcmp(a->name, "java/lang/Long")) {
+      int64_t x = (int64_t)av.ju, y = (int64_t)bv.ju;
+      RETI(x < y ? -1 : x > y ? 1 : 0);
+   }
+   if (!strcmp(a->name, "java/lang/Double")) {
+      double x = av.d, y = bv.d;
+      RETI(x < y ? -1 : x > y ? 1 : 0);
+   }
+   if (!strcmp(a->name, "java/lang/Float")) {
+      float x = av.f, y = bv.f;
+      RETI(x < y ? -1 : x > y ? 1 : 0);
+   }
+   if (!strcmp(a->name, "java/lang/Character") ||
+       !strcmp(a->name, "java/lang/Boolean")) {
+      uint32_t x = av.u, y = bv.u;
+      RETI(x < y ? -1 : x > y ? 1 : 0);
+   }
+   int32_t x = av.i, y = bv.i;
+   RETI(x < y ? -1 : x > y ? 1 : 0);
 }
 
 static dvm_ref box_make(struct dvm *vm, const char *desc, union dvm_value v)
@@ -2978,8 +3098,9 @@ static bool t_getId(struct dvm *vm, dvm_ref self, const union dvm_value *args,
  * queue the caller has not filled yet — Volley's dispatchers are started
  * before the first request is added — and a Handler.post() is by definition
  * work for later.  Returns false when the queue is full. */
-static bool queue_runnable_at(struct dvm *vm, dvm_ref r, bool as_thread,
-                              int64_t delay_ms, dvm_ref looper)
+static bool queue_runnable_for(struct dvm *vm, dvm_ref r, bool as_thread,
+                               int64_t delay_ms, dvm_ref looper,
+                               dvm_ref owner, dvm_ref token)
 {
    struct dvm_class *c = r ? dvm_object_class(vm, r) : NULL;
    struct dvm_method *run = c ? dvm_find_method(vm, c, "run", "()V") : NULL;
@@ -3004,6 +3125,10 @@ static bool queue_runnable_at(struct dvm *vm, dvm_ref r, bool as_thread,
     * against.  Main-looper posts are stored as 0 so the existing main drain
     * keeps picking them without comparing against g_main_looper every time. */
    vm->pending_looper[vm->npending] = as_thread ? 0 : looper;
+   /* Who posted it and under which token — Handler.removeCallbacksAndMessages
+    * is defined in terms of exactly these two. */
+   vm->pending_owner[vm->npending] = as_thread ? 0 : owner;
+   vm->pending_token[vm->npending] = as_thread ? 0 : token;
    vm->pending_threads[vm->npending++] = r;
    if (vm->trace)
       fprintf(stderr, "[dvm] queue runnable=@%x thread=%d delay=%lld pending=%d\n",
@@ -3021,6 +3146,12 @@ static bool queue_runnable_at(struct dvm *vm, dvm_ref r, bool as_thread,
       }
    }
    return true;
+}
+
+static bool queue_runnable_at(struct dvm *vm, dvm_ref r, bool as_thread,
+                              int64_t delay_ms, dvm_ref looper)
+{
+   return queue_runnable_for(vm, r, as_thread, delay_ms, looper, 0, 0);
 }
 
 static bool queue_runnable(struct dvm *vm, dvm_ref r, bool as_thread)
@@ -3426,8 +3557,9 @@ static dvm_ref looper_main(struct dvm *vm);
  * dropped the Runnable, so anything that delivered its result through the main
  * looper — Volley's ExecutorDelivery, every SDK callback built on it — was
  * silently never delivered. */
-static bool h_post(struct dvm *vm, dvm_ref self, const union dvm_value *args,
-                   int nargs, union dvm_value *out)
+static bool h_post_token(struct dvm *vm, dvm_ref self,
+                         const union dvm_value *args, int nargs,
+                         dvm_ref token, union dvm_value *out)
 {
    dvm_ref r = ARG(0).l;
    if (!r) RETI(0);
@@ -3445,7 +3577,7 @@ static bool h_post(struct dvm *vm, dvm_ref self, const union dvm_value *args,
     * visible to that Looper's loop(). */
    if (looper && looper == looper_main(vm))
       looper = 0;
-   if (!queue_runnable_at(vm, r, false, delay, looper)) {
+   if (!queue_runnable_for(vm, r, false, delay, looper, self, token)) {
       struct dvm_class *c = dvm_object_class(vm, r);
       struct dvm_method *run =
          c ? dvm_find_method(vm, c, "run", "()V") : NULL;
@@ -3455,32 +3587,84 @@ static bool h_post(struct dvm *vm, dvm_ref self, const union dvm_value *args,
    RETI(1);
 }
 
+static bool h_post(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                   int nargs, union dvm_value *out)
+{
+   return h_post_token(vm, self, args, nargs, 0, out);
+}
+
 static bool h_postAtTime(struct dvm *vm, dvm_ref self,
                          const union dvm_value *args, int nargs,
                          union dvm_value *out)
 {
-   (void)nargs;
-   return h_post(vm, self, args, 1, out);
+   /* postAtTime(r, token, uptimeMillis): the absolute time is a clock the VM
+    * does not keep, so it is treated as "soon" — but the token is not, and
+    * removeCallbacksAndMessages(token) is asked about it later. */
+   return h_post_token(vm, self, args, 1, nargs > 2 ? ARG(1).l : 0, out);
 }
 
-/* postDelayed(r, token, ms): the token only matters to removeCallbacks. */
+/* postDelayed(r, token, ms). */
 static bool h_postDelayedToken(struct dvm *vm, dvm_ref self,
                                const union dvm_value *args, int nargs,
                                union dvm_value *out)
 {
+   (void)nargs;
    union dvm_value two[2] = { ARG(0), ARG(2) };
-   return h_post(vm, self, two, 2, out);
+   return h_post_token(vm, self, two, 2, ARG(1).l, out);
 }
 
 static bool h_hasCallbacks(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out)
 {
-   (void)self;
+   (void)nargs;
    dvm_ref r = ARG(0).l;
-   for (int i = 0; r && i < vm->npending; ++i)
-      if (vm->pending_threads[i] == r && !vm->pending_is_thread[i]) RETI(1);
+   for (int i = 0; r && i < vm->npending; ++i) {
+      if (vm->pending_is_thread[i] || vm->pending_threads[i] != r) continue;
+      if (self && vm->pending_owner[i] != self) continue;
+      RETI(1);
+   }
    RETI(0);
+}
+
+/* Drops every pending entry the predicate accepts, keeping the queue's order.
+ * The four parallel arrays are compacted together; forgetting one of them is
+ * how an entry ends up running with another entry's deadline or looper. */
+static void pending_drop(struct dvm *vm,
+                         bool (*match)(struct dvm *vm, int i, void *ctx),
+                         void *ctx)
+{
+   int keep = 0;
+   for (int i = 0; i < vm->npending; ++i) {
+      if (!vm->pending_is_thread[i] && match(vm, i, ctx)) {
+         dvm_unpin(vm, vm->pending_threads[i]);
+         continue;
+      }
+      vm->pending_threads[keep]   = vm->pending_threads[i];
+      vm->pending_is_thread[keep] = vm->pending_is_thread[i];
+      vm->pending_due_ms[keep]    = vm->pending_due_ms[i];
+      vm->pending_looper[keep]    = vm->pending_looper[i];
+      vm->pending_owner[keep]     = vm->pending_owner[i];
+      vm->pending_token[keep]     = vm->pending_token[i];
+      ++keep;
+   }
+   vm->npending = keep;
+}
+
+struct pending_key { dvm_ref owner, runnable, token; bool has_token; };
+
+/* Note that this deliberately does not narrow by the Handler the Runnable was
+ * posted through.  Android's removeCallbacks() does — but a Runnable posted on
+ * one Handler and cancelled through another is a caller bug, and cancelling it
+ * anyway is the safe direction: the alternative is a cancelled callback that
+ * fires. */
+static bool pending_is_callback(struct dvm *vm, int i, void *ctx)
+{
+   const struct pending_key *k = ctx;
+   if (vm->pending_threads[i] != k->runnable) return false;
+   /* removeCallbacks(r, token): only the posts made under that token. */
+   if (k->has_token && vm->pending_token[i] != k->token) return false;
+   return true;
 }
 
 /* removeCallbacks(r) is the other half of postDelayed: dropping it left the
@@ -3492,21 +3676,99 @@ static bool h_removeCallbacks(struct dvm *vm, dvm_ref self,
    (void)self;
    dvm_ref r = ARG(0).l;
    if (out) memset(out, 0, sizeof *out);
-   if (!r) return true;   /* null token means "everything"; nothing to key on */
+   if (!r) return true;   /* no Runnable named: nothing to key on */
+   /* removeCallbacks(r, null) means "any token", which is the one-argument
+    * form; a non-null token narrows it. */
+   struct pending_key k = { .owner = self, .runnable = r,
+                            .token = nargs > 1 ? ARG(1).l : 0,
+                            .has_token = nargs > 1 && ARG(1).l != 0 };
+   pending_drop(vm, pending_is_callback, &k);
+   return true;
+}
+
+static bool pending_matches_token(struct dvm *vm, int i, void *ctx)
+{
+   const struct pending_key *k = ctx;
+   /* Only this Handler's own entries: another Handler's queue is not ours to
+    * empty, and Thread.start() entries are not on any queue. */
+   if (k->owner && vm->pending_owner[i] != k->owner) return false;
+   if (!k->has_token) return true;          /* null token: all of them */
+   /* A Message's token is its `obj`, not the token the post carried. */
+   union dvm_value obj = { 0 };
+   (void)dvm_get_field(vm, vm->pending_threads[i], "obj", "Ljava/lang/Object;",
+                       &obj);
+   return vm->pending_token[i] == k->token || obj.l == k->token;
+}
+
+/* removeCallbacksAndMessages(token) — everything this Handler has pending,
+ * narrowed to one token when one is given.
+ *
+ * It was a no-op, which is the opposite of what it is for: it is how a
+ * component says "I am going away, do not call me".  UE4's
+ * NetworkChangedManager.clearRetry() calls it to cancel a retry that would
+ * otherwise still fire after the network came back, and every SDK that
+ * cancels its timeouts on teardown goes through here. */
+static bool h_removeCallbacksAndMessages(struct dvm *vm, dvm_ref self,
+                                         const union dvm_value *args,
+                                         int nargs, union dvm_value *out)
+{
+   struct pending_key k = { .owner = self, .runnable = 0,
+                            .token = nargs > 0 ? ARG(0).l : 0,
+                            .has_token = nargs > 0 && ARG(0).l != 0 };
+   pending_drop(vm, pending_matches_token, &k);
+   RETV();
+}
+
+/* removeMessages(what[, object]) — the Message-side sibling.  Messages are
+ * queued as ordinary entries carrying their `what`, so the test is on the
+ * Message object's own field. */
+static bool h_removeMessages(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   int32_t what = nargs > 0 ? ARG(0).i : 0;
+   dvm_ref obj = nargs > 1 ? ARG(1).l : 0;
    int keep = 0;
    for (int i = 0; i < vm->npending; ++i) {
-      if (vm->pending_threads[i] == r && !vm->pending_is_thread[i]) {
-         dvm_unpin(vm, r);
-         continue;
+      bool drop = false;
+      if (!vm->pending_is_thread[i] &&
+          (!self || vm->pending_owner[i] == self)) {
+         union dvm_value w = { 0 }, o = { 0 };
+         if (dvm_get_field(vm, vm->pending_threads[i], "what", "I", &w) &&
+             w.i == what) {
+            (void)dvm_get_field(vm, vm->pending_threads[i], "obj",
+                                "Ljava/lang/Object;", &o);
+            drop = !obj || o.l == obj;
+         }
       }
-      vm->pending_threads[keep] = vm->pending_threads[i];
+      if (drop) { dvm_unpin(vm, vm->pending_threads[i]); continue; }
+      vm->pending_threads[keep]   = vm->pending_threads[i];
       vm->pending_is_thread[keep] = vm->pending_is_thread[i];
-      vm->pending_due_ms[keep] = vm->pending_due_ms[i];
-      vm->pending_looper[keep] = vm->pending_looper[i];
+      vm->pending_due_ms[keep]    = vm->pending_due_ms[i];
+      vm->pending_looper[keep]    = vm->pending_looper[i];
+      vm->pending_owner[keep]     = vm->pending_owner[i];
+      vm->pending_token[keep]     = vm->pending_token[i];
       ++keep;
    }
    vm->npending = keep;
-   return true;
+   RETV();
+}
+
+/* hasMessages(what) — asked before posting a duplicate. */
+static bool h_hasMessages(struct dvm *vm, dvm_ref self,
+                          const union dvm_value *args, int nargs,
+                          union dvm_value *out)
+{
+   int32_t what = nargs > 0 ? ARG(0).i : 0;
+   for (int i = 0; i < vm->npending; ++i) {
+      if (vm->pending_is_thread[i]) continue;
+      if (self && vm->pending_owner[i] != self) continue;
+      union dvm_value w = { 0 };
+      if (dvm_get_field(vm, vm->pending_threads[i], "what", "I", &w) &&
+          w.i == what)
+         RETI(1);
+   }
+   RETI(0);
 }
 
 /* ------------------------------------------------------------------------ *
@@ -4282,6 +4544,9 @@ static const struct rt_method rt_string[] = {
    M("hashCode", "()I", o_hashCode),
    M("toString", "()Ljava/lang/String;", o_toString),
    M("compareTo", "(Ljava/lang/String;)I", s_compareTo),
+   /* The erased Comparable form: an interface call lands here. */
+   M("compareTo", "(Ljava/lang/Object;)I", s_compareTo),
+   M("compareToIgnoreCase", "(Ljava/lang/String;)I", s_compareToIgnoreCase),
    M("indexOf", "(I)I", s_indexOf_char),
    M("indexOf", "(II)I", s_indexOf_char),
    M("indexOf", "(Ljava/lang/String;)I", s_indexOf_str),
@@ -5497,6 +5762,9 @@ static bool exec_schedule_task(struct dvm *vm, dvm_ref self, dvm_ref runnable,
    union dvm_value fixed = { .i = fixed_rate ? 1 : 0 };
    (void)dvm_set_field(vm, scheduled, "task", "Ljava/lang/Runnable;", task);
    (void)dvm_set_field(vm, scheduled, "dueMs", "J", due);
+   /* A TimerTask reads back the instant it was scheduled for; anything else
+    * simply has no such field and ignores this. */
+   (void)dvm_set_field(vm, runnable, "scheduledExecutionTime", "J", due);
    (void)dvm_set_field(vm, scheduled, "periodMs", "J", period);
    (void)dvm_set_field(vm, scheduled, "fixedRate", "Z", fixed);
    union dvm_value a = { .l = scheduled }, added = { 0 };
@@ -5616,10 +5884,49 @@ static const struct rt_method rt_thread_factory[] = {
    M_END,
 };
 
+/* ExecutorService.shutdownNow() — stop accepting work and hand back the tasks
+ * that had not started.
+ *
+ * It was `nop_void`, and its return type is a List: a void handler leaves the
+ * result slot zero, so every caller got null from a method that is specified
+ * never to return null.  `shutdownNow().size()` — which is how a caller finds
+ * out what it has to re-queue — was an NPE waiting for the first teardown that
+ * reached it.  The queued-but-unstarted tasks are exactly this executor's task
+ * queue, so that is what comes back, emptied out of the executor. */
+static bool exec_shutdown_now(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   dvm_ref pending = coll_new_list(vm, "Ljava/util/ArrayList;");
+   dvm_ref q = exec_task_queue(vm, self);
+   struct rt_list *l = q ? list_of(vm, q) : NULL;
+   for (uint32_t i = 0; pending && l && i < l->size; ++i) {
+      union dvm_value a = { .l = l->items[i] }, ignored = { 0 };
+      (void)list_add(vm, pending, &a, 1, &ignored);
+   }
+   if (l) l->size = 0;
+   RETL(pending);
+}
+
+/* Defined with FutureTask below; get() has to be able to run the task. */
+static bool future_run(struct dvm *vm, dvm_ref self,
+                       const union dvm_value *args, int nargs,
+                       union dvm_value *out);
+
 static bool future_get(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                        int nargs, union dvm_value *out)
 {
    (void)args; (void)nargs;
+   /* get() blocks until the task has run.  Nothing else will run it if the
+    * caller never handed it to an executor, so running it here is what the
+    * wait would have ended with. */
+   union dvm_value done = { 0 };
+   (void)dvm_get_field(vm, self, "done", "Z", &done);
+   if (!done.i) {
+      union dvm_value ignored = { 0 };
+      (void)future_run(vm, self, NULL, 0, &ignored);
+   }
    union dvm_value v = { 0 };
    (void)dvm_get_field(vm, self, "value", "Ljava/lang/Object;", &v);
    RETL(v.l);
@@ -5697,7 +6004,7 @@ static const struct rt_method rt_executor_service[] = {
      "(Ljava/lang/Runnable;JJLjava/util/concurrent/TimeUnit;)"
      "Ljava/util/concurrent/ScheduledFuture;", exec_schedule_delay),
    M("shutdown", "()V", nop_void),
-   M("shutdownNow", "()Ljava/util/List;", nop_void),
+   M("shutdownNow", "()Ljava/util/List;", exec_shutdown_now),
    M("isShutdown", "()Z", ret_false),
    M("isTerminated", "()Z", ret_false),
    M("awaitTermination", "(JLjava/util/concurrent/TimeUnit;)Z", ret_true),
@@ -5714,7 +6021,13 @@ static const struct rt_method rt_future[] = {
 };
 
 static const struct rt_field rt_future_fields[] = {
-   { "value", "Ljava/lang/Object;" }, F_END
+   { "value", "Ljava/lang/Object;" },
+   /* The Runnable form of FutureTask has nothing to run until run() is
+    * called, so the work and the result it will publish have to be kept. */
+   { "task", "Ljava/lang/Runnable;" },
+   { "result", "Ljava/lang/Object;" },
+   { "done", "Z" },
+   F_END
 };
 
 /* java.util.Locale.  Its constants are static fields on the class, so nothing
@@ -6370,6 +6683,8 @@ static const struct rt_method rt_integer[] = {
    M("toString", "()Ljava/lang/String;", i_toString),
    M("hashCode", "()I", box_intValue),
    M("equals", "(Ljava/lang/Object;)Z", box_equals),
+   M("compareTo", "(Ljava/lang/Integer;)I", box_compareTo),
+   M("compareTo", "(Ljava/lang/Object;)I", box_compareTo),
    M_END,
 };
 
@@ -6410,6 +6725,8 @@ static const struct rt_method rt_long[] = {
    M("intValue", "()I", box_intValue),
    M("toString", "()Ljava/lang/String;", l_toString),
    M("equals", "(Ljava/lang/Object;)Z", box_equals),
+   M("compareTo", "(Ljava/lang/Long;)I", box_compareTo),
+   M("compareTo", "(Ljava/lang/Object;)I", box_compareTo),
    M_END,
 };
 
@@ -6423,6 +6740,8 @@ static const struct rt_method rt_float[] = {
    M("doubleValue", "()D", box_doubleValue),
    M("intValue", "()I", box_intValue),
    M("equals", "(Ljava/lang/Object;)Z", box_equals),
+   M("compareTo", "(Ljava/lang/Float;)I", box_compareTo),
+   M("compareTo", "(Ljava/lang/Object;)I", box_compareTo),
    M_END,
 };
 
@@ -6436,6 +6755,8 @@ static const struct rt_method rt_double[] = {
    M("floatValue", "()F", box_floatValue),
    M("intValue", "()I", box_intValue),
    M("equals", "(Ljava/lang/Object;)Z", box_equals),
+   M("compareTo", "(Ljava/lang/Double;)I", box_compareTo),
+   M("compareTo", "(Ljava/lang/Object;)I", box_compareTo),
    M_END,
 };
 
@@ -6448,6 +6769,8 @@ static const struct rt_method rt_boolean[] = {
    SM("getBoolean", "(Ljava/lang/String;)Z", b_getBoolean),
    M("booleanValue", "()Z", b_booleanValue),
    M("equals", "(Ljava/lang/Object;)Z", box_equals),
+   M("compareTo", "(Ljava/lang/Boolean;)I", box_compareTo),
+   M("compareTo", "(Ljava/lang/Object;)I", box_compareTo),
    M_END,
 };
 
@@ -6506,6 +6829,8 @@ static const struct rt_method rt_character[] = {
    SM("valueOf", "(C)Ljava/lang/Character;", c_valueOf),
    M("charValue", "()C", c_charValue),
    M("equals", "(Ljava/lang/Object;)Z", box_equals),
+   M("compareTo", "(Ljava/lang/Character;)I", box_compareTo),
+   M("compareTo", "(Ljava/lang/Object;)I", box_compareTo),
    SM("isUpperCase", "(C)Z", ch_isUpperCase),
    SM("isLowerCase", "(C)Z", ch_isLowerCase),
    SM("isDigit", "(C)Z", ch_isDigit),
@@ -6529,6 +6854,8 @@ static const struct rt_method rt_short[] = {
    M("shortValue", "()S", box_intValue),
    M("intValue", "()I", box_intValue),
    M("equals", "(Ljava/lang/Object;)Z", box_equals),
+   M("compareTo", "(Ljava/lang/Short;)I", box_compareTo),
+   M("compareTo", "(Ljava/lang/Object;)I", box_compareTo),
    M_END,
 };
 
@@ -6543,6 +6870,8 @@ static const struct rt_method rt_byte[] = {
    M("shortValue", "()S", box_intValue),
    M("intValue", "()I", box_intValue),
    M("equals", "(Ljava/lang/Object;)Z", box_equals),
+   M("compareTo", "(Ljava/lang/Byte;)I", box_compareTo),
+   M("compareTo", "(Ljava/lang/Object;)I", box_compareTo),
    M_END,
 };
 
@@ -7151,6 +7480,12 @@ static const struct rt_field rt_method_fields[] = {
     * of matching against a Method that only knew its name. */
    { "sig", "Ljava/lang/String;" },
    { "access", "I" },
+   /* AccessibleObject's own flag.  Nothing in this VM enforces access, so
+    * setting it changes no behaviour — but it is a flag with a *value*, and
+    * isAccessible() was answering `true` for members nobody had opened.  Code
+    * that saves the old value and restores it afterwards (a common pattern
+    * around a single reflective read) was restoring the wrong one. */
+   { "accessible", "Z" },
    F_END
 };
 
@@ -7247,16 +7582,40 @@ static bool rm_getParameterTypes(struct dvm *vm, dvm_ref self,
    RETL(arr);
 }
 
+/* AccessibleObject.setAccessible / isAccessible, shared by Method, Field and
+ * Constructor.  It suppresses the access checks — which this VM does not
+ * perform in the first place, so the only observable part is the flag itself,
+ * and that has to read back as what was set. */
+static bool ao_setAccessible(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value v = { .i = ARG(0).i != 0 };
+   (void)dvm_set_field(vm, self, "accessible", "Z", v);
+   RETV();
+}
+
+static bool ao_isAccessible(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "accessible", "Z", &v);
+   RETI(v.i ? 1 : 0);
+}
+
 static const struct rt_method rt_reflect_method[] = {
    M("getName", "()Ljava/lang/String;", rm_getName),
    M("getDeclaringClass", "()Ljava/lang/Class;", rm_getDeclaringClass),
    M("getModifiers", "()I", rm_getModifiers),
    M("getReturnType", "()Ljava/lang/Class;", rm_getReturnType),
    M("getParameterTypes", "()[Ljava/lang/Class;", rm_getParameterTypes),
-   M("isAccessible", "()Z", ret_true),
+   M("isAccessible", "()Z", ao_isAccessible),
    M("invoke", "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
      rm_invoke),
-   M("setAccessible", "(Z)V", nop_void),
+   M("setAccessible", "(Z)V", ao_setAccessible),
    /* Runtime methods here do not carry annotation bytes; null is what
     * getAnnotation returns when the annotation is absent. */
    M("getAnnotation", "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
@@ -7630,8 +7989,8 @@ static bool rf_set(struct dvm *vm, dvm_ref self,
 static const struct rt_method rt_reflect_field[] = {
    M("getName", "()Ljava/lang/String;", rm_getName),
    M("getDeclaringClass", "()Ljava/lang/Class;", rf_getDeclaringClass),
-   M("setAccessible", "(Z)V", nop_void),
-   M("isAccessible", "()Z", ret_true),
+   M("setAccessible", "(Z)V", ao_setAccessible),
+   M("isAccessible", "()Z", ao_isAccessible),
    M("get", "(Ljava/lang/Object;)Ljava/lang/Object;", rf_get),
    M("getInt", "(Ljava/lang/Object;)I", rf_get),
    M("getLong", "(Ljava/lang/Object;)J", rf_get),
@@ -8197,6 +8556,73 @@ static bool cl_getConstructor(struct dvm *vm, dvm_ref self,
       (void)dvm_set_field(vm, k, "sig", "Ljava/lang/String;", v);
    }
    RETL(k);
+}
+
+static dvm_ref reflect_constructor(struct dvm *vm, dvm_ref owner,
+                                   const struct dvm_method *method)
+{
+   struct dvm_class *cc =
+      dvm__class_by_desc(vm, "Ljava/lang/reflect/Constructor;");
+   dvm_ref ctor = cc ? dvm_new_object(vm, cc) : 0;
+   if (!ctor) return 0;
+   union dvm_value v = { .l = owner };
+   (void)dvm_set_field(vm, ctor, "owner", "Ljava/lang/Class;", v);
+   v.l = dvm_new_string(vm, "<init>");
+   (void)dvm_set_field(vm, ctor, "name", "Ljava/lang/String;", v);
+   if (method && method->sig) {
+      v.l = dvm_new_string(vm, method->sig);
+      (void)dvm_set_field(vm, ctor, "sig", "Ljava/lang/String;", v);
+   }
+   v.i = method ? (int32_t)method->access : 0;
+   (void)dvm_set_field(vm, ctor, "access", "I", v);
+   return ctor;
+}
+
+/* Constructors are not inherited.  getConstructors() enumerates this class's
+ * public constructors; getDeclaredConstructors() enumerates all of them.  The
+ * runtime table predates access flags and records zero for its public platform
+ * methods, so builtin/external classes treat that legacy zero as public. */
+static bool cl_getConstructors_common(struct dvm *vm, dvm_ref self,
+                                      bool public_only, union dvm_value *out)
+{
+   struct dvm_object *co = dvm__obj(vm, self);
+   struct dvm_class *cls = co ? co->klass : NULL;
+   int count = 0;
+   for (int i = 0; cls && i < cls->nmethods; ++i) {
+      const struct dvm_method *m = &cls->methods[i];
+      if (!m->name || strcmp(m->name, "<init>")) continue;
+      if (public_only && !(m->access & DEX_ACC_PUBLIC) && !cls->external)
+         continue;
+      ++count;
+   }
+   dvm_ref arr = dvm_new_array(vm, 'L', "Ljava/lang/reflect/Constructor;",
+                               (uint32_t)count);
+   dvm_ref *items = arr ? dvm_array_data(vm, arr) : NULL;
+   int at = 0;
+   for (int i = 0; items && cls && i < cls->nmethods; ++i) {
+      const struct dvm_method *m = &cls->methods[i];
+      if (!m->name || strcmp(m->name, "<init>")) continue;
+      if (public_only && !(m->access & DEX_ACC_PUBLIC) && !cls->external)
+         continue;
+      items[at++] = reflect_constructor(vm, self, m);
+   }
+   RETL(arr);
+}
+
+static bool cl_getConstructors(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   return cl_getConstructors_common(vm, self, true, out);
+}
+
+static bool cl_getDeclaredConstructors(struct dvm *vm, dvm_ref self,
+                                       const union dvm_value *args, int nargs,
+                                       union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   return cl_getConstructors_common(vm, self, false, out);
 }
 
 static bool rc_newInstance(struct dvm *vm, dvm_ref self,
@@ -8916,9 +9342,8 @@ static const struct rt_method rt_reflect_ctor[] = {
    M("getName", "()Ljava/lang/String;", rm_getName),
    M("newInstance", "([Ljava/lang/Object;)Ljava/lang/Object;", rc_newInstance),
    M("newInstance", "()Ljava/lang/Object;", rc_newInstance),
-   M("setAccessible", "(Z)V", nop_void),
-   /* Nothing here enforces access, so every member is reachable. */
-   M("isAccessible", "()Z", ret_true),
+   M("setAccessible", "(Z)V", ao_setAccessible),
+   M("isAccessible", "()Z", ao_isAccessible),
    M_END,
 };
 
@@ -8989,6 +9414,10 @@ static const struct rt_method rt_class[] = {
      cl_getConstructor),
    M("getDeclaredConstructor",
      "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;", cl_getConstructor),
+   M("getConstructors", "()[Ljava/lang/reflect/Constructor;",
+     cl_getConstructors),
+   M("getDeclaredConstructors", "()[Ljava/lang/reflect/Constructor;",
+     cl_getDeclaredConstructors),
    M("newInstance", "()Ljava/lang/Object;", cl_newInstance),
    M("isInstance", "(Ljava/lang/Object;)Z", cl_isInstance),
    M("cast", "(Ljava/lang/Object;)Ljava/lang/Object;", cl_cast),
@@ -9015,7 +9444,39 @@ static const struct rt_method rt_class[] = {
    M_END,
 };
 
+/* ClassLoader(ClassLoader parent) — the constructor every custom loader in an
+ * SDK chains to with super(parent).  Without it the super() call is
+ * unresolved, the parent is dropped, and getParent() answers null: delegation
+ * stops at the subclass and a class the parent could have loaded is reported
+ * missing instead. */
+static bool clsl_init_parent(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)out;
+   union dvm_value parent = { .l = nargs > 0 ? ARG(0).l : 0 };
+   (void)dvm_set_field(vm, self, "parent", "Ljava/lang/ClassLoader;", parent);
+   RETV();
+}
+
+static bool clsl_get_parent(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "parent", "Ljava/lang/ClassLoader;", &v);
+   RETL(v.l);
+}
+
+static const struct rt_field rt_class_loader_fields[] = {
+   { "parent", "Ljava/lang/ClassLoader;" }, F_END
+};
+
 static const struct rt_method rt_class_loader[] = {
+   M("<init>", "()V", nop_void),
+   M("<init>", "(Ljava/lang/ClassLoader;)V", clsl_init_parent),
+   M("getParent", "()Ljava/lang/ClassLoader;", clsl_get_parent),
    M("loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", cl_forName),
    SM("getSystemClassLoader", "()Ljava/lang/ClassLoader;", cl_getClassLoader),
    M("getResource", "(Ljava/lang/String;)Ljava/net/URL;", cl_getResource),
@@ -9329,12 +9790,17 @@ static const struct rt_field rt_stack_trace_element_fields[] = {
    F_END,
 };
 
-/* A host sleep would stall the whole cooperative VM.  When the foreground
- * thread parks, first yield to runnable work: completion callbacks can then
- * unpark it and the guest's own Future loop observes the changed state on its
- * next instruction.  A worker that parks while the queue is already being
- * drained still has to end its slice; there is no second interpreter stack to
- * block on, and re-entering the drain would recurse indefinitely. */
+/* LockSupport.park() does not throw InterruptedException: interruption and
+ * spurious wakeups both make this void method return.  It used to manufacture
+ * an InterruptedException as an interpreter-unwind token.  SDK catch-all code
+ * then quite correctly forwarded that Java object to the process uncaught
+ * handler, so an idle coroutine was reported as a fatal application crash.
+ *
+ * Keep the interpreter stack and release the DVM GIL in a channel wait.  A
+ * short timeout on the cooperative foreground is a legal spurious wakeup and
+ * lets it reach the pending-runnable drain without busy-spinning.  A bytecode
+ * host thread can wait for the full bounded interval because another host
+ * thread can unpark it directly. */
 static bool locksupport_park(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
                              union dvm_value *out)
@@ -9355,27 +9821,20 @@ static bool locksupport_park(struct dvm *vm, dvm_ref self,
       dvm__drain_for_wait(vm);
       return true;
    }
-   /* On a thread of its own, wait for the permit instead of unwinding. */
-   if (dvm_on_bytecode_thread()) {
-      uint64_t deadline = dvm__now_ms() + DVM_BLOCK_MAX_MS;
-      while (dvm__now_ms() < deadline) {
-         uint64_t now = dvm__now_ms();
-         dvm_gil_wait_for(vm, thread,
-                          (unsigned)(deadline > now ? deadline - now : 1));
-         permit.i = 0;
-         if (thread)
-            (void)dvm_get_field(vm, thread, "parkPermit", "Z", &permit);
-         if (permit.i) {
-            permit.i = 0;
-            (void)dvm_set_field(vm, thread, "parkPermit", "Z", permit);
-            return true;
-         }
-      }
+   const unsigned wait_ms = dvm_on_bytecode_thread()
+                          ? DVM_BLOCK_MAX_MS : DVM_PARK_RETRY_MS;
+   if (vm->trace)
+      fprintf(stderr, "[dvm] LockSupport.park wait thread=@%x ms=%u\n",
+              thread, wait_ms);
+   dvm_gil_wait_for(vm, thread, wait_ms);
+   permit.i = 0;
+   if (thread)
+      (void)dvm_get_field(vm, thread, "parkPermit", "Z", &permit);
+   if (permit.i) {
+      permit.i = 0;
+      (void)dvm_set_field(vm, thread, "parkPermit", "Z", permit);
    }
-   dvm__throw(vm, "java/lang/InterruptedException", "thread parked");
-   if (vm->trace) fprintf(stderr, "[dvm] LockSupport.park block thread=@%x\n", thread);
-   vm->parked = true;
-   return false;
+   return true;                    /* permit, interrupt, or spurious wakeup */
 }
 
 static bool locksupport_unpark(struct dvm *vm, dvm_ref self,
@@ -9638,6 +10097,9 @@ static bool tu_indexOf(struct dvm *vm, dvm_ref self,
 static bool tu_indexOf_seq(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out);
+static bool tu_getCapsMode(struct dvm *vm, dvm_ref self,
+                           const union dvm_value *args, int nargs,
+                           union dvm_value *out);
 
 /* TextUtils.isDigitsOnly — true when every character is a digit (an empty
  * sequence is all-digits by that definition, which is what Android returns).
@@ -9715,7 +10177,10 @@ static const struct rt_method rt_textutils[] = {
       tu_join),
    SM("join", "(Ljava/lang/CharSequence;Ljava/lang/Iterable;)Ljava/lang/String;",
       tu_join),
+   SM("indexOf", "(Ljava/lang/CharSequence;C)I", tu_indexOf),
+   SM("indexOf", "(Ljava/lang/CharSequence;CI)I", tu_indexOf),
    SM("indexOf", "(Ljava/lang/CharSequence;CII)I", tu_indexOf),
+   SM("getCapsMode", "(Ljava/lang/CharSequence;II)I", tu_getCapsMode),
    SM("indexOf", "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)I",
       tu_indexOf_seq),
    SM("indexOf", "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;I)I",
@@ -9884,7 +10349,9 @@ static const struct rt_method rt_list_methods[] = {
    M("toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;", list_toArray),
    /* The backing store grows in add(); this is a hint the caller is about to
     * insert many items, not a different capacity model. */
-   M("ensureCapacity", "(I)V", nop_void),
+   /* A capacity hint.  This list grows on demand and reserving ahead only
+    * changes when the reallocation happens, which nothing can observe. */
+   M("ensureCapacity", "(I)V", empty_void),
    M_END,
 };
 
@@ -10242,9 +10709,9 @@ static bool bundle_number(struct dvm *vm, dvm_ref value, int64_t *as_int,
                           double *as_real)
 {
    struct dvm_object *o = value ? dvm__obj(vm, value) : NULL;
-   if (!o || !o->klass || !o->klass->name) return false;
-   const char *name = o->klass->name;
-   if (!strcmp(name, "Ljava/lang/String;")) {
+   if (!o || !o->cls || !o->cls->name) return false;
+   const char *name = o->cls->name;
+   if (!strcmp(name, "java/lang/String")) {
       const char *s = dvm_string_utf8(vm, value);
       if (!s) return false;
       *as_int = strtoll(s, NULL, 10);
@@ -10252,17 +10719,17 @@ static bool bundle_number(struct dvm *vm, dvm_ref value, int64_t *as_int,
       return true;
    }
    if (!o->slots) return false;
-   if (!strcmp(name, "Ljava/lang/Long;")) {
+   if (!strcmp(name, "java/lang/Long")) {
       *as_int = o->slots[0].j; *as_real = (double)o->slots[0].j;
-   } else if (!strcmp(name, "Ljava/lang/Float;")) {
+   } else if (!strcmp(name, "java/lang/Float")) {
       *as_real = o->slots[0].f; *as_int = (int64_t)o->slots[0].f;
-   } else if (!strcmp(name, "Ljava/lang/Double;")) {
+   } else if (!strcmp(name, "java/lang/Double")) {
       *as_real = o->slots[0].d; *as_int = (int64_t)o->slots[0].d;
-   } else if (!strcmp(name, "Ljava/lang/Integer;") ||
-              !strcmp(name, "Ljava/lang/Short;") ||
-              !strcmp(name, "Ljava/lang/Byte;") ||
-              !strcmp(name, "Ljava/lang/Character;") ||
-              !strcmp(name, "Ljava/lang/Boolean;")) {
+   } else if (!strcmp(name, "java/lang/Integer") ||
+              !strcmp(name, "java/lang/Short") ||
+              !strcmp(name, "java/lang/Byte") ||
+              !strcmp(name, "java/lang/Character") ||
+              !strcmp(name, "java/lang/Boolean")) {
       *as_int = o->slots[0].i; *as_real = o->slots[0].i;
    } else {
       return false;
@@ -10815,6 +11282,33 @@ static bool package_item_label(struct dvm *vm, dvm_ref self,
    RETL(label.l ? label.l : dvm_new_string(vm, ""));
 }
 
+static bool res_get_xml(struct dvm *vm, dvm_ref self,
+                        const union dvm_value *args, int nargs,
+                        union dvm_value *out);
+
+/* PackageItemInfo.loadXmlMetaData() resolves the integer resource stored in
+ * its metaData Bundle and opens that resource as an XmlResourceParser.  This
+ * is the common framework path used by providers, services and receivers; a
+ * populated Bundle alone is not sufficient because callers do not normally
+ * read the integer themselves. */
+static bool package_item_load_xml_meta(struct dvm *vm, dvm_ref self,
+                                       const union dvm_value *args, int nargs,
+                                       union dvm_value *out)
+{
+   union dvm_value metadata = { 0 }, id = { 0 };
+   if (nargs < 2 ||
+       !dvm_get_field(vm, self, "metaData", "Landroid/os/Bundle;", &metadata) ||
+       !metadata.l)
+      RETL(0);
+   (void)bundle_getInt(vm, metadata.l, &args[1], 1, &id);
+   if (vm->trace)
+      fprintf(stderr, "[dvm] PackageItemInfo.loadXmlMetaData key=%s -> 0x%x\n",
+              dvm_string_utf8(vm, args[1].l), (unsigned)id.i);
+   if (!id.i) RETL(0);
+   union dvm_value resource = { .i = id.i };
+   return res_get_xml(vm, 0, &resource, 1, out);
+}
+
 static const struct rt_field rt_package_item_fields[] = {
    { "name", "Ljava/lang/String;" }, { "packageName", "Ljava/lang/String;" },
    { "nonLocalizedLabel", "Ljava/lang/CharSequence;" }, F_END
@@ -10822,7 +11316,11 @@ static const struct rt_field rt_package_item_fields[] = {
 
 static const struct rt_method rt_package_item[] = {
    M("loadLabel", "(Landroid/content/pm/PackageManager;)Ljava/lang/CharSequence;",
-     package_item_label), M_END,
+     package_item_label),
+   M("loadXmlMetaData",
+     "(Landroid/content/pm/PackageManager;Ljava/lang/String;)Landroid/content/res/XmlResourceParser;",
+     package_item_load_xml_meta),
+   M_END,
 };
 
 static bool coll_emptySet(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -11081,8 +11579,11 @@ static const struct rt_method rt_lock[] = {
 };
 
 static const struct rt_method rt_rwlock[] = {
-   M("<init>", "()V", nop_void),
-   M("<init>", "(Z)V", nop_void),
+   /* The read and write views are built on first use by readLock() and
+    * writeLock(), so the constructor has nothing left to do.  The fairness
+    * flag has no meaning where the locks never block. */
+   M("<init>", "()V", empty_void),
+   M("<init>", "(Z)V", empty_void),
    M("readLock", "()Ljava/util/concurrent/locks/ReentrantReadWriteLock$ReadLock;",
      rwlock_readLock),
    M("writeLock", "()Ljava/util/concurrent/locks/ReentrantReadWriteLock$WriteLock;",
@@ -11431,8 +11932,11 @@ static const struct rt_method rt_logger[] = {
 };
 
 static const struct rt_method rt_os_trace[] = {
-   SM("beginSection", "(Ljava/lang/String;)V", nop_void),
-   SM("endSection", "()V", nop_void),
+   /* android.os.Trace writes into the kernel's systrace buffer.  Nothing is
+    * tracing this process and there is no buffer to write to, so a section
+    * marker genuinely has nowhere to go. */
+   SM("beginSection", "(Ljava/lang/String;)V", empty_void),
+   SM("endSection", "()V", empty_void),
    SM("isEnabled", "()Z", ret_false),
    M_END,
 };
@@ -11717,6 +12221,36 @@ static bool q_put(struct dvm *vm, dvm_ref self, const union dvm_value *args,
    RETV();
 }
 
+static bool q_drainTo(struct dvm *vm, dvm_ref self,
+                      const union dvm_value *args, int nargs,
+                      union dvm_value *out)
+{
+   dvm_ref destination = nargs ? ARG(0).l : 0;
+   if (!destination || destination == self) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException",
+                 "drainTo destination must be a different collection");
+      return false;
+   }
+   struct rt_list *source = list_of(vm, self);
+   uint32_t limit = source ? source->size : 0;
+   if (nargs > 1 && ARG(1).i >= 0 && (uint32_t)ARG(1).i < limit)
+      limit = (uint32_t)ARG(1).i;
+   struct dvm_class *dc = dvm_object_class(vm, destination);
+   struct dvm_method *add = dc
+      ? dvm_find_method(vm, dc, "add", "(Ljava/lang/Object;)Z") : NULL;
+   uint32_t moved = 0;
+   while (source && source->size && moved < limit) {
+      union dvm_value item = { .l = source->items[0] }, accepted = { 0 };
+      if (!add || !dvm_call(vm, add, destination, &item, 1, &accepted))
+         break;
+      memmove(&source->items[0], &source->items[1],
+              (source->size - 1) * sizeof source->items[0]);
+      --source->size;
+      ++moved;
+   }
+   RETI((int32_t)moved);
+}
+
 static const struct rt_method rt_blocking_queue[] = {
    M("<init>", "()V", list_init),
    M("<init>", "(I)V", list_init),
@@ -11736,6 +12270,8 @@ static const struct rt_method rt_blocking_queue[] = {
    M("clear", "()V", list_clear),
    M("contains", "(Ljava/lang/Object;)Z", list_contains),
    M("containsAll", "(Ljava/util/Collection;)Z", list_containsAll),
+   M("drainTo", "(Ljava/util/Collection;)I", q_drainTo),
+   M("drainTo", "(Ljava/util/Collection;I)I", q_drainTo),
    M("iterator", "()Ljava/util/Iterator;", list_iterator),
    M_END,
 };
@@ -13802,6 +14338,22 @@ struct rt_conn {
    dvm_ref out_stream;              /* the request body, once asked for */
    int connect_timeout, read_timeout;
    bool follow;
+   /* The three switches HttpURLConnection is configured with before it
+    * connects.  They were accepted and thrown away, so the API's own rules —
+    * "you may not write to a connection with doOutput=false", "a connection
+    * with a body and no method is a POST", "streaming mode may not be chosen
+    * after connecting" — could not be applied, and a caller that got them
+    * wrong found out from a wrong request rather than from the exception the
+    * platform owes it.  doInput defaults to true, doOutput to false and
+    * useCaches to true, as they do on a device. */
+   bool do_input, do_output, use_caches;
+   /* setChunkedStreamingMode / setFixedLengthStreamingMode: the caller asking
+    * not to have its body buffered.  This client always has the whole body
+    * before it sends — the request is framed with a Content-Length, which is
+    * the same request either way — so the value is kept for getters and for
+    * the "not after connecting" rule rather than changing the wire format.
+    * -1 means "not chosen". */
+   int chunk_len, fixed_len;
    bool performed;
    bool failed;
    struct dvm_http_response resp;
@@ -14179,6 +14731,9 @@ static bool url_openConnection(struct dvm *vm, dvm_ref self,
    rc->connect_timeout = 30000;
    rc->read_timeout = 30000;
    rc->follow = true;
+   rc->do_input = true;
+   rc->use_caches = true;
+   rc->chunk_len = rc->fixed_len = -1;
    rc->resp.status = -1;
    union dvm_value v = { .l = dvm_new_string(vm, s) };
    (void)dvm_set_field(vm, c, "url", "Ljava/lang/String;", v);
@@ -14275,6 +14830,109 @@ static bool conn_setFollowRedirects(struct dvm *vm, dvm_ref self,
    RETV();
 }
 
+/* setDoInput / setDoOutput / setUseCaches.
+ *
+ * These are not decorations: doOutput is what turns a request into one that
+ * has a body, and the platform reads it back in getOutputStream() and in the
+ * method it ends up sending.  Discarding them meant a caller could set
+ * doOutput(true) and still have its POST go out as a GET. */
+static bool conn_setDoInput(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)nargs;
+   struct rt_conn *c = conn_of(vm, self);
+   if (c) c->do_input = ARG(0).i != 0;
+   RETV();
+}
+
+static bool conn_setDoOutput(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)nargs;
+   struct rt_conn *c = conn_of(vm, self);
+   if (c) c->do_output = ARG(0).i != 0;
+   RETV();
+}
+
+static bool conn_setUseCaches(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)nargs;
+   struct rt_conn *c = conn_of(vm, self);
+   if (c) c->use_caches = ARG(0).i != 0;
+   RETV();
+}
+
+static bool conn_getDoInput(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   struct rt_conn *c = conn_of(vm, self);
+   RETI(c ? c->do_input : 1);
+}
+
+static bool conn_getDoOutput(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   struct rt_conn *c = conn_of(vm, self);
+   RETI(c ? c->do_output : 0);
+}
+
+static bool conn_getUseCaches(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   struct rt_conn *c = conn_of(vm, self);
+   RETI(c ? c->use_caches : 1);
+}
+
+/* setChunkedStreamingMode(len) / setFixedLengthStreamingMode(len).
+ *
+ * Both say "do not buffer my body".  This client has the whole body in hand
+ * before it sends — see conn_perform — so the request goes out framed by
+ * Content-Length either way, which is the same request on the wire and the
+ * one framing every server accepts.  What is *not* the same is the rule the
+ * platform enforces: choosing a streaming mode after the connection has been
+ * made is an error the caller needs to be told about, because it means its
+ * body is going somewhere it did not intend. */
+static bool conn_setStreamingMode(struct dvm *vm, dvm_ref self,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+   (void)nargs;
+   struct rt_conn *c = conn_of(vm, self);
+   if (!c) RETV();
+   if (c->performed) {
+      dvm__throw(vm, "java/lang/IllegalStateException",
+                 "already connected");
+      return false;
+   }
+   c->chunk_len = ARG(0).i;
+   RETV();
+}
+
+static bool conn_setFixedLengthMode(struct dvm *vm, dvm_ref self,
+                                    const union dvm_value *args, int nargs,
+                                    union dvm_value *out)
+{
+   (void)nargs;
+   struct rt_conn *c = conn_of(vm, self);
+   if (!c) RETV();
+   if (c->performed) {
+      dvm__throw(vm, "java/lang/IllegalStateException", "already connected");
+      return false;
+   }
+   c->fixed_len = ARG(0).i;
+   RETV();
+}
+
 static bool conn_getOutputStream(struct dvm *vm, dvm_ref self,
                                  const union dvm_value *args, int nargs,
                                  union dvm_value *out)
@@ -14282,6 +14940,15 @@ static bool conn_getOutputStream(struct dvm *vm, dvm_ref self,
    (void)args; (void)nargs;
    struct rt_conn *c = conn_of(vm, self);
    if (!c) RETL(0);
+   /* The platform's own rule.  A caller that writes a body without asking for
+    * one has a bug, and this exception is where it finds out; answering with
+    * a stream instead sends a request nobody meant to send. */
+   if (!c->do_output) {
+      dvm__throw(vm, "java/net/ProtocolException",
+                 "cannot write to a URLConnection if doOutput=false - "
+                 "call setDoOutput(true)");
+      return false;
+   }
    if (!c->out_stream) {
       struct dvm_class *cls =
          dvm__class_by_desc(vm, "Ljava/io/ByteArrayOutputStream;");
@@ -14313,6 +14980,13 @@ static bool conn_perform(struct dvm *vm, dvm_ref self, struct rt_conn *c)
          body = p;
          body_len = n;
       }
+   }
+   /* HttpURLConnection turns a doOutput connection whose method is still the
+    * default GET into a POST — a GET with a body is not what the caller
+    * asked for and not what a server will accept. */
+   if (c->do_output && c->method && !strcmp(c->method, "GET")) {
+      free(c->method);
+      c->method = strdup("POST");
    }
    int timeout = c->connect_timeout > c->read_timeout ? c->connect_timeout
                                                       : c->read_timeout;
@@ -14806,12 +15480,17 @@ static const struct rt_method rt_url_connection[] = {
    M("getReadTimeout", "()I", ret_zero),
    M("setInstanceFollowRedirects", "(Z)V", conn_setFollowRedirects),
    M("getInstanceFollowRedirects", "()Z", ret_true),
-   M("setUseCaches", "(Z)V", nop_void),
-   M("setDefaultUseCaches", "(Z)V", nop_void),
-   M("setDoInput", "(Z)V", nop_void),
-   M("setDoOutput", "(Z)V", nop_void),
-   M("setChunkedStreamingMode", "(I)V", nop_void),
-   M("setFixedLengthStreamingMode", "(I)V", nop_void),
+   M("setUseCaches", "(Z)V", conn_setUseCaches),
+   M("getUseCaches", "()Z", conn_getUseCaches),
+   /* There is no response cache here, so the process-wide default is the
+    * setting every connection already has. */
+   SM("setDefaultUseCaches", "(Z)V", empty_void),
+   M("setDoInput", "(Z)V", conn_setDoInput),
+   M("getDoInput", "()Z", conn_getDoInput),
+   M("setDoOutput", "(Z)V", conn_setDoOutput),
+   M("getDoOutput", "()Z", conn_getDoOutput),
+   M("setChunkedStreamingMode", "(I)V", conn_setStreamingMode),
+   M("setFixedLengthStreamingMode", "(I)V", conn_setFixedLengthMode),
    M("setSSLSocketFactory", "(Ljavax/net/ssl/SSLSocketFactory;)V", nop_void),
    M("setHostnameVerifier", "(Ljavax/net/ssl/HostnameVerifier;)V", nop_void),
    M("connect", "()V", conn_connect),
@@ -14951,7 +15630,12 @@ static const struct rt_method rt_handler[] = {
    M("removeCallbacks", "(Ljava/lang/Runnable;)V", h_removeCallbacks),
    M("removeCallbacks", "(Ljava/lang/Runnable;Ljava/lang/Object;)V",
      h_removeCallbacks),
-   M("removeCallbacksAndMessages", "(Ljava/lang/Object;)V", nop_void),
+   M("removeCallbacksAndMessages", "(Ljava/lang/Object;)V",
+     h_removeCallbacksAndMessages),
+   M("removeMessages", "(I)V", h_removeMessages),
+   M("removeMessages", "(ILjava/lang/Object;)V", h_removeMessages),
+   M("hasMessages", "(I)Z", h_hasMessages),
+   M("hasMessages", "(ILjava/lang/Object;)Z", h_hasMessages),
    M("obtainMessage", "(I)Landroid/os/Message;", h_obtainMessage),
    M("obtainMessage", "()Landroid/os/Message;", h_obtainMessage),
    M("obtainMessage", "(ILjava/lang/Object;)Landroid/os/Message;", h_obtainMessage),
@@ -14962,7 +15646,10 @@ static const struct rt_method rt_handler[] = {
    M("sendEmptyMessage", "(I)Z", h_sendEmptyMessage),
    M("sendEmptyMessageDelayed", "(IJ)Z", h_sendEmptyMessage),
    M("sendMessageDelayed", "(Landroid/os/Message;J)Z", h_sendMessage),
-   M("handleMessage", "(Landroid/os/Message;)V", nop_void),
+   /* Handler.handleMessage() is empty on Android too — it exists to be
+    * overridden, and a Handler built without a subclass or a Callback is one
+    * whose messages are meant to go nowhere. */
+   M("handleMessage", "(Landroid/os/Message;)V", empty_void),
    M_END,
 };
 
@@ -15006,6 +15693,8 @@ static const struct rt_field rt_message_fields[] = {
    { "what", "I" }, { "arg1", "I" }, { "arg2", "I" },
    { "obj", "Ljava/lang/Object;" },
    { "target", "Landroid/os/Handler;" },
+   { "replyTo", "Landroid/os/Messenger;" },
+   { "when", "J" },
    { "data", "Landroid/os/Bundle;" },
    /* Message.obtain(handler, runnable) carries the work on the message; it
     * takes precedence over both the Handler's Callback and handleMessage(). */
@@ -15045,6 +15734,36 @@ static bool msg_getData(struct dvm *vm, dvm_ref self,
    RETL(v.l);
 }
 
+static bool msg_getWhen(struct dvm *vm, dvm_ref self,
+                        const union dvm_value *args, int nargs,
+                        union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value when = { 0 };
+   (void)dvm_get_field(vm, self, "when", "J", &when);
+   RETJ(when.j);
+}
+
+static bool msg_getTarget(struct dvm *vm, dvm_ref self,
+                          const union dvm_value *args, int nargs,
+                          union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value target = { 0 };
+   (void)dvm_get_field(vm, self, "target", "Landroid/os/Handler;", &target);
+   RETL(target.l);
+}
+
+static bool msg_getCallback(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value callback = { 0 };
+   (void)dvm_get_field(vm, self, "callback", "Ljava/lang/Runnable;", &callback);
+   RETL(callback.l);
+}
+
 static bool msg_peekData(struct dvm *vm, dvm_ref self,
                          const union dvm_value *args, int nargs,
                          union dvm_value *out)
@@ -15053,6 +15772,75 @@ static bool msg_peekData(struct dvm *vm, dvm_ref self,
    union dvm_value v = { 0 };
    (void)dvm_get_field(vm, self, "data", "Landroid/os/Bundle;", &v);
    RETL(v.l);
+}
+
+static dvm_ref msg_new(struct dvm *vm)
+{
+   struct dvm_class *mc = dvm__class_by_desc(vm, "Landroid/os/Message;");
+   return mc ? dvm_new_object(vm, mc) : 0;
+}
+
+static bool msg_obtain(struct dvm *vm, dvm_ref self,
+                       const union dvm_value *args, int nargs,
+                       union dvm_value *out)
+{
+   (void)self;
+   dvm_ref message = msg_new(vm);
+   if (!message) RETL(0);
+   if (nargs > 0) {
+      union dvm_value v = { .l = ARG(0).l };
+      (void)dvm_set_field(vm, message, "target", "Landroid/os/Handler;", v);
+   }
+   if (nargs > 1) {
+      union dvm_value v = { .i = ARG(1).i };
+      (void)dvm_set_field(vm, message, "what", "I", v);
+   }
+   if (nargs > 2) {
+      union dvm_value v = { .i = ARG(2).i };
+      (void)dvm_set_field(vm, message, "arg1", "I", v);
+   }
+   if (nargs > 3) {
+      union dvm_value v = { .i = ARG(3).i };
+      (void)dvm_set_field(vm, message, "arg2", "I", v);
+   }
+   if (nargs > 4) {
+      union dvm_value v = { .l = ARG(4).l };
+      (void)dvm_set_field(vm, message, "obj", "Ljava/lang/Object;", v);
+   }
+   RETL(message);
+}
+
+static bool msg_obtain_object(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)self;
+   dvm_ref message = msg_new(vm);
+   if (!message) RETL(0);
+   if (nargs > 0) {
+      union dvm_value target = { .l = ARG(0).l };
+      (void)dvm_set_field(vm, message, "target", "Landroid/os/Handler;", target);
+   }
+   if (nargs > 2) {
+      union dvm_value what = { .i = ARG(1).i }, object = { .l = ARG(2).l };
+      (void)dvm_set_field(vm, message, "what", "I", what);
+      (void)dvm_set_field(vm, message, "obj", "Ljava/lang/Object;", object);
+   }
+   RETL(message);
+}
+
+static bool msg_obtain_callback(struct dvm *vm, dvm_ref self,
+                                const union dvm_value *args, int nargs,
+                                union dvm_value *out)
+{
+   (void)self;
+   dvm_ref message = msg_new(vm);
+   if (!message) RETL(0);
+   union dvm_value target = { .l = nargs ? ARG(0).l : 0 };
+   union dvm_value callback = { .l = nargs > 1 ? ARG(1).l : 0 };
+   (void)dvm_set_field(vm, message, "target", "Landroid/os/Handler;", target);
+   (void)dvm_set_field(vm, message, "callback", "Ljava/lang/Runnable;", callback);
+   RETL(message);
 }
 
 /* Handler.dispatchMessage(), in the order the platform defines it: the
@@ -15131,10 +15919,23 @@ static bool msg_run(struct dvm *vm, dvm_ref self,
 
 static const struct rt_method rt_message[] = {
    M("<init>", "()V", msg_init),
+   SM("obtain", "()Landroid/os/Message;", msg_obtain),
+   SM("obtain", "(Landroid/os/Handler;)Landroid/os/Message;", msg_obtain),
+   SM("obtain", "(Landroid/os/Handler;I)Landroid/os/Message;", msg_obtain),
+   SM("obtain", "(Landroid/os/Handler;III)Landroid/os/Message;", msg_obtain),
+   SM("obtain", "(Landroid/os/Handler;IIILjava/lang/Object;)Landroid/os/Message;",
+      msg_obtain),
+   SM("obtain", "(Landroid/os/Handler;ILjava/lang/Object;)Landroid/os/Message;",
+      msg_obtain_object),
+   SM("obtain", "(Landroid/os/Handler;Ljava/lang/Runnable;)Landroid/os/Message;",
+      msg_obtain_callback),
    M("run", "()V", msg_run),
    M("setData", "(Landroid/os/Bundle;)V", msg_setData),
    M("getData", "()Landroid/os/Bundle;", msg_getData),
    M("peekData", "()Landroid/os/Bundle;", msg_peekData),
+   M("getWhen", "()J", msg_getWhen),
+   M("getTarget", "()Landroid/os/Handler;", msg_getTarget),
+   M("getCallback", "()Ljava/lang/Runnable;", msg_getCallback),
    M_END,
 };
 
@@ -15174,7 +15975,14 @@ static bool h_sendMessage(struct dvm *vm, dvm_ref self,
    if (!msg) RETI(0);
    union dvm_value target = { .l = self };
    (void)dvm_set_field(vm, msg, "target", "Landroid/os/Handler;", target);
-   if (!queue_runnable(vm, msg, false)) RETI(0);
+   /* sendMessageDelayed(msg, ms) carries a delay, and the Message's own `obj`
+    * is the token removeCallbacksAndMessages() will be asked about. */
+   int64_t delay = nargs > 1 ? ARG(1).j : 0;
+   union dvm_value when = { .j = (int64_t)dvm__now_ms() + delay };
+   (void)dvm_set_field(vm, msg, "when", "J", when);
+   union dvm_value obj = { 0 };
+   (void)dvm_get_field(vm, msg, "obj", "Ljava/lang/Object;", &obj);
+   if (!queue_runnable_for(vm, msg, false, delay, 0, self, obj.l)) RETI(0);
    RETI(1);
 }
 
@@ -19436,9 +20244,15 @@ static bool kgs_builder_build(struct dvm *vm, dvm_ref self,
       if (dvm_get_field(vm, self, copy[i], sig, &v) && v.l)
          (void)dvm_set_field(vm, spec, copy[i], sig, v);
    }
-   union dvm_value purposes = { 0 };
-   (void)dvm_get_field(vm, self, "purposes", "I", &purposes);
-   (void)dvm_set_field(vm, spec, "purposes", "I", purposes);
+   static const char *const copy_int[] = {
+      "purposes", "keySize", "randomizedEncryptionRequired", "randomizedSet",
+      "userAuthenticationRequired", NULL
+   };
+   for (int i = 0; copy_int[i]; ++i) {
+      union dvm_value v = { 0 };
+      (void)dvm_get_field(vm, self, copy_int[i], "I", &v);
+      (void)dvm_set_field(vm, spec, copy_int[i], "I", v);
+   }
    RETL(spec);
 }
 
@@ -19472,9 +20286,73 @@ static bool kgs_set_digests(struct dvm *vm, dvm_ref self,
    RETL(self);
 }
 
+static bool kgs_set_key_size(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)nargs;
+   /* The size has to survive into the Spec: KeyGenerator.init(spec) reads it
+    * to decide how many bits to draw, and a zero there is not "the default",
+    * it is an InvalidAlgorithmParameterException on a real device. */
+   rt_set_int(vm, self, "keySize", ARG(0).i);
+   RETL(self);
+}
+
+/* Android's defaults: randomized encryption is required unless the caller
+ * turns it off, user authentication is not.  Store the two so build() can
+ * carry them and the getters answer what was actually asked for. */
+static bool kgs_set_randomized(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)nargs;
+   rt_set_int(vm, self, "randomizedEncryptionRequired", ARG(0).i ? 1 : 0);
+   rt_set_int(vm, self, "randomizedSet", 1);
+   RETL(self);
+}
+
+static bool kgs_set_user_auth(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)nargs;
+   rt_set_int(vm, self, "userAuthenticationRequired", ARG(0).i ? 1 : 0);
+   RETL(self);
+}
+
+static bool kgs_is_randomized(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   if (!rt_get_int(vm, self, "randomizedSet")) RETI(1);   /* Android default */
+   RETI(rt_get_int(vm, self, "randomizedEncryptionRequired") ? 1 : 0);
+}
+
+static bool kgs_is_user_auth(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   RETI(rt_get_int(vm, self, "userAuthenticationRequired") ? 1 : 0);
+}
+
+static bool kgs_set_sig_paddings(struct dvm *vm, dvm_ref self,
+                                 const union dvm_value *args, int nargs,
+                                 union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value v = { .l = ARG(0).l };
+   (void)dvm_set_field(vm, self, "signaturePaddings", "[Ljava/lang/String;", v);
+   RETL(self);
+}
+
 static const struct rt_field rt_kgs_builder_fields[] = {
    { "keystoreAlias", "Ljava/lang/String;" },
    { "purposes", "I" },
+   { "keySize", "I" },
+   { "randomizedEncryptionRequired", "I" }, { "randomizedSet", "I" },
+   { "userAuthenticationRequired", "I" },
    { "blockModes", "[Ljava/lang/String;" },
    { "encryptionPaddings", "[Ljava/lang/String;" },
    { "digests", "[Ljava/lang/String;" },
@@ -19493,15 +20371,17 @@ static const struct rt_method rt_kgs_builder[] = {
    M("setDigests",
      "([Ljava/lang/String;)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
      kgs_set_digests),
+   M("setKeySize", "(I)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
+     kgs_set_key_size),
    M("setSignaturePaddings",
      "([Ljava/lang/String;)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
-     kgs_builder_self),
+     kgs_set_sig_paddings),
    M("setRandomizedEncryptionRequired",
      "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
-     kgs_builder_self),
+     kgs_set_randomized),
    M("setUserAuthenticationRequired",
      "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
-     kgs_builder_self),
+     kgs_set_user_auth),
    M("build", "()Landroid/security/keystore/KeyGenParameterSpec;",
      kgs_builder_build),
    M_END,
@@ -19517,12 +20397,24 @@ static bool kgs_get_alias(struct dvm *vm, dvm_ref self,
    RETL(v.l);
 }
 
+static bool kgs_get_key_size(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   RETI(rt_get_int(vm, self, "keySize"));
+}
+
 static const struct rt_field rt_kgs_fields[] = {
    { "keystoreAlias", "Ljava/lang/String;" },
    { "purposes", "I" },
+   { "keySize", "I" },
+   { "randomizedEncryptionRequired", "I" }, { "randomizedSet", "I" },
+   { "userAuthenticationRequired", "I" },
    { "blockModes", "[Ljava/lang/String;" },
    { "encryptionPaddings", "[Ljava/lang/String;" },
    { "digests", "[Ljava/lang/String;" },
+   { "signaturePaddings", "[Ljava/lang/String;" },
    F_END
 };
 
@@ -19536,9 +20428,36 @@ static bool kgs_get_purposes(struct dvm *vm, dvm_ref self,
    RETI(v.i);
 }
 
+/* androidx.security's MasterKeys.validate() reads every parameter back off the
+ * spec and compares it with what it asked for; a missing getter is not a
+ * missing convenience, it is the key being rejected. */
+#define KGS_GET_STR_ARRAY(fn, field)                                         \
+   static bool fn(struct dvm *vm, dvm_ref self,                              \
+                  const union dvm_value *args, int nargs,                    \
+                  union dvm_value *out)                                      \
+   {                                                                         \
+      (void)args; (void)nargs;                                               \
+      union dvm_value v = { 0 };                                             \
+      if (dvm_get_field(vm, self, field, "[Ljava/lang/String;", &v) && v.l)   \
+         RETL(v.l);                                                          \
+      RETL(dvm_new_array(vm, 'L', "Ljava/lang/String;", 0));                 \
+   }
+KGS_GET_STR_ARRAY(kgs_get_block_modes, "blockModes")
+KGS_GET_STR_ARRAY(kgs_get_enc_paddings, "encryptionPaddings")
+KGS_GET_STR_ARRAY(kgs_get_digests, "digests")
+KGS_GET_STR_ARRAY(kgs_get_sig_paddings, "signaturePaddings")
+#undef KGS_GET_STR_ARRAY
+
 static const struct rt_method rt_kgs[] = {
    M("getKeystoreAlias", "()Ljava/lang/String;", kgs_get_alias),
    M("getPurposes", "()I", kgs_get_purposes),
+   M("getKeySize", "()I", kgs_get_key_size),
+   M("getBlockModes", "()[Ljava/lang/String;", kgs_get_block_modes),
+   M("getEncryptionPaddings", "()[Ljava/lang/String;", kgs_get_enc_paddings),
+   M("getDigests", "()[Ljava/lang/String;", kgs_get_digests),
+   M("getSignaturePaddings", "()[Ljava/lang/String;", kgs_get_sig_paddings),
+   M("isRandomizedEncryptionRequired", "()Z", kgs_is_randomized),
+   M("isUserAuthenticationRequired", "()Z", kgs_is_user_auth),
    M_END,
 };
 
@@ -19738,16 +20657,45 @@ static bool sr_getAlgorithm(struct dvm *vm, dvm_ref self,
    RETL(dvm_new_string(vm, "SHA1PRNG"));
 }
 
+/* SecureRandom's seeding calls.  Its contract is explicit that a given seed
+ * *supplements* rather than replaces the generator's existing state — the
+ * opposite of java.util.Random, where the seed is the whole state — so mixing
+ * it into the CSPRNG is both what the API promises and the only thing that
+ * would be safe to do with it. */
+static bool sr_setSeed_bytes(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   const void *b = dvm_array_data(vm, ARG(0).l);
+   uint32_t n = dvm_array_length(vm, ARG(0).l);
+   if (b && n) RAND_seed(b, (int)n);
+   RETV();
+}
+
+static bool sr_setSeed_long(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)vm; (void)self; (void)nargs;
+   int64_t v = ARG(0).j;
+   RAND_seed(&v, (int)sizeof v);
+   RETV();
+}
+
 static const struct rt_method rt_secure_random[] = {
-   M("<init>", "()V", nop_void),
-   M("<init>", "([B)V", nop_void),
+   /* Constructing a SecureRandom picks a provider; here there is one CSPRNG
+    * and it needs no per-instance state, so there is nothing to construct.
+    * The seeding constructor is a different matter — see setSeed below. */
+   M("<init>", "()V", empty_void),
+   M("<init>", "([B)V", sr_setSeed_bytes),
    SM("getInstance", "(Ljava/lang/String;)Ljava/security/SecureRandom;",
       sr_getInstance),
    SM("getInstanceStrong", "()Ljava/security/SecureRandom;", sr_getInstance),
    SM("getSeed", "(I)[B", sr_getSeed),
    M("generateSeed", "(I)[B", sr_getSeed),
-   M("setSeed", "(J)V", nop_void),
-   M("setSeed", "([B)V", nop_void),
+   M("setSeed", "(J)V", sr_setSeed_long),
+   M("setSeed", "([B)V", sr_setSeed_bytes),
    M("nextBytes", "([B)V", sr_nextBytes),
    M("nextInt", "()I", sr_nextInt),
    M("nextInt", "(I)I", sr_nextInt),
@@ -19914,6 +20862,10 @@ static bool looper_loop(struct dvm *vm, dvm_ref self,
                  (size_t)(vm->npending - i - 1) * sizeof(vm->pending_due_ms[0]));
          memmove(&vm->pending_looper[i], &vm->pending_looper[i + 1],
                  (size_t)(vm->npending - i - 1) * sizeof(vm->pending_looper[0]));
+         memmove(&vm->pending_owner[i], &vm->pending_owner[i + 1],
+                 (size_t)(vm->npending - i - 1) * sizeof(vm->pending_owner[0]));
+         memmove(&vm->pending_token[i], &vm->pending_token[i + 1],
+                 (size_t)(vm->npending - i - 1) * sizeof(vm->pending_token[0]));
          --vm->npending;
          struct dvm_class *c = dvm_object_class(vm, r);
          struct dvm_method *run =
@@ -24046,6 +24998,8 @@ static const struct rt_method rt_intent[] = {
      intent_putExtra),
    M("putExtra", "(Ljava/lang/String;Ljava/lang/Object;)Landroid/content/Intent;",
      intent_putExtra),
+   M("putExtra", "(Ljava/lang/String;Landroid/os/Parcelable;)Landroid/content/Intent;",
+     intent_putExtra),
    M("hasExtra", "(Ljava/lang/String;)Z", intent_hasExtra),
    M("getStringExtra", "(Ljava/lang/String;)Ljava/lang/String;", intent_getExtra),
    M("getParcelableExtra", "(Ljava/lang/String;)Landroid/os/Parcelable;",
@@ -25235,7 +26189,9 @@ static const struct rt_method rt_activity_manager[] = {
 };
 
 static const struct rt_method rt_activity_memory_info[] = {
-   M("<init>", "()V", nop_void), M_END,
+   /* A record with no behaviour: ActivityManager.getMemoryInfo() is what
+    * fills it in, and its fields start at zero on a device too. */
+   M("<init>", "()V", empty_void), M_END,
 };
 
 static const struct rt_method rt_debug_memory_info[] = {
@@ -25814,6 +26770,17 @@ static const struct rt_method rt_urldecoder[] = {
    M_END,
 };
 
+/* String and the boxes are Comparable and Serializable on the platform.
+ * Without the Comparable edge gson's LinkedTreeMap rejects every String
+ * key outright — its natural-ordering path tests `key instanceof
+ * Comparable` and throws "java.lang.String is not Comparable" — which is
+ * where the combo SDK's env config parse died. */
+static const char *const rt_iface_comparable[] = { "Ljava/lang/Comparable;",
+                                                   "Ljava/io/Serializable;",
+                                                   NULL };
+static const char *const rt_iface_charseq_comparable[] = {
+   "Ljava/lang/CharSequence;", "Ljava/lang/Comparable;",
+   "Ljava/io/Serializable;", NULL };
 static const char *const rt_iface_charseq[]    = { "Ljava/lang/CharSequence;", NULL };
 /* StringBuilder/StringBuffer are `implements Appendable, CharSequence`.  With
  * only CharSequence modelled, `check-cast Ljava/lang/Appendable;` on a builder
@@ -25826,6 +26793,11 @@ static const char *const rt_iface_appendable[] = { "Ljava/lang/Appendable;",
 static const char *const rt_iface_closeable[]  = { "Ljava/io/Closeable;",
                                                    "Ljava/lang/AutoCloseable;",
                                                    NULL };
+static const char *const rt_iface_parcelable[] = { "Landroid/os/Parcelable;",
+                                                   NULL };
+static const char *const rt_iface_parcelable_closeable[] = {
+   "Landroid/os/Parcelable;", "Ljava/io/Closeable;",
+   "Ljava/lang/AutoCloseable;", NULL };
 static const char *const rt_iface_iterable[]   = { "Ljava/lang/Iterable;", NULL };
 static const char *const rt_iface_collection[] = { "Ljava/util/Collection;",
                                                    "Ljava/lang/Iterable;", NULL };
@@ -25833,6 +26805,12 @@ static const char *const rt_iface_list[]       = { "Ljava/util/List;",
                                                    "Ljava/util/Collection;",
                                                    "Ljava/lang/Iterable;", NULL };
 static const char *const rt_iface_map[]        = { "Ljava/util/Map;", NULL };
+/* AbstractMap is supplied by the boot class path on Android, not by an APK.
+ * APK classes such as Gson's LinkedTreeMap therefore reach it through the
+ * builtin table.  Preserve its declared Map edge: otherwise an ordinary
+ * `linkedTreeMap instanceof Map` is false and parsers fail before consuming
+ * an object's property name. */
+static const char *const rt_iface_abstract_map[] = { "Ljava/util/Map;", NULL };
 static const char *const rt_iface_concurrent_map[] = {
    "Ljava/util/concurrent/ConcurrentMap;", "Ljava/util/Map;", NULL };
 static const char *const rt_iface_class[] = {
@@ -26220,6 +27198,136 @@ static bool tpe_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
    RETV();
 }
 
+/* ThreadPoolExecutor's tuning calls.
+ *
+ * These decide when the pool grows and when an idle worker is retired.  Two
+ * of the three are *observable to the app* through their getters, and were
+ * answering for a pool nobody had configured; the pool sizes are observable
+ * in a stronger sense still, because setCorePoolSize/setMaximumPoolSize
+ * change how much of the app's work can be in flight at once.
+ *
+ * The keep-alive is the one setting this pool cannot act on: its workers are
+ * started on demand and live for the process, so there is no idle-retirement
+ * moment for a timeout to name.  That is a difference in when host threads are
+ * reclaimed and in nothing else the app can see — it is recorded and read
+ * back, and said plainly here rather than reported as a working timeout. */
+static bool tpe_set_keep_alive(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)nargs;
+   /* setKeepAliveTime(long time, TimeUnit unit): stored in nanoseconds, the
+    * unit getKeepAliveTime() converts back out of. */
+   union dvm_value v = { .j = ARG(0).j };
+   (void)dvm_set_field(vm, self, "keepAlive", "J", v);
+   RETV();
+}
+
+static bool tpe_get_keep_alive(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "keepAlive", "J", &v);
+   RETJ(v.j);
+}
+
+static bool tpe_allow_core_timeout(struct dvm *vm, dvm_ref self,
+                                   const union dvm_value *args, int nargs,
+                                   union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value v = { .i = ARG(0).i != 0 };
+   (void)dvm_set_field(vm, self, "allowCoreTimeout", "Z", v);
+   RETV();
+}
+
+static bool tpe_allows_core_timeout(struct dvm *vm, dvm_ref self,
+                                    const union dvm_value *args, int nargs,
+                                    union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "allowCoreTimeout", "Z", &v);
+   RETI(v.i ? 1 : 0);
+}
+
+/* setMaximumPoolSize / setCorePoolSize really do change the pool: the next
+ * task submitted may start another worker, or may not. */
+static bool tpe_set_pool_size(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)nargs;
+   (void)exec_configure(vm, self, ARG(0).i);
+   RETV();
+}
+
+static bool tpe_get_pool_size(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "maxWorkers", "I", &v);
+   RETI(v.i);
+}
+
+/* getPoolSize()/getActiveCount(): how many workers exist right now. */
+static bool tpe_get_workers(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "workers", "I", &v);
+   RETI(v.i);
+}
+
+static bool tpe_get_queue(struct dvm *vm, dvm_ref self,
+                          const union dvm_value *args, int nargs,
+                          union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   RETL(exec_task_queue(vm, self));
+}
+
+static bool tpe_set_rejected_handler(struct dvm *vm, dvm_ref self,
+                                     const union dvm_value *args, int nargs,
+                                     union dvm_value *out)
+{
+   (void)nargs;
+   /* The queue here is unbounded and the pool never refuses work, so the
+    * handler is never reached — but it is still what getRejectedExecutionHandler
+    * has to answer with. */
+   union dvm_value v = { .l = ARG(0).l };
+   (void)dvm_set_field(vm, self, "rejectedHandler",
+                       "Ljava/util/concurrent/RejectedExecutionHandler;", v);
+   RETV();
+}
+
+static bool tpe_get_rejected_handler(struct dvm *vm, dvm_ref self,
+                                     const union dvm_value *args, int nargs,
+                                     union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "rejectedHandler",
+                       "Ljava/util/concurrent/RejectedExecutionHandler;", &v);
+   RETL(v.l);
+}
+
+static const struct rt_field rt_thread_pool_fields[] = {
+   { "tasks", "Ljava/util/concurrent/BlockingQueue;" },
+   { "workers", "I" },
+   { "maxWorkers", "I" },
+   { "keepAlive", "J" },
+   { "allowCoreTimeout", "Z" },
+   { "rejectedHandler", "Ljava/util/concurrent/RejectedExecutionHandler;" },
+   F_END,
+};
+
 static const struct rt_method rt_thread_pool_executor[] = {
    M("<init>",
      "(IIJLjava/util/concurrent/TimeUnit;Ljava/util/concurrent/BlockingQueue;)V",
@@ -26238,16 +27346,31 @@ static const struct rt_method rt_thread_pool_executor[] = {
      "Ljava/util/concurrent/RejectedExecutionHandler;)V",
      tpe_init),
    M("setRejectedExecutionHandler",
-     "(Ljava/util/concurrent/RejectedExecutionHandler;)V", nop_void),
-   M("allowCoreThreadTimeOut", "(Z)V", nop_void),
-   M("setKeepAliveTime", "(JLjava/util/concurrent/TimeUnit;)V", nop_void),
+     "(Ljava/util/concurrent/RejectedExecutionHandler;)V",
+     tpe_set_rejected_handler),
+   M("getRejectedExecutionHandler",
+     "()Ljava/util/concurrent/RejectedExecutionHandler;",
+     tpe_get_rejected_handler),
+   M("allowCoreThreadTimeOut", "(Z)V", tpe_allow_core_timeout),
+   M("allowsCoreThreadTimeOut", "()Z", tpe_allows_core_timeout),
+   M("setKeepAliveTime", "(JLjava/util/concurrent/TimeUnit;)V",
+     tpe_set_keep_alive),
+   M("getKeepAliveTime", "(Ljava/util/concurrent/TimeUnit;)J",
+     tpe_get_keep_alive),
+   M("setCorePoolSize", "(I)V", tpe_set_pool_size),
+   M("setMaximumPoolSize", "(I)V", tpe_set_pool_size),
+   M("getCorePoolSize", "()I", tpe_get_pool_size),
+   M("getMaximumPoolSize", "()I", tpe_get_pool_size),
+   M("getPoolSize", "()I", tpe_get_workers),
+   M("getActiveCount", "()I", tpe_get_workers),
+   M("getQueue", "()Ljava/util/concurrent/BlockingQueue;", tpe_get_queue),
    M("execute", "(Ljava/lang/Runnable;)V", exec_execute),
    M("submit", "(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;",
      exec_submit_runnable),
    M("submit", "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
      exec_submit_callable),
    M("shutdown", "()V", nop_void),
-   M("shutdownNow", "()Ljava/util/List;", nop_void),
+   M("shutdownNow", "()Ljava/util/List;", exec_shutdown_now),
    M("isShutdown", "()Z", ret_false),
    M("isTerminated", "()Z", ret_false),
    M("awaitTermination", "(JLjava/util/concurrent/TimeUnit;)Z", ret_true),
@@ -26273,18 +27396,69 @@ static bool future_task_init(struct dvm *vm, dvm_ref self,
    dvm_ref value = exec_run_task(vm, call, "call", "()Ljava/lang/Object;");
    union dvm_value v = { .l = value };
    (void)dvm_set_field(vm, self, "value", "Ljava/lang/Object;", v);
+   v.i = 1;
+   (void)dvm_set_field(vm, self, "done", "Z", v);
    RETV();
+}
+
+/* FutureTask(Runnable, result).
+ *
+ * This constructor was a no-op and run() was a no-op too, so the whole object
+ * did nothing at all: a FutureTask built this way and handed to an executor —
+ * which is exactly what it is for, and what the Facebook SDK's NativeProtocol
+ * does on the login path — never ran its Runnable and never completed.  The
+ * work is kept here and performed by run(). */
+static bool future_task_init_runnable(struct dvm *vm, dvm_ref self,
+                                      const union dvm_value *args, int nargs,
+                                      union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value v = { .l = ARG(0).l };
+   (void)dvm_set_field(vm, self, "task", "Ljava/lang/Runnable;", v);
+   v.l = ARG(1).l;
+   (void)dvm_set_field(vm, self, "result", "Ljava/lang/Object;", v);
+   RETV();
+}
+
+/* FutureTask.run() — perform the task, once, and publish its result. */
+static bool future_run(struct dvm *vm, dvm_ref self,
+                       const union dvm_value *args, int nargs,
+                       union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value done = { 0 };
+   (void)dvm_get_field(vm, self, "done", "Z", &done);
+   if (done.i) RETV();
+   union dvm_value task = { 0 }, result = { 0 };
+   (void)dvm_get_field(vm, self, "task", "Ljava/lang/Runnable;", &task);
+   (void)dvm_get_field(vm, self, "result", "Ljava/lang/Object;", &result);
+   if (task.l) (void)exec_run_task(vm, task.l, "run", "()V");
+   (void)dvm_set_field(vm, self, "value", "Ljava/lang/Object;", result);
+   done.i = 1;
+   (void)dvm_set_field(vm, self, "done", "Z", done);
+   RETV();
+}
+
+static bool future_isDone(struct dvm *vm, dvm_ref self,
+                          const union dvm_value *args, int nargs,
+                          union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "done", "Z", &v);
+   RETI(v.i ? 1 : 0);
 }
 
 static const struct rt_method rt_future_task[] = {
    M("<init>", "(Ljava/util/concurrent/Callable;)V", future_task_init),
-   M("<init>", "(Ljava/lang/Runnable;Ljava/lang/Object;)V", nop_void),
+   M("<init>", "(Ljava/lang/Runnable;Ljava/lang/Object;)V",
+     future_task_init_runnable),
    M("get", "()Ljava/lang/Object;", future_get),
    M("get", "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;", future_get),
-   M("isDone", "()Z", ret_true),
+   M("isDone", "()Z", future_isDone),
    M("isCancelled", "()Z", ret_false),
    M("cancel", "(Z)Z", ret_false),
-   M("run", "()V", nop_void),
+   M("run", "()V", future_run),
    M_END,
 };
 
@@ -26341,24 +27515,239 @@ static bool rnd_nextDouble(struct dvm *vm, dvm_ref self,
    RETD((double)(v >> 11) / (double)(1ull << 53));
 }
 
-static const struct rt_method rt_random[] = {
-   M("<init>", "()V", nop_void),
-   M("<init>", "(J)V", nop_void),
-   /* setSeed() makes a java.util.Random reproducible.  This one draws from the
-    * system CSPRNG, so a seed cannot steer it; accepting the call is still
-    * right — the alternative was an unresolved method that stopped the
-    * caller before it ever drew a number. */
-   M("setSeed", "(J)V", nop_void),
-   M("nextBoolean", "()Z", rnd_nextBoolean),
-   M("nextFloat", "()F", rnd_nextFloat),
-   M("nextDouble", "()D", rnd_nextDouble),
-   M("nextInt", "()I", rnd_nextInt),
-   M("nextInt", "(I)I", rnd_nextInt),
-   M("nextLong", "()J", rnd_nextLong),
-   M("nextBytes", "([B)V", sr_nextBytes),
-   M_END,
+/* java.util.Random — the generator java.util.Random *is*, not a source of
+ * randomness.
+ *
+ * This class is specified down to the arithmetic: a 48-bit linear congruential
+ * generator, and every method's exact expression in terms of it.  That is the
+ * point of it — code seeds one and relies on the sequence.  Backing it with
+ * the system CSPRNG made every such use silently wrong, and setSeed() a
+ * no-op that "accepted the call": AppsFlyer's AFi1fSDK.<clinit> seeds a Random
+ * and walks the sequence to pick which of its own classes to load, so it got a
+ * different answer every run — which is why its ClassCastException named a
+ * different class each time.
+ *
+ * SecureRandom is the class that *is* meant to be unpredictable, and it keeps
+ * the CSPRNG (see sr_* above); so does ThreadLocalRandom, whose contract says
+ * its sequence is not reproducible and which has no setSeed at all.
+ *
+ * The seed lives in a field, scrambled the way the constructor scrambles it,
+ * with bit 48 set to mark "this instance has been seeded" — the state is
+ * 48 bits wide, so that bit is free, and without it `new Random(0x5DEECE66DL)`
+ * (which scrambles to exactly 0) would look like an object nobody had seeded.
+ */
+#define JRND_MULT   0x5DEECE66Dull
+#define JRND_ADD    0xBull
+#define JRND_MASK   ((1ull << 48) - 1)
+#define JRND_SEEDED (1ull << 48)
+
+static uint64_t jrnd_scramble(int64_t seed)
+{
+   return (((uint64_t)seed ^ JRND_MULT) & JRND_MASK) | JRND_SEEDED;
+}
+
+static void jrnd_store(struct dvm *vm, dvm_ref self, uint64_t state)
+{
+   union dvm_value v = { .j = (int64_t)(state | JRND_SEEDED) };
+   (void)dvm_set_field(vm, self, "seed", "J", v);
+}
+
+/* The no-argument constructor's seed.  java uses a uniquifier sequence XORed
+ * with nanoTime precisely so that two Randoms built in the same nanosecond
+ * still differ. */
+static int64_t jrnd_unique_seed(void)
+{
+   static uint64_t uniquifier = 8682522807148012ull;
+   uniquifier *= 1181783497276652981ull;
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   uint64_t nanos = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+   return (int64_t)(uniquifier ^ nanos);
+}
+
+static uint64_t jrnd_state(struct dvm *vm, dvm_ref self)
+{
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "seed", "J", &v);
+   uint64_t state = (uint64_t)v.j;
+   if (!(state & JRND_SEEDED)) {
+      /* Constructed by dex code that never reached our <init> (a subclass
+       * calling super() we do not model, say).  Seed it the way the
+       * no-argument constructor would. */
+      state = jrnd_scramble(jrnd_unique_seed());
+      jrnd_store(vm, self, state);
+   }
+   return state & JRND_MASK;
+}
+
+/* protected int next(int bits) — the one primitive; everything else is
+ * defined in terms of it. */
+static int32_t jrnd_next(struct dvm *vm, dvm_ref self, int bits)
+{
+   uint64_t state = jrnd_state(vm, self);
+   state = (state * JRND_MULT + JRND_ADD) & JRND_MASK;
+   jrnd_store(vm, self, state);
+   return (int32_t)(uint32_t)(state >> (48 - bits));
+}
+
+static bool jrnd_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                      int nargs, union dvm_value *out)
+{
+   jrnd_store(vm, self,
+              jrnd_scramble(nargs > 0 ? ARG(0).j : jrnd_unique_seed()));
+   RETV();
+}
+
+static bool jrnd_setSeed(struct dvm *vm, dvm_ref self,
+                         const union dvm_value *args, int nargs,
+                         union dvm_value *out)
+{
+   (void)nargs;
+   jrnd_store(vm, self, jrnd_scramble(ARG(0).j));
+   /* setSeed also drops the cached second gaussian. */
+   union dvm_value f = { .i = 0 };
+   (void)dvm_set_field(vm, self, "haveNextNextGaussian", "Z", f);
+   RETV();
+}
+
+static bool jrnd_next_bits(struct dvm *vm, dvm_ref self,
+                           const union dvm_value *args, int nargs,
+                           union dvm_value *out)
+{
+   (void)nargs;
+   int bits = ARG(0).i;
+   if (bits < 1) bits = 1;
+   if (bits > 32) bits = 32;
+   RETI(jrnd_next(vm, self, bits));
+}
+
+static bool jrnd_nextInt(struct dvm *vm, dvm_ref self,
+                         const union dvm_value *args, int nargs,
+                         union dvm_value *out)
+{
+   if (nargs < 1) RETI(jrnd_next(vm, self, 32));
+   int32_t bound = ARG(0).i;
+   if (bound <= 0) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException",
+                 "bound must be positive");
+      return false;
+   }
+   /* The specified algorithm, rejection and all: a plain modulo is biased and
+    * — more to the point here — produces a different sequence. */
+   if ((bound & -bound) == bound)
+      RETI((int32_t)(((int64_t)bound * (int64_t)jrnd_next(vm, self, 31)) >> 31));
+   int32_t bits, val;
+   do {
+      bits = jrnd_next(vm, self, 31);
+      val = bits % bound;
+   } while (bits - val + (bound - 1) < 0);
+   RETI(val);
+}
+
+static bool jrnd_nextLong(struct dvm *vm, dvm_ref self,
+                          const union dvm_value *args, int nargs,
+                          union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   int64_t hi = (int64_t)jrnd_next(vm, self, 32);
+   int32_t lo = jrnd_next(vm, self, 32);
+   RETJ((hi << 32) + lo);
+}
+
+static bool jrnd_nextBoolean(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   RETI(jrnd_next(vm, self, 1) != 0);
+}
+
+static bool jrnd_nextFloat(struct dvm *vm, dvm_ref self,
+                           const union dvm_value *args, int nargs,
+                           union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   RETF((float)jrnd_next(vm, self, 24) / (float)(1 << 24));
+}
+
+static bool jrnd_nextDouble(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   int64_t hi = (int64_t)jrnd_next(vm, self, 26) << 27;
+   int64_t lo = (int64_t)jrnd_next(vm, self, 27);
+   RETD((double)(hi + lo) * 0x1.0p-53);
+}
+
+static bool jrnd_nextBytes(struct dvm *vm, dvm_ref self,
+                           const union dvm_value *args, int nargs,
+                           union dvm_value *out)
+{
+   (void)nargs;
+   uint8_t *b = dvm_array_data(vm, ARG(0).l);
+   uint32_t n = dvm_array_length(vm, ARG(0).l);
+   for (uint32_t i = 0; i < n; ) {
+      int32_t rnd = jrnd_next(vm, self, 32);
+      for (uint32_t k = 0; k < 4 && i < n; ++k, rnd >>= 8)
+         b[i++] = (uint8_t)rnd;
+   }
+   RETV();
+}
+
+/* nextGaussian: the polar method, which draws two values at a time and keeps
+ * the second — so the cached one is part of the object's state. */
+static bool jrnd_nextGaussian(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value have = { 0 }, cached = { 0 };
+   (void)dvm_get_field(vm, self, "haveNextNextGaussian", "Z", &have);
+   if (have.i) {
+      (void)dvm_get_field(vm, self, "nextNextGaussian", "D", &cached);
+      union dvm_value f = { .i = 0 };
+      (void)dvm_set_field(vm, self, "haveNextNextGaussian", "Z", f);
+      RETD(cached.d);
+   }
+   double v1, v2, ss;
+   do {
+      union dvm_value d = { 0 };
+      (void)jrnd_nextDouble(vm, self, NULL, 0, &d);
+      v1 = 2 * d.d - 1;
+      (void)jrnd_nextDouble(vm, self, NULL, 0, &d);
+      v2 = 2 * d.d - 1;
+      ss = v1 * v1 + v2 * v2;
+   } while (ss >= 1 || ss == 0);
+   double multiplier = sqrt(-2 * log(ss) / ss);
+   union dvm_value keep = { .d = v2 * multiplier }, flag = { .i = 1 };
+   (void)dvm_set_field(vm, self, "nextNextGaussian", "D", keep);
+   (void)dvm_set_field(vm, self, "haveNextNextGaussian", "Z", flag);
+   RETD(v1 * multiplier);
+}
+
+static const struct rt_field rt_random_fields[] = {
+   { "seed", "J" },
+   { "nextNextGaussian", "D" },
+   { "haveNextNextGaussian", "Z" },
+   F_END
 };
 
+static const struct rt_method rt_random[] = {
+   M("<init>", "()V", jrnd_init),
+   M("<init>", "(J)V", jrnd_init),
+   M("setSeed", "(J)V", jrnd_setSeed),
+   M("next", "(I)I", jrnd_next_bits),
+   M("nextBoolean", "()Z", jrnd_nextBoolean),
+   M("nextFloat", "()F", jrnd_nextFloat),
+   M("nextDouble", "()D", jrnd_nextDouble),
+   M("nextGaussian", "()D", jrnd_nextGaussian),
+   M("nextInt", "()I", jrnd_nextInt),
+   M("nextInt", "(I)I", jrnd_nextInt),
+   M("nextLong", "()J", jrnd_nextLong),
+   M("nextBytes", "([B)V", jrnd_nextBytes),
+   M_END,
+};
 /* java.util.concurrent.ThreadLocalRandom — Facebook's PKCE (and Kotlin's
  * PlatformThreadLocalRandom) call current().nextInt(origin, bound) on the
  * title→login path.  Leaving current() unresolved returned null and the NPE
@@ -26553,6 +27942,24 @@ static bool timer_cancel(struct dvm *vm, dvm_ref self,
    RETV();
 }
 
+/* See the table below: this is the abstract base's body, and reaching it is a
+ * fact about the *app*, not about the emulator. */
+static bool timer_task_abstract_run(struct dvm *vm, dvm_ref self,
+                                    const union dvm_value *args, int nargs,
+                                    union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   static bool warned;
+   if (!warned) {
+      warned = true;
+      struct dvm_class *c = dvm_object_class(vm, self);
+      fprintf(stderr, "[dvm] TimerTask.run() reached on %s, which does not "
+                      "override it — nothing was scheduled to happen\n",
+              c && c->name ? c->name : "?");
+   }
+   RETV();
+}
+
 static bool timer_task_cancel(struct dvm *vm, dvm_ref self,
                               const union dvm_value *args, int nargs,
                               union dvm_value *out)
@@ -26574,6 +27981,14 @@ static const struct rt_field rt_timer_fields[] = {
 
 static const struct rt_field rt_timer_task_fields[] = {
    { "cancelled", "Z" },
+   /* When this task is next due, in the same milliseconds Timer schedules
+    * with.  scheduledExecutionTime() is the one piece of state a TimerTask
+    * exposes, and a repeating task uses it to tell "I am late" from "I am on
+    * time" — the usual shape being
+    *   if (System.currentTimeMillis() - scheduledExecutionTime() >= MAX_LATE)
+    *       return;   // skip this run, the next one is already due
+    * which without it compares against zero and never skips. */
+   { "scheduledExecutionTime", "J" },
    F_END,
 };
 
@@ -26596,10 +28011,33 @@ static const struct rt_method rt_timer[] = {
    M_END,
 };
 
+/* TimerTask.scheduledExecutionTime() — when the run that is happening (or the
+ * one that just happened) was scheduled for.  Timer fills it in as it hands
+ * the task to the scheduler; before the first run it is 0, as it is on a
+ * device. */
+static bool timer_task_scheduled_time(struct dvm *vm, dvm_ref self,
+                                      const union dvm_value *args, int nargs,
+                                      union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "scheduledExecutionTime", "J", &v);
+   RETJ(v.j);
+}
+
 static const struct rt_method rt_timer_task[] = {
-   M("<init>", "()V", nop_void),
-   M("run", "()V", nop_void),
+   /* TimerTask() only puts the task in the VIRGIN state, which is what a
+    * freshly allocated object already reads as: not cancelled, never
+    * scheduled. */
+   M("<init>", "()V", empty_void),
+   /* run() is abstract on Android — every TimerTask is a subclass that
+    * overrides it, and virtual dispatch finds that override.  Reaching *this*
+    * body means the subclass has none, which on a device is an
+    * AbstractMethodError; it is reported rather than thrown, because throwing
+    * from a scheduler callback would take the Timer down with it. */
+   M("run", "()V", timer_task_abstract_run),
    M("cancel", "()Z", timer_task_cancel),
+   M("scheduledExecutionTime", "()J", timer_task_scheduled_time),
    M_END,
 };
 
@@ -26674,13 +28112,17 @@ static bool tu_indexOf(struct dvm *vm, dvm_ref self,
                        const union dvm_value *args, int nargs,
                        union dvm_value *out)
 {
-   (void)self; (void)nargs;
+   (void)self;
    dvm_ref cs = ARG(0).l;
    int32_t ch = ARG(1).i;
-   int32_t start = ARG(2).i;
-   int32_t end = ARG(3).i;
    const char *s = dvm_string_utf8(vm, cs);
    if (!s) RETI(-1);
+   /* indexOf(seq, ch), indexOf(seq, ch, start) and indexOf(seq, ch, start,
+    * end) are three entry points into the same search; the shorter ones just
+    * leave the window open at that end. */
+   int32_t start = nargs > 2 ? ARG(2).i : 0;
+   int32_t end   = nargs > 3 ? ARG(3).i : INT32_MAX;
+   if (start < 0) start = 0;
    int32_t i = 0;
    for (const unsigned char *p = (const unsigned char *)s; *p; ) {
       unsigned cp;
@@ -26694,6 +28136,65 @@ static bool tu_indexOf(struct dvm *vm, dvm_ref self,
       if (i >= end) break;
    }
    RETI(-1);
+}
+
+/* TextUtils.getCapsMode(cs, off, reqModes) — which of the auto-capitalisation
+ * modes apply at `off`, restricted to the ones the caller asked about.  An
+ * IME connection calls this on every keystroke to decide the shift state; the
+ * unresolved stub answered 0, which reads as "never capitalise". */
+#define DVM_CAP_MODE_CHARACTERS 0x00001000
+#define DVM_CAP_MODE_WORDS      0x00002000
+#define DVM_CAP_MODE_SENTENCES  0x00004000
+
+static bool tu_getCapsMode(struct dvm *vm, dvm_ref self,
+                           const union dvm_value *args, int nargs,
+                           union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   int32_t off = ARG(1).i, req = ARG(2).i;
+   if (off < 0) RETI(0);
+   int32_t mode = req & DVM_CAP_MODE_CHARACTERS;
+   if ((req & (DVM_CAP_MODE_WORDS | DVM_CAP_MODE_SENTENCES)) == 0) RETI(mode);
+
+   size_t len = 0;
+   const char *cs = sdata(vm, ARG(0).l, &len);
+   if (!cs) RETI(mode);
+   if ((size_t)off > len) off = (int32_t)len;
+
+   /* Step back over opening punctuation, then over spaces and tabs.  What is
+    * left is the character that decides the answer. */
+   int32_t i = off;
+   while (i > 0) {
+      char c = cs[i - 1];
+      if (c != '"' && c != '\'' && c != '(' && c != '[' && c != '{') break;
+      --i;
+   }
+   int32_t j = i;
+   while (j > 0 && (cs[j - 1] == ' ' || cs[j - 1] == '\t')) --j;
+
+   /* Start of the text or of a paragraph: both a word and a sentence begin. */
+   if (j == 0 || cs[j - 1] == '\n')
+      RETI(mode | (req & (DVM_CAP_MODE_WORDS | DVM_CAP_MODE_SENTENCES)));
+
+   /* A word begins wherever whitespace was skipped over. */
+   if (j != i || (i > 0 && (cs[i - 1] == ' ' || cs[i - 1] == '\t')))
+      mode |= req & DVM_CAP_MODE_WORDS;
+   else
+      RETI(mode);   /* mid-word: neither a new word nor a new sentence */
+
+   /* A sentence begins after '.', '?' or '!' (with their closing punctuation),
+    * but only when whitespace separated it from `off`. */
+   int32_t k = j;
+   while (k > 0) {
+      char c = cs[k - 1];
+      if (c != '"' && c != '\'' && c != ')' && c != ']' && c != '}') break;
+      --k;
+   }
+   if (k > 0) {
+      char c = cs[k - 1];
+      if (c == '.' || c == '?' || c == '!') mode |= req & DVM_CAP_MODE_SENTENCES;
+   }
+   RETI(mode);
 }
 
 /* TextUtils.indexOf(haystack, needle[, start]) — the substring overloads.
@@ -26730,7 +28231,10 @@ static bool sm_allowDisk(struct dvm *vm, dvm_ref self,
 static const struct rt_method rt_strictmode[] = {
    SM("allowThreadDiskReads", "()Landroid/os/StrictMode$ThreadPolicy;", sm_allowDisk),
    SM("allowThreadDiskWrites", "()Landroid/os/StrictMode$ThreadPolicy;", sm_allowDisk),
-   SM("setThreadPolicy", "(Landroid/os/StrictMode$ThreadPolicy;)V", nop_void),
+   /* StrictMode only ever *reports* policy violations — it changes no
+    * behaviour.  Nothing here detects them, so a policy is a set of things
+    * this VM would never have complained about anyway. */
+   SM("setThreadPolicy", "(Landroid/os/StrictMode$ThreadPolicy;)V", empty_void),
    SM("getThreadPolicy", "()Landroid/os/StrictMode$ThreadPolicy;", sm_allowDisk),
    M_END,
 };
@@ -26772,7 +28276,9 @@ static const struct rt_method rt_strictmode_builder[] = {
 };
 
 static const struct rt_method rt_traffic_stats[] = {
-   SM("setThreadStatsTag", "(I)V", nop_void),
+   /* Socket tagging feeds per-tag byte counters this device does not keep;
+    * tagging a socket for statistics nobody collects is nothing to do. */
+   SM("setThreadStatsTag", "(I)V", empty_void),
    SM("clearThreadStatsTag", "()V", nop_void),
    SM("getThreadStatsTag", "()I", ret_zero),
    M_END,
@@ -27131,7 +28637,9 @@ static const struct rt_field rt_intent_filter_fields[] = {
 };
 
 static const struct rt_method rt_intent_filter[] = {
-   M("<init>", "()V", nop_void),
+   /* IntentFilter() is a filter with no actions; countActions() reads that
+    * off the (absent) list without needing one allocated up front. */
+   M("<init>", "()V", empty_void),
    M("<init>", "(Ljava/lang/String;)V", if_init),
    M("addAction", "(Ljava/lang/String;)V", if_init),
    M("countActions", "()I", if_countActions),
@@ -27166,11 +28674,7 @@ static bool pm_hasSystemFeature(struct dvm *vm, dvm_ref self,
 
 static bool pm_resolveProvider(struct dvm *vm, dvm_ref self,
                                const union dvm_value *args, int nargs,
-                               union dvm_value *out)
-{
-   (void)vm; (void)self; (void)args; (void)nargs;
-   RETL(0);
-}
+                               union dvm_value *out);
 
 static bool pm_getSystemAvailableFeatures(struct dvm *vm, dvm_ref self,
                                           const union dvm_value *args, int nargs,
@@ -27194,6 +28698,82 @@ static dvm_ref pm_component_info(struct dvm *vm, const char *desc)
    union dvm_value value = { .l = bundle };
    (void)dvm_set_field(vm, info, "metaData", "Landroid/os/Bundle;", value);
    return info;
+}
+
+/* Resolve an installed manifest provider by authority.  lunaria-apk.sh has
+ * already decoded the binary manifest into the same provider table used by
+ * loader.c to start providers, so PackageManager must expose that table too;
+ * returning null here made FileProvider reject metadata that had in fact been
+ * parsed and attached correctly a few instructions earlier. */
+static bool pm_resolveProvider(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   const char *wanted = dvm_string_utf8(vm, ARG(0).l);
+   const char *encoded = getenv("ANDROID_CONTENT_PROVIDERS");
+   char *providers = wanted && encoded ? strdup(encoded) : NULL;
+   if (!providers) RETL(0);
+
+   dvm_ref result = 0;
+   char *save = NULL;
+   for (char *entry = strtok_r(providers, ";", &save); entry;
+        entry = strtok_r(NULL, ";", &save)) {
+      char *authority = strchr(entry, '|');
+      if (authority) *authority++ = '\0';
+      char *metadata = authority ? strchr(authority, '|') : NULL;
+      if (metadata) *metadata++ = '\0';
+      if (!authority || strcmp(authority, wanted)) continue;
+
+      result = pm_component_info(vm, "Landroid/content/pm/ProviderInfo;");
+      if (!result) break;
+      union dvm_value value = { .l = dvm_new_string(vm, authority) };
+      (void)dvm_set_field(vm, result, "authority", "Ljava/lang/String;", value);
+      value.l = dvm_new_string(vm, entry);
+      (void)dvm_set_field(vm, result, "name", "Ljava/lang/String;", value);
+      const char *package_name = getenv("ANDROID_PACKAGE_NAME");
+      value.l = dvm_new_string(vm, package_name ? package_name : "");
+      (void)dvm_set_field(vm, result, "packageName", "Ljava/lang/String;", value);
+      value.i = 1;
+      (void)dvm_set_field(vm, result, "grantUriPermissions", "Z", value);
+
+      union dvm_value bundle = { 0 };
+      (void)dvm_get_field(vm, result, "metaData", "Landroid/os/Bundle;", &bundle);
+      if (vm->trace)
+         fprintf(stderr, "[dvm] provider metadata bundle=@%x text=%s\n",
+                 bundle.l, metadata ? metadata : "");
+      char *meta_save = NULL;
+      for (char *pair = metadata ? strtok_r(metadata, ",", &meta_save) : NULL;
+           pair; pair = strtok_r(NULL, ",", &meta_save)) {
+         char *text = strchr(pair, '~');
+         if (!text || !bundle.l) continue;
+         *text++ = '\0';
+         char *end = NULL;
+         long integer = strtol(text, &end, 0);
+         union dvm_value put_args[2] = {
+            { .l = dvm_new_string(vm, pair) }, { 0 }
+         }, ignored = { 0 };
+         if (end && *end == '\0') {
+            put_args[1].i = (int32_t)integer;
+            (void)bundle_putInt(vm, bundle.l, put_args, 2, &ignored);
+            if (vm->trace) {
+               union dvm_value check = { 0 };
+               (void)bundle_getInt(vm, bundle.l, put_args, 1, &check);
+               fprintf(stderr, "[dvm] provider metadata %s=%ld -> %d\n",
+                       pair, integer, check.i);
+            }
+         } else {
+            put_args[1].l = dvm_new_string(vm, text);
+            (void)bundle_putString(vm, bundle.l, put_args, 2, &ignored);
+         }
+      }
+      if (vm->trace)
+         fprintf(stderr, "[dvm] PackageManager resolved provider %s (%s)\n",
+                 authority, entry);
+      break;
+   }
+   free(providers);
+   RETL(result);
 }
 
 static bool pm_getServiceInfo(struct dvm *vm, dvm_ref self,
@@ -27602,6 +29182,80 @@ static bool window_set_callback(struct dvm *vm, dvm_ref self,
    RETV();
 }
 
+/* Window.setSoftInputMode / addFlags / clearFlags / setFlags.
+ *
+ * All four are the same thing on a device: they edit the window's
+ * LayoutParams, and getAttributes() is where the app reads them back.  Taking
+ * the call and dropping the value left every such read answering for a window
+ * nobody had configured — and the soft-input mode in particular is what an
+ * app checks to decide whether it, or the system, is responsible for moving
+ * its content out from under the keyboard. */
+/* The window's LayoutParams, made on first use — the same object
+ * getAttributes() answers with. */
+static dvm_ref window_attributes(struct dvm *vm, dvm_ref self)
+{
+   union dvm_value v = { 0 };
+   (void)window_get_attributes(vm, self, NULL, 0, &v);
+   return v.l;
+}
+
+static bool window_set_soft_input_mode(struct dvm *vm, dvm_ref self,
+                                       const union dvm_value *args, int nargs,
+                                       union dvm_value *out)
+{
+   (void)nargs;
+   dvm_ref lp = window_attributes(vm, self);
+   union dvm_value v = { .i = ARG(0).i };
+   if (lp) (void)dvm_set_field(vm, lp, "softInputMode", "I", v);
+   RETV();
+}
+
+static bool window_add_flags(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)nargs;
+   dvm_ref lp = window_attributes(vm, self);
+   union dvm_value v = { 0 };
+   if (lp) {
+      (void)dvm_get_field(vm, lp, "flags", "I", &v);
+      v.i |= ARG(0).i;
+      (void)dvm_set_field(vm, lp, "flags", "I", v);
+   }
+   RETV();
+}
+
+static bool window_clear_flags(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)nargs;
+   dvm_ref lp = window_attributes(vm, self);
+   union dvm_value v = { 0 };
+   if (lp) {
+      (void)dvm_get_field(vm, lp, "flags", "I", &v);
+      v.i &= ~ARG(0).i;
+      (void)dvm_set_field(vm, lp, "flags", "I", v);
+   }
+   RETV();
+}
+
+/* setFlags(flags, mask) — only the bits in the mask are touched. */
+static bool window_set_flags(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)nargs;
+   dvm_ref lp = window_attributes(vm, self);
+   union dvm_value v = { 0 };
+   if (lp) {
+      (void)dvm_get_field(vm, lp, "flags", "I", &v);
+      v.i = (v.i & ~ARG(1).i) | (ARG(0).i & ARG(1).i);
+      (void)dvm_set_field(vm, lp, "flags", "I", v);
+   }
+   RETV();
+}
+
 static const struct rt_field rt_window_fields[] = {
    { "attributes", "Landroid/view/WindowManager$LayoutParams;" },
    { "callback", "Landroid/view/Window$Callback;" },
@@ -27611,7 +29265,12 @@ static const struct rt_field rt_window_fields[] = {
 };
 
 static const struct rt_field rt_window_layout_params_fields[] = {
-   { "layoutInDisplayCutoutMode", "I" }, F_END,
+   { "layoutInDisplayCutoutMode", "I" },
+   /* Window.setSoftInputMode() writes here on a device, and
+    * getAttributes().softInputMode is where callers read it back. */
+   { "softInputMode", "I" },
+   { "flags", "I" },
+   F_END,
 };
 
 static const struct rt_method rt_window[] = {
@@ -27629,16 +29288,16 @@ static const struct rt_method rt_window[] = {
     * path for a difference that does not exist here. */
    M("requestFeature", "(I)Z", ret_true),
    M("setDecorFitsSystemWindows", "(Z)V", nop_void),
-   M("setFlags", "(II)V", nop_void),
-   M("addFlags", "(I)V", nop_void),
-   M("clearFlags", "(I)V", nop_void),
+   M("setFlags", "(II)V", window_set_flags),
+   M("addFlags", "(I)V", window_add_flags),
+   M("clearFlags", "(I)V", window_clear_flags),
    M("setDimAmount", "(F)V", nop_void),
    M("setGravity", "(I)V", nop_void),
    M("setLayout", "(II)V", nop_void),
    M("setBackgroundDrawable", "(Landroid/graphics/drawable/Drawable;)V",
      nop_void),
    M("setBackgroundDrawableResource", "(I)V", nop_void),
-   M("setSoftInputMode", "(I)V", nop_void),
+   M("setSoftInputMode", "(I)V", window_set_soft_input_mode),
    M("takeSurface", "(Landroid/view/SurfaceHolder$Callback2;)V",
      window_take_surface),
    M_END,
@@ -27857,6 +29516,38 @@ VIEW_GET_I(view_get_top, "top", 0)
 VIEW_GET_I(view_get_right, "right", 0)
 VIEW_GET_I(view_get_bottom, "bottom", 0)
 VIEW_GET_I(view_get_selected, "selected", 0)
+
+#define VIEW_SET_F(fn, field)                                                \
+   static bool fn(struct dvm *vm, dvm_ref self,                              \
+                  const union dvm_value *args, int nargs,                    \
+                  union dvm_value *out)                                      \
+   {                                                                         \
+      (void)out;                                                             \
+      union dvm_value v = { .f = nargs > 0 ? ARG(0).f : 0.0f };              \
+      (void)dvm_set_field(vm, self, field, "F", v);                          \
+      RETV();                                                                \
+   }
+#define VIEW_GET_F(fn, field)                                                \
+   static bool fn(struct dvm *vm, dvm_ref self,                              \
+                  const union dvm_value *args, int nargs,                    \
+                  union dvm_value *out)                                      \
+   {                                                                         \
+      (void)args; (void)nargs;                                               \
+      union dvm_value v = { 0 };                                             \
+      (void)dvm_get_field(vm, self, field, "F", &v);                         \
+      RETF(v.f);                                                             \
+   }
+VIEW_SET_F(view_set_x, "x")
+VIEW_SET_F(view_set_y, "y")
+VIEW_GET_F(view_get_x, "x")
+VIEW_GET_F(view_get_y, "y")
+#undef VIEW_SET_F
+#undef VIEW_GET_F
+
+/* clearFocus(): nothing in this view tree holds input focus — the IME is
+ * driven from native code — so the honest answer is to drop the focusable
+ * flag's "has focus" side and do no more. */
+
 VIEW_SET_I(view_set_selected, "selected")
 VIEW_SET_I(view_set_activated, "activated")
 VIEW_SET_I(view_set_clickable, "clickable")
@@ -28046,6 +29737,55 @@ static bool vto_add_global_listener(struct dvm *vm, dvm_ref self,
    (void)dvm_set_field(vm, self, "globalLayoutListener",
                        "Landroid/view/ViewTreeObserver$OnGlobalLayoutListener;",
                        v);
+   /* Storing the listener was enough to keep getViewTreeObserver() honest, but
+    * nothing could ever call it: there is no layout pass here to fire it from.
+    * That silence is what an app hears as "the window never changed shape" —
+    * and the window changing shape is exactly how it learns a keyboard came
+    * up.  Remember the observer so the input method can run the pass. */
+   if (v.l) {
+      for (int i = 0; i < g_nlayout_observers; ++i)
+         if (g_layout_observers[i] == self) RETV();
+      if (g_nlayout_observers < RT_MAX_LAYOUT_OBSERVERS) {
+         dvm_pin(vm, self);
+         g_layout_observers[g_nlayout_observers++] = self;
+      }
+   }
+   RETV();
+}
+
+/* View.setOnApplyWindowInsetsListener.
+ *
+ * The listener is how a view learns the shape of the space it may use, and it
+ * is called during a layout pass — not at registration.  Accepting it and
+ * dropping it meant an app that lays itself out from the insets it is given
+ * never laid itself out at all; UE4's GameActivity installs one on its
+ * content FrameLayout in onCreate and waits to be told.
+ *
+ * The views that have one are tracked here because the dispatch happens from
+ * the layout pass (ime_run_layout_pass), which is the only thing in this
+ * emulator that changes the window's shape. */
+#define RT_MAX_INSETS_LISTENERS 8
+static dvm_ref g_insets_views[RT_MAX_INSETS_LISTENERS];
+static int     g_ninsets_views;
+
+static bool view_set_insets_listener(struct dvm *vm, dvm_ref self,
+                                     const union dvm_value *args, int nargs,
+                                     union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value v = { .l = ARG(0).l };
+   (void)dvm_set_field(vm, self, "insetsListener",
+                       "Landroid/view/View$OnApplyWindowInsetsListener;", v);
+   bool known = false;
+   for (int i = 0; i < g_ninsets_views; ++i)
+      if (g_insets_views[i] == self) { known = true; break; }
+   if (!known && v.l && g_ninsets_views < RT_MAX_INSETS_LISTENERS) {
+      dvm_pin(vm, self);
+      g_insets_views[g_ninsets_views++] = self;
+   }
+   /* Android delivers the first insets on the next layout pass, which the
+    * registration itself schedules. */
+   if (v.l) g_layout_pass_pending = true;
    RETV();
 }
 
@@ -28069,6 +29809,10 @@ static const struct rt_field rt_view_fields[] = {
    { "selected", "I" }, { "activated", "I" }, { "clickable", "I" },
    { "scrollX", "I" }, { "scrollY", "I" },
    { "left", "I" }, { "top", "I" }, { "right", "I" }, { "bottom", "I" },
+   /* setX/setY move the view without touching its layout bounds, so they get
+    * their own storage: GameActivity's virtual keyboard positions its input
+    * box that way and reads the value back to decide where the IME goes. */
+   { "x", "F" }, { "y", "F" },
    /* What the compiled layout said about this view.  These used to be thrown
     * away at inflation (see ax_apply_attribute), which left a tree with the
     * right shape and no geometry — findViewById() answered, and nothing could
@@ -28083,6 +29827,7 @@ static const struct rt_field rt_view_fields[] = {
    { "disabled", "Z" },
    { "windowToken", "Landroid/os/IBinder;" },
    { "attachListener", "Landroid/view/View$OnAttachStateChangeListener;" },
+   { "insetsListener", "Landroid/view/View$OnApplyWindowInsetsListener;" },
    F_END,
 };
 
@@ -28418,7 +30163,7 @@ static const struct rt_method rt_view_group[] = {
    M("bringChildToFront", "(Landroid/view/View;)V", vg_bring_child_to_front),
    M("findViewById", "(I)Landroid/view/View;", view_find_by_id),
    M("removeAllViews", "()V", vg_remove_all),
-   M("requestLayout", "()V", nop_void),
+   M("requestLayout", "()V", view_request_layout),
    M("setOnHierarchyChangeListener",
      "(Landroid/view/ViewGroup$OnHierarchyChangeListener;)V", nop_void),
    M("setDescendantFocusability", "(I)V", nop_void),
@@ -28554,7 +30299,8 @@ static const struct rt_method rt_view[] = {
    M("setEnabled", "(Z)V", view_set_enabled),
    M("isEnabled", "()Z", view_is_enabled),
    M("setOnApplyWindowInsetsListener",
-     "(Landroid/view/View$OnApplyWindowInsetsListener;)V", nop_void),
+     "(Landroid/view/View$OnApplyWindowInsetsListener;)V",
+     view_set_insets_listener),
    M("getRootWindowInsets", "()Landroid/view/WindowInsets;",
      view_get_root_window_insets),
    M("getWindowInsetsController", "()Landroid/view/WindowInsetsController;",
@@ -28566,7 +30312,14 @@ static const struct rt_method rt_view[] = {
    M("getPaddingBottom", "()I", view_get_padding_bottom),
    M("setPaddingRelative", "(IIII)V", view_set_padding),
    M("isLaidOut", "()Z", ret_true),
-   M("requestLayout", "()V", nop_void),
+   M("requestLayout", "()V", view_request_layout),
+   M("getWidth", "()I", view_get_width),
+   M("getHeight", "()I", view_get_height),
+   M("getMeasuredWidth", "()I", view_get_width),
+   M("getMeasuredHeight", "()I", view_get_height),
+   M("getDrawingRect", "(Landroid/graphics/Rect;)V", view_get_drawing_rect),
+   M("getWindowVisibleDisplayFrame", "(Landroid/graphics/Rect;)V",
+     view_get_visible_display_frame),
    M("postOnAnimation", "(Ljava/lang/Runnable;)V", view_post),
    M("post", "(Ljava/lang/Runnable;)Z", view_post),
    M("removeCallbacks", "(Ljava/lang/Runnable;)Z", view_remove_callbacks),
@@ -28608,6 +30361,11 @@ static const struct rt_method rt_view[] = {
    M("getScrollX", "()I", view_get_scroll_x),
    M("scrollTo", "(II)V", view_scroll_to),
    M("requestFocus", "()Z", ret_true),
+   M("clearFocus", "()V", view_clear_focus),
+   M("setX", "(F)V", view_set_x),
+   M("setY", "(F)V", view_set_y),
+   M("getX", "()F", view_get_x),
+   M("getY", "()F", view_get_y),
    M("saveAttributeDataForStyleable",
      "(Landroid/content/Context;[ILandroid/util/AttributeSet;Landroid/content/res/TypedArray;II)V",
      nop_void),
@@ -28763,7 +30521,7 @@ static const struct rt_method rt_surface_view[] = {
      surface_view_init),
    M("getHolder", "()Landroid/view/SurfaceHolder;", surface_view_get_holder),
    M("getContext", "()Landroid/content/Context;", view_getContext),
-   M("setBackgroundColor", "(I)V", nop_void),
+   M("setBackgroundColor", "(I)V", view_set_background_color),
    M_END,
 };
 
@@ -29062,10 +30820,14 @@ static const struct rt_field rt_rect_fields[] = {
 };
 
 static const struct rt_method rt_rect[] = {
-   M("<init>", "()V", nop_void),
+   /* Rect() is the empty rectangle: all four fields zero, which is what a
+    * freshly allocated object already reads as. */
+   M("<init>", "()V", empty_void),
    M("<init>", "(IIII)V", rect_set),
    M("set", "(IIII)V", rect_set),
    M("inset", "(II)V", rect_inset),
+   M("width", "()I", rect_width),
+   M("height", "()I", rect_height),
    M_END,
 };
 
@@ -29374,6 +31136,522 @@ static const struct rt_method rt_ui_mode_manager[] = {
    M("getNightMode", "()I", ret_true),
    M("setNightMode", "(I)V", nop_void),
    M("getContrast", "()F", ret_zero),
+   M_END,
+};
+
+/* android.view.inputmethod.InputMethodManager — the handle an app uses to ask
+ * the system for a keyboard.
+ *
+ * These used to answer true and do nothing, which is the shape of the call but
+ * not its point: showSoftInput() is not a question, it is the moment the app
+ * hands the system responsibility for producing text.  There is an input
+ * method here now (luna_ime.c), so show and hide raise and drop it, and
+ * isActive()/isAcceptingText() report whether it is really up rather than
+ * always saying no. */
+static const struct rt_method rt_input_method_manager[] = {
+   M("hideSoftInputFromWindow", "(Landroid/os/IBinder;I)Z", imm_hide_soft_input),
+   M("hideSoftInputFromWindow",
+     "(Landroid/os/IBinder;ILandroid/os/ResultReceiver;)Z", imm_hide_soft_input),
+   M("showSoftInput", "(Landroid/view/View;I)Z", imm_show_soft_input),
+   M("showSoftInput",
+     "(Landroid/view/View;ILandroid/os/ResultReceiver;)Z", imm_show_soft_input),
+   M("hideSoftInputFromInputMethod", "(Landroid/os/IBinder;I)V",
+     imm_hide_soft_input),
+   M("toggleSoftInput", "(II)V", nop_void),
+   M("restartInput", "(Landroid/view/View;)V", nop_void),
+   M("isActive", "()Z", imm_is_active),
+   M("isActive", "(Landroid/view/View;)Z", imm_is_active),
+   M("isAcceptingText", "()Z", imm_is_active),
+   M("viewClicked", "(Landroid/view/View;)V", nop_void),
+   M_END,
+};
+
+/* ------------------------------------------------------------------------ *
+ * The clipboard
+ * ------------------------------------------------------------------------ *
+ *
+ * android.content.ClipboardManager was named in the getSystemService table but
+ * the class itself did not exist, so `getSystemService(CLIPBOARD_SERVICE)`
+ * handed back an object with no methods on it — the same shape of hole
+ * InputMethodManager used to have.  Copy and paste inside the app therefore
+ * did nothing, and nothing could travel between the app and the desktop.
+ *
+ * The clipboard is system state, not manager state: on a device every app
+ * reads and writes the one the system owns.  Here that one is the *host's*
+ * clipboard (arm_exec_clipboard_set/get), which is also what the emulator's
+ * own input method edits against — so text copied in the game can be pasted
+ * into a host window and back.  getPrimaryClip() therefore builds a fresh
+ * ClipData from what is on the clipboard *now* rather than returning something
+ * this process remembers setting.
+ *
+ * The label is the one piece of a clip that the host clipboard cannot carry.
+ * It is kept alongside the text it was set with, and offered only while the
+ * clipboard still holds that text; once something else has been copied, the
+ * clip genuinely is not the one that was labelled.
+ */
+
+/* A CharSequence as UTF-8.  A String answers directly; anything else — a
+ * SpannableString, a StringBuilder, an app's own CharSequence — answers
+ * through its own toString(), which is what coerceToText() does on a device. */
+static const char *rt_charseq_utf8(struct dvm *vm, dvm_ref cs)
+{
+   if (!cs) return NULL;
+   const char *s = dvm_string_utf8(vm, cs);
+   if (s) return s;
+   struct dvm_class *c = dvm_object_class(vm, cs);
+   struct dvm_method *ts =
+      c ? dvm_find_method(vm, c, "toString", "()Ljava/lang/String;") : NULL;
+   union dvm_value ret;
+   if (ts && dvm_call(vm, ts, cs, NULL, 0, &ret))
+      return dvm_string_utf8(vm, ret.l);
+   return NULL;
+}
+
+static char *g_clip_label;        /* label of the clip this process last set */
+static char *g_clip_label_text;   /* the text it was set with */
+
+#define RT_MAX_CLIP_LISTENERS 8
+static dvm_ref g_clip_listeners[RT_MAX_CLIP_LISTENERS];
+static int     g_nclip_listeners;
+
+static void clip_remember_label(const char *label, const char *text)
+{
+   free(g_clip_label);
+   free(g_clip_label_text);
+   g_clip_label = label ? strdup(label) : NULL;
+   g_clip_label_text = text ? strdup(text) : NULL;
+}
+
+/* The label that belongs to what is on the clipboard right now, or NULL. */
+static const char *clip_label_for(const char *text)
+{
+   if (!g_clip_label_text || !text) return NULL;
+   return strcmp(g_clip_label_text, text) == 0 ? g_clip_label : NULL;
+}
+
+static dvm_ref clip_new_item(struct dvm *vm, const char *text)
+{
+   struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/content/ClipData$Item;");
+   dvm_ref item = c ? dvm_new_object(vm, c) : 0;
+   if (item) {
+      union dvm_value t = { .l = dvm_new_string(vm, text ? text : "") };
+      (void)dvm_set_field(vm, item, "text", "Ljava/lang/CharSequence;", t);
+   }
+   return item;
+}
+
+static dvm_ref clip_new_description(struct dvm *vm, const char *label)
+{
+   struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/content/ClipDescription;");
+   dvm_ref d = c ? dvm_new_object(vm, c) : 0;
+   if (d && label) {
+      union dvm_value l = { .l = dvm_new_string(vm, label) };
+      (void)dvm_set_field(vm, d, "label", "Ljava/lang/CharSequence;", l);
+   }
+   return d;
+}
+
+/* A one-item plain-text ClipData, the shape newPlainText() produces. */
+static dvm_ref clip_new_plain(struct dvm *vm, const char *label, const char *text)
+{
+   struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/content/ClipData;");
+   dvm_ref clip = c ? dvm_new_object(vm, c) : 0;
+   if (!clip) return 0;
+   union dvm_value v = { .l = clip_new_description(vm, label) };
+   (void)dvm_set_field(vm, clip, "description", "Landroid/content/ClipDescription;", v);
+   v.l = coll_new_list(vm, "Ljava/util/ArrayList;");
+   (void)dvm_set_field(vm, clip, "items", "Ljava/util/List;", v);
+   dvm_ref item = clip_new_item(vm, text);
+   if (v.l && item) {
+      union dvm_value a = { .l = item }, ignored = { 0 };
+      (void)list_add(vm, v.l, &a, 1, &ignored);
+   }
+   return clip;
+}
+
+static bool clipitem_getText(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value t = { 0 };
+   (void)dvm_get_field(vm, self, "text", "Ljava/lang/CharSequence;", &t);
+   RETL(t.l);
+}
+
+/* coerceToText() differs from getText() only for the item kinds this clipboard
+ * cannot hold (a Uri to resolve, an Intent to render), so on a text item they
+ * are the same answer — but it must never be null: callers use it precisely
+ * because it promises a CharSequence. */
+static bool clipitem_coerceToText(struct dvm *vm, dvm_ref self,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value t = { 0 };
+   (void)dvm_get_field(vm, self, "text", "Ljava/lang/CharSequence;", &t);
+   RETL(t.l ? t.l : dvm_new_string(vm, ""));
+}
+
+static bool clipitem_init(struct dvm *vm, dvm_ref self,
+                          const union dvm_value *args, int nargs,
+                          union dvm_value *out)
+{
+   union dvm_value t = { .l = nargs > 0 ? ARG(0).l : 0 };
+   (void)dvm_set_field(vm, self, "text", "Ljava/lang/CharSequence;", t);
+   RETV();
+}
+
+static bool clipitem_toString(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value t = { 0 };
+   (void)dvm_get_field(vm, self, "text", "Ljava/lang/CharSequence;", &t);
+   char buf[256];
+   snprintf(buf, sizeof buf, "ClipData.Item { T:%s }",
+            t.l ? sref(vm, t.l) : "null");
+   RETL(dvm_new_string(vm, buf));
+}
+
+static const struct rt_field rt_clip_item_fields[] = {
+   { "text", "Ljava/lang/CharSequence;" }, F_END
+};
+
+static const struct rt_method rt_clip_item[] = {
+   M("<init>", "(Ljava/lang/CharSequence;)V", clipitem_init),
+   M("getText", "()Ljava/lang/CharSequence;", clipitem_getText),
+   M("coerceToText", "(Landroid/content/Context;)Ljava/lang/CharSequence;",
+     clipitem_coerceToText),
+   M("coerceToStyledText", "(Landroid/content/Context;)Ljava/lang/CharSequence;",
+     clipitem_coerceToText),
+   M("coerceToHtmlText", "(Landroid/content/Context;)Ljava/lang/String;",
+     clipitem_coerceToText),
+   /* This clipboard carries text.  A Uri or an Intent item is not something
+    * the emulator drops on the floor — it is something no clip here ever
+    * holds, and null is the answer the API defines for that. */
+   M("getUri", "()Landroid/net/Uri;", ret_null),
+   M("getIntent", "()Landroid/content/Intent;", ret_null),
+   M("getHtmlText", "()Ljava/lang/String;", ret_null),
+   M("toString", "()Ljava/lang/String;", clipitem_toString),
+   M_END,
+};
+
+static bool clipdesc_getLabel(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value l = { 0 };
+   (void)dvm_get_field(vm, self, "label", "Ljava/lang/CharSequence;", &l);
+   RETL(l.l);
+}
+
+/* Every clip here is plain text, so the answer is decidable rather than
+ * guessed: "text/plain" and the wildcards match, anything else does not. */
+static bool clipdesc_hasMimeType(struct dvm *vm, dvm_ref self,
+                                 const union dvm_value *args, int nargs,
+                                 union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   const char *want = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
+   if (!want) RETI(0);
+   RETI(!strcmp(want, "text/plain") || !strcmp(want, "text/*") ||
+        !strcmp(want, "*/*"));
+}
+
+static bool clipdesc_getMimeType(struct dvm *vm, dvm_ref self,
+                                 const union dvm_value *args, int nargs,
+                                 union dvm_value *out)
+{
+   (void)self; (void)args; (void)nargs;
+   RETL(dvm_new_string(vm, "text/plain"));
+}
+
+static const struct rt_field rt_clip_desc_fields[] = {
+   { "label", "Ljava/lang/CharSequence;" }, F_END
+};
+
+static const struct rt_method rt_clip_description[] = {
+   M("getLabel", "()Ljava/lang/CharSequence;", clipdesc_getLabel),
+   M("hasMimeType", "(Ljava/lang/String;)Z", clipdesc_hasMimeType),
+   M("getMimeType", "(I)Ljava/lang/String;", clipdesc_getMimeType),
+   M("getMimeTypeCount", "()I", ret_true),   /* one type: text/plain */
+   M("toString", "()Ljava/lang/String;", clipdesc_getLabel),
+   M_END,
+};
+
+static bool clipdata_newPlainText(struct dvm *vm, dvm_ref self,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   const char *label = rt_charseq_utf8(vm, ARG(0).l);
+   const char *text = rt_charseq_utf8(vm, ARG(1).l);
+   RETL(clip_new_plain(vm, label, text));
+}
+
+static dvm_ref clipdata_items(struct dvm *vm, dvm_ref self)
+{
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "items", "Ljava/util/List;", &v);
+   return v.l;
+}
+
+static bool clipdata_getItemCount(struct dvm *vm, dvm_ref self,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   dvm_ref items = clipdata_items(vm, self);
+   struct rt_list *l = items ? list_of(vm, items) : NULL;
+   RETI(l ? (int32_t)l->size : 0);
+}
+
+static bool clipdata_getItemAt(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)nargs;
+   dvm_ref items = clipdata_items(vm, self);
+   struct rt_list *l = items ? list_of(vm, items) : NULL;
+   int32_t i = ARG(0).i;
+   if (!l || i < 0 || (uint32_t)i >= l->size) {
+      dvm__throw(vm, "java/lang/IndexOutOfBoundsException", "item %d", i);
+      return false;
+   }
+   RETL(l->items[i]);
+}
+
+static bool clipdata_addItem(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   /* addItem(Item) and addItem(ContentResolver, Item): the item is the last
+    * argument in both. */
+   dvm_ref item = nargs > 0 ? ARG(nargs - 1).l : 0;
+   dvm_ref items = clipdata_items(vm, self);
+   if (items && item) {
+      union dvm_value a = { .l = item }, ignored = { 0 };
+      (void)list_add(vm, items, &a, 1, &ignored);
+   }
+   RETV();
+}
+
+static bool clipdata_getDescription(struct dvm *vm, dvm_ref self,
+                                    const union dvm_value *args, int nargs,
+                                    union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value d = { 0 };
+   (void)dvm_get_field(vm, self, "description",
+                       "Landroid/content/ClipDescription;", &d);
+   RETL(d.l);
+}
+
+static const struct rt_field rt_clip_data_fields[] = {
+   { "description", "Landroid/content/ClipDescription;" },
+   { "items", "Ljava/util/List;" },
+   F_END
+};
+
+static const struct rt_method rt_clip_data[] = {
+   SM("newPlainText",
+      "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Landroid/content/ClipData;",
+      clipdata_newPlainText),
+   M("getItemCount", "()I", clipdata_getItemCount),
+   M("getItemAt", "(I)Landroid/content/ClipData$Item;", clipdata_getItemAt),
+   M("addItem", "(Landroid/content/ClipData$Item;)V", clipdata_addItem),
+   M("addItem", "(Landroid/content/ContentResolver;Landroid/content/ClipData$Item;)V",
+     clipdata_addItem),
+   M("getDescription", "()Landroid/content/ClipDescription;",
+     clipdata_getDescription),
+   M_END,
+};
+
+/* The text on the clipboard right now, as a fresh guest String. */
+static dvm_ref clip_host_text(struct dvm *vm)
+{
+   char *text = arm_exec_clipboard_get();
+   dvm_ref s = dvm_new_string(vm, text ? text : "");
+   free(text);
+   return s;
+}
+
+static void clip_notify_listeners(struct dvm *vm)
+{
+   for (int i = 0; i < g_nclip_listeners; ++i) {
+      dvm_ref l = g_clip_listeners[i];
+      struct dvm_class *c = l ? dvm_object_class(vm, l) : NULL;
+      struct dvm_method *m =
+         c ? dvm_find_method(vm, c, "onPrimaryClipChanged", "()V") : NULL;
+      union dvm_value ret;
+      if (m) (void)dvm_call(vm, m, l, NULL, 0, &ret);
+   }
+}
+
+/* setPrimaryClip(ClipData) — the whole clip goes on the clipboard.  Multiple
+ * items are joined with newlines, which is how coerceToText() renders a
+ * multi-item clip on a device. */
+static bool clipboard_setPrimaryClip(struct dvm *vm, dvm_ref self,
+                                     const union dvm_value *args, int nargs,
+                                     union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   dvm_ref clip = ARG(0).l;
+   if (!clip) { RETV(); }
+   char joined[4096];
+   size_t used = 0;
+   joined[0] = '\0';
+   dvm_ref items = clipdata_items(vm, clip);
+   struct rt_list *l = items ? list_of(vm, items) : NULL;
+   for (uint32_t i = 0; l && i < l->size; ++i) {
+      union dvm_value t = { 0 };
+      (void)dvm_get_field(vm, l->items[i], "text", "Ljava/lang/CharSequence;", &t);
+      const char *s = rt_charseq_utf8(vm, t.l);
+      if (!s) continue;
+      int n = snprintf(joined + used, sizeof joined - used, "%s%s",
+                       used ? "\n" : "", s);
+      if (n < 0) break;
+      used += (size_t)n;
+      if (used >= sizeof joined) { used = sizeof joined - 1; break; }
+   }
+   union dvm_value d = { 0 };
+   (void)dvm_get_field(vm, clip, "description",
+                       "Landroid/content/ClipDescription;", &d);
+   union dvm_value lab = { 0 };
+   if (d.l)
+      (void)dvm_get_field(vm, d.l, "label", "Ljava/lang/CharSequence;", &lab);
+   clip_remember_label(lab.l ? rt_charseq_utf8(vm, lab.l) : NULL, joined);
+   arm_exec_clipboard_set(joined);
+   fprintf(stderr, "[clipboard] app copied %zu bytes\n", used);
+   clip_notify_listeners(vm);
+   RETV();
+}
+
+static bool clipboard_getPrimaryClip(struct dvm *vm, dvm_ref self,
+                                     const union dvm_value *args, int nargs,
+                                     union dvm_value *out)
+{
+   (void)self; (void)args; (void)nargs;
+   char *text = arm_exec_clipboard_get();
+   /* An empty clipboard has no primary clip — null is the documented answer
+    * and the one callers test for. */
+   if (!text || !*text) { free(text); RETL(0); }
+   dvm_ref clip = clip_new_plain(vm, clip_label_for(text), text);
+   free(text);
+   RETL(clip);
+}
+
+static bool clipboard_getPrimaryClipDescription(struct dvm *vm, dvm_ref self,
+                                                const union dvm_value *args,
+                                                int nargs, union dvm_value *out)
+{
+   (void)self; (void)args; (void)nargs;
+   char *text = arm_exec_clipboard_get();
+   if (!text || !*text) { free(text); RETL(0); }
+   dvm_ref d = clip_new_description(vm, clip_label_for(text));
+   free(text);
+   RETL(d);
+}
+
+static bool clipboard_hasPrimaryClip(struct dvm *vm, dvm_ref self,
+                                     const union dvm_value *args, int nargs,
+                                     union dvm_value *out)
+{
+   (void)vm; (void)self; (void)args; (void)nargs;
+   char *text = arm_exec_clipboard_get();
+   bool any = text && *text;
+   free(text);
+   RETI(any ? 1 : 0);
+}
+
+static bool clipboard_clear(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)self; (void)args; (void)nargs;
+   arm_exec_clipboard_set("");
+   clip_remember_label(NULL, NULL);
+   clip_notify_listeners(vm);
+   RETV();
+}
+
+/* The pre-API-11 text API.  It is the same clipboard, so these are the same
+ * calls with the label left off. */
+static bool clipboard_setText(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   const char *text = rt_charseq_utf8(vm, ARG(0).l);
+   clip_remember_label(NULL, text);
+   arm_exec_clipboard_set(text ? text : "");
+   fprintf(stderr, "[clipboard] app copied %zu bytes (setText)\n",
+           text ? strlen(text) : 0u);
+   clip_notify_listeners(vm);
+   RETV();
+}
+
+static bool clipboard_getText(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)self; (void)args; (void)nargs;
+   RETL(clip_host_text(vm));
+}
+
+static bool clipboard_addListener(struct dvm *vm, dvm_ref self,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   dvm_ref l = ARG(0).l;
+   if (!l) { RETV(); }
+   for (int i = 0; i < g_nclip_listeners; ++i)
+      if (g_clip_listeners[i] == l) { RETV(); }
+   if (g_nclip_listeners < RT_MAX_CLIP_LISTENERS) {
+      dvm_pin(vm, l);
+      g_clip_listeners[g_nclip_listeners++] = l;
+   }
+   RETV();
+}
+
+static bool clipboard_removeListener(struct dvm *vm, dvm_ref self,
+                                     const union dvm_value *args, int nargs,
+                                     union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   dvm_ref l = ARG(0).l;
+   for (int i = 0; i < g_nclip_listeners; ++i) {
+      if (g_clip_listeners[i] != l) continue;
+      dvm_unpin(vm, l);
+      for (int k = i; k + 1 < g_nclip_listeners; ++k)
+         g_clip_listeners[k] = g_clip_listeners[k + 1];
+      --g_nclip_listeners;
+      break;
+   }
+   RETV();
+}
+
+static const struct rt_method rt_clipboard_manager[] = {
+   M("setPrimaryClip", "(Landroid/content/ClipData;)V", clipboard_setPrimaryClip),
+   M("getPrimaryClip", "()Landroid/content/ClipData;", clipboard_getPrimaryClip),
+   M("getPrimaryClipDescription", "()Landroid/content/ClipDescription;",
+     clipboard_getPrimaryClipDescription),
+   M("hasPrimaryClip", "()Z", clipboard_hasPrimaryClip),
+   M("clearPrimaryClip", "()V", clipboard_clear),
+   M("addPrimaryClipChangedListener",
+     "(Landroid/content/ClipboardManager$OnPrimaryClipChangedListener;)V",
+     clipboard_addListener),
+   M("removePrimaryClipChangedListener",
+     "(Landroid/content/ClipboardManager$OnPrimaryClipChangedListener;)V",
+     clipboard_removeListener),
+   /* android.text.ClipboardManager, which this class extends. */
+   M("setText", "(Ljava/lang/CharSequence;)V", clipboard_setText),
+   M("getText", "()Ljava/lang/CharSequence;", clipboard_getText),
+   M("hasText", "()Z", clipboard_hasPrimaryClip),
    M_END,
 };
 
@@ -29927,6 +32205,7 @@ static const struct rt_field rt_text_view_fields[] = {
    { "hint", "Ljava/lang/CharSequence;" },
    { "textSize", "F" }, { "textStyle", "I" }, { "maxLines", "I" },
    { "inputType", "I" }, { "imeOptions", "I" }, { "singleLine", "Z" },
+   { "selectionStart", "I" }, { "selectionEnd", "I" },
    { "textWatchers", "Ljava/util/List;" },
    { "editorActionListener", "Landroid/widget/TextView$OnEditorActionListener;" },
    { "keyListener", "Landroid/text/method/KeyListener;" },
@@ -29947,7 +32226,20 @@ TEXT_SET_INT(text_set_text_color, "textColor")
 TEXT_SET_INT(text_set_bg_color,   "backgroundColor")
 TEXT_SET_INT(text_set_input_type, "inputType")
 TEXT_SET_INT(text_set_ime_options, "imeOptions")
+TEXT_SET_INT(text_set_max_lines,  "maxLines")
 #undef TEXT_SET_INT
+
+/* setRawInputType() differs from setInputType() only in that it leaves the
+ * key listener alone; the stored type is the same one getInputType() answers,
+ * and the virtual-keyboard code that calls it reads that back. */
+
+static bool text_get_max_lines(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   RETI(rt_get_int(vm, self, "maxLines"));
+}
 
 static bool text_get_input_type(struct dvm *vm, dvm_ref self,
                                 const union dvm_value *args, int nargs,
@@ -29999,8 +32291,28 @@ static bool text_add_watcher(struct dvm *vm, dvm_ref self,
       RETV();                                                                \
    }
 
-TEXT_SET_REF(text_set_editor_action, "editorActionListener",
-             "Landroid/widget/TextView$OnEditorActionListener;")
+/* The last field that registered an editor-action listener.  A field asking to
+ * be told when the user is done is a field meant to be typed into, and
+ * LUNARIA_IME_TEST uses it to raise the input method on the app's real widget
+ * — with the app's own watchers and listener behind it — without having to
+ * navigate a game to the screen that would. */
+static dvm_ref g_ime_last_field;
+
+static bool text_set_editor_action(struct dvm *vm, dvm_ref self,
+                                   const union dvm_value *args, int nargs,
+                                   union dvm_value *out)
+{
+   (void)out;
+   union dvm_value v = { .l = nargs > 0 ? ARG(0).l : 0 };
+   (void)dvm_set_field(vm, self, "editorActionListener",
+                       "Landroid/widget/TextView$OnEditorActionListener;", v);
+   if (v.l && g_ime_last_field != self) {
+      if (g_ime_last_field) dvm_unpin(vm, g_ime_last_field);
+      dvm_pin(vm, self);
+      g_ime_last_field = self;
+   }
+   RETV();
+}
 TEXT_SET_REF(text_set_key_listener, "keyListener",
              "Landroid/text/method/KeyListener;")
 TEXT_SET_REF(text_set_editable_factory, "editableFactory",
@@ -30030,23 +32342,34 @@ static const struct rt_method rt_text_view[] = {
    M("getFilters", "()[Landroid/text/InputFilter;", ret_empty_input_filters),
    M("setFilters", "([Landroid/text/InputFilter;)V", nop_void),
    M("getText", "()Ljava/lang/CharSequence;", text_get_text),
+   /* EditText re-declares getText() with the covariant return type Editable.
+    * The dex call site is resolved by descriptor, so the wider signature has
+    * to be present too or it lands on the unresolved stub and the caller gets
+    * null where it expects the edit buffer. */
+   M("getText", "()Landroid/text/Editable;", text_get_text),
    M("setText", "(Ljava/lang/CharSequence;)V", text_set_text),
    M("setTypeface", "(Landroid/graphics/Typeface;)V", nop_void),
    M("setTransformationMethod", "(Landroid/text/method/TransformationMethod;)V", nop_void),
    M("setEnabled", "(Z)V", view_set_enabled),
-   M("getMaxLines", "()I", ret_zero),
+   M("getMaxLines", "()I", text_get_max_lines),
+   M("setMaxLines", "(I)V", text_set_max_lines),
    M("setTextAppearance", "(I)V", nop_void),
    M("setTextColor", "(Landroid/content/res/ColorStateList;)V",
      text_set_color_state),
    M("setTextColor", "(I)V", text_set_text_color),
    M("setBackgroundColor", "(I)V", text_set_bg_color),
    M("setInputType", "(I)V", text_set_input_type),
+   M("setRawInputType", "(I)V", text_set_input_type),
    M("getInputType", "()I", text_get_input_type),
    M("setImeOptions", "(I)V", text_set_ime_options),
    M("getImeOptions", "()I", text_get_ime_options),
    M("setSingleLine", "()V", text_set_single_line),
    M("setSingleLine", "(Z)V", text_set_single_line),
    M("setPadding", "(IIII)V", view_set_padding),
+   M("setWidth", "(I)V", text_set_width),
+   M("setHeight", "(I)V", nop_void),
+   M("setSelection", "(I)V", text_set_selection),
+   M("setSelection", "(II)V", text_set_selection),
    M("addTextChangedListener", "(Landroid/text/TextWatcher;)V",
      text_add_watcher),
    M("removeTextChangedListener", "(Landroid/text/TextWatcher;)V", nop_void),
@@ -30889,6 +33212,32 @@ static bool xml_parser_attribute_value(struct dvm *vm, dvm_ref self,
    RETL(xml_parser_string_at(vm, self, "attributeValueStrings", args, nargs));
 }
 
+/* XmlPullParser's namespace/name overload locates an attribute by name and
+ * returns the value at the same index.  Android binary XML keeps namespace
+ * separately; FileProvider and most manifest readers pass null for it. */
+static bool xml_parser_attribute_value_named(struct dvm *vm, dvm_ref self,
+                                             const union dvm_value *args,
+                                             int nargs, union dvm_value *out)
+{
+   const char *wanted = nargs > 1 ? dvm_string_utf8(vm, ARG(1).l) : NULL;
+   union dvm_value names_ref = { 0 }, values_ref = { 0 };
+   (void)dvm_get_field(vm, self, "attributeNameStrings",
+                       "[Ljava/lang/String;", &names_ref);
+   (void)dvm_get_field(vm, self, "attributeValueStrings",
+                       "[Ljava/lang/String;", &values_ref);
+   struct dvm_object *names = dvm__obj(vm, names_ref.l);
+   struct dvm_object *values = dvm__obj(vm, values_ref.l);
+   if (!wanted || !names || !values || !names->data || !values->data)
+      RETL(0);
+   uint32_t count = names->length < values->length ? names->length : values->length;
+   dvm_ref *name_items = names->data, *value_items = values->data;
+   for (uint32_t i = 0; i < count; ++i) {
+      const char *name = dvm_string_utf8(vm, name_items[i]);
+      if (name && !strcmp(name, wanted)) RETL(value_items[i]);
+   }
+   RETL(0);
+}
+
 static const struct rt_method rt_xml_parser[] = {
    M("next", "()I", xml_parser_next), M("getEventType", "()I", xml_parser_event),
    M("getName", "()Ljava/lang/String;", xml_parser_name),
@@ -30898,6 +33247,9 @@ static const struct rt_method rt_xml_parser[] = {
    M("getAttributeNameResource", "(I)I", xml_parser_attribute_resource),
    M("getAttributeName", "(I)Ljava/lang/String;", xml_parser_attribute_name),
    M("getAttributeValue", "(I)Ljava/lang/String;", xml_parser_attribute_value),
+   M("getAttributeValue",
+     "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+     xml_parser_attribute_value_named),
    M("getAttributeBooleanValue", "(IZ)Z", xml_parser_attribute_boolean),
    M("close", "()V", nop_void), M_END,
 };
@@ -31025,13 +33377,18 @@ static const struct rt_method rt_application[] = {
    M("onConfigurationChanged", "(Landroid/content/res/Configuration;)V",
      nop_void),
    M("registerActivityLifecycleCallbacks",
-     "(Landroid/app/Application$ActivityLifecycleCallbacks;)V", nop_void),
-   M("registerComponentCallbacks", "(Landroid/content/ComponentCallbacks;)V",
-     nop_void),
-   M("unregisterComponentCallbacks", "(Landroid/content/ComponentCallbacks;)V",
-     nop_void),
+     "(Landroid/app/Application$ActivityLifecycleCallbacks;)V",
+     app_register_lifecycle),
    M("unregisterActivityLifecycleCallbacks",
-     "(Landroid/app/Application$ActivityLifecycleCallbacks;)V", nop_void),
+     "(Landroid/app/Application$ActivityLifecycleCallbacks;)V",
+     app_unregister_lifecycle),
+   /* ComponentCallbacks are onConfigurationChanged / onLowMemory.  Neither
+    * ever happens here: the emulator has one configuration for the life of
+    * the process and never reports memory pressure to the app. */
+   M("registerComponentCallbacks", "(Landroid/content/ComponentCallbacks;)V",
+     empty_void),
+   M("unregisterComponentCallbacks", "(Landroid/content/ComponentCallbacks;)V",
+     empty_void),
    M_END,
 };
 
@@ -31065,7 +33422,9 @@ static const struct rt_field rt_content_provider_fields[] = {
 };
 
 static const struct rt_method rt_content_provider[] = {
-   M("<init>", "()V", nop_void),
+   /* ContentProvider() is `{}` on Android — the provider is set up by
+    * attachInfo(), not by its constructor. */
+   M("<init>", "()V", empty_void),
    M("attachInfo",
      "(Landroid/content/Context;Landroid/content/pm/ProviderInfo;)V",
      cp_attach_info),
@@ -31373,6 +33732,106 @@ static const struct rt_method rt_service[] = {
 
 
 
+/* Application.ActivityLifecycleCallbacks.
+ *
+ * The register call was accepted and the callbacks thrown away, so every
+ * library that learns whether the app is in the foreground this way — the
+ * Facebook SDK's ActivityLifecycleTracker, Play Services' BackgroundDetector,
+ * AppsFlyer — was registered and never called.  Each of them then behaves as
+ * if the app had never come to the foreground: sessions are not opened,
+ * "app in background" stays true.
+ *
+ * On a device the dispatch happens inside Activity's own lifecycle methods —
+ * Activity.onResume() calls getApplication().dispatchActivityResumed(this) —
+ * so that is where it happens here too, and the ordering relative to a
+ * subclass's own onResume() body is the same as the framework's.
+ *
+ * Registration is process-wide rather than per-Application object: an app has
+ * one Application, and a caller that registers through a Context wrapper must
+ * still be called.  Activity.registerActivityLifecycleCallbacks (API 29) is
+ * per-activity on a device; here it lands in the same list, which over-calls
+ * a listener only for activities this emulator does not create. */
+#define RT_MAX_LIFECYCLE_CALLBACKS 16
+static dvm_ref g_lifecycle_callbacks[RT_MAX_LIFECYCLE_CALLBACKS];
+static int     g_nlifecycle_callbacks;
+
+static bool app_register_lifecycle(struct dvm *vm, dvm_ref self,
+                                   const union dvm_value *args, int nargs,
+                                   union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   dvm_ref cb = ARG(0).l;
+   if (!cb) { RETV(); }
+   for (int i = 0; i < g_nlifecycle_callbacks; ++i)
+      if (g_lifecycle_callbacks[i] == cb) { RETV(); }
+   if (g_nlifecycle_callbacks >= RT_MAX_LIFECYCLE_CALLBACKS) {
+      /* Dropping one silently is how a library ends up permanently believing
+       * the app is in the background. */
+      fprintf(stderr, "[dvm] activity lifecycle callback list full (%d); "
+                      "%s will not be called\n",
+              RT_MAX_LIFECYCLE_CALLBACKS,
+              dvm_object_class(vm, cb) ? dvm_object_class(vm, cb)->name : "?");
+      RETV();
+   }
+   dvm_pin(vm, cb);
+   g_lifecycle_callbacks[g_nlifecycle_callbacks++] = cb;
+   RETV();
+}
+
+static bool app_unregister_lifecycle(struct dvm *vm, dvm_ref self,
+                                     const union dvm_value *args, int nargs,
+                                     union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   dvm_ref cb = ARG(0).l;
+   for (int i = 0; i < g_nlifecycle_callbacks; ++i) {
+      if (g_lifecycle_callbacks[i] != cb) continue;
+      dvm_unpin(vm, cb);
+      for (int k = i; k + 1 < g_nlifecycle_callbacks; ++k)
+         g_lifecycle_callbacks[k] = g_lifecycle_callbacks[k + 1];
+      --g_nlifecycle_callbacks;
+      break;
+   }
+   RETV();
+}
+
+/* `sig` is the callback's own signature: the Created form takes a Bundle, the
+ * rest take only the Activity. */
+static void dispatch_lifecycle(struct dvm *vm, dvm_ref activity,
+                               const char *name, const char *sig, bool bundle)
+{
+   for (int i = 0; i < g_nlifecycle_callbacks; ++i) {
+      dvm_ref cb = g_lifecycle_callbacks[i];
+      struct dvm_class *c = cb ? dvm_object_class(vm, cb) : NULL;
+      struct dvm_method *m = c ? dvm_find_method(vm, c, name, sig) : NULL;
+      if (!m) continue;
+      union dvm_value a[2] = { { .l = activity }, { .l = 0 } };
+      union dvm_value ret;
+      (void)dvm_call(vm, m, cb, a, bundle ? 2 : 1, &ret);
+      /* One listener throwing must not stop the others being told, and must
+       * not surface as an exception from the activity's own onResume(). */
+      if (dvm_exception(vm)) dvm_clear_exception(vm);
+   }
+}
+
+#define ACT_LIFECYCLE(fn, cbname, cbsig, has_bundle)                          \
+   static bool fn(struct dvm *vm, dvm_ref self,                               \
+                  const union dvm_value *args, int nargs,                     \
+                  union dvm_value *out)                                       \
+   {                                                                          \
+      (void)args; (void)nargs;                                                \
+      dispatch_lifecycle(vm, self, cbname, cbsig, has_bundle);                \
+      RETV();                                                                 \
+   }
+
+ACT_LIFECYCLE(act_on_create, "onActivityCreated",
+              "(Landroid/app/Activity;Landroid/os/Bundle;)V", true)
+ACT_LIFECYCLE(act_on_start, "onActivityStarted", "(Landroid/app/Activity;)V", false)
+ACT_LIFECYCLE(act_on_resume, "onActivityResumed", "(Landroid/app/Activity;)V", false)
+ACT_LIFECYCLE(act_on_pause, "onActivityPaused", "(Landroid/app/Activity;)V", false)
+ACT_LIFECYCLE(act_on_stop, "onActivityStopped", "(Landroid/app/Activity;)V", false)
+#undef ACT_LIFECYCLE
+
 static const struct rt_method rt_activity[] = {
    M("getTitle", "()Ljava/lang/CharSequence;", act_get_title),
    M("getReferrer", "()Landroid/net/Uri;", act_getReferrer),
@@ -31394,13 +33853,19 @@ static const struct rt_method rt_activity[] = {
    M("setVolumeControlStream", "(I)V", nop_void),
    M("startActivityForResult",
      "(Landroid/content/Intent;ILandroid/os/Bundle;)V", nop_void),
-   M("onCreate", "(Landroid/os/Bundle;)V", nop_void),
-   M("onStart", "()V", nop_void),
-   M("onResume", "()V", nop_void),
+   M("onCreate", "(Landroid/os/Bundle;)V", act_on_create),
+   M("onStart", "()V", act_on_start),
+   M("onResume", "()V", act_on_resume),
+   M("onPause", "()V", act_on_pause),
+   M("onStop", "()V", act_on_stop),
    M("onDestroy", "()V", act_on_destroy),
    M("isDestroyed", "()Z", act_is_destroyed),
    M("registerActivityLifecycleCallbacks",
-     "(Landroid/app/Application$ActivityLifecycleCallbacks;)V", nop_void),
+     "(Landroid/app/Application$ActivityLifecycleCallbacks;)V",
+     app_register_lifecycle),
+   M("unregisterActivityLifecycleCallbacks",
+     "(Landroid/app/Application$ActivityLifecycleCallbacks;)V",
+     app_unregister_lifecycle),
    M_END,
 };
 
@@ -32018,10 +34483,24 @@ static const struct rt_method rt_typeface[] = {
    M_END,
 };
 
+/* android.app.NativeActivity.
+ *
+ * On a device these three do the work of starting a native app: onCreate
+ * loads the library named by android.app.lib_name and calls
+ * ANativeActivity_onCreate through it, and onStart/onResume forward to the
+ * activity's callbacks.  Lunaria does all of that itself, from the loader —
+ * it is what the emulator *is* — before any of this bytecode runs: the
+ * library is loaded, ANativeActivity_onCreate has been called with a real
+ * ANativeActivity, and the pump is driving the callbacks.
+ *
+ * So when a subclass such as UE4's GameActivity calls super.onCreate(), there
+ * is genuinely nothing left for it to do.  Doing it twice would be the bug:
+ * a second ANativeActivity_onCreate on the same library re-enters the NDK
+ * glue's thread startup with a half-built state. */
 static const struct rt_method rt_native_activity[] = {
-   M("onCreate", "(Landroid/os/Bundle;)V", nop_void),
-   M("onStart", "()V", nop_void),
-   M("onResume", "()V", nop_void),
+   M("onCreate", "(Landroid/os/Bundle;)V", empty_void),
+   M("onStart", "()V", empty_void),
+   M("onResume", "()V", empty_void),
    M_END,
 };
 
@@ -32755,11 +35234,483 @@ static void ui_window_hidden(struct dvm *vm, dvm_ref window)
    }
 }
 
+
+/* ------------------------------------------------------------------------ *
+ * The input method, on the guest's side
+ *
+ * On a device this is two things at once: a window that produces characters,
+ * and a window that takes up room.  Both halves matter, and the second is the
+ * one that is easy to leave out — an app does not ask "is a keyboard up", it
+ * measures how much shorter its own window became.  UE4's GameActivity does
+ * exactly that (GameActivity$10.onGlobalLayout: it compares the decor view's
+ * drawing rect with the window's visible display frame and calls anything
+ * under 200px "no keyboard"), and everything downstream of it — repositioning
+ * the hidden EditText, nativeVirtualKeyboardShown(), and the TextWatcher that
+ * only reports changes while that field is on screen — is gated on the answer.
+ *
+ * So the emulator's input method reports its own geometry, and a layout pass
+ * runs when it appears and disappears.  luna_ime.c owns the panel and the
+ * editing; this side owns the View it is connected to.
+ * ------------------------------------------------------------------------ */
+
+/* The height the panel gives the connected field, in surface pixels.  It has
+ * to agree with .luna-ime-field in luna_ime.c: this is the number the app
+ * reads back through getHeight() to decide where to put its own copy. */
+#define RT_IME_FIELD_H 52
+
+static dvm_ref g_ime_view;    /* the View showSoftInput() was called on */
+static int     g_ime_band;    /* surface px the panel covers, 0 while down */
+
+static int rt_surface_w(void) { int w = arm_exec_fb_width();  return w > 0 ? w : 0; }
+static int rt_surface_h(void) { int h = arm_exec_fb_height(); return h > 0 ? h : 0; }
+
+static void rect_fill(struct dvm *vm, dvm_ref rect, int l, int t, int r, int b)
+{
+   if (!rect) return;
+   rt_set_int(vm, rect, "left", l);
+   rt_set_int(vm, rect, "top", t);
+   rt_set_int(vm, rect, "right", r);
+   rt_set_int(vm, rect, "bottom", b);
+}
+
+/* A view's own size.
+ *
+ * There is no layout pass in this emulator, so a view that nothing assigned
+ * bounds to has no size to report — and 0 is the honest answer for it.  One
+ * case is not a guess, though: the root of a window fills that window, which
+ * is what makes the decor view's drawing rect a real rectangle and lets the
+ * comparison above mean something. */
+static int32_t view_span(struct dvm *vm, dvm_ref v, bool vertical)
+{
+   int32_t lo = ui_int(vm, v, vertical ? "top" : "left");
+   int32_t hi = ui_int(vm, v, vertical ? "bottom" : "right");
+   if (hi > lo) return hi - lo;
+   if (!ui_obj(vm, v, "parent", "Landroid/view/ViewParent;"))
+      return vertical ? rt_surface_h() : rt_surface_w();
+   return 0;
+}
+
+static bool view_get_width(struct dvm *vm, dvm_ref self,
+                           const union dvm_value *args, int nargs,
+                           union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   RETI(view_span(vm, self, false));
+}
+
+static bool view_get_height(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   RETI(view_span(vm, self, true));
+}
+
+static bool view_get_drawing_rect(struct dvm *vm, dvm_ref self,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+   (void)out;
+   rect_fill(vm, nargs > 0 ? ARG(0).l : 0, 0, 0,
+             view_span(vm, self, false), view_span(vm, self, true));
+   RETV();
+}
+
+/* The part of the window the user can still see — the surface, less whatever
+ * the system has put over it.  Here that is the input method's band, and
+ * nothing else: there is no status bar and no navigation bar. */
+static bool view_get_visible_display_frame(struct dvm *vm, dvm_ref self,
+                                           const union dvm_value *args,
+                                           int nargs, union dvm_value *out)
+{
+   (void)self; (void)out;
+   int h = rt_surface_h();
+   rect_fill(vm, nargs > 0 ? ARG(0).l : 0, 0, 0, rt_surface_w(),
+             h - (g_ime_band < h ? g_ime_band : h));
+   RETV();
+}
+
+static bool rect_width(struct dvm *vm, dvm_ref self,
+                       const union dvm_value *args, int nargs,
+                       union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   RETI(rt_get_int(vm, self, "right") - rt_get_int(vm, self, "left"));
+}
+
+static bool rect_height(struct dvm *vm, dvm_ref self,
+                        const union dvm_value *args, int nargs,
+                        union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   RETI(rt_get_int(vm, self, "bottom") - rt_get_int(vm, self, "top"));
+}
+
+/* TextView.setWidth() sets the view's width outright, which is a layout
+ * result, not a request: getWidth() has to answer it afterwards. */
+static bool text_set_width(struct dvm *vm, dvm_ref self,
+                           const union dvm_value *args, int nargs,
+                           union dvm_value *out)
+{
+   (void)out;
+   int32_t w = nargs > 0 ? ARG(0).i : 0;
+   rt_set_int(vm, self, "right", rt_get_int(vm, self, "left") + w);
+   RETV();
+}
+
+/* The caret, which here belongs to the input method's own field. */
+static bool text_set_selection(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)out;
+   rt_set_int(vm, self, "selectionStart", nargs > 0 ? ARG(0).i : 0);
+   rt_set_int(vm, self, "selectionEnd",
+              nargs > 1 ? ARG(1).i : (nargs > 0 ? ARG(0).i : 0));
+   RETV();
+}
+
+static bool view_clear_focus(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)args; (void)nargs; (void)out;
+   /* Focus is what decides where typed text goes, and there is exactly one
+    * place it can go: the field the input method is connected to.  A view
+    * dropping focus is that connection ending. */
+   if (self && self == g_ime_view) {
+      luna_ime_hide();
+      g_ime_band = 0;
+      g_layout_pass_pending = true;
+   }
+   RETV();
+}
+
+/* Runs the listeners a layout pass would have run.  This is the only thing in
+ * the emulator that changes the window's shape, so it is the only caller. */
+static void ime_run_layout_pass(struct dvm *vm)
+{
+   for (int i = 0; i < g_nlayout_observers; ++i) {
+      dvm_ref listener =
+         ui_obj(vm, g_layout_observers[i], "globalLayoutListener",
+                "Landroid/view/ViewTreeObserver$OnGlobalLayoutListener;");
+      if (!listener) continue;
+      struct dvm_class *c = dvm_object_class(vm, listener);
+      struct dvm_method *m =
+         c ? dvm_find_method(vm, c, "onGlobalLayout", "()V") : NULL;
+      if (!m) continue;
+      union dvm_value ignored = { 0 };
+      if (!dvm_call(vm, m, listener, NULL, 0, &ignored))
+         ui_report_exception(vm, "onGlobalLayout");
+   }
+   /* The same pass delivers the window insets.  There is no status bar,
+    * navigation bar or cutout here, so they are zero — a real answer, and the
+    * one a full-screen game gets on a gesture-navigation device. */
+   for (int i = 0; i < g_ninsets_views; ++i) {
+      dvm_ref view = g_insets_views[i];
+      dvm_ref listener =
+         ui_obj(vm, view, "insetsListener",
+                "Landroid/view/View$OnApplyWindowInsetsListener;");
+      if (!listener) continue;
+      struct dvm_class *c = dvm_object_class(vm, listener);
+      struct dvm_method *m = c ? dvm_find_method(
+         vm, c, "onApplyWindowInsets",
+         "(Landroid/view/View;Landroid/view/WindowInsets;)"
+         "Landroid/view/WindowInsets;") : NULL;
+      if (!m) continue;
+      struct dvm_class *wic =
+         dvm__class_by_desc(vm, "Landroid/view/WindowInsets;");
+      union dvm_value a[2] = { { .l = view },
+                               { .l = wic ? dvm_new_object(vm, wic) : 0 } };
+      union dvm_value ignored = { 0 };
+      if (!dvm_call(vm, m, listener, a, 2, &ignored))
+         ui_report_exception(vm, "onApplyWindowInsets");
+   }
+}
+
+/* View.requestLayout(): the app asking for a layout pass.  On a device one
+ * runs on the next frame and the global-layout listeners fire with it — which
+ * is how GameActivity$27 recovers when its field is still off-screen half a
+ * second after the keyboard was raised. */
+static bool view_request_layout(struct dvm *vm, dvm_ref self,
+                                const union dvm_value *args, int nargs,
+                                union dvm_value *out)
+{
+   (void)vm; (void)self; (void)args; (void)nargs; (void)out;
+   g_layout_pass_pending = true;
+   RETV();
+}
+
+/* How many UTF-16 units the Java side would count in this UTF-8 text.  The
+ * TextWatcher arguments are char offsets, and a caller that compares them with
+ * String.length() gets a different number if these are bytes. */
+static int32_t utf16_len(const char *s)
+{
+   int32_t n = 0;
+   for (const unsigned char *p = (const unsigned char *)s; p && *p; ) {
+      unsigned c = *p;
+      if (c < 0x80u) { ++p; ++n; }
+      else if (c < 0xe0u) { p += 2; ++n; }
+      else if (c < 0xf0u) { p += 3; ++n; }
+      else { p += 4; n += 2; }   /* outside the BMP: a surrogate pair */
+   }
+   return n;
+}
+
+/* Replaces the field's contents and tells its watchers, in the order the
+ * platform does: every watcher sees the old text, then the field changes, then
+ * every watcher sees the new one.  A watcher that reads getText() in
+ * onTextChanged — UE4's does — depends on that ordering. */
+static void ime_deliver_text(struct dvm *vm, dvm_ref view, const char *text)
+{
+   const char *prev = ui_text_of(vm, view);
+   dvm_ref old_cs = ui_obj(vm, view, "text", "Ljava/lang/CharSequence;");
+   int32_t before = utf16_len(prev ? prev : "");
+   int32_t after = utf16_len(text);
+
+   dvm_ref kids = ui_obj(vm, view, "textWatchers", "Ljava/util/List;");
+   struct rt_list *l = kids ? list_of(vm, kids) : NULL;
+
+   for (uint32_t i = 0; l && i < l->size; ++i) {
+      struct dvm_class *c = dvm_object_class(vm, l->items[i]);
+      struct dvm_method *m = c ? dvm_find_method(vm, c, "beforeTextChanged",
+         "(Ljava/lang/CharSequence;III)V") : NULL;
+      if (!m) continue;
+      union dvm_value a[4] = { { .l = old_cs }, { .i = 0 }, { .i = before },
+                               { .i = after } }, ignored = { 0 };
+      if (!dvm_call(vm, m, l->items[i], a, 4, &ignored))
+         ui_report_exception(vm, "beforeTextChanged");
+   }
+
+   if (getenv("LUNARIA_IME_TRACE"))
+      fprintf(stderr, "[ime] -> view %u: \"%s\" (%d watcher(s))\n",
+              (unsigned)view, text, l ? (int)l->size : 0);
+
+   dvm_ref now = dvm_new_string(vm, text);
+   union dvm_value v = { .l = now };
+   (void)dvm_set_field(vm, view, "text", "Ljava/lang/CharSequence;", v);
+   rt_set_int(vm, view, "selectionStart", after);
+   rt_set_int(vm, view, "selectionEnd", after);
+   ui_invalidate();
+
+   /* The list is re-read: a watcher is allowed to add or drop watchers, and
+    * the earlier pointer would be stale if one grew the backing array. */
+   kids = ui_obj(vm, view, "textWatchers", "Ljava/util/List;");
+   l = kids ? list_of(vm, kids) : NULL;
+   for (uint32_t i = 0; l && i < l->size; ++i) {
+      struct dvm_class *c = dvm_object_class(vm, l->items[i]);
+      struct dvm_method *m = c ? dvm_find_method(vm, c, "onTextChanged",
+         "(Ljava/lang/CharSequence;III)V") : NULL;
+      if (m) {
+         union dvm_value a[4] = { { .l = now }, { .i = 0 }, { .i = before },
+                                  { .i = after } }, ignored = { 0 };
+         if (!dvm_call(vm, m, l->items[i], a, 4, &ignored))
+            ui_report_exception(vm, "onTextChanged");
+      }
+      kids = ui_obj(vm, view, "textWatchers", "Ljava/util/List;");
+      l = kids ? list_of(vm, kids) : NULL;
+      if (!l) break;
+   }
+
+   kids = ui_obj(vm, view, "textWatchers", "Ljava/util/List;");
+   l = kids ? list_of(vm, kids) : NULL;
+   for (uint32_t i = 0; l && i < l->size; ++i) {
+      struct dvm_class *c = dvm_object_class(vm, l->items[i]);
+      struct dvm_method *m = c ? dvm_find_method(vm, c, "afterTextChanged",
+         "(Landroid/text/Editable;)V") : NULL;
+      if (!m) continue;
+      union dvm_value a = { .l = now }, ignored = { 0 };
+      if (!dvm_call(vm, m, l->items[i], &a, 1, &ignored))
+         ui_report_exception(vm, "afterTextChanged");
+   }
+}
+
+static void ime_disconnect(struct dvm *vm)
+{
+   luna_ime_hide();
+   g_ime_band = 0;
+   g_layout_pass_pending = true;
+   if (g_ime_view) {
+      dvm_unpin(vm, g_ime_view);
+      g_ime_view = 0;
+   }
+}
+
+/* IME_ACTION_DONE.  It is what a single-line field's Enter reports, and the
+ * value GameActivity$36 tests for before it hands the text to native code. */
+#define RT_IME_ACTION_DONE 6
+
+static void ime_deliver_action(struct dvm *vm, dvm_ref view)
+{
+   dvm_ref listener = ui_obj(vm, view, "editorActionListener",
+                             "Landroid/widget/TextView$OnEditorActionListener;");
+   bool handled = false;
+   if (listener) {
+      struct dvm_class *c = dvm_object_class(vm, listener);
+      struct dvm_method *m = c ? dvm_find_method(vm, c, "onEditorAction",
+         "(Landroid/widget/TextView;ILandroid/view/KeyEvent;)Z") : NULL;
+      if (m) {
+         union dvm_value a[3] = { { .l = view }, { .i = RT_IME_ACTION_DONE },
+                                  { .l = 0 } }, ret = { 0 };
+         if (dvm_call(vm, m, listener, a, 3, &ret)) handled = ret.i != 0;
+         else ui_report_exception(vm, "onEditorAction");
+      }
+   }
+   /* A field that handles the action decides for itself what happens next —
+    * UE4's asks for the keyboard to be hidden, which comes back through
+    * hideSoftInputFromWindow().  One that does not is finished with the text,
+    * and leaving the panel up would be leaving it up for ever. */
+   if (!handled) ime_disconnect(vm);
+}
+
+static bool imm_show_soft_input(struct dvm *vm, dvm_ref self,
+                                const union dvm_value *args, int nargs,
+                                union dvm_value *out)
+{
+   (void)self;
+   dvm_ref view = nargs > 0 ? ARG(0).l : 0;
+   if (!view) RETI(0);
+
+   if (g_ime_view != view) {
+      if (g_ime_view) dvm_unpin(vm, g_ime_view);
+      dvm_pin(vm, view);
+      g_ime_view = view;
+   }
+
+   /* The field is laid out by whatever draws it, and here that is the input
+    * method: give the View the geometry the panel gives it, so getHeight()
+    * answers what is really on screen rather than the zero of a view no
+    * layout pass ever touched. */
+   rt_set_int(vm, view, "left", 0);
+   rt_set_int(vm, view, "top", 0);
+   rt_set_int(vm, view, "right", rt_surface_w());
+   rt_set_int(vm, view, "bottom", RT_IME_FIELD_H);
+
+   const char *text = ui_text_of(vm, view);
+   int input_type = ui_int(vm, view, "inputType");
+   /* setSingleLine(true) and setMaxLines(1) are the two ways a field says it
+    * takes one line; either makes Enter the editor action instead of a
+    * newline. */
+   bool multiline = !ui_int(vm, view, "singleLine") &&
+                    ui_int(vm, view, "maxLines") != 1;
+
+   luna_ime_show(text ? text : "", input_type, multiline);
+   g_ime_band = luna_ime_band_height(rt_surface_h());
+   /* Not fired here: on a device the window resizes and the layout pass runs
+    * on the next frame, never inside showSoftInput(), and the caller is
+    * holding its own lock while it asks. */
+   g_layout_pass_pending = true;
+   RETI(1);
+}
+
+static bool imm_hide_soft_input(struct dvm *vm, dvm_ref self,
+                                const union dvm_value *args, int nargs,
+                                union dvm_value *out)
+{
+   (void)self; (void)args; (void)nargs;
+   ime_disconnect(vm);
+   RETI(1);
+}
+
+static bool imm_is_active(struct dvm *vm, dvm_ref self,
+                          const union dvm_value *args, int nargs,
+                          union dvm_value *out)
+{
+   (void)vm; (void)self; (void)args; (void)nargs;
+   RETI(luna_ime_active() ? 1 : 0);
+}
+
+/* Called from the main-looper drain, next to the widget tick, and once per
+ * host frame from the pump.  Both are needed: the drain only runs when the
+ * guest has just called into Java, and a game waiting for the name the player
+ * is typing has no reason to. */
+/* LUNARIA_IME_TEST=<seconds>: raise the input method on the app's own text
+ * field that long after the guest starts running.  A diagnostic, not a path
+ * the guest can take — it goes through exactly the same entry point the app
+ * would use, so what it exercises is the real chain. */
+static void ime_maybe_self_test(struct dvm *vm)
+{
+   static int64_t due = -1;
+   if (due == -2) return;
+   if (due < 0) {
+      const char *e = getenv("LUNARIA_IME_TEST");
+      long secs = (e && *e) ? atol(e) : 0;
+      if (secs <= 0) { due = -2; return; }
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      due = (int64_t)ts.tv_sec + secs;
+   }
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   if ((int64_t)ts.tv_sec < due) return;
+   if (!g_ime_last_field) return;
+   due = -2;
+
+   /* Prefer the app's own entry point.  UE4's is a method on the Activity the
+    * field belongs to, and going through it exercises the whole chain the
+    * game would take — the posted command, the field being configured, the
+    * layout pass, the watchers — rather than only the half below
+    * showSoftInput(). */
+   dvm_ref ctx = ui_obj(vm, g_ime_last_field, "context",
+                        "Landroid/content/Context;");
+   struct dvm_class *c = ctx ? dvm_object_class(vm, ctx) : NULL;
+   struct dvm_method *m = c ? dvm_find_method(vm, c,
+      "AndroidThunkJava_ShowVirtualKeyboardInput",
+      "(ILjava/lang/String;Ljava/lang/String;)V") : NULL;
+   if (m) {
+      fprintf(stderr, "[ime] LUNARIA_IME_TEST: %s.%s\n",
+              dvm_class_name(c), m->name);
+      union dvm_value a[3] = { { .i = 1 },   /* TYPE_CLASS_TEXT */
+                               { .l = dvm_new_string(vm, "Lunaria") },
+                               { .l = dvm_new_string(vm, "") } };
+      union dvm_value ignored = { 0 };
+      if (!dvm_call(vm, m, ctx, a, 3, &ignored))
+         ui_report_exception(vm, "AndroidThunkJava_ShowVirtualKeyboardInput");
+      return;
+   }
+
+   fprintf(stderr, "[ime] LUNARIA_IME_TEST: showSoftInput on view %u\n",
+           (unsigned)g_ime_last_field);
+   union dvm_value a[2] = { { .l = g_ime_last_field }, { .i = 0 } };
+   union dvm_value ignored = { 0 };
+   (void)imm_show_soft_input(vm, 0, a, 2, &ignored);
+}
+
+static void dvm_ime_tick(struct dvm *vm)
+{
+   ime_maybe_self_test(vm);
+   if (g_layout_pass_pending) {
+      g_layout_pass_pending = false;
+      ime_run_layout_pass(vm);
+   }
+   if (!g_ime_view || !luna_ime_active()) return;
+
+   char text[512];
+   int events = luna_ime_pump(text, sizeof text);
+   if (!events) return;
+
+   dvm_ref view = g_ime_view;
+   if (events & LUNA_IME_EV_TEXT) ime_deliver_text(vm, view, text);
+   if (events & LUNA_IME_EV_ACCEPT) ime_deliver_action(vm, view);
+   else if (events & LUNA_IME_EV_CANCEL) ime_disconnect(vm);
+}
+
+void dvm_ime_frame(struct dvm *vm)
+{
+   if (!g_layout_pass_pending && !g_ime_view) return;
+   /* The frame pump does not carry the interpreter lock, and everything below
+    * runs guest code. */
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   dvm_ime_tick(vm);
+   dvm_gil_leave_to_guest(vm, cookie);
+}
+
 /* Called from the pending-queue drain: the emulator's equivalent of the main
  * looper, and so the right thread to run a click callback and to read the view
  * tree while nothing else is mutating it. */
 void dvm__ui_tick(struct dvm *vm)
 {
+   dvm_ime_tick(vm);
    dvm_ref clicks[16];
    int n = 0;
    pthread_mutex_lock(&g_ui_click_lock);
@@ -32808,6 +35759,41 @@ static bool adb_return_self(struct dvm *vm, dvm_ref self,
    RETL(self);
 }
 
+/* Defined with the Dialog below; Builder.show() is create() plus this. */
+static bool dialog_show(struct dvm *vm, dvm_ref self,
+                        const union dvm_value *args, int nargs,
+                        union dvm_value *out);
+
+/* AlertDialog.Builder.setTitle / setMessage.
+ *
+ * These were `adb_return_self`: the chaining worked and the text went nowhere.
+ * A dialog is a question, and its text is the question — dropping it leaves
+ * the emulator showing a box whose contents nobody, including whoever is
+ * reading the log, can find out.  The string forms are kept; the resource-id
+ * forms are looked up the same way the rest of the runtime resolves ids. */
+static bool adb_set_title(struct dvm *vm, dvm_ref self,
+                          const union dvm_value *args, int nargs,
+                          union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value v = { .l = ARG(0).l };
+   (void)dvm_set_field(vm, self, "title", "Ljava/lang/CharSequence;", v);
+   RETL(self);
+}
+
+static bool adb_set_message(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value v = { .l = ARG(0).l };
+   (void)dvm_set_field(vm, self, "message", "Ljava/lang/CharSequence;", v);
+   RETL(self);
+}
+
+/* create() builds the dialog the builder describes.  Everything the builder
+ * was told has to travel with it — the cancelable flag decides whether the
+ * user may dismiss it, and the text is what it says. */
 static bool adb_create(struct dvm *vm, dvm_ref self,
                        const union dvm_value *args, int nargs,
                        union dvm_value *out)
@@ -32815,12 +35801,52 @@ static bool adb_create(struct dvm *vm, dvm_ref self,
    (void)args; (void)nargs;
    struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/app/AlertDialog;");
    dvm_ref dialog = c ? dvm_new_object(vm, c) : 0;
-   if (dialog) {
-      union dvm_value v = { .l = self };
-      (void)dvm_set_field(vm, dialog, "builder",
-                          "Landroid/app/AlertDialog$Builder;", v);
-   }
+   if (!dialog) RETL(0);
+   union dvm_value v = { .l = self };
+   (void)dvm_set_field(vm, dialog, "builder",
+                       "Landroid/app/AlertDialog$Builder;", v);
+   union dvm_value copy = { 0 };
+   (void)dvm_get_field(vm, self, "context", "Landroid/content/Context;", &copy);
+   (void)dvm_set_field(vm, dialog, "context", "Landroid/content/Context;", copy);
+   /* Builder.setCancelable() defaults to true, and adb_init sets it. */
+   copy.i = 0;
+   (void)dvm_get_field(vm, self, "cancelable", "Z", &copy);
+   (void)dvm_set_field(vm, dialog, "cancelable", "Z", copy);
+   (void)dvm_set_field(vm, dialog, "cancelOutside", "Z", copy);
    RETL(dialog);
+}
+
+/* Builder.show() is create() *and* show() on Android, and here it is create()
+ * alone — the one deliberate deviation in this file.
+ *
+ * Making it show is a one-line change and it is *not* being made yet, because
+ * showing is not the whole of it: the emulator's dialog is a full-screen
+ * modal with a dim scrim over the guest's frame, and every pointer event goes
+ * to it until one of its buttons is pressed.  Cross Worlds' security module
+ * raises one ("Need Security License") behind the title screen, so honouring
+ * show() here darkens the title and takes the player's input with it, with
+ * nothing on the emulator side that dismisses it.
+ *
+ * The missing piece is the emulator's own handling of an unanswerable modal,
+ * not this call.  Until that exists, the dialog is built and logged (see
+ * dialog_show) but not raised, and this comment is the record of the
+ * difference — the alternative was leaving it undocumented in a table entry
+ * that reads as if show() worked. */
+static bool adb_show(struct dvm *vm, dvm_ref self,
+                     const union dvm_value *args, int nargs,
+                     union dvm_value *out)
+{
+   union dvm_value dialog = { 0 };
+   if (!adb_create(vm, self, args, nargs, &dialog)) return false;
+   union dvm_value t = { 0 }, m = { 0 };
+   (void)dvm_get_field(vm, self, "title", "Ljava/lang/CharSequence;", &t);
+   (void)dvm_get_field(vm, self, "message", "Ljava/lang/CharSequence;", &m);
+   const char *ts = t.l ? rt_charseq_utf8(vm, t.l) : NULL;
+   const char *ms = m.l ? rt_charseq_utf8(vm, m.l) : NULL;
+   if (ts || ms)
+      fprintf(stderr, "[dialog] not raised (Builder.show): %s%s%s\n",
+              ts ? ts : "", ts && ms ? " — " : "", ms ? ms : "");
+   RETL(dialog.l);
 }
 
 /* Defined with the rest of the Dialog surface below. */
@@ -32836,6 +35862,26 @@ static bool dialog_show(struct dvm *vm, dvm_ref self,
    if (!dialog_ensure_created(vm, self)) return false;
    union dvm_value v = { .i = 1 };
    (void)dvm_set_field(vm, self, "showing", "Z", v);
+   /* Say what it says.  A modal dialog is where a title stops, and the one
+    * thing that explains why is the text on it — which used to exist only as
+    * pixels in the overlay, so a headless run or a run that never presented
+    * another frame left no record of the question at all. */
+   {
+      union dvm_value b = { 0 }, t = { 0 }, m = { 0 }, c = { 0 };
+      (void)dvm_get_field(vm, self, "builder",
+                          "Landroid/app/AlertDialog$Builder;", &b);
+      if (b.l) {
+         (void)dvm_get_field(vm, b.l, "title", "Ljava/lang/CharSequence;", &t);
+         (void)dvm_get_field(vm, b.l, "message", "Ljava/lang/CharSequence;", &m);
+      }
+      (void)dvm_get_field(vm, self, "cancelable", "Z", &c);
+      const char *ts = t.l ? rt_charseq_utf8(vm, t.l) : NULL;
+      const char *ms = m.l ? rt_charseq_utf8(vm, m.l) : NULL;
+      fprintf(stderr, "[dialog] shown%s%s%s%s%s%s\n",
+              ts ? " title=\"" : "", ts ? ts : "", ts ? "\"" : "",
+              ms ? " message=\"" : "", ms ? ms : "", ms ? "\"" : "");
+      if (!c.i) fprintf(stderr, "[dialog]   not cancelable: it has to be answered\n");
+   }
    ui_window_shown(vm, self);
    /* A registered OnShowListener runs when the dialog is shown — that is the
     * only moment it ever gets, and apps put their button wiring in it. */
@@ -32901,6 +35947,55 @@ static bool dialog_dismiss(struct dvm *vm, dvm_ref self,
 /* cancel() is dismiss() preceded by the cancel callback: the two mean
  * different things to the app (the player backed out, versus the dialog
  * finished), and only cancel() reports the first. */
+/* Dialog.setCancelable / setCanceledOnTouchOutside.
+ *
+ * These decide whether the *user* may dismiss the dialog without answering it,
+ * and a dialog that says "not cancelable" means it: UE4's MessageBox01 puts
+ * one up for a fatal startup condition and expects the player to have to press
+ * a button.  Discarding the flags meant the emulator had no way to know which
+ * dialogs those are — it could only ever guess, and guessing "dismissable"
+ * turns a question the game is waiting on into one it never got an answer to.
+ *
+ * setCancelable(false) also implies not-cancelable-on-touch-outside, which is
+ * what Android does when the two disagree. */
+static bool dialog_set_cancelable(struct dvm *vm, dvm_ref self,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value v = { .i = ARG(0).i != 0 };
+   (void)dvm_set_field(vm, self, "cancelable", "Z", v);
+   if (!v.i)
+      (void)dvm_set_field(vm, self, "cancelOutside", "Z", v);
+   RETV();
+}
+
+static bool dialog_set_canceled_outside(struct dvm *vm, dvm_ref self,
+                                        const union dvm_value *args, int nargs,
+                                        union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value cancelable = { 0 };
+   (void)dvm_get_field(vm, self, "cancelable", "Z", &cancelable);
+   union dvm_value v = { .i = ARG(0).i != 0 };
+   /* setCanceledOnTouchOutside(true) makes the dialog cancelable, as it does
+    * on a device. */
+   if (v.i && !cancelable.i)
+      (void)dvm_set_field(vm, self, "cancelable", "Z", v);
+   (void)dvm_set_field(vm, self, "cancelOutside", "Z", v);
+   RETV();
+}
+
+/* Whether the user may dismiss this dialog without pressing one of its
+ * buttons.  Consulted by the emulator's own UI layer, which is the only thing
+ * here that can deliver a Back press or a tap outside the dialog. */
+static bool dialog_user_cancelable(struct dvm *vm, dvm_ref dialog)
+{
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, dialog, "cancelable", "Z", &v);
+   return v.i != 0;
+}
+
 static bool dialog_cancel(struct dvm *vm, dvm_ref self,
                           const union dvm_value *args, int nargs,
                           union dvm_value *out)
@@ -32929,6 +36024,8 @@ static const struct rt_field rt_alert_builder_fields[] = {
    { "context", "Landroid/content/Context;" },
    { "view", "Landroid/view/View;" },
    { "cancelable", "Z" },
+   { "title", "Ljava/lang/CharSequence;" },
+   { "message", "Ljava/lang/CharSequence;" },
    F_END,
 };
 
@@ -32937,13 +36034,15 @@ static const struct rt_method rt_alert_builder[] = {
    M("<init>", "(Landroid/content/Context;I)V", adb_init),
    M("setView", "(Landroid/view/View;)Landroid/app/AlertDialog$Builder;",
      adb_set_view),
+   /* The resource-id forms carry an id this runtime has no string table for;
+    * the text forms are the ones that arrive with their content. */
    M("setTitle", "(I)Landroid/app/AlertDialog$Builder;", adb_return_self),
    M("setTitle", "(Ljava/lang/CharSequence;)Landroid/app/AlertDialog$Builder;",
-     adb_return_self),
+     adb_set_title),
    M("setMessage", "(I)Landroid/app/AlertDialog$Builder;", adb_return_self),
    M("setMessage",
      "(Ljava/lang/CharSequence;)Landroid/app/AlertDialog$Builder;",
-     adb_return_self),
+     adb_set_message),
    M("setPositiveButton",
      "(ILandroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;",
      adb_return_self),
@@ -32959,7 +36058,7 @@ static const struct rt_method rt_alert_builder[] = {
    M("setCancelable", "(Z)Landroid/app/AlertDialog$Builder;",
      adb_set_cancelable),
    M("create", "()Landroid/app/AlertDialog;", adb_create),
-   M("show", "()Landroid/app/AlertDialog;", adb_create),
+   M("show", "()Landroid/app/AlertDialog;", adb_show),
    M_END,
 };
 
@@ -32970,6 +36069,11 @@ static const struct rt_field rt_alert_dialog_fields[] = {
    { "buttonNeutral", "Landroid/widget/Button;" },
    { "showing", "Z" },
    { "created", "Z" },
+   /* Dialog() starts cancelable on Android; setCancelable(false) is how a
+    * dialog that must be answered says so.  The default is applied in
+    * dialog_init rather than left at the zero a fresh object reads as. */
+   { "cancelable", "Z" },
+   { "cancelOutside", "Z" },
    { "showListener", "Landroid/content/DialogInterface$OnShowListener;" },
    { "dismissListener", "Landroid/content/DialogInterface$OnDismissListener;" },
    { "cancelListener", "Landroid/content/DialogInterface$OnCancelListener;" },
@@ -32990,6 +36094,11 @@ static bool dialog_init(struct dvm *vm, dvm_ref self,
 {
    union dvm_value ctx = { .l = nargs > 0 ? ARG(0).l : 0 };
    (void)dvm_set_field(vm, self, "context", "Landroid/content/Context;", ctx);
+   /* A Dialog is cancelable until it says otherwise; the three-argument
+    * constructor carries that flag itself. */
+   union dvm_value cancelable = { .i = nargs > 1 && args[1].i == 0 ? 0 : 1 };
+   (void)dvm_set_field(vm, self, "cancelable", "Z", cancelable);
+   (void)dvm_set_field(vm, self, "cancelOutside", "Z", cancelable);
    RETV();
 }
 
@@ -33152,11 +36261,12 @@ static const struct rt_method rt_alert_dialog[] = {
      dialog_init),
    M("getContext", "()Landroid/content/Context;", dialog_get_context),
    M("getWindow", "()Landroid/view/Window;", dialog_get_window),
-   /* A Dialog subclass's onCreate() opens with super.onCreate(state); the base
-    * class has nothing to do here, but the call has to resolve. */
-   M("onCreate", "(Landroid/os/Bundle;)V", nop_void),
-   M("onStart", "()V", nop_void),
-   M("onStop", "()V", nop_void),
+   /* Dialog.onCreate/onStart/onStop are empty on Android: they exist to be
+    * overridden, and the base class's own setup happens in show().  A
+    * subclass's onCreate() opens with super.onCreate(state), which is this. */
+   M("onCreate", "(Landroid/os/Bundle;)V", empty_void),
+   M("onStart", "()V", empty_void),
+   M("onStop", "()V", empty_void),
    M("getLayoutInflater", "()Landroid/view/LayoutInflater;",
      dialog_get_layout_inflater),
    M("setContentView", "(I)V", dialog_set_content_view),
@@ -33164,8 +36274,8 @@ static const struct rt_method rt_alert_dialog[] = {
    M("setContentView", "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
      dialog_set_content_view),
    M("findViewById", "(I)Landroid/view/View;", dialog_find_view_by_id),
-   M("setCancelable", "(Z)V", nop_void),
-   M("setCanceledOnTouchOutside", "(Z)V", nop_void),
+   M("setCancelable", "(Z)V", dialog_set_cancelable),
+   M("setCanceledOnTouchOutside", "(Z)V", dialog_set_canceled_outside),
    M("setOnDismissListener",
      "(Landroid/content/DialogInterface$OnDismissListener;)V",
      dialog_set_dismiss_listener),
@@ -33452,12 +36562,138 @@ static const struct rt_method rt_color[] = {
    M_END,
 };
 
+/* android.graphics.Paint — the state, at least.
+ *
+ * A Paint is mostly a bag of settings that the caller writes and reads back;
+ * androidx.emoji2's DefaultGlyphChecker builds one, sets a text size on it and
+ * keeps it for the life of the process.  Accepting the setters and dropping
+ * the values made every getter answer for a Paint nobody had configured, so
+ * the fields are real now.
+ *
+ * What this Paint still cannot do is *measure*: there is no font engine
+ * behind it (the emulator's own text goes through luna-ui, in the overlay's
+ * GL context, on another thread).  measureText() therefore stays at zero and
+ * is the one call here that is not an answer — noted rather than hidden. */
+static bool paint_init(struct dvm *vm, dvm_ref self,
+                       const union dvm_value *args, int nargs,
+                       union dvm_value *out)
+{
+   /* new Paint() is a Paint with the platform defaults: black, opaque, 12px
+    * text.  new Paint(flags) adds the caller's flags. */
+   union dvm_value v = { .f = 12.0f };
+   (void)dvm_set_field(vm, self, "textSize", "F", v);
+   v.f = 1.0f;
+   (void)dvm_set_field(vm, self, "textScaleX", "F", v);
+   v.i = (int32_t)0xff000000;
+   (void)dvm_set_field(vm, self, "color", "I", v);
+   v.i = nargs > 0 ? ARG(0).i : 0;
+   (void)dvm_set_field(vm, self, "flags", "I", v);
+   RETV();
+}
+
+#define PAINT_ACCESSOR(setter, getter, field, type, member)                   \
+   static bool setter(struct dvm *vm, dvm_ref self,                           \
+                      const union dvm_value *args, int nargs,                 \
+                      union dvm_value *out)                                   \
+   {                                                                          \
+      (void)nargs;                                                            \
+      union dvm_value v = { 0 };                                              \
+      v.member = ARG(0).member;                                               \
+      (void)dvm_set_field(vm, self, field, type, v);                          \
+      RETV();                                                                 \
+   }                                                                          \
+   static bool getter(struct dvm *vm, dvm_ref self,                           \
+                      const union dvm_value *args, int nargs,                 \
+                      union dvm_value *out)                                   \
+   {                                                                          \
+      (void)args; (void)nargs;                                                \
+      union dvm_value v = { 0 };                                              \
+      (void)dvm_get_field(vm, self, field, type, &v);                         \
+      if (out) { memset(out, 0, sizeof *out); out->member = v.member; }        \
+      return true;                                                            \
+   }
+
+PAINT_ACCESSOR(paint_setTextSize, paint_getTextSize, "textSize", "F", f)
+PAINT_ACCESSOR(paint_setTextScaleX, paint_getTextScaleX, "textScaleX", "F", f)
+PAINT_ACCESSOR(paint_setColor, paint_getColor, "color", "I", i)
+PAINT_ACCESSOR(paint_setFlags, paint_getFlags, "flags", "I", i)
+PAINT_ACCESSOR(paint_setStrokeWidth, paint_getStrokeWidth, "strokeWidth", "F", f)
+#undef PAINT_ACCESSOR
+
+/* setAntiAlias(bool) is flag bit 0 (Paint.ANTI_ALIAS_FLAG). */
+static bool paint_setAntiAlias(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "flags", "I", &v);
+   v.i = ARG(0).i ? (v.i | 1) : (v.i & ~1);
+   (void)dvm_set_field(vm, self, "flags", "I", v);
+   RETV();
+}
+
+static bool paint_isAntiAlias(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "flags", "I", &v);
+   RETI(v.i & 1 ? 1 : 0);
+}
+
+/* setTypeface returns the typeface that was set, which is what the caller
+ * chains on; it also has to be remembered for getTypeface(). */
+static bool paint_setTypeface(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value v = { .l = ARG(0).l };
+   (void)dvm_set_field(vm, self, "typeface", "Landroid/graphics/Typeface;", v);
+   RETL(v.l);
+}
+
+static bool paint_getTypeface(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "typeface", "Landroid/graphics/Typeface;", &v);
+   RETL(v.l);
+}
+
+static const struct rt_field rt_paint_fields[] = {
+   { "textSize", "F" }, { "textScaleX", "F" }, { "strokeWidth", "F" },
+   { "color", "I" }, { "flags", "I" },
+   { "typeface", "Landroid/graphics/Typeface;" },
+   F_END
+};
+
 static const struct rt_method rt_paint[] = {
-   M("<init>", "()V", nop_void),
-   M("<init>", "(I)V", nop_void),
-   M("setTextSize", "(F)V", nop_void),
+   M("<init>", "()V", paint_init),
+   M("<init>", "(I)V", paint_init),
+   M("setTextSize", "(F)V", paint_setTextSize),
+   M("getTextSize", "()F", paint_getTextSize),
+   M("setTextScaleX", "(F)V", paint_setTextScaleX),
+   M("getTextScaleX", "()F", paint_getTextScaleX),
+   M("setColor", "(I)V", paint_setColor),
+   M("getColor", "()I", paint_getColor),
+   M("setFlags", "(I)V", paint_setFlags),
+   M("getFlags", "()I", paint_getFlags),
+   M("setStrokeWidth", "(F)V", paint_setStrokeWidth),
+   M("getStrokeWidth", "()F", paint_getStrokeWidth),
+   M("setAntiAlias", "(Z)V", paint_setAntiAlias),
+   M("isAntiAlias", "()Z", paint_isAntiAlias),
    M("setTypeface", "(Landroid/graphics/Typeface;)Landroid/graphics/Typeface;",
-     ret_null),
+     paint_setTypeface),
+   M("getTypeface", "()Landroid/graphics/Typeface;", paint_getTypeface),
+   /* No font engine behind this Paint: every glyph "exists" and no string can
+    * be measured.  Both are stated rather than pretended — hasGlyph is used
+    * to decide whether an emoji needs a fallback font, and there is no
+    * fallback here either. */
    M("hasGlyph", "(Ljava/lang/String;)Z", ret_true),
    M("measureText", "(Ljava/lang/String;)F", ret_zero),
    M_END,
@@ -33655,8 +36891,70 @@ static const struct rt_field rt_value_object_fields[] = {
    { "value", "Ljava/lang/Object;" }, F_END
 };
 
+static const struct rt_field rt_messenger_fields[] = {
+   { "handler", "Landroid/os/Handler;" },
+   { "binder", "Landroid/os/IBinder;" }, F_END
+};
+
+static bool messenger_from_handler(struct dvm *vm, dvm_ref self,
+                                   const union dvm_value *args, int nargs,
+                                   union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   union dvm_value handler = { .l = ARG(0).l };
+   (void)dvm_set_field(vm, self, "handler", "Landroid/os/Handler;", handler);
+   RETV();
+}
+
+static bool messenger_from_binder(struct dvm *vm, dvm_ref self,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   union dvm_value binder = { .l = ARG(0).l }, handler = { 0 };
+   (void)dvm_set_field(vm, self, "binder", "Landroid/os/IBinder;", binder);
+   (void)dvm_get_field(vm, binder.l, "messengerHandler",
+                       "Landroid/os/Handler;", &handler);
+   (void)dvm_set_field(vm, self, "handler", "Landroid/os/Handler;", handler);
+   RETV();
+}
+
+static bool messenger_get_binder(struct dvm *vm, dvm_ref self,
+                                 const union dvm_value *args, int nargs,
+                                 union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value binder = { 0 };
+   (void)dvm_get_field(vm, self, "binder", "Landroid/os/IBinder;", &binder);
+   if (!binder.l) {
+      struct dvm_class *bc = dvm__class_by_desc(vm, "Landroid/os/Binder;");
+      binder.l = bc ? dvm_new_object(vm, bc) : 0;
+      union dvm_value handler = { 0 };
+      (void)dvm_get_field(vm, self, "handler", "Landroid/os/Handler;", &handler);
+      if (binder.l)
+         (void)dvm_set_field(vm, binder.l, "messengerHandler",
+                             "Landroid/os/Handler;", handler);
+      (void)dvm_set_field(vm, self, "binder", "Landroid/os/IBinder;", binder);
+   }
+   RETL(binder.l);
+}
+
+static bool messenger_send(struct dvm *vm, dvm_ref self,
+                           const union dvm_value *args, int nargs,
+                           union dvm_value *out)
+{
+   union dvm_value handler = { 0 };
+   (void)dvm_get_field(vm, self, "handler", "Landroid/os/Handler;", &handler);
+   if (!handler.l || !nargs) RETV();
+   return h_sendMessage(vm, handler.l, args, 1, out);
+}
+
 static const struct rt_method rt_messenger[] = {
-   M("<init>", "(Landroid/os/Handler;)V", object_store_first_ref), M_END,
+   M("<init>", "(Landroid/os/Handler;)V", messenger_from_handler),
+   M("<init>", "(Landroid/os/IBinder;)V", messenger_from_binder),
+   M("getBinder", "()Landroid/os/IBinder;", messenger_get_binder),
+   M("send", "(Landroid/os/Message;)V", messenger_send),
+   M_END,
 };
 
 static const struct rt_method rt_result_receiver[] = {
@@ -33690,6 +36988,7 @@ static bool binder_attach(struct dvm *vm, dvm_ref self,
 static const struct rt_field rt_binder_fields[] = {
    { "owner", "Landroid/os/IInterface;" },
    { "descriptor", "Ljava/lang/String;" },
+   { "messengerHandler", "Landroid/os/Handler;" },
    F_END
 };
 
@@ -36906,7 +40205,7 @@ static const struct rt_class rt_classes[] = {
    { "Ldouble;", NULL, NULL, NULL, NULL },
    { "Lvoid;", NULL, NULL, NULL, NULL },
    { "Ljava/lang/String;", "Ljava/lang/Object;", rt_string, NULL,
-     rt_iface_charseq },
+     rt_iface_charseq_comparable },
    { "Ljava/lang/CharSequence;", "Ljava/lang/Object;", rt_charseq, NULL,
      NULL, NULL, true },
    { "Ljava/lang/StringBuilder;", "Ljava/lang/Object;", rt_sb, NULL,
@@ -36916,16 +40215,24 @@ static const struct rt_class rt_classes[] = {
    { "Ljava/lang/Appendable;", "Ljava/lang/Object;", rt_appendable, NULL,
      NULL, NULL, true },
    { "Ljava/lang/Number;", "Ljava/lang/Object;", NULL, NULL, NULL },
-   { "Ljava/lang/Integer;", "Ljava/lang/Number;", rt_integer, rt_box_fields, NULL },
-   { "Ljava/lang/Long;", "Ljava/lang/Number;", rt_long, rt_box_fields, NULL },
-   { "Ljava/lang/Float;", "Ljava/lang/Number;", rt_float, rt_box_fields, NULL },
-   { "Ljava/lang/Double;", "Ljava/lang/Number;", rt_double, rt_box_fields, NULL },
-   { "Ljava/lang/Short;", "Ljava/lang/Number;", rt_short, rt_box_fields, NULL },
-   { "Ljava/lang/Byte;", "Ljava/lang/Number;", rt_byte, rt_box_fields, NULL },
+   { "Ljava/lang/Integer;", "Ljava/lang/Number;", rt_integer, rt_box_fields,
+     rt_iface_comparable },
+   { "Ljava/lang/Long;", "Ljava/lang/Number;", rt_long, rt_box_fields,
+     rt_iface_comparable },
+   { "Ljava/lang/Float;", "Ljava/lang/Number;", rt_float, rt_box_fields,
+     rt_iface_comparable },
+   { "Ljava/lang/Double;", "Ljava/lang/Number;", rt_double, rt_box_fields,
+     rt_iface_comparable },
+   { "Ljava/lang/Short;", "Ljava/lang/Number;", rt_short, rt_box_fields,
+     rt_iface_comparable },
+   { "Ljava/lang/Byte;", "Ljava/lang/Number;", rt_byte, rt_box_fields,
+     rt_iface_comparable },
    { "Ljava/math/BigInteger;", "Ljava/lang/Number;", rt_bigint,
-     rt_bigint_fields, NULL },
-   { "Ljava/lang/Boolean;", "Ljava/lang/Object;", rt_boolean, rt_box_fields, NULL },
-   { "Ljava/lang/Character;", "Ljava/lang/Object;", rt_character, rt_box_fields, NULL },
+     rt_bigint_fields, rt_iface_comparable },
+   { "Ljava/lang/Boolean;", "Ljava/lang/Object;", rt_boolean, rt_box_fields,
+     rt_iface_comparable },
+   { "Ljava/lang/Character;", "Ljava/lang/Object;", rt_character, rt_box_fields,
+     rt_iface_comparable },
    { "Ljava/lang/Character$UnicodeScript;", "Ljava/lang/Object;",
      rt_unicode_script, rt_unicode_script_fields, NULL },
    { "Ljava/lang/Math;", "Ljava/lang/Object;", rt_math, NULL, NULL },
@@ -36970,7 +40277,7 @@ static const struct rt_class rt_classes[] = {
    { "Ljava/lang/reflect/Array;", "Ljava/lang/Object;", rt_reflect_array,
      NULL, NULL },
    { "Ljava/lang/ClassLoader;", "Ljava/lang/Object;", rt_class_loader,
-     NULL, NULL },
+     rt_class_loader_fields, NULL },
    { "Ljava/util/ServiceLoader;", "Ljava/lang/Object;", rt_service_loader,
      rt_service_loader_fields, NULL },
    { "Ljava/lang/Thread;", "Ljava/lang/Object;", rt_thread,
@@ -36984,7 +40291,8 @@ static const struct rt_class rt_classes[] = {
    { "Ljava/lang/Runtime;", "Ljava/lang/Object;", rt_runtime, NULL, NULL },
    { "Ljava/security/AccessController;", "Ljava/lang/Object;",
      rt_access_controller, NULL, NULL },
-   { "Ljava/lang/Enum;", "Ljava/lang/Object;", rt_enum, rt_enum_fields, NULL },
+   { "Ljava/lang/Enum;", "Ljava/lang/Object;", rt_enum, rt_enum_fields,
+     rt_iface_comparable },
    { "Ljava/lang/Iterable;", "Ljava/lang/Object;", NULL, NULL,
      NULL, NULL, true,
      "<T:Ljava/lang/Object;>Ljava/lang/Object;" },
@@ -37050,7 +40358,9 @@ static const struct rt_class rt_classes[] = {
    { EGL_D_CONTEXT, "Landroid/opengl/EGLObjectHandle;", NULL, NULL, NULL },
    { EGL_D_SURFACE, "Landroid/opengl/EGLObjectHandle;", NULL, NULL, NULL },
    { EGL_D_CONFIG,  "Landroid/opengl/EGLObjectHandle;", NULL, NULL, NULL },
-   { "Ljava/util/HashMap;", "Ljava/lang/Object;", rt_map_methods, NULL,
+   { "Ljava/util/AbstractMap;", "Ljava/lang/Object;", rt_map_methods, NULL,
+     rt_iface_abstract_map },
+   { "Ljava/util/HashMap;", "Ljava/util/AbstractMap;", rt_map_methods, NULL,
      rt_iface_map },
    { "Ljava/util/WeakHashMap;", "Ljava/util/HashMap;", rt_map_methods, NULL,
      rt_iface_map },
@@ -37078,13 +40388,16 @@ static const struct rt_class rt_classes[] = {
      NULL, NULL, NULL },
    { "Ljava/lang/ref/PhantomReference;", "Ljava/lang/ref/Reference;",
      NULL, NULL, NULL },
-   { "Ljava/io/File;", "Ljava/lang/Object;", rt_file, rt_file_fields, NULL },
+   { "Ljava/io/File;", "Ljava/lang/Object;", rt_file, rt_file_fields,
+     rt_iface_comparable },
    { "Ljava/nio/file/Path;", "Ljava/lang/Object;", NULL, rt_path_fields, NULL },
    { "Ljava/nio/file/Files;", "Ljava/lang/Object;", rt_files, NULL, NULL },
    { "Landroid/os/Environment;", "Ljava/lang/Object;", rt_environment,
      NULL, NULL },
+   { "Landroid/os/Parcelable;", "Ljava/lang/Object;", NULL, NULL,
+     NULL, NULL, true },
    { "Landroid/os/ParcelFileDescriptor;", "Ljava/lang/Object;", rt_parcel_fd,
-     rt_parcel_fd_fields, NULL },
+     rt_parcel_fd_fields, rt_iface_parcelable_closeable },
    { "Landroid/os/FileObserver;", "Ljava/lang/Object;", rt_file_observer,
      rt_file_observer_fields, NULL },
    { "Landroid/provider/Settings$Global;", "Ljava/lang/Object;",
@@ -37108,7 +40421,7 @@ static const struct rt_class rt_classes[] = {
    { "Landroid/media/AudioFocusRequest$Builder;", "Ljava/lang/Object;",
      rt_audio_focus_request_builder, rt_audio_focus_request_fields, NULL },
    { "Landroid/accounts/Account;", "Ljava/lang/Object;",
-     rt_account, rt_account_fields, NULL },
+     rt_account, rt_account_fields, rt_iface_parcelable },
    { "Landroid/app/ActivityManager$MemoryInfo;", "Ljava/lang/Object;",
      rt_activity_memory_info, rt_activity_memory_fields, NULL },
    { "Landroid/app/ActivityManager$RunningAppProcessInfo;", "Ljava/lang/Object;",
@@ -37123,7 +40436,8 @@ static const struct rt_class rt_classes[] = {
    { "Ljava/util/Arrays;", "Ljava/lang/Object;", rt_arrays, NULL, NULL },
    { "Ljava/util/UUID;", "Ljava/lang/Object;", rt_uuid, rt_uuid_fields, NULL },
    { "Landroid/os/BaseBundle;", "Ljava/lang/Object;", rt_bundle, NULL, NULL },
-   { "Landroid/os/Bundle;", "Landroid/os/BaseBundle;", rt_bundle, NULL, NULL },
+   { "Landroid/os/Bundle;", "Landroid/os/BaseBundle;", rt_bundle, NULL,
+     rt_iface_parcelable },
    { "Landroid/content/pm/PackageItemInfo;", "Ljava/lang/Object;",
      rt_package_item, rt_package_item_fields, NULL },
    { "Landroid/content/pm/ApplicationInfo;", "Landroid/content/pm/PackageItemInfo;",
@@ -37136,7 +40450,8 @@ static const struct rt_class rt_classes[] = {
      rt_locale_list_fields, NULL },
    { "Landroid/content/res/Configuration;", "Ljava/lang/Object;",
      rt_configuration, rt_configuration_fields, NULL },
-   { "Landroid/net/Uri;", "Ljava/lang/Object;", rt_uri, rt_uri_fields, NULL },
+   { "Landroid/net/Uri;", "Ljava/lang/Object;", rt_uri, rt_uri_fields,
+     rt_iface_parcelable },
    { "Landroid/net/Uri$Builder;", "Ljava/lang/Object;",
      rt_uri_builder, rt_uri_fields, NULL },
    { "Landroid/content/UriMatcher;", "Ljava/lang/Object;", rt_uri_matcher,
@@ -37232,6 +40547,13 @@ static const struct rt_class rt_classes[] = {
    { "Ljava/io/DataOutputStream;", "Ljava/io/FilterOutputStream;",
      rt_data_output_stream, NULL, NULL },
    { "Ljava/lang/AutoCloseable;", "Ljava/lang/Object;", NULL, NULL, NULL },
+   /* Marker/ordering interfaces the platform declares on its value types.  A
+    * dex type reference to one has to resolve to a class, or `instanceof`
+    * against it answers false for objects that really do implement it. */
+   { "Ljava/lang/Comparable;", "Ljava/lang/Object;", NULL, NULL, NULL, NULL,
+     true, "<T:Ljava/lang/Object;>Ljava/lang/Object;" },
+   { "Ljava/io/Serializable;", "Ljava/lang/Object;", NULL, NULL, NULL, NULL,
+     true },
    { "Ljava/io/Closeable;", "Ljava/lang/AutoCloseable;", NULL, NULL, NULL },
    { "Ljava/io/Writer;", "Ljava/lang/Object;", rt_writer,
      rt_writer_fields, rt_iface_closeable },
@@ -37327,7 +40649,8 @@ static const struct rt_class rt_classes[] = {
      rt_url_connection, NULL, NULL },
    { "Ljavax/net/ssl/HttpsURLConnection;", "Ljava/net/HttpURLConnection;",
      NULL, NULL, NULL },
-   { "Ljava/util/Date;", "Ljava/lang/Object;", rt_date, rt_time_fields, NULL },
+   { "Ljava/util/Date;", "Ljava/lang/Object;", rt_date, rt_time_fields,
+     rt_iface_comparable },
    { "Ljava/util/TimeZone;", "Ljava/lang/Object;", rt_timezone,
      rt_time_fields, NULL },
    { "Ljava/util/SimpleTimeZone;", "Ljava/util/TimeZone;", NULL, NULL, NULL },
@@ -37391,11 +40714,11 @@ static const struct rt_class rt_classes[] = {
    { "Landroid/os/CountDownTimer$Tick;", "Ljava/lang/Object;",
      rt_countdown_tick, rt_countdown_tick_fields, NULL },
    { "Landroid/os/Messenger;", "Ljava/lang/Object;", rt_messenger,
-     rt_value_object_fields, NULL },
+     rt_messenger_fields, rt_iface_parcelable },
    { "Landroid/os/ResultReceiver;", "Ljava/lang/Object;", rt_result_receiver,
-     rt_value_object_fields, NULL },
+     rt_value_object_fields, rt_iface_parcelable },
    { "Landroid/os/Message;", "Ljava/lang/Object;", rt_message, rt_message_fields,
-     NULL },
+     rt_iface_parcelable },
    { "Landroid/os/HandlerThread;", "Ljava/lang/Thread;", rt_handler_thread,
      rt_handler_thread_fields, NULL },
    { "Landroid/os/Looper;", "Ljava/lang/Object;", rt_looper,
@@ -37416,7 +40739,7 @@ static const struct rt_class rt_classes[] = {
    { "Landroid/net/NetworkRequest$Builder;", "Ljava/lang/Object;",
      rt_net_request_builder, rt_net_request_fields, NULL },
    { "Landroid/content/Intent;", "Ljava/lang/Object;",
-     rt_intent, rt_intent_fields, NULL },
+     rt_intent, rt_intent_fields, rt_iface_parcelable },
    { "Landroid/content/ContentResolver;", "Ljava/lang/Object;",
      rt_content_resolver, NULL, NULL },
    { "Landroid/net/ConnectivityManager;", "Ljava/lang/Object;",
@@ -37534,8 +40857,8 @@ static const struct rt_class rt_classes[] = {
    { "Ljava/util/concurrent/ScheduledExecutorService;",
      "Ljava/util/concurrent/ExecutorService;", NULL, NULL, NULL },
    { "Ljava/util/concurrent/ThreadPoolExecutor;",
-     "Ljava/util/concurrent/ExecutorService;", rt_thread_pool_executor, NULL,
-     NULL },
+     "Ljava/util/concurrent/ExecutorService;", rt_thread_pool_executor,
+     rt_thread_pool_fields, NULL },
    { "Ljava/util/concurrent/ScheduledThreadPoolExecutor;",
      "Ljava/util/concurrent/ThreadPoolExecutor;", rt_scheduled_executor, NULL,
      NULL },
@@ -37634,7 +40957,8 @@ static const struct rt_class rt_classes[] = {
      rt_proxy, rt_proxy_fields, NULL },
    { "Ljava/lang/Package;", "Ljava/lang/Object;", rt_package, rt_package_fields,
      NULL },
-   { "Ljava/util/Random;", "Ljava/lang/Object;", rt_random, NULL, NULL },
+   { "Ljava/util/Random;", "Ljava/lang/Object;", rt_random,
+     rt_random_fields, NULL },
    { "Ljava/util/concurrent/ThreadLocalRandom;", "Ljava/util/Random;",
      rt_thread_local_random, NULL, NULL },
    { "Ljava/util/BitSet;", "Ljava/lang/Object;", rt_bitset, NULL, NULL },
@@ -37706,6 +41030,20 @@ static const struct rt_class rt_classes[] = {
      rt_view_configuration, NULL, NULL },
    { "Landroid/view/accessibility/AccessibilityManager;", "Ljava/lang/Object;",
      rt_accessibility_manager, NULL, NULL },
+   { "Landroid/view/inputmethod/InputMethodManager;", "Ljava/lang/Object;",
+     rt_input_method_manager, NULL, NULL },
+   /* The clipboard.  android.content.ClipboardManager extends the older
+    * android.text.ClipboardManager, and code still casts to either. */
+   { "Landroid/text/ClipboardManager;", "Ljava/lang/Object;",
+     rt_clipboard_manager, NULL, NULL },
+   { "Landroid/content/ClipboardManager;", "Landroid/text/ClipboardManager;",
+     rt_clipboard_manager, NULL, NULL },
+   { "Landroid/content/ClipData;", "Ljava/lang/Object;", rt_clip_data,
+     rt_clip_data_fields, NULL },
+   { "Landroid/content/ClipData$Item;", "Ljava/lang/Object;", rt_clip_item,
+     rt_clip_item_fields, NULL },
+   { "Landroid/content/ClipDescription;", "Ljava/lang/Object;",
+     rt_clip_description, rt_clip_desc_fields, NULL },
    { "Landroid/telephony/TelephonyManager;", "Ljava/lang/Object;",
      rt_telephony_manager, NULL, NULL },
    { "Landroid/view/LayoutInflater;", "Ljava/lang/Object;", rt_layout_inflater,
@@ -37810,7 +41148,7 @@ static const struct rt_class rt_classes[] = {
    { "Landroid/app/Activity;", "Landroid/content/ContextWrapper;", rt_activity,
      rt_activity_fields, NULL },
    { "Landroid/app/PendingIntent;", "Ljava/lang/Object;", rt_pending_intent,
-     rt_pending_intent_fields, NULL },
+     rt_pending_intent_fields, rt_iface_parcelable },
    { "Landroid/view/Choreographer;", "Ljava/lang/Object;", rt_choreographer,
      NULL, NULL },
    { "Landroid/app/Fragment;", "Ljava/lang/Object;", NULL, NULL, NULL },
@@ -37847,7 +41185,8 @@ static const struct rt_class rt_classes[] = {
    { "Landroid/widget/ExpandableListView;", "Ljava/lang/Object;",
      rt_expandable_list, NULL, NULL },
    { "Landroid/graphics/Color;", "Ljava/lang/Object;", rt_color, NULL, NULL },
-   { "Landroid/graphics/Paint;", "Ljava/lang/Object;", rt_paint, NULL, NULL },
+   { "Landroid/graphics/Paint;", "Ljava/lang/Object;", rt_paint,
+     rt_paint_fields, NULL },
    /* TextPaint is a Paint; AppCompat's auto-size helper and SwitchCompat both
     * measure through one, and with the class unregistered every Paint method
     * on it fell out to the stub layer. */

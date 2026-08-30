@@ -19,6 +19,7 @@
 #include "luna-ui.h"
 
 #include "luna_overlay.h"
+#include "luna_ime.h"
 #include "arm_exec.h"
 
 #include <dlfcn.h>
@@ -37,6 +38,8 @@ static char *g_html;           /* guest widget document (dialogs, …) */
 static char *g_css;
 static char *g_status_html;    /* JIT / boot status card */
 static char *g_status_css;
+static char *g_ime_html;       /* the input method's panel, above both */
+static char *g_ime_css;
 static bool  g_doc_dirty;
 static bool  g_from_files;   /* LUNARIA_UI_TEST names an HTML file */
 static int   g_w, g_h;
@@ -248,6 +251,24 @@ static unsigned char *overlay_load_font(int role, size_t *out_size)
  * is what makes both ends of the comparison the same clock. */
 static double overlay_platform_time(void) { return overlay_now(); }
 
+/* The clipboard luna-ui edits against.
+ *
+ * luna-ui already implements Ctrl+C / Ctrl+X / Ctrl+V on a focused <input>;
+ * what it needs is somewhere to put the text.  With no platform installed
+ * those two hooks were NULL, so the shortcuts ran and did nothing — the
+ * emulator's input method could be typed into but never pasted into, which is
+ * exactly the case a coupon code or an account name is copied for.  Both ends
+ * are the host's own clipboard, the same one the guest's ClipboardManager
+ * uses, because a device has one clipboard. */
+static void overlay_clipboard_set(const char *utf8)
+{
+   arm_exec_clipboard_set(utf8 ? utf8 : "");
+}
+
+/* luna-ui frees the result with free(), which is what arm_exec_clipboard_get
+ * allocates with. */
+static char *overlay_clipboard_get(void) { return arm_exec_clipboard_get(); }
+
 static void overlay_set_platform(void)
 {
    LunaPlatform platform;
@@ -255,6 +276,8 @@ static void overlay_set_platform(void)
    platform.get_time = overlay_platform_time;
    platform.get_proc = overlay_get_proc;
    platform.load_font = overlay_load_font;
+   platform.set_clipboard = overlay_clipboard_set;
+   platform.get_clipboard = overlay_clipboard_get;
    platform.struct_size = (uint32_t)sizeof platform;
    luna_set_platform(&platform);
 }
@@ -326,6 +349,24 @@ void luna_overlay_set_status(const char *html, const char *css)
    pthread_mutex_unlock(&g_doc_lock);
 }
 
+void luna_overlay_set_ime(const char *html, const char *css)
+{
+   pthread_mutex_lock(&g_doc_lock);
+   free(g_ime_html);
+   g_ime_html = html ? strdup(html) : NULL;
+   if (css) {
+      free(g_ime_css);
+      g_ime_css = strdup(css);
+   } else if (!html) {
+      free(g_ime_css);
+      g_ime_css = NULL;
+   }
+   /* The panel is composited into the same parsed document, so raising or
+    * dropping it is a reparse either way. */
+   g_doc_dirty = true;
+   pthread_mutex_unlock(&g_doc_lock);
+}
+
 bool luna_overlay_status_showing(void)
 {
    pthread_mutex_lock(&g_doc_lock);
@@ -348,7 +389,9 @@ void luna_overlay_set_frame_handler(luna_overlay_frame_fn fn)
  * widget layer needs to identify the guest View it stands for. */
 static void overlay_element_clicked(LunaElement *e)
 {
-   if (g_click_fn && e && e->id[0]) g_click_fn(e->id);
+   if (!e || !e->id[0]) return;
+   if (luna_ime_click(e->id)) return;
+   if (g_click_fn) g_click_fn(e->id);
 }
 
 /* Every element the widget layer named is clickable from luna-ui's side; the
@@ -421,7 +464,7 @@ bool luna_overlay_active(void)
 {
    overlay_maybe_test_card();
    pthread_mutex_lock(&g_doc_lock);
-   bool up = g_html != NULL || g_status_html != NULL;
+   bool up = g_html != NULL || g_status_html != NULL || g_ime_html != NULL;
    pthread_mutex_unlock(&g_doc_lock);
    return up && !g_failed;
 }
@@ -462,9 +505,16 @@ void luna_overlay_present(int w, int h)
        * from the Android View layer is up. */
       const char *html = g_html ? g_html : g_status_html;
       const char *css  = g_html ? g_css  : g_status_css;
-      const bool status_only = g_html == NULL && g_status_html != NULL;
+      const bool status_only =
+         g_html == NULL && g_status_html != NULL && g_ime_html == NULL;
+      bool reparsed = g_doc_dirty;
       if (g_doc_dirty) {
          g_doc_dirty = false;
+         /* parse_html() appends, so the previous document has to be dropped
+          * first or every republish stacks another copy of the page behind the
+          * one on screen — with its ids, its click wiring and its animations
+          * still live. */
+         luna_reset_document();
          /* Styles are resolved while the HTML is parsed, so the sheet has to
           * be in place first. */
          luna_reset_css();
@@ -487,12 +537,24 @@ void luna_overlay_present(int w, int h)
             if (css) luna_parse_css(css);
             luna_parse_html(html);
          }
+         /* The input method is a window of its own on a device, composited
+          * over whatever the application has up — including a dialog.  There
+          * is one luna-ui document here, so "over" means last: appended after
+          * the layer below it, with its own sheet. */
+         if (g_ime_html) {
+            if (g_ime_css) luna_parse_css(g_ime_css);
+            luna_parse_html(g_ime_html);
+         }
          luna_resize((float)w, (float)h);
          overlay_wire_clicks();
       }
       pthread_mutex_unlock(&g_doc_lock);
 
       overlay_drain_pointer();
+      /* Keystrokes go in and the field's contents come back out here: the
+       * document is parsed and luna-ui is live, which is the only state its
+       * element API may be called in. */
+      luna_ime_frame(reparsed);
 
       /* The document is parsed and luna-ui's state is live here, which is the
        * only moment a caller may mutate it.  The boot card pushes its stage
@@ -513,6 +575,12 @@ void luna_overlay_present(int w, int h)
          glClearColor(0.043f, 0.059f, 0.078f, 1.f); /* #0b0f14 */
          glClear(GL_COLOR_BUFFER_BIT);
       }
+      /* Everything below is composited onto the guest's finished frame, so
+       * luna-ui must not start its pass by clearing the buffer — which it
+       * otherwise does, because for a window it owns the previous back buffer
+       * is undefined.  The status card is the exception: it *is* the whole
+       * frame, and has already cleared to its own ink above. */
+      luna_set_preserve_backdrop(!status_only);
       glDisable(GL_DEPTH_TEST);
       glDisable(GL_CULL_FACE);
       glDisable(GL_SCISSOR_TEST);
@@ -545,8 +613,17 @@ bool luna_overlay_pointer(double x, double y, int action)
 {
    pthread_mutex_lock(&g_doc_lock);
    bool guest = g_html != NULL;
+   bool ime = g_ime_html != NULL;
    pthread_mutex_unlock(&g_doc_lock);
-   if (!guest || g_failed) return false;
+   if (g_failed) return false;
+   if (guest) goto consume;   /* a dialog is modal: it takes every touch */
+   if (!ime) return false;
+   /* The input method is not modal — the application below it keeps working,
+    * exactly as it does on a device — but the band it occupies is its own
+    * window, and a touch there is the keyboard's, not the game's.  Before the
+    * overlay has a size there is no band to be inside, so nothing is. */
+   if (g_h <= 0 || y < g_h - luna_ime_band_height(g_h)) return false;
+consume:
    pthread_mutex_lock(&g_ptr_lock);
    if (g_ptr_count < (int)(sizeof g_ptr_queue / sizeof g_ptr_queue[0])) {
       g_ptr_queue[g_ptr_count].x = x;
@@ -566,5 +643,8 @@ void luna_overlay_shutdown(void)
    free(g_css);
    free(g_status_html);
    free(g_status_css);
+   free(g_ime_html);
+   free(g_ime_css);
    g_html = g_css = g_status_html = g_status_css = NULL;
+   g_ime_html = g_ime_css = NULL;
 }

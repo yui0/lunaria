@@ -1069,6 +1069,10 @@ pump_run_frame(void (*run_threads)(void))
       /* Preferences an apply() left pending: on a device the framework writes
        * them behind the caller's back, and this is that writer. */
       if (vm) dvm_prefs_flush(vm);
+      /* The input method: a game blocked on the text the player is typing
+       * calls no Java of its own, so the keystrokes need a way in that does
+       * not depend on the guest doing anything. */
+      if (vm) dvm_ime_frame(vm);
 
       /* Drive UE's media clock even when the guest happens to be waiting
        * on other task graph work; this is the root of "updateVideoFrame

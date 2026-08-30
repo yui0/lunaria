@@ -1,5 +1,3 @@
-<!-- Hallmark · pre-emit critique: P5 H5 E4 S5 R4 V5 -->
-
 # Lunaria
 
 ### Run Android game engines on Linux — without booting Android.
@@ -20,7 +18,6 @@ through a built-in Dalvik bytecode emulator — no Android system image required
 > Android emulator. Support varies by title and engine version.
 
 ![Ni no Kuni: Cross Worlds intro, rendered through Lunaria](screenshot_crossworlds_intro.png)
-
 
 <p align="center"><sub>Ni no Kuni: Cross Worlds · UE4 · arm64-v8a · 1024×576 · guest framebuffer</sub></p>
 
@@ -103,29 +100,30 @@ The card comes down the moment the guest takes the surface, and a guest dialog
 always takes priority over it. `LUNARIA_JIT_UI=0` turns it off, and
 `make boot-card-test` renders it on its own, without booting a title.
 
-Past it, the title runs:
+Past it, the title can reach its own UI:
 
 ![Blade & Soul Revolution rendering its own UI through Lunaria](screenshot_bladesoul_ui.png)
 
 <p align="center"><sub>The game's own dialog, its own art and fonts, rendered
-through Lunaria · it reports the patch server unreachable because this capture
-had no route to Netmarble's servers</sub></p>
+through Lunaria · further progress needs a route to Netmarble's CDN</sub></p>
 
 ## Compatibility
 
 These are observed milestones, not a general compatibility guarantee.
+Details and launch recipes live in `PROGRESS.md`.
 
 | Title | Engine / ABI | Current result |
 |---|---|---|
-| **Ni no Kuni: Cross Worlds** | Unreal Engine 4 · AArch64 XAPK | Intro → patch → Guest login → title → **village**; SharedPreferences persist; ~55–60 present/s around the title |
+| **Ni no Kuni: Cross Worlds** | Unreal Engine 4 · AArch64 XAPK | Intro → patch → Guest login → title → village → **story dialogue with 3D world**; SharedPreferences persist; in-game present about 40–57/s after recent scheduler work |
 | **Blade & Soul Masia** | Unreal Engine 5 · AArch64 APKS | Opening movie reaches EOS; title screen; additional-patch dialog is readable and Agree advances the download |
+| **Genshin Impact 7.0.0** | Unity IL2CPP · AArch64 XAPK | HoYoverse splash renders (GLES 3.2 + ComputeShader compile); stalls on a Java uncaught exception after the splash |
 | **Between Two Worlds** | Unity 2023 IL2CPP · ARMv7 | Playable; reaches the main story scene |
 | **Between Two Worlds** | Unity 2023 IL2CPP · AArch64 | Reaches language selection / main menu at about 50–70 fps on recorded runs |
 | **FPSMobile** | Unreal Engine 4 · ARMv7 | FirstPersonExampleMap renders; 16,000+ swaps observed |
 | **UnitySampleGame** | Unity · ARMv7 | Start screen accepts injected touch; playable 3D scene renders |
 | **TIME LOCKER** | Unity · ARMv7 | Reaches the portrait tutorial gameplay scene |
 | **Black Clover: Asta Fight** | Unity IL2CPP · AArch64 XAPK | Base + split load; Unity splash renders headlessly |
-| **Blade & Soul Revolution** | Unreal Engine 4 · AArch64 | Boots to the game's own UI: dex compiles, the SDK's audio-focus and account setup complete, the startup movies are skipped as undecodable when openh264 cannot decode them, and the title renders its patch/login flow. Needs network access to Netmarble's servers to go further |
+| **Blade & Soul Revolution** | Unreal Engine 4 · AArch64 | Boots through dex / SDK setup into the game's own patch/login UI; without CDN access the client stalls |
 | **Daggerfall Unity** | Unity Mono · ARMv7 | Mono runtime boots; rendering remains blocked |
 
 <details>
@@ -174,24 +172,45 @@ make fetch-libunity
 These frames are read from Lunaria's guest framebuffer (GLFW window or headless
 EGL) — not phone captures or Android emulator windows.
 
-### Ni no Kuni: Cross Worlds · title to village
+### Ni no Kuni: Cross Worlds · title to story
 
-A commercial UE4 title on arm64-v8a: Guest login, server select, then the
-starting village. No APK or guest patches — emulator-side fixes only.
-Programmatic taps use `LUNARIA_TOUCH_TEST` (guest FB coordinates; `xdotool`
-synthetic clicks are ignored by GLFW).
+A commercial UE4 title on arm64-v8a: Guest login, server select, character
+select, the starting village, then story dialogue with the 3D world behind it.
+No APK or guest patches — emulator-side fixes only. Programmatic taps use
+`LUNARIA_TOUCH_TEST` (guest FB coordinates; `xdotool` synthetic clicks are
+ignored by GLFW). Framebuffer is **1024×576**.
 
 <p align="center">
-  <img src="screenshot_crossworlds_title.png" width="48%" alt="Cross Worlds title / Luxelion server select">
+  <img src="screenshot_crossworlds_title.png" width="48%" alt="Cross Worlds title screen">
   &nbsp;
-  <img src="screenshot_crossworlds_account.png" width="48%" alt="Cross Worlds account-link dialog">
+  <img src="screenshot_crossworlds_servers.png" width="48%" alt="Cross Worlds server select (Luxelion)">
 </p>
 
 <p align="center">
-  <img src="screenshot_crossworlds_village.png" width="72%" alt="Cross Worlds starting village rendered through Lunaria">
+  <img src="screenshot_crossworlds_account.png" width="48%" alt="Cross Worlds account-link dialog">
+  &nbsp;
+  <img src="screenshot_crossworlds_character_select.png" width="48%" alt="Cross Worlds character select">
 </p>
 
-<p align="center"><sub>Title · account link · village · 1024×576</sub></p>
+<p align="center">
+  <img src="screenshot_crossworlds_village.png" width="48%" alt="Cross Worlds starting village">
+  &nbsp;
+  <img src="screenshot_crossworlds_ingame.png" width="48%" alt="Cross Worlds in-world cutscene">
+</p>
+
+<p align="center">
+  <img src="screenshot_crossworlds_dialog.png" width="48%" alt="Cross Worlds story dialogue (Chloe)">
+  &nbsp;
+  <img src="screenshot_crossworlds_evermore.png" width="48%" alt="Cross Worlds arrival at Evermore">
+</p>
+
+<p align="center"><sub>Title · server · account · character select · village · cutscene · dialogue · Evermore</sub></p>
+
+### Genshin Impact · HoYoverse splash
+
+![Genshin Impact HoYoverse splash rendered through Lunaria](screenshot_genshin_splash.png)
+
+<p align="center"><sub>Unity IL2CPP · arm64-v8a · 1280×720 · first guest frame after GLES 3.2 init</sub></p>
 
 ### Between Two Worlds · main menu
 
@@ -215,6 +234,12 @@ rendered at 720×1280.
 
 <p align="center">
   <img src="screenshot_timelocker_gameplay.png" width="420" alt="TIME LOCKER tutorial gameplay running through Lunaria">
+</p>
+
+### Black Clover: Asta Fight · splash
+
+<p align="center">
+  <img src="screenshot_blackclover_splash.png" width="480" alt="Black Clover Unity splash through Lunaria">
 </p>
 
 ### FPSMobile · Unreal sample
@@ -271,12 +296,17 @@ F12 (GLFW window) or creating `$LUNARIA_SHOT_TRIGGER` (default
 - **ARM64:** guest virtual addresses map one-to-one to host addresses; a
   high-address image window holds loaded ELFs, trampolines, JNI tables and
   stacks, enabling dynarmic fastmem. `LUNARIA_A64_ENGINES` (1–8; defaults from
-  host core count) can run multiple JIT engines on host threads.
+  host core count) can run multiple JIT engines on host threads. By default
+  the frame pump barriers engines at pass boundaries; `LUNARIA_A64_SELF_SCHED=1`
+  lets engines pull runnable guests freely (breaks some anti-cheat / timing
+  checks — off by default).
 - **Native calls:** guest libc, EGL, GLES and JNI calls cross generated
   `SVC #n` trampolines into host implementations.
 - **Threads:** guest pthreads use cooperative round-robin scheduling with a
   separate JIT context per worker; mutex unlock can hand off directly to a
-  waiter.
+  waiter. Optional parking (`LUNARIA_GUEST_SLEEP`, `LUNARIA_FD_PARK`) is
+  implemented but off by default — enabling it changes wake timing that some
+  titles measure.
 - **Java:** when a JNI call has no host stub, `src/dvm/` executes the method
   from the APK's `classes*.dex` (`LUNARIA_DVM=1` by default).
 - **Assets:** `AssetManager` reads DEFLATE/STORE entries from APKs and OBB
@@ -298,12 +328,14 @@ full diagnostic set.
 | `LUNARIA_PBUFFER` | auto fallback | Set `1` to skip GLFW and force headless EGL |
 | `LUNARIA_MAX_FRAMES` | unlimited | Stop the render loop after *N* frames |
 | `LUNARIA_MEM_TOTAL_MB` | `6144` | RAM reported to the guest |
-| `LUNARIA_HEAP_MB` | `256` | Guest allocation heap size |
+| `LUNARIA_HEAP_MB` | A32 `256` / A64 window (~`2560`) | Guest malloc arena; A64 defaults to the full `[HEAP_BASE, MMAP2)` window |
 | `LUNARIA_THREAD_TICKS` | `200M` | ARM32 worker scheduling slice |
 | `LUNARIA_A64_THREAD_TICKS` | `20K` | AArch64 worker scheduling slice |
 | `LUNARIA_A64_ENGINES` | auto | Host threads for AArch64 JIT engines (1–8; defaults to 4 / 2 / 1 from host core count) |
+| `LUNARIA_A64_SELF_SCHED` | off | Engines pull runnable guests freely instead of barrier-pooled passes |
 | `LUNARIA_A64_FASTMEM` | `1` | Set `0` to route memory through callbacks |
 | `LUNARIA_A64_CODE_CACHE_MB` | `128` | Per-JIT translated-code cache |
+| `LUNARIA_GUEST_SLEEP` / `LUNARIA_FD_PARK` | off | Park long sleeps / blocking reads for real wall time |
 | `LUNARIA_TOUCH_TEST` | off | Inject taps at guest FB `x,y[;x,y…]` (max 8) |
 | `LUNARIA_TOUCH_FRAME` / `_HOLD` / `_GAP` | `60` / `10` / `60` | First DOWN frame / hold / gap between taps |
 | `LUNARIA_PERF_S` | `10` | `[perf]` interval seconds; `0` disables |
@@ -347,6 +379,7 @@ Tick values accept `K`, `M`, and `G` suffixes, for example
 | `src/lib/` | host implementations exposed to Android native code |
 | `src/luna_overlay.c` | the emulator's own UI surface, drawn with luna-ui and composited over the guest frame |
 | `src/luna_boot.c` | the boot card: an animated CSS document with translation and dex progress |
+| `src/luna_ime.c` | host IME bridge into guest text input |
 | `runtime/` | generated Android-compatible host shared libraries |
 | `lunaria-apk.sh` | APK/XAPK/APKS inspection, extraction and launch pipeline |
 | `PROGRESS.md` | detailed compatibility notes and current engineering work |

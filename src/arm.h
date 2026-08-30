@@ -475,18 +475,39 @@ inline uint64_t mmap2_end_excl(void) {
     return g_mmap2_end ? (uint64_t)g_mmap2_end : 0x100000000ull;
 }
 
+/* True once the process is running a 64-bit guest.  Set before
+ * guest_layout_init(), which sizes the heap differently for the two. */
+inline bool g_guest_proc_arm64 = false;
+
 inline void guest_layout_init(void) {
     static bool once = false;
     if (once) return;
     once = true;
-    long heap_mb = lunaria_env_long("LUNARIA_HEAP_MB", 256);
+    long m2b = lunaria_env_long("LUNARIA_MMAP2_BASE", 0);
+    long m2e = lunaria_env_long("LUNARIA_MMAP2_END", 0);
+
+    /* How much of the window malloc and the small-mmap fallback share.
+     *
+     * A 32-bit guest has one 4 GiB window holding images, thread stacks, mmap
+     * and heap, so 256 MiB of malloc arena there is a deliberate share of it.
+     * A 64-bit guest puts its mmaps in the real 64-bit address space
+     * (guest_va_layout_arm64), which leaves everything from HEAP_BASE up to
+     * MMAP2_BASE with nothing in it but this arena — and 256 MiB of that is
+     * not a budget, it is a leftover.  Genshin's Unity allocator reported
+     * "System out of memory! Trying to allocate 262160B" with 142 MiB in use,
+     * on a device this emulator tells the guest has 6 GiB of RAM.  Default to
+     * the whole window instead; LUNARIA_HEAP_MB still overrides it. */
+    const uint32_t heap_window_top = m2b ? (uint32_t)m2b : 0xF0000000u;
+    const long window_mb = (long)((heap_window_top - HEAP_BASE) >> 20);
+    long max_mb = g_guest_proc_arm64 ? window_mb
+                                     : (window_mb < 1024 ? window_mb : 1024);
+    long heap_mb = lunaria_env_long("LUNARIA_HEAP_MB",
+                                    g_guest_proc_arm64 ? window_mb : 256);
     if (heap_mb < 64) heap_mb = 64;
-    if (heap_mb > 1024) heap_mb = 1024;
+    if (heap_mb > max_mb) heap_mb = max_mb;
     g_heap_size = (uint32_t)heap_mb * 1024u * 1024u;
     uint32_t heap_end = HEAP_BASE + g_heap_size;
     g_small_mmap_top = heap_end;
-    long m2b = lunaria_env_long("LUNARIA_MMAP2_BASE", 0);
-    long m2e = lunaria_env_long("LUNARIA_MMAP2_END", 0);
     g_mmap2_base = m2b ? (uint32_t)m2b
                        : ((heap_end + 0xfffffu) & ~0xfffffu);
     g_mmap2_end  = m2e ? (uint32_t)m2e : 0u;
@@ -516,7 +537,6 @@ inline size_t a64_buf_len(uint64_t x) {
 struct LoadedRegion { uint32_t lo, hi; uint32_t flags; std::string path; };
 inline std::vector<LoadedRegion> g_loaded_regions;
 // Process-wide ABI selector used by synthetic /proc files.
-inline bool g_guest_proc_arm64 = false;
 
 // Program-header metadata exposed through dl_iterate_phdr.
 struct ModulePhdr {
@@ -2149,6 +2169,57 @@ constexpr uint32_t SVC_LIBC_FFLUSH                = SVC31_BASE + 396u;
  * host avoids baking an incomplete, version-specific switch into guest code. */
 constexpr uint32_t SVC_ANW_QUERY                  = SVC31_BASE + 397u;
 
+/* stdio pushback and the wide-character read side.  Both sat at SVC_RET0.
+ * ungetc() returning 0 is indistinguishable from success for a caller that
+ * only checks against EOF, so a parser that peeks one byte and pushes it back
+ * silently lost it — the byte was never put anywhere, and the next getc()
+ * returned the one after.  getwc() answering 0 is worse: 0 is L'\0', a
+ * perfectly good wide character, so a read loop that stops at WEOF never
+ * stops. */
+constexpr uint32_t SVC_UNGETC                     = SVC31_BASE + 398u;
+constexpr uint32_t SVC_UNGETWC                    = SVC31_BASE + 399u;
+constexpr uint32_t SVC_GETWC                      = SVC31_BASE + 400u;
+/* Per-object locales (POSIX 2008).  newlocale() returning NULL is the "out of
+ * memory / unsupported locale" answer, and libc++'s std::locale constructor
+ * turns that into a runtime_error; uselocale() returning NULL is not even a
+ * legal locale_t.  Android has exactly one locale — C.UTF-8, under several
+ * names — so these are cheap to answer truthfully. */
+constexpr uint32_t SVC_NEWLOCALE                  = SVC31_BASE + 401u;
+constexpr uint32_t SVC_USELOCALE                  = SVC31_BASE + 402u;
+constexpr uint32_t SVC_FREELOCALE                 = SVC31_BASE + 403u;
+constexpr uint32_t SVC_DUPLOCALE                  = SVC31_BASE + 404u;
+/* wcstold(): the wide-character long-double parse.  See SVC_STRTOLD for the
+ * return width — on A64 a long double is a 128-bit quad in q0, not a double. */
+constexpr uint32_t SVC_WCSTOLD                    = SVC31_BASE + 405u;
+/* Wide-string collation.  Returning 0 from wcscoll means "these two strings
+ * are equal", which turns every sort that uses it into a no-op and every
+ * lookup keyed on it into a false hit. */
+constexpr uint32_t SVC_WCSCOLL                    = SVC31_BASE + 406u;
+constexpr uint32_t SVC_WCSXFRM                    = SVC31_BASE + 407u;
+/* wcsnrtombs(): the wide->multibyte direction of SVC_MBSRTOWCS. */
+constexpr uint32_t SVC_WCSNRTOMBS                 = SVC31_BASE + 408u;
+constexpr uint32_t SVC_WCSRTOMBS                  = SVC31_BASE + 409u;
+/* mbsnrtowcs() is not mbsrtowcs() with an extra argument: it takes the source
+ * limit *before* the destination limit, so sharing one handler read the wrong
+ * register as "how many wide characters fit" and wrote past the caller's
+ * buffer whenever the two differed. */
+constexpr uint32_t SVC_MBSNRTOWCS                 = SVC31_BASE + 410u;
+/* rmdir(2).  It was bound to the "returns -1" template, so every attempt to
+ * remove a directory failed — with no errno set, so the guest could not even
+ * tell why.  A game that cleans up its own cache directory tree leaves it
+ * behind and, worse, may treat the failure as "the directory is in use". */
+constexpr uint32_t SVC_RMDIR                      = SVC31_BASE + 411u;
+/* pthread_getschedparam / pthread_setschedparam.  The getter returning 0
+ * without writing its two out-parameters is the dangerous one: the caller
+ * reads an uninitialised policy and priority off its own stack and then hands
+ * them straight back to the setter. */
+constexpr uint32_t SVC_PTHREAD_GETSCHEDPARAM      = SVC31_BASE + 412u;
+constexpr uint32_t SVC_PTHREAD_SETSCHEDPARAM      = SVC31_BASE + 413u;
+/* __sched_cpucount() is what CPU_COUNT() expands to.  Answering 0 tells the
+ * caller its affinity mask contains no CPUs at all, which is how a worker-pool
+ * size computed from "how many cores may I use" comes out as zero. */
+constexpr uint32_t SVC_SCHED_CPUCOUNT             = SVC31_BASE + 414u;
+
 /* Which SVC a JNINativeInterface slot dispatches to.  Identity up to 221;
  * beyond that the historical numbering is four short, so name every slot. */
 constexpr uint32_t jni_vtable_svc(uint32_t slot) {
@@ -2179,7 +2250,7 @@ static_assert(SVC_PTHREAD_SETNAME > SVC_GL3_GenTransformFeedbacks,
  * numbers after it live past SVC_SIGPROCMASK, so their trampolines were never
  * built and the unknown-symbol pool — which starts here — handed the same
  * addresses out to dlsym'd names it did not implement. */
-constexpr uint32_t SVC_TRAMP_TOTAL        = SVC_ANW_QUERY + 1u;
+constexpr uint32_t SVC_TRAMP_TOTAL        = SVC_SCHED_CPUCOUNT + 1u;
 static_assert(SVC_TRAMP_TOTAL > SVC_PROCESS_VM_READV &&
               SVC_TRAMP_TOTAL > SVC_ACFG_INT_END &&
               SVC_TRAMP_TOTAL > SVC_GL3_GenTransformFeedbacks &&
@@ -2219,6 +2290,13 @@ constexpr uint32_t TRAMP_STRIDE     = 8u; /* ARM32: SVC #n + BX LR */
 // dlsym'd-but-unimplemented symbols: slot i lives at trampoline index SVC_TRAMP_TOTAL + i and executes svc.
 inline std::vector<std::string> g_unknown_sym_names;
 inline std::map<std::string, uint32_t> g_unknown_sym_slot;
+/* What that slot's stub answers, and whether it is a shared "return 0/-1"
+ * template rather than a symbol nobody has heard of.  Both are per slot so the
+ * stub can name itself when it is *called*: which functions were bound is a
+ * property of the binary, which ones the run actually reached is a property of
+ * the run, and only the second explains a wrong answer the guest acted on. */
+inline std::vector<int32_t> g_unknown_sym_ret;
+inline std::vector<uint8_t> g_unknown_sym_is_template;
 
 
 constexpr uint32_t JVM_SLOT_RESERVED0  = 0;

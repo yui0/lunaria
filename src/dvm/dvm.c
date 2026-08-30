@@ -1100,6 +1100,48 @@ void dvm_describe_exception(struct dvm *vm, dvm_ref exc, char *buf, size_t sz)
    if (!at && at < sz) snprintf(buf, sz, "(no exception)");
 }
 
+/* An installed UncaughtExceptionHandler receives the Throwable as an ordinary
+ * Java argument: by then vm->exception has been cleared because the throw was
+ * caught by Thread/Unity and deliberately forwarded to the handler.  Logging
+ * only dvm_call() failures therefore misses exactly the process-ending
+ * exception Crashlytics is meant to catch.  Describe it at that one semantic
+ * boundary, before the handler can wrap or discard it. */
+static void log_forwarded_uncaught(struct dvm *vm, dvm_ref exc,
+                                   const struct dvm_method *handler)
+{
+   char why[1024];
+   dvm_describe_exception(vm, exc, why, sizeof why);
+   fprintf(stderr, "[dvm] forwarded uncaught %s to %s.%s\n", why,
+           handler && handler->cls ? handler->cls->name : "?",
+           handler ? handler->name : "?");
+
+   /* Throwable.fillInStackTrace()/setStackTrace() store the actual throw-side
+    * trace on the object.  Print it when present; do not synthesize the
+    * handler's current stack, which would point at Crashlytics instead of the
+    * failure. */
+   union dvm_value trace = { 0 };
+   if (!dvm_get_field(vm, exc, "stackTrace", "[Ljava/lang/StackTraceElement;",
+                      &trace) || !trace.l)
+      return;
+   struct dvm_object *array = dvm__obj(vm, trace.l);
+   if (!array || array->kind != DVM_OBJ_ARRAY || array->elem_kind != 'L' ||
+       !array->data)
+      return;
+   const dvm_ref *items = array->data;
+   uint32_t n = array->length < 32u ? array->length : 32u;
+   for (uint32_t i = 0; i < n; ++i) {
+      union dvm_value cls = { 0 }, method = { 0 };
+      if (!items[i]) continue;
+      (void)dvm_get_field(vm, items[i], "declaringClass", "Ljava/lang/String;",
+                          &cls);
+      (void)dvm_get_field(vm, items[i], "methodName", "Ljava/lang/String;",
+                          &method);
+      fprintf(stderr, "[dvm]   at %s.%s\n",
+              cls.l ? dvm_string_utf8(vm, cls.l) : "?",
+              method.l ? dvm_string_utf8(vm, method.l) : "?");
+   }
+}
+
 /* ------------------------------------------------------------------------ *
  * Fields
  * ------------------------------------------------------------------------ */
@@ -1428,8 +1470,16 @@ bool dvm__call_out(struct dvm *vm, struct dvm_class *cls, const char *name,
                                self, args, nargs, out))
       return true;
 
+   /* Nothing implements this and the guest is calling it *now*: the zero
+    * below is about to be used as an answer.  Report the caller with it —
+    * which app method acted on the missing result is what separates a
+    * harmless optional-plugin probe from the cause of the next failure. */
    char what[512];
-   snprintf(what, sizeof what, "%s.%s%s", cls->name, name, sig);
+   struct dvm_method *from = vm->cur_method;
+   snprintf(what, sizeof what, "%s.%s%s (called from %s.%s) → 0", cls->name,
+            name, sig,
+            from && from->cls && from->cls->name ? from->cls->name : "?",
+            from && from->name ? from->name : "?");
    note_missing(vm, what);
    /* Returning zero is what the stub layer did before this module existed.
     * Throwing here would abort app code that only wanted a no-op logger. */
@@ -1832,13 +1882,19 @@ bool dvm__monitor_state(struct dvm *vm, dvm_ref ref, bool current,
 
 void dvm__warn_placeholder(struct dvm *vm)
 {
-   (void)vm;
    struct dvm_method *m = g_builtin_method;
    if (!m || m->placeholder_warned) return;
    m->placeholder_warned = true;
-   fprintf(stderr, "[dvm] placeholder no-op invoked: %s.%s%s\n",
+   /* Name the caller too.  "Paint.<init> is a no-op" is a fact about the
+    * emulator; "…and app code X called it" is the only half that can explain
+    * what X does next, and it is the reason this is reported at call time
+    * rather than when the method table was built. */
+   struct dvm_method *from = vm ? vm->cur_method : NULL;
+   fprintf(stderr, "[dvm] placeholder no-op invoked: %s.%s%s (from %s.%s)\n",
            m->cls && m->cls->name ? m->cls->name : "?",
-           m->name ? m->name : "?", m->sig ? m->sig : "");
+           m->name ? m->name : "?", m->sig ? m->sig : "",
+           from && from->cls && from->cls->name ? from->cls->name : "?",
+           from && from->name ? from->name : "?");
 }
 
 static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
@@ -1851,6 +1907,11 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
       dvm__throw(vm, "java/lang/StackOverflowError", "%d frames", vm->depth);
       return false;
    }
+
+   if (nslots >= 2 && m->name && m->sig &&
+       !strcmp(m->name, "uncaughtException") &&
+       !strcmp(m->sig, "(Ljava/lang/Thread;Ljava/lang/Throwable;)V"))
+      log_forwarded_uncaught(vm, (dvm_ref)slots[1], m);
 
    bool is_static = (m->access & DEX_ACC_STATIC) != 0;
    if (!is_static && !self && !(m->access & DEX_ACC_NATIVE)) {
@@ -3141,6 +3202,8 @@ static void drain_pending(struct dvm *vm, bool nested)
          vm->pending_is_thread[i] = vm->pending_is_thread[i + 1];
          vm->pending_due_ms[i] = vm->pending_due_ms[i + 1];
          vm->pending_looper[i] = vm->pending_looper[i + 1];
+         vm->pending_owner[i] = vm->pending_owner[i + 1];
+         vm->pending_token[i] = vm->pending_token[i + 1];
       }
       --vm->npending;
 

@@ -50,6 +50,12 @@ bool luna_overlay_pointer(double x, double y, int action);
  * it takes priority over the JIT status card below. */
 void luna_overlay_set_document(const char *html, const char *css);
 
+/* The input method's panel (luna_ime.c).  It is a third layer, above both the
+ * guest's widgets and the status card, because on a device the IME is its own
+ * window and is composited over whatever the app has up — including a dialog.
+ * NULL html takes it down. */
+void luna_overlay_set_ime(const char *html, const char *css);
+
 /* Boot / JIT status card.  Shown only when no guest document is up, so a
  * terms-of-service dialog is never covered by "Translating ARM".  Does not
  * steal pointer input.  NULL html clears the card. */

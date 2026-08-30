@@ -210,6 +210,10 @@ uint64_t dvm_instructions(const struct dvm *vm);
 /* Write out any preferences an apply() left pending.  The frame pump calls
  * this, which is where a device's asynchronous write would land. */
 void dvm_prefs_flush(struct dvm *vm);
+/* One frame of the emulator's input method: what the host typed goes to the
+ * connected View, and a pending layout pass runs.  Called from the frame pump
+ * without the interpreter lock. */
+void dvm_ime_frame(struct dvm *vm);
 
 /* Caps runaway bytecode (a spin loop in Java would otherwise hang the pump
  * loop, which is cooperative).  0 disables.  Default 200M. */

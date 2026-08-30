@@ -113,6 +113,9 @@ struct dvm *dvm_jni_vm(void);
  * and repeated here because the frame pump calls it and does not (and cannot)
  * include the interpreter's own header. */
 void dvm_prefs_flush(struct dvm *vm);
+/* Declared in dvm.h too; repeated here for the loader's frame pump, which
+ * reaches the VM through this header. */
+void dvm_ime_frame(struct dvm *vm);
 
 /* The interpreter lock, for callers that cannot include dvm.h.
  *

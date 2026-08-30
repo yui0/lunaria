@@ -876,7 +876,6 @@ JNIEnv_IsInstanceOf(JNIEnv* p0, jobject p1, jclass p2)
    const char *oc = jvm_get_object(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1)->this_klass)->klass.name.data;
    const char *tc = jvm_get_object(jnienv_get_jvm(p0), p2)->klass.name.data;
    verbose("%s instanceof %s", oc, tc);
-   { static int n; if (n < 24) { fprintf(stderr, "[isinst] %s instanceof %s\n", oc, tc); ++n; } }
 
    if (jvm_get_object(jnienv_get_jvm(p0), p1)->this_klass == p2 || jvm_name_eq(oc, tc))
       return true;
