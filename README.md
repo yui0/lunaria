@@ -343,6 +343,9 @@ full diagnostic set.
 | `LUNARIA_SCREENSHOT_EVERY` | off | Capture every *N* swaps |
 | `LUNARIA_DUMP_DIR` | `/tmp` | Frame output directory |
 | `LUNARIA_TRACE_SVC` | off | Trace guest-to-host SVC calls |
+| `LUNARIA_TRACE_HEAP` | off | Diagnose corrupt guest malloc free-list entries |
+| `LUNARIA_HEAP_POISON` | off | Fill non-calloc bump allocations with `0xFF` to expose uninitialized reads |
+| `LUNARIA_HEAP_SELFTEST` | off | Verify alignment, calloc reuse, trim, coalescing, realloc growth and memalign before loading guest code |
 | `LUNARIA_TRACE_MEDIA` | off | MediaCodec state transitions |
 | `LUNARIA_A64_PCPROF` | off | Sample and report hot AArch64 guest PCs, per thread |
 | `LUNARIA_A64_PCPROF_EVERY` | `20000` | Samples between profiler reports |

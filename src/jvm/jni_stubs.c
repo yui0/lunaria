@@ -26,7 +26,6 @@
 #include "jvm/jni.h"
 #include "jvm.h"
 #include "arm_exec.h"
-#include "guest_mem.h"
 #include "dvm/dvm_jni.h"
 
 extern void arm_exec_drain_gl_thread_jobs(void);
@@ -1236,19 +1235,30 @@ android_view_MotionEvent_getSource(JNIEnv *env, jobject object, va_list args)
    return 0x00001002; // SOURCE_TOUCHSCREEN
 }
 
-/* Unity 5.x nativeInjectEvent copies the event via
- * MotionEvent.obtain(MotionEvent) before queuing.  Without this static
- * method CallStaticObjectMethodV returns null and inject bails with false
- * (~6k insns, no getAction/getX).  Getters read arm_exec_touch_*, so a
- * fresh stub object is enough. */
+/* MotionEvent is a value object: each sample is its own JVM_OBJECT_MOTION with
+ * action/coords/times stored in jvm_object::motion.  Getters read that payload
+ * only — never a process-global "current touch".  Unity keeps the jobject and
+ * consults it again during PlayerLoop, often frames after nativeInjectEvent. */
+
+static const lunaria_touch_event *
+motion_payload(JNIEnv *env, jobject object)
+{
+   static lunaria_touch_event scratch;
+   struct jvm *jvm = jnienv_get_jvm(env);
+   return jvm && jvm_motion_event_read(jvm, object, &scratch) ? &scratch : NULL;
+}
+
 jobject
 android_view_MotionEvent_obtain(JNIEnv *env, jclass clazz, va_list args)
 {
    assert(env && clazz);
    motion_trace("obtain");
-   (void)args;
-   return (*env)->AllocObject(env,
-         (*env)->FindClass(env, "android/view/MotionEvent"));
+   struct jvm *jvm = jnienv_get_jvm(env);
+   jobject src = va_arg(args, jobject);
+   lunaria_touch_event ev = {0};
+   if (!jvm || !jvm_motion_event_read(jvm, src, &ev))
+      return NULL;
+   return jvm_new_motion_event(jvm, &ev);
 }
 
 void
@@ -1259,22 +1269,14 @@ android_view_MotionEvent_recycle(JNIEnv *env, jobject object, va_list args)
    (void)args;
 }
 
-/* MotionEvent getters read the current touch event captured from the GLFW
- * mouse by arm_exec.cpp (see arm_exec_touch_* in arm_exec.h).  The loader
- * pops one event per arm_exec_touch_next() and injects it via
- * nativeInjectEvent; Unity then reads it back through these. */
-extern int       arm_exec_touch_action(void);
-extern float     arm_exec_touch_x(void);
-extern float     arm_exec_touch_y(void);
-extern long long arm_exec_touch_time(void);
-
 
 jint
 android_view_MotionEvent_getAction(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
    motion_trace("getAction");
-   return arm_exec_touch_action();
+   const lunaria_touch_event *ev = motion_payload(env, object);
+   return ev ? ev->action : 0;
 }
 
 jint
@@ -1282,7 +1284,8 @@ android_view_MotionEvent_getActionMasked(JNIEnv *env, jobject object, va_list ar
 {
    assert(env && object);
    motion_trace("getActionMasked");
-   return arm_exec_touch_action() & 0xff;
+   const lunaria_touch_event *ev = motion_payload(env, object);
+   return ev ? (ev->action & 0xff) : 0;
 }
 
 jint
@@ -1298,7 +1301,8 @@ android_view_MotionEvent_getX(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
    motion_trace("getX");
-   return arm_exec_touch_x();
+   const lunaria_touch_event *ev = motion_payload(env, object);
+   return ev ? ev->x : 0.f;
 }
 
 jfloat
@@ -1306,7 +1310,8 @@ android_view_MotionEvent_getY(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
    motion_trace("getY");
-   return arm_exec_touch_y();
+   const lunaria_touch_event *ev = motion_payload(env, object);
+   return ev ? ev->y : 0.f;
 }
 
 jfloat
@@ -1314,7 +1319,8 @@ android_view_MotionEvent_getRawX(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
    motion_trace("getRawX");
-   return arm_exec_touch_x();
+   const lunaria_touch_event *ev = motion_payload(env, object);
+   return ev ? ev->x : 0.f;
 }
 
 jfloat
@@ -1322,7 +1328,8 @@ android_view_MotionEvent_getRawY(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
    motion_trace("getRawY");
-   return arm_exec_touch_y();
+   const lunaria_touch_event *ev = motion_payload(env, object);
+   return ev ? ev->y : 0.f;
 }
 
 jint
@@ -1346,7 +1353,8 @@ android_view_MotionEvent_getEventTime(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
    motion_trace("getEventTime");
-   return (jlong)arm_exec_touch_time();
+   const lunaria_touch_event *ev = motion_payload(env, object);
+   return ev ? (jlong)ev->event_ms : 0;
 }
 
 jlong
@@ -1354,7 +1362,8 @@ android_view_MotionEvent_getDownTime(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
    motion_trace("getDownTime");
-   return (jlong)arm_exec_touch_time();
+   const lunaria_touch_event *ev = motion_payload(env, object);
+   return ev ? (jlong)ev->down_ms : 0;
 }
 
 jint
@@ -1378,8 +1387,8 @@ android_view_MotionEvent_getPressure(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
    motion_trace("getPressure");
-   /* pressure 1.0 while touching, 0 on UP */
-   return arm_exec_touch_action() == 1 ? 0.0f : 1.0f;
+   const lunaria_touch_event *ev = motion_payload(env, object);
+   return (ev && ev->action != 1) ? 1.0f : 0.0f;
 }
 
 jint
@@ -2258,7 +2267,7 @@ jboolean java_lang_Class_lowMemory(JNIEnv *env, jobject obj)
 
 /* ActivityManager.getMemoryInfo(ActivityManager.MemoryInfo outInfo) — void method.
  * Unity queries this to size Dynamic Heap / trim caches.  Profile comes from
- * guest_mem.h (LUNARIA_MEM_TOTAL_MB default 6144 = 6 GiB phone-class), kept in
+ * arm_exec.h (LUNARIA_MEM_TOTAL_MB default 6144 = 6 GiB phone-class), kept in
  * sync with synthetic /proc/meminfo — never the host sysinfo().
  *
  * Field IDs are looked up once and cached. */

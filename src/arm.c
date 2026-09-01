@@ -74,6 +74,7 @@ static struct timespec    g_held_since;
  * reserved ids below it, so there is nothing to allocate and nothing to lock. */
 static _Atomic unsigned long long g_tag_ns[ARM_LOCK_TAG_MAX];
 static __thread unsigned t_tag;
+static __thread unsigned t_tag_saved;
 
 unsigned arm_lock_tag(unsigned tag)
 {
@@ -144,6 +145,13 @@ void arm_lock_acquire(void)
       /* g_locked stayed true: the releaser handed ownership straight over. */
    }
    pthread_mutex_unlock(&g_m);
+   /* The label belongs to this acquisition, not to the thread.  It used to
+    * persist, so every acquire that never set one -- a scheduler pass, a guest
+    * callback, any internal helper that just takes the lock -- was charged to
+    * whichever SVC this thread happened to run last.  That is how one SVC came
+    * to "hold" a quarter of the wall clock while the timers inside it summed
+    * to a fraction of a second.  Start unlabelled and let the caller name it. */
+   t_tag = 0u;
    t_depth = 1;
 }
 
@@ -182,6 +190,7 @@ unsigned arm_lock_unlock_all(void)
 {
    unsigned d = t_depth;
    if (d) {
+      t_tag_saved = t_tag;   /* the same acquisition resumes in relock() */
       t_depth = 1u;
       arm_lock_release();
    }
@@ -192,6 +201,7 @@ void arm_lock_relock(unsigned depth)
 {
    if (!depth) return;
    arm_lock_acquire();
+   t_tag   = t_tag_saved;
    t_depth = depth;
 }
 

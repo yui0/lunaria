@@ -8,7 +8,9 @@
  *
  * All functions forward to the system libm via dlsym(RTLD_NEXT).
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <stdint.h>

@@ -11,6 +11,9 @@ argv0="$0"
 msg() { printf -- '%s: %s\n' "${argv0##*/}" "$@" 1>&2; }
 err() { msg "$@"; exit 1; }
 
+script_dir=$(CDPATH= cd -- "$(dirname -- "$argv0")" && pwd) \
+    || err 'cannot resolve launcher directory'
+
 [ -z "$1" ] && err 'usage: <apk-or-xapk>'
 inputfile="$(realpath "$1")"
 pkgfile="$inputfile"
@@ -35,9 +38,18 @@ if [ -z "$LUNARIA_NO_CACHE" ]; then
     # Include the installed-tree format.  Launcher fixes that change how
     # split assets are materialised must never silently reuse an older tree.
     _cache_format=5
-    _key="$(printf '%s|%s|%s' "$inputfile" \
-        "$_cache_format" \
-        "$(stat -c '%s|%Y' "$inputfile" 2>/dev/null)" | sha1sum | cut -c1-16)"
+    # Python supplies one implementation on GNU/Linux and BSD/macOS.  The old
+    # stat -c | sha1sum pipeline produced an empty key on macOS; that collapsed
+    # every package into the cache root and made the following cleanup unsafe.
+    _key="$(python3 - "$inputfile" "$_cache_format" <<'PYEOF'
+import hashlib, os, sys
+path, fmt = sys.argv[1:]
+st = os.stat(path)
+identity = f'{os.path.realpath(path)}|{fmt}|{st.st_size}|{st.st_mtime_ns}'
+print(hashlib.sha1(identity.encode()).hexdigest()[:16])
+PYEOF
+)" || err 'cannot identify input package'
+    [ -n "$_key" ] || err 'empty package cache key'
     cache_dir="${LUNARIA_CACHE_DIR:-${TMPDIR:-/tmp}/lunaria-cache}/$_key"
     if [ -f "$cache_dir/.ready" ]; then
         cache_hit=1
@@ -100,7 +112,7 @@ PYEOF
         _xapk_base="base.apk"
         [ -f "$xapk_dir/$_xapk_base" ] || err "apks has no base.apk"
         xapk_splits="$(find "$xapk_dir" -maxdepth 1 -name '*.apk' ! -name 'base.apk' \
-                        -printf '%f\n' | sort)"
+                        -exec basename {} \; | sort)"
         pkgfile="$xapk_dir/$_xapk_base"
         msg "apks base: $_xapk_base"
         [ -n "$xapk_splits" ] && msg "apks splits: $(printf '%s' "$xapk_splits" | tr '\n' ' ')"
@@ -567,7 +579,7 @@ fi
 # again.  So the first run that names a root writes it down, and every later
 # run picks it up without being told.  Pass a new one to move; pass the
 # default explicitly (LUNARIA_DATA_ROOT="$PWD") to go back.
-_root_memo="${0%/*}/.lunaria-data-root"
+_root_memo="$script_dir/.lunaria-data-root"
 if [ -n "$LUNARIA_DATA_ROOT" ]; then
     printf '%s\n' "$LUNARIA_DATA_ROOT" > "$_root_memo" 2>/dev/null || :
 elif [ -r "$_root_memo" ]; then
@@ -741,7 +753,7 @@ if [ -n "$ANDROID_OBB_MAIN" ]; then
     # ShaderArchive/maps need AES-ECB index decrypt.  Stage the real cooked
     # assets (including the real .uproject from the pak) as loose files —
     # host staging only, no fabricated project descriptor.
-    _stage_py="$(dirname "$argv0")/scripts/ue4_stage_encrypted_paks.py"
+    _stage_py="$script_dir/scripts/ue4_stage_encrypted_paks.py"
     # Skip it when the tree it writes into already has its output.  The test
     # used to be "did we hit the package cache", which stopped being the right
     # question once the external-files tree moved out of that cache: a cached
@@ -802,7 +814,10 @@ if [ -d "$managed_dir" ]; then
     export MONO_CONFIG="$mono_cfg/mono/config"
 fi
 
-export LD_LIBRARY_PATH="$PWD:$PWD/runtime${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$script_dir:$script_dir/runtime${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+if [ "$(uname -s)" = Darwin ]; then
+    export DYLD_LIBRARY_PATH="$script_dir:$script_dir/runtime${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+fi
 
 # Run the package's real launcher Activity from dex by default.  Set
 # LUNARIA_DEX_START=0 only when comparing against the legacy, engine-specific
@@ -867,7 +882,7 @@ PYEOF
     fi
 fi
 
-lunaria_bin="${LUNARIA_BIN:-./lunaria}"
+lunaria_bin="${LUNARIA_BIN:-$script_dir/lunaria}"
 
 # Cold-start JIT can spend a long stretch translating with a blank window.
 # The luna-ui progress card is on by default; LUNARIA_JIT_UI=0 turns it off.

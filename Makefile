@@ -22,20 +22,115 @@ CPPFLAGS ?= -D_FORTIFY_SOURCE=2
 CPPFLAGS += -Isrc -DANDROID_X86_LINKER # -DVERBOSE_FUNCTIONS
 # Default: x86 (32-bit). Use targets below for other ABIs.
 
+# The host operating system, one file per platform.  A build compiles exactly
+# one of them, so each is free to include whatever its own platform needs and
+# none of them carries an #ifdef for the other two.  See src/lunaria_os.h.
+LUNA_OS_NAME := $(shell uname -s)
+ifeq ($(LUNA_OS_NAME),Darwin)
+LUNA_OS_SRC = src/lunaria_mac.c
+else ifneq (,$(findstring MINGW,$(LUNA_OS_NAME)))
+LUNA_OS_SRC = src/lunaria_windows.c
+else ifneq (,$(findstring MSYS,$(LUNA_OS_NAME)))
+LUNA_OS_SRC = src/lunaria_windows.c
+else ifneq (,$(findstring CYGWIN,$(LUNA_OS_NAME)))
+LUNA_OS_SRC = src/lunaria_windows.c
+else
+LUNA_OS_SRC = src/lunaria_linux.c
+endif
+LUNA_OS_OBJ = lunaria_os.o
+
+# Host graphics and system libraries.  The macOS build uses GLFW's Cocoa
+# backend and ANGLE's Metal backend from .deps/; no X11 or Linux libEGL is
+# involved.  `make macos-deps` produces these files without Homebrew.
+ifeq ($(LUNA_OS_NAME),Darwin)
+MAC_DEPS          = .deps
+MAC_OPENSSL      ?= /opt/homebrew/opt/openssl@3
+MAC_SDK           = $(shell xcrun --show-sdk-path)
+CMAKE             = $(MAC_DEPS)/bin/cmake
+DYNARMIC_CMAKE_FLAGS = -DBOOST_ROOT=$(abspath $(MAC_DEPS)/boost) \
+	-DBoost_NO_SYSTEM_PATHS=ON -DCMAKE_CXX_FLAGS=-DFMT_CONSTEVAL=
+HOST_CPPFLAGS     = -DEGL_NO_PLATFORM_SPECIFIC_TYPES \
+	-I$(MAC_DEPS)/linux-abi -I$(MAC_DEPS)/khronos/include \
+	-I$(MAC_DEPS)/glfw/include -I$(MAC_DEPS)/icu/include \
+	-I$(MAC_OPENSSL)/include
+HOST_GL_LIBS      = $(MAC_DEPS)/lib/libEGL.dylib $(MAC_DEPS)/lib/libGLESv2.dylib
+HOST_Z_LIBS       = $(MAC_SDK)/usr/lib/libz.tbd
+HOST_WINDOW_LIBS  = $(MAC_DEPS)/lib/libglfw3.a -framework Cocoa \
+	-framework IOKit -framework CoreFoundation -framework QuartzCore
+HOST_CRYPTO_LIBS  = -L$(MAC_OPENSSL)/lib -lssl -lcrypto
+HOST_ICU_LIBS     = -licucore
+HOST_DL_LIBS      = runtime/libdl.so
+HOST_SYSTEM_DL_LIBS =
+HOST_RT_LIBS      =
+HOST_LIBC_LIBS    =
+HOST_LIBC_LDFLAGS =
+HOST_SO_LDFLAGS   = -Wl,-undefined,dynamic_lookup \
+	-Wl,-install_name,@rpath/$(@F)
+HOST_EXPORT       = -Wl,-export_dynamic
+HOST_RPATH        = -Wl,-rpath,@loader_path/runtime \
+	-Wl,-rpath,@loader_path/.deps/lib -Wl,-rpath,$(MAC_OPENSSL)/lib
+HOST_TEST_RPATH   = -Wl,-rpath,@loader_path/../.deps/lib
+LUNARIA_LIBDIRS   = -L. -Lruntime
+
+OPENH264_SO       = runtime/libopenh264.dylib
+OPENH264_ARCH    ?= mac-arm64
+OPENH264_URL      = http://ciscobinary.openh264.org/libopenh264-$(OPENH264_VERSION)-$(OPENH264_ARCH).dylib.bz2
+PTHREAD_SRC       = src/lib/pthread_mac.c
+HOST_BIONIC_LIBC  =
+else
+HOST_CPPFLAGS     = $(shell pkg-config --cflags glfw3)
+HOST_GL_LIBS      = -lEGL -lGLESv2
+HOST_Z_LIBS       = -lz
+HOST_WINDOW_LIBS  = $(shell pkg-config --libs glfw3)
+HOST_CRYPTO_LIBS  = -lssl -lcrypto
+HOST_ICU_LIBS     = -licuuc
+HOST_DL_LIBS      = -ldl
+HOST_SYSTEM_DL_LIBS = -ldl
+HOST_RT_LIBS      = -lrt
+HOST_LIBC_LIBS    = $(shell pkg-config --libs libbsd libunwind)
+HOST_LIBC_LDFLAGS = -Wl,-wrap,_IO_file_xsputn
+HOST_SO_LDFLAGS   =
+HOST_EXPORT       = -rdynamic
+HOST_RPATH        = -Wl,-Y,runtime,-rpath,$(PREFIX)$(LIBDIR)$(RUNTIMEDIR)
+HOST_TEST_RPATH   =
+# Guest Android stubs live in runtime/, but -Lruntime must not appear on the
+# host executable link line: ld would resolve -lc to runtime/libc.so (the guest
+# bionic shim) instead of the system libc.  -Wl,-Y,runtime below is enough for
+# -ljvm and the libdl/libpthread symlinks in .
+LUNARIA_LIBDIRS   = -L.
+OPENH264_SO       = runtime/libopenh264.so
+OPENH264_ARCH    ?= linux64
+OPENH264_ABI      = 7
+OPENH264_URL      = http://ciscobinary.openh264.org/libopenh264-$(OPENH264_VERSION)-$(OPENH264_ARCH).$(OPENH264_ABI).so.bz2
+PTHREAD_SRC       = src/lib/pthread.c
+HOST_BIONIC_LIBC  = runtime/libc.so
+endif
+
+CPPFLAGS += $(HOST_CPPFLAGS)
+
 bins = lunaria
 libs = runtime/libpthread.so runtime/libdl.so runtime/libc.so runtime/libandroid.so \
        runtime/liblog.so runtime/libEGL.so runtime/libOpenSLES.so runtime/libjvm.so \
        runtime/libm.so runtime/libz.so runtime/libmediandk.so runtime/libGLESv3.so
 libs += runtime/libvulkan.so
 
-OPENH264_SO      = runtime/libopenh264.so
-
 # The H.264 decoder is part of a working build, not an optional extra: a title
 # whose intro is an .mp4 waits on that movie, so a build without it stops at the
 # splash for a reason that looks nothing like a missing decoder.  It is a
 # download rather than a compile — see fetch-openh264 below for why it cannot be
 # vendored — so it is cheap to have and expensive to forget.
-all: $(bins) $(OPENH264_SO)
+ifeq ($(LUNA_OS_NAME),Darwin)
+all: macos-deps
+	$(MAKE) host-all
+else
+all: host-all
+endif
+
+host-all: $(bins) $(OPENH264_SO)
+
+macos-deps:
+	scripts/fetch-macos-deps.sh
+	scripts/build-macos-glfw.sh
 
 # https://developer.android.com/ndk/guides/abis
 # https://android.googlesource.com/platform/ndk/+/ics-mr0/docs/STANDALONE-TOOLCHAIN.html
@@ -76,31 +171,32 @@ arm64-v8a:
 trace.o: src/trace.c src/trace.h
 	$(CC) $(CFLAGS) -fvisibility=hidden -fPIC $(CPPFLAGS) -D_GNU_SOURCE -c src/trace.c -o $@
 
-runtime/libpthread.so: src/lib/pthread.c
+runtime/libpthread.so: $(PTHREAD_SRC)
 	mkdir -p runtime
-	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE $(LDFLAGS) -shared src/lib/pthread.c -lpthread -lrt -o $@
+	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE $(LDFLAGS) \
+	    $(HOST_SO_LDFLAGS) -shared $(PTHREAD_SRC) -lpthread $(HOST_RT_LIBS) -o $@
 
 runtime/libdl.so: trace.o src/linker/dlfcn.c src/linker/linker.c src/linker/linker_environ.c src/linker/rt.c src/linker/strlcpy.c
 	mkdir -p runtime
 	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE -DLINKER_DEBUG=1 -DRUNTIMEPATH='"$(PREFIX)$(LIBDIR)$(RUNTIMEDIR)"' \
 	    -Wno-pedantic -Wno-variadic-macros -Wno-pointer-to-int-cast -Wno-int-to-pointer-cast -Wno-incompatible-pointer-types \
-	    $(LDFLAGS) -shared trace.o \
+	    $(LDFLAGS) $(HOST_SO_LDFLAGS) -shared trace.o \
 	    src/linker/dlfcn.c src/linker/linker.c src/linker/linker_environ.c src/linker/rt.c src/linker/strlcpy.c \
-	    -ldl -lpthread -o $@
+	    $(HOST_SYSTEM_DL_LIBS) -lpthread -o $@
 
 runtime/libc.so: trace.o src/lib/libc.c src/lib/libc-ctype.h src/lib/libc-sysconf.h src/lib/libc-verbose.h
 	mkdir -p runtime
 	$(CC) $(CFLAGS) -fPIC -Wno-deprecated-declarations $(CPPFLAGS) -D_GNU_SOURCE \
-	    -Wl,-wrap,_IO_file_xsputn $(LDFLAGS) -shared \
+	    $(HOST_LIBC_LDFLAGS) $(LDFLAGS) $(HOST_SO_LDFLAGS) -shared \
 	    trace.o src/lib/libc.c \
-	    `pkg-config --libs libbsd libunwind` -o $@
+	    $(HOST_LIBC_LIBS) -o $@
 
 # Small Android API stubs: one driver (src/lib/stub.c), one -DLUNARIA_STUB_* per .so
-STUB_SO = $(CC) $(CFLAGS) -fPIC $(CPPFLAGS) $(LDFLAGS) -Isrc/lib -shared src/lib/stub.c
+STUB_SO = $(CC) $(CFLAGS) -fPIC $(CPPFLAGS) $(LDFLAGS) $(HOST_SO_LDFLAGS) -Isrc/lib -shared src/lib/stub.c
 
 runtime/libandroid.so:
 	mkdir -p runtime
-	$(STUB_SO) -DLUNARIA_STUB_ANDROID -o $@ `pkg-config --libs glfw3`
+	$(STUB_SO) -DLUNARIA_STUB_ANDROID -o $@ $(HOST_WINDOW_LIBS)
 
 runtime/liblog.so:
 	mkdir -p runtime
@@ -108,11 +204,11 @@ runtime/liblog.so:
 
 runtime/libEGL.so:
 	mkdir -p runtime
-	$(STUB_SO) -DLUNARIA_STUB_EGL -D_GNU_SOURCE -o $@ -lEGL `pkg-config --libs glfw3`
+	$(STUB_SO) -DLUNARIA_STUB_EGL -D_GNU_SOURCE -o $@ $(HOST_GL_LIBS) $(HOST_WINDOW_LIBS)
 
 runtime/libOpenSLES.so: trace.o
 	mkdir -p runtime
-	$(CC) $(CFLAGS) -Wno-pedantic -fPIC $(CPPFLAGS) $(LDFLAGS) -Isrc/lib -shared trace.o \
+	$(CC) $(CFLAGS) -Wno-pedantic -fPIC $(CPPFLAGS) $(LDFLAGS) $(HOST_SO_LDFLAGS) -Isrc/lib -shared trace.o \
 	    src/lib/stub.c -DLUNARIA_STUB_OPENSLES -o $@
 
 DVM_SRC = src/dvm/dex.c src/dvm/dvm.c src/dvm/dvm_runtime.c src/dvm/dvm_jni.c \
@@ -127,20 +223,20 @@ DVM_HDR = src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
 # layer inside the VM publishes the document, and the swap path in arm_exec
 # presents it.  Both sides then resolve to the same single instance of the
 # engine — two copies would each hold half of the state.
-runtime/libjvm.so: trace.o src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/jvm.h src/jvm/jni.h $(DVM_SRC) $(DVM_HDR) luna_overlay.o luna_boot.o
+runtime/libjvm.so: trace.o src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/jvm.h src/jvm/jni.h $(DVM_SRC) $(DVM_HDR) luna_overlay.o luna_boot.o luna_ime.o
 	mkdir -p runtime
-	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE -Wno-pedantic $(LDFLAGS) -shared \
-	    trace.o src/jvm/jvm.c src/jvm/jni_stubs.c $(DVM_SRC) luna_overlay.o luna_boot.o \
-	    -lm -lssl -lcrypto -licuuc \
-	    -lEGL -lGLESv2 -lz -o $@
+	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE -Wno-pedantic $(LDFLAGS) $(HOST_SO_LDFLAGS) -shared \
+	    trace.o src/jvm/jvm.c src/jvm/jni_stubs.c $(DVM_SRC) luna_overlay.o luna_boot.o luna_ime.o \
+	    -lm $(HOST_CRYPTO_LIBS) $(HOST_ICU_LIBS) \
+	    $(HOST_GL_LIBS) $(HOST_Z_LIBS) -o $@
 
 runtime/libm.so:
 	mkdir -p runtime
-	$(STUB_SO) -DLUNARIA_STUB_MATH -D_GNU_SOURCE -o $@ -ldl -lm
+	$(STUB_SO) -DLUNARIA_STUB_MATH -D_GNU_SOURCE -o $@ $(HOST_DL_LIBS) -lm
 
 runtime/libz.so:
 	mkdir -p runtime
-	$(STUB_SO) -DLUNARIA_STUB_ZLIB -o $@ -ldl -lz
+	$(STUB_SO) -DLUNARIA_STUB_ZLIB -o $@ $(HOST_DL_LIBS) -lz
 
 runtime/libmediandk.so:
 	mkdir -p runtime
@@ -148,7 +244,7 @@ runtime/libmediandk.so:
 
 runtime/libGLESv3.so:
 	mkdir -p runtime
-	$(STUB_SO) -DLUNARIA_STUB_GLESV3 -D_GNU_SOURCE -o $@ -lGLESv2
+	$(STUB_SO) -DLUNARIA_STUB_GLESV3 -D_GNU_SOURCE -o $@ $(HOST_GL_LIBS)
 
 runtime/libvulkan.so:
 	mkdir -p runtime
@@ -161,11 +257,14 @@ libpthread.so: runtime/libpthread.so
 	ln -sfn runtime/libpthread.so $@
 
 # arm_exec.o: compiled with C++20 and dynarmic headers; linked into lunaria
-arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/arm.h src/jvm/jvm.h $(DYNARMIC_LIB)
+arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/arm.h src/jvm/jvm.h src/binary128.h $(DYNARMIC_LIB)
 	$(CXX) -std=c++20 -O2 -g -fPIC \
 	    $(DYNARMIC_INCS) \
-	    -Isrc -D_GNU_SOURCE \
+	    $(CPPFLAGS) -D_GNU_SOURCE \
 	    -c src/arm_exec.cpp -o $@
+
+binary128.o: src/binary128.cpp src/binary128.h
+	$(CXX) -std=c++20 -O2 -g -fPIC $(CPPFLAGS) -c src/binary128.cpp -o $@
 
 # arm.o: code common to the ARM32 and ARM64 execution paths, C11.  Currently
 # the ARM execution lock; anything else neither path owns alone belongs here
@@ -181,33 +280,42 @@ loader.o: src/loader.c src/arm_exec.h src/arm.h
 # the project's own warning set relaxed — luna-ui.h is a 680 KB single-header
 # library from another tree, and its diagnostics are not this build's to fix.
 LUNA_UI_DIR ?= ../luna-ui
-luna_overlay.o: src/luna_overlay.c src/luna_overlay.h $(LUNA_UI_DIR)/luna-ui.h
-	$(CC) -std=c11 -O2 -g -fPIC -Isrc -I$(LUNA_UI_DIR) -D_GNU_SOURCE \
+luna_overlay.o: src/luna_overlay.c src/luna_overlay.h src/luna_ime.h $(LUNA_UI_DIR)/luna-ui.h
+	$(CC) -std=c11 -O2 -g -fPIC $(CPPFLAGS) -I$(LUNA_UI_DIR) -D_GNU_SOURCE \
 	    -Wno-unused-function -Wno-unused-variable -Wno-sign-compare \
 	    -c src/luna_overlay.c -o $@
 
 # The boot card.  It calls luna-ui but does not define its implementation —
 # luna_overlay.o is the one translation unit that does, and both land in
 # libjvm.so, so the engine is linked once.
+luna_ime.o: src/luna_ime.c src/luna_ime.h src/luna_overlay.h $(LUNA_UI_DIR)/luna-ui.h
+	$(CC) -std=c11 -O2 -g -fPIC $(CPPFLAGS) -I$(LUNA_UI_DIR) -D_GNU_SOURCE \
+	    -Wno-unused-function -Wno-unused-variable -Wno-sign-compare \
+	    -c src/luna_ime.c -o $@
+
 luna_boot.o: src/luna_boot.c src/luna_boot.h src/luna_overlay.h $(LUNA_UI_DIR)/luna-ui.h
-	$(CC) -std=c11 -O2 -g -fPIC -Isrc -I$(LUNA_UI_DIR) -D_GNU_SOURCE \
+	$(CC) -std=c11 -O2 -g -fPIC $(CPPFLAGS) -I$(LUNA_UI_DIR) -D_GNU_SOURCE \
 	    -Wno-unused-function -Wno-unused-variable -Wno-sign-compare \
 	    -c src/luna_boot.c -o $@
 
 # lunaria: link with g++ so arm_exec.o (C++) and dynarmic (C++) are handled correctly
-lunaria: loader.o arm_exec.o arm.o trace.o libdl.so libpthread.so \
-       runtime/libpthread.so runtime/libc.so \
+lunaria_os.o: $(LUNA_OS_SRC) src/lunaria_os.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+	    -c $(LUNA_OS_SRC) -o $@
+
+lunaria: loader.o arm_exec.o binary128.o arm.o trace.o $(LUNA_OS_OBJ) libdl.so libpthread.so \
+       runtime/libpthread.so $(HOST_BIONIC_LIBC) \
        runtime/libandroid.so runtime/liblog.so \
        runtime/libEGL.so runtime/libOpenSLES.so \
        runtime/libjvm.so runtime/libm.so runtime/libz.so \
        runtime/libmediandk.so runtime/libGLESv3.so
 lunaria: runtime/libvulkan.so
-	$(CXX) -std=c++20 -O2 -g \
-	    -L. -Wl,-Y,runtime,-rpath,$(PREFIX)$(LIBDIR)$(RUNTIMEDIR) $(LDFLAGS) \
-	    loader.o arm_exec.o arm.o trace.o \
+	$(CXX) -std=c++20 -O2 -g $(HOST_EXPORT) \
+	    $(LUNARIA_LIBDIRS) $(HOST_RPATH) $(LDFLAGS) \
+	    loader.o arm_exec.o binary128.o arm.o trace.o $(LUNA_OS_OBJ) \
 	    $(DYNARMIC_LIBS) \
-	    -ldl -lpthread -ljvm \
-	    `pkg-config --libs glfw3` -lEGL -lGLESv2 -lz -lcrypto -o $@
+	    $(HOST_DL_LIBS) -lpthread -ljvm \
+	    $(HOST_WINDOW_LIBS) $(HOST_GL_LIBS) $(HOST_Z_LIBS) $(HOST_CRYPTO_LIBS) -o $@
 
 install-bin: $(bins)
 	install -Dm755 $(bins) -t "$(DESTDIR)$(PREFIX)$(BINDIR)"
@@ -218,7 +326,7 @@ install-lib: $(libs)
 install: install-bin install-lib
 
 clean:
-	$(RM) $(bins) trace.o arm_exec.o arm.o loader.o luna_overlay.o luna_boot.o \
+	$(RM) $(bins) trace.o arm_exec.o binary128.o arm.o loader.o lunaria_os.o luna_overlay.o luna_boot.o \
 	    libdl.so libpthread.so
 	$(RM) -r runtime
 	$(RM) test/test_dynarmic_arm test/test_unity test/test_dvm test/dvm_test.dex
@@ -245,17 +353,19 @@ test/test_dvm: test/dvm_test.c $(DVM_SRC) $(DVM_HDR) luna_overlay.o luna_boot.o
 	$(CC) -std=c11 -g -O1 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -Isrc \
 	    $(DVM_TEST_SAN) \
 	    test/dvm_test.c $(DVM_SRC:src/dvm/dvm_jni.c=) luna_overlay.o luna_boot.o \
-	    -lm -lssl -lcrypto -lz -ldl -lEGL -lGLESv2 -o $@
+	    -lm $(HOST_CRYPTO_LIBS) $(HOST_Z_LIBS) $(HOST_SYSTEM_DL_LIBS) $(HOST_GL_LIBS) -o $@
 
 # Pass a real classes.dex as DVM_DEX to also run every method in it.
 DVM_DEX ?=
 # The boot card, rendered headlessly so it can be looked at without waiting
 # through a real title's boot.
-test/test_boot_card: test/boot_card_test.c luna_overlay.o luna_boot.o \
-                     src/luna_overlay.h src/luna_boot.h
-	$(CC) -std=c11 -O2 -g -Isrc -D_GNU_SOURCE \
-	    test/boot_card_test.c luna_overlay.o luna_boot.o \
-	    -lEGL -lGLESv2 -lm -o $@
+# luna_ime.o comes along because the overlay presents through it: the input
+# method is part of the surface now, not a separate layer.
+test/test_boot_card: test/boot_card_test.c luna_overlay.o luna_boot.o luna_ime.o \
+                     src/luna_overlay.h src/luna_boot.h src/luna_ime.h
+	$(CC) -std=c11 -O2 -g $(CPPFLAGS) -D_GNU_SOURCE $(HOST_TEST_RPATH) \
+	    test/boot_card_test.c luna_overlay.o luna_boot.o luna_ime.o \
+	    $(HOST_GL_LIBS) -lm -o $@
 
 boot-card-test: test/test_boot_card
 	mkdir -p /tmp/lunaria-boot
@@ -382,18 +492,33 @@ DYNARMIC_INCS = \
 	-I$(DYNARMIC_BUILD)/externals/zydis \
 	-I$(DYNARMIC_BUILD)/externals/zydis/zycore
 
+ifeq ($(LUNA_OS_NAME),Darwin)
+# Dynarmic's native arm64 backend emits A64 directly and does not build the
+# x86-only Zydis disassembler archives.
+DYNARMIC_LIBS = $(DYNARMIC_LIB) $(DYNARMIC_FMT_LIB) $(DYNARMIC_MCL_LIB)
+else
 DYNARMIC_LIBS = \
 	$(DYNARMIC_LIB) $(DYNARMIC_FMT_LIB) $(DYNARMIC_MCL_LIB) \
 	$(DYNARMIC_ZYD_LIB) $(DYNARMIC_ZYC_LIB)
+endif
 
 $(DYNARMIC_LIB):
-	cmake -B $(DYNARMIC_BUILD) -S $(DYNARMIC_DIR) \
+	$(CMAKE) -B $(DYNARMIC_BUILD) -S $(DYNARMIC_DIR) \
 	    -DDYNARMIC_WARNINGS_AS_ERRORS=OFF \
 	    -DDYNARMIC_TESTS=OFF \
 	    -DCMAKE_BUILD_TYPE=Release \
+	    $(DYNARMIC_CMAKE_FLAGS) \
 	    -DDYNARMIC_FRONTENDS="A32;A64" \
 	    -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-	cmake --build $(DYNARMIC_BUILD) -j$(shell nproc)
+	$(CMAKE) --build $(DYNARMIC_BUILD) -j$(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+
+# These archives are emitted by the same CMake build.  Listing the relation
+# keeps a clean tree buildable: otherwise make sees them as prerequisites of
+# lunaria but has no rule with which to create them.
+$(DYNARMIC_FMT_LIB) $(DYNARMIC_MCL_LIB): $(DYNARMIC_LIB)
+ifneq ($(LUNA_OS_NAME),Darwin)
+$(DYNARMIC_ZYD_LIB) $(DYNARMIC_ZYC_LIB): $(DYNARMIC_LIB)
+endif
 
 test/test_dynarmic_arm: test/test_dynarmic_arm.cpp $(DYNARMIC_LIB)
 	$(CXX) -std=c++20 -O2 -g \
@@ -401,6 +526,12 @@ test/test_dynarmic_arm: test/test_dynarmic_arm.cpp $(DYNARMIC_LIB)
 	    test/test_dynarmic_arm.cpp \
 	    $(DYNARMIC_LIBS) \
 	    -lpthread -o $@
+
+test/test_binary128: test/binary128_test.cpp src/binary128.cpp src/binary128.h
+	$(CXX) -std=c++20 -O2 -g -Isrc test/binary128_test.cpp src/binary128.cpp -o $@
+
+binary128-test: test/test_binary128
+	./test/test_binary128
 
 # Relink when dynarmic itself is rebuilt: it is linked in statically, so a
 # fresh libdynarmic.a that nothing depends on leaves the old code in the
@@ -452,9 +583,6 @@ $(BLADE_SOUL_APK):
 # http://www.openh264.org/BINARY_LICENSE.txt
 # ---------------------------------------------------------------------------
 OPENH264_VERSION = 2.5.1
-OPENH264_ABI     = 7
-OPENH264_ARCH   ?= linux64
-OPENH264_URL     = http://ciscobinary.openh264.org/libopenh264-$(OPENH264_VERSION)-$(OPENH264_ARCH).$(OPENH264_ABI).so.bz2
 
 fetch-openh264: $(OPENH264_SO)
 	@printf 'openh264 ready: $(OPENH264_SO)\n'
@@ -468,8 +596,8 @@ $(OPENH264_SO):
 # Aggregate: download all sample APKs used for development / regression.
 fetch: fetch-libunity fetch-btw fetch-blade-soul fetch-openh264
 
-.PHONY: all x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
-        clean install install-bin install-lib test net-test dvm-test abi-test \
-        posix-test boot-card-test \
+.PHONY: all host-all macos-deps x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
+	        clean install install-bin install-lib test net-test dvm-test abi-test \
+	        posix-test boot-card-test binary128-test \
         fetch fetch-libunity fetch-btw fetch-blade-soul fetch-openh264 \
         dynarmic-build

@@ -10,9 +10,111 @@
 
 #include "jvm/jvm.h"
 
+#include <stdint.h>
+#include <stdlib.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* ---- guest RAM profile -------------------------------------------------- *
+ *
+ * What ActivityManager.getMemoryInfo() and /proc/meminfo tell the app it is
+ * running on.  It lived in a header of its own, which bought nothing: the
+ * three translation units that read it (arm_exec.cpp, jni_stubs.c,
+ * dvm_runtime.c) all include this one already.
+ *
+ * Env (all optional):
+ *   LUNARIA_MEM_TOTAL_MB      — total RAM advertised (default 6144 = 6 GiB)
+ *   LUNARIA_MEM_AVAIL_MB      — available RAM (default ~5/6 of total)
+ *   LUNARIA_MEM_THRESHOLD_MB  — low-memory threshold (default 48)
+ *   LUNARIA_MEM_FREE_MB       — MemFree in /proc/meminfo (default ~2/3 avail)
+ *
+ * The 32-bit guest VA space is still ~4 GiB, so mmap arenas cannot back a full
+ * 6 GiB mapping; the reported size drives Unity's heuristics while
+ * LUNARIA_HEAP_MB / the MMAP2 layout control actual allocation. */
+static inline long lunaria_env_long(const char *name, long def)
+{
+    const char *e = getenv(name);
+    if (!e || !e[0])
+        return def;
+    char *end = NULL;
+    long v = strtol(e, &end, 0);
+    return (end != e) ? v : def;
+}
+
+/* Clamp phone-class totals into a sane range for the emulator. */
+static inline long lunaria_mem_total_mb(void)
+{
+    long mb = lunaria_env_long("LUNARIA_MEM_TOTAL_MB", 6144);
+    if (mb < 512)
+        mb = 512;
+    if (mb > 16384)
+        mb = 16384;
+    return mb;
+}
+
+static inline long lunaria_mem_avail_mb(void)
+{
+    long mb = lunaria_env_long("LUNARIA_MEM_AVAIL_MB", 0);
+    if (mb <= 0)
+        mb = lunaria_mem_total_mb() * 5 / 6;
+    if (mb < 256)
+        mb = 256;
+    if (mb > lunaria_mem_total_mb())
+        mb = lunaria_mem_total_mb();
+    return mb;
+}
+
+static inline long lunaria_mem_free_mb(void)
+{
+    long mb = lunaria_env_long("LUNARIA_MEM_FREE_MB", 0);
+    if (mb <= 0)
+        mb = lunaria_mem_avail_mb() * 2 / 3;
+    if (mb < 128)
+        mb = 128;
+    if (mb > lunaria_mem_avail_mb())
+        mb = lunaria_mem_avail_mb();
+    return mb;
+}
+
+static inline long lunaria_mem_threshold_mb(void)
+{
+    long mb = lunaria_env_long("LUNARIA_MEM_THRESHOLD_MB", 48);
+    if (mb < 8)
+        mb = 8;
+    return mb;
+}
+
+static inline uint64_t lunaria_mem_total_bytes(void)
+{
+    return (uint64_t)lunaria_mem_total_mb() * 1024ull * 1024ull;
+}
+
+static inline uint64_t lunaria_mem_avail_bytes(void)
+{
+    return (uint64_t)lunaria_mem_avail_mb() * 1024ull * 1024ull;
+}
+
+static inline uint64_t lunaria_mem_threshold_bytes(void)
+{
+    return (uint64_t)lunaria_mem_threshold_mb() * 1024ull * 1024ull;
+}
+
+static inline uint64_t lunaria_mem_total_kb(void)
+{
+    return (uint64_t)lunaria_mem_total_mb() * 1024ull;
+}
+
+static inline uint64_t lunaria_mem_avail_kb(void)
+{
+    return (uint64_t)lunaria_mem_avail_mb() * 1024ull;
+}
+
+static inline uint64_t lunaria_mem_free_kb(void)
+{
+    return (uint64_t)lunaria_mem_free_mb() * 1024ull;
+}
 
 /*
  * Detect whether the ELF at `path` is an ARM 32-bit shared object.
@@ -179,15 +281,24 @@ int arm_exec_apk_style_value(uint32_t style_id, uint32_t attr_id,
 int arm_exec_fb_height(void);
 
 /* Touch input bridge (GLFW mouse → Android MotionEvent).
- * arm_exec_touch_next() pops the next queued event and makes it "current";
- * returns 0 when the queue is empty.  The accessors below return the current
- * event's data — libjvm-android.c's MotionEvent JNI getters call them. */
-int       arm_exec_touch_next(void);
-int       arm_exec_touch_action(void);  /* 0=DOWN 1=UP 2=MOVE */
+ * arm_exec_touch_next() pops the next queued sample into *out (required).
+ * Returns 0 when the queue is empty.  arm_exec_touch_* accessors reflect the
+ * last popped sample for diagnostics only — MotionEvent JNI getters must use
+ * jvm_motion_event_view(), not these. */
+typedef struct ArmExecTouchEvent {
+   int action;          /* 0=DOWN 1=UP 2=MOVE */
+   float x, y;
+   long long event_ms;
+   long long down_ms;
+} ArmExecTouchEvent;
+
+int       arm_exec_touch_next(ArmExecTouchEvent *out);
+int       arm_exec_touch_action(void);
 float     arm_exec_touch_x(void);
 float     arm_exec_touch_y(void);
-long long arm_exec_touch_time(void);    /* CLOCK_MONOTONIC ms */
-void      arm_exec_touch_push(int action, float x, float y); /* test injection */
+long long arm_exec_touch_time(void);
+long long arm_exec_touch_down_time(void);
+void      arm_exec_touch_push(int action, float x, float y);
 
 /* NDK input queue for NativeActivity titles (UE).  Creates the queue's pipe on
  * first call and returns the opaque AInputQueue* the guest will hand back to
@@ -205,6 +316,16 @@ char *arm_exec_clipboard_get(void);
 /* Returns 1 if the GLFW window close button was pressed, 0 otherwise. */
 int arm_exec_glfw_should_close(void);
 void arm_exec_request_quit(void);
+
+/* Stop and join the A64 engine pool.  Call once the guest is finished and
+ * before the process returns from main: the workers are host threads owned by
+ * a static, and destroying a joinable std::thread calls std::terminate(). */
+void arm_exec_shutdown_engines(void);
+
+/* One line naming which guest threads the instructions went to.  Printed
+ * beside [perf]: the process-wide rate says how fast the guest is running,
+ * this says whether the thread running is the one that should be. */
+void arm_exec_ticks_report(void);
 
 /* Run all pthread_create-queued ARM thread functions inline (up to 8 passes). */
 void arm_exec_run_pending_threads(void);
@@ -264,6 +385,11 @@ void arm_exec_write32(uint32_t va, uint32_t val);
 
 /* Bytes of guest heap consumed by the bump allocator (for leak diagnosis). */
 uint32_t arm_exec_heap_used(void);
+
+/* Present the boot / JIT status card once.  Safe during dex load (few SVCs):
+ * opens the host window if needed and draws through the overlay's unshared
+ * context.  No-op once the guest has presented its first frame. */
+int arm_exec_boot_present(void);
 
 /* How many times guest abort() has been called (mono g_assert, etc.). */
 uint64_t arm_exec_guest_abort_count(void);

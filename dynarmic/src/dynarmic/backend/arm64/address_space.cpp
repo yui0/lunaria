@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 
 #include <mcl/bit_cast.hpp>
@@ -17,6 +19,35 @@
 #include "dynarmic/common/fp/fpcr.h"
 #include "dynarmic/common/llvm_disassemble.h"
 #include "dynarmic/interface/exclusive_monitor.h"
+
+/* Lunaria's cold-start progress counters.  The x64 backend has the same ABI;
+ * native Apple Silicon builds compile this backend instead, so leaving the
+ * counters in x64 alone made the arm64 host fail at link time and hid the
+ * very stalls they are intended to expose. */
+namespace {
+using ProgressHook = void (*)(uint64_t compiles, uint64_t compile_ns);
+std::atomic<uint64_t> g_lunaria_compile_count{0};
+std::atomic<uint64_t> g_lunaria_compile_ns{0};
+std::atomic<uint64_t> g_lunaria_hook_last_ns{0};
+std::atomic<ProgressHook> g_lunaria_progress_hook{nullptr};
+
+uint64_t LunariaSteadyNs() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+}  // namespace
+
+extern "C" uint64_t dynarmic_a64_compile_count(void) {
+    return g_lunaria_compile_count.load(std::memory_order_relaxed);
+}
+
+extern "C" uint64_t dynarmic_a64_compile_ns(void) {
+    return g_lunaria_compile_ns.load(std::memory_order_relaxed);
+}
+
+extern "C" void dynarmic_a64_set_progress_hook(void (*fn)(uint64_t, uint64_t)) {
+    g_lunaria_progress_hook.store(fn, std::memory_order_relaxed);
+}
 
 namespace Dynarmic::Backend::Arm64 {
 
@@ -65,8 +96,24 @@ CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
         return block_entry;
     }
 
+    const uint64_t started_ns = LunariaSteadyNs();
     IR::Block ir_block = GenerateIR(descriptor);
     const EmittedBlockInfo block_info = Emit(std::move(ir_block));
+    const uint64_t elapsed_ns = LunariaSteadyNs() - started_ns;
+    const uint64_t total_ns = g_lunaria_compile_ns.fetch_add(
+                                  elapsed_ns, std::memory_order_relaxed) + elapsed_ns;
+    const uint64_t count = g_lunaria_compile_count.fetch_add(
+                               1, std::memory_order_relaxed) + 1;
+    if (ProgressHook hook = g_lunaria_progress_hook.load(std::memory_order_relaxed)) {
+        const uint64_t now_ns = LunariaSteadyNs();
+        uint64_t last_ns = g_lunaria_hook_last_ns.load(std::memory_order_relaxed);
+        if ((count & 255u) == 0 || now_ns - last_ns >= 100000000ULL) {
+            if (g_lunaria_hook_last_ns.compare_exchange_strong(
+                    last_ns, now_ns, std::memory_order_relaxed)) {
+                hook(count, total_ns);
+            }
+        }
+    }
     return block_info.entry_point;
 }
 

@@ -72,6 +72,12 @@ struct jvm_object {
       struct jvm_method method;
       struct jvm_class klass;
       struct jvm_string string;
+      struct {
+         int action;       /* AMOTION_EVENT_ACTION_* */
+         float x, y;
+         int64_t event_ms; /* CLOCK_MONOTONIC ms when this sample happened */
+         int64_t down_ms;  /* down time of the active pointer gesture */
+      } motion;
    };
 
    enum jvm_object_type {
@@ -81,6 +87,7 @@ struct jvm_object {
       JVM_OBJECT_METHOD,
       JVM_OBJECT_CLASS,
       JVM_OBJECT_STRING,
+      JVM_OBJECT_MOTION,
       JVM_OBJECT_LAST,
    } type;
 
@@ -200,6 +207,23 @@ jvm_release(struct jvm *jvm);
 
 void
 jvm_init(struct jvm *jvm);
+
+/* Immutable Android MotionEvent payload.  Each injected touch gets its own
+ * JVM_OBJECT_MOTION instance; getters read only that object, never global
+ * state — Unity keeps the jobject and reads it again during PlayerLoop. */
+typedef struct lunaria_touch_event {
+   int action;
+   float x, y;
+   long long event_ms;
+   long long down_ms;
+} lunaria_touch_event;
+
+jobject
+jvm_new_motion_event(struct jvm *jvm, const lunaria_touch_event *ev);
+
+/* Copy payload out of a JVM_OBJECT_MOTION handle.  Returns false for other types. */
+bool
+jvm_motion_event_read(struct jvm *jvm, jobject object, lunaria_touch_event *out);
 
 struct jvm*
 jnienv_get_jvm(JNIEnv *env);

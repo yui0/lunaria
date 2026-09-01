@@ -8,6 +8,7 @@
 
 #include "dvm/dex.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -537,6 +538,132 @@ static bool dex_skip_value(const struct dex_file *d, size_t *p)
    return true;
 }
 
+static size_t dex_read_value(const struct dex_file *d, size_t p,
+                             struct dex_value *v);
+
+static bool dex_annotation_set_find(struct dex_file *d, uint32_t set_off,
+                                    const char *annotation_desc,
+                                    bool runtime_only, uint32_t *encoded_off)
+{
+   if (!d || !annotation_desc || !set_off ||
+       (uint64_t)set_off + 4u > d->len)
+      return false;
+   uint32_t count = dex_u32_at(d, set_off);
+   if ((uint64_t)set_off + 4u + (uint64_t)count * 4u > d->len) return false;
+   for (uint32_t i = 0; i < count; ++i) {
+      uint32_t item_off = dex_u32_at(d, set_off + 4u + (size_t)i * 4u);
+      if (!item_off || (uint64_t)item_off + 2u > d->len) continue;
+      /* visibility: 0 build, 1 runtime, 2 system.  Reflection exposes only
+       * runtime annotations; VM metadata helpers below may ask for system. */
+      if (runtime_only && d->p[item_off] != 1u) continue;
+      size_t p = (size_t)item_off + 1u;
+      uint32_t type_idx;
+      size_t q = dex_uleb(d, p, &type_idx);
+      const char *type = q > p ? dex_type(d, type_idx) : NULL;
+      if (type && !strcmp(type, annotation_desc)) {
+         if (encoded_off) *encoded_off = (uint32_t)p;
+         return true;
+      }
+   }
+   return false;
+}
+
+bool dex_class_annotation(struct dex_file *d, uint32_t class_def_idx,
+                          const char *annotation_desc, uint32_t *encoded_off)
+{
+   struct dex_class_def cd;
+   if (!dex_class_def(d, class_def_idx, &cd) || !cd.annotations_off ||
+       (uint64_t)cd.annotations_off + 16u > d->len)
+      return false;
+   return dex_annotation_set_find(d, dex_u32_at(d, cd.annotations_off),
+                                  annotation_desc, true, encoded_off);
+}
+
+/* Annotations on one of a class's fields.
+ *
+ * annotations_directory_item is class_annotations_off, then three counts, then
+ * the field_annotation[] table of {field_idx, annotations_off} pairs.  The
+ * field is named rather than indexed because struct dvm_field does not carry
+ * its dex index, and a class cannot declare the same field name twice. */
+bool dex_field_annotation(struct dex_file *d, uint32_t class_def_idx,
+                          const char *field_name, const char *annotation_desc,
+                          uint32_t *encoded_off)
+{
+   struct dex_class_def cd;
+   if (!d || !field_name ||
+       !dex_class_def(d, class_def_idx, &cd) || !cd.annotations_off ||
+       (uint64_t)cd.annotations_off + 16u > d->len)
+      return false;
+   uint32_t fields = dex_u32_at(d, cd.annotations_off + 4u);
+   size_t table = (size_t)cd.annotations_off + 16u;
+   if ((uint64_t)table + (uint64_t)fields * 8u > d->len) return false;
+   for (uint32_t i = 0; i < fields; ++i) {
+      uint32_t field_idx = dex_u32_at(d, table + (size_t)i * 8u);
+      uint32_t set_off   = dex_u32_at(d, table + (size_t)i * 8u + 4u);
+      struct dex_field_id fid;
+      if (!dex_field_id(d, field_idx, &fid)) continue;
+      const char *name = dex_string(d, fid.name_idx);
+      if (!name || strcmp(name, field_name)) continue;
+      return dex_annotation_set_find(d, set_off, annotation_desc, true,
+                                     encoded_off);
+   }
+   return false;
+}
+
+const char *dex_annotation_type(struct dex_file *d, uint32_t encoded_off)
+{
+   if (!d || encoded_off >= d->len) return NULL;
+   uint32_t type_idx;
+   size_t q = dex_uleb(d, encoded_off, &type_idx);
+   return q > encoded_off ? dex_type(d, type_idx) : NULL;
+}
+
+bool dex_annotation_element(struct dex_file *d, uint32_t encoded_off,
+                            const char *name, struct dex_value *out)
+{
+   if (!d || !name || !out || encoded_off >= d->len) return false;
+   uint32_t ignored, count;
+   size_t p = dex_uleb(d, encoded_off, &ignored);
+   size_t q = dex_uleb(d, p, &count);
+   if (p <= encoded_off || q <= p || q > d->len) return false;
+   p = q;
+   for (uint32_t i = 0; i < count; ++i) {
+      uint32_t name_idx;
+      q = dex_uleb(d, p, &name_idx);
+      if (q <= p || q >= d->len) return false;
+      p = q;
+      struct dex_value value;
+      size_t next = dex_read_value(d, p, &value);
+      if (next <= p || next > d->len) return false;
+      const char *element_name = dex_string(d, name_idx);
+      if (element_name && !strcmp(element_name, name)) {
+         *out = value;
+         return true;
+      }
+      p = next;
+   }
+   return false;
+}
+
+bool dex_annotation_default(struct dex_file *d, uint32_t class_def_idx,
+                            const char *name, struct dex_value *out)
+{
+   struct dex_class_def cd;
+   if (!dex_class_def(d, class_def_idx, &cd) || !cd.annotations_off ||
+       (uint64_t)cd.annotations_off + 16u > d->len)
+      return false;
+   uint32_t annotation_default;
+   if (!dex_annotation_set_find(d, dex_u32_at(d, cd.annotations_off),
+                                "Ldalvik/annotation/AnnotationDefault;",
+                                false, &annotation_default))
+      return false;
+   struct dex_value defaults;
+   if (!dex_annotation_element(d, annotation_default, "value", &defaults) ||
+       defaults.type != DEX_VALUE_ANNOTATION || defaults.bits > UINT32_MAX)
+      return false;
+   return dex_annotation_element(d, (uint32_t)defaults.bits, name, out);
+}
+
 bool dex_class_signature(struct dex_file *d, uint32_t class_def_idx,
                          char *out, size_t out_sz)
 {
@@ -600,6 +727,70 @@ bool dex_class_signature(struct dex_file *d, uint32_t class_def_idx,
       }
    }
    return false;
+}
+
+/* Field generic metadata uses the same fragmented String[] payload as a
+ * class Signature, but lives in the field's annotation set.  It is a system
+ * annotation (visibility 2), so it must stay separate from the public
+ * runtime-annotation lookup used by Field.getAnnotation(). */
+bool dex_field_signature(struct dex_file *d, uint32_t class_def_idx,
+                         const char *field_name, char *out, size_t out_sz)
+{
+   if (!d || !field_name || !out || !out_sz) return false;
+   out[0] = '\0';
+   struct dex_class_def cd;
+   if (!dex_class_def(d, class_def_idx, &cd) || !cd.annotations_off ||
+       (uint64_t)cd.annotations_off + 16u > d->len)
+      return false;
+
+   uint32_t fields = dex_u32_at(d, cd.annotations_off + 4u);
+   size_t table = (size_t)cd.annotations_off + 16u;
+   if ((uint64_t)table + (uint64_t)fields * 8u > d->len) return false;
+   uint32_t signature_off = 0;
+   for (uint32_t i = 0; i < fields; ++i) {
+      uint32_t field_idx = dex_u32_at(d, table + (size_t)i * 8u);
+      struct dex_field_id fid;
+      if (!dex_field_id(d, field_idx, &fid)) continue;
+      const char *name = dex_string(d, fid.name_idx);
+      if (!name || strcmp(name, field_name)) continue;
+      uint32_t set_off = dex_u32_at(d, table + (size_t)i * 8u + 4u);
+      if (!dex_annotation_set_find(d, set_off,
+                                   "Ldalvik/annotation/Signature;", false,
+                                   &signature_off))
+         return false;
+      break;
+   }
+   if (!signature_off) return false;
+
+   struct dex_value value;
+   if (!dex_annotation_element(d, signature_off, "value", &value) ||
+       value.type != DEX_VALUE_ARRAY)
+      return false;
+   int count = dex_value_array(d, &value, NULL, 0);
+   if (count <= 0) return false;
+   struct dex_value *fragments = calloc((size_t)count, sizeof *fragments);
+   if (!fragments) return false;
+   bool ok = dex_value_array(d, &value, fragments, count) == count;
+   size_t used = 0;
+   for (int i = 0; ok && i < count; ++i) {
+      if (fragments[i].type != DEX_VALUE_STRING ||
+          fragments[i].bits > UINT32_MAX) {
+         ok = false;
+         break;
+      }
+      const char *fragment = dex_string(d, (uint32_t)fragments[i].bits);
+      size_t n = fragment ? strlen(fragment) : 0;
+      if (!fragment || n >= out_sz - used) {
+         ok = false;
+         break;
+      }
+      memcpy(out + used, fragment, n);
+      used += n;
+      out[used] = '\0';
+   }
+   free(fragments);
+   if (!ok || !used) out[0] = '\0';
+   return ok && used;
 }
 
 const char *dex_class_enclosing_type(struct dex_file *d,
@@ -687,6 +878,7 @@ static size_t dex_read_value(const struct dex_file *d, size_t p, struct dex_valu
       }
       case DEX_VALUE_ANNOTATION: {
          /* type_idx, size, then (name_idx, value)* */
+         v->bits = p;
          uint32_t ti, n;
          size_t q = dex_uleb(d, p, &ti);
          q = dex_uleb(d, q, &n);
@@ -745,6 +937,25 @@ int dex_static_values(const struct dex_file *d, uint32_t off,
       p = dex_read_value(d, p, (int)i < max ? &out[i] : &tmp);
    }
    return (int)n;
+}
+
+int dex_value_array(const struct dex_file *d, const struct dex_value *array,
+                    struct dex_value *out, int max)
+{
+   if (!d || !array || array->type != DEX_VALUE_ARRAY ||
+       array->bits >= d->len)
+      return -1;
+   uint32_t count;
+   size_t p = dex_uleb(d, (size_t)array->bits, &count);
+   if (p <= (size_t)array->bits || p > d->len) return -1;
+   for (uint32_t i = 0; i < count; ++i) {
+      struct dex_value ignored;
+      struct dex_value *value = (int)i < max ? &out[i] : &ignored;
+      size_t next = dex_read_value(d, p, value);
+      if (next <= p || next > d->len) return -1;
+      p = next;
+   }
+   return count > INT_MAX ? -1 : (int)count;
 }
 
 /* Silence "defined but not used" for the p1 helper: it is part of the format

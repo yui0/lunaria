@@ -114,6 +114,30 @@ static double overlay_now(void)
    return t - epoch;
 }
 
+/* LUNARIA_BOOT_DUMP=/path — write a PPM after each boot-card frame (QA only). */
+static void overlay_maybe_dump_boot(int w, int h, bool status_only)
+{
+   static int frame_no;
+   const char *dir = getenv("LUNARIA_BOOT_DUMP");
+   if (!dir || !*dir || !status_only || w <= 0 || h <= 0) return;
+   unsigned char *px = malloc((size_t)w * (size_t)h * 4u);
+   if (!px) return;
+   glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+   char path[512];
+   snprintf(path, sizeof path, "%s/boot_%04d.ppm", dir, frame_no++);
+   FILE *f = fopen(path, "wb");
+   if (f) {
+      fprintf(f, "P6\n%d %d\n255\n", w, h);
+      for (int y = h - 1; y >= 0; --y)
+         for (int x = 0; x < w; ++x) {
+            unsigned char *p = px + ((size_t)y * (size_t)w + (size_t)x) * 4u;
+            fwrite(p, 1, 3, f);
+         }
+      fclose(f);
+   }
+   free(px);
+}
+
 /* The overlay used to share the guest's context and put its state back
  * afterwards, one binding at a time.  That approach cannot be finished: a
  * modern engine leaves far more set than is practical to enumerate, and the
@@ -138,15 +162,12 @@ static void overlay_report_gl_errors(const char *where)
    }
 }
 
-/* The overlay's own context, sharing objects with the guest's.
+/* The overlay's own context — not shared with the guest.
  *
- * Saving and restoring individual pieces of the guest's GL state was never
- * going to be complete: a modern engine leaves dozens of bindings set, and the
- * text pass in particular kept coming out wrong while every untextured box
- * painted correctly, with every state query reporting exactly what it should.
- * A second context in the same share group removes the question — luna-ui gets
- * a clean state vector of its own, while textures, buffers and programs stay
- * shared, so nothing has to be uploaded twice. */
+ * Sharing put luna-ui's textures and programs into the guest's share group and
+ * corrupted guest state in ways that only showed up as missing text.  A second
+ * unshared ES2 context keeps the emulator UI completely separate; the same
+ * window surface is bound briefly to draw, then handed back. */
 static EGLDisplay g_ov_dpy = EGL_NO_DISPLAY;
 static EGLContext g_ov_ctx = EGL_NO_CONTEXT;
 
@@ -164,14 +185,31 @@ static bool overlay_config_of(EGLDisplay dpy, EGLContext ctx, EGLConfig *out)
 static bool overlay_context_create(void)
 {
    EGLDisplay dpy = eglGetCurrentDisplay();
-   EGLContext guest = eglGetCurrentContext();
-   if (dpy == EGL_NO_DISPLAY || guest == EGL_NO_CONTEXT) return false;
+   EGLContext current = eglGetCurrentContext();
+   if (dpy == EGL_NO_DISPLAY) return false;
    EGLConfig cfg;
-   if (!overlay_config_of(dpy, guest, &cfg)) return false;
-   EGLint version = 3;
-   (void)eglQueryContext(dpy, guest, EGL_CONTEXT_CLIENT_VERSION, &version);
-   const EGLint attrs[] = { EGL_CONTEXT_CLIENT_VERSION, version, EGL_NONE };
-   EGLContext ctx = eglCreateContext(dpy, cfg, guest, attrs);
+   if (current != EGL_NO_CONTEXT) {
+      if (!overlay_config_of(dpy, current, &cfg)) return false;
+   } else {
+      const EGLint cfg_attrs[] = {
+         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+         EGL_SURFACE_TYPE, EGL_WINDOW_BIT | EGL_PBUFFER_BIT,
+         EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+         EGL_NONE
+      };
+      EGLint n = 0;
+      if (!eglChooseConfig(dpy, cfg_attrs, &cfg, 1, &n) || n < 1)
+         return false;
+   }
+   /* Prefer ES2 so luna-ui does not depend on the guest's ES3 context. */
+   const EGLint es2[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+   EGLContext ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, es2);
+   if (ctx == EGL_NO_CONTEXT && current != EGL_NO_CONTEXT) {
+      EGLint version = 2;
+      (void)eglQueryContext(dpy, current, EGL_CONTEXT_CLIENT_VERSION, &version);
+      const EGLint attrs[] = { EGL_CONTEXT_CLIENT_VERSION, version, EGL_NONE };
+      ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, attrs);
+   }
    if (ctx == EGL_NO_CONTEXT) return false;
    g_ov_dpy = dpy;
    g_ov_ctx = ctx;
@@ -474,23 +512,23 @@ void luna_overlay_present(int w, int h)
    if (!luna_overlay_active() || w <= 0 || h <= 0) return;
 
    EGLDisplay dpy = eglGetCurrentDisplay();
-   EGLContext guest_ctx = eglGetCurrentContext();
+   EGLContext prev_ctx = eglGetCurrentContext();
    EGLSurface draw = eglGetCurrentSurface(EGL_DRAW);
    EGLSurface read = eglGetCurrentSurface(EGL_READ);
-   if (dpy == EGL_NO_DISPLAY || guest_ctx == EGL_NO_CONTEXT) return;
+   if (dpy == EGL_NO_DISPLAY || draw == EGL_NO_SURFACE) return;
 
    if (g_ov_ctx == EGL_NO_CONTEXT && !g_failed && !overlay_context_create()) {
-      fprintf(stderr, "[overlay] no shared context — emulator UI disabled\n");
+      fprintf(stderr, "[overlay] no context — emulator UI disabled\n");
       g_failed = true;
       return;
    }
    if (!eglMakeCurrent(dpy, draw, read, g_ov_ctx)) {
-      fprintf(stderr, "[overlay] eglMakeCurrent failed (0x%04x)\n",
-              (unsigned)eglGetError());
-      g_failed = true;
+      /* Surface is current on another thread (the guest took it).  Skip this
+       * frame rather than retiring the overlay for the rest of the run. */
+      (void)eglGetError();
       return;
    }
-   /* Guest binding is gone until we restore below. */
+   /* Previous binding is gone until we restore below. */
    arm_exec_egl_invalidate_current();
 
    if (overlay_start(w, h)) {
@@ -595,15 +633,16 @@ void luna_overlay_present(int w, int h)
       g_last_time = now;
       luna_update(now, dt);
       luna_render(w, h);
+      overlay_maybe_dump_boot(w, h, status_only);
       overlay_report_gl_errors("render");
    }
 
-   /* Hand the guest back exactly the binding it had. */
-   if (!eglMakeCurrent(dpy, draw, read, guest_ctx))
-      fprintf(stderr, "[overlay] failed to restore the guest context (0x%04x)\n",
+   /* Hand the previous binding back. */
+   if (!eglMakeCurrent(dpy, draw, read, prev_ctx))
+      fprintf(stderr, "[overlay] failed to restore previous context (0x%04x)\n",
               (unsigned)eglGetError());
-   else
-      arm_exec_egl_note_current(guest_ctx, draw);
+   else if (prev_ctx != EGL_NO_CONTEXT)
+      arm_exec_egl_note_current(prev_ctx, draw);
 }
 
 /* A shown Android dialog is modal: the window above takes every touch, and

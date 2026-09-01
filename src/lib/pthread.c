@@ -120,10 +120,10 @@ struct bionic_pthread_cleanup_t {
 static bool
 is_mapped(void *mem, const size_t sz)
 {
-   const size_t ps = sysconf(_SC_PAGESIZE);
-   assert(ps > 0);
-   unsigned char vec[(sz + ps - 1) / ps];
-   return !mincore(mem, sz, vec);
+   unsigned char vec[1];
+   (void)sz;
+   if (!mem) return false;
+   return mincore(mem, 1, vec) == 0;
 }
 
 void
@@ -135,7 +135,10 @@ bionic___pthread_cleanup_push(struct bionic_pthread_cleanup_t *c, void (*routine
    c->arg = arg;
 
    int not_first_call;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
    if ((not_first_call = __sigsetjmp((struct __jmp_buf_tag*)(void*)c->glibc->__cancel_jmp_buf, 0))) {
+#pragma GCC diagnostic pop
       routine(arg);
       __pthread_unwind_next(c->glibc);
    }

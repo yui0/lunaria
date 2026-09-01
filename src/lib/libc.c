@@ -212,12 +212,12 @@ bionic_readdir_r(DIR *dirp, struct bionic_dirent *entry, struct bionic_dirent **
 int
 bionic_sigaddset(const bionic_sigset_t *set, int sig)
 {
-   int bit = sig - 1; // Signal numbers start at 1, but bit positions start at 0.
    unsigned long *local_set = (unsigned long*)set;
-   if (!set || bit < 0 || bit >= (int)(8 * sizeof(*set))) {
+   if (!set || sig < 1 || sig > (int)(8 * (int)sizeof(*set))) {
       errno = EINVAL;
       return -1;
    }
+   int bit = sig - 1;
    local_set[bit / LONG_BIT] |= 1UL << (bit % LONG_BIT);
    return 0;
 }
@@ -225,12 +225,12 @@ bionic_sigaddset(const bionic_sigset_t *set, int sig)
 int
 bionic_sigismember(const bionic_sigset_t *set, int sig)
 {
-   int bit = sig - 1; // Signal numbers start at 1, but bit positions start at 0.
    const unsigned long *local_set = (const unsigned long*)set;
-   if (!set || bit < 0 || bit >= (int)(8 * sizeof(*set))) {
+   if (!set || sig < 1 || sig > (int)(8 * (int)sizeof(*set))) {
       errno = EINVAL;
       return -1;
    }
+   int bit = sig - 1;
    return (int)((local_set[bit / LONG_BIT] >> (bit % LONG_BIT)) & 1);
 }
 

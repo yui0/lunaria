@@ -39,6 +39,16 @@ void lm_sink_free(struct lm_sink *s);
 void lm_sink_push(struct lm_sink *s, const uint8_t *rgba, int w, int h,
                   int64_t timestamp_ns);
 
+/* Producer side, without the handover copy.  A decoded frame is 3.6 MB at
+ * 720p, and lm_sink_push() copies into a buffer the sink already owns: the
+ * producer used to convert into a malloc'd scratch buffer and then copy that
+ * in, which costs one 3.6 MB allocation (fresh pages, so a fault per 4 KB
+ * written), one full write and one full read+write on every video frame --
+ * all of it on the thread the guest is blocked on.  begin() hands back the
+ * sink's own buffer to convert into, commit() publishes it. */
+uint8_t *lm_sink_begin(struct lm_sink *s, int w, int h);
+void lm_sink_commit(struct lm_sink *s, int w, int h, int64_t timestamp_ns);
+
 /* Consumer side.  False when no frame has arrived since the last take; the
  * pointer stays valid until the next push. */
 bool lm_sink_take(struct lm_sink *s, const uint8_t **rgba, int *w, int *h);

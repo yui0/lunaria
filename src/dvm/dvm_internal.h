@@ -135,6 +135,13 @@ struct dvm_object {
    /* java.lang.Class */
    struct dvm_class *klass;
 
+   /* A materialised DEX annotation.  Its object class is the annotation
+    * interface, while these two words identify the encoded element values.
+    * Keeping the immutable mapping reference on the object avoids a global
+    * side table and needs no lock beyond the VM GIL. */
+   struct dex_file *annotation_dex;
+   uint32_t annotation_off;
+
    /* instance fields */
    union dvm_value *slots;
 
@@ -315,6 +322,10 @@ bool dvm__class_assignable(struct dvm *vm, struct dvm_class *from,
 struct dvm_object *dvm__obj(struct dvm *vm, dvm_ref ref);
 void dvm__throw(struct dvm *vm, const char *class_name, const char *fmt, ...);
 void dvm__warn_placeholder(struct dvm *vm);
+/* The builtin whose body is running, for the handful of handlers bound to
+ * several overloads at once (Field.get/getInt/..., Field.set/setInt/...)
+ * whose behaviour differs by which one the caller named. */
+struct dvm_method *dvm__builtin_method(void);
 bool dvm__monitor_enter(struct dvm *vm, dvm_ref ref);
 bool dvm__monitor_try_enter(struct dvm *vm, dvm_ref ref);
 bool dvm__monitor_exit(struct dvm *vm, dvm_ref ref);
@@ -404,7 +415,11 @@ void dvm__ui_tick(struct dvm *vm);
 void dvm__run_pending_threads(struct dvm *vm);
 /* Same queue, for a thread that is blocked waiting on another one: this form
  * is allowed to nest, because what it waits for is queued here too. */
-void dvm__drain_for_wait(struct dvm *vm);
+/* Run whatever is due on the pending queue and answer how many ran.  A caller
+ * that is about to block needs the count: "the queue is not empty" is not the
+ * same as "there was work to do", and treating the two as one turns a blocking
+ * wait into a spin whenever the queue holds only entries that are not due. */
+int dvm__drain_for_wait(struct dvm *vm);
 bool dvm__queue_runnable_at(struct dvm *vm, dvm_ref r, bool as_thread,
                             int64_t delay_ms);
 /* LUNARIA_DVM_SCHED: scheduler-only tracing (what the pending queue ran, and

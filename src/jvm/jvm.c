@@ -186,6 +186,16 @@ compare_string(const struct jvm_object *a, const struct jvm_object *b)
    return jvm_string_eq(&a->string, &b->string);
 }
 
+static bool
+compare_motion(const struct jvm_object *a, const struct jvm_object *b)
+{
+   assert(a && b);
+   return a->motion.action == b->motion.action &&
+          a->motion.x == b->motion.x && a->motion.y == b->motion.y &&
+          a->motion.event_ms == b->motion.event_ms &&
+          a->motion.down_ms == b->motion.down_ms;
+}
+
 static jobject
 jvm_find_object(struct jvm *jvm, const struct jvm_object *o)
 {
@@ -198,6 +208,7 @@ jvm_find_object(struct jvm *jvm, const struct jvm_object *o)
       compare_method,
       compare_class,
       compare_string,
+      compare_motion,
    };
 
    for (uintptr_t i = 0; i < ARRAY_SIZE(jvm->objects); ++i) {
@@ -227,6 +238,10 @@ jvm_assign_default_class(struct jvm *jvm, struct jvm_object *o)
 
       case JVM_OBJECT_STRING:
          o->this_klass = jvm_make_class(jvm, "java/lang/String");
+         break;
+
+      case JVM_OBJECT_MOTION:
+         o->this_klass = jvm_make_class(jvm, "android/view/MotionEvent");
          break;
 
       case JVM_OBJECT_NONE:
@@ -342,7 +357,8 @@ jvm_deref_object(struct jvm *jvm, jobject object)
       --o->refs;
    if (o->refs > 0)
       return;
-   if (o->type != JVM_OBJECT_ARRAY && o->type != JVM_OBJECT_STRING) {
+   if (o->type != JVM_OBJECT_ARRAY && o->type != JVM_OBJECT_STRING &&
+       o->type != JVM_OBJECT_MOTION) {
       o->refs = 1; /* pinned for the process lifetime */
       return;
    }
@@ -400,6 +416,11 @@ jvm_object_print(struct jvm *jvm, const struct jvm_object *obj)
          break;
       case JVM_OBJECT_STRING:
          verbose("[STRING] (%d) %s (%zu)", obj->string.heap, obj->string.data, obj->string.size);
+         break;
+      case JVM_OBJECT_MOTION:
+         verbose("[MOTION] action=%d (%.1f,%.1f) event=%lld down=%lld",
+                 obj->motion.action, (double)obj->motion.x, (double)obj->motion.y,
+                 (long long)obj->motion.event_ms, (long long)obj->motion.down_ms);
          break;
 
       case JVM_OBJECT_NONE:
@@ -1167,7 +1188,15 @@ static void
 jvm_va_from_jvalues(struct jvm_va_wrap *v, const jvalue *args)
 {
    memset(v, 0, sizeof *v);
-#if defined(__x86_64__)
+#if defined(__APPLE__)
+   /* Darwin defines va_list as a simple char pointer on both supported host
+    * architectures.  Treating it as the Linux AArch64 four-field structure
+    * wrote 32 bytes through an 8-byte field, corrupting the caller's stack;
+    * every Call*MethodA that reached a host stub could damage unrelated JNI
+    * state.  A jvalue is one aligned 8-byte vararg slot, so the cursor begins
+    * directly at the array. */
+   v->ap = (va_list)(uintptr_t)args;
+#elif defined(__x86_64__)
    struct { unsigned gp_offset, fp_offset; void *overflow, *reg_save; } *t =
       (void *)&v->ap;
    t->gp_offset = 6 * 8;         /* all 6 GP argument registers consumed */
@@ -2530,6 +2559,38 @@ jvm_get_native_method(struct jvm *jvm, const char *klass, const char *method)
          return wrapper_create(method, jvm->methods[i].function);
    }
    return NULL;
+}
+
+jobject
+jvm_new_motion_event(struct jvm *jvm, const lunaria_touch_event *ev)
+{
+   assert(jvm && ev);
+   struct jvm_object o = {
+      .this_klass = jvm_make_class(jvm, "android/view/MotionEvent"),
+      .type = JVM_OBJECT_MOTION,
+      .motion = {
+         .action = ev->action,
+         .x = ev->x,
+         .y = ev->y,
+         .event_ms = ev->event_ms,
+         .down_ms = ev->down_ms,
+      },
+   };
+   return jvm_add_object(jvm, &o);
+}
+
+bool
+jvm_motion_event_read(struct jvm *jvm, jobject object, lunaria_touch_event *out)
+{
+   struct jvm_object *o = jvm_get_object(jvm, object);
+   if (!o || o->type != JVM_OBJECT_MOTION || !out)
+      return false;
+   out->action = o->motion.action;
+   out->x = o->motion.x;
+   out->y = o->motion.y;
+   out->event_ms = o->motion.event_ms;
+   out->down_ms = o->motion.down_ms;
+   return true;
 }
 
 void

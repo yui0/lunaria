@@ -13,6 +13,8 @@
 #include <ctype.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <libgen.h>
 #include <dlfcn.h>
 #include <elf.h>
@@ -26,8 +28,21 @@
 #include "jvm/jvm.h"
 #include "arm_exec.h"
 #include "dvm/dvm_jni.h"
+
+static lunaria_touch_event
+touch_to_lunaria(const ArmExecTouchEvent *te)
+{
+   lunaria_touch_event ev = {
+      .action = te->action,
+      .x = te->x,
+      .y = te->y,
+      .event_ms = te->event_ms,
+      .down_ms = te->down_ms,
+   };
+   return ev;
+}
 #include "dvm/dvm_media.h"
-#include <link.h>
+#include "lunaria_link.h"
 
 /* Exposed from arm_exec.cpp for diagnostic dumps */
 extern void arm_exec_svc_ring_dump(void);
@@ -143,6 +158,99 @@ static void a64_preload_needed(const char *path, const char *dir,
    }
 }
 
+/* LUNARIA_TOUCH_FIFO — taps arriving while the emulator is already running.
+ *
+ * LUNARIA_TOUCH_TEST can only describe a script written before launch, keyed
+ * on a pump frame number.  Anything that waits on the network — a title
+ * screen that asks to be tapped once the session is up — lands on a different
+ * frame every run, so a fixed script either fires too early or not at all.
+ *
+ * This is the same injection path, driven from outside instead: a FIFO whose
+ * lines are "x,y" or "x,y,hold" in guest framebuffer coordinates.  Reads are
+ * non-blocking and happen once per pump frame, so an empty FIFO costs one
+ * read(2) that returns EAGAIN.  Held taps finish on a later frame, which is
+ * what a guest expects — a DOWN and an UP in the same frame is not a tap.
+ */
+#define TF_MAX 16
+static struct { float x, y; int up_frame; } g_tf_hold[TF_MAX];
+static int g_tf_nhold;
+static int g_tf_fd = -2;
+static char g_tf_buf[256];
+static size_t g_tf_len;
+
+static void touch_fifo_line(const char *line, int frame_count)
+{
+   float x = -1, y = -1;
+   int hold = 6;
+   if (sscanf(line, "%f,%f,%d", &x, &y, &hold) < 2) return;
+   if (x < 0 || y < 0) return;
+   if (hold < 1) hold = 1;
+   arm_exec_touch_push(0, x, y);
+   fprintf(stderr, "[loader] TOUCH_FIFO DOWN (%.0f,%.0f) frame %d hold=%d\n",
+           x, y, frame_count, hold);
+   if (g_tf_nhold < TF_MAX) {
+      g_tf_hold[g_tf_nhold].x = x;
+      g_tf_hold[g_tf_nhold].y = y;
+      g_tf_hold[g_tf_nhold].up_frame = frame_count + hold;
+      ++g_tf_nhold;
+   } else {
+      arm_exec_touch_push(1, x, y);
+   }
+}
+
+static void touch_fifo_tick(int frame_count)
+{
+   /* Finish the taps whose hold has run out, and keep the rest pressed. */
+   for (int i = 0; i < g_tf_nhold; ) {
+      if (frame_count >= g_tf_hold[i].up_frame) {
+         arm_exec_touch_push(1, g_tf_hold[i].x, g_tf_hold[i].y);
+         fprintf(stderr, "[loader] TOUCH_FIFO UP (%.0f,%.0f) frame %d\n",
+                 g_tf_hold[i].x, g_tf_hold[i].y, frame_count);
+         g_tf_hold[i] = g_tf_hold[--g_tf_nhold];
+      } else {
+         arm_exec_touch_push(2, g_tf_hold[i].x, g_tf_hold[i].y);
+         ++i;
+      }
+   }
+
+   if (g_tf_fd == -2) {
+      const char *path = getenv("LUNARIA_TOUCH_FIFO");
+      g_tf_fd = -1;
+      if (path && *path) {
+         if (mkfifo(path, 0600) != 0 && errno != EEXIST)
+            fprintf(stderr, "[loader] TOUCH_FIFO mkfifo(%s): %s\n",
+                    path, strerror(errno));
+         /* O_RDWR keeps a writer on the pipe, so the reader never sees the
+          * end-of-file that a closing writer would otherwise deliver on every
+          * command. */
+         g_tf_fd = open(path, O_RDWR | O_NONBLOCK);
+         if (g_tf_fd < 0)
+            fprintf(stderr, "[loader] TOUCH_FIFO open(%s): %s\n",
+                    path, strerror(errno));
+         else
+            fprintf(stderr, "[loader] TOUCH_FIFO listening on %s "
+                    "(echo 'x,y[,hold]' > %s)\n", path, path);
+      }
+   }
+   if (g_tf_fd < 0) return;
+
+   for (;;) {
+      char chunk[128];
+      ssize_t n = read(g_tf_fd, chunk, sizeof chunk);
+      if (n <= 0) break;
+      for (ssize_t i = 0; i < n; ++i) {
+         if (chunk[i] == '\n' || chunk[i] == ';') {
+            g_tf_buf[g_tf_len] = '\0';
+            if (g_tf_len) touch_fifo_line(g_tf_buf, frame_count);
+            g_tf_len = 0;
+         } else if (g_tf_len + 1 < sizeof g_tf_buf) {
+            g_tf_buf[g_tf_len++] = chunk[i];
+         }
+      }
+   }
+}
+#undef TF_MAX
+
 /* LUNARIA_TOUCH_TEST replay, shared by the pump loops.
  *
  * x,y[;x,y...] taps, one after another: LUNARIA_TOUCH_FRAME is the first
@@ -155,6 +263,7 @@ static void a64_preload_needed(const char *path, const char *dir,
  * wants a checkbox and then Confirm, in that order. */
 static void touch_test_tick(int frame_count)
 {
+   touch_fifo_tick(frame_count);
 #define TT_MAX 8
    static float tt_x[TT_MAX], tt_y[TT_MAX];
    static int tt_n = -1, tt_frame = 60, tt_hold = 10, tt_gap = 60;
@@ -276,7 +385,7 @@ static void perf_tick(void)
       if (every < 0.0) every = 0.0;
       t0 = last = now;
    }
-   if (every == 0.0 || now - last < every) return;
+   if (!(every > 0.0) || now - last < every) return;
 
    const uint64_t presents = arm_exec_guest_swap_count();
    const uint64_t gticks   = arm_exec_sched_ticks();
@@ -292,6 +401,7 @@ static void perf_tick(void)
            (double)gticks / 1e6, (double)(gticks - last_ticks) / dt / 1e6,
            (double)xlat / 1e6, (double)(xlat - last_xlat) / dt / 1e6);
 
+   arm_exec_ticks_report();
    frame_stage_report(dt, frames - last_frames);
 
    last = now;
@@ -327,7 +437,7 @@ static void stall_watch_tick(void)
       if (next_s < 0.0) next_s = 0.0;
       last_change = now;
    }
-   if (next_s == 0.0) return;
+   if (!(next_s > 0.0)) return;
 
    const uint64_t swaps = arm_exec_guest_swap_count();
    if (swaps != last_swaps) {
@@ -678,7 +788,7 @@ static const char *const ue_files_roots[] = { "UE4Game", "UnrealGame", NULL };
 static const char *
 ue_project_name(const char *pkg)
 {
-   static char name[128];
+   static char name[NAME_MAX + 1];
    if (*name) return name;
 
    const char *dir = getenv("ANDROID_PACKAGE_CODE_PATH");
@@ -731,12 +841,14 @@ ue_project_name(const char *pkg)
       struct dirent *de;
       while ((de = readdir(d))) {
          if (de->d_name[0] == '.') continue;
-         char paks[PATH_MAX];
+         char paks[PATH_MAX + NAME_MAX + NAME_MAX + 32];
          struct stat sb;
-         snprintf(paks, sizeof paks, "%s/%s/%s/Content/Paks",
-                  ue, de->d_name, de->d_name);
+         if (snprintf(paks, sizeof paks, "%s/%s/%s/Content/Paks",
+                      ue, de->d_name, de->d_name) >= (int)sizeof paks)
+            continue;
          if (stat(paks, &sb) == 0 && S_ISDIR(sb.st_mode)) {
-            snprintf(name, sizeof name, "%s", de->d_name);
+            if (snprintf(name, sizeof name, "%s", de->d_name) >= (int)sizeof name)
+               name[sizeof name - 1] = '\0';
             closedir(d);
             fprintf(stderr, "[loader] UE project name %s (from staged %s)\n",
                     name, ue_files_roots[r]);
@@ -2058,13 +2170,12 @@ run_unity_game_arm64(struct jvm *jvm, jobject existing_context,
          fprintf(stderr, "[loader] LUNARIA_MAX_FRAMES=%d reached\n", max_frames);
          break;
       }
-      if (va_inject && arm_exec_touch_next()) {
-         static jobject motion_ev;
-         if (!motion_ev)
-            motion_ev = jvm->native.AllocObject(&jvm->env,
-                  jvm->native.FindClass(&jvm->env, "android/view/MotionEvent"));
+      ArmExecTouchEvent te;
+      if (va_inject && arm_exec_touch_next(&te)) {
          if (va_fwd_dalv)
             arm64_exec_call(va_fwd_dalv, env, ctx, 0, 0);
+         lunaria_touch_event lev = touch_to_lunaria(&te);
+         jobject motion_ev = jvm_new_motion_event(jvm, &lev);
          arm64_exec_call(va_inject, env, ctx, (uint64_t)(uintptr_t)motion_ev, 0);
       }
 
@@ -2593,12 +2704,11 @@ run_jni_game_arm(struct jvm *jvm)
          }
       }
       touch_test_tick(frame_count);
-      /* GLFW マウス → MotionEvent 注入 (UnityPlayer.onTouchEvent 相当)。
-       * MotionEvent の中身 (action/x/y) は libjvm-android.c の JNI getter が
-       * arm_exec_touch_* アクセサ経由で読む。1 フレーム 1 イベント: 実機の
-       * タップは DOWN と UP が別フレームに届く。同一フレームに両方入れると
-       * Unity の Input 集計でタップと認識されないことがある。 */
-      if (va_inject && arm_exec_touch_next()) {
+      /* GLFW mouse → one MotionEvent per queued sample.  Each object carries
+       * its own immutable payload (JVM_OBJECT_MOTION); Unity keeps the jobject
+       * and reads it again during PlayerLoop.  One inject per frame. */
+      ArmExecTouchEvent te;
+      if (va_inject && arm_exec_touch_next(&te)) {
          /* Re-clear in case Java/meta-data path set the flag during startup. */
          if (fwd_flag_va) {
             uint32_t word = arm_exec_read32(fwd_flag_va & ~3u);
@@ -2608,17 +2718,14 @@ run_jni_game_arm(struct jvm *jvm)
          }
          if (va_fwd_dalv)
             arm_exec_call(va_fwd_dalv, env, ctx, 0, 0);
-         static jobject motion_ev;
-         if (!motion_ev)
-            motion_ev = jvm->native.AllocObject(&jvm->env,
-                  jvm->native.FindClass(&jvm->env, "android/view/MotionEvent"));
+         lunaria_touch_event lev = touch_to_lunaria(&te);
+         jobject motion_ev = jvm_new_motion_event(jvm, &lev);
          int handled = arm_exec_call(va_inject, env, ctx,
                                      (uint32_t)(uintptr_t)motion_ev, 0);
          static int inj_log = 0;
          if (inj_log < 100) {
             fprintf(stderr, "[loader] injectEvent action=%d x=%.0f y=%.0f → %d\n",
-                    arm_exec_touch_action(), arm_exec_touch_x(),
-                    arm_exec_touch_y(), handled);
+                    te.action, te.x, te.y, handled);
             ++inj_log;
          }
       }
@@ -2782,6 +2889,8 @@ main(int argc, const char *argv[])
       if (!is_a64)
          fprintf(stderr, "[loader] ARM32 APK-process startup is not implemented yet\n");
       jvm_release(&jvm);
+      /* The guest is done; stop the engines before anything static goes away. */
+      arm_exec_shutdown_engines();
       printf("exiting\n");
       return ret;
    }
@@ -2850,6 +2959,8 @@ main(int argc, const char *argv[])
          errx(EXIT_FAILURE, "arm64_exec_jni_onload failed");
       int ret = run_jni_game_arm64(&jvm);
       jvm_release(&jvm);
+      /* The guest is done; stop the engines before anything static goes away. */
+      arm_exec_shutdown_engines();
       printf("exiting\n");
       return ret;
    }
@@ -2957,13 +3068,16 @@ main(int argc, const char *argv[])
          errx(EXIT_FAILURE, "arm_exec_jni_onload failed");
       int ret = run_jni_game_arm(&jvm);
       jvm_release(&jvm);
+      /* The guest is done; stop the engines before anything static goes away. */
+      arm_exec_shutdown_engines();
       printf("exiting\n");
       return ret;
    }
 
    {
       char abs[PATH_MAX], paths[4096];
-      realpath(argv[1], abs);
+      if (!realpath(argv[1], abs))
+         snprintf(abs, sizeof abs, "%s", argv[1]);
       snprintf(paths, sizeof(paths), "%s", dirname(abs));
       dl_parse_library_path(paths, ":");
    }
@@ -2993,7 +3107,10 @@ main(int argc, const char *argv[])
       if (!(f = fopen(argv[1], "rb")))
          err(EXIT_FAILURE, "fopen(%s)", argv[1]);
 
-      fread(elf.bytes, 1, sizeof(elf.bytes), f);
+      if (fread(elf.bytes, 1, sizeof(elf.bytes), f) != sizeof(elf.bytes)) {
+         fclose(f);
+         err(EXIT_FAILURE, "fread(%s)", argv[1]);
+      }
       fclose(f);
 
       struct soinfo *si = handle;
@@ -3006,7 +3123,7 @@ main(int argc, const char *argv[])
       printf("jumping to %p\n", entry.start.ptr);
       raw_start(entry.start.ptr, argc - 1, &argv[1]);
    } else if ((entry.JNI_OnLoad.ptr = bionic_dlsym(handle, "JNI_OnLoad"))) {
-      struct jvm jvm;
+      static struct jvm jvm;
       jvm_init(&jvm);
       entry.JNI_OnLoad.fun(&jvm.vm, NULL);
       ret = run_jni_game(&jvm);
@@ -3016,6 +3133,8 @@ main(int argc, const char *argv[])
    }
 
    dvm_jni_report();
+   /* The guest is done; stop the engines before anything static goes away. */
+   arm_exec_shutdown_engines();
    printf("unloading module: %s\n", argv[1]);
    bionic_dlclose(handle);
    printf("exiting\n");

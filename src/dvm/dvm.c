@@ -11,6 +11,7 @@
 
 #include "dvm/dvm_internal.h"
 #include "luna_boot.h"
+#include "arm_exec.h"
 #include "arm.h"
 
 #include <errno.h>
@@ -633,6 +634,10 @@ static void method_finish(struct dvm_method *m)
    m->ret_kind = dvm_sig_return_kind(m->sig);
 }
 
+static bool annotation_element_builtin(struct dvm *vm, dvm_ref self,
+                                       const union dvm_value *args, int nargs,
+                                       union dvm_value *out);
+
 static bool class_load_from_dex(struct dvm *vm, struct dvm_class *c,
                                 struct dvm_dex *dd, uint32_t class_def_idx)
 {
@@ -732,6 +737,14 @@ static bool class_load_from_dex(struct dvm *vm, struct dvm_class *c,
          if (list[i].code_off && dex_code(d, list[i].code_off, &m->code))
             m->has_code = true;
          method_finish(m);
+         /* An annotation type's element declarations are abstract interface
+          * methods in DEX, but a materialised annotation instance must answer
+          * them from its encoded element map.  Bind every zero-argument
+          * element here, so this works for arbitrary application annotations
+          * rather than a Gson-specific proxy class. */
+         if ((c->access & DEX_ACC_ANNOTATION) && m->arg_count == 0 &&
+             strcmp(m->name, "<clinit>") && strcmp(m->name, "<init>"))
+            m->builtin = annotation_element_builtin;
          ++c->nmethods;
       }
    }
@@ -968,10 +981,11 @@ static void throw_storm_watch(void)
 {
    static unsigned long long since;
    static double last_check, last_report;
+   static bool started;
    struct timespec ts;
    clock_gettime(CLOCK_MONOTONIC, &ts);
    const double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-   if (!last_check) { last_check = last_report = now; return; }
+   if (!started) { started = true; last_check = last_report = now; return; }
 
    if (++since < 1024u) return;
    const double window = now - last_check;
@@ -1759,6 +1773,140 @@ static _Thread_local struct dvm_method *g_builtin_method;
 static _Thread_local uint64_t g_monitor_thread_token;
 static _Atomic uint64_t g_next_monitor_thread_token = 1;
 
+static bool annotation_value_to_dvm(struct dvm *vm, struct dex_file *dex,
+                                    const struct dex_value *value,
+                                    const char *expected,
+                                    union dvm_value *out)
+{
+   memset(out, 0, sizeof *out);
+   if (!value) return false;
+   switch (value->type) {
+      case DEX_VALUE_NULL:
+         return true;
+      case DEX_VALUE_BOOLEAN: case DEX_VALUE_BYTE: case DEX_VALUE_SHORT:
+      case DEX_VALUE_CHAR: case DEX_VALUE_INT: case DEX_VALUE_LONG:
+      case DEX_VALUE_FLOAT: case DEX_VALUE_DOUBLE:
+         out->ju = value->bits;
+         return true;
+      case DEX_VALUE_STRING: {
+         const char *s = dex_string(dex, (uint32_t)value->bits);
+         out->l = s ? dvm__intern(vm, s) : 0;
+         return s != NULL;
+      }
+      case DEX_VALUE_TYPE: {
+         const char *desc = dex_type(dex, (uint32_t)value->bits);
+         out->l = desc ? class_object(vm, dvm__class_by_desc(vm, desc)) : 0;
+         return desc != NULL;
+      }
+      case DEX_VALUE_ENUM: {
+         struct dex_field_id field;
+         if (!dex_field_id(dex, (uint32_t)value->bits, &field)) return false;
+         const char *desc = dex_type(dex, field.class_idx);
+         const char *name = dex_string(dex, field.name_idx);
+         struct dvm_class *cls = desc ? dvm__class_by_desc(vm, desc) : NULL;
+         if (!cls || !name) return false;
+         if (!dvm_init_class(vm, cls)) return false;
+         return dvm_get_static(vm, cls, name, desc, out);
+      }
+      case DEX_VALUE_ANNOTATION: {
+         if (value->bits > UINT32_MAX) return false;
+         const char *desc = dex_annotation_type(dex, (uint32_t)value->bits);
+         struct dvm_class *cls = desc ? dvm__class_by_desc(vm, desc) : NULL;
+         dvm_ref ref = cls ? dvm_new_object(vm, cls) : 0;
+         struct dvm_object *obj = dvm__obj(vm, ref);
+         if (!obj) return false;
+         obj->annotation_dex = dex;
+         obj->annotation_off = (uint32_t)value->bits;
+         out->l = ref;
+         return true;
+      }
+      case DEX_VALUE_ARRAY: {
+         if (!expected || expected[0] != '[') return false;
+         int count = dex_value_array(dex, value, NULL, 0);
+         if (count < 0) return false;
+         struct dex_value *items = count
+            ? calloc((size_t)count, sizeof *items) : NULL;
+         if (count && !items) return false;
+         if (count && dex_value_array(dex, value, items, count) != count) {
+            free(items);
+            return false;
+         }
+         char element_kind = expected[1] == '[' || expected[1] == 'L'
+            ? 'L' : expected[1];
+         dvm_ref array = dvm_new_array(vm, element_kind, expected + 1,
+                                       (uint32_t)count);
+         struct dvm_object *obj = dvm__obj(vm, array);
+         if (!obj) { free(items); return false; }
+         for (int i = 0; i < count; ++i) {
+            union dvm_value item;
+            if (!annotation_value_to_dvm(vm, dex, &items[i], expected + 1,
+                                         &item)) {
+               free(items);
+               return false;
+            }
+            switch (element_kind) {
+               case 'Z': case 'B':
+                  ((uint8_t *)obj->data)[i] = (uint8_t)item.u;
+                  break;
+               case 'C': case 'S':
+                  ((uint16_t *)obj->data)[i] = (uint16_t)item.u;
+                  break;
+               case 'J': case 'D':
+                  ((uint64_t *)obj->data)[i] = item.ju;
+                  break;
+               default:
+                  ((uint32_t *)obj->data)[i] = item.u;
+                  break;
+            }
+         }
+         free(items);
+         out->l = array;
+         return true;
+      }
+      default:
+         return false;
+   }
+}
+
+static bool annotation_element_builtin(struct dvm *vm, dvm_ref self,
+                                       const union dvm_value *args, int nargs,
+                                       union dvm_value *out)
+{
+   (void)args;
+   (void)nargs;
+   struct dvm_method *method = g_builtin_method;
+   struct dvm_object *obj = dvm__obj(vm, self);
+   struct dex_value value;
+   if (!method || !method->name || !method->sig || !obj ||
+       !obj->annotation_dex || !obj->annotation_off) {
+      dvm__throw(vm, "java/lang/annotation/IncompleteAnnotationException",
+                 "annotation element has no encoded value");
+      return false;
+   }
+   bool found = dex_annotation_element(obj->annotation_dex,
+                                       obj->annotation_off,
+                                       method->name, &value);
+   if (!found && method->cls && method->cls->dex)
+      found = dex_annotation_default(method->cls->dex,
+                                     method->cls->class_def_idx,
+                                     method->name, &value);
+   if (!found) {
+      dvm__throw(vm, "java/lang/annotation/IncompleteAnnotationException",
+                 "%s.%s", method->cls && method->cls->name
+                    ? method->cls->name : "?", method->name);
+      return false;
+   }
+   const char *returns = strchr(method->sig, ')');
+   if (!returns || !annotation_value_to_dvm(vm, obj->annotation_dex, &value,
+                                            returns + 1, out)) {
+      dvm__throw(vm, "java/lang/AnnotationFormatError", "%s.%s",
+                 method->cls && method->cls->name ? method->cls->name : "?",
+                 method->name);
+      return false;
+   }
+   return true;
+}
+
 static uint64_t monitor_thread_token(void)
 {
    if (!g_monitor_thread_token)
@@ -1879,6 +2027,8 @@ bool dvm__monitor_state(struct dvm *vm, dvm_ref ref, bool current,
    if (!o || !o->monitor_owner) return false;
    return !current || o->monitor_owner == monitor_thread_token();
 }
+
+struct dvm_method *dvm__builtin_method(void) { return g_builtin_method; }
 
 void dvm__warn_placeholder(struct dvm *vm)
 {
@@ -3150,16 +3300,17 @@ bool dvm__sched_trace_for(const char *class_name)
  * that starts another into unbounded recursion.  A blocking wait is the
  * opposite case — the work it waits for is in this very queue, so refusing to
  * nest makes the wait unsatisfiable by construction. */
-static void drain_pending(struct dvm *vm, bool nested)
+static int drain_pending(struct dvm *vm, bool nested)
 {
-   if (!vm->npending) return;
-   if (!nested && vm->drain_depth) return;
+   if (!vm->npending) return 0;
+   if (!nested && vm->drain_depth) return 0;
    if (vm->drain_depth >= DVM_DRAIN_MAX_DEPTH) {
       if (dvm__sched_trace())
          fprintf(stderr, "[sched] drain refused: depth=%d pending=%d\n",
                  vm->drain_depth, vm->npending);
-      return;
+      return 0;
    }
+   int ran = 0;
    ++vm->drain_depth;
    uint64_t saved_limit = vm->step_limit;
    bool saved_quiet = vm->quiet_uncaught;
@@ -3194,6 +3345,7 @@ static void drain_pending(struct dvm *vm, bool nested)
          if (vm->pending_due_ms[i] <= now) { pick = i; break; }
       }
       if (pick < 0) break;
+      ++ran;
 
       dvm_ref entry = vm->pending_threads[pick];
       bool entry_is_thread = vm->pending_is_thread[pick];
@@ -3301,16 +3453,17 @@ static void drain_pending(struct dvm *vm, bool nested)
    vm->step_limit = saved_limit;
    vm->quiet_uncaught = saved_quiet;
    --vm->drain_depth;
+   return ran;
 }
 
 void dvm__run_pending_threads(struct dvm *vm)
 {
-   drain_pending(vm, false);
+   (void)drain_pending(vm, false);
    /* Only at the top: a nested drain is inside somebody's Runnable, and a
     * click callback dispatched there would run underneath a wait. */
    if (vm->drain_depth == 0) dvm__ui_tick(vm);
 }
-void dvm__drain_for_wait(struct dvm *vm) { drain_pending(vm, true); }
+int dvm__drain_for_wait(struct dvm *vm) { return drain_pending(vm, true); }
 
 
 /* ------------------------------------------------------------------------ *
@@ -4115,6 +4268,7 @@ bool dvm_add_dex(struct dvm *vm, const char *path)
       luna_boot_dex_loaded(path, dd->file.class_defs_size,
                            dd->file.method_ids_size,
                            stat(path, &st) == 0 ? (uint64_t)st.st_size : 0);
+      (void)arm_exec_boot_present();
    }
    return true;
 }
@@ -4186,6 +4340,7 @@ int dvm_add_apk_dir(struct dvm *vm, const char *dir)
          }
       }
       luna_boot_dex_total(files, bytes);
+      (void)arm_exec_boot_present();
    }
    for (size_t s = 0; s < sizeof subdirs / sizeof subdirs[0]; ++s) {
       for (int i = 0; i < 64; ++i) {

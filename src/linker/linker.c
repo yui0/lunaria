@@ -41,7 +41,11 @@
 #endif
 
 
+#if defined(__linux__)
 #include <linux/auxvec.h>
+#else
+#include <elf.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,6 +69,7 @@
 #include "trace.h"
 
 #include "linker.h"
+#include "lunaria_os.h"
 #include "linker_debug.h"
 #include "linker_environ.h"
 #include "linker_format.h"
@@ -147,13 +152,15 @@ unsigned apkenv_bitmask[4096];
 #define PT_ARM_EXIDX    0x70000001      /* .ARM.exidx segment */
 #endif
 
-static char apkenv_tmp_err_buf[768];
-static char apkenv___linker_dl_err_buf[768];
+static char apkenv_tmp_err_buf[4096];
+static char apkenv___linker_dl_err_buf[4096];
 #define DL_ERR(fmt, x...)                                                     \
     do {                                                                      \
-        format_buffer(apkenv___linker_dl_err_buf, sizeof(apkenv___linker_dl_err_buf),            \
-                 "%s[%d]: " fmt, __func__, __LINE__, ##x);                    \
-        ERROR(fmt "\n", ##x);                                                      \
+        if (format_buffer(apkenv___linker_dl_err_buf, sizeof(apkenv___linker_dl_err_buf), \
+                 "%s[%d]: " fmt, __func__, __LINE__, ##x)                     \
+            >= (int)sizeof(apkenv___linker_dl_err_buf))                       \
+            apkenv___linker_dl_err_buf[sizeof(apkenv___linker_dl_err_buf) - 1] = '\0'; \
+        ERROR(fmt "\n", ##x);                                                 \
     } while(0)
 
 const char *apkenv_linker_get_error(void)
@@ -177,7 +184,12 @@ enum {
 //static struct r_debug _r_debug = {1, NULL, &rtld_db_dlactivity,
 //                                  RT_CONSISTENT, 0};
 /* apkenv */
+#if defined(__APPLE__)
+static struct r_debug _r_debug = {1, NULL, 0, RT_CONSISTENT, 0};
+#define rtld_db_dlactivity() ((void)0)
+#else
 #define rtld_db_dlactivity() ((void (*)(void))_r_debug.r_brk)()
+#endif
 
 static struct link_map *apkenv_r_debug_head, *apkenv_r_debug_tail;
 
@@ -1328,7 +1340,7 @@ static int apkenv_reloc_library(soinfo *si, AElf(Rela) *rela, unsigned count)
 {
     AElf(Sym) *symtab = si->symtab;
     const char *strtab = si->strtab;
-    AElf(Sym) *s;
+    AElf(Sym) *s = NULL;
     uintptr_t base;
     AElf(Rela) *start = rela;
     unsigned idx;
@@ -1359,9 +1371,7 @@ static int apkenv_reloc_library(soinfo *si, AElf(Rela) *rela, unsigned count)
             }
 
             if (sym_addr != 0) {
-                Dl_info info;
-                ElfW(Sym) *extra;
-                if (dladdr1((void*)sym_addr, &info, (void**) &extra, RTLD_DL_SYMENT) && (!extra || ELF64_ST_TYPE(extra->st_info) == STT_FUNC))
+                if (luna_os_symbol_is_function((void*)sym_addr))
                     sym_addr = (uintptr_t)wrapper_create(sym_name, (void*)sym_addr);
             } else if (s == NULL) {
                 s = &symtab[sym];
@@ -1443,6 +1453,10 @@ static int apkenv_reloc_library(soinfo *si, AElf(Rela) *rela, unsigned count)
         case R_AARCH64_COPY:
             COUNT_RELOC(RELOC_COPY);
             MARK(rela->r_offset);
+            if (!s) {
+                DL_ERR("%5d COPY reloc with no symbol @ %p", apkenv_pid, rela);
+                return -1;
+            }
             TRACE_TYPE(RELO, "%5d RELO COPY %08lx <- %zu @ %08lx %s\n", apkenv_pid,
                        (unsigned long)reloc, (size_t)s->st_size, (unsigned long)sym_addr, sym_name);
             memcpy((void*)reloc, (void*)sym_addr, s->st_size);
@@ -1492,6 +1506,10 @@ static int apkenv_reloc_library(soinfo *si, AElf(Rela) *rela, unsigned count)
         case R_X86_64_COPY:
             COUNT_RELOC(RELOC_COPY);
             MARK(rela->r_offset);
+            if (!s) {
+                DL_ERR("%5d COPY reloc with no symbol @ %p", apkenv_pid, rela);
+                return -1;
+            }
             memcpy((void*)reloc, (void*)sym_addr, s->st_size);
             break;
 #endif
@@ -1509,7 +1527,7 @@ static int apkenv_reloc_library(soinfo *si, AElf(Rel) *rel, unsigned count)
 {
     AElf(Sym) *symtab = si->symtab;
     const char *strtab = si->strtab;
-    AElf(Sym) *s;
+    AElf(Sym) *s = NULL;
     uintptr_t base;
     AElf(Rel) *start = rel;
     unsigned idx;
@@ -1540,9 +1558,7 @@ static int apkenv_reloc_library(soinfo *si, AElf(Rel) *rel, unsigned count)
             }
 
             if (sym_addr != 0) {
-                Dl_info info;
-                ElfW(Sym) *extra;
-                if (dladdr1((void*)sym_addr, &info, (void**) &extra, RTLD_DL_SYMENT) && (!extra || ELF32_ST_TYPE(extra->st_info) == STT_FUNC))
+                if (luna_os_symbol_is_function((void*)sym_addr))
                     sym_addr = (uintptr_t)wrapper_create(sym_name, (void*)sym_addr);
             } else if (s == NULL) {
                 s = &symtab[sym];
@@ -2510,8 +2526,8 @@ sanitize:
     }
     if(apkenv_link_image(si, 0)) {
         char errmsg[] = "CANNOT LINK EXECUTABLE\n";
-        write(2, apkenv___linker_dl_err_buf, strlen(apkenv___linker_dl_err_buf));
-        write(2, errmsg, sizeof(errmsg));
+        if (write(2, apkenv___linker_dl_err_buf, strlen(apkenv___linker_dl_err_buf)) < 0) {}
+        if (write(2, errmsg, sizeof(errmsg)) < 0) {}
         exit(-1);
     }
 

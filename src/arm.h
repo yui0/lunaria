@@ -1486,27 +1486,39 @@ constexpr uint32_t SVC_KUSER_DMB           = SVC_DETOUR_BASE + NUM_DETOURS + 108
 // Wrap mono_add_internal_call to probe Time/Transform icalls (LUNARIA_TRACE_ICALL).
 constexpr uint32_t SVC_MONO_ADD_ICALL     = SVC_DETOUR_BASE + NUM_DETOURS + 109u;
 // Host AES-ECB for FAES::DecryptData — UE pak indexes in this title need it.
-constexpr uint32_t SVC_FAES_DECRYPT        = SVC_DETOUR_BASE + NUM_DETOURS + 140u;
+/* Host implementations of UE's own functions, reached by an inline detour that
+ * overwrites the first instruction with `svc #N` — not by a symbol binding, so
+ * these numbers never appear in kSymbolSvcMap and nothing in the build checks
+ * them against it.  They used to be carved out of the same run as the SVC29
+ * bank and collided with it exactly: FAES::DecryptData shared a number with
+ * mbrlen, FSHA1::HashBuffer with mbsrtowcs, CityHash64 with logb,
+ * DES_ncbc_encrypt with lrintf, and so on down the block.  The hook is tested
+ * with an `if` before dispatch_svc's switch and returns, so a guest calling
+ * mbrlen ran AES-256 over its own string buffer and got the pointer back as
+ * the answer.  Give them a range of their own, above everything else, and
+ * keep SVC_TRAMP_TOTAL derived from its end. */
+constexpr uint32_t SVC_UE_HOOK_BASE = 1400u;
+constexpr uint32_t SVC_FAES_DECRYPT = SVC_UE_HOOK_BASE + 0u;
 // Host SHA-1 for FSHA1::HashBuffer — startup profiler showed 27% of load time.
-constexpr uint32_t SVC_FSHA1_HASHBUFFER    = SVC_DETOUR_BASE + NUM_DETOURS + 141u;
+constexpr uint32_t SVC_FSHA1_HASHBUFFER = SVC_UE_HOOK_BASE + 1u;
 // Host CityHash64 — FName interning showed 11% of load time.
-constexpr uint32_t SVC_CITYHASH64          = SVC_DETOUR_BASE + NUM_DETOURS + 142u;
+constexpr uint32_t SVC_CITYHASH64 = SVC_UE_HOOK_BASE + 2u;
 /* Host OpenSSL DES-CBC.  This title decrypts its content with single DES and
  * the guest's own OpenSSL was 78% of every instruction the emulator executed
  * — 39.7 billion of them in 140 s, one thread, no SVCs, all of it inside
  * DES_ncbc_encrypt.  Same trade as FAES/FSHA1/CityHash above. */
-constexpr uint32_t SVC_DES_NCBC             = SVC_DETOUR_BASE + NUM_DETOURS + 143u;
-constexpr uint32_t SVC_DES_EDE3_CBC         = SVC_DETOUR_BASE + NUM_DETOURS + 144u;
+constexpr uint32_t SVC_DES_NCBC = SVC_UE_HOOK_BASE + 3u;
+constexpr uint32_t SVC_DES_EDE3_CBC = SVC_UE_HOOK_BASE + 4u;
 /* Host FGenericPlatformStricmp::Stricmp.  UE compares FNames and paths with
  * it a character at a time; it was 2.7% of every guest instruction on the load
  * screen.  One SVC for all the width combinations — which one a call is comes
  * from the address the SVC was taken at. */
-constexpr uint32_t SVC_UE_STRICMP           = SVC_DETOUR_BASE + NUM_DETOURS + 145u;
+constexpr uint32_t SVC_UE_STRICMP = SVC_UE_HOOK_BASE + 5u;
 /* Host FGenericPlatformStricmp::Strnicmp — the same function with a count.
  * UE reaches for it wherever it compares a prefix, and mounting this title's
  * patch paks (570k filenames, each turned into a package name) spends 10% of
  * every guest instruction in it. */
-constexpr uint32_t SVC_UE_STRNICMP          = SVC_DETOUR_BASE + NUM_DETOURS + 146u;
+constexpr uint32_t SVC_UE_STRNICMP = SVC_UE_HOOK_BASE + 6u;
 /* Host FString::ReplaceInline.  Mounting this title's patch paks turns every
  * one of 570k pak entries into a package name, and each conversion normalises
  * the filename — which is a ReplaceInline of "\\" by "/".  That is 12% of
@@ -1515,12 +1527,79 @@ constexpr uint32_t SVC_UE_STRNICMP          = SVC_DETOUR_BASE + NUM_DETOURS + 14
  * same length, so the characters are overwritten in place.  The handler takes
  * only that shape and hands every other call back to the guest's own code
  * through a resume stub, so the growing path keeps its own semantics. */
-constexpr uint32_t SVC_UE_REPLACE_INLINE    = SVC_DETOUR_BASE + NUM_DETOURS + 147u;
+constexpr uint32_t SVC_UE_REPLACE_INLINE = SVC_UE_HOOK_BASE + 7u;
 /* Host TStringViewImpl<T>::FindChar.  A one-character scan over a path, 9.5%
  * of the load screen: the loop is four instructions, so the guest pays for
  * fetch and decode rather than for the comparison.  Whole function, no
  * fallback — there is nothing in it to fall back to. */
-constexpr uint32_t SVC_UE_FINDCHAR          = SVC_DETOUR_BASE + NUM_DETOURS + 148u;
+constexpr uint32_t SVC_UE_FINDCHAR = SVC_UE_HOOK_BASE + 8u;
+constexpr uint32_t SVC_UE_HOOK_LAST = SVC_UE_FINDCHAR;
+
+
+constexpr uint32_t SVC_HONEST_BASE          = 1354u; /* first free id */
+/* Entry points that used to be bound to the generic "returns 0" / "returns
+ * -1" templates and turned out to be called for real.  A template answer is a
+ * guess about what the caller wanted; these are the answers the caller can
+ * actually act on. */
+constexpr uint32_t SVC_SCHED_SETAFFINITY       = SVC_HONEST_BASE + 0u;
+constexpr uint32_t SVC_CXA_ATEXIT              = SVC_HONEST_BASE + 1u;
+constexpr uint32_t SVC_CXA_FINALIZE            = SVC_HONEST_BASE + 2u;
+constexpr uint32_t SVC_ATEXIT                  = SVC_HONEST_BASE + 3u;
+constexpr uint32_t SVC_SETRLIMIT               = SVC_HONEST_BASE + 4u;
+constexpr uint32_t SVC_CHMOD                   = SVC_HONEST_BASE + 5u;
+constexpr uint32_t SVC_FCHMOD                  = SVC_HONEST_BASE + 6u;
+constexpr uint32_t SVC_SYSTEM                  = SVC_HONEST_BASE + 7u;
+constexpr uint32_t SVC_FORK                    = SVC_HONEST_BASE + 8u;
+constexpr uint32_t SVC_ANA_SET_WINDOW_FORMAT   = SVC_HONEST_BASE + 9u;
+constexpr uint32_t SVC_TRUNCATE                = SVC_HONEST_BASE + 10u;
+constexpr uint32_t SVC_SYMLINK                 = SVC_HONEST_BASE + 11u;
+constexpr uint32_t SVC_LINK                    = SVC_HONEST_BASE + 12u;
+constexpr uint32_t SVC_FDATASYNC               = SVC_HONEST_BASE + 13u;
+constexpr uint32_t SVC_UTIMENSAT               = SVC_HONEST_BASE + 14u;
+constexpr uint32_t SVC_FCHMODAT                = SVC_HONEST_BASE + 15u;
+constexpr uint32_t SVC_FNMATCH                 = SVC_HONEST_BASE + 16u;
+constexpr uint32_t SVC_LLDIV                   = SVC_HONEST_BASE + 17u;
+constexpr uint32_t SVC_PATHCONF                = SVC_HONEST_BASE + 18u;
+constexpr uint32_t SVC_GETNAMEINFO             = SVC_HONEST_BASE + 19u;
+constexpr uint32_t SVC_SETVBUF                 = SVC_HONEST_BASE + 20u;
+constexpr uint32_t SVC_ANW_GETFORMAT           = SVC_HONEST_BASE + 21u;
+constexpr uint32_t SVC_ALOOPER_ACQUIRE         = SVC_HONEST_BASE + 22u;
+constexpr uint32_t SVC_ALOOPER_RELEASE         = SVC_HONEST_BASE + 23u;
+constexpr uint32_t SVC_PTHREAD_ATFORK          = SVC_HONEST_BASE + 24u;
+constexpr uint32_t SVC_MLOCK                   = SVC_HONEST_BASE + 25u;
+constexpr uint32_t SVC_MUNLOCK                 = SVC_HONEST_BASE + 26u;
+constexpr uint32_t SVC_GETPWUID_R              = SVC_HONEST_BASE + 27u;
+constexpr uint32_t SVC_CXA_THREAD_ATEXIT       = SVC_HONEST_BASE + 28u;
+/* pthread_condattr_setclock/getclock: a condvar may be created on
+ * CLOCK_MONOTONIC, and its timedwait deadlines are then on that clock. */
+constexpr uint32_t SVC_PTHREAD_CONDATTR_SETCLOCK = SVC_HONEST_BASE + 29u;
+constexpr uint32_t SVC_PTHREAD_CONDATTR_GETCLOCK = SVC_HONEST_BASE + 30u;
+/* pthread_mutexattr_settype/gettype: NORMAL, RECURSIVE and ERRORCHECK are
+ * three different contracts and a mutex has to know which one it was made
+ * with. */
+constexpr uint32_t SVC_PTHREAD_MUTEXATTR_SETTYPE = SVC_HONEST_BASE + 31u;
+constexpr uint32_t SVC_PTHREAD_MUTEXATTR_GETTYPE = SVC_HONEST_BASE + 32u;
+/* pthread_attr_t is bionic's plain struct in guest memory, so the setters
+ * write the same fields the getters above already read. */
+constexpr uint32_t SVC_PTHREAD_ATTR_INIT         = SVC_HONEST_BASE + 33u;
+constexpr uint32_t SVC_PTHREAD_ATTR_SETSTACKSZ   = SVC_HONEST_BASE + 34u;
+constexpr uint32_t SVC_PTHREAD_ATTR_SETDETACH    = SVC_HONEST_BASE + 35u;
+constexpr uint32_t SVC_PTHREAD_ATTR_GETDETACH    = SVC_HONEST_BASE + 36u;
+/* __pthread_cleanup_push/pop: the handler stack a thread unwinds through when
+ * it is cancelled or exits. */
+constexpr uint32_t SVC_PTHREAD_CLEANUP_PUSH      = SVC_HONEST_BASE + 37u;
+constexpr uint32_t SVC_PTHREAD_CLEANUP_POP       = SVC_HONEST_BASE + 38u;
+/* Destroying an attribute has to leave it *invalid*, not untouched. */
+constexpr uint32_t SVC_PTHREAD_MUTEXATTR_DESTROY = SVC_HONEST_BASE + 39u;
+/* The last number in the block above.  SVC_TRAMP_TOTAL is derived from this
+ * rather than from whichever SVC happened to be written last: a number past
+ * that bound gets no trampoline built, and the unknown-symbol pool — which
+ * starts at the bound — hands its address out to a dlsym'd name instead, so
+ * two unrelated symbols end up sharing one stub.  Adding to the block above
+ * means moving this line down with it. */
+constexpr uint32_t SVC_HONEST_LAST             = SVC_CXA_THREAD_ATEXIT;
+static_assert(SVC_HONEST_LAST < SVC_UE_HOOK_BASE,
+              "the honest block has grown into the UE hook block");
 constexpr uint32_t NUM_ICALL_PROBES        = 16u;
 constexpr uint32_t SVC_ICALL_PROBE_BASE    = SVC_DETOUR_BASE + NUM_DETOURS + 110u;
 constexpr uint32_t ICALL_PROBE_STUB_BASE   = 0x4100e800u;
@@ -2219,6 +2298,27 @@ constexpr uint32_t SVC_PTHREAD_SETSCHEDPARAM      = SVC31_BASE + 413u;
  * caller its affinity mask contains no CPUs at all, which is how a worker-pool
  * size computed from "how many cores may I use" comes out as zero. */
 constexpr uint32_t SVC_SCHED_CPUCOUNT             = SVC31_BASE + 414u;
+/* libc calls that were bound to the shared "return 0" template and then showed
+ * up as `[stub] CALLED … nothing was done`.  A zero answer is often a lie the
+ * guest acts on (getuid()=0 is root; dladdr()=0 means "no module"; setenv()=0
+ * looks like success without writing).  Each gets its own trampoline. */
+constexpr uint32_t SVC_GETUID                     = SVC31_BASE + 415u;
+constexpr uint32_t SVC_GETEUID                    = SVC31_BASE + 416u;
+constexpr uint32_t SVC_GETGID                     = SVC31_BASE + 417u;
+constexpr uint32_t SVC_GETEGID                    = SVC31_BASE + 418u;
+constexpr uint32_t SVC_PRCTL                      = SVC31_BASE + 419u;
+constexpr uint32_t SVC_SETPRIORITY                = SVC31_BASE + 420u;
+constexpr uint32_t SVC_GETPRIORITY                = SVC31_BASE + 421u;
+constexpr uint32_t SVC_MADVISE                    = SVC31_BASE + 422u;
+constexpr uint32_t SVC_MSYNC                      = SVC31_BASE + 423u;
+constexpr uint32_t SVC_SETENV                     = SVC31_BASE + 424u;
+constexpr uint32_t SVC_UNSETENV                   = SVC31_BASE + 425u;
+constexpr uint32_t SVC_PTHREAD_SIGMASK            = SVC31_BASE + 426u;
+constexpr uint32_t SVC_DLADDR                     = SVC31_BASE + 427u;
+constexpr uint32_t SVC_DLERROR                    = SVC31_BASE + 428u;
+constexpr uint32_t SVC_FSCANF                     = SVC31_BASE + 429u;
+constexpr uint32_t SVC_FSYNC                      = SVC31_BASE + 430u;
+constexpr uint32_t SVC_FLOCK                      = SVC31_BASE + 431u;
 
 /* Which SVC a JNINativeInterface slot dispatches to.  Identity up to 221;
  * beyond that the historical numbering is four short, so name every slot. */
@@ -2250,7 +2350,7 @@ static_assert(SVC_PTHREAD_SETNAME > SVC_GL3_GenTransformFeedbacks,
  * numbers after it live past SVC_SIGPROCMASK, so their trampolines were never
  * built and the unknown-symbol pool — which starts here — handed the same
  * addresses out to dlsym'd names it did not implement. */
-constexpr uint32_t SVC_TRAMP_TOTAL        = SVC_SCHED_CPUCOUNT + 1u;
+constexpr uint32_t SVC_TRAMP_TOTAL        = SVC_UE_HOOK_LAST + 1u;
 static_assert(SVC_TRAMP_TOTAL > SVC_PROCESS_VM_READV &&
               SVC_TRAMP_TOTAL > SVC_ACFG_INT_END &&
               SVC_TRAMP_TOTAL > SVC_GL3_GenTransformFeedbacks &&
@@ -2266,7 +2366,11 @@ static_assert(SVC_TRAMP_TOTAL > SVC_PROCESS_VM_READV &&
               SVC_TRAMP_TOTAL > SVC_MALLINFO &&
               SVC_TRAMP_TOTAL > SVC_SIGNALFD &&
               SVC_TRAMP_TOTAL > SVC_SIGPROCMASK &&
-              SVC_TRAMP_TOTAL > SVC_GL_GET_QUERY_OBJECT_UIV,
+              SVC_TRAMP_TOTAL > SVC_GL_GET_QUERY_OBJECT_UIV &&
+              SVC_TRAMP_TOTAL > SVC_FLOCK &&
+              SVC_TRAMP_TOTAL > SVC_GETPWUID_R &&
+              SVC_TRAMP_TOTAL > SVC_HONEST_LAST &&
+              SVC_TRAMP_TOTAL > SVC_UE_HOOK_LAST,
               "SVC_TRAMP_TOTAL must bound every trampolined SVC");
 
 // OpenSL ES fake object page.

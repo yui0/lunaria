@@ -41,7 +41,7 @@
 #include <sys/types.h>
 #include <stdint.h>
 #include <elf.h>
-#include <link.h>
+#include "lunaria_link.h"
 #include <stdbool.h>
 
 #undef PAGE_MASK

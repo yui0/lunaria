@@ -169,9 +169,29 @@ bool dex_class_def(const struct dex_file *d, uint32_t idx, struct dex_class_def 
  * information erased from the ordinary superclass/type pools. */
 bool dex_class_signature(struct dex_file *d, uint32_t class_def_idx,
                          char *out, size_t out_sz);
+/* Generic signature of a declared field, from its system-visible
+ * dalvik.annotation.Signature annotation. */
+bool dex_field_signature(struct dex_file *d, uint32_t class_def_idx,
+                         const char *field_name, char *out, size_t out_sz);
 /* Declaring/enclosing class recorded by EnclosingClass or EnclosingMethod. */
 const char *dex_class_enclosing_type(struct dex_file *d,
                                      uint32_t class_def_idx);
+
+/* Runtime-visible class annotations.  `encoded_off` points at the
+ * encoded_annotation (its type_idx, not the preceding visibility byte).
+ * AnnotationDefault is kept on the annotation interface itself and is used
+ * when an instance omits an element with a Java default. */
+bool dex_class_annotation(struct dex_file *d, uint32_t class_def_idx,
+                          const char *annotation_desc,
+                          uint32_t *encoded_off);
+bool dex_field_annotation(struct dex_file *d, uint32_t class_def_idx,
+                          const char *field_name, const char *annotation_desc,
+                          uint32_t *encoded_off);
+const char *dex_annotation_type(struct dex_file *d, uint32_t encoded_off);
+bool dex_annotation_element(struct dex_file *d, uint32_t encoded_off,
+                            const char *name, struct dex_value *out);
+bool dex_annotation_default(struct dex_file *d, uint32_t class_def_idx,
+                            const char *name, struct dex_value *out);
 
 /* Shorty of a proto: return type first, then one char per parameter. */
 const char *dex_proto_shorty(struct dex_file *d, uint32_t proto_idx);
@@ -208,6 +228,9 @@ int dex_interfaces(const struct dex_file *d, uint32_t interfaces_off,
  * element count and fills at most `max`.  Returns -1 when `off` is 0. */
 int dex_static_values(const struct dex_file *d, uint32_t off,
                       struct dex_value *out, int max);
+/* Decodes the array payload referenced by a DEX_VALUE_ARRAY. */
+int dex_value_array(const struct dex_file *d, const struct dex_value *array,
+                    struct dex_value *out, int max);
 
 /* --- low level (exposed for the interpreter's payload decoding) ---------- */
 

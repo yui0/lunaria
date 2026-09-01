@@ -9,6 +9,7 @@
  */
 
 #include "dvm/dvm_media.h"
+#include "lunaria_os.h"
 
 #include <dlfcn.h>
 #include <limits.h>
@@ -89,15 +90,19 @@ static void *openh264_dlopen(void)
    if (env && *env) return dlopen(env, RTLD_NOW | RTLD_LOCAL);
 
    char self[PATH_MAX];
-   ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
-   if (n > 0) {
-      self[n] = '\0';
+   if (luna_os_executable_path(self, sizeof self) == 0) {
       char *slash = strrchr(self, '/');
       if (slash) {
          char path[PATH_MAX];
          *slash = '\0';
-         if ((size_t)snprintf(path, sizeof path, "%s/runtime/libopenh264.so",
-                              self) < sizeof path) {
+         if ((size_t)snprintf(path, sizeof path, "%s/runtime/%s",
+                              self,
+#ifdef __APPLE__
+                              "libopenh264.dylib"
+#else
+                              "libopenh264.so"
+#endif
+                              ) < sizeof path) {
             void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
             if (h) return h;
          }
@@ -105,9 +110,14 @@ static void *openh264_dlopen(void)
    }
 
    static const char *const fallbacks[] = {
+#ifdef __APPLE__
+      "/usr/local/lib/lunaria/libopenh264.dylib",
+      "libopenh264.dylib",
+#else
       "/usr/local/lib/lunaria/libopenh264.so",
       "libopenh264.so",
       "libopenh264.so.7",
+#endif
    };
    for (size_t i = 0; i < sizeof fallbacks / sizeof *fallbacks; ++i) {
       void *h = dlopen(fallbacks[i], RTLD_NOW | RTLD_LOCAL);
@@ -292,22 +302,37 @@ void lm_sink_free(struct lm_sink *s)
    free(s);
 }
 
-void lm_sink_push(struct lm_sink *s, const uint8_t *rgba, int w, int h,
-                  int64_t timestamp_ns)
+uint8_t *lm_sink_begin(struct lm_sink *s, int w, int h)
 {
-   if (!s || !rgba || w <= 0 || h <= 0) return;
+   if (!s || w <= 0 || h <= 0) return NULL;
    size_t need = (size_t)w * (size_t)h * 4u;
    if (need > s->cap) {
       uint8_t *p = realloc(s->rgba, need);
-      if (!p) return;
+      if (!p) return NULL;
       s->rgba = p;
       s->cap = need;
    }
-   memcpy(s->rgba, rgba, need);
+   return s->rgba;
+}
+
+void lm_sink_commit(struct lm_sink *s, int w, int h, int64_t timestamp_ns)
+{
+   if (!s || !s->rgba || w <= 0 || h <= 0) return;
    s->w = w;
    s->h = h;
    s->ts_ns = timestamp_ns;
    s->pending = true;
+}
+
+void lm_sink_push(struct lm_sink *s, const uint8_t *rgba, int w, int h,
+                  int64_t timestamp_ns)
+{
+   uint8_t *dst;
+   if (!rgba) return;
+   dst = lm_sink_begin(s, w, h);
+   if (!dst) return;
+   memcpy(dst, rgba, (size_t)w * (size_t)h * 4u);
+   lm_sink_commit(s, w, h, timestamp_ns);
 }
 
 bool lm_sink_take(struct lm_sink *s, const uint8_t **rgba, int *w, int *h)
@@ -895,27 +920,50 @@ static inline uint8_t clamp8(int v)
    return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
 }
 
+/* Chroma is shared by a 2x2 block, so its three products are computed once per
+ * pair of pixels rather than once per pixel, and the luma row is walked with a
+ * pointer instead of being re-indexed from the base on every sample.  At 720p
+ * this runs 921,600 times a frame, at video rate, on the thread the guest is
+ * waiting on -- the arithmetic per pixel is the whole cost. */
 static void i420_to_rgba(const uint8_t *yuv, int w, int h, uint8_t *rgba)
 {
-   int cw = (w + 1) / 2, ch = (h + 1) / 2;
+   const int cw = (w + 1) / 2, ch = (h + 1) / 2;
    const uint8_t *yp = yuv;
    const uint8_t *up = yuv + (size_t)w * h;
    const uint8_t *vp = up + (size_t)cw * ch;
+   int y;
 
-   for (int y = 0; y < h; ++y) {
+   for (y = 0; y < h; ++y) {
+      const uint8_t *yr = yp + (size_t)y * w;
       const uint8_t *ur = up + (size_t)(y / 2) * cw;
       const uint8_t *vr = vp + (size_t)(y / 2) * cw;
       uint8_t *dst = rgba + (size_t)y * w * 4;
-      for (int x = 0; x < w; ++x) {
-         int c = yp[(size_t)y * w + x] - 16;
-         int d = ur[x / 2] - 128;
-         int e = vr[x / 2] - 128;
-         int y298 = 298 * c;
+      int x = 0;
+      for (; x + 1 < w; x += 2) {
+         const int d = *ur++ - 128;
+         const int e = *vr++ - 128;
+         const int r = 409 * e + 128;
+         const int g = -100 * d - 208 * e + 128;
+         const int b = 516 * d + 128;
+         int y298 = 298 * (*yr++ - 16);
+         dst[0] = clamp8((y298 + r) >> 8);
+         dst[1] = clamp8((y298 + g) >> 8);
+         dst[2] = clamp8((y298 + b) >> 8);
+         dst[3] = 255;
+         y298 = 298 * (*yr++ - 16);
+         dst[4] = clamp8((y298 + r) >> 8);
+         dst[5] = clamp8((y298 + g) >> 8);
+         dst[6] = clamp8((y298 + b) >> 8);
+         dst[7] = 255;
+         dst += 8;
+      }
+      if (x < w) {                      /* odd width: one trailing pixel */
+         const int d = *ur - 128, e = *vr - 128;
+         const int y298 = 298 * (*yr - 16);
          dst[0] = clamp8((y298 + 409 * e + 128) >> 8);
          dst[1] = clamp8((y298 - 100 * d - 208 * e + 128) >> 8);
          dst[2] = clamp8((y298 + 516 * d + 128) >> 8);
          dst[3] = 255;
-         dst += 4;
       }
    }
 }
@@ -927,12 +975,10 @@ void lm_codec_release_output(struct lm_codec *c, int idx, bool render,
    struct lm_outbuf *o = &c->out[idx];
 
    if (render && sink && o->len && o->w > 0 && o->h > 0) {
-      size_t need = (size_t)o->w * (size_t)o->h * 4u;
-      uint8_t *rgba = malloc(need);
+      uint8_t *rgba = lm_sink_begin(sink, o->w, o->h);
       if (rgba) {
          i420_to_rgba(o->yuv, o->w, o->h, rgba);
-         lm_sink_push(sink, rgba, o->w, o->h, o->pts_us * 1000);
-         free(rgba);
+         lm_sink_commit(sink, o->w, o->h, o->pts_us * 1000);
       }
    }
    if (trace_media())
