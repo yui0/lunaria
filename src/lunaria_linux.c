@@ -315,3 +315,153 @@ void *luna_os_native_window(void *glfw_window)
     * one signature serves the platforms whose handle really is a pointer. */
    return (void *)(uintptr_t)glfwGetX11Window((GLFWwindow *)glfw_window);
 }
+
+/* ---- audio out ----------------------------------------------------------
+ *
+ * ALSA, through the header-only helper in src/alsa.h.  The device is opened
+ * once with the format the guest's audio track asked for; a thread of this
+ * layer's own does the blocking snd_pcm_writei, because the caller is a guest
+ * thread inside an SVC and must not wait for a sound card.
+ *
+ * Between the two is a plain ring of frames.  One producer (the guest audio
+ * thread) and one consumer (the thread below), so a pair of atomic indices is
+ * the whole of the synchronisation — no lock on the path the guest is on.
+ * The ring holds about a third of a second: long enough to ride out a
+ * scheduling gap in the emulator, short enough that the sound stays in step
+ * with the picture. */
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include "alsa.h"
+
+#define LUNA_AUDIO_RING_FRAMES 16384u   /* 341 ms at 48 kHz */
+
+static AUDIO             g_audio;
+static int               g_audio_open;
+static unsigned          g_audio_ch = 2u;
+static int16_t          *g_audio_ring;
+static _Atomic unsigned  g_audio_head;  /* producer writes here */
+static _Atomic unsigned  g_audio_tail;  /* consumer reads here */
+static _Atomic int       g_audio_stop;
+static pthread_t         g_audio_thread;
+
+static unsigned luna_audio_used(void)
+{
+   const unsigned h = atomic_load_explicit(&g_audio_head, memory_order_acquire);
+   const unsigned t = atomic_load_explicit(&g_audio_tail, memory_order_acquire);
+   return (h - t) % LUNA_AUDIO_RING_FRAMES;
+}
+
+static void *luna_audio_thread(void *arg)
+{
+   (void)arg;
+   luna_os_thread_name("luna-audio");
+   /* Hand the card whole periods.  Writing whatever happens to be in the ring
+    * makes snd_pcm_writei return short and the stream stutter; waiting for a
+    * period's worth is what keeps it continuous. */
+   const unsigned period = (unsigned)g_audio.frames ? (unsigned)g_audio.frames : 256u;
+   int16_t *chunk = (int16_t *)malloc((size_t)period * g_audio_ch * sizeof *chunk);
+   if (!chunk) return NULL;
+   while (!atomic_load_explicit(&g_audio_stop, memory_order_acquire)) {
+      if (luna_audio_used() < period) {
+         /* Nothing to play.  Sleeping a fraction of a period keeps the
+          * wake-up cost low without letting the card run dry unnoticed. */
+         struct timespec ts = { 0, 2 * 1000 * 1000 };
+         nanosleep(&ts, NULL);
+         continue;
+      }
+      unsigned t = atomic_load_explicit(&g_audio_tail, memory_order_relaxed);
+      for (unsigned i = 0; i < period; ++i) {
+         const unsigned src = ((t + i) % LUNA_AUDIO_RING_FRAMES) * g_audio_ch;
+         for (unsigned c = 0; c < g_audio_ch; ++c)
+            chunk[i * g_audio_ch + c] = g_audio_ring[src + c];
+      }
+      AUDIO_play(&g_audio, (char *)chunk, (int)period);
+      atomic_store_explicit(&g_audio_tail, (t + period) % LUNA_AUDIO_RING_FRAMES,
+                            memory_order_release);
+   }
+   free(chunk);
+   return NULL;
+}
+
+int luna_os_audio_open(unsigned rate, unsigned channels)
+{
+   if (g_audio_open) return 0;
+   if (!rate) rate = 48000u;
+   if (channels < 1u || channels > 8u) channels = 2u;
+   const char *dev = getenv("LUNARIA_ALSA_DEVICE");
+   /* "default" is the plug layer: it converts rate and channel count when the
+    * card cannot do what the guest asked for, which a hw: device would simply
+    * refuse. */
+   char devbuf[128];
+   snprintf(devbuf, sizeof devbuf, "%s", (dev && *dev) ? dev : "default");
+   /* A period of about 10 ms: small enough that the guest's own buffer queue
+    * keeps its timing, large enough not to wake the thread constantly. */
+   unsigned period = rate / 100u;
+   if (period < 64u) period = 64u;
+   if (AUDIO_init(&g_audio, devbuf, rate, (int)channels, (int)period, 1,
+                  SND_PCM_FORMAT_S16_LE) != 0) {
+      /* The usual reason on a desktop is that something else holds the card
+       * exclusively (a player on hw:N,0 keeps even dmix from opening it).
+       * Say so, and name the way out, rather than reporting "no audio". */
+      /* The caller retries, so say it once and then rarely: a line every few
+       * seconds for a whole session buries everything else. */
+      static unsigned complained;
+      if (complained++ % 10u == 0u)
+         fprintf(stderr, "[audio] cannot open ALSA '%s' — is another program "
+                 "using the card?  LUNARIA_ALSA_DEVICE names a different one, "
+                 "LUNARIA_AUDIO=0 turns playback off\n", devbuf);
+      return -1;
+   }
+   g_audio_ring = (int16_t *)calloc((size_t)LUNA_AUDIO_RING_FRAMES * channels,
+                                    sizeof *g_audio_ring);
+   if (!g_audio_ring) { AUDIO_close(&g_audio); return -1; }
+   g_audio_ch = channels;
+   atomic_store_explicit(&g_audio_head, 0u, memory_order_relaxed);
+   atomic_store_explicit(&g_audio_tail, 0u, memory_order_relaxed);
+   atomic_store_explicit(&g_audio_stop, 0, memory_order_relaxed);
+   g_audio_open = 1;
+   if (pthread_create(&g_audio_thread, NULL, luna_audio_thread, NULL) != 0) {
+      g_audio_open = 0;
+      free(g_audio_ring);
+      g_audio_ring = NULL;
+      AUDIO_close(&g_audio);
+      return -1;
+   }
+   fprintf(stderr, "[audio] ALSA '%s' %u Hz %u ch, %lu-frame periods\n",
+           devbuf, g_audio.freq, channels, (unsigned long)g_audio.frames);
+   return 0;
+}
+
+int luna_os_audio_write(const void *pcm16, unsigned frames)
+{
+   if (!g_audio_open || !pcm16 || !frames) return 0;
+   const int16_t *src = (const int16_t *)pcm16;
+   const unsigned h = atomic_load_explicit(&g_audio_head, memory_order_relaxed);
+   const unsigned free_frames = LUNA_AUDIO_RING_FRAMES - 1u - luna_audio_used();
+   if (frames > free_frames) frames = free_frames;
+   for (unsigned i = 0; i < frames; ++i) {
+      const unsigned dst = ((h + i) % LUNA_AUDIO_RING_FRAMES) * g_audio_ch;
+      for (unsigned c = 0; c < g_audio_ch; ++c)
+         g_audio_ring[dst + c] = src[i * g_audio_ch + c];
+   }
+   atomic_store_explicit(&g_audio_head, (h + frames) % LUNA_AUDIO_RING_FRAMES,
+                         memory_order_release);
+   return (int)frames;
+}
+
+unsigned luna_os_audio_queued_frames(void)
+{
+   return g_audio_open ? luna_audio_used() : 0u;
+}
+
+void luna_os_audio_close(void)
+{
+   if (!g_audio_open) return;
+   atomic_store_explicit(&g_audio_stop, 1, memory_order_release);
+   pthread_join(g_audio_thread, NULL);
+   AUDIO_close(&g_audio);
+   free(g_audio_ring);
+   g_audio_ring = NULL;
+   g_audio_open = 0;
+}

@@ -50,8 +50,12 @@ void luna_boot_dex_loaded(const char *path, uint32_t classes,
  * ever saw finish. */
 bool luna_boot_active(void);
 
-/* Takes the card down for good.  Called when the guest presents its own first
- * frame: from there the surface is the guest's. */
+/* Guest eglSwapBuffers.  Dismisses the card once dex is finished and the guest
+ * has presented a couple of frames — the first is often blank while libUE4 is
+ * still wiring up its renderer. */
+void luna_boot_guest_presented(void);
+
+/* Takes the card down for good. */
 void luna_boot_finish(const char *why);
 
 #ifdef __cplusplus

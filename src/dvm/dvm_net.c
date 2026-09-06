@@ -368,19 +368,42 @@ static const char *header_get(const struct dvm_http_response *r,
 }
 
 /* Decodes a chunked body in place of `src`, appending to `out`. */
-static bool dechunk(const uint8_t *src, size_t len, struct buf *out)
+/* Decode the chunked transfer coding.  `stop_at` receives the offset the
+ * decoder gave up at, so a caller can say whether the framing was wrong or the
+ * body simply arrived short — the two look identical from the outside.
+ *
+ * The size line is parsed here rather than with strtoul(): `src` is a length-
+ * counted buffer with no NUL, which strtoul() may read past, and its answer
+ * for a line that holds no digits at all is 0 — the same answer as the
+ * last-chunk marker.  A body whose framing went wrong therefore used to decode
+ * as a short but perfectly valid one, with nothing said about it. */
+static bool dechunk(const uint8_t *src, size_t len, struct buf *out,
+                    size_t *stop_at)
 {
    size_t p = 0;
    for (;;) {
       /* chunk-size [;ext] CRLF */
       size_t line = p;
       while (p < len && src[p] != '\n') ++p;
-      if (p >= len) return false;
-      size_t sz = strtoul((const char *)src + line, NULL, 16);
+      if (p >= len) { *stop_at = line; return false; }
+      size_t sz = 0;
+      int digits = 0;
+      for (size_t q = line; q < p; ++q) {
+         unsigned c = src[q], d;
+         if (c >= '0' && c <= '9')      d = c - '0';
+         else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+         else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+         else if (!digits && (c == ' ' || c == '\t')) continue;
+         else break;   /* ';' extension, CR, or trailing junk */
+         if (sz > (SIZE_MAX - d) / 16) { *stop_at = line; return false; }
+         sz = sz * 16 + d;
+         ++digits;
+      }
+      if (!digits) { *stop_at = line; return false; }
       ++p;
-      if (!sz) return true;
-      if (p + sz > len) return false;
-      if (!buf_add(out, src + p, sz)) return false;
+      if (!sz) return true;   /* last-chunk; trailers carry nothing we read */
+      if (p + sz > len) { *stop_at = p; return false; }
+      if (!buf_add(out, src + p, sz)) { *stop_at = p; return false; }
       p += sz;
       /* trailing CRLF */
       while (p < len && (src[p] == '\r' || src[p] == '\n')) ++p;
@@ -726,8 +749,10 @@ bool dvm_http_slurp(struct dvm_http_response *r)
 
    if (r->chunked) {
       struct buf dec = { 0 };
-      if (!dechunk(all.p, all.len, &dec))
-         fprintf(stderr, "[http] malformed chunked body\n");
+      size_t stop = 0;
+      if (!dechunk(all.p, all.len, &dec, &stop))
+         fprintf(stderr, "[http] malformed chunked body: gave up at byte %zu "
+                 "of %zu received, %zu decoded\n", stop, all.len, dec.len);
       free(all.p);
       r->body = dec.p;
       r->body_len = dec.len;

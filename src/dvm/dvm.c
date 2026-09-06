@@ -301,16 +301,6 @@ dvm_ref dvm_new_string(struct dvm *vm, const char *utf8)
    return dvm_new_string_n(vm, utf8 ? utf8 : "", utf8 ? strlen(utf8) : 0);
 }
 
-static int elem_width(char kind)
-{
-   switch (kind) {
-      case 'Z': case 'B': return 1;
-      case 'C': case 'S': return 2;
-      case 'J': case 'D': return 8;
-      default: return 4;
-   }
-}
-
 dvm_ref dvm_new_array(struct dvm *vm, char elem, const char *elem_desc, uint32_t length)
 {
    char desc[256];
@@ -324,7 +314,7 @@ dvm_ref dvm_new_array(struct dvm *vm, char elem, const char *elem_desc, uint32_t
    o->kind = DVM_OBJ_ARRAY;
    o->length = length;
    o->elem_kind = elem;
-   size_t bytes = (size_t)length * (size_t)elem_width(elem);
+   size_t bytes = (size_t)length * (size_t)dvm__elem_width(elem);
    o->data = calloc(bytes ? bytes : 1, 1);
    if (!o->data) { heap_free(vm, r); return 0; }
    return r;
@@ -2346,11 +2336,26 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
                         (uint32_t)IU(1) | ((uint32_t)IU(2) << 16)) : 0;
          fr->pc += 3;
          break;
-      case 0x1c: /* const-class */
+      case 0x1c: { /* const-class */
          REQ(AA(u0));
-         r[AA(u0)] = class_object(vm, dd ? resolve_type(vm, dd, IU(1)) : NULL);
+         /* A type the loader cannot produce is NoClassDefFoundError, not a
+          * null Class.  Handing back null turned "this optional component is
+          * not in the package" into a NullPointerException several frames
+          * later, inside whatever the caller did with the Class object —
+          * CrashSight's Singleton.getSingleton(clazz) reports the NPE from
+          * clazz.newInstance() and never mentions the class that is missing.
+          * new-instance has always answered this way (case 0x22); this makes
+          * the two agree. */
+         struct dvm_class *t = dd ? resolve_type(vm, dd, IU(1)) : NULL;
+         if (!t || class_absent(vm, t)) {
+            dvm__throw(vm, "java/lang/NoClassDefFoundError", "%s",
+                       t && t->name ? t->name : "?");
+            goto exception;
+         }
+         r[AA(u0)] = class_object(vm, t);
          fr->pc += 2;
          break;
+      }
 
       case 0x1d: /* monitor-enter */
          REQ(AA(u0));
@@ -2436,7 +2441,7 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          struct dvm_object *ao = dvm__obj(vm, arr);
          if (ao) {
             for (int i = 0; i < n; ++i) {
-               switch (elem_width(kind)) {
+               switch (dvm__elem_width(kind)) {
                   case 1: ((uint8_t *)ao->data)[i] = (uint8_t)slots[i]; break;
                   case 2: ((uint16_t *)ao->data)[i] = (uint16_t)slots[i]; break;
                   default: ((uint32_t *)ao->data)[i] = slots[i]; break;
@@ -2463,7 +2468,7 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             /* The payload is `count * width` bytes; a truncated one would
              * read past the code array. */
             uint64_t units = ((uint64_t)count * width + 1u) / 2u;
-            if (poff + 4u + units <= nins && width == (uint16_t)elem_width(ao->elem_kind))
+            if (poff + 4u + units <= nins && width == (uint16_t)dvm__elem_width(ao->elem_kind))
                memcpy(ao->data, (const uint8_t *)&insns[poff + 4], (size_t)n * width);
          }
          fr->pc += 3;

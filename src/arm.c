@@ -73,6 +73,12 @@ static struct timespec    g_held_since;
  * is fixed and indexed directly: a label is an SVC number or one of the few
  * reserved ids below it, so there is nothing to allocate and nothing to lock. */
 static _Atomic unsigned long long g_tag_ns[ARM_LOCK_TAG_MAX];
+/* The longest single hold, and whose it was.  The summed table says which
+ * label costs the most in total; it cannot say which one stopped everything
+ * else for forty milliseconds in one go, and that is the number a guest with
+ * a periodic thread actually feels. */
+static _Atomic unsigned long long g_max_hold_ns;
+static _Atomic unsigned          g_max_hold_tag;
 static __thread unsigned t_tag;
 static __thread unsigned t_tag_saved;
 
@@ -108,6 +114,13 @@ unsigned long long arm_lock_wait_ns(void)
 unsigned long long arm_lock_max_wait_ns(void)
 {
    return atomic_exchange_explicit(&g_max_wait_ns, 0ull, memory_order_relaxed);
+}
+
+unsigned long long arm_lock_max_hold_ns(unsigned *tag_out)
+{
+   if (tag_out)
+      *tag_out = atomic_load_explicit(&g_max_hold_tag, memory_order_relaxed);
+   return atomic_exchange_explicit(&g_max_hold_ns, 0ull, memory_order_relaxed);
 }
 
 void arm_lock_acquire(void)
@@ -162,12 +175,34 @@ void arm_lock_release(void)
    pthread_mutex_lock(&g_m);
    struct timespec now;
    clock_gettime(CLOCK_MONOTONIC, &now);
-   const unsigned long long mine =
-      (unsigned long long)(now.tv_sec - g_held_since.tv_sec) * 1000000000ull +
-      (unsigned long long)now.tv_nsec -
-      (unsigned long long)g_held_since.tv_nsec;
+   /* tv_nsec borrows across the second boundary on roughly half of all
+    * releases (whenever now.tv_nsec < g_held_since.tv_nsec) -- computing
+    * that subtraction in unsigned before adding the whole-seconds term
+    * wrapped it to just under 2^64 ns instead of going negative, so "mine"
+    * came out around 18446744073709.5 ms on those releases. Since that beat
+    * every real hold, g_max_hold_ns latched onto the wrapped value instead
+    * of the actual longest hold almost as often as not -- the
+    * "[slice] longest single hold" line this feeds was reporting garbage,
+    * not a rare fluke. Do the subtraction in signed arithmetic, where a
+    * borrow is just a negative intermediate, and only convert to unsigned
+    * once the true (non-negative, the clock is monotonic) result is known. */
+   const long long mine_s =
+      (long long)(now.tv_sec - g_held_since.tv_sec) * 1000000000ll +
+      ((long long)now.tv_nsec - (long long)g_held_since.tv_nsec);
+   const unsigned long long mine = (unsigned long long)mine_s;
    atomic_fetch_add_explicit(&g_held_ns, mine, memory_order_relaxed);
    atomic_fetch_add_explicit(&g_tag_ns[t_tag], mine, memory_order_relaxed);
+   {
+      unsigned long long prev =
+         atomic_load_explicit(&g_max_hold_ns, memory_order_relaxed);
+      while (mine > prev &&
+             !atomic_compare_exchange_weak_explicit(
+                 &g_max_hold_ns, &prev, mine,
+                 memory_order_relaxed, memory_order_relaxed))
+         ;
+      if (mine >= prev)
+         atomic_store_explicit(&g_max_hold_tag, t_tag, memory_order_relaxed);
+   }
    struct arm_lock_waiter *w = g_head;
    if (w) {
       g_head = w->next;

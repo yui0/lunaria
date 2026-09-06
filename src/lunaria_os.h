@@ -160,6 +160,27 @@ int luna_os_disk_info(const char *path, uint64_t *total_bytes,
 void *luna_os_native_display(void);
 void *luna_os_native_window(void *glfw_window);
 
+/* ---- audio out ----------------------------------------------------------
+ *
+ * One PCM playback stream, which is what the guest's OpenSL ES / AAudio
+ * buffer queue turns into.  16-bit signed interleaved, because that is what
+ * an Android audio track carries and what every mixer in the guest already
+ * produces.
+ *
+ * The write is *not* allowed to block: it is called from the SVC that the
+ * guest's audio thread is inside, and that thread also holds the emulator's
+ * execution lock.  So the platform keeps a small ring and a thread of its own
+ * to hand it to the device; a write that finds the ring full drops the
+ * newest frames and says how many it took, which is a glitch — the honest
+ * outcome when the guest produces faster than the card consumes.
+ *
+ * Returns: open 0 on success (the stream is silent but harmless otherwise),
+ * write the number of frames accepted, queued_frames what is still to play. */
+int      luna_os_audio_open(unsigned rate, unsigned channels);
+int      luna_os_audio_write(const void *pcm16, unsigned frames);
+unsigned luna_os_audio_queued_frames(void);
+void     luna_os_audio_close(void);
+
 #ifdef __cplusplus
 }
 #endif

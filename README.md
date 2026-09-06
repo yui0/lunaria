@@ -66,6 +66,7 @@ make x86_64 -j"$(nproc)"   # host is x86_64; plain `make` builds the 32-bit x86 
 ./lunaria-apk.sh path/to/game.apk
 ./lunaria-apk.sh path/to/game.xapk
 ./lunaria-apk.sh path/to/game.apks
+LUNARIA_ALSA_DEVICE="hw:7,0" ./lunaria-apk.sh Cross+Worlds_5.03.04_APKPure.xapk
 ```
 
 The launcher detects `arm64-v8a` or `armeabi-v7a`, finds the main native

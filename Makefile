@@ -56,7 +56,8 @@ HOST_CPPFLAGS     = -DEGL_NO_PLATFORM_SPECIFIC_TYPES \
 HOST_GL_LIBS      = $(MAC_DEPS)/lib/libEGL.dylib $(MAC_DEPS)/lib/libGLESv2.dylib
 HOST_Z_LIBS       = $(MAC_SDK)/usr/lib/libz.tbd
 HOST_WINDOW_LIBS  = $(MAC_DEPS)/lib/libglfw3.a -framework Cocoa \
-	-framework IOKit -framework CoreFoundation -framework QuartzCore
+	-framework IOKit -framework CoreFoundation -framework QuartzCore \
+	-framework AudioToolbox
 HOST_CRYPTO_LIBS  = -L$(MAC_OPENSSL)/lib -lssl -lcrypto
 HOST_ICU_LIBS     = -licucore
 HOST_DL_LIBS      = runtime/libdl.so
@@ -76,6 +77,7 @@ OPENH264_SO       = runtime/libopenh264.dylib
 OPENH264_ARCH    ?= mac-arm64
 OPENH264_URL      = http://ciscobinary.openh264.org/libopenh264-$(OPENH264_VERSION)-$(OPENH264_ARCH).dylib.bz2
 PTHREAD_SRC       = src/lib/pthread_mac.c
+HOST_AUDIO_LIBS   =
 HOST_BIONIC_LIBC  =
 else
 HOST_CPPFLAGS     = $(shell pkg-config --cflags glfw3)
@@ -87,6 +89,9 @@ HOST_ICU_LIBS     = -licuuc
 HOST_DL_LIBS      = -ldl
 HOST_SYSTEM_DL_LIBS = -ldl
 HOST_RT_LIBS      = -lrt
+# The sound card, through src/alsa.h.  ALSA is the kernel's own audio API on
+# GNU/Linux — no daemon, no client library beyond this one.
+HOST_AUDIO_LIBS   = -lasound
 HOST_LIBC_LIBS    = $(shell pkg-config --libs libbsd libunwind)
 HOST_LIBC_LDFLAGS = -Wl,-wrap,_IO_file_xsputn
 HOST_SO_LDFLAGS   =
@@ -137,6 +142,54 @@ macos-deps:
 # https://android.googlesource.com/platform/ndk/+/ics-mr0/docs/CPU-ARCH-ABIS.html
 # you can also try compiling with your custom ABI with the all target,
 # but compatibility with android binaries is not guaranteed
+
+
+# ---------------------------------------------------------------------------
+# Real AArch64 Android platform libraries for the guest.
+#
+# Everything the emulator answers with an SVC thunk costs the guest a JIT exit,
+# and libm alone -- pow and sincosf -- measured 40% of every exit Cross Worlds
+# made.  Those are pure arithmetic that has no business leaving the JIT: give
+# the guest the same code a device runs and it stays inside it.
+#
+# The file is bionic's arm64 libm, which Google ships inside the SDK
+# build-tools archive (the renderscript intermediates are real AArch64 objects,
+# unlike the NDK sysroot stubs, which carry no code).  A local SDK or NDK is
+# used when there is one, so this only reaches the network when it has to.
+SYSLIB_DIR    ?= syslib-arm64
+SYSLIB_LIBM   := $(SYSLIB_DIR)/libm.so
+BUILD_TOOLS_ZIP ?= build-tools_r34-linux.zip
+BUILD_TOOLS_URL ?= https://dl.google.com/android/repository/$(BUILD_TOOLS_ZIP)
+
+syslib: $(SYSLIB_LIBM)
+
+$(SYSLIB_LIBM):
+	@mkdir -p $(SYSLIB_DIR)
+	@set -e; \
+	found=""; \
+	for root in "$$LUNARIA_ANDROID_SDK" "$$ANDROID_HOME" "$$ANDROID_SDK_ROOT" /root/image/android; do \
+	    [ -n "$$root" ] || continue; \
+	    cand=`find "$$root" -path '*/renderscript/lib/intermediates/arm64-v8a/libm.so' 2>/dev/null | head -1`; \
+	    if [ -n "$$cand" ]; then found="$$cand"; break; fi; \
+	done; \
+	if [ -n "$$found" ]; then \
+	    echo "syslib: using $$found"; \
+	    cp "$$found" $@; \
+	else \
+	    echo "syslib: fetching $(BUILD_TOOLS_URL)"; \
+	    tmp=`mktemp -d`; \
+	    curl -fsSL -o "$$tmp/bt.zip" "$(BUILD_TOOLS_URL)"; \
+	    entry=`unzip -Z1 "$$tmp/bt.zip" '*/renderscript/lib/intermediates/arm64-v8a/libm.so' | head -1`; \
+	    [ -n "$$entry" ] || { echo "syslib: no arm64 libm in the archive" >&2; rm -rf "$$tmp"; exit 1; }; \
+	    unzip -p "$$tmp/bt.zip" "$$entry" > $@; \
+	    rm -rf "$$tmp"; \
+	fi; \
+	head -c 20 $@ | od -An -tu1 -j18 -N1 | grep -q 183 || \
+	    { echo "syslib: $@ is not AArch64" >&2; rm -f $@; exit 1; }
+	@echo "syslib: $@ ready"
+
+syslib-clean:
+	rm -rf $(SYSLIB_DIR)
 
 x86:
 	$(MAKE) all \
@@ -263,14 +316,27 @@ arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/arm.h src/jvm/jvm.h src/binary12
 	    $(CPPFLAGS) -D_GNU_SOURCE \
 	    -c src/arm_exec.cpp -o $@
 
-binary128.o: src/binary128.cpp src/binary128.h
-	$(CXX) -std=c++20 -O2 -g -fPIC $(CPPFLAGS) -c src/binary128.cpp -o $@
+# Plain C11, and its own translation unit: the binary128 parser touches
+# nothing else in the emulator.  Not macOS-only despite the reason it exists —
+# AArch64 long double is binary128 on every host (see the file's header).
+binary128.o: src/binary128.c src/binary128.h
+	$(CC) -std=c11 -O2 -g -fPIC $(CPPFLAGS) -c src/binary128.c -o $@
 
 # arm.o: code common to the ARM32 and ARM64 execution paths, C11.  Currently
 # the ARM execution lock; anything else neither path owns alone belongs here
 # rather than in a file of its own.
 arm.o: src/arm.c src/arm.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -c src/arm.c -o $@
+
+# stb_vorbis.c: Sean Barrett's single-file Ogg Vorbis decoder (public domain /
+# MIT, vendored verbatim — see the file's own header for the license text).
+# Host decode for FVorbisAudioInfo::ReadCompressedData/StreamCompressedData —
+# see the SVC_STB_VORBIS_* block in arm_exec.cpp for why.  Its own warnings
+# are not this build's to fix (upstream, unmodified).
+stb_vorbis.o: src/lib/stb_vorbis.c
+	$(CC) -std=c11 -O2 -g -fPIC $(CPPFLAGS) -D_GNU_SOURCE \
+	    -Wno-unused-function -Wno-unused-variable -Wno-sign-compare \
+	    -c src/lib/stb_vorbis.c -o $@
 
 # loader.o: compiled as C11 (arm_exec.h is C-compatible)
 loader.o: src/loader.c src/arm_exec.h src/arm.h
@@ -303,7 +369,7 @@ lunaria_os.o: $(LUNA_OS_SRC) src/lunaria_os.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 	    -c $(LUNA_OS_SRC) -o $@
 
-lunaria: loader.o arm_exec.o binary128.o arm.o trace.o $(LUNA_OS_OBJ) libdl.so libpthread.so \
+lunaria: loader.o arm_exec.o binary128.o arm.o trace.o stb_vorbis.o $(LUNA_OS_OBJ) libdl.so libpthread.so \
        runtime/libpthread.so $(HOST_BIONIC_LIBC) \
        runtime/libandroid.so runtime/liblog.so \
        runtime/libEGL.so runtime/libOpenSLES.so \
@@ -312,10 +378,11 @@ lunaria: loader.o arm_exec.o binary128.o arm.o trace.o $(LUNA_OS_OBJ) libdl.so l
 lunaria: runtime/libvulkan.so
 	$(CXX) -std=c++20 -O2 -g $(HOST_EXPORT) \
 	    $(LUNARIA_LIBDIRS) $(HOST_RPATH) $(LDFLAGS) \
-	    loader.o arm_exec.o binary128.o arm.o trace.o $(LUNA_OS_OBJ) \
+	    loader.o arm_exec.o binary128.o arm.o trace.o stb_vorbis.o $(LUNA_OS_OBJ) \
 	    $(DYNARMIC_LIBS) \
 	    $(HOST_DL_LIBS) -lpthread -ljvm \
-	    $(HOST_WINDOW_LIBS) $(HOST_GL_LIBS) $(HOST_Z_LIBS) $(HOST_CRYPTO_LIBS) -o $@
+	    $(HOST_WINDOW_LIBS) $(HOST_GL_LIBS) $(HOST_Z_LIBS) $(HOST_CRYPTO_LIBS) \
+	    $(HOST_AUDIO_LIBS) -o $@
 
 install-bin: $(bins)
 	install -Dm755 $(bins) -t "$(DESTDIR)$(PREFIX)$(BINDIR)"
@@ -327,7 +394,7 @@ install: install-bin install-lib
 
 clean:
 	$(RM) $(bins) trace.o arm_exec.o binary128.o arm.o loader.o lunaria_os.o luna_overlay.o luna_boot.o \
-	    libdl.so libpthread.so
+	    stb_vorbis.o libdl.so libpthread.so
 	$(RM) -r runtime
 	$(RM) test/test_dynarmic_arm test/test_unity test/test_dvm test/dvm_test.dex
 	$(RM) test/test_boot_card
@@ -527,8 +594,9 @@ test/test_dynarmic_arm: test/test_dynarmic_arm.cpp $(DYNARMIC_LIB)
 	    $(DYNARMIC_LIBS) \
 	    -lpthread -o $@
 
-test/test_binary128: test/binary128_test.cpp src/binary128.cpp src/binary128.h
-	$(CXX) -std=c++20 -O2 -g -Isrc test/binary128_test.cpp src/binary128.cpp -o $@
+test/test_binary128: test/binary128_test.cpp src/binary128.c src/binary128.h
+	$(CC) -std=c11 -O2 -g -Isrc -c src/binary128.c -o test/binary128_c.o
+	$(CXX) -std=c++20 -O2 -g -Isrc test/binary128_test.cpp test/binary128_c.o -o $@
 
 binary128-test: test/test_binary128
 	./test/test_binary128
@@ -596,7 +664,7 @@ $(OPENH264_SO):
 # Aggregate: download all sample APKs used for development / regression.
 fetch: fetch-libunity fetch-btw fetch-blade-soul fetch-openh264
 
-.PHONY: all host-all macos-deps x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
+.PHONY: all syslib syslib-clean host-all macos-deps x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
 	        clean install install-bin install-lib test net-test dvm-test abi-test \
 	        posix-test boot-card-test binary128-test \
         fetch fetch-libunity fetch-btw fetch-blade-soul fetch-openh264 \

@@ -101,6 +101,8 @@ RT_BUILTIN_DECL(view_get_drawing_rect);
 RT_BUILTIN_DECL(view_get_visible_display_frame);
 RT_BUILTIN_DECL(view_request_layout);
 RT_BUILTIN_DECL(view_clear_focus);
+RT_BUILTIN_DECL(view_request_focus);
+RT_BUILTIN_DECL(view_has_focus);
 RT_BUILTIN_DECL(rect_width);
 RT_BUILTIN_DECL(rect_height);
 RT_BUILTIN_DECL(text_set_width);
@@ -8799,10 +8801,24 @@ static const struct rt_method rt_reflect_field[] = {
 };
 
 /* sun.misc.Unsafe is used by desugared java.util.concurrent itself.  A field
- * offset is represented by its reflected Field handle; array offsets use the
- * element index (base 0, scale 1).  Guest bytecode is single-threaded within a
- * slice, so compare/read/write is atomic with respect to every other guest
- * operation. */
+ * offset is represented by its reflected Field handle; an array offset is a
+ * byte offset from arrayBaseOffset() (0 here) scaled by arrayIndexScale(),
+ * exactly as on a device.  It used to be the raw element index, with the scale
+ * reported as 1 — but a caller does not read elements at the offsets it was
+ * given, it computes them: rx's SpscArrayQueue accepts only a 4- or 8-byte
+ * reference scale and threw "Unknown pointer size" out of <clinit> for every
+ * queue class it has.  Guest bytecode is single-threaded within a slice, so
+ * compare/read/write is atomic with respect to every other guest operation. */
+
+/* Element index for the byte offset a caller derived from arrayIndexScale().
+ * Negative or unaligned offsets name no element; -1 keeps them out of the
+ * payload rather than truncating them into it. */
+static int64_t unsafe_array_index(const struct dvm_object *o, int64_t offset)
+{
+   int w = dvm__elem_width(o->elem_kind);
+   if (offset < 0 || offset % w) return -1;
+   return offset / w;
+}
 static struct dvm_field *unsafe_field(struct dvm *vm, int64_t offset)
 {
    dvm_ref ref = (dvm_ref)offset;
@@ -8858,16 +8874,16 @@ static bool unsafe_put_prim(struct dvm *vm, dvm_ref self,
    RETV();
 }
 
-/* Array element access.  arrayBaseOffset/arrayIndexScale report 0/1 here, so
- * the "address" a caller computes is the element index — the same convention
- * the object/CAS accessors above already use. */
+/* Array element access.  arrayBaseOffset() is 0 and arrayIndexScale() is the
+ * element width, so the "address" a caller computes divides back to the index
+ * — the same convention the object/CAS accessors above already use. */
 static bool unsafe_array_or_field_get(struct dvm *vm, dvm_ref self,
                                       const union dvm_value *args, int nargs,
                                       union dvm_value *out, char kind)
 {
    struct dvm_object *o = dvm__obj(vm, ARG(0).l);
    if (o && o->kind == DVM_OBJ_ARRAY && o->data) {
-      int64_t index = ARG(1).j;
+      int64_t index = unsafe_array_index(o, ARG(1).j);
       if (index < 0 || (uint64_t)index >= o->length) RETJ(0);
       union dvm_value v = { 0 };
       switch (kind) {
@@ -8893,7 +8909,7 @@ static bool unsafe_array_or_field_put(struct dvm *vm, dvm_ref self,
 {
    struct dvm_object *o = dvm__obj(vm, ARG(0).l);
    if (o && o->kind == DVM_OBJ_ARRAY && o->data) {
-      int64_t index = ARG(1).j;
+      int64_t index = unsafe_array_index(o, ARG(1).j);
       if (index < 0 || (uint64_t)index >= o->length) RETV();
       switch (kind) {
          case 'B': ((int8_t *)o->data)[index]   = (int8_t)args[2].i;   break;
@@ -8962,8 +8978,11 @@ static bool unsafe_arrayIndexScale(struct dvm *vm, dvm_ref self,
                                    const union dvm_value *args, int nargs,
                                    union dvm_value *out)
 {
-   (void)vm; (void)self; (void)args; (void)nargs;
-   RETI(1);
+   (void)self; (void)nargs;
+   struct dvm_object *co = dvm__obj(vm, ARG(0).l);
+   struct dvm_class *k = co ? co->klass : NULL;
+   /* 0 is what a device answers for a class that is not an array type. */
+   RETI(k && k->is_array ? dvm__elem_width(k->elem_kind) : 0);
 }
 
 static bool unsafe_cas_int(struct dvm *vm, dvm_ref self,
@@ -8974,7 +8993,7 @@ static bool unsafe_cas_int(struct dvm *vm, dvm_ref self,
    dvm_ref object = ARG(0).l;
    struct dvm_object *o = dvm__obj(vm, object);
    if (o && o->kind == DVM_OBJ_ARRAY) {
-      int64_t index = ARG(1).j;
+      int64_t index = unsafe_array_index(o, ARG(1).j);
       int32_t *items = dvm_array_data(vm, object);
       if (index < 0 || (uint64_t)index >= dvm_array_length(vm, object)) RETI(0);
       if (items[index] != ARG(2).i) RETI(0);
@@ -9012,7 +9031,7 @@ static bool unsafe_cas_object(struct dvm *vm, dvm_ref self,
    dvm_ref object = ARG(0).l;
    struct dvm_object *o = dvm__obj(vm, object);
    if (o && o->kind == DVM_OBJ_ARRAY) {
-      int64_t index = ARG(1).j;
+      int64_t index = unsafe_array_index(o, ARG(1).j);
       dvm_ref *items = dvm_array_data(vm, object);
       if (index < 0 || (uint64_t)index >= dvm_array_length(vm, object)) RETI(0);
       if (items[index] != ARG(2).l) RETI(0);
@@ -9036,7 +9055,7 @@ static bool unsafe_get_object(struct dvm *vm, dvm_ref self,
    (void)self; (void)nargs;
    struct dvm_object *o = dvm__obj(vm, ARG(0).l);
    if (o && o->kind == DVM_OBJ_ARRAY) {
-      int64_t index = ARG(1).j;
+      int64_t index = unsafe_array_index(o, ARG(1).j);
       dvm_ref *items = dvm_array_data(vm, ARG(0).l);
       RETL(items && index >= 0 && (uint64_t)index < dvm_array_length(vm, ARG(0).l)
               ? items[index] : 0);
@@ -9054,7 +9073,7 @@ static bool unsafe_put_object(struct dvm *vm, dvm_ref self,
    (void)self; (void)nargs; (void)out;
    struct dvm_object *o = dvm__obj(vm, ARG(0).l);
    if (o && o->kind == DVM_OBJ_ARRAY) {
-      int64_t index = ARG(1).j;
+      int64_t index = unsafe_array_index(o, ARG(1).j);
       dvm_ref *items = dvm_array_data(vm, ARG(0).l);
       if (items && index >= 0 && (uint64_t)index < dvm_array_length(vm, ARG(0).l))
          items[index] = ARG(2).l;
@@ -12082,6 +12101,49 @@ static bool arrays_fill_object(struct dvm *vm, dvm_ref self,
    RETV();
 }
 
+/* Arrays.fill for the primitive arrays.
+ *
+ * Only the Object[] forms were modelled, so every primitive fill resolved to
+ * nothing and returned — leaving the array at whatever it already held.  That
+ * is not a slow path, it is a wrong answer: Play Billing's zzci.zzg() fills a
+ * byte[] before writing its own bytes into it, and code that pads a buffer or
+ * resets a table this way reads back stale contents with no error anywhere.
+ *
+ * The store width comes from the array itself, not from the descriptor, so one
+ * implementation covers every element type and a boolean[] filled with `true`
+ * still stores 1. */
+static bool arrays_fill_prim(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)self; (void)out;
+   struct dvm_object *a = ARG(0).l ? dvm__obj(vm, ARG(0).l) : NULL;
+   if (!a || a->kind != DVM_OBJ_ARRAY || !a->data) return true;
+   const bool ranged = nargs >= 4;
+   int32_t from = ranged ? ARG(1).i : 0;
+   int32_t to   = ranged ? ARG(2).i : (int32_t)a->length;
+   const union dvm_value v = ranged ? args[3] : args[1];
+   if (from < 0 || to < from || (uint32_t)to > a->length) {
+      dvm__throw(vm, "java/lang/ArrayIndexOutOfBoundsException",
+                 "fill %d..%d of %u", from, to, a->length);
+      return false;
+   }
+   for (int32_t i = from; i < to; ++i) {
+      switch (a->elem_kind) {
+         case 'Z': ((uint8_t  *)a->data)[i] = v.i ? 1 : 0;     break;
+         case 'B': ((int8_t   *)a->data)[i] = (int8_t)v.i;     break;
+         case 'C': ((uint16_t *)a->data)[i] = (uint16_t)v.i;   break;
+         case 'S': ((int16_t  *)a->data)[i] = (int16_t)v.i;    break;
+         case 'I': ((int32_t  *)a->data)[i] = v.i;             break;
+         case 'J': ((int64_t  *)a->data)[i] = v.j;             break;
+         case 'F': ((float    *)a->data)[i] = v.f;             break;
+         case 'D': ((double   *)a->data)[i] = v.d;             break;
+         default:  return true;   /* a reference array; the Object[] form owns it */
+      }
+   }
+   RETV();
+}
+
 /* Arrays.binarySearch.
  *
  * Play Core resolves an install-time asset pack by looking its name up in
@@ -12308,6 +12370,22 @@ static const struct rt_method rt_arrays[] = {
       arrays_copyOfRange),
    SM("fill", "([Ljava/lang/Object;Ljava/lang/Object;)V", arrays_fill_object),
    SM("fill", "([Ljava/lang/Object;IILjava/lang/Object;)V", arrays_fill_object),
+   SM("fill", "([ZZ)V",   arrays_fill_prim),
+   SM("fill", "([ZIIZ)V", arrays_fill_prim),
+   SM("fill", "([BB)V",   arrays_fill_prim),
+   SM("fill", "([BIIB)V", arrays_fill_prim),
+   SM("fill", "([CC)V",   arrays_fill_prim),
+   SM("fill", "([CIIC)V", arrays_fill_prim),
+   SM("fill", "([SS)V",   arrays_fill_prim),
+   SM("fill", "([SIIS)V", arrays_fill_prim),
+   SM("fill", "([II)V",   arrays_fill_prim),
+   SM("fill", "([IIII)V", arrays_fill_prim),
+   SM("fill", "([JJ)V",   arrays_fill_prim),
+   SM("fill", "([JIIJ)V", arrays_fill_prim),
+   SM("fill", "([FF)V",   arrays_fill_prim),
+   SM("fill", "([FIIF)V", arrays_fill_prim),
+   SM("fill", "([DD)V",   arrays_fill_prim),
+   SM("fill", "([DIID)V", arrays_fill_prim),
    M_END,
 };
 
@@ -16988,7 +17066,11 @@ static bool looper_my(struct dvm *vm, dvm_ref self,
 static bool looper_get(struct dvm *vm, dvm_ref self,
                        const union dvm_value *args, int nargs,
                        union dvm_value *out);
-extern dvm_ref g_current_looper;
+static bool looper_loop(struct dvm *vm, dvm_ref self,
+                        const union dvm_value *args, int nargs,
+                        union dvm_value *out);
+static void looper_bind_to_current_thread(dvm_ref looper);
+extern __thread dvm_ref g_current_looper;
 
 static bool h_init(struct dvm *vm, dvm_ref self,
                    const union dvm_value *args, int nargs,
@@ -17482,6 +17564,53 @@ static bool ht_getLooper(struct dvm *vm, dvm_ref self,
    RETL(looper.l);
 }
 
+/* HandlerThread.run(): the platform's body is
+ *
+ *     Looper.prepare(); onLooperPrepared(); Looper.loop();
+ *
+ * and without it the Looper getLooper() hands out belongs to no thread at all.
+ * A Handler built on it tags every post with that Looper, and the general
+ * drain deliberately leaves tagged entries to the loop that owns them — so
+ * nothing ever ran them and the queue only grew.  That is not a dropped
+ * callback the app can notice: it is a callback that stays forever pending.
+ * Genshin's boot waits on exactly one such post and stopped there with every
+ * guest thread parked, the interpreter 100% idle, and one Runnable due since
+ * the moment it was posted. */
+static bool ht_run(struct dvm *vm, dvm_ref self,
+                   const union dvm_value *args, int nargs,
+                   union dvm_value *out)
+{
+   union dvm_value looper = { 0 };
+   if (!ht_getLooper(vm, self, args, nargs, &looper) || !looper.l) RETV();
+   looper_bind_to_current_thread(looper.l);
+   /* A subclass's onLooperPrepared() runs between prepare() and loop(), which
+    * is the only window in which it may build Handlers against this Looper. */
+   struct dvm_class *c = dvm_object_class(vm, self);
+   struct dvm_method *prep =
+      c ? dvm_find_method(vm, c, "onLooperPrepared", "()V") : NULL;
+   if (prep && (prep->has_code || prep->builtin)) {
+      union dvm_value ret = { 0 };
+      (void)dvm_call(vm, prep, self, NULL, 0, &ret);
+   }
+   return looper_loop(vm, looper.l, args, 0, out);
+}
+
+/* quit()/quitSafely(): the loop run() started has to be able to end, or the
+ * host thread outlives the HandlerThread that owns it. */
+static bool ht_quit(struct dvm *vm, dvm_ref self,
+                    const union dvm_value *args, int nargs,
+                    union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value looper = { 0 };
+   (void)dvm_get_field(vm, self, "looper", "Landroid/os/Looper;", &looper);
+   if (looper.l) {
+      union dvm_value t = { .i = 1 };
+      (void)dvm_set_field(vm, looper.l, "quit", "Z", t);
+   }
+   RETI(1);
+}
+
 static const struct rt_field rt_handler_thread_fields[] = {
    { "name", "Ljava/lang/String;" },
    { "looper", "Landroid/os/Looper;" }, F_END
@@ -17491,9 +17620,10 @@ static const struct rt_method rt_handler_thread[] = {
    M("<init>", "(Ljava/lang/String;)V", ht_init),
    M("<init>", "(Ljava/lang/String;I)V", ht_init),
    M("start", "()V", t_start),
+   M("run", "()V", ht_run),
    M("getLooper", "()Landroid/os/Looper;", ht_getLooper),
-   M("quit", "()Z", ret_true),
-   M("quitSafely", "()Z", ret_true),
+   M("quit", "()Z", ht_quit),
+   M("quitSafely", "()Z", ht_quit),
    M_END,
 };
 
@@ -22463,8 +22593,26 @@ static const struct rt_method rt_secure_random[] = {
  * Looper to this thread, Handler() takes myLooper(), loop() blocks until quit.
  */
 static dvm_ref g_main_looper;
-dvm_ref g_current_looper;   /* NULL: the main looper is running */
+/* The looper a dispatch is deliberately running under, per host thread: a
+ * Message posted to a HandlerThread's Handler is run by whichever host thread
+ * picks the queue up, wearing that looper's identity.  It has to outrank the
+ * thread's own prepared looper — the pump prepares the main looper the first
+ * time anything asks for it, so consulting that first answered "main" for
+ * every dispatch and Play services' Preconditions.checkHandlerThread() threw
+ * "Must be called on GoogleApiHandler thread, but got main". */
+__thread dvm_ref g_current_looper;   /* NULL: this thread's own looper */
 static __thread dvm_ref t_prepared_looper;  /* Looper.prepare() for this host thread */
+
+/* Adopt an already-minted Looper as this host thread's own.
+ *
+ * HandlerThread.getLooper() hands its Looper out before the thread's run()
+ * gets anywhere near prepare(), and posts made in between are already tagged
+ * with that object — so run() has to bind the one that exists rather than
+ * mint a second one nothing is addressed to. */
+static void looper_bind_to_current_thread(dvm_ref looper)
+{
+   if (looper) t_prepared_looper = looper;
+}
 
 static dvm_ref looper_main(struct dvm *vm)
 {
@@ -22496,8 +22644,8 @@ static bool looper_my(struct dvm *vm, dvm_ref self,
                       union dvm_value *out)
 {
    (void)self; (void)args; (void)nargs;
-   if (t_prepared_looper) RETL(t_prepared_looper);
    if (g_current_looper) RETL(g_current_looper);
+   if (t_prepared_looper) RETL(t_prepared_looper);
    /* The pump thread is the main looper without an explicit prepare(). */
    if (!dvm_on_bytecode_thread()) RETL(looper_main(vm));
    RETL(0);
@@ -22525,8 +22673,8 @@ static bool looper_isCurrentThread(struct dvm *vm, dvm_ref self,
                                    union dvm_value *out)
 {
    (void)args; (void)nargs;
-   dvm_ref now = t_prepared_looper ? t_prepared_looper
-                                   : (g_current_looper ? g_current_looper
+   dvm_ref now = g_current_looper ? g_current_looper
+                                  : (t_prepared_looper ? t_prepared_looper
                                                        : looper_main(vm));
    RETI(self == now);
 }
@@ -27159,8 +27307,42 @@ static bool file_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
     * IL2CPP extract wrote Managed trees onto the host root. */
    if (a && *a && b) {
       size_t n = strlen(a);
+      /* An absolute child is still a child — java.io.File pastes it under the
+       * parent — but on a device "absolute" means the device's own tree, and
+       * here it means the host's.  Pasting one of our directories under
+       * another repeats the whole data root inside the name
+       * (".../cache//var/lunaria/data/<pkg>/no_backup/x").  Nothing reads
+       * those names, but they are what the app then opens, prints and hashes,
+       * and PATH_MAX is finite.  Keep the child relative to the root it
+       * already names. */
+      const char *child = b;
+      if (child[0] == '/') {
+         /* Strip the deepest of our own roots the child already names: the
+          * package's own directory first (".../data/<pkg>"), then the data
+          * root.  What is left is the part that actually distinguishes the
+          * file. */
+         const char *files = getenv("ANDROID_FILES_DIR");
+         char pkgdir[PATH_MAX];
+         const char *roots[2] = { NULL, getenv("LUNARIA_DATA_ROOT") };
+         if (files && *files) {
+            snprintf(pkgdir, sizeof pkgdir, "%s", files);
+            char *slash = strrchr(pkgdir, '/');
+            if (slash && slash != pkgdir) { *slash = '\0'; roots[0] = pkgdir; }
+         }
+         for (int i = 0; i < 2; ++i) {
+            const char *root = roots[i];
+            size_t rlen = root ? strlen(root) : 0u;
+            while (rlen && root[rlen - 1] == '/') --rlen;
+            if (rlen && strncmp(child, root, rlen) == 0 && child[rlen] == '/') {
+               child += rlen;
+               break;
+            }
+         }
+         while (child[0] == '/' && child[1] == '/') ++child;
+      }
       snprintf(joined, sizeof joined, "%s%s%s", a,
-               (n && a[n - 1] == '/') ? "" : "/", b);
+               (n && a[n - 1] == '/') ? "" :
+                  (child[0] == '/' ? "" : "/"), child);
    } else if (b) {
       snprintf(joined, sizeof joined, "%s", b);
    } else {
@@ -31160,10 +31342,16 @@ static const struct rt_field rt_window_fields[] = {
    { "callback", "Landroid/view/Window$Callback;" },
    { "decorView", "Landroid/view/View;" },
    { "contentView", "Landroid/view/View;" },
-   { "surfaceCallback", "Landroid/view/SurfaceHolder$Callback2;" }, F_END,
+   { "surfaceCallback", "Landroid/view/SurfaceHolder$Callback2;" },
+   { "background", "Landroid/graphics/drawable/Drawable;" }, F_END,
 };
 
 static const struct rt_field rt_window_layout_params_fields[] = {
+   /* Where the window goes and how big it is.  width/height come from
+    * ViewGroup.LayoutParams, but the placement is this class's own and the
+    * emulator has to honour it: without them every window was drawn over the
+    * whole display. */
+   { "gravity", "I" }, { "x", "I" }, { "y", "I" },
    { "layoutInDisplayCutoutMode", "I" },
    /* Window.setSoftInputMode() writes here on a device, and
     * getAttributes().softInputMode is where callers read it back. */
@@ -31171,6 +31359,72 @@ static const struct rt_field rt_window_layout_params_fields[] = {
    { "flags", "I" },
    F_END,
 };
+
+static bool window_set_background(struct dvm *vm, dvm_ref self,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   (void)dvm_set_field(vm, self, "background",
+                       "Landroid/graphics/drawable/Drawable;", ARG(0));
+   RETV();
+}
+
+static bool window_get_background(struct dvm *vm, dvm_ref self,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "background",
+                       "Landroid/graphics/drawable/Drawable;", &v);
+   RETL(v.l);
+}
+
+static bool window_set_background_resource(struct dvm *vm, dvm_ref self,
+                                           const union dvm_value *args,
+                                           int nargs, union dvm_value *out)
+{
+   union dvm_value drawable = { 0 };
+   if (!res_get_drawable(vm, self, args, nargs, &drawable)) return false;
+   (void)dvm_set_field(vm, self, "background",
+                       "Landroid/graphics/drawable/Drawable;", drawable);
+   (void)out;
+   RETV();
+}
+
+/* Window.setLayout(width, height) and Window.setGravity(gravity).
+ *
+ * These are how an app sizes and places its own window, and both were
+ * dropped.  With them gone every window the emulator drew was whatever the
+ * LayoutParams defaulted to — MATCH_PARENT — so a notification banner that
+ * asks to be a strip near the top came out as tall as the display, with its
+ * close button pushed to the corner of the screen instead of the corner of
+ * the panel.  They write the same fields getAttributes() hands back, which is
+ * where the platform keeps them and where the compositing side reads them. */
+static bool window_set_layout(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   union dvm_value lp = { 0 };
+   if (!window_get_attributes(vm, self, NULL, 0, &lp) || !lp.l) RETV();
+   union dvm_value w = { .i = nargs > 0 ? ARG(0).i : 0 };
+   union dvm_value h = { .i = nargs > 1 ? ARG(1).i : 0 };
+   (void)dvm_set_field(vm, lp.l, "width", "I", w);
+   (void)dvm_set_field(vm, lp.l, "height", "I", h);
+   RETV();
+}
+
+static bool window_set_gravity(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   union dvm_value lp = { 0 };
+   if (!window_get_attributes(vm, self, NULL, 0, &lp) || !lp.l) RETV();
+   union dvm_value g = { .i = nargs > 0 ? ARG(0).i : 0 };
+   (void)dvm_set_field(vm, lp.l, "gravity", "I", g);
+   RETV();
+}
 
 static const struct rt_method rt_window[] = {
    M("getDecorView", "()Landroid/view/View;", window_getDecorView),
@@ -31191,11 +31445,17 @@ static const struct rt_method rt_window[] = {
    M("addFlags", "(I)V", window_add_flags),
    M("clearFlags", "(I)V", window_clear_flags),
    M("setDimAmount", "(F)V", nop_void),
-   M("setGravity", "(I)V", nop_void),
-   M("setLayout", "(II)V", nop_void),
+   M("setGravity", "(I)V", window_set_gravity),
+   M("setLayout", "(II)V", window_set_layout),
+   /* The window's background drawable.  Nothing composites it here, but the
+      caller owns the object and reads it back (WebViewDialog builds a
+      transparent ColorDrawable and hands it over); dropping it answered null
+      to the next getter. */
    M("setBackgroundDrawable", "(Landroid/graphics/drawable/Drawable;)V",
-     nop_void),
-   M("setBackgroundDrawableResource", "(I)V", nop_void),
+     window_set_background),
+   M("getBackgroundDrawable", "()Landroid/graphics/drawable/Drawable;",
+     window_get_background),
+   M("setBackgroundDrawableResource", "(I)V", window_set_background_resource),
    M("setSoftInputMode", "(I)V", window_set_soft_input_mode),
    M("takeSurface", "(Landroid/view/SurfaceHolder$Callback2;)V",
      window_take_surface),
@@ -31464,6 +31724,8 @@ VIEW_SET_L(view_set_content_description, "contentDescription",
            "Ljava/lang/CharSequence;")
 VIEW_GET_L(view_get_content_description, "contentDescription",
            "Ljava/lang/CharSequence;")
+VIEW_SET_L(view_set_focus_listener, "focusChangeListener",
+           "Landroid/view/View$OnFocusChangeListener;")
 VIEW_SET_L(view_set_click_listener, "clickListener", "Landroid/view/View$OnClickListener;")
 VIEW_SET_L(view_set_touch_listener, "touchListener", "Landroid/view/View$OnTouchListener;")
 #undef VIEW_SET_I
@@ -31771,6 +32033,12 @@ static const struct rt_field rt_view_fields[] = {
    { "sysUiVisibility", "I" },
    { "sysUiDispatching", "Z" },
    { "sysUiListener", "Landroid/view/View$OnSystemUiVisibilityChangeListener;" },
+   /* Input focus, and who wants to hear about it changing.  GameActivity
+      hangs a focus listener on its virtual-keyboard box and closes the IME
+      when the box loses focus; with the listener dropped on the floor the
+      keyboard stayed up for the rest of the session. */
+   { "focused", "Z" },
+   { "focusChangeListener", "Landroid/view/View$OnFocusChangeListener;" },
    /* The accessibility label.  Storing it costs a slot and makes
       getContentDescription() answer what was set instead of null. */
    { "contentDescription", "Ljava/lang/CharSequence;" },
@@ -32324,7 +32592,9 @@ static const struct rt_method rt_view[] = {
    M("getBottom", "()I", view_get_bottom),
    M("getScrollX", "()I", view_get_scroll_x),
    M("scrollTo", "(II)V", view_scroll_to),
-   M("requestFocus", "()Z", ret_true),
+   M("requestFocus", "()Z", view_request_focus),
+   M("hasFocus", "()Z", view_has_focus),
+   M("isFocused", "()Z", view_has_focus),
    M("clearFocus", "()V", view_clear_focus),
    M("setX", "(F)V", view_set_x),
    M("setY", "(F)V", view_set_y),
@@ -32340,7 +32610,7 @@ static const struct rt_method rt_view[] = {
      "(Landroid/view/View$OnSystemUiVisibilityChangeListener;)V",
      view_set_sysui_listener),
    M("setOnFocusChangeListener", "(Landroid/view/View$OnFocusChangeListener;)V",
-     nop_void),
+     view_set_focus_listener),
    M("getLocationInWindow", "([I)V", view_get_location),
    M("getLocationOnScreen", "([I)V", view_get_location),
    M("getWindowToken", "()Landroid/os/IBinder;", view_get_window_token),
@@ -32929,6 +33199,14 @@ static bool drawable_clear_color_filter(struct dvm *vm, dvm_ref self,
    return drawable_set_color_filter(vm, self, &v, 1, out);
 }
 
+static bool drawable_get_state(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)self; (void)args; (void)nargs;
+   RETL(dvm_new_array(vm, 'I', NULL, 0));
+}
+
 static const struct rt_method rt_drawable[] = {
    SM("resolveOpacity", "(II)I", drawable_resolve_opacity),
    M("mutate", "()Landroid/graphics/drawable/Drawable;", drawable_mutate),
@@ -32945,6 +33223,11 @@ static const struct rt_method rt_drawable[] = {
    M("getLevel", "()I", drawable_get_level),
    M("setLevel", "(I)Z", drawable_set_level),
    M("isStateful", "()Z", ret_false),
+   /* getState() is the current state set — empty for a drawable nobody has
+      given states to, which is what Android's own Drawable returns.  Answering
+      null instead made every caller that iterates it throw. */
+   M("getState", "()[I", drawable_get_state),
+   M("setState", "([I)Z", ret_false),
    M("setLayoutDirection", "(I)Z", drawable_set_layout_direction),
    M("setVisible", "(ZZ)Z", drawable_set_visible),
    M("setCallback", "(Landroid/graphics/drawable/Drawable$Callback;)V",
@@ -34676,6 +34959,32 @@ static bool res_getString(struct dvm *vm, dvm_ref self,
    RETL(dvm_new_string(vm, buf));
 }
 
+/* Resources.getStringArray(int) — a <string-array> resource.
+ *
+ * The compiled table this runtime reads answers single values, not arrays, so
+ * for a resource it cannot expand the honest answer is an *empty* array: the
+ * caller iterates it and finds nothing, which is what an array with no
+ * entries means.  Null — the unresolved answer — is what threw. */
+static bool res_get_string_array(struct dvm *vm, dvm_ref self,
+                                 const union dvm_value *args, int nargs,
+                                 union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   const char *value = NULL;
+   int32_t iv = 0;
+   const int kind =
+      arm_exec_apk_resource_value((uint32_t)ARG(0).i, &iv, &value);
+   /* A single string where an array was asked for is a one-element array —
+      the shape the caller expects. */
+   const uint32_t n = (kind == 'L' && value && *value) ? 1u : 0u;
+   dvm_ref arr = dvm_new_array(vm, 'L', "Ljava/lang/String;", n);
+   if (arr && n) {
+      dvm_ref *slots = dvm_array_data(vm, arr);
+      if (slots) slots[0] = dvm_new_string(vm, value);
+   }
+   RETL(arr);
+}
+
 static bool res_getIdentifier(struct dvm *vm, dvm_ref self,
                               const union dvm_value *args, int nargs,
                               union dvm_value *out)
@@ -34805,6 +35114,19 @@ static bool res_get_color_state_list(struct dvm *vm, dvm_ref self,
    RETL(color_state_list_new(vm, value));
 }
 
+/* Resources.getColor(int) — the packed ARGB of a colour resource.  Left
+ * unresolved it answered 0, transparent black, so a widget that asks the
+ * theme for its own colour drew invisible. */
+static bool res_get_color(struct dvm *vm, dvm_ref self,
+                          const union dvm_value *args, int nargs,
+                          union dvm_value *out)
+{
+   (void)vm; (void)self; (void)nargs;
+   int32_t value = 0; const char *string = NULL;
+   (void)arm_exec_apk_resource_value((uint32_t)ARG(0).i, &value, &string);
+   RETI(value);
+}
+
 static bool res_get_drawable(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
                              union dvm_value *out)
@@ -34859,6 +35181,13 @@ static const struct rt_method rt_resources[] = {
    M("getColorStateList",
      "(ILandroid/content/res/Resources$Theme;)Landroid/content/res/ColorStateList;",
      res_get_color_state_list),
+   /* getColor() is the packed ARGB of a colour resource.  Unresolved it
+      answered 0 — transparent black — so a widget that asks the theme for its
+      own colour drew invisible. */
+   M("getColor", "(I)I", res_get_color),
+   M("getColor", "(ILandroid/content/res/Resources$Theme;)I", res_get_color),
+   M("getStringArray", "(I)[Ljava/lang/String;", res_get_string_array),
+   M("getTextArray", "(I)[Ljava/lang/CharSequence;", res_get_string_array),
    M("getDrawable", "(I)Landroid/graphics/drawable/Drawable;", res_get_drawable),
    M("getConfiguration", "()Landroid/content/res/Configuration;",
      res_getConfiguration),
@@ -35332,8 +35661,21 @@ static bool color_state_init(struct dvm *vm, dvm_ref self,
 static const struct rt_field rt_color_state_fields[] = {
    { "color", "I" }, { "stateSpecs", "[[I" }, { "colors", "[I" }, F_END
 };
+/* ColorStateList.valueOf(int) — the single-colour list every widget uses when
+ * it is handed a plain colour.  Unresolved it answered null, and the caller
+ * then either drew with no colour at all (CardView's background) or threw on
+ * the null it stored. */
+static bool color_state_value_of(struct dvm *vm, dvm_ref self,
+                                 const union dvm_value *args, int nargs,
+                                 union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   RETL(color_state_list_new(vm, ARG(0).i));
+}
+
 static const struct rt_method rt_color_state[] = {
    M("<init>", "([[I[I)V", color_state_init),
+   SM("valueOf", "(I)Landroid/content/res/ColorStateList;", color_state_value_of),
    M("getDefaultColor", "()I", color_state_default), M_END,
 };
 
@@ -35352,6 +35694,26 @@ static const struct rt_method rt_resources_theme[] = {
    M("rebase", "()V", nop_void),
    M_END,
 };
+
+static bool activity_set_volume_stream(struct dvm *vm, dvm_ref self,
+                                       const union dvm_value *args, int nargs,
+                                       union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   (void)dvm_set_field(vm, self, "volumeControlStream", "I", ARG(0));
+   RETV();
+}
+
+static bool activity_get_volume_stream(struct dvm *vm, dvm_ref self,
+                                       const union dvm_value *args, int nargs,
+                                       union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { .i = INT32_MIN }; /* USE_DEFAULT_STREAM_TYPE */
+   if (!dvm_get_field(vm, self, "volumeControlStream", "I", &v))
+      v.i = INT32_MIN;
+   RETI(v.i);
+}
 
 static bool cw_attachBaseContext(struct dvm *vm, dvm_ref self,
                                  const union dvm_value *args, int nargs,
@@ -35607,7 +35969,10 @@ static const struct rt_field rt_activity_fields[] = {
    { "application", "Landroid/app/Application;" },
    { "window", "Landroid/view/Window;" },
    { "fragmentManager", "Landroid/app/FragmentManager;" },
-   { "destroyed", "Z" }, { "finishing", "Z" }, F_END,
+   { "destroyed", "Z" }, { "finishing", "Z" },
+   /* setVolumeControlStream()'s value, so getVolumeControlStream() answers
+      what was set rather than a constant. */
+   { "volumeControlStream", "I" }, F_END,
 };
 
 static bool act_is_destroyed(struct dvm *vm, dvm_ref self,
@@ -35890,7 +36255,12 @@ static const struct rt_method rt_activity[] = {
      "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
      act_add_content_view),
    M("findViewById", "(I)Landroid/view/View;", act_find_view_by_id),
-   M("setVolumeControlStream", "(I)V", nop_void),
+   /* setVolumeControlStream(int): which stream the hardware volume keys move
+      while this activity is in front.  There are no volume keys here, but the
+      value reads back — an activity that sets it and checks is entitled to
+      see its own write, and Android's default is USE_DEFAULT_STREAM_TYPE. */
+   M("setVolumeControlStream", "(I)V", activity_set_volume_stream),
+   M("getVolumeControlStream", "()I", activity_get_volume_stream),
    M("startActivityForResult",
      "(Landroid/content/Intent;ILandroid/os/Bundle;)V", nop_void),
    M("onCreate", "(Landroid/os/Bundle;)V", act_on_create),
@@ -36577,7 +36947,11 @@ static const struct rt_method rt_native_activity[] = {
 /* Gravity bits, from android.view.Gravity. */
 #define UI_GRAVITY_CENTER_H 0x01
 #define UI_GRAVITY_CENTER_V 0x10
+/* parent_orientation values that are not a LinearLayout axis. */
+#define UI_PARENT_FRAME    (-2)   /* a FrameLayout: children overlay */
+#define UI_GRAVITY_LEFT     0x03
 #define UI_GRAVITY_RIGHT    0x05
+#define UI_GRAVITY_TOP      0x30
 #define UI_GRAVITY_BOTTOM   0x50
 
 /* A growing text buffer.  The document is built once per change, not per
@@ -36722,6 +37096,85 @@ static bool ui_background_color(struct dvm *vm, dvm_ref view, int32_t *out)
       if (c) { *out = c; return true; }
    }
    return false;
+}
+
+/* A drawable resource as a file the overlay's renderer can load.
+ *
+ * On a device a drawable is most of what a widget *is*: an ImageButton has no
+ * text, so the icon is the whole button.  This layer drew text and nothing
+ * else, which made every icon-only view an empty box — invisible, and with
+ * wrap_content sizing, zero-sized and therefore unhittable.  A dialog's close
+ * button is exactly that view, so a window the emulator put up could not be
+ * taken down, and its scrim goes on swallowing every touch meant for the game
+ * underneath.
+ *
+ * resources.arsc already maps the id to an entry name and the package is
+ * already unpacked, so this is a lookup, not a decoder.  Only the bitmap
+ * formats luna-ui reads are answered: an .xml drawable is a vector or a state
+ * list, which is a program to run rather than a file to show, and claiming to
+ * have drawn one would be a worse answer than drawing nothing. */
+static const char *ui_drawable_path(int32_t res_id)
+{
+   if (res_id <= 0) return NULL;
+   int32_t iv = 0;
+   const char *entry = NULL;
+   if (!arm_exec_apk_resource_value((uint32_t)res_id, &iv, &entry)) return NULL;
+   if (!entry || !*entry) return NULL;
+   const char *dot = strrchr(entry, '.');
+   if (!dot) return NULL;
+   if (strcmp(dot, ".png") != 0 && strcmp(dot, ".jpg") != 0 &&
+       strcmp(dot, ".jpeg") != 0 && strcmp(dot, ".webp") != 0 &&
+       strcmp(dot, ".svg") != 0)
+      return NULL;
+   return arm_exec_apk_entry_path(entry);
+}
+
+/* A PNG's pixel size, from its IHDR — the first chunk, at a fixed offset.
+ *
+ * This is the drawable's intrinsic size, which is what Android measures an
+ * ImageView's wrap_content against.  Without it an icon-only view has no size
+ * at all: nothing to paint the image into and nothing to press.  Reading two
+ * big-endian words is not decoding the image, and the renderer decodes it
+ * anyway when it draws. */
+static bool ui_png_size(const char *path, int32_t *w, int32_t *h)
+{
+   static const unsigned char sig[8] =
+      { 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
+   unsigned char hdr[24];
+   FILE *f = fopen(path, "rb");
+   if (!f) return false;
+   size_t n = fread(hdr, 1, sizeof hdr, f);
+   fclose(f);
+   if (n != sizeof hdr || memcmp(hdr, sig, sizeof sig) != 0) return false;
+   if (memcmp(hdr + 12, "IHDR", 4) != 0) return false;
+   *w = (int32_t)(((uint32_t)hdr[16] << 24) | ((uint32_t)hdr[17] << 16) |
+                  ((uint32_t)hdr[18] << 8) | hdr[19]);
+   *h = (int32_t)(((uint32_t)hdr[20] << 24) | ((uint32_t)hdr[21] << 16) |
+                  ((uint32_t)hdr[22] << 8) | hdr[23]);
+   return *w > 0 && *h > 0;
+}
+
+/* The drawable this view shows: its source image if it has one, otherwise the
+ * background it was given as a reference rather than a colour.
+ *
+ * `lw`/`lh` are the layout's own width and height, so a view that was sized
+ * by the layout keeps that size and only a wrap_content one is measured from
+ * the image, as the platform does. */
+static void ui_emit_drawables(struct dvm *vm, struct ui_buf *css, dvm_ref view,
+                              int32_t lw, int32_t lh)
+{
+   const char *src = ui_drawable_path(ui_int(vm, view, "imageResource"));
+   if (!src) src = ui_drawable_path(ui_int(vm, view, "backgroundResource"));
+   if (!src) return;
+   /* contain, because the entry resources.arsc names is whichever density
+    * bucket this build shipped and the view was sized in dp. */
+   ui_printf(css, "background-image:url('%s');background-size:contain;"
+                  "background-repeat:no-repeat;background-position:center;",
+             src);
+   int32_t iw = 0, ih = 0;
+   if (!ui_png_size(src, &iw, &ih)) return;
+   if (lw != -1 && lw <= 0) ui_printf(css, "width:%dpx;", iw);
+   if (lh != -1 && lh <= 0) ui_printf(css, "height:%dpx;", ih);
 }
 
 /* MATCH_PARENT / WRAP_CONTENT / an explicit length, as the CSS the parent's
@@ -36940,6 +37393,13 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
    bool is_linear = ui_is_a(vm, view, "android/widget/LinearLayout");
    int32_t orientation = is_linear ? ui_int(vm, view, "orientation") : -1;
    bool is_compound = ui_is_a(vm, view, "android/widget/CompoundButton");
+   /* A FrameLayout — and CardView, which is one — stacks its children on top
+    * of each other and places each by its own layout_gravity.  Emitting it as
+    * a column put the network banner's close button *below* the card instead
+    * of over its top-right corner, which is where the app drew it and where
+    * the player looks for it. */
+   bool is_frame = ui_is_a(vm, view, "android/widget/FrameLayout") ||
+                   ui_is_a(vm, view, "androidx/cardview/widget/CardView");
 
    if (ui_is_recycler(vm, view)) ui_fill_recycler(vm, view);
    dvm_ref kids = ui_obj(vm, view, "children", "Ljava/util/List;");
@@ -36954,6 +37414,8 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
    if (is_linear)
       ui_printf(b2, "display:flex;flex-direction:%s;",
                 orientation == 1 ? "column" : "row");
+   else if (is_frame && has_children)
+      ui_puts(b2, "position:relative;");
    else if (is_compound)
       /* A CompoundButton is a box and a label side by side. */
       ui_puts(b2, "display:flex;flex-direction:row;align-items:center;");
@@ -36974,14 +37436,25 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
       ui_printf(b2, "flex:%g 1 0;", (double)weight);
       if (parent_orientation == 1) ui_emit_length(b2, "width", lw);
       else ui_emit_length(b2, "height", lh);
-   } else {
-      ui_emit_length(b2, "width", lw);
-      ui_emit_length(b2, "height", lh);
    }
 
    int32_t ml = ui_int(vm, view, "marginLeft"), mt = ui_int(vm, view, "marginTop");
    int32_t mr = ui_int(vm, view, "marginRight");
    int32_t mb = ui_int(vm, view, "marginBottom");
+   if (weight <= 0.0f) {
+      /* MATCH_PARENT is the parent's box *less this view's margins*; CSS's
+       * 100% is the parent's box and the margins are added outside it, so a
+       * card with margin:57px 20px inside a full-width window hung 40px past
+       * the right edge — the banner looked cut off on the right. */
+      if (lw == -1 && (ml || mr))
+         ui_printf(b2, "width:calc(100%% - %dpx);", ml + mr);
+      else
+         ui_emit_length(b2, "width", lw);
+      if (lh == -1 && (mt || mb))
+         ui_printf(b2, "height:calc(100%% - %dpx);", mt + mb);
+      else
+         ui_emit_length(b2, "height", lh);
+   }
    if (ml || mt || mr || mb)
       ui_printf(b2, "margin:%dpx %dpx %dpx %dpx;", mt, mr, mb, ml);
    int32_t pl = ui_int(vm, view, "paddingLeft"), pt = ui_int(vm, view, "paddingTop");
@@ -36998,6 +37471,10 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
    }
    int32_t radius = ui_int(vm, view, "cornerRadius");
    if (radius > 0) ui_printf(b2, "border-radius:%dpx;", radius);
+
+   /* The icon, if this view's visual is one.  An ImageButton has no text, so
+    * without this the close button of a window is a blank box. */
+   ui_emit_drawables(vm, b2, view, lw, lh);
 
    /* Text presentation.  A view with no text of its own ignores all of it. */
    const char *text = ui_text_of(vm, view);
@@ -37027,7 +37504,20 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
    /* layout_gravity is how the *parent* places this child: align-self across
     * the parent's axis, and an auto margin along it. */
    int32_t lg = ui_int(vm, view, "layoutGravity");
-   if (lg) {
+   if (parent_orientation == UI_PARENT_FRAME) {
+      /* Inside a FrameLayout the children share the same box, so gravity is
+       * an absolute placement against it rather than an alignment along an
+       * axis.  Unset gravity is top|left, as the platform documents. */
+      ui_puts(b2, "position:absolute;");
+      if ((lg & UI_GRAVITY_RIGHT) == UI_GRAVITY_RIGHT) ui_puts(b2, "right:0;");
+      else if (lg & UI_GRAVITY_CENTER_H)
+         ui_puts(b2, "left:50%;transform:translateX(-50%);");
+      else ui_puts(b2, "left:0;");
+      if ((lg & UI_GRAVITY_BOTTOM) == UI_GRAVITY_BOTTOM) ui_puts(b2, "bottom:0;");
+      else if (lg & UI_GRAVITY_CENTER_V)
+         ui_puts(b2, "top:50%;transform:translateY(-50%);");
+      else ui_puts(b2, "top:0;");
+   } else if (lg) {
       bool column = parent_orientation != 0;
       if (lg & UI_GRAVITY_CENTER_H)
          ui_puts(b2, column ? "align-self:center;"
@@ -37075,7 +37565,9 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
       ui_put_escaped(b, text);
       ui_puts(b, "</span>");
    }
-   ui_emit_children(vm, b, css, view, is_linear ? orientation : -1, depth);
+   ui_emit_children(vm, b, css, view,
+                    is_linear ? orientation : (is_frame ? UI_PARENT_FRAME : -1),
+                    depth);
    ui_puts(b, "</div>");
 }
 
@@ -37116,6 +37608,74 @@ static dvm_ref ui_window_content(struct dvm *vm, dvm_ref window)
    return 0;
 }
 
+/* The WindowManager.LayoutParams a window was given, if it has any.  A Dialog
+ * keeps its Window in a field; a Window carries them itself. */
+static dvm_ref ui_window_params(struct dvm *vm, dvm_ref window)
+{
+   dvm_ref lp = ui_obj(vm, window, "attributes",
+                       "Landroid/view/WindowManager$LayoutParams;");
+   if (lp) return lp;
+   dvm_ref w = ui_obj(vm, window, "window", "Landroid/view/Window;");
+   return w ? ui_obj(vm, w, "attributes",
+                     "Landroid/view/WindowManager$LayoutParams;") : 0;
+}
+
+/* WindowManager.LayoutParams.FLAG_DIM_BEHIND.  A Dialog gets it from the
+ * floating-window theme unless it cleared it, so absent params mean a dialog
+ * dims and a window added straight to the WindowManager does not. */
+#define UI_FLAG_DIM_BEHIND 0x00000002
+static bool ui_window_dims(struct dvm *vm, dvm_ref window)
+{
+   dvm_ref lp = ui_window_params(vm, window);
+   if (lp && ui_int(vm, lp, "flags")) 
+      return (ui_int(vm, lp, "flags") & UI_FLAG_DIM_BEHIND) != 0;
+   return ui_is_a(vm, window, "android/app/Dialog");
+}
+
+/* Where the window sits and how big it is, from its own LayoutParams.
+ *
+ * MATCH_PARENT (-1) fills the screen along that axis, WRAP_CONTENT (-2) and an
+ * unset 0 are as big as the content, and anything else is a pixel size.  The
+ * gravity is the same one View uses, applied against the display; with none
+ * given a floating window is centred, which is what a Dialog does. */
+static void ui_emit_window_box(struct dvm *vm, struct ui_buf *css, dvm_ref window)
+{
+   dvm_ref lp = ui_window_params(vm, window);
+   /* An unset field reads back as 0, which is not a size any LayoutParams can
+    * hold: `new WindowManager.LayoutParams()` starts at MATCH_PARENT, and a
+    * floating window takes WRAP_CONTENT for its height from the theme.  Read
+    * 0 as "never set" and use those, or a window that never touched its
+    * attributes shrinks to its text — the notification banner came out a
+    * hundred pixels wide with every line wrapped. */
+   int32_t w = lp ? ui_int(vm, lp, "width") : 0;
+   int32_t h = lp ? ui_int(vm, lp, "height") : 0;
+   int32_t g = lp ? ui_int(vm, lp, "gravity") : 0;
+   if (w == 0) w = -1;   /* MATCH_PARENT, the LayoutParams default */
+   if (h == 0) h = -1;
+   int32_t x = lp ? ui_int(vm, lp, "x") : 0;
+   int32_t y = lp ? ui_int(vm, lp, "y") : 0;
+
+   ui_printf(css, "#win%u{", (unsigned)window);
+   if (w == -1) ui_puts(css, "left:0;right:0;");
+   else if (w > 0) ui_printf(css, "width:%dpx;", w);
+   if (h == -1) ui_puts(css, "top:0;bottom:0;");
+   else if (h > 0) ui_printf(css, "height:%dpx;", h);
+
+   /* Horizontal placement, when the width did not already pin both edges. */
+   if (w != -1) {
+      if ((g & UI_GRAVITY_RIGHT) == UI_GRAVITY_RIGHT) ui_printf(css, "right:%dpx;", x);
+      else if (g & UI_GRAVITY_LEFT) ui_printf(css, "left:%dpx;", x);
+      else ui_puts(css, "left:50%;transform:translateX(-50%);");
+   }
+   if (h != -1) {
+      if ((g & UI_GRAVITY_BOTTOM) == UI_GRAVITY_BOTTOM) ui_printf(css, "bottom:%dpx;", y);
+      else if (g & UI_GRAVITY_TOP) ui_printf(css, "top:%dpx;", y);
+      else if (w == -1) ui_puts(css, "top:50%;transform:translateY(-50%);");
+      else ui_puts(css, "top:50%;transform:translate(-50%,-50%);");
+   }
+   ui_puts(css, "}");
+}
+
 /* The sheet is fixed: everything that varies about a view is written inline,
  * because it comes from the guest's own attributes rather than from a theme
  * this side gets to choose. */
@@ -37125,8 +37685,14 @@ static const char *ui_stylesheet(void)
       "body{margin:0;background:transparent;font-size:14px;color:#ffffff;}"
       ".scrim{position:fixed;left:0;top:0;width:100%;height:100%;"
       "background:rgba(0,0,0,0.6);}"
-      ".root{position:fixed;left:0;top:0;width:100%;height:100%;"
-      "display:flex;flex-direction:column;box-sizing:border-box;}"
+      /* A window is placed by its own LayoutParams; only the box it asks
+       * for belongs to it, and the rest of the screen belongs to whatever is
+       * underneath.  `.root` used to be the whole screen for every window,
+       * which turned a notification banner into a full-screen yellow panel
+       * and pushed its close button, laid out with gravity bottom|end, into
+       * the corner of the display instead of the corner of the banner. */
+      ".root{position:fixed;display:flex;flex-direction:column;"
+      "box-sizing:border-box;}"
       ".w{box-sizing:border-box;}"
       ".label{flex:1 1 auto;}"
       /* The check box a CompoundButton would have drawn from its drawable. */
@@ -37145,11 +37711,21 @@ static void ui_rebuild(struct dvm *vm)
    struct ui_buf b = { 0 }, css = { 0 };
    g_ui_building = true;
    ui_puts(&css, ui_stylesheet());
-   ui_puts(&b, "<body><div class=\"scrim\"></div>");
+   ui_puts(&b, "<body>");
+   /* The dim behind belongs to the windows that asked for it, not to the act
+    * of having a window up.  A window without FLAG_DIM_BEHIND does not dim on
+    * a device, and painting one anyway also takes every touch meant for the
+    * app underneath — which is how a banner that says "press X to play" ended
+    * up making the game unplayable. */
+   bool dim = false;
+   for (int i = 0; i < g_ui_nwindows; ++i)
+      if (ui_window_dims(vm, g_ui_windows[i])) dim = true;
+   if (dim) ui_puts(&b, "<div class=\"scrim\"></div>");
    for (int i = 0; i < g_ui_nwindows; ++i) {
       dvm_ref content = ui_window_content(vm, g_ui_windows[i]);
       if (!content) continue;
-      ui_puts(&b, "<div class=\"root\">");
+      ui_printf(&b, "<div id=\"win%u\" class=\"root\">", (unsigned)g_ui_windows[i]);
+      ui_emit_window_box(vm, &css, g_ui_windows[i]);
       ui_emit_view(vm, &b, &css, content, -1, 0);
       ui_puts(&b, "</div>");
    }
@@ -37410,11 +37986,64 @@ static bool text_set_selection(struct dvm *vm, dvm_ref self,
    RETV();
 }
 
+/* Tell the view's focus listener what just happened.
+ *
+ * onFocusChange(View, boolean) is how an application learns that the field it
+ * was editing is no longer the one receiving text — the point at which it
+ * commits the edit, hides its own chrome, or (GameActivity) closes the input
+ * method.  Only a real change is reported, as the framework does. */
+static void view_dispatch_focus_change(struct dvm *vm, dvm_ref self, bool gained)
+{
+   union dvm_value cur = { 0 };
+   (void)dvm_get_field(vm, self, "focused", "Z", &cur);
+   if ((cur.i != 0) == gained) return;
+   union dvm_value now = { .i = gained ? 1 : 0 };
+   (void)dvm_set_field(vm, self, "focused", "Z", now);
+
+   union dvm_value l = { 0 };
+   (void)dvm_get_field(vm, self, "focusChangeListener",
+                       "Landroid/view/View$OnFocusChangeListener;", &l);
+   if (!l.l) return;
+   struct dvm_class *c = dvm_object_class(vm, l.l);
+   struct dvm_method *m =
+      c ? dvm_find_method(vm, c, "onFocusChange", "(Landroid/view/View;Z)V") : NULL;
+   if (!m) return;
+   union dvm_value a[2], ignored = { 0 };
+   a[0].l = self;
+   a[1].i = gained ? 1 : 0;
+   (void)dvm_call(vm, m, l.l, a, 2, &ignored);
+}
+
+/* requestFocus(): the view becomes the one text goes to.  It used to answer
+ * "yes" without becoming anything, so hasFocus() disagreed with it and the
+ * focus listener never ran. */
+static bool view_request_focus(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   view_dispatch_focus_change(vm, self, true);
+   if (out) out->i = 1;
+   return true;
+}
+
+static bool view_has_focus(struct dvm *vm, dvm_ref self,
+                           const union dvm_value *args, int nargs,
+                           union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value cur = { 0 };
+   (void)dvm_get_field(vm, self, "focused", "Z", &cur);
+   if (out) out->i = cur.i ? 1 : 0;
+   return true;
+}
+
 static bool view_clear_focus(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
                              union dvm_value *out)
 {
    (void)args; (void)nargs; (void)out;
+   view_dispatch_focus_change(vm, self, false);
    /* Focus is what decides where typed text goes, and there is exactly one
     * place it can go: the field the input method is connected to.  A view
     * dropping focus is that connection ending. */
@@ -38738,7 +39367,71 @@ static bool color_parseColor(struct dvm *vm, dvm_ref self,
    return false;
 }
 
+/* Color.colorToHSV(int, float[]) and its inverse.
+ *
+ * The conversion itself, not a stub: the caller passes an array it then reads
+ * back, so doing nothing left it with whatever the array held (zeros — hue 0,
+ * saturation 0, value 0, i.e. black) and the widget picked its colours from
+ * that.  CardView uses it to decide whether its shadow should be light or
+ * dark. */
+static bool color_to_hsv(struct dvm *vm, dvm_ref self,
+                         const union dvm_value *args, int nargs,
+                         union dvm_value *out)
+{
+   (void)self; (void)nargs; (void)out;
+   const int32_t c = ARG(0).i;
+   const dvm_ref arr = ARG(1).l;
+   const float r = (float)((c >> 16) & 0xff) / 255.0f;
+   const float g = (float)((c >> 8) & 0xff) / 255.0f;
+   const float b = (float)(c & 0xff) / 255.0f;
+   const float mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+   const float mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+   const float d = mx - mn;
+   float h = 0.0f;
+   if (d > 0.0f) {
+      if (mx == r)      h = 60.0f * fmodf((g - b) / d, 6.0f);
+      else if (mx == g) h = 60.0f * (((b - r) / d) + 2.0f);
+      else              h = 60.0f * (((r - g) / d) + 4.0f);
+      if (h < 0.0f) h += 360.0f;
+   }
+   const float sv[3] = { h, mx > 0.0f ? d / mx : 0.0f, mx };
+   float *hsv = arr ? (float *)dvm_array_data(vm, arr) : NULL;
+   const uint32_t n = arr ? dvm_array_length(vm, arr) : 0u;
+   if (hsv)
+      for (uint32_t i = 0; i < 3u && i < n; ++i) hsv[i] = sv[i];
+   RETV();
+}
+
+static bool color_hsv_to_color(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   const dvm_ref arr = ARG(0).l;
+   const float *hsv = arr ? (const float *)dvm_array_data(vm, arr) : NULL;
+   if (!hsv || dvm_array_length(vm, arr) < 3u) RETI((int32_t)0xff000000);
+   float h = fmodf(hsv[0], 360.0f); if (h < 0.0f) h += 360.0f;
+   const float s = hsv[1] < 0.0f ? 0.0f : (hsv[1] > 1.0f ? 1.0f : hsv[1]);
+   const float v = hsv[2] < 0.0f ? 0.0f : (hsv[2] > 1.0f ? 1.0f : hsv[2]);
+   const float c = v * s;
+   const float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
+   const float m = v - c;
+   float r = 0, g = 0, b = 0;
+   if (h < 60)       { r = c; g = x; }
+   else if (h < 120) { r = x; g = c; }
+   else if (h < 180) { g = c; b = x; }
+   else if (h < 240) { g = x; b = c; }
+   else if (h < 300) { r = x; b = c; }
+   else              { r = c; b = x; }
+   const int32_t ri = (int32_t)((r + m) * 255.0f + 0.5f);
+   const int32_t gi = (int32_t)((g + m) * 255.0f + 0.5f);
+   const int32_t bi = (int32_t)((b + m) * 255.0f + 0.5f);
+   RETI((int32_t)0xff000000 | (ri << 16) | (gi << 8) | bi);
+}
+
 static const struct rt_method rt_color[] = {
+   SM("colorToHSV", "(I[F)V", color_to_hsv),
+   SM("HSVToColor", "([F)I", color_hsv_to_color),
    SM("parseColor", "(Ljava/lang/String;)I", color_parseColor),
    SM("blue", "(I)I", color_blue),
    SM("green", "(I)I", color_green),

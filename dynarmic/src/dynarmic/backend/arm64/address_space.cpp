@@ -289,6 +289,9 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
         case LinkTarget::ExceptionRaised:
             c.BL(prelude_info.exception_raised);
             break;
+        case LinkTarget::InterpreterFallback:
+            c.BL(prelude_info.interpreter_fallback);
+            break;
         case LinkTarget::InstructionSynchronizationBarrierRaised:
             c.BL(prelude_info.isb_raised);
             break;

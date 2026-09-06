@@ -498,6 +498,14 @@ static void overlay_maybe_test_card(void)
       ".body{font-size:15px;color:#9fb2d8;}");
 }
 
+bool luna_overlay_guest_window_up(void)
+{
+   pthread_mutex_lock(&g_doc_lock);
+   bool up = g_html != NULL;
+   pthread_mutex_unlock(&g_doc_lock);
+   return up && !g_failed;
+}
+
 bool luna_overlay_active(void)
 {
    overlay_maybe_test_card();

@@ -467,3 +467,144 @@ void *luna_os_native_window(void *glfw_window)
    ((void (*)(id, SEL, int))objc_msgSend)(view, set_wants_layer, 1);
    return (void *)((id (*)(id, SEL))objc_msgSend)(view, layer_sel);
 }
+
+/* ---- audio out --------------------------------------------------------- *
+ *
+ * CoreAudio's AudioQueue, the macOS counterpart of the ALSA path in
+ * lunaria_linux.c.  The queue owns a callback thread that CoreAudio drives;
+ * the caller is a guest thread inside an SVC and must not wait on it, so the
+ * two are decoupled by the same plain ring of interleaved S16 frames: one
+ * producer (the guest audio thread) and one consumer (the queue callback),
+ * synchronised by a pair of atomic indices and nothing else — no lock on the
+ * path the guest is on.  The ring holds about a third of a second. */
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <AudioToolbox/AudioToolbox.h>
+
+#define LUNA_MAC_AUDIO_RING_FRAMES 16384u   /* 341 ms at 48 kHz */
+#define LUNA_MAC_AUDIO_BUFS        3
+#define LUNA_MAC_AUDIO_BUF_FRAMES  512u
+
+static AudioQueueRef     g_aq;
+static AudioQueueBufferRef g_aq_buf[LUNA_MAC_AUDIO_BUFS];
+static int               g_aq_open;
+static unsigned          g_aq_ch = 2u;
+static int16_t          *g_aq_ring;
+static _Atomic unsigned  g_aq_head;   /* producer writes here */
+static _Atomic unsigned  g_aq_tail;   /* consumer reads here */
+
+static unsigned luna_aq_used(void)
+{
+   const unsigned h = atomic_load_explicit(&g_aq_head, memory_order_acquire);
+   const unsigned t = atomic_load_explicit(&g_aq_tail, memory_order_acquire);
+   return (h - t) % LUNA_MAC_AUDIO_RING_FRAMES;
+}
+
+static void luna_aq_callback(void *user, AudioQueueRef q, AudioQueueBufferRef b)
+{
+   (void)user;
+   const unsigned want = LUNA_MAC_AUDIO_BUF_FRAMES;
+   int16_t *out = (int16_t *)b->mAudioData;
+   unsigned t = atomic_load_explicit(&g_aq_tail, memory_order_relaxed);
+   const unsigned have = luna_aq_used();
+   const unsigned n = have < want ? have : want;
+   for (unsigned i = 0; i < n; ++i) {
+      const unsigned src = ((t + i) % LUNA_MAC_AUDIO_RING_FRAMES) * g_aq_ch;
+      for (unsigned c = 0; c < g_aq_ch; ++c)
+         out[i * g_aq_ch + c] = g_aq_ring[src + c];
+   }
+   /* A device never stops the clock: pad an underrun with silence rather than
+    * handing back a short buffer, which AudioQueue treats as end-of-stream. */
+   for (unsigned i = n; i < want; ++i)
+      for (unsigned c = 0; c < g_aq_ch; ++c)
+         out[i * g_aq_ch + c] = 0;
+   atomic_store_explicit(&g_aq_tail, (t + n) % LUNA_MAC_AUDIO_RING_FRAMES,
+                         memory_order_release);
+   b->mAudioDataByteSize = want * g_aq_ch * sizeof(int16_t);
+   AudioQueueEnqueueBuffer(q, b, 0, NULL);
+}
+
+int luna_os_audio_open(unsigned rate, unsigned channels)
+{
+   if (g_aq_open) return 0;
+   if (!rate) rate = 48000u;
+   if (channels < 1u || channels > 8u) channels = 2u;
+
+   AudioStreamBasicDescription fmt;
+   memset(&fmt, 0, sizeof fmt);
+   fmt.mSampleRate       = (double)rate;
+   fmt.mFormatID         = kAudioFormatLinearPCM;
+   fmt.mFormatFlags      = kAudioFormatFlagIsSignedInteger |
+                           kAudioFormatFlagIsPacked;
+   fmt.mBitsPerChannel   = 16;
+   fmt.mChannelsPerFrame = channels;
+   fmt.mFramesPerPacket  = 1;
+   fmt.mBytesPerFrame    = channels * (UInt32)sizeof(int16_t);
+   fmt.mBytesPerPacket   = fmt.mBytesPerFrame;
+
+   g_aq_ring = (int16_t *)calloc((size_t)LUNA_MAC_AUDIO_RING_FRAMES * channels,
+                                 sizeof *g_aq_ring);
+   if (!g_aq_ring) return -1;
+   g_aq_ch = channels;
+   atomic_store_explicit(&g_aq_head, 0u, memory_order_relaxed);
+   atomic_store_explicit(&g_aq_tail, 0u, memory_order_relaxed);
+
+   OSStatus rc = AudioQueueNewOutput(&fmt, luna_aq_callback, NULL, NULL, NULL,
+                                     0, &g_aq);
+   if (rc != noErr) {
+      fprintf(stderr, "[audio] AudioQueueNewOutput failed (%d)\n", (int)rc);
+      free(g_aq_ring); g_aq_ring = NULL;
+      return -1;
+   }
+   const UInt32 bytes = LUNA_MAC_AUDIO_BUF_FRAMES * fmt.mBytesPerFrame;
+   for (int i = 0; i < LUNA_MAC_AUDIO_BUFS; ++i) {
+      if (AudioQueueAllocateBuffer(g_aq, bytes, &g_aq_buf[i]) != noErr) {
+         AudioQueueDispose(g_aq, true); g_aq = NULL;
+         free(g_aq_ring); g_aq_ring = NULL;
+         return -1;
+      }
+      luna_aq_callback(NULL, g_aq, g_aq_buf[i]);   /* prime with silence */
+   }
+   if (AudioQueueStart(g_aq, NULL) != noErr) {
+      AudioQueueDispose(g_aq, true); g_aq = NULL;
+      free(g_aq_ring); g_aq_ring = NULL;
+      return -1;
+   }
+   g_aq_open = 1;
+   fprintf(stderr, "[audio] AudioQueue %u Hz %u ch\n", rate, channels);
+   return 0;
+}
+
+int luna_os_audio_write(const void *pcm16, unsigned frames)
+{
+   if (!g_aq_open || !pcm16 || !frames) return 0;
+   const int16_t *src = (const int16_t *)pcm16;
+   const unsigned h = atomic_load_explicit(&g_aq_head, memory_order_relaxed);
+   const unsigned free_frames =
+      LUNA_MAC_AUDIO_RING_FRAMES - 1u - luna_aq_used();
+   if (frames > free_frames) frames = free_frames;
+   for (unsigned i = 0; i < frames; ++i) {
+      const unsigned dst = ((h + i) % LUNA_MAC_AUDIO_RING_FRAMES) * g_aq_ch;
+      for (unsigned c = 0; c < g_aq_ch; ++c)
+         g_aq_ring[dst + c] = src[i * g_aq_ch + c];
+   }
+   atomic_store_explicit(&g_aq_head, (h + frames) % LUNA_MAC_AUDIO_RING_FRAMES,
+                         memory_order_release);
+   return (int)frames;
+}
+
+unsigned luna_os_audio_queued_frames(void)
+{
+   return g_aq_open ? luna_aq_used() : 0u;
+}
+
+void luna_os_audio_close(void)
+{
+   if (!g_aq_open) return;
+   g_aq_open = 0;
+   AudioQueueStop(g_aq, true);
+   AudioQueueDispose(g_aq, true);
+   g_aq = NULL;
+   free(g_aq_ring);
+   g_aq_ring = NULL;
+}

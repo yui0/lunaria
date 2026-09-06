@@ -386,6 +386,20 @@ bool dvm_proxy_try_invoke(struct dvm *vm, dvm_ref self, struct dvm_class *cls,
  * host threads. */
 bool dvm__other_threads_live(void);
 
+/* Bytes one element of a `kind` array occupies, which is how dvm_new_array()
+ * lays the payload out.  It is also the scale sun.misc.Unsafe reports for that
+ * array class, so an offset a caller computed from arrayIndexScale() divides
+ * back to the element index. */
+static inline int dvm__elem_width(char kind)
+{
+   switch (kind) {
+      case 'Z': case 'B': return 1;
+      case 'C': case 'S': return 2;
+      case 'J': case 'D': return 8;
+      default: return 4;
+   }
+}
+
 #define DVM_IO_PROGRESS_BYTES 4096u
 static inline void dvm__note_io_progress(struct dvm *vm, size_t bytes) {
    /* Only a bulk transfer counts.  Incidental I/O — a preference file, a log

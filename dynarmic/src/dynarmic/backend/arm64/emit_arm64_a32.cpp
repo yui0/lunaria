@@ -33,10 +33,6 @@ oaknut::Label EmitA32Cond(oaknut::CodeGenerator& code, EmitContext&, IR::Cond co
 
 void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Terminal terminal, IR::LocationDescriptor initial_location, bool is_single_step);
 
-void EmitA32Terminal(oaknut::CodeGenerator&, EmitContext&, IR::Term::Interpret, IR::LocationDescriptor, bool) {
-    ASSERT_FALSE("Interpret should never be emitted.");
-}
-
 void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::ReturnToDispatch, IR::LocationDescriptor, bool) {
     EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
 }
@@ -56,6 +52,22 @@ static void EmitSetUpperLocationDescriptor(oaknut::CodeGenerator& code, EmitCont
         code.MOV(Wscratch0, new_upper);
         code.STR(Wscratch0, Xstate, offsetof(A32JitState, upper_location_descriptor));
     }
+}
+
+/* See the AArch64 (A64) counterpart in emit_arm64_a64.cpp for why this exists
+ * at all: the AArch64 host backend never implemented the interpreter-fallback
+ * terminal, unlike x86-64, so any instruction the A32 frontend could not
+ * translate was fatal here specifically. Same fix, A32 state layout: PC is
+ * regs[15], and the upper location descriptor (T/E flags) has to be brought
+ * up to date the same way LinkBlock/LinkBlockFast do it, since the resume
+ * runs through the ordinary dispatcher and reads that word. */
+void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Interpret terminal, IR::LocationDescriptor initial_location, bool) {
+    EmitSetUpperLocationDescriptor(code, ctx, terminal.next, initial_location);
+    code.MOV(W1, A32::LocationDescriptor{terminal.next}.PC());
+    code.STR(W1, Xstate, offsetof(A32JitState, regs) + sizeof(u32) * 15);
+    code.MOV(X2, terminal.num_instructions);
+    EmitRelocation(code, ctx, LinkTarget::InterpreterFallback);
+    EmitRelocation(code, ctx, LinkTarget::ReturnFromRunCode);
 }
 
 void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::LinkBlock terminal, IR::LocationDescriptor initial_location, bool is_single_step) {

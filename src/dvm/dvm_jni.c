@@ -35,8 +35,34 @@ static enum dvm_jni_mode g_mode = DVM_JNI_FILL_GAPS;
 static _Thread_local JNIEnv *g_env;
 static JNIEnv *g_env_any;
 
-/* The env to make outward calls through: this thread's, or the process's. */
-static JNIEnv *current_env(void) { return g_env ? g_env : g_env_any; }
+/* The env to make outward calls through: this thread's, or the process's.
+ *
+ * An env whose function table is NULL is not an env.  Callers test the result
+ * for NULL and then go straight to (*env)->FindClass, which is table slot 6 —
+ * so handing one back segfaults at address 0x30, inside the callee, with
+ * nothing in the report to say the env was the problem.  Cross Worlds died
+ * exactly there: a bytecode thread running a HandlerThread's Looper has no env
+ * of its own, took the process-wide one, and that one's table read as NULL.
+ *
+ * Say so once and decline.  A caller that cannot get an env reports a missing
+ * implementation, which is recoverable and visible; a caller that gets a
+ * broken one takes the process down. */
+static JNIEnv *current_env(void)
+{
+   JNIEnv *e = g_env ? g_env : g_env_any;
+   if (e && !*e) {
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "[dvm] JNIEnv %p has a NULL function table "
+                 "(thread-local=%p process=%p) — declining outward calls "
+                 "from this thread\n", (void *)e, (void *)g_env,
+                 (void *)g_env_any);
+      }
+      return NULL;
+   }
+   return e;
+}
 static dvm_guest_native_fn g_guest_native;
 static dvm_guest_library_fn g_guest_library;
 static unsigned g_calls, g_native_calls, g_external_calls;
@@ -839,7 +865,17 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
     * itself delivers no callbacks — so accepting the registration is the whole
     * of the work here.  Reporting the method as missing instead is what is
     * wrong: SwappyDisplayManager calls it from startListening(), and an
-    * unresolved call there reads as "this device has no display service". */
+    * unresolved call there reads as "this device has no display service".
+    *
+    * Delivering one onDisplayChanged from here — which is what a device does
+    * during startup, and what SwappyDisplayManager's only path to the display's
+    * *current* refresh period needs — was tried and taken back out: this title
+    * never reaches startListening() at all (its Swappy takes the NDK
+    * choreographer path on SDK 31), so it bought nothing, and running guest
+    * bytecode synchronously from inside a JNI stub gave two runs that hung in
+    * the first forty seconds with the pump holding a guest mutex.  If it is
+    * needed again it belongs on the Handler the caller passes, posted, not
+    * called inline. */
    if (!strcmp(class_name, "android/hardware/display/DisplayManager") &&
        (!strcmp(method, "registerDisplayListener") ||
         !strcmp(method, "unregisterDisplayListener"))) {

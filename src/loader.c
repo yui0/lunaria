@@ -42,7 +42,6 @@ touch_to_lunaria(const ArmExecTouchEvent *te)
    return ev;
 }
 #include "dvm/dvm_media.h"
-#include "lunaria_link.h"
 
 /* Exposed from arm_exec.cpp for diagnostic dumps */
 extern void arm_exec_svc_ring_dump(void);
@@ -128,6 +127,29 @@ out:
    return count;
 }
 
+/* A directory of real AArch64 Android platform libraries.
+ *
+ * Everything the emulator answers with an SVC thunk costs the guest a JIT
+ * exit, and the measurements put libm alone — pow and sincosf — at 40% of
+ * every exit Cross Worlds makes.  Those are pure computation with no business
+ * leaving the JIT at all; the right fix is the same code a device runs, as
+ * guest code.  Point LUNARIA_SYSLIB_DIR at a directory holding them (an
+ * Android NDK ships an arm64 libm.so under
+ * build-tools/<v>/renderscript/lib/intermediates/arm64-v8a/), and any
+ * DT_NEEDED that is not beside the APK's own libraries is looked up there
+ * before being left to the SVC bridge.  Unset, nothing changes. */
+static const char *a64_syslib_dir(void)
+{
+   static const char *dir;
+   static int probed;
+   if (!probed) {
+      probed = 1;
+      dir = getenv("LUNARIA_SYSLIB_DIR");
+      if (dir && !*dir) dir = NULL;
+   }
+   return dir;
+}
+
 static void a64_preload_needed(const char *path, const char *dir,
                                char seen[][NAME_MAX + 1], size_t *seen_n)
 {
@@ -149,8 +171,27 @@ static void a64_preload_needed(const char *path, const char *dir,
       }
       memcpy(dep_path, dir, dir_len);
       memcpy(dep_path + dir_len, needed[i], name_len + 1);
-      if (stat(dep_path, &st) != 0 || !arm64_elf_is_arm64(dep_path))
-         continue; /* Android platform library: handled by the emulator. */
+      if (stat(dep_path, &st) != 0 || !arm64_elf_is_arm64(dep_path)) {
+         /* Not beside the APK's libraries.  Before handing it to the SVC
+          * bridge, look for the real thing among the platform libraries. */
+         const char *sys = a64_syslib_dir();
+         int found = 0;
+         if (sys) {
+            char cand[PATH_MAX];
+            if ((size_t)snprintf(cand, sizeof cand, "%s/%s", sys, needed[i])
+                < sizeof cand &&
+                stat(cand, &st) == 0 && arm64_elf_is_arm64(cand)) {
+               printf("preloading arm64 platform library: %s\n", cand);
+               if (arm64_exec_load_library(cand, 0) < 0)
+                  warnx("failed to load platform library %s", cand);
+               else
+                  found = 1;
+            }
+         }
+         if (!found)
+            continue; /* Android platform library: handled by the emulator. */
+         continue;    /* loaded from the platform directory, not from `dir` */
+      }
       a64_preload_needed(dep_path, dir, seen, seen_n);
       printf("preloading arm64 DT_NEEDED: %s\n", dep_path);
       if (arm64_exec_load_library(dep_path, 0) < 0)
@@ -1112,7 +1153,7 @@ pump_run_frame(void (*run_threads)(void))
        * eventually call MediaPlayer14.updateVideoFrame/getVideoLastFrame.
        * On Lunaria bring-up the media clock path can miss frames, leaving
        * the movie texture white. Tick the clock explicitly to re-enter the
-       * native→JNI→SurfaceTexture consumer pipeline. */
+       * native->JNI->SurfaceTexture consumer pipeline. */
       ue_media_tick_dbg = getenv("LUNARIA_TRACE_MEDIA") ? 1 : 0;
 
       /* Resolve for the currently active guest arch. */
@@ -1412,7 +1453,7 @@ run_ue4_game_arm(struct jvm *jvm)
          if (win) {
             /* Public window @36; pendingWindow sits after mutex/cond/pipe/
              * thread/poll_sources/flags — typically msgread+0x38 (=0x80 when
-             * msgread is 0x48).  process_cmd copies pendingWindow → window. */
+             * msgread is 0x48).  process_cmd copies pendingWindow -> window. */
             arm_exec_write32(instance + 36, win);
             uint32_t pend = pipe_off ? pipe_off + 0x38u : 0x80u;
             arm_exec_write32(instance + pend, win);
@@ -1543,7 +1584,7 @@ dex_first_defined_class(const char *const *cands)
    return NULL;
 }
 
-/* Epic renamed the package at UE5 (com.epicgames.ue4 → com.epicgames.unreal). */
+/* Epic renamed the package at UE5 (com.epicgames.ue4 -> com.epicgames.unreal). */
 static const char *
 ue_activity_dex_class(void)
 {
@@ -2194,7 +2235,7 @@ run_unity_game_arm64(struct jvm *jvm, jobject existing_context,
       arm64_exec_glfw_poll();
       ++frame_count;
       if (ok != last_ok || frame_count <= 5 || (frame_count % 50 == 0)) {
-         fprintf(stderr, "[loader] arm64 nativeRender → %d (frame %d)\n",
+         fprintf(stderr, "[loader] arm64 nativeRender -> %d (frame %d)\n",
                  ok, frame_count);
          last_ok = ok;
       }
@@ -2704,7 +2745,7 @@ run_jni_game_arm(struct jvm *jvm)
          }
       }
       touch_test_tick(frame_count);
-      /* GLFW mouse → one MotionEvent per queued sample.  Each object carries
+      /* GLFW mouse -> one MotionEvent per queued sample.  Each object carries
        * its own immutable payload (JVM_OBJECT_MOTION); Unity keeps the jobject
        * and reads it again during PlayerLoop.  One inject per frame. */
       ArmExecTouchEvent te;
@@ -2724,7 +2765,7 @@ run_jni_game_arm(struct jvm *jvm)
                                      (uint32_t)(uintptr_t)motion_ev, 0);
          static int inj_log = 0;
          if (inj_log < 100) {
-            fprintf(stderr, "[loader] injectEvent action=%d x=%.0f y=%.0f → %d\n",
+            fprintf(stderr, "[loader] injectEvent action=%d x=%.0f y=%.0f -> %d\n",
                     te.action, te.x, te.y, handled);
             ++inj_log;
          }
@@ -2757,7 +2798,7 @@ run_jni_game_arm(struct jvm *jvm)
                     frame_count);
          }
       }
-      /* Android では surfaceChanged → nativeResize がエンジン初期化後にも
+      /* Android では surfaceChanged -> nativeResize がエンジン初期化後にも
        * 届く。ループ前の nativeResize はエンジン未初期化で無視されるため
        * (画面が 128x128 の既定値のままになる)、初回フレーム完了後に再送する。 */
       if (!resized_after_init && frame_count >= 1 && va_resize) {
@@ -2807,7 +2848,7 @@ run_jni_game_arm(struct jvm *jvm)
       arm_exec_egl_swap();
       ++frame_count;
       if (ok != last_ok || (frame_count <= 5) || (frame_count % 100 == 0)) {
-         fprintf(stderr, "[loader] nativeRender → %d (frame %d)\n", ok, frame_count);
+         fprintf(stderr, "[loader] nativeRender -> %d (frame %d)\n", ok, frame_count);
          last_ok = ok;
       }
       if (getenv("LUNARIA_TRACE_HEAP"))
@@ -2981,7 +3022,7 @@ main(int argc, const char *argv[])
          setenv("GC_DONT_GC", "1", 0);
       /* Boehm GC computes max_heap_size from the 32-bit address space (~4 GB),
        * producing requests of ~3.7 GB which our mmap bump allocator must reject.
-       * With zero heap the GC calls GC_scratch_alloc(0) → ABORT("Bad GET_MEM arg").
+       * With zero heap the GC calls GC_scratch_alloc(0) -> ABORT("Bad GET_MEM arg").
        * Cap the heap to 256 MB so the GC gets usable memory without flooding. */
       setenv("GC_MAXIMUM_HEAP_SIZE", "268435456", 0); /* 256 MB */
       setenv("GC_INITIAL_HEAP_SIZE", "67108864",  0); /* 64 MB */
@@ -3019,7 +3060,7 @@ main(int argc, const char *argv[])
           * libunity.so を dlopen するだけのスタブで、エミュレーション環境では
           * NativeLoader 待ちでハングする */
 
-         /* libc++_shared.so → libil2cpp.so の順 (IL2CPP ゲーム対応) */
+         /* libc++_shared.so -> libil2cpp.so の順 (IL2CPP ゲーム対応) */
          snprintf(libpath, sizeof(libpath), "%s%s", dir, "libc++_shared.so");
          if (stat(libpath, &stbuf) == 0 && arm_elf_is_arm32(libpath)) {
             printf("preloading libc++_shared: %s\n", libpath);

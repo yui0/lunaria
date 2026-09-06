@@ -70,9 +70,21 @@ case "$inputfile" in
         else
             xapk_dir="$(mktemp -d)"
         fi
-        if [ "$cache_hit" -eq 0 ]; then
+        # pkg/ is a cheap-to-rebuild staging copy of the xapk's own zip
+        # contents; the expensive tree $cache_hit actually guards is inst/
+        # (unpacked further down).  A host that reclaims disk space under
+        # pressure has no reason to know that, and reaps whichever files in
+        # the cache tree look least recently touched -- which, once a package
+        # is cached, is always pkg/: inst/ is opened every run, pkg/ never is
+        # again until the input xapk changes.  Losing just pkg/ used to fail
+        # the whole run with "invalid xapk manifest" and offer only
+        # LUNARIA_NO_CACHE=1 (a full multi-GB inst/ rebuild) as the fix, for
+        # damage a few seconds of re-unzipping the small xapk repairs. Re-
+        # extract pkg/ whenever it is missing, independent of $cache_hit,
+        # which still gates the one expensive step (inst/) below unchanged.
+        if [ "$cache_hit" -eq 0 ] || [ ! -f "$xapk_dir/manifest.json" ]; then
             mkdir -p "$xapk_dir"
-            unzip -q "$inputfile" -d "$xapk_dir" || err "extract xapk failed"
+            unzip -qo "$inputfile" -d "$xapk_dir" || err "extract xapk failed"
         fi
         _xapk_info="$(python3 - "$xapk_dir" <<'PYEOF'
 import json, os, sys
@@ -105,9 +117,11 @@ PYEOF
         else
             xapk_dir="$(mktemp -d)"
         fi
-        if [ "$cache_hit" -eq 0 ]; then
+        # See the matching .xapk case above: pkg/ can be reaped independently
+        # of inst/ under disk pressure, and is cheap to re-extract on its own.
+        if [ "$cache_hit" -eq 0 ] || [ ! -f "$xapk_dir/base.apk" ]; then
             mkdir -p "$xapk_dir"
-            unzip -q "$inputfile" -d "$xapk_dir" || err "extract apks failed"
+            unzip -qo "$inputfile" -d "$xapk_dir" || err "extract apks failed"
         fi
         _xapk_base="base.apk"
         [ -f "$xapk_dir/$_xapk_base" ] || err "apks has no base.apk"
@@ -588,7 +602,26 @@ elif [ -r "$_root_memo" ]; then
     [ -n "$LUNARIA_DATA_ROOT" ] && msg "data root (remembered): $LUNARIA_DATA_ROOT"
 fi
 : "${LUNARIA_DATA_ROOT:=$PWD}"
-export ANDROID_EXTERNAL_FILES_DIR="$LUNARIA_DATA_ROOT/local/data/$pkgname/external/files"
+
+# The app's directories live at "$LUNARIA_DATA_ROOT/data/<pkg>/…".  They used
+# to carry an extra "local/" component, which said nothing — the root itself
+# already is the device's storage — and it showed up doubled in every path the
+# guest printed.  Rename the old tree once rather than leaving an install
+# (tens of gigabytes for some titles) stranded under the old name.  A rename
+# inside one filesystem is atomic and cannot lose the tree; if the new name
+# already exists the old one is left alone for a human to look at.
+if [ -d "$LUNARIA_DATA_ROOT/local/data" ] && [ ! -e "$LUNARIA_DATA_ROOT/data" ]; then
+    if mv "$LUNARIA_DATA_ROOT/local/data" "$LUNARIA_DATA_ROOT/data" 2>/dev/null; then
+        msg "moved app data to $LUNARIA_DATA_ROOT/data (was .../local/data)"
+        rmdir "$LUNARIA_DATA_ROOT/local" 2>/dev/null || :
+    fi
+fi
+
+# The emulator reads this too: a guest that hands an absolute path back as the
+# *child* of a File(parent, child) would otherwise repeat the whole root
+# inside the name (see file_init in src/dvm/dvm_runtime.c).
+export LUNARIA_DATA_ROOT
+export ANDROID_EXTERNAL_FILES_DIR="$LUNARIA_DATA_ROOT/data/$pkgname/external/files"
 mkdir -p "$ANDROID_EXTERNAL_FILES_DIR"
 # One migration for trees staged by earlier launchers, so an existing install
 # is not re-downloaded just because this moved.
@@ -598,22 +631,22 @@ if [ -n "$cache_dir" ] && [ -d "$tmpdir/local/files" ] &&
     (cd "$tmpdir/local/files" && tar cf - .) | (cd "$ANDROID_EXTERNAL_FILES_DIR" && tar xf -) \
         && rm -rf "$tmpdir/local/files"
 fi
-export ANDROID_EXTERNAL_OBB_DIR="$LUNARIA_DATA_ROOT/local/data/$pkgname/obb"
+export ANDROID_EXTERNAL_OBB_DIR="$LUNARIA_DATA_ROOT/data/$pkgname/obb"
 mkdir -p "$ANDROID_EXTERNAL_OBB_DIR"
 
 # Android's credential-protected application data.  Keep this outside the
 # transient APK extraction tree: databases/preferences/files survive process
 # restarts on a device and framework code (notably Room/WorkManager) relies on
 # the directories being distinct from the APK code path.
-export ANDROID_FILES_DIR="$LUNARIA_DATA_ROOT/local/data/$pkgname/files"
-export ANDROID_CACHE_DIR="$LUNARIA_DATA_ROOT/local/data/$pkgname/cache"
-export ANDROID_CODE_CACHE_DIR="$LUNARIA_DATA_ROOT/local/data/$pkgname/code_cache"
-export ANDROID_DATABASES_DIR="$LUNARIA_DATA_ROOT/local/data/$pkgname/databases"
-export ANDROID_NO_BACKUP_DIR="$LUNARIA_DATA_ROOT/local/data/$pkgname/no_backup"
+export ANDROID_FILES_DIR="$LUNARIA_DATA_ROOT/data/$pkgname/files"
+export ANDROID_CACHE_DIR="$LUNARIA_DATA_ROOT/data/$pkgname/cache"
+export ANDROID_CODE_CACHE_DIR="$LUNARIA_DATA_ROOT/data/$pkgname/code_cache"
+export ANDROID_DATABASES_DIR="$LUNARIA_DATA_ROOT/data/$pkgname/databases"
+export ANDROID_NO_BACKUP_DIR="$LUNARIA_DATA_ROOT/data/$pkgname/no_backup"
 # SharedPreferences, in the same place and the same XML a device keeps them in.
 # They persist across launches: an SDK that writes the account it just created
 # here has to find it again next time, or every launch is a new user.
-export ANDROID_PREFS_DIR="$LUNARIA_DATA_ROOT/local/data/$pkgname/shared_prefs"
+export ANDROID_PREFS_DIR="$LUNARIA_DATA_ROOT/data/$pkgname/shared_prefs"
 mkdir -p "$ANDROID_FILES_DIR" "$ANDROID_CACHE_DIR" "$ANDROID_CODE_CACHE_DIR" \
     "$ANDROID_DATABASES_DIR" \
     "$ANDROID_NO_BACKUP_DIR" "$ANDROID_PREFS_DIR"
@@ -888,6 +921,23 @@ lunaria_bin="${LUNARIA_BIN:-$script_dir/lunaria}"
 # The luna-ui progress card is on by default; LUNARIA_JIT_UI=0 turns it off.
 : "${LUNARIA_JIT_UI:=1}"
 export LUNARIA_JIT_UI
+
+# Real AArch64 platform libraries for the guest, if `make syslib` fetched them.
+# Every symbol answered from one of these runs as guest code instead of leaving
+# the JIT for an SVC; libm alone was 40% of the guest's exits.  Unset when the
+# directory is not there, which puts those symbols back on the SVC bridge.
+if [ -z "${LUNARIA_SYSLIB_DIR:-}" ] && [ -d "$script_dir/syslib-arm64" ]; then
+    LUNARIA_SYSLIB_DIR="$script_dir/syslib-arm64"
+    export LUNARIA_SYSLIB_DIR
+fi
+# Without a guest libm, pow/sincosf and the rest leave the JIT for an SVC on
+# every call — 40% of Cross Worlds' exits during the post-title load, which is
+# the single biggest reason that stretch is slow.  It is a one-time `make
+# syslib`, so say plainly that it is missing rather than running slow silently.
+if [ -z "${LUNARIA_SYSLIB_DIR:-}" ] && [ "$arch" = arm64-v8a ]; then
+    msg "no syslib-arm64/ — guest libm (pow, sincosf, ...) will run as SVC thunks."
+    msg "run 'make syslib' once for a real AArch64 libm; the post-title load is ~40% JIT exits without it."
+fi
 
 # A signal aimed at this script (Ctrl-C, `timeout`) has to reach the emulator.
 # Run it in the background and forward, rather than leaving an orphan behind:

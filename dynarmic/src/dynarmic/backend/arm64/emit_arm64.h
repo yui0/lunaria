@@ -75,6 +75,7 @@ enum class LinkTarget {
     ExclusiveWriteMemory128,
     CallSVC,
     ExceptionRaised,
+    InterpreterFallback,
     InstructionSynchronizationBarrierRaised,
     InstructionCacheOperationRaised,
     DataCacheOperationRaised,

@@ -59,6 +59,9 @@ unsigned arm_lock_waiters(void);
 unsigned long long arm_lock_held_ns(void);
 unsigned long long arm_lock_wait_ns(void);
 unsigned long long arm_lock_max_wait_ns(void);
+/* The longest single hold since the last call, and the label of whoever held
+ * it (an SVC number, or one of the reserved ARM_LOCK_TAG_* ids). */
+unsigned long long arm_lock_max_hold_ns(unsigned *tag_out);
 
 /* Which caller the lock was held *for*.
  *
@@ -69,7 +72,12 @@ unsigned long long arm_lock_max_wait_ns(void);
  * outermost release happens, so the report can name the handler rather than
  * the lock.  One thread-local store per acquire and one relaxed add per
  * release: cheap enough to leave on. */
-#define ARM_LOCK_TAG_MAX 4160u
+/* SVC labels occupy 1..4096, the named holders 4097..4100, and a raw syscall
+ * gets its own label above those: every `svc #0` shares SVC number 0, so
+ * without this the report can only say "svc0 held the lock for 8.7 ms" and
+ * never which syscall that was. */
+#define ARM_LOCK_TAG_RAW(n) (4160u + ((unsigned)(n) & 511u))
+#define ARM_LOCK_TAG_MAX 4672u
 /* SVC numbers occupy 0..4095 (see SVC_TIME_MAX), so they are labelled at +1 and
  * 0 stays "unlabelled".  The named holders live above that range. */
 #define ARM_LOCK_TAG_SVC(n) ((unsigned)(n) + 1u)
@@ -811,6 +819,12 @@ inline uint32_t misc_sl_iid_end(void) { return MISC_DATA + 0x100u; }
 inline uint32_t misc_tzname(void)     { return MISC_DATA + 0x100u; }
 inline uint32_t misc_tzvars(void)     { return MISC_DATA + 0x180u; }
 inline uint32_t misc_stdio(void)      { return MISC_DATA + 0x200u; }
+/* __stack_chk_guard is a *variable* the compiled guest reads directly (the
+ * prologue copies it onto the stack, the epilogue compares).  Binding it to a
+ * code trampoline handed out the address of an instruction as the guard
+ * value; it happened to compare equal, but the whole point of the cookie is
+ * that it is unpredictable.  Give it a word of real entropy instead. */
+inline uint32_t misc_stack_guard(void) { return MISC_DATA + 0x1C0u; }
 // glGetString/eglQueryString ring (8 × 8 KiB) — see stash_gl_c_string().
 inline uint32_t GL_STR_RING_BASE = 0x41020000u;
 constexpr uint32_t GL_STR_RING_SLOTS = 8u;
@@ -1497,7 +1511,7 @@ constexpr uint32_t SVC_MONO_ADD_ICALL     = SVC_DETOUR_BASE + NUM_DETOURS + 109u
  * mbrlen ran AES-256 over its own string buffer and got the pointer back as
  * the answer.  Give them a range of their own, above everything else, and
  * keep SVC_TRAMP_TOTAL derived from its end. */
-constexpr uint32_t SVC_UE_HOOK_BASE = 1400u;
+constexpr uint32_t SVC_UE_HOOK_BASE = 1450u;
 constexpr uint32_t SVC_FAES_DECRYPT = SVC_UE_HOOK_BASE + 0u;
 // Host SHA-1 for FSHA1::HashBuffer — startup profiler showed 27% of load time.
 constexpr uint32_t SVC_FSHA1_HASHBUFFER = SVC_UE_HOOK_BASE + 1u;
@@ -1533,7 +1547,40 @@ constexpr uint32_t SVC_UE_REPLACE_INLINE = SVC_UE_HOOK_BASE + 7u;
  * fetch and decode rather than for the comparison.  Whole function, no
  * fallback — there is nothing in it to fall back to. */
 constexpr uint32_t SVC_UE_FINDCHAR = SVC_UE_HOOK_BASE + 8u;
-constexpr uint32_t SVC_UE_HOOK_LAST = SVC_UE_FINDCHAR;
+/* Host CityHash32.  Same reasoning as SVC_CITYHASH64 above, and the same
+ * emulator: FName's 32-bit hash (FCrc::StrCrc32 aside) and a handful of other
+ * UE hash paths call CityHash32 directly, not just its 64-bit sibling —
+ * profiling the post-title-load stall showed it alone at up to 40-50% of
+ * every guest instruction in some windows, more than CityHash64 ever was.
+ * Answered host-side with the same v1.1 algorithm UE bundles (verified
+ * against the reference `cityhash` implementation on every code-length class:
+ * 0-4, 5-12, 13-24 and >24 bytes, including a >64-byte string that loops the
+ * main round more than once). */
+constexpr uint32_t SVC_CITYHASH32 = SVC_UE_HOOK_BASE + 9u;
+/* Host Ogg Vorbis decode via stb_vorbis (src/lib/stb_vorbis.c), for
+ * FVorbisAudioInfo::ReadCompressedInfo/ReadCompressedData/StreamCompressedData.
+ * Profiling the post-title-load stall (2026-09-04) found libvorbis itself
+ * (mdct_backward, floor1_encode, oggpack_look, ...) dominating the guest's
+ * instructions once a sound starts playing — Vorbis has no host bridge the
+ * way MediaCodec's H.264 (openh264) and AAC (libavcodec) already do.
+ *
+ * SVC_STB_VORBIS_INFO is an *observe* hook: the displaced instruction runs
+ * and the guest's own ReadCompressedInfo executes unmodified, so
+ * FSoundQualityInfo — whose field layout this file has no source for — is
+ * filled by the game itself, not guessed at here.  This SVC only opens a
+ * parallel, independent stb_vorbis decoder from the same compressed bytes,
+ * keyed by the `this` pointer, entirely separate from whatever internal
+ * state FVorbisAudioInfo keeps (also not this file's business, for the same
+ * reason).
+ *
+ * SVC_STB_VORBIS_READ *replaces* ReadCompressedData/StreamCompressedData
+ * outright (same svc+ret patch as CityHash above): both are a closed
+ * contract over plain bytes — `(uint8* Destination, bool bLooping,
+ * uint32 BufferSize)`, fill Destination and say whether the sound is done —
+ * with no struct to get wrong. */
+constexpr uint32_t SVC_STB_VORBIS_INFO = SVC_UE_HOOK_BASE + 10u;
+constexpr uint32_t SVC_STB_VORBIS_READ = SVC_UE_HOOK_BASE + 11u;
+constexpr uint32_t SVC_UE_HOOK_LAST = SVC_STB_VORBIS_READ;
 
 
 constexpr uint32_t SVC_HONEST_BASE          = 1354u; /* first free id */
@@ -1591,13 +1638,33 @@ constexpr uint32_t SVC_PTHREAD_CLEANUP_PUSH      = SVC_HONEST_BASE + 37u;
 constexpr uint32_t SVC_PTHREAD_CLEANUP_POP       = SVC_HONEST_BASE + 38u;
 /* Destroying an attribute has to leave it *invalid*, not untouched. */
 constexpr uint32_t SVC_PTHREAD_MUTEXATTR_DESTROY = SVC_HONEST_BASE + 39u;
+constexpr uint32_t SVC_AASSET_OPENFD64           = SVC_HONEST_BASE + 40u;
+constexpr uint32_t SVC_RAISE                     = SVC_HONEST_BASE + 41u;
+constexpr uint32_t SVC_SIGALTSTACK               = SVC_HONEST_BASE + 42u;
+constexpr uint32_t SVC_SYSPROP_FIND             = SVC_HONEST_BASE + 43u;
+constexpr uint32_t SVC_SYSPROP_READ             = SVC_HONEST_BASE + 44u;
+constexpr uint32_t SVC_SYSPROP_READ_CB           = SVC_HONEST_BASE + 45u;
+constexpr uint32_t SVC_AKEY_ACTION                = SVC_HONEST_BASE + 46u;
+constexpr uint32_t SVC_AKEY_KEYCODE               = SVC_HONEST_BASE + 47u;
+constexpr uint32_t SVC_AKEY_META                  = SVC_HONEST_BASE + 48u;
+constexpr uint32_t SVC_AKEY_FLAGS                 = SVC_HONEST_BASE + 49u;
+constexpr uint32_t SVC_ACFG_DELETE                = SVC_HONEST_BASE + 50u;
+constexpr uint32_t SVC_ACFG_COPY                  = SVC_HONEST_BASE + 51u;
+constexpr uint32_t SVC_ACFG_DIFF                  = SVC_HONEST_BASE + 52u;
+constexpr uint32_t SVC_ACFG_SET_INT_BASE          = SVC_HONEST_BASE + 53u;
+constexpr uint32_t SVC_ACFG_SET_INT_END           = SVC_HONEST_BASE + 69u; /* + ACFG_I_COUNT - 1 */
+constexpr uint32_t SVC_ACFG_SETLANG               = SVC_HONEST_BASE + 70u;
+constexpr uint32_t SVC_ACFG_SETCOUNTRY            = SVC_HONEST_BASE + 71u;
+constexpr uint32_t SVC_ACFG_SET_SDKVER            = SVC_HONEST_BASE + 72u;
+constexpr uint32_t SVC_UNWIND_FAIL                = SVC_HONEST_BASE + 73u;
+constexpr uint32_t SVC_WAITPID                    = SVC_HONEST_BASE + 74u;
 /* The last number in the block above.  SVC_TRAMP_TOTAL is derived from this
  * rather than from whichever SVC happened to be written last: a number past
  * that bound gets no trampoline built, and the unknown-symbol pool — which
  * starts at the bound — hands its address out to a dlsym'd name instead, so
  * two unrelated symbols end up sharing one stub.  Adding to the block above
  * means moving this line down with it. */
-constexpr uint32_t SVC_HONEST_LAST             = SVC_CXA_THREAD_ATEXIT;
+constexpr uint32_t SVC_HONEST_LAST             = SVC_WAITPID;
 static_assert(SVC_HONEST_LAST < SVC_UE_HOOK_BASE,
               "the honest block has grown into the UE hook block");
 constexpr uint32_t NUM_ICALL_PROBES        = 16u;
@@ -1956,7 +2023,8 @@ constexpr uint32_t SVC_GLX_BlendBarrier           = SVC31_BASE + 67u;
 constexpr uint32_t SVC_AASSETMGR_OPENDIR          = SVC31_BASE + 68u;
 constexpr uint32_t SVC_AASSETDIR_NEXT             = SVC31_BASE + 69u;
 constexpr uint32_t SVC_AASSETDIR_CLOSE            = SVC31_BASE + 70u;
-constexpr uint32_t SVC_AASSET_OPENFD              = SVC31_BASE + 71u; /* openFileDescriptor / 64 */
+constexpr uint32_t SVC_AASSET_OPENFD32            = SVC31_BASE + 71u; /* openFileDescriptor(off_t*) */
+constexpr uint32_t SVC_AASSET_OPENFD              = SVC_AASSET_OPENFD32; /* alias */
 constexpr uint32_t SVC_ACFG_NEW                   = SVC31_BASE + 72u; /* AConfiguration_new */
 constexpr uint32_t SVC_ACFG_GETLANG               = SVC31_BASE + 73u; /* getLanguage → write 2 chars */
 constexpr uint32_t SVC_ACFG_GETCOUNTRY            = SVC31_BASE + 74u; /* getCountry → write 2 chars */
@@ -2319,6 +2387,58 @@ constexpr uint32_t SVC_DLERROR                    = SVC31_BASE + 428u;
 constexpr uint32_t SVC_FSCANF                     = SVC31_BASE + 429u;
 constexpr uint32_t SVC_FSYNC                      = SVC31_BASE + 430u;
 constexpr uint32_t SVC_FLOCK                      = SVC31_BASE + 431u;
+/* bionic fd_set fortification, getresuid, strxfrm_l, and honest GL stubs.
+ * SVC31_BASE+432 would land in the SVC_HONEST block (FLOCK is +431), so these
+ * live in the gap before the UE hook block instead. */
+constexpr uint32_t SVC_COMPAT_BASE                = SVC_HONEST_LAST + 1u;
+constexpr uint32_t SVC_FD_SET_CHK                 = SVC_COMPAT_BASE + 0u;
+constexpr uint32_t SVC_FD_ISSET_CHK               = SVC_COMPAT_BASE + 1u;
+constexpr uint32_t SVC_FD_CLR_CHK                 = SVC_COMPAT_BASE + 2u;
+constexpr uint32_t SVC_FD_ZERO_CHK                = SVC_COMPAT_BASE + 3u;
+constexpr uint32_t SVC_GETRESUID                  = SVC_COMPAT_BASE + 4u;
+constexpr uint32_t SVC_STRXFRM_L                  = SVC_COMPAT_BASE + 5u;
+constexpr uint32_t SVC_GL_UNIMPL                  = SVC_COMPAT_BASE + 6u;
+/* ctype classes that used to be answered by a different class entirely:
+ * ispunct/isgraph/isprint were bound to isalnum and iscntrl to isspace.
+ * '!' is punctuation and graphic but not alphanumeric, ' ' is printable but
+ * not alphanumeric, and '\t' is a space but not a control-only answer — the
+ * guest acts on the wrong classification wherever it parses text. */
+constexpr uint32_t SVC_ISPUNCT                    = SVC_COMPAT_BASE + 7u;
+constexpr uint32_t SVC_ISPRINT                    = SVC_COMPAT_BASE + 8u;
+constexpr uint32_t SVC_ISCNTRL                    = SVC_COMPAT_BASE + 9u;
+constexpr uint32_t SVC_ISGRAPH                    = SVC_COMPAT_BASE + 10u;
+/* AMotionEvent_getButtonState: the mouse/stylus buttons held during the
+ * event.  A template zero is the right answer for a finger, but it is the
+ * right answer by accident — the call has to look at the event. */
+constexpr uint32_t SVC_AMOTION_BUTTONSTATE        = SVC_COMPAT_BASE + 11u;
+/* gethostbyaddr(3): the reverse of gethostbyname, which is implemented.
+ * Returning NULL from a stub told the caller the address has no name, which
+ * is a lookup result it then acts on. */
+constexpr uint32_t SVC_NET_GETHOSTBYADDR          = SVC_COMPAT_BASE + 12u;
+/* getpwuid(3).  Android has no /etc/passwd, but bionic answers for app uids
+ * from its own table: an app's name is u<user>_a<appid>, its home is the
+ * data directory and its shell is /system/bin/sh.  NULL means "no such user",
+ * which is not true of the uid the app is running as. */
+constexpr uint32_t SVC_GETPWUID                   = SVC_COMPAT_BASE + 13u;
+/* sleep(3) takes seconds and returns the unslept seconds.  It cannot share
+ * SVC_USLEEP: treating the same register as microseconds made sleep(1) a
+ * one-microsecond delay and turned ordinary retry loops into busy loops. */
+constexpr uint32_t SVC_SLEEP                      = SVC_COMPAT_BASE + 14u;
+/* std::__ndk1::condition_variable::wait(unique_lock<mutex>&) — libc++'s own
+ * out-of-line instantiation, not a bionic/pthread symbol, so it needs its
+ * own binding rather than reusing SVC_PTHREAD_COND_WAIT: r1 here is the
+ * address of a stack-local unique_lock<mutex>, not a mutex* directly. Guest
+ * ABI (verified by disassembling a real call site and resolving its
+ * mutex::lock()/unlock() relocations, not assumed): unique_lock<mutex> is
+ * {mutex_type *__m_; bool __owns_;} at offsets 0/8, and both libc++ mutex
+ * and condition_variable hold their pthread_mutex_t/pthread_cond_t as the
+ * sole member at offset 0 — so `this` (r0) already *is* the guest VA
+ * SVC_PTHREAD_COND_WAIT wants for the cond, and *(r1) already *is* the one
+ * it wants for the mutex. */
+constexpr uint32_t SVC_CXX_CONDVAR_WAIT           = SVC_COMPAT_BASE + 15u;
+constexpr uint32_t SVC_COMPAT_LAST                = SVC_CXX_CONDVAR_WAIT;
+static_assert(SVC_COMPAT_LAST < SVC_UE_HOOK_BASE,
+              "the compat block has grown into the UE hook block");
 
 /* Which SVC a JNINativeInterface slot dispatches to.  Identity up to 221;
  * beyond that the historical numbering is four short, so name every slot. */
@@ -2367,7 +2487,9 @@ static_assert(SVC_TRAMP_TOTAL > SVC_PROCESS_VM_READV &&
               SVC_TRAMP_TOTAL > SVC_SIGNALFD &&
               SVC_TRAMP_TOTAL > SVC_SIGPROCMASK &&
               SVC_TRAMP_TOTAL > SVC_GL_GET_QUERY_OBJECT_UIV &&
-              SVC_TRAMP_TOTAL > SVC_FLOCK &&
+              SVC_TRAMP_TOTAL > SVC_COMPAT_LAST &&
+              SVC_TRAMP_TOTAL > SVC_UNWIND_FAIL &&
+              SVC_TRAMP_TOTAL > SVC_SYSPROP_READ_CB &&
               SVC_TRAMP_TOTAL > SVC_GETPWUID_R &&
               SVC_TRAMP_TOTAL > SVC_HONEST_LAST &&
               SVC_TRAMP_TOTAL > SVC_UE_HOOK_LAST,

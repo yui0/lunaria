@@ -38,6 +38,17 @@ void luna_overlay_present(int w, int h);
  * handing a touch to the guest. */
 bool luna_overlay_active(void);
 
+/* True while a window from the guest's own View layer is up — a dialog, a
+ * notification banner — as opposed to the emulator's status card or the IME.
+ *
+ * The compositor on a device draws such a window whether or not the
+ * application is still rendering.  Here the overlay is drawn inside the
+ * guest's eglSwapBuffers, so a guest that stops presenting takes its own
+ * dialog off the screen with it — and a guest that is *waiting for the answer
+ * to that dialog* can then never show it.  The frame pump uses this to put
+ * the window up itself in that case. */
+bool luna_overlay_guest_window_up(void);
+
 /* Pointer/touch in surface pixels.  Returns true when the overlay consumed the
  * event, which is when the guest must not also see it. */
 bool luna_overlay_pointer(double x, double y, int action);

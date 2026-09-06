@@ -125,6 +125,7 @@ protected:
 
         void* call_svc;
         void* exception_raised;
+        void* interpreter_fallback;
         void* dc_raised;
         void* ic_raised;
         void* isb_raised;

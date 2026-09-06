@@ -32,8 +32,26 @@ oaknut::Label EmitA64Cond(oaknut::CodeGenerator& code, EmitContext&, IR::Cond co
 
 void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Terminal terminal, IR::LocationDescriptor initial_location, bool is_single_step);
 
-void EmitA64Terminal(oaknut::CodeGenerator&, EmitContext&, IR::Term::Interpret, IR::LocationDescriptor, bool) {
-    ASSERT_FALSE("Interpret should never be emitted.");
+/* The A64 frontend punts an instruction it has no IR translation for to a
+ * single-step host interpreter (TranslatorVisitor::InterpretThisInstruction,
+ * a genuinely undecodable encoding, or one of the small number the frontend
+ * marks IR-incomplete on purpose — SIMD-x-indexed-element FP16 forms, some
+ * MSR/MRS system registers).  The x86-64 backend has always called back into
+ * the frontend's UserCallbacks::InterpreterFallback for this; the AArch64
+ * (host) backend never did — this terminal was unreachable here and asserted
+ * instead, which made every one of those instructions fatal on an AArch64
+ * host even though the callback that handles them already exists and is
+ * exercised on x86-64. Same relocation mechanism as CallSVC/ExceptionRaised
+ * above: store the resume PC into JitState (the callback callee reads and
+ * advances it, same as CallSVC's ABI), pass it and the instruction count in
+ * X1/X2, and return from run code exactly as the interpret-fallback case
+ * does everywhere else in this backend family. */
+void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Interpret terminal, IR::LocationDescriptor, bool) {
+    code.MOV(X1, A64::LocationDescriptor{terminal.next}.PC());
+    code.STR(X1, Xstate, offsetof(A64JitState, pc));
+    code.MOV(X2, terminal.num_instructions);
+    EmitRelocation(code, ctx, LinkTarget::InterpreterFallback);
+    EmitRelocation(code, ctx, LinkTarget::ReturnFromRunCode);
 }
 
 void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::ReturnToDispatch, IR::LocationDescriptor, bool) {

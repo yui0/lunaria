@@ -432,6 +432,12 @@ uint32_t arm_exec_native_window_va(void);
  * guessing from which env vars happen to be set. */
 int arm_exec_apk_has_entry(const char *name);
 
+/* The host path of that entry when the package was unpacked to a directory,
+ * else NULL.  The widget layer resolves a drawable resource to an entry name
+ * and needs a file the overlay's image loader can open.  Static buffer, valid
+ * until the next call. */
+const char *arm_exec_apk_entry_path(const char *name);
+
 /* -------------------------------------------------------------------------
  * ARM64 (AArch64) execution engine — parallel to the ARM32 engine above.
  * All arm64_exec_* functions mirror their arm_exec_* counterparts but
