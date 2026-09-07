@@ -642,20 +642,24 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlock terminal, IR::LocationDesc
     code.ForceReturnFromRunCode();
 }
 
-void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlockFast terminal, IR::LocationDescriptor, bool is_single_step) {
-    if (!conf.HasOptimization(OptimizationFlag::BlockLinking) || is_single_step) {
-        code.mov(rax, A64::LocationDescriptor{terminal.next}.PC());
-        code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
-        code.ReturnFromRunCode();
-        return;
-    }
-
-    patch_information[terminal.next].jmp.push_back(code.getCurr());
-    if (auto next_bb = GetBasicBlock(terminal.next)) {
-        EmitPatchJmp(terminal.next, next_bb->entrypoint);
-    } else {
-        EmitPatchJmp(terminal.next);
-    }
+/* LinkBlockFast used to emit a bare jmp to the next block: no cycle check, no
+ * halt check, nothing.  A chain of these therefore runs forever — the tick
+ * budget cannot end it and HaltExecution() from another thread cannot either,
+ * because neither value is ever read again.  A guest loop whose back edge lands
+ * on this terminal is uninterruptible, and an emulator that multiplexes guest
+ * threads onto engines cannot schedule around it: the thread holds its engine
+ * for the life of the process.
+ *
+ * Genshin does exactly that after its first frames.  The watchdog issued 66402
+ * halts against a Run() that never returned, no scheduler pass ran again, and
+ * two guest threads sat in the ready queue, runnable, for as long as the
+ * process lived.
+ *
+ * Emit the same guard LinkBlock does.  It costs one compare and a predicted
+ * branch per block transition — which is what LinkBlock already pays — and it
+ * is the only thing that makes the chain interruptible at all. */
+void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlockFast terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+    EmitTerminalImpl(IR::Term::LinkBlock{terminal.next}, initial_location, is_single_step);
 }
 
 void A64EmitX64::EmitTerminalImpl(IR::Term::PopRSBHint, IR::LocationDescriptor, bool is_single_step) {

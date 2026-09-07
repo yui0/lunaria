@@ -107,6 +107,17 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, in
 	thiz->frames = frames;
 	snd_pcm_hw_params_set_period_size_near(thiz->handle, params, &thiz->frames, &dir);
 
+	// And say how many periods the card should hold.  Left unset, ALSA picks
+	// whatever the hardware's maximum happens to be: on one card that is tens
+	// of milliseconds of slack, on the next it is half a second of latency.
+	// Four periods is the usual playback compromise — enough that a late
+	// writer does not empty the card, short enough that sound follows the
+	// picture.
+	{
+		snd_pcm_uframes_t buffer = thiz->frames * 4;
+		snd_pcm_hw_params_set_buffer_size_near(thiz->handle, params, &buffer);
+	}
+
 	// Write the parameters to the driver
 	rc = snd_pcm_hw_params(thiz->handle, params);
 	if (rc < 0) {

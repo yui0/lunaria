@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <sched.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -303,14 +304,62 @@ int luna_os_disk_info(const char *path, uint64_t *total_bytes,
 
 /* ---- the window --------------------------------------------------------- */
 
+/* GLFW 3.4 can select either backend at runtime. Resolve the optional native
+ * entry points dynamically so X11-only GLFW installations remain usable. */
+static int luna_wayland_backend(void)
+{
+   int (*get_platform)(void);
+   void *symbol = dlsym(RTLD_DEFAULT, "glfwGetPlatform");
+   memcpy(&get_platform, &symbol, sizeof(get_platform));
+   return get_platform && get_platform() == 0x00060003; /* GLFW_PLATFORM_WAYLAND */
+}
+
+static void *g_wayland_egl_window;
+static void (*g_wayland_egl_resize)(void *, int, int, int, int);
+
 void *luna_os_native_display(void)
 {
+   if (luna_wayland_backend()) {
+      void *(*get_display)(void);
+      void *symbol = dlsym(RTLD_DEFAULT, "glfwGetWaylandDisplay");
+      memcpy(&get_display, &symbol, sizeof(get_display));
+      /* eglGetDisplay's native handle is platform-specific. Mesa must not
+       * interpret a wl_display as an Xlib Display. */
+      setenv("EGL_PLATFORM", "wayland", 1);
+      return get_display ? get_display() : NULL;
+   }
    return (void *)glfwGetX11Display();
 }
 
 void *luna_os_native_window(void *glfw_window)
 {
    if (!glfw_window) return NULL;
+   if (luna_wayland_backend()) {
+      int w = 0, h = 0;
+      glfwGetFramebufferSize((GLFWwindow *)glfw_window, &w, &h);
+      if (w <= 0 || h <= 0) return g_wayland_egl_window;
+      if (!g_wayland_egl_window) {
+         void *lib = dlopen("libwayland-egl.so.1", RTLD_NOW | RTLD_LOCAL);
+         void *(*create)(void *, int, int);
+         void *(*get_surface)(GLFWwindow *);
+         void *symbol = lib ? dlsym(lib, "wl_egl_window_create") : NULL;
+         memcpy(&create, &symbol, sizeof(create));
+         symbol = dlsym(RTLD_DEFAULT, "glfwGetWaylandWindow");
+         memcpy(&get_surface, &symbol, sizeof(get_surface));
+         symbol = lib ? dlsym(lib, "wl_egl_window_resize") : NULL;
+         memcpy(&g_wayland_egl_resize, &symbol, sizeof(g_wayland_egl_resize));
+         void *surface = get_surface ? get_surface((GLFWwindow *)glfw_window) : NULL;
+         if (!create || !g_wayland_egl_resize || !surface) {
+            fprintf(stderr, "[lunaria] Wayland EGL window unavailable\n");
+            return NULL;
+         }
+         /* Lunaria owns one process-lifetime host window, like its EGL surface. */
+         g_wayland_egl_window = create(surface, w, h);
+      } else {
+         g_wayland_egl_resize(g_wayland_egl_window, w, h, 0, 0);
+      }
+      return g_wayland_egl_window;
+   }
    /* An X11 window id is a number, not a pointer; it is widened here so the
     * one signature serves the platforms whose handle really is a pointer. */
    return (void *)(uintptr_t)glfwGetX11Window((GLFWwindow *)glfw_window);
@@ -362,23 +411,49 @@ static void *luna_audio_thread(void *arg)
    const unsigned period = (unsigned)g_audio.frames ? (unsigned)g_audio.frames : 256u;
    int16_t *chunk = (int16_t *)malloc((size_t)period * g_audio_ch * sizeof *chunk);
    if (!chunk) return NULL;
+   unsigned long starved_periods = 0, starved_frames = 0;
    while (!atomic_load_explicit(&g_audio_stop, memory_order_acquire)) {
-      if (luna_audio_used() < period) {
-         /* Nothing to play.  Sleeping a fraction of a period keeps the
-          * wake-up cost low without letting the card run dry unnoticed. */
-         struct timespec ts = { 0, 2 * 1000 * 1000 };
-         nanosleep(&ts, NULL);
-         continue;
-      }
+      /* Hand the card a whole period every period, always.  A mixer does not
+       * stop when the application is late; it plays what it has and silence
+       * for the rest, and the stream stays continuous.  Waiting for a full
+       * period before writing anything let the card run out instead — every
+       * dry spell is an -EPIPE, a restart of the stream, and an audible click
+       * — which is what a producer that cannot keep up sounds like here.
+       * snd_pcm_writei blocks while the card still has audio, so it, not a
+       * sleep, is what paces this loop. */
       unsigned t = atomic_load_explicit(&g_audio_tail, memory_order_relaxed);
-      for (unsigned i = 0; i < period; ++i) {
+      unsigned have = luna_audio_used();
+      if (have > period) have = period;
+      for (unsigned i = 0; i < have; ++i) {
          const unsigned src = ((t + i) % LUNA_AUDIO_RING_FRAMES) * g_audio_ch;
          for (unsigned c = 0; c < g_audio_ch; ++c)
             chunk[i * g_audio_ch + c] = g_audio_ring[src + c];
       }
-      AUDIO_play(&g_audio, (char *)chunk, (int)period);
-      atomic_store_explicit(&g_audio_tail, (t + period) % LUNA_AUDIO_RING_FRAMES,
-                            memory_order_release);
+      if (have < period) {
+         memset(chunk + (size_t)have * g_audio_ch, 0,
+                (size_t)(period - have) * g_audio_ch * sizeof *chunk);
+         /* Say so: silence covers the gap, it does not fill it.  A run that
+          * reports these is one whose guest mixer is not being asked for
+          * audio often enough, and that is a bug upstream of the card. */
+         ++starved_periods;
+         starved_frames += period - have;
+         if (starved_periods == 1 || (starved_periods % 500) == 0)
+            fprintf(stderr, "[audio] sink starved: %lu periods short so far "
+                    "(%lu frames of silence, %.0f ms)\n", starved_periods,
+                    starved_frames,
+                    1000.0 * (double)starved_frames / (double)g_audio.freq);
+      }
+      const int wrote = AUDIO_play(&g_audio, (char *)chunk, (int)period);
+      /* Give back only what the card took.  A short write leaves the tail of
+       * the chunk unplayed, and advancing the ring past it would drop those
+       * frames on the floor — a gap in the middle of the sound rather than at
+       * its edge, which is the one artefact a listener cannot miss. */
+      unsigned consumed = have;
+      if (wrote >= 0 && (unsigned)wrote < consumed) consumed = (unsigned)wrote;
+      if (consumed)
+         atomic_store_explicit(&g_audio_tail,
+                               (t + consumed) % LUNA_AUDIO_RING_FRAMES,
+                               memory_order_release);
    }
    free(chunk);
    return NULL;

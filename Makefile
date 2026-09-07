@@ -39,6 +39,11 @@ LUNA_OS_SRC = src/lunaria_linux.c
 endif
 LUNA_OS_OBJ = lunaria_os.o
 
+# The dynarmic sub-build's driver.  Only the macOS branch below used to set
+# this, so `make dynarmic-build` on a Linux host ran an empty command and
+# reported the archive as up to date without ever producing it.
+CMAKE ?= cmake
+
 # Host graphics and system libraries.  The macOS build uses GLFW's Cocoa
 # backend and ANGLE's Metal backend from .deps/; no X11 or Linux libEGL is
 # involved.  `make macos-deps` produces these files without Homebrew.
@@ -265,9 +270,9 @@ runtime/libOpenSLES.so: trace.o
 	    src/lib/stub.c -DLUNARIA_STUB_OPENSLES -o $@
 
 DVM_SRC = src/dvm/dex.c src/dvm/dvm.c src/dvm/dvm_runtime.c src/dvm/dvm_jni.c \
-          src/dvm/dvm_net.c src/dvm/dvm_media.c
+          src/dvm/dvm_net.c src/dvm/dvm_media.c src/dvm/regex.c
 DVM_HDR = src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
-          src/dvm/dvm_net.h src/dvm/dvm_media.h
+          src/dvm/dvm_net.h src/dvm/dvm_media.h src/dvm/regex.h
 
 # The Dalvik bytecode emulator lives in libjvm.so: it is reached from jvm.c
 # (a JNI call with no host stub) and it calls back out through the same JNI
@@ -396,7 +401,7 @@ clean:
 	$(RM) $(bins) trace.o arm_exec.o binary128.o arm.o loader.o lunaria_os.o luna_overlay.o luna_boot.o \
 	    stb_vorbis.o libdl.so libpthread.so
 	$(RM) -r runtime
-	$(RM) test/test_dynarmic_arm test/test_unity test/test_dvm test/dvm_test.dex
+	$(RM) test/test_dynarmic_arm test/test_unity test/test_dvm test/dvm_test.dex test/test_regex
 	$(RM) test/test_boot_card
 	$(RM) test/libabitest64.so test/libabitest32.so test/abi_test_values.h
 	$(RM) test/abi_pkg/classes.dex
@@ -437,6 +442,14 @@ test/test_boot_card: test/boot_card_test.c luna_overlay.o luna_boot.o luna_ime.o
 boot-card-test: test/test_boot_card
 	mkdir -p /tmp/lunaria-boot
 	./test/test_boot_card 18 /tmp/lunaria-boot
+
+test/test_regex: test/regex_test.c src/dvm/regex.c src/dvm/regex.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc/dvm -o $@ test/regex_test.c src/dvm/regex.c -lpthread
+
+# The java.util.regex engine on its own: it depends on nothing from the VM, so
+# its behaviour can be checked without booting one.
+regex-test: test/test_regex
+	./test/test_regex
 
 dvm-test: test/test_dvm test/dvm_test.dex
 	./test/test_dvm test/dvm_test.dex $(DVM_DEX)
@@ -665,7 +678,7 @@ $(OPENH264_SO):
 fetch: fetch-libunity fetch-btw fetch-blade-soul fetch-openh264
 
 .PHONY: all syslib syslib-clean host-all macos-deps x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
-	        clean install install-bin install-lib test net-test dvm-test abi-test \
+	        clean install install-bin install-lib test net-test dvm-test regex-test abi-test \
 	        posix-test boot-card-test binary128-test \
         fetch fetch-libunity fetch-btw fetch-blade-soul fetch-openh264 \
         dynarmic-build

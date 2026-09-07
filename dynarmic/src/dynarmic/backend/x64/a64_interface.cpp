@@ -322,15 +322,19 @@ private:
                                  (unsigned long long)g_cache_evacuations);
                 ProgressHook hook = g_progress_hook.load(std::memory_order_relaxed);
                 if (!hook) return;
-                /* ~10 Hz or every 256 blocks — enough for a progress bar,
-                 * cheap enough not to matter inside the emitter. */
+                /* ~60 Hz or every 64 blocks.  The hook is what draws the
+                 * boot card while the guest is compiling and issuing no
+                 * syscalls, so its rate *is* that card's frame rate: at 10 Hz
+                 * the falling snow advanced in visible jumps.  Two clock
+                 * reads and a compare per compiled block is nothing beside
+                 * the emitter. */
                 const uint64_t now_ns = (uint64_t)std::chrono::duration_cast<
                     std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now().time_since_epoch())
                         .count();
                 uint64_t last_ns = g_hook_last_ns.load(std::memory_order_relaxed);
                 uint64_t last_n = g_hook_last_compiles.load(std::memory_order_relaxed);
-                if (n - last_n < 256 && now_ns - last_ns < 100'000'000ull)
+                if (n - last_n < 64 && now_ns - last_ns < 16'000'000ull)
                     return;
                 if (!g_hook_last_ns.compare_exchange_strong(
                         last_ns, now_ns, std::memory_order_relaxed))

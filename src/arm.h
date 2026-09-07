@@ -856,11 +856,9 @@ constexpr int      CB_MAX_DEPTH  = 2;            /* outer + one nest */
  * anti-tamper thread that lost its signal sat in a Java retry loop that
  * pinned the interpreter lock for seconds at a time.
  *
- * Exclusive-monitor ids are permanent per host thread (LL/SC identity) and
- * come from a larger pool, because they are cheap and the JIT that embeds
- * them is thread-local. */
+ * Exclusive-monitor ids are per host thread, not per callback JIT; see
+ * EXCL_ID_PE below. */
 constexpr int      CB_MAX_SLOTS  = 16;           /* concurrent stack windows */
-constexpr int      CB_MAX_EXCL   = 64;           /* host threads that callback */
 /* How many of those slots the guest address space actually has stack windows
  * for; the layout functions below set it from the room they have. */
 inline int         g_cb_slots    = 4;
@@ -869,18 +867,32 @@ inline uint32_t cb_stack_base(int slot, int depth) {
            (uint32_t)(slot * CB_MAX_DEPTH + depth) * CB_STACK_SIZE;
 }
 
-// Exclusive-monitor processor ids.
+/* Exclusive-monitor processor ids.
+ *
+ * A reservation belongs to the processing element that took it, and this
+ * emulator's processing elements are the host threads that run guest code:
+ * an engine, or any host thread that enters a guest callback.  Several JITs
+ * live on one such thread (the engine's, plus one callback JIT per nest depth
+ * for A32 and A64), but only one of them executes at a time, and a nested one
+ * clobbering the outer one's reservation is precisely what a real PE does
+ * when an exception handler uses LL/SC: the outer STXR fails and the guest's
+ * retry loop takes it from there.  So the id belongs to the host thread, not
+ * to the JIT object.
+ *
+ * The count is not just memory.  dynarmic emits one inline compare-and-clear
+ * per *other* processor at every store-exclusive, and its out-of-line path
+ * scans the whole table under one global spin lock.  Giving every possible
+ * callback thread two ids per nest depth sized this monitor at 266 — 265
+ * compares over 33 cache lines on every STXR, and UE4 takes a reservation on
+ * every refcount.  One id per host thread that can run guest code is both the
+ * architecturally right model and two orders of magnitude cheaper. */
+constexpr int      A64_ENGINE_MAX = 8;
+constexpr int      EXCL_PE_MAX    = 14;  /* host threads that run guest code */
 enum : size_t {
-    EXCL_ID_MAIN   = 0,
-    EXCL_ID_AUX    = 1,
-    /* + excl * CB_MAX_DEPTH + nest depth */
-    EXCL_ID_A32_CB = 2,
-    EXCL_ID_A64_CB = EXCL_ID_A32_CB + CB_MAX_DEPTH * CB_MAX_EXCL,
-    /* One slot per A64 engine (LUNARIA_A64_ENGINES): engines can hold an LL/SC
-     * reservation at the same time, so they may not share a slot. */
-    EXCL_ID_A64_ENG = EXCL_ID_A64_CB + CB_MAX_DEPTH * CB_MAX_EXCL,
-    A64_ENGINE_MAX  = 8,
-    EXCL_ID_COUNT  = EXCL_ID_A64_ENG + A64_ENGINE_MAX,
+    EXCL_ID_MAIN  = 0,
+    EXCL_ID_AUX   = 1,
+    EXCL_ID_PE    = 2,
+    EXCL_ID_COUNT = EXCL_ID_PE + EXCL_PE_MAX,
 };
 
 // A64: tramp/stack below MMAP_BASE so primary holds 2×512 MiB exact slabs and secondary 5× → 7 exact 512 MiB (A64 Unity.

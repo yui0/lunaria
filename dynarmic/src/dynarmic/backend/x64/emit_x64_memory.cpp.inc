@@ -332,7 +332,11 @@ void AxxEmitX64::EmitExclusiveWriteMemory(AxxEmitContext& ctx, IR::Inst* inst) {
 
 template<std::size_t bitsize, auto callback>
 void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* inst) {
-    ASSERT(conf.global_monitor && conf.fastmem_pointer);
+    /* A fastmem base of 0 is a legitimate configuration: the guest address
+     * space is then mapped identically to the host's, which is what an
+     * emulator that hands out host addresses as guest addresses does.  The
+     * inline exclusive path only needs a base to add, and 0 adds nothing. */
+    ASSERT(conf.global_monitor);
     if (!exception_handler.SupportsFastmem()) {
         EmitExclusiveReadMemory<bitsize, callback>(ctx, inst);
         return;
@@ -409,7 +413,11 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
 
 template<std::size_t bitsize, auto callback>
 void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* inst) {
-    ASSERT(conf.global_monitor && conf.fastmem_pointer);
+    /* A fastmem base of 0 is a legitimate configuration: the guest address
+     * space is then mapped identically to the host's, which is what an
+     * emulator that hands out host addresses as guest addresses does.  The
+     * inline exclusive path only needs a base to add, and 0 adds nothing. */
+    ASSERT(conf.global_monitor);
     if (!exception_handler.SupportsFastmem()) {
         EmitExclusiveWriteMemory<bitsize, callback>(ctx, inst);
         return;

@@ -1188,21 +1188,11 @@ void A32EmitX64::EmitTerminalImpl(IR::Term::LinkBlock terminal, IR::LocationDesc
     code.ForceReturnFromRunCode();
 }
 
+/* Same as the A64 side: a bare jmp between linked blocks is a loop nothing can
+ * interrupt.  UnitySampleGame's mono thread spins on one PC for billions of
+ * ticks when it lands here.  Emit LinkBlock's guard instead. */
 void A32EmitX64::EmitTerminalImpl(IR::Term::LinkBlockFast terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
-    EmitSetUpperLocationDescriptor(terminal.next, initial_location);
-
-    if (!conf.HasOptimization(OptimizationFlag::BlockLinking) || is_single_step) {
-        code.mov(MJitStateReg(A32::Reg::PC), A32::LocationDescriptor{terminal.next}.PC());
-        code.ReturnFromRunCode();
-        return;
-    }
-
-    patch_information[terminal.next].jmp.push_back(code.getCurr());
-    if (const auto next_bb = GetBasicBlock(terminal.next)) {
-        EmitPatchJmp(terminal.next, next_bb->entrypoint);
-    } else {
-        EmitPatchJmp(terminal.next);
-    }
+    EmitTerminalImpl(IR::Term::LinkBlock{terminal.next}, initial_location, is_single_step);
 }
 
 void A32EmitX64::EmitTerminalImpl(IR::Term::PopRSBHint, IR::LocationDescriptor, bool is_single_step) {

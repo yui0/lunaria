@@ -15,6 +15,9 @@
 #    endif
 #endif
 
+#include <execinfo.h>
+
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -256,6 +259,20 @@ void SigHandler::SigAction(int sig, siginfo_t* info, void* raw_context) {
 #    error "Invalid architecture"
 
 #endif
+
+    /* The fault is not a fastmem miss, so it is a real host crash.  Printing
+     * only the rip leaves nothing to work with: the address is in a shared
+     * library loaded at a random base, and by the time the shell reports the
+     * signal the process is gone.  Dump the faulting address and the host call
+     * stack while the frames still exist. */
+    {
+        void* frames[64];
+        const int n = backtrace(frames, 64);
+        fmt::print(stderr, "Faulting address {:#018x}, {} host frames:\n",
+                   reinterpret_cast<uintptr_t>(info->si_addr), n);
+        std::fflush(stderr);
+        backtrace_symbols_fd(frames, n, 2);
+    }
 
     struct sigaction* retry_sa = sig == SIGSEGV ? &sig_handler->old_sa_segv : &sig_handler->old_sa_bus;
     if (retry_sa->sa_flags & SA_SIGINFO) {

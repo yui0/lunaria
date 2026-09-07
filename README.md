@@ -451,8 +451,8 @@ like an emulator hang when it is only the software rasterizer.
 Mesa llvmpipe is a software renderer and is useful for headless validation,
 not performance testing. Use a GPU-accelerated host EGL/OpenGL stack for
 real-time rendering. For AArch64 titles, try `LUNARIA_A64_ENGINES=4` once
-the single-engine path is stable; leave `LUNARIA_PROF` /
-`LUNARIA_SLICE_DETAIL` / `LUNARIA_SVC_HISTO` unset when measuring speed.
+the single-engine path is stable; leave `LUNARIA_SLICE_DETAIL` /
+`LUNARIA_SVC_HISTO` unset when measuring speed.
 
 </details>
 

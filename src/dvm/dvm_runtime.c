@@ -21,6 +21,7 @@
 #include "dvm/dvm_internal.h"
 #include "dvm/dvm_media.h"
 #include "dvm/dvm_net.h"
+#include "dvm/regex.h"
 #include "arm_exec.h"
 #include "arm.h"
 #include "jvm/jvm.h"
@@ -54,7 +55,6 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <pthread.h>
-#include <regex.h>
 #include <stdatomic.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -185,6 +185,16 @@ static uint16_t ax_u16(const unsigned char *p);
 static uint32_t ax_u32(const unsigned char *p);
 static char **ax_string_pool(const unsigned char *b, size_t n,
                              uint32_t *out_count);
+
+/* The regex engine binding lives further down, next to the java.util.regex
+ * classes; String.split()/matches()/replaceAll() are declared up here because
+ * java.lang.String comes first in this file. */
+static const struct rx *regex_for(struct dvm *vm, const char *expr, int flags);
+static dvm_ref regex_split(struct dvm *vm, const struct rx *re,
+                           const char *input, size_t len, int32_t limit);
+static dvm_ref regex_replace_text(struct dvm *vm, const struct rx *re,
+                                  const char *input, size_t len,
+                                  const char *replacement, bool first_only);
 
 static const char *sref(struct dvm *vm, dvm_ref r)
 {
@@ -988,54 +998,22 @@ static bool s_getBytes(struct dvm *vm, dvm_ref self, const union dvm_value *args
 
 /* String.split(regex[, limit]).
  *
- * The VM has no regex engine, and adding one is not what the callers need:
- * app code overwhelmingly splits on a literal, spelled either plainly (",")
- * or escaped ("\\." for a dot).  Those are handled exactly.  A pattern that
- * still carries regex syntax after unescaping cannot be honoured, so the whole
- * string comes back as the single element — which is what Java returns for a
- * separator that never matches, and never silently mangles the input. */
+ * This used to unescape the pattern and, if anything regex-shaped survived,
+ * hand back the whole string as a single element — so `split("\\s*,\\s*")`
+ * returned one piece and every caller that trimmed while splitting got the
+ * input back unsplit.  It also stopped at 63 pieces.  Both were consequences
+ * of there being no regex engine; there is one now. */
 static bool s_split(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                     int nargs, union dvm_value *out)
 {
-   const char *s = sref(vm, self);
    const char *pat = (nargs > 0 && args[0].l) ? dvm_string_utf8(vm, args[0].l) : NULL;
    int32_t limit = (nargs > 1) ? args[1].i : 0;
-
-   char sep[64];
-   size_t w = 0;
-   bool literal = pat && *pat;
-   for (const char *p = pat; p && *p && w + 1 < sizeof sep; ++p) {
-      if (*p == '\\' && p[1]) { sep[w++] = *++p; continue; }
-      if (strchr("[](){}*+?|^$", *p)) { literal = false; break; }
-      sep[w++] = *p;
-   }
-   sep[w] = '\0';
-   if (!w) literal = false;
-
-   dvm_ref parts[64];
-   int n = 0;
-   if (!literal) {
-      parts[n++] = dvm_new_string(vm, s);
-   } else {
-      const char *cur = s;
-      for (;;) {
-         const char *hit = (limit > 0 && n == limit - 1) ? NULL : strstr(cur, sep);
-         if (!hit || n >= 63) { parts[n++] = dvm_new_string(vm, cur); break; }
-         parts[n++] = dvm_new_string_n(vm, cur, (size_t)(hit - cur));
-         cur = hit + w;
-      }
-      /* limit == 0 drops the trailing empties. */
-      if (limit == 0)
-         while (n > 1) {
-            const char *last = dvm_string_utf8(vm, parts[n - 1]);
-            if (last && *last) break;
-            --n;
-         }
-   }
-
-   dvm_ref arr = dvm_new_array(vm, 'L', "Ljava/lang/String;", (uint32_t)n);
-   dvm_ref *slots = arr ? dvm_array_data(vm, arr) : NULL;
-   for (int i = 0; slots && i < n; ++i) slots[i] = parts[i];
+   const struct rx *re = regex_for(vm, pat, 0);
+   if (!re) return false;
+   size_t n = 0;
+   const char *s = sdata(vm, self, &n);
+   dvm_ref arr = regex_split(vm, re, s ? s : "", s ? n : 0, limit);
+   rx_cached_release(re);
    RETL(arr);
 }
 
@@ -2182,226 +2160,104 @@ static bool sys_loadLibrary(struct dvm *vm, dvm_ref self,
    RETV();
 }
 
-/* java.util.regex backed by the host's POSIX ERE engine.  AndroidX uses this
- * during VM capability detection, and application glue uses the same small
- * API surface for validation. */
+/* java.util.regex, backed by the VM's own engine (dvm/regex.c).
+ *
+ * This used to translate Java patterns into POSIX ERE and hand them to the
+ * host's regcomp()/regexec().  POSIX ERE is a different language: no reluctant
+ * quantifier, no lookaround, no backreference, no \b or \A/\z, and
+ * leftmost-longest where Java is leftmost-first.  The translation could only
+ * drop those or refuse the pattern, and `(.*?)` — the commonest idiom in
+ * hand-written parsers — silently became a greedy `(.*)`, matching far more
+ * than the caller asked for.  regex.c implements Java's grammar directly, so
+ * the surface below is a thin binding rather than a translation. */
 struct rt_regex_pattern {
-   regex_t re;
-   int valid;
+   struct rx *re;
    char *expression;
-   /* POSIX ERE has no non-capturing group, so (?:...) is emitted as an
-    * ordinary host group.  Preserve Java's public group numbering by mapping
-    * each Java capture to the corresponding host capture. */
-   uint8_t group_map[16];
+   int flags;
 };
+
 struct rt_regex_matcher {
    struct rt_regex_pattern *pattern;
    char *input;
-   regmatch_t groups[16];
-   int matched;
+   size_t inlen;
+   int *caps;
+   int ncaps;
+   bool matched;
+   size_t next_from;      /* where the following find() starts */
+   size_t append_pos;     /* how much appendReplacement has consumed */
 };
 
-/* Java's predefined and Unicode-property character classes, as POSIX bracket
- * expressions.  The `inner` form is what goes *inside* an existing [...]; the
- * `outer` form is the whole class.
- *
- * The host engine works on bytes in the C locale, so a Unicode general
- * category can only be approximated — but the approximation is exact for the
- * thing these are used for.  \p{C} ("other": control, format, surrogate,
- * private use, unassigned) is how AppsFlyer strips non-printing characters
- * from its JSON payload with replaceAll("\\p{C}", ""), and over UTF-8 bytes
- * [:cntrl:] matches exactly the ASCII control bytes and leaves every
- * continuation byte of a multi-byte character alone, which is the intent.
- * The alternative — refusing the pattern — is what this replaces, and it was
- * not neutral: the SDK caught the PatternSyntaxException, failed to prepare
- * the event, and retried, throwing eighteen hundred exceptions a second
- * through the whole Cross Worlds loading screen. */
-struct regex_class_map { const char *name; const char *inner; };
-static const struct regex_class_map kRegexClasses[] = {
-   /* POSIX classes Java spells the same way */
-   { "Lower",  "[:lower:]"  }, { "Upper",  "[:upper:]"  },
-   { "Alpha",  "[:alpha:]"  }, { "Digit",  "[:digit:]"  },
-   { "Alnum",  "[:alnum:]"  }, { "Punct",  "[:punct:]"  },
-   { "Graph",  "[:graph:]"  }, { "Print",  "[:print:]"  },
-   { "Blank",  "[:blank:]"  }, { "Cntrl",  "[:cntrl:]"  },
-   { "XDigit", "[:xdigit:]" }, { "Space",  "[:space:]"  },
-   { "ASCII",  "\\x00-\\x7f" },
-   /* Unicode general categories, one- and two-letter forms */
-   { "L",  "[:alpha:]" }, { "Lu", "[:upper:]" }, { "Ll", "[:lower:]" },
-   { "Lt", "[:upper:]" }, { "Lm", "[:alpha:]" }, { "Lo", "[:alpha:]" },
-   { "N",  "[:digit:]" }, { "Nd", "[:digit:]" }, { "Nl", "[:digit:]" },
-   { "No", "[:digit:]" },
-   { "P",  "[:punct:]" }, { "S",  "[:punct:]" },
-   { "Z",  "[:space:]" }, { "Zs", "[:space:]" },
-   { "C",  "[:cntrl:]" }, { "Cc", "[:cntrl:]" }, { "Cf", "[:cntrl:]" },
-   { "Cn", "[:cntrl:]" }, { "Co", "[:cntrl:]" }, { "Cs", "[:cntrl:]" },
-};
-
-static const char *regex_class_body(const char *name, size_t len)
+/* Compile for one of the String shortcuts, through the shared cache: those
+ * call sites have no Pattern object to hold a compiled form, and used to
+ * recompile on every call. */
+static const struct rx *regex_for(struct dvm *vm, const char *expr, int flags)
 {
-   for (size_t i = 0; i < sizeof kRegexClasses / sizeof kRegexClasses[0]; ++i)
-      if (strlen(kRegexClasses[i].name) == len &&
-          !strncmp(kRegexClasses[i].name, name, len))
-         return kRegexClasses[i].inner;
-   return NULL;
+   char *err = NULL;
+   const struct rx *re = expr ? rx_cached(expr, flags, &err) : NULL;
+   if (!re) {
+      dvm__throw(vm, "java/util/regex/PatternSyntaxException", "%s",
+                 err ? err : (expr ? expr : "null"));
+      free(err);
+      return NULL;
+   }
+   return re;
 }
 
-static char *regex_java_to_ere(const char *src, struct rt_regex_pattern *meta)
+static struct rt_regex_pattern *pattern_of(struct dvm *vm, dvm_ref self)
 {
-   if (!src) return NULL;
-   size_t n = strlen(src), cap = n * 16 + 1, j = 0;
-   char *dst = malloc(cap);
-   if (!dst) return NULL;
-   bool in_class = false;
-   unsigned host_group = 0, java_group = 0;
-   if (meta) meta->group_map[0] = 0;
+   struct dvm_object *o = dvm__obj(vm, self);
+   return o ? o->data : NULL;
+}
 
-#define EMIT(str) do { const char *s_ = (str); size_t m_ = strlen(s_); \
-                       memcpy(dst + j, s_, m_); j += m_; } while (0)
-
-   for (size_t i = 0; i < n; ++i) {
-      if (src[i] == '\\' && i + 1 < n) {
-         const char esc = src[i + 1];
-         const char *body = NULL;
-         bool negate = false;
-         size_t consumed = 1;          /* the escape letter itself */
-
-         switch (esc) {
-            case 'd': body = "[:digit:]"; break;
-            case 'D': body = "[:digit:]"; negate = true; break;
-            case 's': body = "[:space:]"; break;
-            case 'S': body = "[:space:]"; negate = true; break;
-            case 'w': body = "[:alnum:]_"; break;
-            case 'W': body = "[:alnum:]_"; negate = true; break;
-            case 'p': case 'P': {
-               negate = (esc == 'P');
-               const char *name = src + i + 2;
-               size_t len = 0;
-               if (*name == '{') {
-                  ++name;
-                  while (name[len] && name[len] != '}') ++len;
-                  if (name[len] != '}') break;      /* unterminated: literal */
-                  consumed = 1 + 1 + len + 1;       /* p + { + name + } */
-               } else if (*name) {
-                  len = 1;                          /* \pL, the one-letter form */
-                  consumed = 2;
-               } else {
-                  break;
-               }
-               /* Java allows an "Is" or "In" prefix (IsAlpha, InGreek). */
-               if (len > 2 && (!strncmp(name, "Is", 2) || !strncmp(name, "In", 2))) {
-                  const char *b = regex_class_body(name + 2, len - 2);
-                  if (b) { body = b; break; }
-               }
-               body = regex_class_body(name, len);
-               break;
-            }
-            default: break;
-         }
-
-         if (body) {
-            if (in_class) {
-               /* Inside an existing class only the body can be spliced in; a
-                * negated property there would need a set difference the host
-                * engine does not have, so it is left to match nothing extra. */
-               if (!negate) EMIT(body);
-            } else {
-               EMIT(negate ? "[^" : "[");
-               EMIT(body);
-               EMIT("]");
-            }
-            i += consumed;
-            continue;
-         }
-         /* Not a class escape: hand both characters to the host engine. */
-         dst[j++] = src[i];
-         dst[j++] = src[i + 1];
-         ++i;
-         continue;
-      }
-
-      if (src[i] == '(' && !in_class) {
-         ++host_group;
-         if (i + 2 < n && src[i + 1] == '?' && src[i + 2] == ':') {
-            /* ERE captures it internally; group_map hides that extra group
-             * from Matcher.group() and replacement $n references. */
-            dst[j++] = '(';
-            i += 2;
-         } else {
-            ++java_group;
-            if (meta && java_group < sizeof meta->group_map)
-               meta->group_map[java_group] =
-                  host_group < UINT8_MAX ? (uint8_t)host_group : UINT8_MAX;
-            dst[j++] = src[i];
-         }
-      } else if (src[i] == '[') {
-         in_class = true;
-         dst[j++] = src[i];
-      } else if (src[i] == ']' && in_class) {
-         in_class = false;
-         dst[j++] = src[i];
-      } else if (src[i] == '-' && in_class) {
-         /* Java treats '-' as a literal when it cannot form a valid range.
-          * glibc's POSIX ERE rejects e.g. [0-9-_.], interpreting 9-_ as a
-          * descending range.  Preserve ordinary ASCII ranges but quote every
-          * other mid-class dash for the host engine.
-          *
-          * Do NOT escape a leading '-' (right after '[' or '[^'): POSIX already
-          * treats that as a literal, and writing [\-._ turns into a bad range
-          * from '\\' to '.' ("Invalid range end").  That broke Facebook PKCE
-          * (^[-._~A-Za-z0-9]+$) and aborted ConnectToChannel on the title tap. */
-         unsigned char prev = i ? (unsigned char)src[i - 1] : 0;
-         unsigned char next = i + 1 < n ? (unsigned char)src[i + 1] : 0;
-         bool at_start = (prev == '[') ||
-             (prev == '^' && i >= 2 && src[i - 2] == '[');
-         bool range = !at_start && isalnum(prev) && isalnum(next) && prev <= next;
-         if (!range && !at_start) dst[j++] = '\\';
-         dst[j++] = '-';
-      } else {
-         dst[j++] = src[i];
-      }
-   }
-#undef EMIT
-   dst[j] = '\0';
-   return dst;
+static struct rt_regex_matcher *matcher_of(struct dvm *vm, dvm_ref self)
+{
+   struct dvm_object *o = dvm__obj(vm, self);
+   return o ? o->data : NULL;
 }
 
 static bool regex_compile(struct dvm *vm, dvm_ref self,
                           const union dvm_value *args, int nargs,
                           union dvm_value *out)
 {
-   (void)self; (void)nargs;
+   (void)self;
    const char *java = dvm_string_utf8(vm, ARG(0).l);
-   struct rt_regex_pattern *p = calloc(1, sizeof *p);
-   char *ere = regex_java_to_ere(java, p);
+   const int flags = nargs > 1 ? ARG(1).i : 0;
+   char *err = NULL;
+   struct rx *re = rx_compile(java ? java : "", flags, &err);
    struct dvm_class *c = dvm__class_by_desc(vm, "Ljava/util/regex/Pattern;");
-   dvm_ref ref = (p && c) ? dvm_new_object(vm, c) : 0;
-   if (!ere || !p || !ref || regcomp(&p->re, ere, REG_EXTENDED) != 0) {
-      free(ere); free(p);
+   dvm_ref ref = (re && c) ? dvm_new_object(vm, c) : 0;
+   struct rt_regex_pattern *p = ref ? calloc(1, sizeof *p) : NULL;
+   if (!re || !ref || !p) {
+      free(p);
+      rx_free(re);
       dvm__throw(vm, "java/util/regex/PatternSyntaxException", "%s",
-                 java ? java : "null");
+                 err ? err : (java ? java : "null"));
+      free(err);
       return false;
    }
-   free(ere);
-   p->valid = 1;
-   p->expression = strdup(java);
+   p->re = re;
+   p->flags = flags;
+   p->expression = strdup(java ? java : "");
    dvm__obj(vm, ref)->data = p;
    RETL(ref);
 }
 
-static int regex_exec(const struct rt_regex_pattern *pattern,
-                      const char *input, regmatch_t groups[16])
+static bool regex_pattern_text(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
 {
-   regmatch_t host[64];
-   int rc = regexec(&pattern->re, input, sizeof host / sizeof host[0], host, 0);
-   if (rc != 0) return rc;
-   groups[0] = host[0];
-   for (size_t i = 1; i < 16; ++i) {
-      uint8_t mapped = pattern->group_map[i];
-      groups[i] = mapped && mapped < sizeof host / sizeof host[0]
-         ? host[mapped] : (regmatch_t){ .rm_so = -1, .rm_eo = -1 };
-   }
-   return 0;
+   (void)args; (void)nargs;
+   struct rt_regex_pattern *p = pattern_of(vm, self);
+   RETL(dvm_new_string(vm, p && p->expression ? p->expression : ""));
+}
+
+static bool regex_pattern_flags(struct dvm *vm, dvm_ref self,
+                                const union dvm_value *args, int nargs,
+                                union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   struct rt_regex_pattern *p = pattern_of(vm, self);
+   RETI(p ? p->flags : 0);
 }
 
 static bool regex_matcher(struct dvm *vm, dvm_ref self,
@@ -2409,16 +2265,40 @@ static bool regex_matcher(struct dvm *vm, dvm_ref self,
                           union dvm_value *out)
 {
    (void)nargs;
+   struct rt_regex_pattern *p = pattern_of(vm, self);
    struct dvm_class *c = dvm__class_by_desc(vm, "Ljava/util/regex/Matcher;");
    dvm_ref ref = c ? dvm_new_object(vm, c) : 0;
-   struct rt_regex_matcher *m = calloc(1, sizeof *m);
-   const char *input = dvm_string_utf8(vm, ARG(0).l);
-   if (!ref || !m || !input) { free(m); RETL(0); }
-   m->pattern = dvm__obj(vm, self) ? dvm__obj(vm, self)->data : NULL;
-   m->input = strdup(input);
-   if (!m->input) { free(m); RETL(0); }
+   struct rt_regex_matcher *m = ref ? calloc(1, sizeof *m) : NULL;
+   size_t n = 0;
+   const char *input = ARG(0).l ? sdata(vm, ARG(0).l, &n) : NULL;
+   if (!ref || !m || !input || !p) { free(m); RETL(0); }
+   m->pattern = p;
+   m->input = malloc(n + 1);
+   m->ncaps = 2 * (rx_group_count(p->re) + 1);
+   m->caps = calloc((size_t)m->ncaps, sizeof *m->caps);
+   if (!m->input || !m->caps) { free(m->input); free(m->caps); free(m); RETL(0); }
+   memcpy(m->input, input, n);
+   m->input[n] = '\0';
+   m->inlen = n;
    dvm__obj(vm, ref)->data = m;
    RETL(ref);
+}
+
+/* matches() / lookingAt() / find() differ only in where the match may start
+ * and whether it has to reach the end. */
+static bool matcher_run(struct rt_regex_matcher *m, size_t from,
+                        bool anchor_start, bool anchor_end)
+{
+   if (!m || !m->pattern || !m->pattern->re || !m->input) return false;
+   for (int i = 0; i < m->ncaps; ++i) m->caps[i] = -1;
+   m->matched = rx_search(m->pattern->re, m->input, m->inlen, from,
+                          m->caps, m->ncaps, anchor_start, anchor_end);
+   if (m->matched) {
+      /* Java advances past a zero-width match so find() terminates. */
+      m->next_from = (size_t)m->caps[1];
+      if (m->caps[1] == m->caps[0] && m->next_from <= m->inlen) ++m->next_from;
+   }
+   return m->matched;
 }
 
 static bool regex_matches(struct dvm *vm, dvm_ref self,
@@ -2426,64 +2306,238 @@ static bool regex_matches(struct dvm *vm, dvm_ref self,
                           union dvm_value *out)
 {
    (void)args; (void)nargs;
-   struct dvm_object *o = dvm__obj(vm, self);
-   struct rt_regex_matcher *m = o ? o->data : NULL;
-   if (!m || !m->pattern || !m->pattern->valid || !m->input) RETI(0);
-   m->matched = regex_exec(m->pattern, m->input, m->groups) == 0;
-   if (m->matched && (m->groups[0].rm_so != 0 ||
-       (size_t)m->groups[0].rm_eo != strlen(m->input))) m->matched = 0;
-   RETI(m->matched);
+   RETI(matcher_run(matcher_of(vm, self), 0, true, true));
+}
+
+static bool regex_lookingAt(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   RETI(matcher_run(matcher_of(vm, self), 0, true, false));
+}
+
+static bool regex_find(struct dvm *vm, dvm_ref self,
+                       const union dvm_value *args, int nargs,
+                       union dvm_value *out)
+{
+   struct rt_regex_matcher *m = matcher_of(vm, self);
+   if (!m) RETI(0);
+   size_t from = m->next_from;
+   if (nargs > 0) {                       /* find(int start) resets the region */
+      int32_t s = ARG(0).i;
+      if (s < 0 || (size_t)s > m->inlen) {
+         dvm__throw(vm, "java/lang/IndexOutOfBoundsException", "%d", s);
+         return false;
+      }
+      from = (size_t)s;
+      m->append_pos = 0;
+   }
+   if (from > m->inlen) { m->matched = false; RETI(0); }
+   RETI(matcher_run(m, from, false, false));
+}
+
+static bool regex_reset(struct dvm *vm, dvm_ref self,
+                        const union dvm_value *args, int nargs,
+                        union dvm_value *out)
+{
+   struct rt_regex_matcher *m = matcher_of(vm, self);
+   if (!m) RETL(self);
+   if (nargs > 0 && ARG(0).l) {
+      size_t n = 0;
+      const char *s = sdata(vm, ARG(0).l, &n);
+      char *copy = s ? malloc(n + 1) : NULL;
+      if (copy) {
+         memcpy(copy, s, n);
+         copy[n] = '\0';
+         free(m->input);
+         m->input = copy;
+         m->inlen = n;
+      }
+   }
+   m->matched = false;
+   m->next_from = 0;
+   m->append_pos = 0;
+   for (int i = 0; i < m->ncaps; ++i) m->caps[i] = -1;
+   RETL(self);
+}
+
+static bool regex_groupCount(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   struct rt_regex_matcher *m = matcher_of(vm, self);
+   RETI(m && m->pattern ? rx_group_count(m->pattern->re) : 0);
+}
+
+/* Resolve the group a Matcher accessor was given: an int index, or the name
+ * of a (?<name>...) group. */
+static int regex_group_arg(struct dvm *vm, struct rt_regex_matcher *m,
+                           const union dvm_value *args, int nargs, bool *bad)
+{
+   *bad = false;
+   if (!nargs) return 0;
+   struct dvm_object *o = dvm__obj(vm, ARG(0).l);
+   if (o && o->kind == DVM_OBJ_STRING) {
+      const char *name = dvm_string_utf8(vm, ARG(0).l);
+      int idx = m->pattern ? rx_group_index(m->pattern->re, name) : -1;
+      if (idx < 0) *bad = true;
+      return idx;
+   }
+   return ARG(0).i;
 }
 
 static bool regex_group(struct dvm *vm, dvm_ref self,
                         const union dvm_value *args, int nargs,
                         union dvm_value *out)
 {
-   struct dvm_object *o = dvm__obj(vm, self);
-   struct rt_regex_matcher *m = o ? o->data : NULL;
-   int idx = nargs > 0 ? ARG(0).i : 0;
-   if (!m || !m->matched || idx < 0 || idx >= 16 ||
-       m->groups[idx].rm_so < 0) RETL(0);
-   size_t n = (size_t)(m->groups[idx].rm_eo - m->groups[idx].rm_so);
-   char *s = malloc(n + 1);
-   if (!s) RETL(0);
-   memcpy(s, m->input + m->groups[idx].rm_so, n); s[n] = '\0';
-   dvm_ref ref = dvm_new_string(vm, s);
-   free(s);
-   RETL(ref);
+   struct rt_regex_matcher *m = matcher_of(vm, self);
+   if (!m || !m->matched) {
+      dvm__throw(vm, "java/lang/IllegalStateException", "No match found");
+      return false;
+   }
+   bool bad = false;
+   int idx = regex_group_arg(vm, m, args, nargs, &bad);
+   if (bad || idx < 0 || 2 * idx + 1 >= m->ncaps) {
+      dvm__throw(vm, "java/lang/IndexOutOfBoundsException", "No group %d", idx);
+      return false;
+   }
+   if (m->caps[2 * idx] < 0) RETL(0);     /* a group that did not participate */
+   size_t n = (size_t)(m->caps[2 * idx + 1] - m->caps[2 * idx]);
+   RETL(dvm_new_string_n(vm, m->input + m->caps[2 * idx], n));
 }
 
-static dvm_ref regex_replace_text(struct dvm *vm,
-                                  struct rt_regex_pattern *pattern,
-                                  const char *input, const char *replacement,
-                                  bool first_only)
+static bool regex_start(struct dvm *vm, dvm_ref self,
+                        const union dvm_value *args, int nargs,
+                        union dvm_value *out)
 {
-   if (!pattern || !pattern->valid || !input || !replacement) return 0;
-   struct rt_bytes b = { 0 };
-   const char *cur = input;
-   regmatch_t groups[16];
-   while (regex_exec(pattern, cur, groups) == 0 && groups[0].rm_so >= 0) {
-      bytes_append(&b, cur, (size_t)groups[0].rm_so);
-      for (const char *r = replacement; *r; ++r) {
-         if (*r == '\\' && r[1]) { bytes_append(&b, ++r, 1); continue; }
-         if (*r == '$' && r[1] >= '0' && r[1] <= '9') {
-            int g = *++r - '0';
-            if (groups[g].rm_so >= 0)
-               bytes_append(&b, cur + groups[g].rm_so,
-                            (size_t)(groups[g].rm_eo - groups[g].rm_so));
+   struct rt_regex_matcher *m = matcher_of(vm, self);
+   if (!m || !m->matched) {
+      dvm__throw(vm, "java/lang/IllegalStateException", "No match available");
+      return false;
+   }
+   bool bad = false;
+   int idx = regex_group_arg(vm, m, args, nargs, &bad);
+   if (bad || idx < 0 || 2 * idx + 1 >= m->ncaps) {
+      dvm__throw(vm, "java/lang/IndexOutOfBoundsException", "No group %d", idx);
+      return false;
+   }
+   RETI(m->caps[2 * idx]);
+}
+
+static bool regex_end(struct dvm *vm, dvm_ref self,
+                      const union dvm_value *args, int nargs,
+                      union dvm_value *out)
+{
+   struct rt_regex_matcher *m = matcher_of(vm, self);
+   if (!m || !m->matched) {
+      dvm__throw(vm, "java/lang/IllegalStateException", "No match available");
+      return false;
+   }
+   bool bad = false;
+   int idx = regex_group_arg(vm, m, args, nargs, &bad);
+   if (bad || idx < 0 || 2 * idx + 1 >= m->ncaps) {
+      dvm__throw(vm, "java/lang/IndexOutOfBoundsException", "No group %d", idx);
+      return false;
+   }
+   RETI(m->caps[2 * idx + 1]);
+}
+
+static bool regex_hitEnd(struct dvm *vm, dvm_ref self,
+                         const union dvm_value *args, int nargs,
+                         union dvm_value *out)
+{
+   (void)vm; (void)self; (void)args; (void)nargs;
+   RETI(0);
+}
+
+/* Expand one replacement template against the current match.  Java's rules:
+ * `$n` names a group (greedily, as far as a group that exists), `${name}` a
+ * named one, and a backslash quotes the next character. */
+static void regex_expand(struct rt_bytes *b, const struct rx *re,
+                         const char *input, const int *caps, int ncaps,
+                         const char *repl)
+{
+   for (const char *r = repl; *r; ++r) {
+      if (*r == '\\' && r[1]) { bytes_append(b, ++r, 1); continue; }
+      if (*r == '$' && r[1] == '{') {
+         const char *s = r + 2;
+         const char *e = strchr(s, '}');
+         if (e) {
+            char name[64];
+            size_t n = (size_t)(e - s);
+            if (n < sizeof name) {
+               memcpy(name, s, n); name[n] = '\0';
+               int g = rx_group_index(re, name);
+               if (g >= 0 && 2 * g + 1 < ncaps && caps[2 * g] >= 0)
+                  bytes_append(b, input + caps[2 * g],
+                               (size_t)(caps[2 * g + 1] - caps[2 * g]));
+            }
+            r = e;
             continue;
          }
-         bytes_append(&b, r, 1);
       }
-      size_t used = (size_t)groups[0].rm_eo;
-      if (!used) { if (*cur) bytes_append(&b, cur, 1); used = *cur ? 1 : 0; }
-      cur += used;
-      if (first_only) break;
-      if (!used) break;
+      if (*r == '$' && r[1] >= '0' && r[1] <= '9') {
+         int g = 0;
+         const char *q = r + 1;
+         while (*q >= '0' && *q <= '9') {
+            int cand = g * 10 + (*q - '0');
+            if (2 * cand + 1 >= ncaps) break;
+            g = cand;
+            ++q;
+         }
+         r = q - 1;
+         if (2 * g + 1 < ncaps && caps[2 * g] >= 0)
+            bytes_append(b, input + caps[2 * g],
+                         (size_t)(caps[2 * g + 1] - caps[2 * g]));
+         continue;
+      }
+      bytes_append(b, r, 1);
    }
-   bytes_append(&b, cur, strlen(cur));
+}
+
+/* Bytes in the UTF-8 character starting at `i`, clamped to the string. */
+static size_t regex_step(const char *s, size_t len, size_t i)
+{
+   if (i >= len) return 0;
+   const unsigned char c = (const unsigned char)s[i];
+   size_t w = 1;
+   if ((c & 0xE0u) == 0xC0u) w = 2;
+   else if ((c & 0xF0u) == 0xE0u) w = 3;
+   else if ((c & 0xF8u) == 0xF0u) w = 4;
+   return i + w > len ? 1 : w;
+}
+
+static dvm_ref regex_replace_text(struct dvm *vm, const struct rx *re,
+                                  const char *input, size_t len,
+                                  const char *replacement, bool first_only)
+{
+   if (!re || !input || !replacement) return 0;
+   const int ncaps = 2 * (rx_group_count(re) + 1);
+   int *caps = calloc((size_t)ncaps, sizeof *caps);
+   if (!caps) return 0;
+   struct rt_bytes b = { 0 };
+   size_t pos = 0;
+   while (pos <= len && rx_search(re, input, len, pos, caps, ncaps, false, false)) {
+      const size_t ms = (size_t)caps[0], me = (size_t)caps[1];
+      bytes_append(&b, input + pos, ms - pos);
+      regex_expand(&b, re, input, caps, ncaps, replacement);
+      pos = me;
+      if (first_only) break;
+      if (me == ms) {
+         /* A zero-width match: copy one character and move on, or the loop
+          * would replace at the same offset for ever. */
+         const size_t w = regex_step(input, len, ms);
+         if (!w) break;
+         bytes_append(&b, input + ms, w);
+         pos = ms + w;
+      }
+   }
+   if (pos <= len) bytes_append(&b, input + pos, len - pos);
    dvm_ref result = dvm_new_string_n(vm, b.p ? (char *)b.p : "", b.len);
    free(b.p);
+   free(caps);
    return result;
 }
 
@@ -2491,10 +2545,24 @@ static bool regex_replaceAll(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
                              union dvm_value *out)
 {
-   struct dvm_object *o = dvm__obj(vm, self);
-   struct rt_regex_matcher *m = o ? o->data : NULL;
+   struct rt_regex_matcher *m = matcher_of(vm, self);
    const char *replacement = nargs ? dvm_string_utf8(vm, ARG(0).l) : NULL;
-   RETL(m ? regex_replace_text(vm, m->pattern, m->input, replacement, false) : 0);
+   RETL(m && m->pattern
+        ? regex_replace_text(vm, m->pattern->re, m->input, m->inlen,
+                             replacement, false)
+        : 0);
+}
+
+static bool regex_replaceFirst(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   struct rt_regex_matcher *m = matcher_of(vm, self);
+   const char *replacement = nargs ? dvm_string_utf8(vm, ARG(0).l) : NULL;
+   RETL(m && m->pattern
+        ? regex_replace_text(vm, m->pattern->re, m->input, m->inlen,
+                             replacement, true)
+        : 0);
 }
 
 static bool regex_quote(struct dvm *vm, dvm_ref self,
@@ -2506,12 +2574,77 @@ static bool regex_quote(struct dvm *vm, dvm_ref self,
    if (!s) RETL(0);
    struct rt_bytes b = { 0 };
    for (const char *p = s; *p; ++p) {
-      if (strchr(".[]{}()*+?^$|\\", *p)) bytes_append(&b, "\\", 1);
+      if (strchr(".[]{}()*+-?^$|\\", *p)) bytes_append(&b, "\\", 1);
       bytes_append(&b, p, 1);
    }
    dvm_ref result = dvm_new_string_n(vm, b.p ? (char *)b.p : "", b.len);
    free(b.p);
    RETL(result);
+}
+
+/* Pattern.split() and String.split() share this.  `limit` follows Java's
+ * rule: a positive value caps the number of pieces, 0 drops trailing empty
+ * strings, and a negative value keeps them. */
+static dvm_ref regex_split(struct dvm *vm, const struct rx *re,
+                           const char *input, size_t len, int32_t limit)
+{
+   const int ncaps = 2 * (rx_group_count(re) + 1);
+   int *caps = calloc((size_t)ncaps, sizeof *caps);
+   dvm_ref *parts = NULL;
+   size_t n = 0, cap = 0;
+   size_t pos = 0;      /* start of the piece being accumulated */
+   size_t search = 0;   /* where the next separator is looked for */
+
+   /* Grow-and-push, so the piece count is not capped by a fixed array the way
+    * the old literal-only split was (it stopped at 63 and glued the rest into
+    * the last element). */
+#define PUSH(p_, n_) do { \
+      if (n == cap) { \
+         size_t c2_ = cap ? cap * 2 : 8; \
+         dvm_ref *np_ = realloc(parts, c2_ * sizeof *np_); \
+         if (!np_) goto done; \
+         parts = np_; cap = c2_; \
+      } \
+      parts[n++] = dvm_new_string_n(vm, (p_), (n_)); \
+   } while (0)
+
+   while (caps && (limit <= 0 || (int32_t)n < limit - 1) && search <= len &&
+          rx_search(re, input, len, search, caps, ncaps, false, false)) {
+      const size_t ms = (size_t)caps[0], me = (size_t)caps[1];
+      if (me == ms) {
+         /* Java produces no leading "" for a zero-width match at the start,
+          * and a zero-width match at the end ends the loop. */
+         if (ms >= len) break;
+         if (ms == 0) { search = regex_step(input, len, 0); continue; }
+      }
+      PUSH(input + pos, ms - pos);
+      pos = me;
+      search = (me == ms) ? me + regex_step(input, len, me) : me;
+   }
+   PUSH(input + pos, len - pos);
+done:
+#undef PUSH
+   if (limit == 0)
+      while (n > 1 && slen(vm, parts[n - 1]) == 0) --n;
+
+   dvm_ref arr = dvm_new_array(vm, 'L', "Ljava/lang/String;", (uint32_t)n);
+   dvm_ref *slots = arr ? dvm_array_data(vm, arr) : NULL;
+   for (size_t i = 0; slots && i < n; ++i) slots[i] = parts[i];
+   free(parts);
+   free(caps);
+   return arr;
+}
+
+static bool regex_pattern_split(struct dvm *vm, dvm_ref self,
+                                const union dvm_value *args, int nargs,
+                                union dvm_value *out)
+{
+   struct rt_regex_pattern *p = pattern_of(vm, self);
+   size_t n = 0;
+   const char *s = (nargs > 0 && ARG(0).l) ? sdata(vm, ARG(0).l, &n) : NULL;
+   int32_t limit = nargs > 1 ? ARG(1).i : 0;
+   if (!p || !s) RETL(0);
+   RETL(regex_split(vm, p->re, s, n, limit));
 }
 
 static bool s_replaceAll(struct dvm *vm, dvm_ref self,
@@ -2520,17 +2653,13 @@ static bool s_replaceAll(struct dvm *vm, dvm_ref self,
 {
    const char *expr = dvm_string_utf8(vm, ARG(0).l);
    const char *replacement = nargs > 1 ? dvm_string_utf8(vm, ARG(1).l) : NULL;
-   struct rt_regex_pattern pattern = { 0 };
-   char *ere = regex_java_to_ere(expr, &pattern);
-   if (!ere || regcomp(&pattern.re, ere, REG_EXTENDED) != 0) {
-      free(ere);
-      dvm__throw(vm, "java/util/regex/PatternSyntaxException", "%s", expr ? expr : "null");
-      return false;
-   }
-   free(ere); pattern.valid = 1;
-   dvm_ref result = regex_replace_text(vm, &pattern, sref(vm, self), replacement,
-                                       false);
-   regfree(&pattern.re);
+   const struct rx *re = regex_for(vm, expr, 0);
+   if (!re) return false;
+   size_t n = 0;
+   const char *s = sdata(vm, self, &n);
+   dvm_ref result = regex_replace_text(vm, re, s ? s : "", s ? n : 0,
+                                       replacement, false);
+   rx_cached_release(re);
    RETL(result);
 }
 
@@ -2540,19 +2669,13 @@ static bool s_replaceFirst(struct dvm *vm, dvm_ref self,
 {
    const char *expr = nargs > 0 ? dvm_string_utf8(vm, ARG(0).l) : NULL;
    const char *replacement = nargs > 1 ? dvm_string_utf8(vm, ARG(1).l) : NULL;
-   struct rt_regex_pattern pattern = { 0 };
-   char *ere = regex_java_to_ere(expr, &pattern);
-   if (!ere || regcomp(&pattern.re, ere, REG_EXTENDED) != 0) {
-      free(ere);
-      dvm__throw(vm, "java/util/regex/PatternSyntaxException", "%s",
-                 expr ? expr : "null");
-      return false;
-   }
-   free(ere);
-   pattern.valid = 1;
-   dvm_ref result = regex_replace_text(vm, &pattern, sref(vm, self), replacement,
-                                       true);
-   regfree(&pattern.re);
+   const struct rx *re = regex_for(vm, expr, 0);
+   if (!re) return false;
+   size_t n = 0;
+   const char *s = sdata(vm, self, &n);
+   dvm_ref result = regex_replace_text(vm, re, s ? s : "", s ? n : 0,
+                                       replacement, true);
+   rx_cached_release(re);
    RETL(result);
 }
 
@@ -4736,20 +4859,12 @@ static bool regex_static_matches(struct dvm *vm, dvm_ref self,
 {
    (void)self; (void)nargs;
    const char *expr = dvm_string_utf8(vm, ARG(0).l);
-   const char *input = ARG(1).l ? dvm_string_utf8(vm, ARG(1).l) : NULL;
-   char *ere = regex_java_to_ere(expr, NULL);
-   regex_t re;
-   if (!ere || regcomp(&re, ere, REG_EXTENDED) != 0) {
-      free(ere);
-      dvm__throw(vm, "java/util/regex/PatternSyntaxException", "%s",
-                 expr ? expr : "null");
-      return false;
-   }
-   free(ere);
-   regmatch_t m = { 0 };
-   int rc = input ? regexec(&re, input, 1, &m, 0) : REG_NOMATCH;
-   bool whole = rc == 0 && m.rm_so == 0 && (size_t)m.rm_eo == strlen(input);
-   regfree(&re);
+   const struct rx *re = regex_for(vm, expr, 0);
+   if (!re) return false;
+   size_t n = 0;
+   const char *input = ARG(1).l ? sdata(vm, ARG(1).l, &n) : NULL;
+   bool whole = input && rx_search(re, input, n, 0, NULL, 0, true, true);
+   rx_cached_release(re);
    RETI(whole);
 }
 
@@ -4769,14 +4884,34 @@ static const struct rt_method rt_regex_pattern[] = {
    SM("matches", "(Ljava/lang/String;Ljava/lang/CharSequence;)Z",
       regex_static_matches),
    M("matcher", "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;", regex_matcher),
+   M("pattern", "()Ljava/lang/String;", regex_pattern_text),
+   M("toString", "()Ljava/lang/String;", regex_pattern_text),
+   M("flags", "()I", regex_pattern_flags),
+   M("split", "(Ljava/lang/CharSequence;)[Ljava/lang/String;", regex_pattern_split),
+   M("split", "(Ljava/lang/CharSequence;I)[Ljava/lang/String;", regex_pattern_split),
    M_END,
 };
 
 static const struct rt_method rt_regex_matcher[] = {
    M("matches", "()Z", regex_matches),
+   M("lookingAt", "()Z", regex_lookingAt),
+   M("find", "()Z", regex_find),
+   M("find", "(I)Z", regex_find),
    M("group", "()Ljava/lang/String;", regex_group),
    M("group", "(I)Ljava/lang/String;", regex_group),
+   M("group", "(Ljava/lang/String;)Ljava/lang/String;", regex_group),
+   M("groupCount", "()I", regex_groupCount),
+   M("start", "()I", regex_start),
+   M("start", "(I)I", regex_start),
+   M("start", "(Ljava/lang/String;)I", regex_start),
+   M("end", "()I", regex_end),
+   M("end", "(I)I", regex_end),
+   M("end", "(Ljava/lang/String;)I", regex_end),
+   M("reset", "()Ljava/util/regex/Matcher;", regex_reset),
+   M("reset", "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;", regex_reset),
+   M("hitEnd", "()Z", regex_hitEnd),
    M("replaceAll", "(Ljava/lang/String;)Ljava/lang/String;", regex_replaceAll),
+   M("replaceFirst", "(Ljava/lang/String;)Ljava/lang/String;", regex_replaceFirst),
    M_END,
 };
 
@@ -6919,6 +7054,124 @@ static const struct rt_method rt_display_mode[] = {
    M("getPhysicalWidth", "()I", m_mode_width),
    M("getPhysicalHeight", "()I", m_mode_height),
    M("getRefreshRate", "()F", m_mode_refresh),
+   M_END,
+};
+
+/* android.view.Display.
+ *
+ * The rate the emulator actually presents at.  Keep it the same number the
+ * JNI-side Display.getRefreshRate() answers (LUNA_REFRESH_HZ in
+ * src/jvm/jni_stubs.c) and the same one AChoreographer paces to
+ * (A_VSYNC_PERIOD_NS in src/arm_exec.cpp): a frame pacer reads the period
+ * through several of these paths at once and compares them. */
+#define LUNA_DVM_REFRESH_HZ 60.0f
+
+/* The framebuffer the emulator presents; defined with the surface helpers
+ * further down, which is where the geometry lives. */
+static int rt_surface_w(void);
+static int rt_surface_h(void);
+
+/* One Display.Mode describing this display.
+ *
+ * Swappy's SwappyDisplayManager -- Java, shipped inside the APK, run here by
+ * the dex interpreter -- walks Display.getSupportedModes(), turns each mode's
+ * refresh rate into a vsync period, and hands the set to libswappy through
+ * nSetSupportedRefreshRates()/nOnRefreshPeriodChanged().  There was no Display
+ * class here at all, so those calls fell out to the generic stub and the
+ * period Swappy paced to had nothing to do with the rate this emulator
+ * presents at: measured live in swappy::ChoreographerFilter::threadMain, its
+ * mRefreshPeriod was 7,051,009 ns while SwappyCommon had logged 16,666,667 at
+ * init.  A pacer given a period the display does not have never lines its
+ * frames up, and its filter threads then spend whole scheduler slices in
+ *     while (timestamp < now) timestamp += mRefreshPeriod;
+ * catching up against a timestamp that no longer advances. */
+static dvm_ref display_new_mode(struct dvm *vm)
+{
+   struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/view/Display$Mode;");
+   dvm_ref m = c ? dvm_new_object(vm, c) : 0;
+   if (!m) return 0;
+   rt_set_int(vm, m, "modeId", 1);
+   rt_set_int(vm, m, "physicalWidth", rt_surface_w());
+   rt_set_int(vm, m, "physicalHeight", rt_surface_h());
+   {
+      union dvm_value v = { 0 };
+      v.f = LUNA_DVM_REFRESH_HZ;
+      (void)dvm_set_field(vm, m, "refreshRate", "F", v);
+   }
+   return m;
+}
+
+static bool display_getMode(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)self; (void)args; (void)nargs;
+   RETL(display_new_mode(vm));
+}
+
+static bool display_getSupportedModes(struct dvm *vm, dvm_ref self,
+                                      const union dvm_value *args, int nargs,
+                                      union dvm_value *out)
+{
+   (void)self; (void)args; (void)nargs;
+   /* Exactly one mode: this display has one rate, and offering a list with
+    * anything else in it invites the caller to switch to a rate we do not
+    * present at. */
+   dvm_ref arr = dvm_new_array(vm, 'L', "Landroid/view/Display$Mode;", 1u);
+   dvm_ref *slots = arr ? dvm_array_data(vm, arr) : NULL;
+   if (slots) slots[0] = display_new_mode(vm);
+   RETL(arr);
+}
+
+static bool display_getRefreshRate(struct dvm *vm, dvm_ref self,
+                                   const union dvm_value *args, int nargs,
+                                   union dvm_value *out)
+{
+   (void)vm; (void)self; (void)args; (void)nargs;
+   RETF(LUNA_DVM_REFRESH_HZ);
+}
+
+static bool display_getWidth(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)vm; (void)self; (void)args; (void)nargs;
+   RETI(rt_surface_w());
+}
+
+static bool display_getHeight(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)vm; (void)self; (void)args; (void)nargs;
+   RETI(rt_surface_h());
+}
+
+static bool display_getSize(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)self; (void)out;
+   dvm_ref pt = nargs > 0 ? ARG(0).l : 0;
+   if (pt) {
+      rt_set_int(vm, pt, "x", rt_surface_w());
+      rt_set_int(vm, pt, "y", rt_surface_h());
+   }
+   RETV();
+}
+
+static const struct rt_method rt_display[] = {
+   M("getDisplayId", "()I", ret_zero),
+   M("getRefreshRate", "()F", display_getRefreshRate),
+   M("getMode", "()Landroid/view/Display$Mode;", display_getMode),
+   M("getSupportedModes", "()[Landroid/view/Display$Mode;",
+     display_getSupportedModes),
+   M("getWidth", "()I", display_getWidth),
+   M("getHeight", "()I", display_getHeight),
+   M("getRotation", "()I", ret_zero),
+   M("getState", "()I", ret_zero),
+   M("getSize", "(Landroid/graphics/Point;)V", display_getSize),
+   M("getRealSize", "(Landroid/graphics/Point;)V", display_getSize),
    M_END,
 };
 
@@ -43802,6 +44055,7 @@ static const struct rt_class rt_classes[] = {
      NULL },
    { "Landroid/view/Display$Mode;", "Ljava/lang/Object;",
      rt_display_mode, rt_display_mode_fields, NULL },
+   { "Landroid/view/Display;", "Ljava/lang/Object;", rt_display, NULL, NULL },
    { "Ljava/util/concurrent/atomic/AtomicBoolean;", "Ljava/lang/Object;",
      rt_atomic_boolean, rt_atomic_i_fields, NULL },
    { "Ljava/util/concurrent/atomic/AtomicInteger;", "Ljava/lang/Number;",
