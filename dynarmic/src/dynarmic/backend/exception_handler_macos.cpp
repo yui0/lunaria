@@ -5,6 +5,7 @@
 
 #include <mach/mach.h>
 #include <mach/message.h>
+#include <dlfcn.h>
 
 #include <cstring>
 #include <functional>
@@ -154,7 +155,18 @@ kern_return_t MachHandler::HandleRequest(arm_thread_state64_t* ts) {
 
     const auto iter = FindCodeBlockInfo(ts->__pc);
     if (iter == code_block_infos.end()) {
-        fmt::print(stderr, "Unhandled EXC_BAD_ACCESS at pc {:#016x}\n", ts->__pc);
+        Dl_info image{};
+        const bool found = dladdr(reinterpret_cast<void*>(ts->__pc), &image);
+        const auto base = found ? reinterpret_cast<uintptr_t>(image.dli_fbase) : 0;
+        const auto sym = found ? reinterpret_cast<uintptr_t>(image.dli_saddr) : 0;
+        fmt::print(stderr,
+                   "Unhandled EXC_BAD_ACCESS at pc {:#016x} lr={:#016x} "
+                   "sp={:#016x} image={}+{:#x} symbol={}+{:#x}\n",
+                   ts->__pc, ts->__lr, ts->__sp,
+                   found && image.dli_fname ? image.dli_fname : "?",
+                   base ? ts->__pc - base : 0,
+                   found && image.dli_sname ? image.dli_sname : "?",
+                   sym ? ts->__pc - sym : 0);
         return KERN_FAILURE;
     }
 

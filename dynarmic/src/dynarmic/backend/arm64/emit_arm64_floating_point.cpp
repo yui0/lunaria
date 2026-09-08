@@ -430,10 +430,47 @@ void EmitIR<IR::Opcode::FPRecipStepFused64>(oaknut::CodeGenerator& code, EmitCon
 
 template<>
 void EmitIR<IR::Opcode::FPRoundInt16>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    const auto rounding_mode = static_cast<FP::RoundingMode>(inst->GetArg(1).GetU8());
+    const bool exact = inst->GetArg(2).GetU1();
+
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    auto Hresult = ctx.reg_alloc.WriteH(inst);
+    auto Hoperand = ctx.reg_alloc.ReadH(args[0]);
+    RegAlloc::Realize(Hresult, Hoperand);
+    ctx.fpsr.Load();
+
+    /* Scalar FP16 FRINT encodings are not available in the base A64 ISA (the
+     * vector FP16 forms require v8.2).  A half is represented exactly as a
+     * float, so widen in the destination register, round there, and narrow
+     * the integral result back without changing the architectural value. */
+    const oaknut::SReg Sresult{Hresult->index()};
+    code.FCVT(Sresult, Hoperand);
+
+    if (exact) {
+        ASSERT(ctx.FPCR().RMode() == rounding_mode);
+        code.FRINTX(Sresult, Sresult);
+    } else {
+        switch (rounding_mode) {
+        case FP::RoundingMode::ToNearest_TieEven:
+            code.FRINTN(Sresult, Sresult);
+            break;
+        case FP::RoundingMode::TowardsPlusInfinity:
+            code.FRINTP(Sresult, Sresult);
+            break;
+        case FP::RoundingMode::TowardsMinusInfinity:
+            code.FRINTM(Sresult, Sresult);
+            break;
+        case FP::RoundingMode::TowardsZero:
+            code.FRINTZ(Sresult, Sresult);
+            break;
+        case FP::RoundingMode::ToNearest_TieAwayFromZero:
+            code.FRINTA(Sresult, Sresult);
+            break;
+        default:
+            ASSERT_FALSE("Invalid RoundingMode");
+        }
+    }
+    code.FCVT(Hresult, Sresult);
 }
 
 template<>

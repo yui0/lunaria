@@ -179,6 +179,7 @@ void *luna_os_native_window(void *glfw_window);
 int      luna_os_audio_open(unsigned rate, unsigned channels);
 int      luna_os_audio_write(const void *pcm16, unsigned frames);
 unsigned luna_os_audio_queued_frames(void);
+uint64_t luna_os_audio_played_frames(void);
 void     luna_os_audio_close(void);
 
 #ifdef __cplusplus

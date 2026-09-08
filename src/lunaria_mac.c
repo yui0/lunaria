@@ -26,6 +26,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
@@ -218,28 +219,43 @@ int luna_os_symbol_is_function(void *address)
  * the count lives beside it, so a drain reports the total the way eventfd
  * does rather than one byte per signal. */
 #define LUNA_EVENT_MAX 64
-static struct { int rd, wr; uint64_t count; } g_events[LUNA_EVENT_MAX];
+static struct {
+   _Atomic int rd, wr;
+   _Atomic uint64_t count;
+} g_events[LUNA_EVENT_MAX];
 
 static int luna_event_slot(int fd)
 {
    for (int i = 0; i < LUNA_EVENT_MAX; ++i)
-      if (g_events[i].rd > 0 && g_events[i].rd == fd) return i;
+      if (atomic_load_explicit(&g_events[i].rd, memory_order_acquire) == fd)
+         return i;
    return -1;
 }
 
 int luna_os_event_open(unsigned initval, int nonblock)
 {
    int fds[2], slot = -1;
-   for (int i = 0; i < LUNA_EVENT_MAX; ++i)
-      if (!g_events[i].rd) { slot = i; break; }
-   if (slot < 0 || pipe(fds) != 0) return -1;
+   for (int i = 0; i < LUNA_EVENT_MAX; ++i) {
+      int free_slot = 0;
+      if (atomic_compare_exchange_strong_explicit(
+             &g_events[i].rd, &free_slot, -1,
+             memory_order_acq_rel, memory_order_relaxed)) {
+         slot = i;
+         break;
+      }
+   }
+   if (slot < 0) return -1;
+   if (pipe(fds) != 0) {
+      atomic_store_explicit(&g_events[slot].rd, 0, memory_order_release);
+      return -1;
+   }
    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
    fcntl(fds[1], F_SETFD, FD_CLOEXEC);
    if (nonblock) fcntl(fds[0], F_SETFL, O_NONBLOCK);
    fcntl(fds[1], F_SETFL, O_NONBLOCK);
-   g_events[slot].rd = fds[0];
-   g_events[slot].wr = fds[1];
-   g_events[slot].count = 0;
+   atomic_store_explicit(&g_events[slot].wr, fds[1], memory_order_relaxed);
+   atomic_store_explicit(&g_events[slot].count, 0, memory_order_relaxed);
+   atomic_store_explicit(&g_events[slot].rd, fds[0], memory_order_release);
    if (initval) luna_os_event_signal(fds[0], initval);
    return fds[0];
 }
@@ -249,8 +265,14 @@ int luna_os_event_signal(int fd, uint64_t count)
    int i = luna_event_slot(fd);
    char b = 1;
    if (i < 0 || !count) return i < 0 ? -1 : 0;
-   g_events[i].count += count;
-   return write(g_events[i].wr, &b, 1) == 1 ? 0 : -1;
+   atomic_fetch_add_explicit(&g_events[i].count, count, memory_order_release);
+   const int wr = atomic_load_explicit(&g_events[i].wr, memory_order_acquire);
+   if (write(wr, &b, 1) == 1 || errno == EAGAIN) return 0;
+   /* Keep the count on a hard pipe error.  A concurrent drain may already
+    * have observed it, so rolling it back here can underflow the shared
+    * counter.  The broken wake descriptor is itself the error; eventfd's
+    * accumulated value must still remain monotonic. */
+   return -1;
 }
 
 int luna_os_event_drain(int fd, uint64_t *out)
@@ -258,10 +280,11 @@ int luna_os_event_drain(int fd, uint64_t *out)
    int i = luna_event_slot(fd);
    char b[64];
    if (i < 0) return -1;
-   while (read(g_events[i].rd, b, sizeof b) > 0) { }
-   if (!g_events[i].count) { errno = EAGAIN; return -1; }
-   if (out) *out = g_events[i].count;
-   g_events[i].count = 0;
+   while (read(fd, b, sizeof b) > 0) { }
+   const uint64_t count = atomic_exchange_explicit(
+      &g_events[i].count, 0, memory_order_acq_rel);
+   if (!count) { errno = EAGAIN; return -1; }
+   if (out) *out = count;
    return 0;
 }
 
@@ -492,6 +515,7 @@ static unsigned          g_aq_ch = 2u;
 static int16_t          *g_aq_ring;
 static _Atomic unsigned  g_aq_head;   /* producer writes here */
 static _Atomic unsigned  g_aq_tail;   /* consumer reads here */
+static _Atomic uint64_t  g_aq_played; /* source frames actually consumed */
 
 static unsigned luna_aq_used(void)
 {
@@ -520,6 +544,7 @@ static void luna_aq_callback(void *user, AudioQueueRef q, AudioQueueBufferRef b)
          out[i * g_aq_ch + c] = 0;
    atomic_store_explicit(&g_aq_tail, (t + n) % LUNA_MAC_AUDIO_RING_FRAMES,
                          memory_order_release);
+   atomic_fetch_add_explicit(&g_aq_played, n, memory_order_release);
    b->mAudioDataByteSize = want * g_aq_ch * sizeof(int16_t);
    AudioQueueEnqueueBuffer(q, b, 0, NULL);
 }
@@ -548,6 +573,7 @@ int luna_os_audio_open(unsigned rate, unsigned channels)
    g_aq_ch = channels;
    atomic_store_explicit(&g_aq_head, 0u, memory_order_relaxed);
    atomic_store_explicit(&g_aq_tail, 0u, memory_order_relaxed);
+   atomic_store_explicit(&g_aq_played, 0u, memory_order_relaxed);
 
    OSStatus rc = AudioQueueNewOutput(&fmt, luna_aq_callback, NULL, NULL, NULL,
                                      0, &g_aq);
@@ -596,6 +622,12 @@ int luna_os_audio_write(const void *pcm16, unsigned frames)
 unsigned luna_os_audio_queued_frames(void)
 {
    return g_aq_open ? luna_aq_used() : 0u;
+}
+
+uint64_t luna_os_audio_played_frames(void)
+{
+   return g_aq_open
+      ? atomic_load_explicit(&g_aq_played, memory_order_acquire) : 0u;
 }
 
 void luna_os_audio_close(void)

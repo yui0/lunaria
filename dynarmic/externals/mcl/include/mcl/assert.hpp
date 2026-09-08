@@ -52,7 +52,10 @@ template<typename... Ts>
         }                                                                    \
     }()
 
-#define ASSERT_FALSE(...) ::mcl::detail::assert_terminate("false", __VA_ARGS__)
+#define MCL_STRINGIFY_IMPL(value) #value
+#define MCL_STRINGIFY(value) MCL_STRINGIFY_IMPL(value)
+#define ASSERT_FALSE(...) \
+    ::mcl::detail::assert_terminate("false at " __FILE__ ":" MCL_STRINGIFY(__LINE__), __VA_ARGS__)
 
 #if defined(NDEBUG) || defined(MCL_IGNORE_ASSERTS)
 #    define DEBUG_ASSERT(expr) ASSUME(expr)

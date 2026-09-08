@@ -614,6 +614,19 @@ test/test_binary128: test/binary128_test.cpp src/binary128.c src/binary128.h
 binary128-test: test/test_binary128
 	./test/test_binary128
 
+test/test_os_event: test/os_event_test.c lunaria_os.o src/lunaria_os.h
+	$(CC) -std=c11 -O2 $(CPPFLAGS) -Isrc test/os_event_test.c lunaria_os.o \
+	    -Wl,-undefined,dynamic_lookup -lpthread -o $@
+
+os-event-test: test/test_os_event
+	./test/test_os_event
+
+test/test_opensl_format: test/opensl_format_test.c src/opensl_format.h
+	$(CC) -std=c11 -O2 -Wall -Wextra -Isrc $< -o $@
+
+opensl-format-test: test/test_opensl_format
+	./test/test_opensl_format
+
 # Relink when dynarmic itself is rebuilt: it is linked in statically, so a
 # fresh libdynarmic.a that nothing depends on leaves the old code in the
 # binary.  This has to sit below the DYNARMIC_LIBS definition — make expands

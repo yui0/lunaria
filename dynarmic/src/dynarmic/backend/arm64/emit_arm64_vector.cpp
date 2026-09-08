@@ -864,10 +864,11 @@ void EmitIR<IR::Opcode::VectorMaxS32>(oaknut::CodeGenerator& code, EmitContext& 
 
 template<>
 void EmitIR<IR::Opcode::VectorMaxS64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    EmitThreeOpArranged<64>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) {
+        code.CMGT(V0.D2(), Va, Vb);
+        code.BSL(V0.B16(), oaknut::VReg_16B{Va.index()}, oaknut::VReg_16B{Vb.index()});
+        code.MOV(oaknut::VReg_16B{Vresult.index()}, V0.B16());
+    });
 }
 
 template<>
@@ -887,10 +888,11 @@ void EmitIR<IR::Opcode::VectorMaxU32>(oaknut::CodeGenerator& code, EmitContext& 
 
 template<>
 void EmitIR<IR::Opcode::VectorMaxU64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    EmitThreeOpArranged<64>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) {
+        code.CMHI(V0.D2(), Va, Vb);
+        code.BSL(V0.B16(), oaknut::VReg_16B{Va.index()}, oaknut::VReg_16B{Vb.index()});
+        code.MOV(oaknut::VReg_16B{Vresult.index()}, V0.B16());
+    });
 }
 
 template<>
@@ -910,10 +912,11 @@ void EmitIR<IR::Opcode::VectorMinS32>(oaknut::CodeGenerator& code, EmitContext& 
 
 template<>
 void EmitIR<IR::Opcode::VectorMinS64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    EmitThreeOpArranged<64>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) {
+        code.CMGT(V0.D2(), Va, Vb);
+        code.BSL(V0.B16(), oaknut::VReg_16B{Vb.index()}, oaknut::VReg_16B{Va.index()});
+        code.MOV(oaknut::VReg_16B{Vresult.index()}, V0.B16());
+    });
 }
 
 template<>
@@ -933,10 +936,11 @@ void EmitIR<IR::Opcode::VectorMinU32>(oaknut::CodeGenerator& code, EmitContext& 
 
 template<>
 void EmitIR<IR::Opcode::VectorMinU64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    EmitThreeOpArranged<64>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) {
+        code.CMHI(V0.D2(), Va, Vb);
+        code.BSL(V0.B16(), oaknut::VReg_16B{Vb.index()}, oaknut::VReg_16B{Va.index()});
+        code.MOV(oaknut::VReg_16B{Vresult.index()}, V0.B16());
+    });
 }
 
 template<>

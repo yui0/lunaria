@@ -391,6 +391,7 @@ static unsigned          g_audio_ch = 2u;
 static int16_t          *g_audio_ring;
 static _Atomic unsigned  g_audio_head;  /* producer writes here */
 static _Atomic unsigned  g_audio_tail;  /* consumer reads here */
+static _Atomic uint64_t  g_audio_played; /* source frames actually consumed */
 static _Atomic int       g_audio_stop;
 static pthread_t         g_audio_thread;
 
@@ -454,6 +455,7 @@ static void *luna_audio_thread(void *arg)
          atomic_store_explicit(&g_audio_tail,
                                (t + consumed) % LUNA_AUDIO_RING_FRAMES,
                                memory_order_release);
+      atomic_fetch_add_explicit(&g_audio_played, consumed, memory_order_release);
    }
    free(chunk);
    return NULL;
@@ -494,6 +496,7 @@ int luna_os_audio_open(unsigned rate, unsigned channels)
    g_audio_ch = channels;
    atomic_store_explicit(&g_audio_head, 0u, memory_order_relaxed);
    atomic_store_explicit(&g_audio_tail, 0u, memory_order_relaxed);
+   atomic_store_explicit(&g_audio_played, 0u, memory_order_relaxed);
    atomic_store_explicit(&g_audio_stop, 0, memory_order_relaxed);
    g_audio_open = 1;
    if (pthread_create(&g_audio_thread, NULL, luna_audio_thread, NULL) != 0) {
@@ -528,6 +531,12 @@ int luna_os_audio_write(const void *pcm16, unsigned frames)
 unsigned luna_os_audio_queued_frames(void)
 {
    return g_audio_open ? luna_audio_used() : 0u;
+}
+
+uint64_t luna_os_audio_played_frames(void)
+{
+   return g_audio_open
+      ? atomic_load_explicit(&g_audio_played, memory_order_acquire) : 0u;
 }
 
 void luna_os_audio_close(void)

@@ -379,16 +379,42 @@ inline bool a64_va_usable(void *p, uint64_t len) {
 }
 
 // Reserve `len` bytes of 64-bit guest VA backed by real host pages.
-inline GuestVA a64_va_map(GuestVA hint, uint64_t len, uint32_t prot) {
+inline GuestVA a64_va_map(GuestVA hint, uint64_t len, uint32_t prot,
+                          bool fixed = false) {
     len = (len + 4095ull) & ~4095ull;
     if (!len) return 0;
     void *want = nullptr;
     if (hint && !a64_is_guest_va(hint) && hint >= 0x10000ull &&
         !(hint & 4095ull) && hint + len <= 0x0010000000000000ull)
         want = (void *)hint;
+    if (fixed && !want) { errno = EINVAL; return 0; }
+    /* Android exposes 4 KiB pages while Apple Silicon uses 16 KiB host
+     * pages.  Scudo reserves a large PROT_NONE span and commits 4 KiB-aligned
+     * subranges with MAP_FIXED; asking Darwin to mmap such a subrange fails
+     * with EINVAL when it is not host-page aligned.  Our anonymous reserve is
+     * deliberately host-RW already, so replacing a wholly mapped guest range
+     * is represented by zeroing it and changing the guest VMA metadata. */
+    if (fixed && a64_mapped_span((GuestVA)want) >= len) {
+        memset(want, 0, (size_t)len);
+        a64_map_remove((GuestVA)want, (GuestVA)want + len, /*release=*/false);
+        a64_map_insert((GuestVA)want, (GuestVA)want + len, prot, /*owned=*/true);
+        return (GuestVA)want;
+    }
+    if (fixed)
+        a64_map_remove((GuestVA)want, (GuestVA)want + len, /*release=*/false);
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+    if (fixed) flags |= MAP_FIXED;
     void *p = ::mmap(want, (size_t)len, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+                     flags, -1, 0);
+    if (fixed && p != want) {
+        if (p != MAP_FAILED) ::munmap(p, (size_t)len);
+        return 0;
+    }
     if (!a64_va_usable(p, len)) {
+        if (fixed) {
+            if (p != MAP_FAILED) ::munmap(p, (size_t)len);
+            return 0;
+        }
         // Landed in the image window (or an unusable hint).
         void *bad = p;
         p = (want || p != MAP_FAILED)
@@ -434,6 +460,10 @@ inline GuestVA a64_va_mmap_file(GuestVA hint, uint64_t len, uint32_t prot,
     void *p = ::mmap(want, (size_t)len, host_prot, host_flags, fd, (off_t)off);
     if (!a64_va_usable(p, len) || (fixed && want && p != want)) {
         void *bad = p;
+        if (fixed) {
+            if (bad != MAP_FAILED) ::munmap(bad, (size_t)len);
+            return 0;
+        }
         int retry = host_flags & ~(int)MAP_FIXED;
 #ifdef MAP_FIXED_NOREPLACE
         retry &= ~(int)MAP_FIXED_NOREPLACE;
