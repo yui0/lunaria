@@ -216,6 +216,33 @@ static bool overlay_context_create(void)
    return true;
 }
 
+/* The window surface's EGLConfig can change when the guest recreates its
+ * context (boot card → UE GL).  An overlay context built against the old
+ * config then fails eglMakeCurrent with EGL_BAD_MATCH (0x3009), so the dialog
+ * never paints and queued clicks never drain — an invisible modal.  Rebuild
+ * against the context that currently owns the surface. */
+static bool overlay_context_rebind(void)
+{
+   EGLDisplay dpy = eglGetCurrentDisplay();
+   if (dpy == EGL_NO_DISPLAY) return false;
+   /* Do not luna_shutdown() here: the overlay context is not current (that is
+    * why we are rebinding), and deleting its names against the guest's
+    * context would free the wrong objects.  Destroying the context drops its
+    * share-group resources with it. */
+   if (g_ov_ctx != EGL_NO_CONTEXT) {
+      eglDestroyContext(dpy, g_ov_ctx);
+      g_ov_ctx = EGL_NO_CONTEXT;
+   }
+   g_ready = false;
+   g_w = g_h = 0;
+   if (!overlay_context_create()) return false;
+   pthread_mutex_lock(&g_doc_lock);
+   g_doc_dirty = true;
+   pthread_mutex_unlock(&g_doc_lock);
+   fprintf(stderr, "[overlay] rebuilt context for current surface config\n");
+   return true;
+}
+
 /* The faces the overlay draws with.
  *
  * Left to itself luna-ui scans /usr/share/fonts and scores what it finds; on a
@@ -531,10 +558,19 @@ void luna_overlay_present(int w, int h)
       return;
    }
    if (!eglMakeCurrent(dpy, draw, read, g_ov_ctx)) {
-      /* Surface is current on another thread (the guest took it).  Skip this
-       * frame rather than retiring the overlay for the rest of the run. */
-      (void)eglGetError();
-      return;
+      EGLint err = eglGetError();
+      /* EGL_BAD_MATCH (0x3009): overlay context was built for a different
+       * config than this surface — recreate once and retry. */
+      if (err == 0x3009 && overlay_context_rebind() &&
+          eglMakeCurrent(dpy, draw, read, g_ov_ctx)) {
+         /* ok after rebind */
+      } else {
+         static unsigned long skipped;
+         if ((skipped++ % 120) == 0)
+            fprintf(stderr, "[overlay] makeCurrent failed (0x%04x) — skip present "
+                    "(%lu)\n", (unsigned)err, skipped);
+         return;
+      }
    }
    /* Previous binding is gone until we restore below. */
    arm_exec_egl_invalidate_current();
@@ -593,6 +629,21 @@ void luna_overlay_present(int w, int h)
          }
          luna_resize((float)w, (float)h);
          overlay_wire_clicks();
+         /* One layout pass so a dump of element boxes is meaningful. */
+         luna_update(overlay_now(), 0.0);
+         {
+            int n = luna_element_count();
+            fprintf(stderr, "[overlay] parsed guest document: %d elements "
+                    "at %dx%d\n", n, w, h);
+            for (int i = 0; i < n && i < 12; ++i) {
+               LunaElement *e = luna_element_at(i);
+               if (!e) continue;
+               fprintf(stderr, "[overlay]   [%d] id=%s %.0fx%.0f @%.0f,%.0f "
+                       "pe_none=%d\n", i, e->id[0] ? e->id : "-",
+                       (double)e->w, (double)e->h, (double)e->x, (double)e->y,
+                       e->pointer_events_none);
+            }
+         }
       }
       pthread_mutex_unlock(&g_doc_lock);
 
@@ -671,6 +722,19 @@ bool luna_overlay_pointer(double x, double y, int action)
     * overlay has a size there is no band to be inside, so nothing is. */
    if (g_h <= 0 || y < g_h - luna_ime_band_height(g_h)) return false;
 consume:
+   /* Say so.  Swallowing a touch here is invisible from the guest's side --
+    * it is indistinguishable from a button that does not respond -- and the
+    * overlay is above the application, so it is the first thing to rule out
+    * when a tap stops working.  Rate-limited, and the gate is named. */
+   {
+      static unsigned long taken;
+      if (taken == 0 || (taken % 64) == 0)
+         fprintf(stderr, "[overlay] took pointer %.0f,%.0f action=%d "
+                 "(%s) — the guest does not see this touch\n", x, y, action,
+                 guest ? "a guest dialog is up and is modal"
+                       : "inside the input method's band");
+      ++taken;
+   }
    pthread_mutex_lock(&g_ptr_lock);
    if (g_ptr_count < (int)(sizeof g_ptr_queue / sizeof g_ptr_queue[0])) {
       g_ptr_queue[g_ptr_count].x = x;

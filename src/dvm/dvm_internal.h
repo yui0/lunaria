@@ -373,6 +373,14 @@ bool dvm_proxy_try_invoke(struct dvm *vm, dvm_ref self, struct dvm_class *cls,
  * a frame and far above the cost of the hand-off itself. */
 #define DVM_GIL_YIELD_STEPS 32768u
 
+/* The same for the ARM execution lock, which a JNI call from guest code is
+ * still holding while it runs Java (see the yield in the dispatch loop).  It
+ * is shorter because the cost of the offer is a single relaxed load when
+ * nobody is waiting, and because what is waiting on the other side is the
+ * frame pump: a whole frame's worth of bytecode with the lock held is a frame
+ * nobody presents and a Looper callback nobody runs. */
+#define DVM_AEL_YIELD_STEPS 4096u
+
 /* Longest a blocking primitive waits for something only another thread can
  * produce.  A thread with its own stack may legitimately wait forever, but a
  * wait on something that will never arrive would keep that thread and

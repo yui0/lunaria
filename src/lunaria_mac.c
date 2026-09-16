@@ -537,15 +537,28 @@ static void luna_aq_callback(void *user, AudioQueueRef q, AudioQueueBufferRef b)
       for (unsigned c = 0; c < g_aq_ch; ++c)
          out[i * g_aq_ch + c] = g_aq_ring[src + c];
    }
-   /* A device never stops the clock: pad an underrun with silence rather than
-    * handing back a short buffer, which AudioQueue treats as end-of-stream. */
-   for (unsigned i = n; i < want; ++i)
-      for (unsigned c = 0; c < g_aq_ch; ++c)
-         out[i * g_aq_ch + c] = 0;
+   /* AudioQueue permits a buffer to carry fewer bytes than it was allocated
+    * with.  Do not turn a producer delay into a whole 512-frame silence
+    * block: OpenSL's buffer callback may become runnable just after this
+    * callback sampled the ring, and padding the allocation made the device
+    * commit to another 10.7 ms of silence before it could look again.  Submit
+    * all real frames we have.  When completely dry submit a small silence
+    * quantum so the device clock keeps running while recovery latency stays
+    * bounded.  This is the same non-blocking underrun behaviour used by an
+    * Android AudioTrack fast mixer; the real-time callback never waits. */
+   const unsigned submit = n ? n : 128u;
+   if (!n)
+      memset(out, 0, (size_t)submit * g_aq_ch * sizeof *out);
    atomic_store_explicit(&g_aq_tail, (t + n) % LUNA_MAC_AUDIO_RING_FRAMES,
                          memory_order_release);
-   atomic_fetch_add_explicit(&g_aq_played, n, memory_order_release);
-   b->mAudioDataByteSize = want * g_aq_ch * sizeof(int16_t);
+   /* The device's playback position, silence quantum included -- see the
+    * same counter in lunaria_linux.c.  Counting only the frames the producer
+    * supplied makes an underrun permanent: the OpenSL buffer queue retires a
+    * buffer when this counter passes its end mark, and the guest enqueues the
+    * next buffer from inside that retirement, so a stalled counter means the
+    * guest is never asked for audio again. */
+   atomic_fetch_add_explicit(&g_aq_played, submit, memory_order_release);
+   b->mAudioDataByteSize = submit * g_aq_ch * sizeof(int16_t);
    AudioQueueEnqueueBuffer(q, b, 0, NULL);
 }
 

@@ -445,17 +445,36 @@ static void *luna_audio_thread(void *arg)
                     1000.0 * (double)starved_frames / (double)g_audio.freq);
       }
       const int wrote = AUDIO_play(&g_audio, (char *)chunk, (int)period);
+      /* Frames the card accepted, silence padding included.  This is the
+       * device's playback position, and it is what g_audio_played has to
+       * count: the clock a mixer hands out belongs to the card, and the card
+       * does not stop when the application is late.
+       *
+       * Counting only the frames the producer supplied made an underrun
+       * permanent.  The OpenSL buffer queue retires a buffer when the device
+       * has played it (luna_os_audio_played_frames() >= its end mark in
+       * drive_opensles_callbacks), and the guest enqueues the next buffer
+       * from inside that retirement callback.  So the moment the ring ran dry
+       * the counter stopped, no buffer could ever reach its end mark, the
+       * guest was never asked for audio again, and the ring stayed dry --
+       * measured on Cross Worlds as 266 seconds of unbroken silence out of a
+       * 330 second run, all of it after the first underrun during the load.
+       * On a device the mixer consumes a period every period and the app's
+       * buffers retire on that schedule whatever the app managed to produce;
+       * Enqueue already carries the resync (it pulls last_end up to the
+       * current position), so the time lost to silence is simply lost. */
+      unsigned taken = 0u;
+      if (wrote >= 0) taken = (unsigned)wrote < period ? (unsigned)wrote : period;
       /* Give back only what the card took.  A short write leaves the tail of
        * the chunk unplayed, and advancing the ring past it would drop those
        * frames on the floor — a gap in the middle of the sound rather than at
        * its edge, which is the one artefact a listener cannot miss. */
-      unsigned consumed = have;
-      if (wrote >= 0 && (unsigned)wrote < consumed) consumed = (unsigned)wrote;
+      unsigned consumed = have < taken ? have : taken;
       if (consumed)
          atomic_store_explicit(&g_audio_tail,
                                (t + consumed) % LUNA_AUDIO_RING_FRAMES,
                                memory_order_release);
-      atomic_fetch_add_explicit(&g_audio_played, consumed, memory_order_release);
+      atomic_fetch_add_explicit(&g_audio_played, taken, memory_order_release);
    }
    free(chunk);
    return NULL;
@@ -469,7 +488,12 @@ int luna_os_audio_open(unsigned rate, unsigned channels)
    const char *dev = getenv("LUNARIA_ALSA_DEVICE");
    /* "default" is the plug layer: it converts rate and channel count when the
     * card cannot do what the guest asked for, which a hw: device would simply
-    * refuse. */
+    * refuse.  A caller who names a bare "hw:" device is asking for that
+    * device specifically — LUNARIA_ALSA_DEVICE is not rewritten — but a rate
+    * mismatch on a hw: device is then real (see the [audio] log line this
+    * function prints: compare its Hz against the [opensles] CreateAudioPlayer
+    * line) and the fix is to name "plughw:" instead, not for this function to
+    * silently substitute one for the other. */
    char devbuf[128];
    snprintf(devbuf, sizeof devbuf, "%s", (dev && *dev) ? dev : "default");
    /* A period of about 10 ms: small enough that the guest's own buffer queue
@@ -517,7 +541,21 @@ int luna_os_audio_write(const void *pcm16, unsigned frames)
    const int16_t *src = (const int16_t *)pcm16;
    const unsigned h = atomic_load_explicit(&g_audio_head, memory_order_relaxed);
    const unsigned free_frames = LUNA_AUDIO_RING_FRAMES - 1u - luna_audio_used();
-   if (frames > free_frames) frames = free_frames;
+   if (frames > free_frames) {
+      /* The ring is full and the excess is silently discarded below —
+       * without this line that loss was invisible next to [audio] sink
+       * starved, which reports the opposite direction (the sink going
+       * dry).  A full ring means the producer (drive_opensles_callbacks)
+       * is enqueuing faster than the device drains it, which happens right
+       * after the low-water-mark fix hands back a burst of buffers at once;
+       * seeing this fire is what tells whether that burst is too large. */
+      static unsigned complained;
+      if (complained++ % 200u == 0u)
+         fprintf(stderr, "[audio] ring full: dropping %u of %u frames "
+                 "(used=%u/%u)\n", frames - free_frames, frames,
+                 luna_audio_used(), LUNA_AUDIO_RING_FRAMES);
+      frames = free_frames;
+   }
    for (unsigned i = 0; i < frames; ++i) {
       const unsigned dst = ((h + i) % LUNA_AUDIO_RING_FRAMES) * g_audio_ch;
       for (unsigned c = 0; c < g_audio_ch; ++c)

@@ -42,7 +42,135 @@ static inline const char *lunaria_apk_mount_path(void)
 #define LUNARIA_SDK_INT_FLOOR   31   /* Android 12 — supported floor */
 
 int lunaria_sdk_int(void);
+int lunaria_app_min_sdk(void);
+int lunaria_app_target_sdk(void);
 const char *lunaria_android_release(void);
+
+/* The device this emulator reports itself as.
+ *
+ * A device identity is not a free-form label: `ro.product.model`,
+ * `ro.product.device`, `ro.board.platform`, `ro.hardware`, the build id and
+ * the fingerprint all have to describe one machine that was actually built and
+ * shipped, and the platform level has to be one that machine shipped with.
+ * Naming a device that has never existed ("Lunaria" on a board called
+ * "lunaria") is internally consistent and still describes nothing -- which is
+ * what any library that knows what phones exist is looking for.
+ *
+ * So the identity is a profile, chosen with LUNARIA_DEVICE and defaulting to a
+ * real retail device.  Individual fields can be overridden one at a time; the
+ * build id, DISPLAY and the fingerprint are assembled from whatever the
+ * profile finally says, so an override cannot make them disagree. */
+struct lunaria_device {
+   const char *key;             /* LUNARIA_DEVICE selector */
+   const char *manufacturer;    /* ro.product.manufacturer / Build.MANUFACTURER */
+   const char *brand;           /* ro.product.brand */
+   const char *model;           /* ro.product.model */
+   const char *name;            /* ro.product.name */
+   const char *device;          /* ro.product.device */
+   const char *board;           /* ro.product.board */
+   const char *platform;        /* ro.board.platform */
+   const char *hardware;        /* ro.hardware */
+   const char *build_id;        /* ro.build.id */
+   const char *incremental;     /* ro.build.version.incremental */
+   const char *security_patch;  /* ro.build.version.security_patch */
+   const char *sensor_vendor;   /* the IMU's maker, for ASensor_getVendor */
+   const char *accel_name;
+   const char *gyro_name;
+   int         sdk;             /* the level this build actually shipped with */
+   /* The panel this machine was built with, in its natural (portrait)
+    * orientation, and the density the build declares for it
+    * (ro.sf.lcd_density).  A device's screen is a property of the device, so
+    * it belongs in the same row as the board and the build id: a profile that
+    * claims to be a Pixel 6 while reporting some other display describes a
+    * machine nobody shipped, and an app that reads both notices.
+    *
+    * The emulator does not have to open a window that large — see
+    * LUNARIA_SCALE in arm_exec.cpp, which shrinks the panel and its density
+    * together, the way `wm size` / `wm density` do on a device. */
+   int         screen_w;        /* px, short side  */
+   int         screen_h;        /* px, long side   */
+   int         density;         /* dpi             */
+};
+
+/* The emulated display, after LUNARIA_SCALE / LUNARIA_WIDTH / LUNARIA_HEIGHT /
+ * LUNARIA_DPI and the app's requested orientation have been applied.  One
+ * answer for the whole process: AConfiguration, DisplayMetrics, the EGL
+ * surface and the window are all views of this. */
+struct lunaria_screen {
+   int width;      /* px, as oriented */
+   int height;     /* px, as oriented */
+   int density;    /* dpi             */
+};
+const struct lunaria_screen *lunaria_screen(void);
+
+/* The active profile, after LUNARIA_DEVICE and the per-field overrides. */
+const struct lunaria_device *lunaria_device(void);
+/* Every built-in profile, for `--devices`-style listing.  NULL-terminated. */
+const struct lunaria_device *const *lunaria_device_list(void);
+
+/* Android system properties, and the only place they are decided.
+ * android.os.Build is a view of this table (see jni_stubs.c), and so are
+ * SystemProperties.get() in the bytecode VM and __system_property_get() in
+ * the ARM SVC layer.  Returns "" for a property this device does not have. */
+const char *lunaria_android_property(const char *name);
+
+/* Where this install lives, spelled the way a device spells it.
+ *
+ * Everything the guest is told about its own package has to agree: an app
+ * that reads sourceDir, getPackageCodePath() and dl_iterate_phdr() gets three
+ * views of one file.  Handing any of them a
+ * /tmp/lunaria-cache path describes a process no Android install could
+ * produce.  map_guest_path() resolves these back to the staged copies, so the
+ * canonical spelling opens as well as the host one did. */
+const char *lunaria_android_apk_path(void);        /* .../base.apk */
+const char *lunaria_android_apk_dir(void);         /* opaque installd directory */
+const char *lunaria_android_native_lib_path(void); /* .../lib/arm64 */
+const char *lunaria_android_data_path(void);       /* /data/data/<pkg> */
+
+/* The installed-package registry of the Android device Lunaria presents.
+ * PackageManager, ActivityManager and the device shell all answer from this
+ * one ledger; two of them disagreeing is itself something an app can detect.
+ *
+ * The ledger itself is src/jvm/packages.c: what it holds is a property of the
+ * installation, so it is configured in lunaria.conf (LUNARIA_PACKAGES,
+ * LUNARIA_PACKAGES_EXTRA) rather than derived from the running app. */
+enum {
+   /* `flags` below is ApplicationInfo.flags exactly as the guest is handed
+    * it, so the bits are the framework's.  FLAG_SYSTEM is the one the
+    * emulator itself tests (`pm list packages -s|-3`). */
+   LUNARIA_APP_FLAG_SYSTEM = 1u
+};
+
+struct lunaria_android_package {
+   const char *name;
+   const char *source_dir;
+   const char *data_dir;
+   /* Never empty on a device: a platform package's native libraries live in
+    * /system/lib64 and an installed app's in its own lib directory.  An empty
+    * one is visible to any caller that builds a path out of it -- NMSS opens
+    * nativeLibraryDir + "/libnmsssa.so" and greps `pm list packages -f` for
+    * the same string. */
+   const char *lib_dir;
+   int uid;
+   int flags;
+   int target_sdk;
+};
+
+size_t lunaria_android_package_count(void);
+int lunaria_android_package_at(size_t index,
+                               struct lunaria_android_package *out);
+int lunaria_android_package_find(const char *name,
+                                 struct lunaria_android_package *out);
+
+/* Package visibility, as Android 11 defines it for PackageManager queries.
+ *
+ * An app that targets API 30 or later sees only itself, the packages its
+ * manifest <queries> names, and the always-queryable platform packages --
+ * unless it holds QUERY_ALL_PACKAGES.  The device shell and the registry
+ * itself are not filtered; only what an app is allowed to observe is.
+ *
+ * Returns non-zero when the running app may see `record`. */
+int lunaria_android_package_visible(const struct lunaria_android_package *record);
 
 struct jvm_string {
    const char *data;

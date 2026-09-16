@@ -786,6 +786,228 @@ jstring android_opengl_GLES31_glGetString(JNIEnv *env, jobject o, va_list a)
 jstring android_opengl_GLES32_glGetString(JNIEnv *env, jobject o, va_list a)
 { (void)o; return android_gl_get_string(env, a); }
 
+
+/* ---------------------------------------------------------------------------
+ * The device this emulator reports itself as.  See struct lunaria_device.
+ *
+ * Every profile below is a machine that shipped: the board, the SoC, the build
+ * id, the incremental and the security patch are the ones that device really
+ * carried at that platform level, so the fingerprint assembled from them is a
+ * string that existed.  Add one by copying the values out of a real device's
+ * `getprop`; do not invent them, because the whole point of the table is that
+ * each row describes something that was built.
+ * ------------------------------------------------------------------------ */
+static const struct lunaria_device k_devices[] = {
+   {  "pixel6", "Google", "google", "Pixel 6", "oriole", "oriole", "oriole",
+      "gs101", "oriole", "SQ3A.220705.003.A1", "8672226", "2022-07-05",
+      "Bosch", "LSM6DSO Accelerometer", "LSM6DSO Gyroscope", 31,
+      1080, 2400, 420 },
+   {  "pixel7", "Google", "google", "Pixel 7", "panther", "panther", "panther",
+      "gs201", "panther", "TQ3A.230805.001", "10316531", "2023-08-05",
+      "Bosch", "BMI323 Accelerometer", "BMI323 Gyroscope", 33,
+      1080, 2400, 420 },
+   {  "galaxys21", "samsung", "samsung", "SM-G991B", "o1sxxx", "o1s", "exynos2100",
+      "exynos2100", "exynos2100", "SP1A.210812.016", "G991BXXU4CVF2",
+      "2022-06-01", "STMicroelectronics", "LSM6DSO Accelerometer",
+      "LSM6DSO Gyroscope", 31,
+      1080, 2400, 420 },
+   /* The emulator's own former identity.  Kept so the previous behaviour is
+    * still reachable, and because it is the honest answer when the point is
+    * to say "this is Lunaria" rather than to imitate a phone.  It names no
+    * device that exists, which is exactly why it is not the default. */
+   {  "lunaria", "Lunaria", "Lunaria", "Lunaria", "lunaria", "lunaria",
+      "lunaria", "lunaria", "lunaria", NULL, "1", "2026-09-05",
+      "Lunaria", "Lunaria Accelerometer", "Lunaria Gyroscope", 31,
+      720, 1280, 320 },
+};
+
+static const struct lunaria_device *const k_device_list[] = {
+   &k_devices[0], &k_devices[1], &k_devices[2], &k_devices[3], NULL
+};
+
+const struct lunaria_device *const *
+lunaria_device_list(void)
+{
+   return k_device_list;
+}
+
+static const char *
+device_env(const char *suffix, const char *fallback)
+{
+   char var[64];
+   snprintf(var, sizeof var, "LUNARIA_DEVICE_%s", suffix);
+   const char *v = getenv(var);
+   return (v && *v) ? v : fallback;
+}
+
+const struct lunaria_device *
+lunaria_device(void)
+{
+   static struct lunaria_device active;
+   static int resolved;
+   if (resolved) return &active;
+   resolved = 1;
+
+   const struct lunaria_device *base = &k_devices[0];   /* a real device */
+   const char *want = getenv("LUNARIA_DEVICE");
+   if (want && *want) {
+      const struct lunaria_device *hit = NULL;
+      for (size_t i = 0; i < sizeof k_devices / sizeof k_devices[0]; ++i)
+         if (!strcasecmp(want, k_devices[i].key)) { hit = &k_devices[i]; break; }
+      if (hit) {
+         base = hit;
+      } else {
+         fprintf(stderr, "[jvm] LUNARIA_DEVICE=%s is not a known profile; "
+                         "using %s.  Known:", want, base->key);
+         for (size_t i = 0; i < sizeof k_devices / sizeof k_devices[0]; ++i)
+            fprintf(stderr, " %s", k_devices[i].key);
+         fputc('\n', stderr);
+      }
+   }
+   active = *base;
+   active.manufacturer   = device_env("MANUFACTURER", base->manufacturer);
+   active.brand          = device_env("BRAND", base->brand);
+   active.model          = device_env("MODEL", base->model);
+   active.name           = device_env("NAME", base->name);
+   active.device         = device_env("DEVICE", base->device);
+   active.board          = device_env("BOARD", base->board);
+   active.platform       = device_env("PLATFORM", base->platform);
+   active.hardware       = device_env("HARDWARE", base->hardware);
+   active.build_id       = device_env("BUILD_ID", base->build_id);
+   active.incremental    = device_env("INCREMENTAL", base->incremental);
+   active.security_patch = device_env("SECURITY_PATCH", base->security_patch);
+   if (want && *want)
+      fprintf(stderr, "[jvm] device: %s %s (%s, %s, API %d)\n",
+              active.manufacturer, active.model, active.device,
+              active.platform, active.sdk);
+   return &active;
+}
+
+/* ---------------------------------------------------------------------------
+ * The emulated display.
+ *
+ * The panel comes from the device profile, because that is what it is a
+ * property of: a Pixel 6 has a 1080x2400 screen at 420 dpi whether or not the
+ * title running on it has an opinion.  Two things then act on it, and both are
+ * things a real device can do to itself:
+ *
+ *   - the app's android:screenOrientation decides which way up it is, exactly
+ *     as the window manager would;
+ *   - LUNARIA_SCALE shrinks it, pixels and density together, which is what
+ *     `wm size` and `wm density` do.  Scaling only the pixels would leave the
+ *     guest computing dp from a density its own pixel count contradicts, and
+ *     every layout that sizes itself in dp would come out wrong.
+ *
+ * Defaulting the scale below 1 is a deliberate choice about the host window,
+ * not about the device: a 2400x1080 window is larger than most desktops want
+ * a phone drawn at, and the operator who does want the panel at its true size
+ * asks for it (LUNARIA_SCALE=1).
+ * ------------------------------------------------------------------------ */
+#define LUNARIA_SCALE_DEFAULT 0.3
+
+static long
+screen_env_long(const char *name, long fallback)
+{
+   const char *v = getenv(name);
+   if (!v || !*v) return fallback;
+   char *end = NULL;
+   long n = strtol(v, &end, 10);
+   return (end && end != v) ? n : fallback;
+}
+
+/* android:screenOrientation, as the launcher read it out of the manifest.
+ * The landscape constants are the four in ActivityInfo that name a landscape
+ * rotation; everything else (portrait, unspecified, sensor, absent) leaves the
+ * panel the way the hardware is built. */
+static int
+screen_is_landscape(void)
+{
+   const char *o = getenv("ANDROID_SCREEN_ORIENTATION");
+   if (!o || !*o) return 0;
+   switch (strtol(o, NULL, 10)) {
+   case 0:   /* SCREEN_ORIENTATION_LANDSCAPE         */
+   case 6:   /* SCREEN_ORIENTATION_SENSOR_LANDSCAPE  */
+   case 8:   /* SCREEN_ORIENTATION_REVERSE_LANDSCAPE */
+   case 11:  /* SCREEN_ORIENTATION_USER_LANDSCAPE    */
+      return 1;
+   default:
+      return 0;
+   }
+}
+
+const struct lunaria_screen *
+lunaria_screen(void)
+{
+   static struct lunaria_screen s;
+   static int resolved;
+   if (resolved) return &s;
+   resolved = 1;
+
+   const struct lunaria_device *d = lunaria_device();
+   const int operator_chose_panel =
+      (getenv("LUNARIA_DEVICE_SCREEN_WIDTH")   && *getenv("LUNARIA_DEVICE_SCREEN_WIDTH")) ||
+      (getenv("LUNARIA_DEVICE_SCREEN_HEIGHT")  && *getenv("LUNARIA_DEVICE_SCREEN_HEIGHT")) ||
+      (getenv("LUNARIA_DEVICE_SCREEN_DENSITY") && *getenv("LUNARIA_DEVICE_SCREEN_DENSITY")) ||
+      (getenv("LUNARIA_SCALE")                 && *getenv("LUNARIA_SCALE"));
+   int w   = (int)screen_env_long("LUNARIA_DEVICE_SCREEN_WIDTH",   d->screen_w);
+   int h   = (int)screen_env_long("LUNARIA_DEVICE_SCREEN_HEIGHT",  d->screen_h);
+   int dpi = (int)screen_env_long("LUNARIA_DEVICE_SCREEN_DENSITY", d->density);
+   if (w < 64 || w > 8192) w = 1080;
+   if (h < 64 || h > 8192) h = 2400;
+   if (dpi < 40 || dpi > 1200) dpi = 420;
+   if (w > h) { int t = w; w = h; h = t; }   /* the table is portrait-natural */
+   if (screen_is_landscape()) { int t = w; w = h; h = t; }
+
+   double scale = LUNARIA_SCALE_DEFAULT;
+   const char *sc = getenv("LUNARIA_SCALE");
+   if (sc && *sc) {
+      char *end = NULL;
+      double v = strtod(sc, &end);
+      if (end != sc && v >= 0.1 && v <= 4.0) scale = v;
+      else fprintf(stderr, "[jvm] LUNARIA_SCALE=%s is not a factor between "
+                           "0.1 and 4.0; using %.2f\n", sc, scale);
+   }
+
+   /* Even dimensions: a chroma-subsampled encoder and a half-resolution
+    * render target both want the surface to halve without a remainder. */
+   s.width   = ((int)(w * scale + 0.5) + 1) & ~1;
+   s.height  = ((int)(h * scale + 0.5) + 1) & ~1;
+   s.density = (int)(dpi * scale + 0.5);
+
+   /* With no operator opinion on the panel or the scale, land on a size an
+    * operator can actually use on a desktop instead of the scaled-down
+    * device panel (720x324 @ 126dpi from the Pixel 6 default at 0.3).  This
+    * keeps dp layout correct: 1024x768 @ 320dpi is 512x384 dp, which stays
+    * in the "normal" screen-size bucket the device profile already reports
+    * (see acfg_int_value's ACFG_I_SCREENSIZE/SCREENLONG), so nothing about
+    * which resource bucket the app picks changes because of this default. */
+   if (!operator_chose_panel) {
+      const int landscape = screen_is_landscape();
+      s.width   = landscape ? 1024 : 768;
+      s.height  = landscape ? 768  : 1024;
+      s.density = 320;
+   }
+
+   /* Exact sizes, for an operator who wants one particular surface rather
+    * than a fraction of the device's.  These name pixels only; the density
+    * has its own setting, so that asking for a window size does not silently
+    * restate what kind of screen this is. */
+   long ew = screen_env_long("LUNARIA_WIDTH", 0);
+   long eh = screen_env_long("LUNARIA_HEIGHT", 0);
+   if (ew >= 64 && ew <= 8192) s.width  = (int)ew;
+   if (eh >= 64 && eh <= 8192) s.height = (int)eh;
+   long ed = screen_env_long("LUNARIA_DPI", 0);
+   if (ed >= 40 && ed <= 1200) s.density = (int)ed;
+   if (s.density < 40) s.density = 40;
+
+   fprintf(stderr, "[jvm] screen: %dx%d @ %d dpi (%s %s panel %dx%d @ %d dpi, "
+                   "%s, LUNARIA_SCALE=%.2f)\n",
+           s.width, s.height, s.density, d->manufacturer, d->model,
+           d->screen_w, d->screen_h, d->density,
+           screen_is_landscape() ? "landscape" : "portrait", scale);
+   return &s;
+}
+
 /* The single answer to "which Android is this?".  See jvm.h for why there is
  * exactly one. */
 int
@@ -795,6 +1017,10 @@ lunaria_sdk_int(void)
    if (!cached) {
       const char *e = getenv("LUNARIA_SDK_INT");
       long v = (e && *e) ? strtol(e, NULL, 10) : 0;
+      /* Unset, the level is the one the chosen device actually shipped with,
+       * so the build id and the fingerprint cannot describe a release that
+       * device never ran. */
+      if (v < 1 || v > 99) v = lunaria_device()->sdk;
       if (v < 1 || v > 99) v = LUNARIA_SDK_INT_DEFAULT;
       cached = (int)v;
       if (cached != LUNARIA_SDK_INT_DEFAULT)
@@ -805,6 +1031,93 @@ lunaria_sdk_int(void)
    }
    return cached;
 }
+
+static int
+manifest_sdk(const char *name, int fallback)
+{
+   const char *s = getenv(name);
+   char *end = NULL;
+   long value = (s && *s) ? strtol(s, &end, 10) : 0;
+   return value > 0 && value <= 99 && end && !*end ? (int)value : fallback;
+}
+
+int lunaria_app_min_sdk(void)
+{
+   return manifest_sdk("ANDROID_MIN_SDK", 1);
+}
+
+int lunaria_app_target_sdk(void)
+{
+   return manifest_sdk("ANDROID_TARGET_SDK", lunaria_sdk_int());
+}
+
+/* See jvm.h: the device spelling of this install.  The installer segment
+ * matches what the module list already reports for the app's libraries. */
+static void android_install_token(const char *label, const char *pkg,
+                                  char out[12])
+{
+   static const char alphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+   uint64_t h = UINT64_C(1469598103934665603);
+   const char *parts[3] = { label, pkg, getenv("ANDROID_APK_FILE") };
+   for (unsigned p = 0; p < 3; ++p)
+      for (const unsigned char *s =
+              (const unsigned char *)(parts[p] ? parts[p] : ""); *s; ++s) {
+         h ^= *s;
+         h *= UINT64_C(1099511628211);
+      }
+   for (unsigned i = 0; i < 11; ++i) {
+      h ^= h >> 12; h ^= h << 25; h ^= h >> 27;
+      h *= UINT64_C(2685821657736338717);
+      out[i] = alphabet[h & 63u];
+   }
+   out[11] = '\0';
+}
+
+const char *lunaria_android_apk_dir(void)
+{
+   static char dir[PATH_MAX];
+   const char *pkg = getenv("ANDROID_PACKAGE_NAME");
+   if (!dir[0]) {
+      char installer[12], instance[12];
+      pkg = (pkg && *pkg) ? pkg : "com.lunaria.app";
+      android_install_token("installer", pkg, installer);
+      android_install_token("instance", pkg, instance);
+      snprintf(dir, sizeof dir, "/data/app/~~%s==/%s-%s==",
+               installer, pkg, instance);
+   }
+   return dir;
+}
+
+const char *lunaria_android_apk_path(void)
+{
+   static char path[PATH_MAX];
+   if (!path[0]) snprintf(path, sizeof path, "%s/base.apk", lunaria_android_apk_dir());
+   return path;
+}
+
+const char *lunaria_android_native_lib_path(void)
+{
+   static char path[PATH_MAX];
+   if (!path[0]) snprintf(path, sizeof path, "%s/lib/arm64", lunaria_android_apk_dir());
+   return path;
+}
+
+const char *lunaria_android_data_path(void)
+{
+   static char path[PATH_MAX];
+   const char *pkg = getenv("ANDROID_PACKAGE_NAME");
+   if (!path[0])
+      snprintf(path, sizeof path, "/data/data/%s",
+               (pkg && *pkg) ? pkg : "com.lunaria.app");
+   return path;
+}
+
+/* The installed-package ledger -- lunaria_android_package_count/at/find and
+ * lunaria_android_package_visible -- lives in packages.c.  It is a model of
+ * the device rather than of the running app, so it is its own translation
+ * unit and its own configuration file; see the comment at the top of it.
+ */
 
 /* Build.VERSION.RELEASE for that level.  Apps parse this string (an integer
  * major version is what every release since 4.4 actually reports), so it has
@@ -830,36 +1143,142 @@ lunaria_android_release(void)
    return (cached = buf);
 }
 
-jstring
-android_os_Build_MANUFACTURER(JNIEnv *env, jobject object)
+/* The device's build properties — one table, because Android has one.
+ *
+ * android.os.Build is not an independent source of facts: every field of it
+ * is literally SystemProperties.get() of the property named below, read once
+ * in its <clinit>.  This emulator answered the two halves separately -- the
+ * Build fields said "berry"/"berry_hw"/"berry000" from here, the property
+ * reads said "Lunaria"/"lunaria"/"" from two further tables in dvm_runtime.c
+ * and arm_exec.cpp -- so a guest that asked the same question both ways got
+ * two different answers.  No device can do that, and code that compares the
+ * two (an anti-tamper module does exactly that, and so does any library
+ * sniffing for an emulator) is reading a real inconsistency, not a heuristic.
+ *
+ * The other half of the same defect was absence.  A property this table did
+ * not name came back as the empty string, and an empty string is not a value
+ * any of these have on any device: Build.FINGERPRINT came back null,
+ * ro.build.tags came back "" where a retail build says "release-keys", and
+ * ro.secure came back "" -- which every caller parses as 0, the value that
+ * means an engineering build with root.  Reporting a coherent retail device
+ * is what this emulator is for; leaving the field blank reports a broken one.
+ *
+ * Values that follow from the platform level come from the same two functions
+ * that decide it, so the build string cannot drift from SDK_INT either. */
+const char *
+lunaria_android_property(const char *name)
 {
-   assert(env && object);
-   return (*env)->NewStringUTF(env, "berry");
+   if (!name || !*name) return "";
+
+   const struct lunaria_device *dev = lunaria_device();
+   static char sdk[8], fingerprint[192], display[96], build_id[48];
+   if (!sdk[0]) {
+      snprintf(sdk, sizeof sdk, "%d", lunaria_sdk_int());
+      /* A retail build id is the platform's own release tag; DISPLAY is that
+       * id again, and the fingerprint is assembled from the same parts in the
+       * order the platform documents.  Every one of them therefore follows
+       * whatever the active device profile (and any override) finally says. */
+      if (dev->build_id && *dev->build_id)
+         snprintf(build_id, sizeof build_id, "%s", dev->build_id);
+      else
+         snprintf(build_id, sizeof build_id, "%s.%s.001",
+                  dev->device, lunaria_android_release());
+      snprintf(display, sizeof display, "%s", build_id);
+      snprintf(fingerprint, sizeof fingerprint,
+               "%s/%s/%s:%s/%s/%s:user/release-keys",
+               dev->brand, dev->name, dev->device,
+               lunaria_android_release(), build_id, dev->incremental);
+   }
+
+   const struct { const char *name, *value; } fixed[] = {
+      /* identity */
+      { "ro.product.manufacturer",  dev->manufacturer },
+      { "ro.product.brand",         dev->brand },
+      { "ro.product.model",         dev->model },
+      { "ro.product.name",          dev->name },
+      { "ro.product.device",        dev->device },
+      { "ro.product.board",         dev->board },
+      { "ro.board.platform",        dev->platform },
+      { "ro.hardware",              dev->hardware },
+      /* build */
+      { "ro.build.type",            "user" },
+      { "ro.build.tags",            "release-keys" },
+      { "ro.build.user",            "android-build" },
+      { "ro.build.host",            "abfarm" },
+      { "ro.build.characteristics", "default" },
+      { "ro.build.version.incremental", dev->incremental },
+      { "ro.build.version.codename",    "REL" },
+      { "ro.build.version.security_patch", dev->security_patch },
+      /* A retail device boots a locked, verified, non-debuggable image.  The
+       * emulator is not an engineering build, so these are 1/0/1, not "". */
+      { "ro.secure",                "1" },
+      { "ro.debuggable",            "0" },
+      { "ro.adb.secure",            "1" },
+      { "ro.boot.verifiedbootstate", "green" },
+      { "ro.boot.flash.locked",     "1" },
+      { "ro.bootloader",            "unknown" },
+      /* Since Android 8 the serial is not readable by ordinary apps, and the
+       * platform answers Build.UNKNOWN rather than a number. */
+      { "ro.serialno",              "unknown" },
+      { "gsm.version.baseband",     "unknown" },
+   };
+
+   if (!strcmp(name, "ro.build.version.sdk"))     return sdk;
+   if (!strcmp(name, "ro.build.version.release")) return lunaria_android_release();
+   if (!strcmp(name, "ro.build.id"))              return build_id;
+   if (!strcmp(name, "ro.build.display.id"))      return display;
+   if (!strcmp(name, "ro.build.fingerprint") ||
+       !strcmp(name, "ro.bootimage.build.fingerprint") ||
+       !strcmp(name, "ro.system.build.fingerprint") ||
+       !strcmp(name, "ro.vendor.build.fingerprint"))
+      return fingerprint;
+
+   for (size_t i = 0; i < sizeof fixed / sizeof fixed[0]; ++i)
+      if (!strcmp(name, fixed[i].name)) return fixed[i].value;
+   return "";
 }
 
-jstring
-android_os_Build_MODEL(JNIEnv *env, jobject object)
-{
-   return android_os_Build_MANUFACTURER(env, object);
-}
+/* Every android.os.Build string field is the property of the same name.
+ * Spelling the pairing out once keeps the two in step by construction. */
+#define LUNARIA_BUILD_FIELD(FIELD, PROPERTY)                                   \
+   jstring                                                                     \
+   android_os_Build_##FIELD(JNIEnv *env, jobject object)                       \
+   {                                                                           \
+      assert(env && object);                                                   \
+      return (*env)->NewStringUTF(env, lunaria_android_property(PROPERTY));    \
+   }
 
-jstring
-android_os_Build_PRODUCT(JNIEnv *env, jobject object)
-{
-   return android_os_Build_MANUFACTURER(env, object);
-}
+LUNARIA_BUILD_FIELD(MANUFACTURER, "ro.product.manufacturer")
+LUNARIA_BUILD_FIELD(MODEL,        "ro.product.model")
+LUNARIA_BUILD_FIELD(BRAND,        "ro.product.brand")
+LUNARIA_BUILD_FIELD(PRODUCT,      "ro.product.name")
+LUNARIA_BUILD_FIELD(BOARD,        "ro.product.board")
+LUNARIA_BUILD_FIELD(ID,           "ro.build.id")
+LUNARIA_BUILD_FIELD(FINGERPRINT,  "ro.build.fingerprint")
+LUNARIA_BUILD_FIELD(TAGS,         "ro.build.tags")
+LUNARIA_BUILD_FIELD(TYPE,         "ro.build.type")
+LUNARIA_BUILD_FIELD(USER,         "ro.build.user")
+LUNARIA_BUILD_FIELD(HOST,         "ro.build.host")
+LUNARIA_BUILD_FIELD(BOOTLOADER,   "ro.bootloader")
+LUNARIA_BUILD_FIELD(RADIO,        "gsm.version.baseband")
+LUNARIA_BUILD_FIELD(UNKNOWN,      "ro.serialno")   /* Build.UNKNOWN == "unknown" */
+LUNARIA_BUILD_FIELD(VERSION_SECURITY_PATCH, "ro.build.version.security_patch")
+LUNARIA_BUILD_FIELD(VERSION_CODENAME,       "ro.build.version.codename")
 
-jstring
-android_os_Build_ID(JNIEnv *env, jobject object)
-{
-   return android_os_Build_MANUFACTURER(env, object);
-}
+/* A field read whose declaring class came back as Object/Class resolves to
+ * these aliases; the four fields that already had them are spelled out the
+ * same way further down, so the fields added above need them too. */
+#define LUNARIA_BUILD_FIELD_ALIAS(FIELD)                                       \
+   jstring java_lang_Object_##FIELD(JNIEnv *e, jobject o)                      \
+   { return android_os_Build_##FIELD(e, o); }                                  \
+   jstring java_lang_Class_##FIELD(JNIEnv *e, jobject o)                       \
+   { return android_os_Build_##FIELD(e, o); }
 
-jstring
-android_os_Build_BRAND(JNIEnv *env, jobject object)
-{
-   return android_os_Build_MANUFACTURER(env, object);
-}
+LUNARIA_BUILD_FIELD_ALIAS(FINGERPRINT)
+LUNARIA_BUILD_FIELD_ALIAS(TAGS)
+LUNARIA_BUILD_FIELD_ALIAS(TYPE)
+LUNARIA_BUILD_FIELD_ALIAS(BOARD)
+LUNARIA_BUILD_FIELD_ALIAS(BOOTLOADER)
 
 jstring
 android_os_Build_VERSION_RELEASE(JNIEnv *env, jobject object)
@@ -879,7 +1298,8 @@ jstring
 android_os_Build_VERSION_INCREMENTAL(JNIEnv *env, jobject object)
 {
    assert(env && object);
-   return (*env)->NewStringUTF(env, "0"); // XXX: maybe git sha of this repo
+   return (*env)->NewStringUTF(env,
+                               lunaria_android_property("ro.build.version.incremental"));
 }
 
 jstring
@@ -893,8 +1313,7 @@ jstring
 android_content_Context_getPackageCodePath(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
-   const char *apk = lunaria_apk_mount_path();
-   return (*env)->NewStringUTF(env, (apk && *apk) ? apk : "");
+   return (*env)->NewStringUTF(env, lunaria_android_apk_path());
 }
 
 jstring
@@ -954,6 +1373,28 @@ android_content_Context_getApplicationInfo(JNIEnv *env, jobject object, va_list 
    return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "android/content/pm/ApplicationInfo"))));
 }
 
+/* PackageItemInfo.packageName is inherited by ApplicationInfo.  Android
+ * always fills it on the object returned by Context.getApplicationInfo().
+ * The object above is intentionally lightweight and its other public fields
+ * are supplied by these JNI field accessors, but packageName used to be the
+ * one missing identity field.  Native SDKs consequently observed null while
+ * Context.getPackageName() and PackageManager reported the installed name. */
+jstring
+android_content_pm_ApplicationInfo_packageName(JNIEnv *env, jobject object)
+{
+   assert(env && object);
+   const char *name = getenv("ANDROID_PACKAGE_NAME");
+   return (*env)->NewStringUTF(env, (name && *name) ? name : "");
+}
+
+/* packageName is declared by PackageItemInfo and inherited by
+ * ApplicationInfo; JNI field lookup uses the declaring class name. */
+jstring
+android_content_pm_PackageItemInfo_packageName(JNIEnv *env, jobject object)
+{
+   return android_content_pm_ApplicationInfo_packageName(env, object);
+}
+
 /* ApplicationInfo.splitPublicSourceDirs — accessed as a field (String[]).
  * This is a non-split (mono) APK, so return an empty String array. */
 jobjectArray
@@ -968,8 +1409,7 @@ jstring
 android_content_pm_ApplicationInfo_sourceDir(JNIEnv *env, jobject object)
 {
    assert(env && object);
-   const char *apk = lunaria_apk_mount_path();
-   return (*env)->NewStringUTF(env, (apk && *apk) ? apk : "");
+   return (*env)->NewStringUTF(env, lunaria_android_apk_path());
 }
 
 jstring
@@ -984,21 +1424,14 @@ jstring
 android_content_pm_ApplicationInfo_dataDir(JNIEnv *env, jobject object)
 {
    assert(env && object);
-   const char *files = getenv("ANDROID_FILES_DIR");
-   char path[PATH_MAX];
-   snprintf(path, sizeof path, "%s", (files && *files) ? files : "/tmp/lunaria-files");
-   size_t n = strlen(path);
-   if (n >= 6 && !strcmp(path + n - 6, "/files"))
-      path[n - 6] = '\0';
-   return (*env)->NewStringUTF(env, path);
+   return (*env)->NewStringUTF(env, lunaria_android_data_path());
 }
 
 jstring
 android_content_pm_ApplicationInfo_nativeLibraryDir(JNIEnv *env, jobject object)
 {
    assert(env && object);
-   const char *path = getenv("ANDROID_NATIVE_LIB_DIR");
-   return (*env)->NewStringUTF(env, (path && *path) ? path : "");
+   return (*env)->NewStringUTF(env, lunaria_android_native_lib_path());
 }
 
 jobject
@@ -1848,17 +2281,14 @@ android_content_pm_ApplicationInfo_minSdkVersion(JNIEnv *env, jobject object)
    (void)env; (void)object;
    /* Unity 2023's floor, but never above what the platform reports: an app
     * whose minSdk exceeds the device's SDK_INT could not have been installed. */
-   const int sdk = lunaria_sdk_int();
-   return sdk < 22 ? sdk : 22;
+   return lunaria_app_min_sdk();
 }
 
 jint
 android_content_pm_ApplicationInfo_targetSdkVersion(JNIEnv *env, jobject object)
 {
    (void)env; (void)object;
-   /* An app targeting a level the device does not have does not exist, so this
-    * tracks Build.VERSION.SDK_INT. */
-   return lunaria_sdk_int();
+   return lunaria_app_target_sdk();
 }
 
 /* AlertDialog.Builder fluent setters — each returns the builder itself so the
@@ -2422,28 +2852,28 @@ jint java_lang_Class_getRequestedOrientation(JNIEnv *e, jobject o, va_list a)
 
 /* ---- android.os.Build string fields ---- */
 jstring android_os_Build_DEVICE(JNIEnv *e, jobject o)
-{ (void)o; return (*e)->NewStringUTF(e, "berry_device"); }
+{ (void)o; return (*e)->NewStringUTF(e, lunaria_android_property("ro.product.device")); }
 jstring java_lang_Object_DEVICE(JNIEnv *e, jobject o)
 { return android_os_Build_DEVICE(e, o); }
 jstring java_lang_Class_DEVICE(JNIEnv *e, jobject o)
 { return android_os_Build_DEVICE(e, o); }
 
 jstring android_os_Build_DISPLAY(JNIEnv *e, jobject o)
-{ (void)o; return (*e)->NewStringUTF(e, "berry_display"); }
+{ (void)o; return (*e)->NewStringUTF(e, lunaria_android_property("ro.build.display.id")); }
 jstring java_lang_Object_DISPLAY(JNIEnv *e, jobject o)
 { return android_os_Build_DISPLAY(e, o); }
 jstring java_lang_Class_DISPLAY(JNIEnv *e, jobject o)
 { return android_os_Build_DISPLAY(e, o); }
 
 jstring android_os_Build_HARDWARE(JNIEnv *e, jobject o)
-{ (void)o; return (*e)->NewStringUTF(e, "berry_hw"); }
+{ (void)o; return (*e)->NewStringUTF(e, lunaria_android_property("ro.hardware")); }
 jstring java_lang_Object_HARDWARE(JNIEnv *e, jobject o)
 { return android_os_Build_HARDWARE(e, o); }
 jstring java_lang_Class_HARDWARE(JNIEnv *e, jobject o)
 { return android_os_Build_HARDWARE(e, o); }
 
 jstring android_os_Build_SERIAL(JNIEnv *e, jobject o)
-{ (void)o; return (*e)->NewStringUTF(e, "berry000"); }
+{ (void)o; return (*e)->NewStringUTF(e, lunaria_android_property("ro.serialno")); }
 jstring java_lang_Object_SERIAL(JNIEnv *e, jobject o)
 { return android_os_Build_SERIAL(e, o); }
 jstring java_lang_Class_SERIAL(JNIEnv *e, jobject o)

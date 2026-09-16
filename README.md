@@ -325,7 +325,7 @@ full diagnostic set.
 | Variable | Default | Purpose |
 |---|---:|---|
 | `LUNARIA_ARCH` | auto | `armeabi-v7a` or `arm64-v8a` |
-| `LUNARIA_WIDTH` / `LUNARIA_HEIGHT` | `1280` / `720` | Window or EGL surface size |
+| `LUNARIA_WIDTH` / `LUNARIA_HEIGHT` | `1024` / `768` (landscape app: `768`/`1024` swapped) | Window or EGL surface size — see `LUNARIA_SCALE` for scaling the device panel instead |
 | `LUNARIA_PBUFFER` | auto fallback | Set `1` to skip GLFW and force headless EGL |
 | `LUNARIA_MAX_FRAMES` | unlimited | Stop the render loop after *N* frames |
 | `LUNARIA_MEM_TOTAL_MB` | `6144` | RAM reported to the guest |
@@ -336,7 +336,7 @@ full diagnostic set.
 | `LUNARIA_A64_SELF_SCHED` | off | Engines pull runnable guests freely instead of barrier-pooled passes |
 | `LUNARIA_A64_FASTMEM` | `1` | Set `0` to route memory through callbacks |
 | `LUNARIA_A64_CODE_CACHE_MB` | `128` | Per-JIT translated-code cache |
-| `LUNARIA_GUEST_SLEEP` / `LUNARIA_FD_PARK` | off | Park long sleeps / blocking reads for real wall time |
+| `LUNARIA_GUEST_SLEEP` / `LUNARIA_FD_PARK` | on / off | Park guest sleeps for real wall time / park blocking reads (`LUNARIA_GUEST_SLEEP=0` is diagnostic only) |
 | `LUNARIA_TOUCH_TEST` | off | Inject taps at guest FB `x,y[;x,y…]` (max 8) |
 | `LUNARIA_TOUCH_FRAME` / `_HOLD` / `_GAP` | `60` / `10` / `60` | First DOWN frame / hold / gap between taps |
 | `LUNARIA_PERF_S` | `10` | `[perf]` interval seconds; `0` disables |

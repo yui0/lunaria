@@ -44,6 +44,7 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/pem.h>
+#include <openssl/pkcs7.h>
 #include <openssl/rand.h>
 #include <openssl/rsa.h>
 #include <openssl/x509.h>
@@ -175,6 +176,9 @@ static bool pm_empty_list(struct dvm *vm, dvm_ref self,
 static bool intent_init(struct dvm *vm, dvm_ref self,
                         const union dvm_value *args, int nargs,
                         union dvm_value *out);
+static bool pm_check_permission(struct dvm *vm, dvm_ref self,
+                                const union dvm_value *args, int nargs,
+                                union dvm_value *out);
 static bool res_get_drawable(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
                              union dvm_value *out);
@@ -260,7 +264,16 @@ static bool o_equals(struct dvm *vm, dvm_ref self, const union dvm_value *args,
    dvm_ref other = ARG(0).l;
    size_t la = 0, lb = 0;
    const char *a = sdata(vm, self, &la), *b = sdata(vm, other, &lb);
-   if (a && b) RETI(la == lb && !memcmp(a, b, la) ? 1 : 0);
+   if (a && b) {
+      int equal = la == lb && !memcmp(a, b, la);
+      const char *pkg = getenv("ANDROID_PACKAGE_NAME");
+      if (getenv("LUNARIA_DVM_TRACE") && pkg &&
+          (!strcmp(a, pkg) || !strcmp(b, pkg)))
+         fprintf(stderr,
+                 "[dvm] String.equals pkg probe: @%x \"%s\" == @%x \"%s\" -> %d\n",
+                 self, a, other, b, equal);
+      RETI(equal ? 1 : 0);
+   }
    RETI(self == other ? 1 : 0);
 }
 
@@ -3597,6 +3610,9 @@ static void *bytecode_thread_main(void *p)
 
    dvm__mark_bytecode_thread();
    dvm_gil_acquire(vm);
+   /* The process-wide order is DVM GIL outside, ARM execution lock inside.
+    * Attaching publishes the Android thread identity under the latter. */
+   arm_exec_dvm_thread_attach();
    dvm__tstate_reset(vm);
    vm->cur_thread = self;
    vm->quiet_uncaught = true;
@@ -3625,6 +3641,7 @@ static void *bytecode_thread_main(void *p)
    dvm_unpin(vm, self);
    dvm_gil_release(vm);
    dvm_gil_notify_for(self); /* joiners for this thread only */
+   arm_exec_dvm_thread_detach();
    return NULL;
 }
 
@@ -6551,6 +6568,28 @@ static bool loc_toString(struct dvm *vm, dvm_ref self, const union dvm_value *ar
    RETL(dvm_new_string(vm, buf));
 }
 
+/* Locale.toLanguageTag() is BCP-47: "en-US", with a hyphen.  It was bound to
+ * toString(), which is Java's *other* spelling of the same locale ("en_US",
+ * with an underscore) — a different format that no BCP-47 parser accepts.
+ * Netmarble's SDK puts the result straight into a query string, so the server
+ * was asked for `locale=en_us` and matched nothing. */
+static bool loc_toLanguageTag(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value l = { 0 }, c = { 0 };
+   (void)dvm_get_field(vm, self, "language", "Ljava/lang/String;", &l);
+   (void)dvm_get_field(vm, self, "country", "Ljava/lang/String;", &c);
+   const char *ls = l.l ? dvm_string_utf8(vm, l.l) : "";
+   const char *cs = c.l ? dvm_string_utf8(vm, c.l) : "";
+   char buf[64];
+   if (cs && *cs) snprintf(buf, sizeof buf, "%s-%s", ls ? ls : "", cs);
+   else           snprintf(buf, sizeof buf, "%s", ls ? ls : "");
+   /* An empty language is "und" in BCP-47, never the empty string. */
+   RETL(dvm_new_string(vm, buf[0] ? buf : "und"));
+}
+
 /* Locale.setDefault() really does change what getDefault() answers — a game
  * that switches language sets it once and then formats everything through the
  * default. */
@@ -6561,18 +6600,24 @@ static bool loc_getDefault(struct dvm *vm, dvm_ref self, const union dvm_value *
 {
    (void)self; (void)args; (void)nargs;
    if (g_default_locale) RETL(g_default_locale);
-   struct dvm_class *c = dvm__class_by_desc(vm, "Ljava/util/Locale;");
+   /* The device's locale, not a hardcoded Locale.US.  An app picks its
+    * language from this: Cross Worlds rendered every string as "(ko)<Korean>"
+    * — its own source language, tagged — because the device it was shown kept
+    * saying en/US.  arm_exec_device_locale() is the one answer the native
+    * AConfiguration gives too, so the two cannot disagree. */
+   char lang[3], country[3];
+   arm_exec_device_locale(lang, country);
    union dvm_value v = { 0 };
-   if (c) {
-      (void)dvm_init_class(vm, c);
-      (void)dvm_get_static(vm, c, "US", "Ljava/util/Locale;", &v);
-   }
+   v.l = locale_make(vm, lang, country);
+   if (v.l) dvm_pin(vm, v.l);
    /* A null default Locale is not something Java ever hands out — callers
-    * immediately do getLanguage() on it.  If the US constant was not wired
-    * yet, mint one rather than returning null. */
+    * immediately do getLanguage() on it. */
    if (!v.l) {
-      v.l = locale_make(vm, "en", "US");
-      if (v.l) dvm_pin(vm, v.l);
+      struct dvm_class *c = dvm__class_by_desc(vm, "Ljava/util/Locale;");
+      if (c) {
+         (void)dvm_init_class(vm, c);
+         (void)dvm_get_static(vm, c, "US", "Ljava/util/Locale;", &v);
+      }
    }
    g_default_locale = v.l;
    if (g_default_locale) dvm_pin(vm, g_default_locale);
@@ -6610,7 +6655,7 @@ static const struct rt_method rt_locale[] = {
    SM("getDefault", "(Ljava/util/Locale$Category;)Ljava/util/Locale;",
       loc_getDefault),
    SM("setDefault", "(Ljava/util/Locale;)V", loc_setDefault),
-   M("toLanguageTag", "()Ljava/lang/String;", loc_toString),
+   M("toLanguageTag", "()Ljava/lang/String;", loc_toLanguageTag),
    SM("forLanguageTag", "(Ljava/lang/String;)Ljava/util/Locale;",
       loc_forLanguageTag),
    M_END,
@@ -6654,6 +6699,10 @@ static bool ll_init(struct dvm *vm, dvm_ref self,
    RETV();
 }
 
+static bool ll_get(struct dvm *vm, dvm_ref self,
+                   const union dvm_value *args, int nargs,
+                   union dvm_value *out);
+
 static bool ll_setDefault(struct dvm *vm, dvm_ref self,
                           const union dvm_value *args, int nargs,
                           union dvm_value *out)
@@ -6662,6 +6711,15 @@ static bool ll_setDefault(struct dvm *vm, dvm_ref self,
    if (nargs && ARG(0).l) {
       default_locale_list = ARG(0).l;
       dvm_pin(vm, default_locale_list);
+      /* Android LocaleList.setDefault() also changes Locale.getDefault() to
+       * the first entry.  Keeping the two process-wide defaults independent
+       * made Resources, Java formatting and native AConfiguration describe
+       * different devices until some later caller happened to set both. */
+      union dvm_value index = { .i = 0 }, locale = { 0 };
+      if (ll_get(vm, default_locale_list, &index, 1, &locale) && locale.l) {
+         g_default_locale = locale.l;
+         dvm_pin(vm, g_default_locale);
+      }
    }
    RETV();
 }
@@ -6782,6 +6840,25 @@ static bool cfg_set_locale(struct dvm *vm, dvm_ref self,
    return cfg_set_locales(vm, self, &arg, 1, out);
 }
 
+static bool cfg_set_to(struct dvm *vm, dvm_ref self,
+                       const union dvm_value *args, int nargs,
+                       union dvm_value *out)
+{
+   if (nargs && ARG(0).l) {
+      union dvm_value locale = { 0 }, locales = { 0 };
+      (void)dvm_get_field(vm, ARG(0).l, "locale",
+                          "Ljava/util/Locale;", &locale);
+      (void)dvm_get_field(vm, ARG(0).l, "locales",
+                          "Landroid/os/LocaleList;", &locales);
+      (void)dvm_set_field(vm, self, "locale",
+                          "Ljava/util/Locale;", locale);
+      (void)dvm_set_field(vm, self, "locales",
+                          "Landroid/os/LocaleList;", locales);
+   }
+   configuration_ensure_locale(vm, self);
+   RETV();
+}
+
 static const struct rt_field rt_locale_list_fields[] = {
    { "locale", "Ljava/util/Locale;" }, F_END
 };
@@ -6805,7 +6882,7 @@ static const struct rt_method rt_configuration[] = {
    M("setLocales", "(Landroid/os/LocaleList;)V", cfg_set_locales),
    M("equals", "(Landroid/content/res/Configuration;)Z", ret_true),
    M("diff", "(Landroid/content/res/Configuration;)I", ret_zero),
-   M("setTo", "(Landroid/content/res/Configuration;)V", nop_void),
+   M("setTo", "(Landroid/content/res/Configuration;)V", cfg_set_to),
    M_END,
 };
 
@@ -13117,6 +13194,32 @@ static bool latch_await(struct dvm *vm, dvm_ref self,
       if (dvm__now_ms() >= hard_deadline) {
          fprintf(stderr, "[sched] CountDownLatch.await gave up after %ums\n",
                  DVM_BLOCK_MAX_MS);
+         union dvm_value count = { 0 };
+         (void)dvm_get_field(vm, self, "count", "I", &count);
+         fprintf(stderr, "[sched]   latch=%u count=%d depth=%d pending=%d "
+                         "host_bytecode=%d cur_thread=%u bytecode stack:\n",
+                         self, count.i, vm->drain_depth, vm->npending,
+                         dvm_on_bytecode_thread() ? 1 : 0, vm->cur_thread);
+         for (int i = vm->ncallstack - 1, shown = 0;
+              i >= 0 && shown < 16; --i, ++shown) {
+            const struct dvm_method *m = vm->callstack[i];
+            fprintf(stderr, "[sched]     %s.%s%s\n",
+                    m && m->cls && m->cls->name ? m->cls->name : "?",
+                    m && m->name ? m->name : "?",
+                    m && m->sig ? m->sig : "");
+         }
+         for (int i = 0; i < vm->npending && i < 16; ++i) {
+            struct dvm_class *pc = dvm_object_class(vm, vm->pending_threads[i]);
+            struct dvm_method *run = pc
+               ? dvm_find_method(vm, pc, "run", "()V") : NULL;
+            fprintf(stderr, "[sched]   pending[%d]=%s due_in=%lldms "
+                            "thread=%d looper=%u owner=%u\n", i,
+                    run && run->cls && run->cls->name ? run->cls->name : "?",
+                    (long long)(vm->pending_due_ms[i] > dvm__now_ms()
+                       ? vm->pending_due_ms[i] - dvm__now_ms() : 0),
+                    vm->pending_is_thread[i] ? 1 : 0,
+                    vm->pending_looper[i], vm->pending_owner[i]);
+         }
          if (timed) RETI(0);
          RETV();
       }
@@ -16830,6 +16933,12 @@ static bool conn_perform(struct dvm *vm, dvm_ref self, struct rt_conn *c)
     * why; it is too useful to need a rebuild to see.  Reading it is safe: an
     * error body is a sentence, not a download. */
    if (verbose || c->resp.status >= 400) {
+      /* And the request that produced it.  "NP not found" says nothing on its
+       * own; which identity was asked for is the whole question, and a
+       * request the emulator assembled wrongly is invisible otherwise. */
+      if (body && body_len)
+         fprintf(stderr, "[http] > body: %.*s\n",
+                 (int)(body_len > 512 ? 512 : body_len), (const char *)body);
       for (int i = 0; verbose && i < c->resp.nheaders; ++i)
          fprintf(stderr, "[http] < %s: %s\n", c->resp.headers[i].name,
                  c->resp.headers[i].value);
@@ -19044,14 +19153,15 @@ static void time_break(int64_t ms, const char *zone, struct tm *tm)
 {
    time_t secs = (time_t)(ms / 1000);
    if (ms < 0 && ms % 1000) --secs;
-   if (!zone || !*zone) {
-      localtime_r(&secs, tm);
-      return;
-   }
+   if (!zone || !*zone) zone = arm_exec_device_timezone();
    if (!strcmp(zone, "UTC") || !strcmp(zone, "GMT")) {
       gmtime_r(&secs, tm);
       return;
    }
+   /* TZ and tzset() are process-global POSIX state.  This emulates a
+    * zone-specific conversion API; serialize it with native localtime/mktime
+    * so a Java formatter can never expose its temporary zone to bionic. */
+   arm_exec_timezone_lock();
    char *old = getenv("TZ");
    char saved[128] = "";
    if (old) snprintf(saved, sizeof saved, "%s", old);
@@ -19061,6 +19171,7 @@ static void time_break(int64_t ms, const char *zone, struct tm *tm)
    if (old) setenv("TZ", saved, 1);
    else unsetenv("TZ");
    tzset();
+   arm_exec_timezone_unlock();
 }
 
 /* Seconds east of UTC at `ms`, in the given zone. */
@@ -19162,7 +19273,7 @@ static bool tz_getDefault(struct dvm *vm, dvm_ref self,
                           union dvm_value *out)
 {
    (void)self; (void)args; (void)nargs;
-   RETL(zone_make(vm, ""));
+   RETL(zone_make(vm, arm_exec_device_timezone()));
 }
 
 static bool tz_getTimeZone(struct dvm *vm, dvm_ref self,
@@ -19653,6 +19764,7 @@ static bool sdf_parse(struct dvm *vm, dvm_ref self,
    (void)dvm_get_field(vm, self, "pattern", "Ljava/lang/String;", &pv);
    const char *pat = pv.l ? dvm_string_utf8(vm, pv.l) : "";
    const char *s = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
+   const size_t slen = ARG(0).l ? dvm_string_utf8_length(vm, ARG(0).l) : 0;
    if (!pat || !s) {
       dvm__throw(vm, "java/text/ParseException", "unparseable date");
       return false;
@@ -19663,11 +19775,12 @@ static bool sdf_parse(struct dvm *vm, dvm_ref self,
    tm.tm_mday = 1;
    int32_t sub = 0;
    const char *in = s;
-   for (const char *p = pat; *p && *in;) {
+   const char *in_end = s + slen;
+   for (const char *p = pat; *p && in < in_end;) {
       if (*p == '\'') {
          ++p;
          if (*p == '\'') { ++p; if (*in == '\'') ++in; continue; }
-         while (*p && *p != '\'') { if (*in) ++in; ++p; }
+         while (*p && *p != '\'') { if (in < in_end) ++in; ++p; }
          if (*p) ++p;
          continue;
       }
@@ -19677,14 +19790,22 @@ static bool sdf_parse(struct dvm *vm, dvm_ref self,
       while (p[n] == c) ++n;
       p += n;
 
-      while (*in && !isdigit((unsigned char)*in) &&
+      while (in < in_end && !isdigit((unsigned char)*in) &&
              (c == 'y' || c == 'M' || c == 'd' || c == 'H' || c == 'h' ||
               c == 'm' || c == 's' || c == 'S'))
          ++in;
-      char *end;
-      long v = strtol(in, &end, 10);
-      if (end == in) { ++in; continue; }
-      in = end;
+      const char *digits = in;
+      long v = 0;
+      while (in < in_end && isdigit((unsigned char)*in)) {
+         const int digit = *in++ - '0';
+         if (v <= (LONG_MAX - digit) / 10) v = v * 10 + digit;
+         else v = LONG_MAX;
+      }
+      if (in == digits) {
+         if (in < in_end) ++in;
+         else break;
+         continue;
+      }
       switch (c) {
       case 'y': tm.tm_year = (int)(v < 100 ? v + 2000 : v) - 1900; break;
       case 'M': tm.tm_mon = (int)v - 1; break;
@@ -23034,8 +23155,14 @@ static bool looper_loop(struct dvm *vm, dvm_ref self,
       dvm_gil_release(vm);
       unsigned armd = arm_lock_unlock_all();
       usleep(5 * 1000u);
-      arm_lock_relock(armd);
+      /* The VM-wide order is GIL outside, ARM execution lock inside (see
+       * dvm_gil_enter_from_guest()).  Taking these back in the opposite order
+       * deadlocks a Looper against any bytecode waiter that already reacquired
+       * GIL and is waiting for AEL.  Cross Worlds exposed this at startup:
+       * Firebase's response Runnable remained tagged to this Looper while its
+       * CountDownLatch timed out forever. */
       dvm_gil_acquire(vm);
+      arm_lock_relock(armd);
    }
    g_current_looper = prev;
    RETV();
@@ -25070,7 +25197,13 @@ static bool mplayer_setSurface(struct dvm *vm, dvm_ref self,
    struct rt_player *p = player_of(vm, self);
    if (!ARG(0).l && p && p->playing && p->video >= 0 &&
        mplayer_ensure_playback_surface(vm, self, p)) {
-      if (p->codec) player_tick(vm, self, p);
+      /* MediaPlayer.setSurface() only changes the destination.  A device
+       * does not decode a buffer and invoke SurfaceTexture callbacks on the
+       * caller's stack; the media/BufferQueue worker reports the next frame
+       * asynchronously.  dvm_media_pump_active() is that worker boundary in
+       * Lunaria.  Running player_tick() here re-entered UE while it still
+       * held its media mutex, so the callback appeared to re-lock the same
+       * NORMAL mutex and correctly deadlocked. */
       RETV();
    }
    union dvm_value v = { .l = ARG(0).l };
@@ -25085,7 +25218,8 @@ static bool mplayer_setSurface(struct dvm *vm, dvm_ref self,
       dvm_pin(vm, self);
       (void)dvm_set_field(vm, st.l, "player", "Ljava/lang/Object;", me);
    }
-   if (p && p->playing) player_tick(vm, self, p);
+   /* See above: the next frame is produced by dvm_media_pump_active(), after
+    * this Java call has returned and the caller has released its locks. */
    RETV();
 }
 
@@ -25106,7 +25240,9 @@ static bool mplayer_start(struct dvm *vm, dvm_ref self,
    if (p->video >= 0)
       mplayer_ensure_playback_surface(vm, self, p);
    player_register_active(vm, self);
-   player_tick(vm, self, p);
+   /* start() changes playback state and returns.  Decoding and listener
+    * delivery belong to the media worker, not to the thread calling start().
+    * The frame pump invokes dvm_media_pump_active() independently. */
    RETV();
 }
 
@@ -27017,13 +27153,40 @@ static bool intent_get_flags(struct dvm *vm, dvm_ref self,
 INTENT_GET_OBJ(intent_getAction, "action", "Ljava/lang/String;")
 INTENT_GET_OBJ(intent_getData, "data", "Landroid/net/Uri;")
 INTENT_GET_OBJ(intent_getComponent, "component", "Landroid/content/ComponentName;")
+INTENT_GET_OBJ(intent_getPackage, "package", "Ljava/lang/String;")
 #undef INTENT_GET_OBJ
 
 #define INTENT_SET_OBJ(fn, field, type)                                          static bool fn(struct dvm *vm, dvm_ref self, const union dvm_value *args,                    int nargs, union dvm_value *out)                               {                                                                                (void)nargs;                                                                  union dvm_value v = { .l = ARG(0).l };                                        dvm_pin(vm, v.l);                                                             (void)dvm_set_field(vm, self, field, type, v);                                RETL(self);                                                                }
 INTENT_SET_OBJ(intent_setAction, "action", "Ljava/lang/String;")
 INTENT_SET_OBJ(intent_setData, "data", "Landroid/net/Uri;")
 INTENT_SET_OBJ(intent_setComponent, "component", "Landroid/content/ComponentName;")
+INTENT_SET_OBJ(intent_setPackage, "package", "Ljava/lang/String;")
 #undef INTENT_SET_OBJ
+
+static bool intent_putExtras(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   union dvm_value ignored = { 0 };
+   if (nargs && ARG(0).l)
+      (void)map_putAll(vm, self, args, 1, &ignored);
+   RETL(self);
+}
+
+static bool intent_getExtras(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   struct dvm_class *bc = dvm__class_by_desc(vm, "Landroid/os/Bundle;");
+   dvm_ref bundle = bc ? dvm_new_object(vm, bc) : 0;
+   if (bundle) {
+      union dvm_value src = { .l = self }, ignored = { 0 };
+      (void)map_init(vm, bundle, NULL, 0, &ignored);
+      (void)map_putAll(vm, bundle, &src, 1, &ignored);
+   }
+   RETL(bundle);
+}
 
 /* Extras live in the same map storage the collections use, keyed by name. */
 static bool intent_putExtra(struct dvm *vm, dvm_ref self,
@@ -27118,6 +27281,7 @@ static const struct rt_field rt_intent_fields[] = {
    { "action", "Ljava/lang/String;" },
    { "data", "Landroid/net/Uri;" },
    { "component", "Landroid/content/ComponentName;" },
+   { "package", "Ljava/lang/String;" },
    /* new Intent(context, Foo.class) names its target directly.  Dropping it
     * left an explicit intent indistinguishable from an empty one, so
     * bindService() had nothing to start. */
@@ -27147,7 +27311,8 @@ static const struct rt_method rt_intent[] = {
    M("setFlags", "(I)Landroid/content/Intent;", intent_set_flags),
    M("addFlags", "(I)Landroid/content/Intent;", intent_add_flags),
    M("getFlags", "()I", intent_get_flags),
-   M("setPackage", "(Ljava/lang/String;)Landroid/content/Intent;", intent_self),
+   M("setPackage", "(Ljava/lang/String;)Landroid/content/Intent;", intent_setPackage),
+   M("getPackage", "()Ljava/lang/String;", intent_getPackage),
    M("addCategory", "(Ljava/lang/String;)Landroid/content/Intent;", intent_self),
    M("putExtra", "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;",
      intent_putExtra),
@@ -27155,6 +27320,8 @@ static const struct rt_method rt_intent[] = {
      intent_putExtra),
    M("putExtra", "(Ljava/lang/String;Landroid/os/Parcelable;)Landroid/content/Intent;",
      intent_putExtra),
+   M("putExtras", "(Landroid/os/Bundle;)Landroid/content/Intent;", intent_putExtras),
+   M("getExtras", "()Landroid/os/Bundle;", intent_getExtras),
    M("hasExtra", "(Ljava/lang/String;)Z", intent_hasExtra),
    M("getStringExtra", "(Ljava/lang/String;)Ljava/lang/String;", intent_getExtra),
    M("getParcelableExtra", "(Ljava/lang/String;)Landroid/os/Parcelable;",
@@ -27233,13 +27400,6 @@ static bool websettings_getDefaultUserAgent(struct dvm *vm, dvm_ref self,
       "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"));
 }
-
-static const struct rt_method rt_web_settings[] = {
-   SM("getDefaultUserAgent",
-      "(Landroid/content/Context;)Ljava/lang/String;",
-      websettings_getDefaultUserAgent),
-   M_END,
-};
 
 /* --- android.webkit.CookieManager --------------------------------------- */
 
@@ -27751,6 +27911,60 @@ static bool file_createNewFile(struct dvm *vm, dvm_ref self,
    return false;
 }
 
+/* File.createTempFile(prefix, suffix, directory).  Several Android SDKs use
+ * this as the durable-write staging step (write, fsync, rename).  Returning
+ * null here made Firebase Installations send an auth request for installation
+ * "null", even though the network stack itself was working. */
+static bool file_createTempFile(struct dvm *vm, dvm_ref self,
+                                const union dvm_value *args, int nargs,
+                                union dvm_value *out)
+{
+   (void)self;
+   const char *prefix = nargs > 0 ? dvm_string_utf8(vm, ARG(0).l) : NULL;
+   const char *suffix = nargs > 1 && ARG(1).l
+                           ? dvm_string_utf8(vm, ARG(1).l) : ".tmp";
+   const char *directory = nargs > 2 && ARG(2).l
+                              ? file_path(vm, ARG(2).l) : NULL;
+   if (!prefix || strlen(prefix) < 3) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException",
+                 "Prefix string too short");
+      return false;
+   }
+   if (!directory || !*directory) directory = "/tmp";
+
+   char guest[PATH_MAX];
+   snprintf(guest, sizeof guest, "%s%s%sXXXXXX%s", directory,
+            directory[strlen(directory) - 1] == '/' ? "" : "/",
+            prefix, suffix ? suffix : ".tmp");
+   char host[PATH_MAX];
+   const char *mapped = arm_exec_map_guest_path(guest, host, sizeof host);
+   if (!mapped) {
+      dvm__throw(vm, "java/io/IOException", "%s: invalid path", guest);
+      return false;
+   }
+   int suffix_len = (int)strlen(suffix ? suffix : ".tmp");
+   int fd = mkstemps(host, suffix_len);
+   if (fd < 0) {
+      dvm__throw(vm, "java/io/IOException", "%s: %s", guest,
+                 strerror(errno));
+      return false;
+   }
+   close(fd);
+
+   /* mkstemps changed the host spelling in place.  The guest and host paths
+    * have the same tail, so copy the generated six characters back. */
+   size_t hn = strlen(host), gn = strlen(guest);
+   if (hn >= (size_t)suffix_len + 6 && gn >= (size_t)suffix_len + 6)
+      memcpy(guest + gn - (size_t)suffix_len - 6,
+             host + hn - (size_t)suffix_len - 6, 6);
+   struct dvm_class *c = dvm__class_by_desc(vm, "Ljava/io/File;");
+   dvm_ref file = c ? dvm_new_object(vm, c) : 0;
+   if (!file) RETL(0);
+   union dvm_value path = { .l = dvm_new_string(vm, guest) };
+   (void)dvm_set_field(vm, file, "path", "Ljava/lang/String;", path);
+   RETL(file);
+}
+
 /* File.renameTo() — the commit step of every write-to-temp-then-swap on
  * Android.  Without it Crashlytics' QueueFile could not install the file it
  * had just built ("Rename failed!") and reported a null queue for the rest of
@@ -27866,6 +28080,9 @@ static const struct rt_method rt_file[] = {
    M("deleteOnExit", "()V", nop_void),
    M("renameTo", "(Ljava/io/File;)Z", file_renameTo),
    M("createNewFile", "()Z", file_createNewFile),
+   SM("createTempFile",
+      "(Ljava/lang/String;Ljava/lang/String;Ljava/io/File;)Ljava/io/File;",
+      file_createTempFile),
    M("toPath", "()Ljava/nio/file/Path;", file_toPath),
    M("getCanonicalFile", "()Ljava/io/File;", file_getCanonicalFile),
    M("list", "()[Ljava/lang/String;", file_list),
@@ -28079,29 +28296,21 @@ static const struct rt_method rt_settings_global[] = {
 
 static const char *android_system_property(const char *name)
 {
-   /* Version properties come from the one place that decides the platform
-    * level (jvm.h); the rest describe this emulator and are fixed. */
-   if (name && !strcmp(name, "ro.build.version.sdk")) {
-      static char sdk[8];
-      if (!sdk[0]) snprintf(sdk, sizeof sdk, "%d", lunaria_sdk_int());
-      return sdk;
-   }
-   if (name && !strcmp(name, "ro.build.version.release"))
-      return lunaria_android_release();
-   static const struct { const char *name, *value; } properties[] = {
+   /* The device's properties are decided in exactly one place
+    * (lunaria_android_property), because android.os.Build is a view of the
+    * same table: a guest that reads Build.MODEL and ro.product.model must be
+    * told the same thing.  Only the ABI list is answered here, because it is
+    * a property of the image this VM is running, not of the device. */
+   if (!name) return "";
+   static const struct { const char *name, *value; } abi[] = {
       { "ro.product.cpu.abi", "arm64-v8a" },
       { "ro.product.cpu.abi2", "" },
       { "ro.product.cpu.abilist", "arm64-v8a" },
       { "ro.product.cpu.abilist64", "arm64-v8a" },
-      { "ro.product.manufacturer", "Lunaria" },
-      { "ro.product.model", "Lunaria" },
-      { "ro.product.board", "lunaria" },
-      { "ro.hardware", "lunaria" },
    };
-   if (!name) return "";
-   for (size_t i = 0; i < sizeof properties / sizeof properties[0]; ++i)
-      if (!strcmp(name, properties[i].name)) return properties[i].value;
-   return "";
+   for (size_t i = 0; i < sizeof abi / sizeof abi[0]; ++i)
+      if (!strcmp(name, abi[i].name)) return abi[i].value;
+   return lunaria_android_property(name);
 }
 
 static bool system_properties_get(struct dvm *vm, dvm_ref self,
@@ -28238,9 +28447,13 @@ static void activity_fill_process_info(struct dvm *vm, dvm_ref info)
    if (!package) package = "";
    union dvm_value value = { .l = dvm_new_string(vm, package) };
    (void)dvm_set_field(vm, info, "processName", "Ljava/lang/String;", value);
-   value.i = (int32_t)getpid();
+   /* The app process's own identity, the same two numbers native getpid() and
+    * getuid() return.  These used to be the *host* process's: the host runs as
+    * root, so ActivityManager reported the running app under uid 0 and a pid
+    * the guest had never seen. */
+   value.i = (int32_t)arm_exec_guest_pid();
    (void)dvm_set_field(vm, info, "pid", "I", value);
-   value.i = (int32_t)getuid();
+   value.i = (int32_t)arm_exec_guest_uid();
    (void)dvm_set_field(vm, info, "uid", "I", value);
    value.i = 100; /* IMPORTANCE_FOREGROUND: Lunaria runs the foreground Activity. */
    (void)dvm_set_field(vm, info, "importance", "I", value);
@@ -28829,14 +29042,17 @@ static bool proc_myPid(struct dvm *vm, dvm_ref self, const union dvm_value *args
                        int nargs, union dvm_value *out)
 {
    (void)vm; (void)self; (void)args; (void)nargs;
-   RETI((int32_t)getpid());
+   /* The guest's pid, not the host's: native getpid() and /proc/<pid> answer
+    * the former, and a process that reports two different pids to its own
+    * code is something no device can be. */
+   RETI((int32_t)arm_exec_guest_pid());
 }
 
 static bool proc_myUid(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                        int nargs, union dvm_value *out)
 {
    (void)vm; (void)self; (void)args; (void)nargs;
-   RETI(10000);   /* FIRST_APPLICATION_UID — matches native getuid() */
+   RETI((int32_t)arm_exec_guest_uid());   /* matches native getuid() */
 }
 
 /* Thread priorities.  There is no Android scheduler behind Lunaria, but
@@ -31207,7 +31423,78 @@ static bool pm_getInstalledApplications(struct dvm *vm, dvm_ref self,
    RETL(list);
 }
 
-static dvm_ref pm_current_package_info(struct dvm *vm)
+bool dvm_package_info_add_signatures(struct dvm *vm, dvm_ref pi)
+{
+   const char *path = getenv("ANDROID_APK_SIGNER_PKCS7");
+   if (!vm || !pi || !path || !*path) return false;
+
+   FILE *fp = fopen(path, "rb");
+   if (!fp) return false;
+   if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return false; }
+   long size = ftell(fp);
+   if (size <= 0 || size > 16 * 1024 * 1024L ||
+       fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return false; }
+   unsigned char *blob = malloc((size_t)size);
+   if (!blob) { fclose(fp); return false; }
+   bool ok = fread(blob, 1, (size_t)size, fp) == (size_t)size;
+   fclose(fp);
+   if (!ok) { free(blob); return false; }
+
+   const unsigned char *cursor = blob;
+   PKCS7 *p7 = d2i_PKCS7(NULL, &cursor, size);
+   free(blob);
+   if (!p7) return false;
+   STACK_OF(X509) *certs = PKCS7_get0_signers(p7, NULL, 0);
+   int count = certs ? sk_X509_num(certs) : 0;
+   if (count <= 0) {
+      sk_X509_free(certs);
+      PKCS7_free(p7);
+      return false;
+   }
+
+   dvm_ref signatures = dvm_new_array(vm, 'L',
+      "Landroid/content/pm/Signature;", (uint32_t)count);
+   dvm_ref *items = signatures ? dvm_array_data(vm, signatures) : NULL;
+   struct dvm_class *sc = dvm__class_by_desc(vm,
+      "Landroid/content/pm/Signature;");
+   for (int i = 0; items && sc && i < count; ++i) {
+      X509 *cert = sk_X509_value(certs, i);
+      int der_size = cert ? i2d_X509(cert, NULL) : 0;
+      if (der_size <= 0) continue;
+      dvm_ref bytes = dvm_new_array(vm, 'B', NULL, (uint32_t)der_size);
+      unsigned char *dst = bytes ? dvm_array_data(vm, bytes) : NULL;
+      if (!dst) continue;
+      unsigned char *write = dst;
+      if (i2d_X509(cert, &write) != der_size) continue;
+      dvm_ref signature = dvm_new_object(vm, sc);
+      union dvm_value value = { .l = bytes };
+      if (signature && dvm_set_field(vm, signature, "bytes", "[B", value))
+         items[i] = signature;
+   }
+   sk_X509_free(certs);
+   PKCS7_free(p7);
+   if (!signatures || !items || !items[0]) return false;
+
+   union dvm_value value = { .l = signatures };
+   (void)dvm_set_field(vm, pi, "signatures",
+                       "[Landroid/content/pm/Signature;", value);
+   struct dvm_class *sic = dvm__class_by_desc(vm,
+      "Landroid/content/pm/SigningInfo;");
+   dvm_ref signing_info = sic ? dvm_new_object(vm, sic) : 0;
+   if (signing_info) {
+      (void)dvm_set_field(vm, signing_info, "signers",
+                          "[Landroid/content/pm/Signature;", value);
+      value.l = signing_info;
+      (void)dvm_set_field(vm, pi, "signingInfo",
+                          "Landroid/content/pm/SigningInfo;", value);
+   }
+   fprintf(stderr, "[apk-meta] PackageInfo: %d real signer certificate(s)\n",
+           count);
+   return true;
+}
+
+static dvm_ref pm_package_info(struct dvm *vm,
+                               const struct lunaria_android_package *record)
 {
    struct dvm_class *pc = dvm__class_by_desc(vm, "Landroid/content/pm/PackageInfo;");
    struct dvm_class *ac = dvm__class_by_desc(vm, "Landroid/content/pm/ApplicationInfo;");
@@ -31215,24 +31502,49 @@ static dvm_ref pm_current_package_info(struct dvm *vm)
    dvm_ref ai = ac ? dvm_new_object(vm, ac) : 0;
    if (!pi || !ai) return 0;
 
-   const char *pkg_name = getenv("ANDROID_PACKAGE_NAME");
-   union dvm_value pkg = { .l = dvm_new_string(vm, pkg_name ? pkg_name : "") };
+   const char *pkg_name = record->name;
+   union dvm_value pkg = { .l = dvm_new_string(vm, pkg_name) };
    (void)dvm_set_field(vm, ai, "packageName", "Ljava/lang/String;", pkg);
    (void)dvm_set_field(vm, pi, "packageName", "Ljava/lang/String;", pkg);
-   union dvm_value sdk = { .i = lunaria_sdk_int() };
+   union dvm_value sdk = { .i = record->target_sdk };
    (void)dvm_set_field(vm, ai, "targetSdkVersion", "I", sdk);
+   /* An installed app's ApplicationInfo.uid is its process uid, which is
+    * >= FIRST_APPLICATION_UID.  Left unset it read as 0 -- root -- while
+    * getuid() said 10000, and code that classifies a package by its uid
+    * (NMSS builds a uid -> package census exactly that way) saw a system
+    * process where the app is. */
+   union dvm_value uid = { .i = record->uid };
+   (void)dvm_set_field(vm, ai, "uid", "I", uid);
+   union dvm_value flags = { .i = record->flags };
+   (void)dvm_set_field(vm, ai, "flags", "I", flags);
    union dvm_value app = { .l = ai };
    (void)dvm_set_field(vm, pi, "applicationInfo",
                        "Landroid/content/pm/ApplicationInfo;", app);
+   /* PackageManager returns a fully populated ApplicationInfo.  In
+    * particular, NMSS uses sourceDir/dataDir when it validates the installed
+    * package; leaving these null makes the object unlike the one returned by
+    * getApplicationInfo(). */
+   union dvm_value path = { .l = dvm_new_string(vm, record->source_dir) };
+   (void)dvm_set_field(vm, ai, "sourceDir", "Ljava/lang/String;", path);
+   (void)dvm_set_field(vm, ai, "publicSourceDir", "Ljava/lang/String;", path);
+   path.l = dvm_new_string(vm, record->data_dir);
+   (void)dvm_set_field(vm, ai, "dataDir", "Ljava/lang/String;", path);
+   const char *self = getenv("ANDROID_PACKAGE_NAME");
+   path.l = dvm_new_string(vm, record->lib_dir ? record->lib_dir : "");
+   (void)dvm_set_field(vm, ai, "nativeLibraryDir", "Ljava/lang/String;", path);
    int32_t version_code = 1;
    const char *version_name = NULL;
-   arm_exec_apk_version(&version_code, &version_name);
+   if (self && !strcmp(self, record->name))
+      arm_exec_apk_version(&version_code, &version_name);
    union dvm_value version = { .i = version_code };
    (void)dvm_set_field(vm, pi, "versionCode", "I", version);
    version.l = dvm_new_string(vm, version_name ? version_name : "");
    (void)dvm_set_field(vm, pi, "versionName", "Ljava/lang/String;", version);
+   if (self && !strcmp(self, record->name))
+      (void)dvm_package_info_add_signatures(vm, pi);
 
-   const char *encoded_permissions = getenv("ANDROID_REQUESTED_PERMISSIONS");
+   const char *encoded_permissions = self && !strcmp(self, record->name)
+                                   ? getenv("ANDROID_REQUESTED_PERMISSIONS") : NULL;
    if (encoded_permissions && *encoded_permissions) {
       char *copy = strdup(encoded_permissions);
       uint32_t count = 1;
@@ -31265,10 +31577,31 @@ static bool pm_getInstalledPackages(struct dvm *vm, dvm_ref self,
 {
    (void)self; (void)args; (void)nargs;
    dvm_ref list = coll_new_list(vm, "Ljava/util/ArrayList;");
-   dvm_ref info = pm_current_package_info(vm);
-   if (list && info) {
+   const size_t count = lunaria_android_package_count();
+   for (size_t i = 0; list && i < count; ++i) {
+      struct lunaria_android_package record;
+      if (!lunaria_android_package_at(i, &record)) continue;
+      /* Android 11 package visibility: see lunaria_android_package_visible(). */
+      if (!lunaria_android_package_visible(&record)) continue;
+      dvm_ref info = pm_package_info(vm, &record);
+      if (!info) continue;
       union dvm_value item = { .l = info }, ignored = { 0 };
       (void)list_add(vm, list, &item, 1, &ignored);
+      if (getenv("LUNARIA_DVM_TRACE")) {
+         union dvm_value pn = { 0 }, ai = { 0 }, ain = { 0 };
+         (void)dvm_get_field(vm, info, "packageName", "Ljava/lang/String;", &pn);
+         (void)dvm_get_field(vm, info, "applicationInfo",
+                             "Landroid/content/pm/ApplicationInfo;", &ai);
+         if (ai.l)
+            (void)dvm_get_field(vm, ai.l, "packageName", "Ljava/lang/String;",
+                                &ain);
+         fprintf(stderr, "[dvm] pm.getInstalledPackages: applicationInfo=@%x \\\"%s\\\"\n",
+                 ai.l, ain.l ? dvm_string_utf8(vm, ain.l) : "");
+         fprintf(stderr, "[dvm] pm.getInstalledPackages: list=@%x size=%d package=@%x \\\"%s\\\" uid=%d flags=0x%x\n",
+                 list, list_of(vm, list) ? (int)list_of(vm, list)->size : -1,
+                 pn.l, pn.l ? dvm_string_utf8(vm, pn.l) : "",
+                 record.uid, record.flags);
+      }
    }
    RETL(list);
 }
@@ -31363,7 +31696,8 @@ static const struct rt_method rt_package_manager[] = {
    M("getInstalledPackages", "(I)Ljava/util/List;", pm_getInstalledPackages),
    M("queryIntentActivities",
      "(Landroid/content/Intent;I)Ljava/util/List;", pm_queryIntentActivities),
-   M("checkPermission", "(Ljava/lang/String;Ljava/lang/String;)I", ret_zero),
+   M("checkPermission", "(Ljava/lang/String;Ljava/lang/String;)I",
+     pm_check_permission),
    M("getLaunchIntentForPackage", "(Ljava/lang/String;)Landroid/content/Intent;",
      pm_launch_intent),
    M("getResourcesForApplication",
@@ -31395,7 +31729,71 @@ static const struct rt_field rt_package_info_fields[] = {
    { "splitNames", "[Ljava/lang/String;" },
    { "requestedPermissions", "[Ljava/lang/String;" },
    { "requestedPermissionsFlags", "[I" },
+   { "signatures", "[Landroid/content/pm/Signature;" },
+   { "signingInfo", "Landroid/content/pm/SigningInfo;" },
    F_END
+};
+
+static const struct rt_field rt_signature_fields[] = {
+   { "bytes", "[B" }, F_END
+};
+
+static const struct rt_field rt_signing_info_fields[] = {
+   { "signers", "[Landroid/content/pm/Signature;" }, F_END
+};
+
+static bool signature_toByteArray(struct dvm *vm, dvm_ref self,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value bytes = { 0 };
+   (void)dvm_get_field(vm, self, "bytes", "[B", &bytes);
+   RETL(bytes.l);
+}
+
+static bool signature_hashCode(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value bytes = { 0 };
+   (void)dvm_get_field(vm, self, "bytes", "[B", &bytes);
+   struct dvm_object *array = dvm__obj(vm, bytes.l);
+   int32_t hash = 1;
+   if (array && array->kind == DVM_OBJ_ARRAY && array->elem_kind == 'B') {
+      const int8_t *data = array->data;
+      for (uint32_t i = 0; data && i < array->length; ++i)
+         hash = hash * 31 + data[i];
+   }
+   RETI(hash);
+}
+
+static bool signing_info_signers(struct dvm *vm, dvm_ref self,
+                                 const union dvm_value *args, int nargs,
+                                 union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value signers = { 0 };
+   (void)dvm_get_field(vm, self, "signers",
+                       "[Landroid/content/pm/Signature;", &signers);
+   RETL(signers.l);
+}
+
+static const struct rt_method rt_signature[] = {
+   M("toByteArray", "()[B", signature_toByteArray),
+   M("hashCode", "()I", signature_hashCode),
+   M_END,
+};
+
+static const struct rt_method rt_signing_info[] = {
+   M("getApkContentsSigners", "()[Landroid/content/pm/Signature;",
+     signing_info_signers),
+   M("getSigningCertificateHistory", "()[Landroid/content/pm/Signature;",
+     signing_info_signers),
+   M("hasMultipleSigners", "()Z", ret_false),
+   M("hasPastSigningCertificates", "()Z", ret_false),
+   M_END,
 };
 
 static const struct rt_field rt_resolve_info_fields[] = {
@@ -31723,6 +32121,378 @@ static bool view_init_context(struct dvm *vm, dvm_ref self,
    (void)dvm_set_field(vm, self, "context", "Landroid/content/Context;", context);
    RETV();
 }
+
+/* Per-instance settings a WebView hands out from getSettings().  The
+ * setters are the contract; this runtime does not render HTML, so the
+ * flags are stored only where a later getter reads them back. */
+static bool websettings_init(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)args; (void)nargs; (void)out;
+   union dvm_value v = { .i = 1 };
+   (void)dvm_set_field(vm, self, "javascriptEnabled", "Z", v);
+   v.l = dvm_new_string(vm,
+      "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+   (void)dvm_set_field(vm, self, "userAgent", "Ljava/lang/String;", v);
+   RETV();
+}
+
+static bool websettings_set_js(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   union dvm_value v = { .i = ARG(0).i };
+   (void)dvm_set_field(vm, self, "javascriptEnabled", "Z", v);
+   RETV();
+}
+
+static bool websettings_get_js(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "javascriptEnabled", "Z", &v);
+   RETI(v.i);
+}
+
+static bool websettings_set_ua(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   union dvm_value v = { .l = ARG(0).l };
+   (void)dvm_set_field(vm, self, "userAgent", "Ljava/lang/String;", v);
+   RETV();
+}
+
+static bool websettings_get_ua(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "userAgent", "Ljava/lang/String;", &v);
+   RETL(v.l);
+}
+
+static const struct rt_field rt_web_settings_fields[] = {
+   { "javascriptEnabled", "Z" },
+   { "userAgent", "Ljava/lang/String;" },
+   F_END,
+};
+
+static const struct rt_method rt_web_settings[] = {
+   M("<init>", "()V", websettings_init),
+   SM("getDefaultUserAgent",
+      "(Landroid/content/Context;)Ljava/lang/String;",
+      websettings_getDefaultUserAgent),
+   M("setJavaScriptEnabled", "(Z)V", websettings_set_js),
+   M("getJavaScriptEnabled", "()Z", websettings_get_js),
+   M("setDomStorageEnabled", "(Z)V", nop_void),
+   M("setDatabaseEnabled", "(Z)V", nop_void),
+   M("setAllowFileAccess", "(Z)V", nop_void),
+   M("setAllowContentAccess", "(Z)V", nop_void),
+   M("setAllowFileAccessFromFileURLs", "(Z)V", nop_void),
+   M("setAllowUniversalAccessFromFileURLs", "(Z)V", nop_void),
+   M("setMixedContentMode", "(I)V", nop_void),
+   M("setLoadWithOverviewMode", "(Z)V", nop_void),
+   M("setUseWideViewPort", "(Z)V", nop_void),
+   M("setSupportZoom", "(Z)V", nop_void),
+   M("setBuiltInZoomControls", "(Z)V", nop_void),
+   M("setDisplayZoomControls", "(Z)V", nop_void),
+   M("setCacheMode", "(I)V", nop_void),
+   M("setMediaPlaybackRequiresUserGesture", "(Z)V", nop_void),
+   M("setJavaScriptCanOpenWindowsAutomatically", "(Z)V", nop_void),
+   M("setSupportMultipleWindows", "(Z)V", nop_void),
+   M("setUserAgentString", "(Ljava/lang/String;)V", websettings_set_ua),
+   M("getUserAgentString", "()Ljava/lang/String;", websettings_get_ua),
+   M("setTextZoom", "(I)V", nop_void),
+   M("setDefaultTextEncodingName", "(Ljava/lang/String;)V", nop_void),
+   M_END,
+};
+
+/* --- android.webkit.WebView --------------------------------------------- *
+ *
+ * A View that loads documents.  This runtime does not paint HTML pixels; it
+ * does deliver the lifecycle Netmarble's UIView waits on: getSettings(),
+ * setWebViewClient(), loadUrl()/loadData*, and the client's
+ * onPageStarted/onPageFinished.  Without those, WebViewDialog stays modal
+ * forever and eats every touch above the game.
+ *
+ * loadUrl fetches the URL on a host thread the same way HttpURLConnection
+ * does for the rest of the SDK, then notifies the client.  A failure still
+ * fires onPageFinished with the requested URL — that is what Chromium does
+ * for an error page, and it is what closeView / isWebViewVisible wait for. */
+
+static bool webview_init(struct dvm *vm, dvm_ref self,
+                         const union dvm_value *args, int nargs,
+                         union dvm_value *out)
+{
+   if (!view_init_context(vm, self, args, nargs, out)) return false;
+   struct dvm_class *sc = dvm__class_by_desc(vm, "Landroid/webkit/WebSettings;");
+   dvm_ref settings = sc ? dvm_new_object(vm, sc) : 0;
+   if (settings) {
+      union dvm_value ignored = { 0 };
+      (void)websettings_init(vm, settings, NULL, 0, &ignored);
+      union dvm_value v = { .l = settings };
+      (void)dvm_set_field(vm, self, "settings",
+                          "Landroid/webkit/WebSettings;", v);
+   }
+   RETV();
+}
+
+static bool webview_get_settings(struct dvm *vm, dvm_ref self,
+                                 const union dvm_value *args, int nargs,
+                                 union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "settings",
+                       "Landroid/webkit/WebSettings;", &v);
+   if (!v.l) {
+      struct dvm_class *sc =
+         dvm__class_by_desc(vm, "Landroid/webkit/WebSettings;");
+      v.l = sc ? dvm_new_object(vm, sc) : 0;
+      if (v.l) {
+         union dvm_value ignored = { 0 };
+         (void)websettings_init(vm, v.l, NULL, 0, &ignored);
+         (void)dvm_set_field(vm, self, "settings",
+                             "Landroid/webkit/WebSettings;", v);
+      }
+   }
+   RETL(v.l);
+}
+
+static bool webview_set_client(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   union dvm_value v = { .l = ARG(0).l };
+   (void)dvm_set_field(vm, self, "client",
+                       "Landroid/webkit/WebViewClient;", v);
+   RETV();
+}
+
+static bool webview_set_chrome(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   union dvm_value v = { .l = ARG(0).l };
+   (void)dvm_set_field(vm, self, "chromeClient",
+                       "Landroid/webkit/WebChromeClient;", v);
+   RETV();
+}
+
+static void webview_call_client(struct dvm *vm, dvm_ref wv, const char *name,
+                                const char *sig, union dvm_value *args, int nargs)
+{
+   union dvm_value client = { 0 };
+   (void)dvm_get_field(vm, wv, "client",
+                       "Landroid/webkit/WebViewClient;", &client);
+   if (!client.l) return;
+   struct dvm_class *lc = dvm_object_class(vm, client.l);
+   struct dvm_method *m = lc ? dvm_find_method(vm, lc, name, sig) : NULL;
+   if (!m) return;
+   union dvm_value ignored = { 0 };
+   (void)dvm_call(vm, m, client.l, args, nargs, &ignored);
+}
+
+static void webview_finish(struct dvm *vm, dvm_ref wv, dvm_ref url)
+{
+   if (url) {
+      union dvm_value v = { .l = url };
+      (void)dvm_set_field(vm, wv, "url", "Ljava/lang/String;", v);
+   }
+   union dvm_value started[3] = {
+      { .l = wv }, { .l = url }, { .l = 0 }
+   };
+   webview_call_client(vm, wv, "onPageStarted",
+                       "(Landroid/webkit/WebView;Ljava/lang/String;"
+                       "Landroid/graphics/Bitmap;)V",
+                       started, 3);
+   union dvm_value finished[2] = { { .l = wv }, { .l = url } };
+   webview_call_client(vm, wv, "onPageFinished",
+                       "(Landroid/webkit/WebView;Ljava/lang/String;)V",
+                       finished, 2);
+   fprintf(stderr, "[webview] onPageFinished url=%s\n",
+           url ? dvm_string_utf8(vm, url) : "(null)");
+}
+
+static bool webview_load_url(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   dvm_ref url = ARG(0).l;
+   fprintf(stderr, "[webview] loadUrl %s\n",
+           url ? dvm_string_utf8(vm, url) : "(null)");
+   /* The document load itself is the platform's job.  Fetching here would
+    * re-enter the interpreter lock from a nested HTTP wait; the client only
+    * needs the finished signal, which Chromium also delivers for about:blank
+    * and for error pages. */
+   webview_finish(vm, self, url);
+   RETV();
+}
+
+static bool webview_load_data(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   /* loadData(data, mime, encoding) / loadDataWithBaseURL(base, data, …).
+    * ARG(0) is the base URL when five args are present. */
+   dvm_ref url = nargs >= 5 ? ARG(0).l : 0;
+   if (!url) url = dvm_new_string(vm, "about:blank");
+   fprintf(stderr, "[webview] loadData base=%s\n",
+           url ? dvm_string_utf8(vm, url) : "(null)");
+   webview_finish(vm, self, url);
+   RETV();
+}
+
+static bool webview_add_js_iface(struct dvm *vm, dvm_ref self,
+                                 const union dvm_value *args, int nargs,
+                                 union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   /* (Object, String) — keep the object so evaluateJavascript / JS bridges
+    * can find it later.  Stored under the name the page will use. */
+   union dvm_value map = { 0 };
+   (void)dvm_get_field(vm, self, "jsInterfaces", "Ljava/util/Map;", &map);
+   if (!map.l) {
+      struct dvm_class *c = dvm__class_by_desc(vm, "Ljava/util/HashMap;");
+      map.l = c ? dvm_new_object(vm, c) : 0;
+      union dvm_value ignored = { 0 };
+      if (map.l) {
+         (void)map_init(vm, map.l, NULL, 0, &ignored);
+         (void)dvm_set_field(vm, self, "jsInterfaces", "Ljava/util/Map;", map);
+      }
+   }
+   if (map.l && nargs >= 2) {
+      union dvm_value put[2] = { { .l = ARG(1).l }, { .l = ARG(0).l } };
+      union dvm_value ignored = { 0 };
+      (void)map_put(vm, map.l, put, 2, &ignored);
+   }
+   RETV();
+}
+
+static bool webview_eval_js(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)self; (void)out;
+   /* evaluateJavascript(script, ValueCallback<String>).  No engine: answer
+    * null the way Chromium does for a void expression. */
+   if (nargs >= 2 && ARG(1).l) {
+      struct dvm_class *lc = dvm_object_class(vm, ARG(1).l);
+      struct dvm_method *m = lc
+         ? dvm_find_method(vm, lc, "onReceiveValue", "(Ljava/lang/Object;)V")
+         : NULL;
+      if (m) {
+         union dvm_value a = { .l = dvm_new_string(vm, "null") }, ignored = { 0 };
+         (void)dvm_call(vm, m, ARG(1).l, &a, 1, &ignored);
+      }
+   }
+   RETV();
+}
+
+static bool webview_get_url(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "url", "Ljava/lang/String;", &v);
+   RETL(v.l);
+}
+
+static const struct rt_field rt_webview_fields[] = {
+   { "settings", "Landroid/webkit/WebSettings;" },
+   { "client", "Landroid/webkit/WebViewClient;" },
+   { "chromeClient", "Landroid/webkit/WebChromeClient;" },
+   { "url", "Ljava/lang/String;" },
+   { "jsInterfaces", "Ljava/util/Map;" },
+   F_END,
+};
+
+static const struct rt_method rt_webview[] = {
+   M("<init>", "(Landroid/content/Context;)V", webview_init),
+   M("<init>", "(Landroid/content/Context;Landroid/util/AttributeSet;)V",
+     webview_init),
+   M("<init>", "(Landroid/content/Context;Landroid/util/AttributeSet;I)V",
+     webview_init),
+   M("getSettings", "()Landroid/webkit/WebSettings;", webview_get_settings),
+   M("setWebViewClient", "(Landroid/webkit/WebViewClient;)V",
+     webview_set_client),
+   M("setWebChromeClient", "(Landroid/webkit/WebChromeClient;)V",
+     webview_set_chrome),
+   M("loadUrl", "(Ljava/lang/String;)V", webview_load_url),
+   M("loadUrl", "(Ljava/lang/String;Ljava/util/Map;)V", webview_load_url),
+   M("loadData",
+     "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+     webview_load_data),
+   M("loadDataWithBaseURL",
+     "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;"
+     "Ljava/lang/String;Ljava/lang/String;)V",
+     webview_load_data),
+   M("stopLoading", "()V", nop_void),
+   M("reload", "()V", nop_void),
+   M("goBack", "()V", nop_void),
+   M("goForward", "()V", nop_void),
+   M("canGoBack", "()Z", ret_false),
+   M("canGoForward", "()Z", ret_false),
+   M("clearCache", "(Z)V", nop_void),
+   M("clearHistory", "()V", nop_void),
+   M("clearFormData", "()V", nop_void),
+   M("onPause", "()V", nop_void),
+   M("onResume", "()V", nop_void),
+   M("destroy", "()V", nop_void),
+   M("getUrl", "()Ljava/lang/String;", webview_get_url),
+   M("getTitle", "()Ljava/lang/String;", webview_get_url),
+   M("addJavascriptInterface",
+     "(Ljava/lang/Object;Ljava/lang/String;)V", webview_add_js_iface),
+   M("removeJavascriptInterface", "(Ljava/lang/String;)V", nop_void),
+   M("evaluateJavascript",
+     "(Ljava/lang/String;Landroid/webkit/ValueCallback;)V", webview_eval_js),
+   M("setDownloadListener", "(Landroid/webkit/DownloadListener;)V", nop_void),
+   M("setVerticalScrollBarEnabled", "(Z)V", nop_void),
+   M("setHorizontalScrollBarEnabled", "(Z)V", nop_void),
+   M("requestFocus", "(ILandroid/graphics/Rect;)Z", ret_true),
+   M("setOverScrollMode", "(I)V", nop_void),
+   M_END,
+};
+
+/* WebViewClient / WebChromeClient base classes — empty methods the app
+ * subclasses override.  find_method walks to the subclass implementation. */
+static const struct rt_method rt_webview_client[] = {
+   M("<init>", "()V", empty_void),
+   M("onPageStarted",
+     "(Landroid/webkit/WebView;Ljava/lang/String;Landroid/graphics/Bitmap;)V",
+     empty_void),
+   M("onPageFinished", "(Landroid/webkit/WebView;Ljava/lang/String;)V",
+     empty_void),
+   M("onReceivedError", "(Landroid/webkit/WebView;ILjava/lang/String;"
+     "Ljava/lang/String;)V", empty_void),
+   M("shouldOverrideUrlLoading",
+     "(Landroid/webkit/WebView;Ljava/lang/String;)Z", ret_false),
+   M("shouldOverrideUrlLoading",
+     "(Landroid/webkit/WebView;Landroid/webkit/WebResourceRequest;)Z",
+     ret_false),
+   M_END,
+};
+
+static const struct rt_method rt_webchrome_client[] = {
+   M("<init>", "()V", empty_void),
+   M("onProgressChanged", "(Landroid/webkit/WebView;I)V", empty_void),
+   M("onReceivedTitle", "(Landroid/webkit/WebView;Ljava/lang/String;)V",
+     empty_void),
+   M_END,
+};
 
 static bool view_getContext(struct dvm *vm, dvm_ref self,
                             const union dvm_value *args, int nargs,
@@ -32306,6 +33076,14 @@ static const struct rt_field rt_view_fields[] = {
    { "backgroundColor", "I" }, { "backgroundResource", "I" },
    { "cornerRadius", "I" },
    { "centerInParent", "I" }, { "alignParentBottom", "I" },
+   { "alignParentTop", "I" }, { "alignParentRight", "I" },
+   { "alignParentLeft", "I" },
+   /* RelativeLayout align*="@id/…" — non-zero means the rule is set.  The
+    * target id is kept so a fuller solver can use it; today's emitter treats
+    * any alignTop+alignRight (or the Parent forms) as top-right placement,
+    * which is what WebViewDialog's close button declares. */
+   { "alignTop", "I" }, { "alignBottom", "I" },
+   { "alignLeft", "I" }, { "alignRight", "I" },
    { "disabled", "Z" },
    { "windowToken", "Landroid/os/IBinder;" },
    { "attachListener", "Landroid/view/View$OnAttachStateChangeListener;" },
@@ -32792,7 +33570,10 @@ static const struct rt_method rt_view[] = {
    M("getPaddingTop", "()I", view_get_padding_top),
    M("getPaddingRight", "()I", view_get_padding_right),
    M("getPaddingBottom", "()I", view_get_padding_bottom),
+   M("setPadding", "(IIII)V", view_set_padding),
    M("setPaddingRelative", "(IIII)V", view_set_padding),
+   M("setElevation", "(F)V", nop_void),
+   M("setClipToOutline", "(Z)V", nop_void),
    M("isLaidOut", "()Z", ret_true),
    M("requestLayout", "()V", view_request_layout),
    M("getWidth", "()I", view_get_width),
@@ -32814,8 +33595,12 @@ static const struct rt_method rt_view[] = {
    M("setAccessibilityDelegate", "(Landroid/view/View$AccessibilityDelegate;)V", nop_void),
    SM("generateViewId", "()I", view_generate_id),
    M("setHorizontalScrollBarEnabled", "(Z)V", nop_void),
+   M("setScrollBarStyle", "(I)V", nop_void),
+   M("setScrollbarFadingEnabled", "(Z)V", nop_void),
    M("getBackground", "()Landroid/graphics/drawable/Drawable;", view_get_background),
    M("setBackground", "(Landroid/graphics/drawable/Drawable;)V", view_set_background),
+   M("setBackgroundDrawable", "(Landroid/graphics/drawable/Drawable;)V",
+     view_set_background),
    M("setBackgroundColor", "(I)V", view_set_background_color),
    M("setBackgroundResource", "(I)V", view_set_background_resource),
    M("postInvalidateOnAnimation", "()V", nop_void),
@@ -33485,11 +34270,59 @@ static const struct rt_method rt_drawable[] = {
    M("setVisible", "(ZZ)Z", drawable_set_visible),
    M("setCallback", "(Landroid/graphics/drawable/Drawable$Callback;)V",
      drawable_set_callback),
+   M("invalidateSelf", "()V", nop_void),
    M_END,
 };
 
 static const struct rt_method rt_gradient_drawable[] = {
    M("setColor", "(I)V", gradient_set_color), M_END,
+};
+
+static const struct rt_field rt_progress_bar_fields[] = {
+   { "indeterminateDrawable", "Landroid/graphics/drawable/Drawable;" },
+   { "progressDrawable", "Landroid/graphics/drawable/Drawable;" },
+   F_END
+};
+
+/* A framework ProgressBar created with the normal Android theme owns a real
+ * indeterminate drawable.  SDK loading dialogs commonly fetch it only to tint
+ * it; returning null here aborts the surrounding login flow with an NPE.
+ * Lazily materialising the base Drawable models the themed default while also
+ * preserving a drawable installed later through setIndeterminateDrawable(). */
+static bool progress_bar_get_indeterminate_drawable(
+   struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+   union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value drawable = { 0 };
+   (void)dvm_get_field(vm, self, "indeterminateDrawable",
+                       "Landroid/graphics/drawable/Drawable;", &drawable);
+   if (!drawable.l) {
+      struct dvm_class *c =
+         dvm__class_by_desc(vm, "Landroid/graphics/drawable/Drawable;");
+      drawable.l = c ? dvm_new_object(vm, c) : 0;
+      (void)dvm_set_field(vm, self, "indeterminateDrawable",
+                          "Landroid/graphics/drawable/Drawable;", drawable);
+   }
+   RETL(drawable.l);
+}
+
+static bool progress_bar_set_indeterminate_drawable(
+   struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+   union dvm_value *out)
+{
+   union dvm_value drawable = { .l = nargs ? ARG(0).l : 0 };
+   (void)dvm_set_field(vm, self, "indeterminateDrawable",
+                       "Landroid/graphics/drawable/Drawable;", drawable);
+   RETV();
+}
+
+static const struct rt_method rt_progress_bar[] = {
+   M("getIndeterminateDrawable", "()Landroid/graphics/drawable/Drawable;",
+     progress_bar_get_indeterminate_drawable),
+   M("setIndeterminateDrawable", "(Landroid/graphics/drawable/Drawable;)V",
+     progress_bar_set_indeterminate_drawable),
+   M_END,
 };
 
 static bool res_getString(struct dvm *vm, dvm_ref self,
@@ -34519,8 +35352,7 @@ static bool context_get_package_resource_path(struct dvm *vm, dvm_ref self,
    /* The APK the package was installed from — UE passes it to the engine so
     * the engine can open the expansion that lives inside it.  Same answer the
     * JNI side gives, so both views of the package agree. */
-   const char *apk = lunaria_apk_mount_path();
-   RETL(dvm_new_string(vm, apk && *apk ? apk : ""));
+   RETL(dvm_new_string(vm, lunaria_android_apk_path()));
 }
 
 /* The process Application.  ActivityThread builds exactly one per process and
@@ -34551,13 +35383,53 @@ static bool context_get_application_context(struct dvm *vm, dvm_ref self,
    RETL(self);
 }
 
+static bool context_get_application_info(struct dvm *vm, dvm_ref self,
+                                         const union dvm_value *args, int nargs,
+                                         union dvm_value *out)
+{
+   (void)self; (void)args; (void)nargs;
+   /* Android hands back the very object PackageManager holds for this
+    * package, so Context.getApplicationInfo() and
+    * PackageManager.getApplicationInfo(getPackageName(), 0) describe the same
+    * install down to every field.  Building a second, thinner object here
+    * left sourceDir, publicSourceDir, dataDir, nativeLibraryDir and flags
+    * null while PackageManager filled them — and a native SDK that reads
+    * sourceDir off this object (NMSS greps `pm list packages -f` for it)
+    * then searched for an empty path. */
+   struct lunaria_android_package record;
+   if (lunaria_android_package_find(getenv("ANDROID_PACKAGE_NAME"), &record)) {
+      dvm_ref pi = pm_package_info(vm, &record);
+      union dvm_value v = { 0 };
+      if (pi && dvm_get_field(vm, pi, "applicationInfo",
+                              "Landroid/content/pm/ApplicationInfo;", &v)
+          && v.l)
+         RETL(v.l);
+   }
+   struct dvm_class *ac = dvm__class_by_desc(vm,
+      "Landroid/content/pm/ApplicationInfo;");
+   dvm_ref ai = ac ? dvm_new_object(vm, ac) : 0;
+   if (!ai) RETL(0);
+   union dvm_value v = { .l = dvm_new_string(vm,
+      getenv("ANDROID_PACKAGE_NAME") ?: "") };
+   (void)dvm_set_field(vm, ai, "packageName", "Ljava/lang/String;", v);
+   v.i = arm_exec_guest_uid();
+   (void)dvm_set_field(vm, ai, "uid", "I", v);
+   v.i = lunaria_app_target_sdk();
+   (void)dvm_set_field(vm, ai, "targetSdkVersion", "I", v);
+   RETL(ai);
+}
+
 static bool context_get_package_name(struct dvm *vm, dvm_ref self,
                                      const union dvm_value *args, int nargs,
                                      union dvm_value *out)
 {
    (void)self; (void)args; (void)nargs;
    const char *pkg = getenv("ANDROID_PACKAGE_NAME");
-   RETL(dvm_new_string(vm, pkg && *pkg ? pkg : "com.lunaria.app"));
+   dvm_ref r = dvm_new_string(vm, pkg && *pkg ? pkg : "com.lunaria.app");
+   if (getenv("LUNARIA_DVM_TRACE"))
+      fprintf(stderr, "[dvm] Context.getPackageName: @%x \\\"%s\\\"\n", r,
+              r ? dvm_string_utf8(vm, r) : "");
+   RETL(r);
 }
 
 /* Context.checkSelfPermission / checkCallingOrSelfPermission /
@@ -34586,6 +35458,24 @@ static bool ctx_check_permission(struct dvm *vm, dvm_ref self,
    RETI(-1);
 }
 
+/* PackageManager.checkPermission(permission, packageName) first resolves the
+ * package.  A package that is not installed cannot hold a permission.  The
+ * old blanket GRANTED answer made Firebase believe the absent GmsCore package
+ * was installed, then wait 30 seconds for a TOKEN_REQUEST receiver which the
+ * same PackageManager correctly said did not exist. */
+static bool pm_check_permission(struct dvm *vm, dvm_ref self,
+                                const union dvm_value *args, int nargs,
+                                union dvm_value *out)
+{
+   (void)self;
+   if (nargs < 2) RETI(-1);
+   const char *package_name = ARG(1).l ? dvm_string_utf8(vm, ARG(1).l) : NULL;
+   const char *self_name = getenv("ANDROID_PACKAGE_NAME");
+   if (!package_name || !self_name || strcmp(package_name, self_name))
+      RETI(-1); /* PERMISSION_DENIED: package is not installed */
+   return ctx_check_permission(vm, self, args, 1, out);
+}
+
 static bool ctx_bindService(struct dvm *vm, dvm_ref self,
                             const union dvm_value *args, int nargs,
                             union dvm_value *out);
@@ -34608,6 +35498,8 @@ static const struct rt_method rt_context[] = {
    M("stopService", "(Landroid/content/Intent;)Z", ret_false),
    M("getApplicationContext", "()Landroid/content/Context;",
      context_get_application_context),
+   M("getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;",
+     context_get_application_info),
    M("getPackageName", "()Ljava/lang/String;", context_get_package_name),
    M("checkSelfPermission", "(Ljava/lang/String;)I", ctx_check_permission),
    M("checkCallingOrSelfPermission", "(Ljava/lang/String;)I",
@@ -35170,6 +36062,7 @@ static const struct rt_method rt_typed_array[] = {
    M("getInt", "(II)I", typed_array_default_int),
    M("getInteger", "(II)I", typed_array_default_int),
    M("getFloat", "(IF)F", typed_array_default_float),
+   M("getDimension", "(IF)F", typed_array_default_float),
    M("getResourceId", "(II)I", typed_array_default_int),
    M("getColor", "(II)I", typed_array_default_int),
    M("getDimensionPixelSize", "(II)I", typed_array_default_int),
@@ -35391,20 +36284,41 @@ static bool res_getConfiguration(struct dvm *vm, dvm_ref self,
                                  const union dvm_value *args, int nargs,
                                  union dvm_value *out)
 {
-   (void)self; (void)args; (void)nargs;
-   static dvm_ref configuration;
+   (void)args; (void)nargs;
+   union dvm_value stored = { 0 };
+   (void)dvm_get_field(vm, self, "configuration",
+                       "Landroid/content/res/Configuration;", &stored);
+   dvm_ref configuration = stored.l;
    if (!configuration) {
       struct dvm_class *c =
          dvm__class_by_desc(vm, "Landroid/content/res/Configuration;");
       configuration = c ? dvm_new_object(vm, c) : 0;
       if (configuration) {
          configuration_ensure_locale(vm, configuration);
+         stored.l = configuration;
+         (void)dvm_set_field(vm, self, "configuration",
+                             "Landroid/content/res/Configuration;", stored);
          dvm_pin(vm, configuration);
       }
    } else {
       configuration_ensure_locale(vm, configuration);
    }
    RETL(configuration);
+}
+
+static bool res_update_configuration(struct dvm *vm, dvm_ref self,
+                                     const union dvm_value *args, int nargs,
+                                     union dvm_value *out)
+{
+   if (nargs && ARG(0).l) {
+      union dvm_value current = { 0 };
+      (void)res_getConfiguration(vm, self, NULL, 0, &current);
+      if (current.l) {
+         union dvm_value source = { .l = ARG(0).l };
+         (void)cfg_set_to(vm, current.l, &source, 1, out);
+      }
+   }
+   RETV();
 }
 
 static bool res_getSystem(struct dvm *vm, dvm_ref self,
@@ -35446,9 +36360,15 @@ static const struct rt_method rt_resources[] = {
      res_getConfiguration),
    SM("getSystem", "()Landroid/content/res/Resources;", res_getSystem),
    M("updateConfiguration",
-     "(Landroid/content/res/Configuration;Landroid/util/DisplayMetrics;)V", nop_void),
+     "(Landroid/content/res/Configuration;Landroid/util/DisplayMetrics;)V",
+     res_update_configuration),
    M("newTheme", "()Landroid/content/res/Resources$Theme;", context_get_theme),
    M_END,
+};
+
+static const struct rt_field rt_resources_fields[] = {
+   { "configuration", "Landroid/content/res/Configuration;" },
+   F_END
 };
 
 static bool theme_apply_style(struct dvm *vm, dvm_ref self,
@@ -35882,6 +36802,19 @@ static bool color_state_default(struct dvm *vm, dvm_ref self,
    RETI(color.i);
 }
 
+/* getColorForState(int[] stateSet, int defaultColor) — return the single
+ * colour this list was built with when there is one, else the caller's
+ * default.  A full state-table walk belongs with multi-colour lists. */
+static bool color_state_for_state(struct dvm *vm, dvm_ref self,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+   union dvm_value color = { 0 };
+   (void)dvm_get_field(vm, self, "color", "I", &color);
+   if (color.i) RETI(color.i);
+   RETI(nargs > 1 ? ARG(1).i : 0);
+}
+
 static bool color_state_init(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
                              union dvm_value *out)
@@ -35929,7 +36862,9 @@ static bool color_state_value_of(struct dvm *vm, dvm_ref self,
 static const struct rt_method rt_color_state[] = {
    M("<init>", "([[I[I)V", color_state_init),
    SM("valueOf", "(I)Landroid/content/res/ColorStateList;", color_state_value_of),
-   M("getDefaultColor", "()I", color_state_default), M_END,
+   M("getDefaultColor", "()I", color_state_default),
+   M("getColorForState", "([II)I", color_state_for_state),
+   M_END,
 };
 
 static const struct rt_method rt_resources_theme[] = {
@@ -36935,6 +37870,22 @@ static void ax_apply_attribute(struct dvm *vm, dvm_ref view, const char *name,
       { ax_set_int(vm, view, "centerInParent", data ? 1 : 0); return; }
    if (!strcmp(name, "layout_alignParentBottom"))
       { ax_set_int(vm, view, "alignParentBottom", data ? 1 : 0); return; }
+   if (!strcmp(name, "layout_alignParentTop"))
+      { ax_set_int(vm, view, "alignParentTop", data ? 1 : 0); return; }
+   if (!strcmp(name, "layout_alignParentRight") ||
+       !strcmp(name, "layout_alignParentEnd"))
+      { ax_set_int(vm, view, "alignParentRight", data ? 1 : 0); return; }
+   if (!strcmp(name, "layout_alignParentLeft") ||
+       !strcmp(name, "layout_alignParentStart"))
+      { ax_set_int(vm, view, "alignParentLeft", data ? 1 : 0); return; }
+   if (!strcmp(name, "layout_alignTop"))
+      { ax_set_int(vm, view, "alignTop", (int32_t)data); return; }
+   if (!strcmp(name, "layout_alignBottom"))
+      { ax_set_int(vm, view, "alignBottom", (int32_t)data); return; }
+   if (!strcmp(name, "layout_alignLeft") || !strcmp(name, "layout_alignStart"))
+      { ax_set_int(vm, view, "alignLeft", (int32_t)data); return; }
+   if (!strcmp(name, "layout_alignRight") || !strcmp(name, "layout_alignEnd"))
+      { ax_set_int(vm, view, "alignRight", (int32_t)data); return; }
 
    /* Backgrounds arrive as a colour, a drawable reference, or a state list.
     * Only a resolved colour can be painted; the reference is kept either way
@@ -37202,6 +38153,7 @@ static const struct rt_method rt_native_activity[] = {
 #define UI_GRAVITY_CENTER_V 0x10
 /* parent_orientation values that are not a LinearLayout axis. */
 #define UI_PARENT_FRAME    (-2)   /* a FrameLayout: children overlay */
+#define UI_PARENT_RELATIVE (-3)   /* RelativeLayout: align* rules */
 #define UI_GRAVITY_LEFT     0x03
 #define UI_GRAVITY_RIGHT    0x05
 #define UI_GRAVITY_TOP      0x30
@@ -37418,16 +38370,31 @@ static void ui_emit_drawables(struct dvm *vm, struct ui_buf *css, dvm_ref view,
 {
    const char *src = ui_drawable_path(ui_int(vm, view, "imageResource"));
    if (!src) src = ui_drawable_path(ui_int(vm, view, "backgroundResource"));
-   if (!src) return;
-   /* contain, because the entry resources.arsc names is whichever density
-    * bucket this build shipped and the view was sized in dp. */
-   ui_printf(css, "background-image:url('%s');background-size:contain;"
-                  "background-repeat:no-repeat;background-position:center;",
-             src);
-   int32_t iw = 0, ih = 0;
-   if (!ui_png_size(src, &iw, &ih)) return;
-   if (lw != -1 && lw <= 0) ui_printf(css, "width:%dpx;", iw);
-   if (lh != -1 && lh <= 0) ui_printf(css, "height:%dpx;", ih);
+   if (src) {
+      /* contain, because the entry resources.arsc names is whichever density
+       * bucket this build shipped and the view was sized in dp. */
+      ui_printf(css, "background-image:url('%s');background-size:contain;"
+                     "background-repeat:no-repeat;background-position:center;",
+                src);
+      int32_t iw = 0, ih = 0;
+      if (ui_png_size(src, &iw, &ih)) {
+         if (lw != -1 && lw <= 0) ui_printf(css, "width:%dpx;", iw);
+         if (lh != -1 && lh <= 0) ui_printf(css, "height:%dpx;", ih);
+         return;
+      }
+   }
+   /* Vector / state-list drawables are not rasterised here.  An icon-only
+    * ImageView/ImageButton/Button that is wrap_content (or whose @dimen size
+    * failed to resolve) would otherwise measure to nothing and become
+    * unhittable — exactly WebViewDialog's close control, which left the
+    * modal overlay eating every touch under the character select screen.
+    * Give it a real hit target; the glyph may still be blank. */
+   if (ui_is_a(vm, view, "android/widget/ImageView") ||
+       ui_is_a(vm, view, "android/widget/ImageButton") ||
+       ui_is_a(vm, view, "android/widget/Button")) {
+      if (lw != -1 && lw <= 0) ui_puts(css, "width:48px;min-width:48px;");
+      if (lh != -1 && lh <= 0) ui_puts(css, "height:48px;min-height:48px;");
+   }
 }
 
 /* MATCH_PARENT / WRAP_CONTENT / an explicit length, as the CSS the parent's
@@ -37442,6 +38409,7 @@ static void ui_emit_length(struct ui_buf *b, const char *prop, int32_t v)
 
 static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
                          dvm_ref view, int parent_orientation, unsigned depth);
+static bool ui_is_clickable(struct dvm *vm, dvm_ref view);
 
 /* --- RecyclerView --------------------------------------------------------
  *
@@ -37653,6 +38621,7 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
     * the player looks for it. */
    bool is_frame = ui_is_a(vm, view, "android/widget/FrameLayout") ||
                    ui_is_a(vm, view, "androidx/cardview/widget/CardView");
+   bool is_relative = ui_is_a(vm, view, "android/widget/RelativeLayout");
 
    if (ui_is_recycler(vm, view)) ui_fill_recycler(vm, view);
    dvm_ref kids = ui_obj(vm, view, "children", "Ljava/util/List;");
@@ -37668,6 +38637,11 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
       ui_printf(b2, "display:flex;flex-direction:%s;",
                 orientation == 1 ? "column" : "row");
    else if (is_frame && has_children)
+      ui_puts(b2, "position:relative;");
+   else if (is_relative)
+      /* Absolute children (alignTop/Right, alignParent*) are placed against
+       * this box.  Flex-column was wrong: it stacked the close button under
+       * the WebView instead of on the corner RelativeLayout promised. */
       ui_puts(b2, "position:relative;");
    else if (is_compound)
       /* A CompoundButton is a box and a label side by side. */
@@ -37699,14 +38673,30 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
        * 100% is the parent's box and the margins are added outside it, so a
        * card with margin:57px 20px inside a full-width window hung 40px past
        * the right edge — the banner looked cut off on the right. */
-      if (lw == -1 && (ml || mr))
-         ui_printf(b2, "width:calc(100%% - %dpx);", ml + mr);
-      else
-         ui_emit_length(b2, "width", lw);
-      if (lh == -1 && (mt || mb))
-         ui_printf(b2, "height:calc(100%% - %dpx);", mt + mb);
-      else
-         ui_emit_length(b2, "height", lh);
+      /* A window's content root with MATCH_PARENT fills by inset, not by
+       * percentage: percentage height of an auto-sized parent is 0, which is
+       * how an otherwise fullscreen WebViewDialog became an invisible modal.
+       * Only the window content root uses parent_orientation == -1; Frame and
+       * Relative pass UI_PARENT_FRAME / UI_PARENT_RELATIVE and have their own
+       * placement below — matching them with "< 0" double-emitted absolute
+       * rules and left the yellow notice card at 0×0. */
+      if (parent_orientation == -1 && lw == -1 && lh == -1 &&
+          !ml && !mr && !mt && !mb) {
+         ui_puts(b2, "position:absolute;left:0;right:0;top:0;bottom:0;");
+      } else if (parent_orientation == UI_PARENT_FRAME && lw == -1 && lh == -1) {
+         /* Size comes from the FrameLayout inset placement below; emitting
+          * width/height:100% here makes luna-ui skip the left+right stretch. */
+         ;
+      } else {
+         if (lw == -1 && (ml || mr))
+            ui_printf(b2, "width:calc(100%% - %dpx);", ml + mr);
+         else
+            ui_emit_length(b2, "width", lw);
+         if (lh == -1 && (mt || mb))
+            ui_printf(b2, "height:calc(100%% - %dpx);", mt + mb);
+         else
+            ui_emit_length(b2, "height", lh);
+      }
    }
    if (ml || mt || mr || mb)
       ui_printf(b2, "margin:%dpx %dpx %dpx %dpx;", mt, mr, mb, ml);
@@ -37762,14 +38752,60 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
        * an absolute placement against it rather than an alignment along an
        * axis.  Unset gravity is top|left, as the platform documents. */
       ui_puts(b2, "position:absolute;");
-      if ((lg & UI_GRAVITY_RIGHT) == UI_GRAVITY_RIGHT) ui_puts(b2, "right:0;");
-      else if (lg & UI_GRAVITY_CENTER_H)
-         ui_puts(b2, "left:50%;transform:translateX(-50%);");
-      else ui_puts(b2, "left:0;");
-      if ((lg & UI_GRAVITY_BOTTOM) == UI_GRAVITY_BOTTOM) ui_puts(b2, "bottom:0;");
-      else if (lg & UI_GRAVITY_CENTER_V)
-         ui_puts(b2, "top:50%;transform:translateY(-50%);");
-      else ui_puts(b2, "top:0;");
+      /* MATCH_PARENT fills the frame.  Emitting only left/top (the gravity
+       * default) left width/height:100% resolving against a 0×0 absolute box
+       * in luna-ui — nested FrameLayouts in WebViewDialog measured empty, so
+       * the notice never painted and the modal still ate every touch. */
+      if (lw == -1 && lh == -1) {
+         ui_puts(b2, "left:0;right:0;top:0;bottom:0;");
+      } else {
+         if ((lg & UI_GRAVITY_RIGHT) == UI_GRAVITY_RIGHT) ui_puts(b2, "right:0;");
+         else if (lg & UI_GRAVITY_CENTER_H)
+            ui_puts(b2, "left:50%;transform:translateX(-50%);");
+         else ui_puts(b2, "left:0;");
+         if ((lg & UI_GRAVITY_BOTTOM) == UI_GRAVITY_BOTTOM) ui_puts(b2, "bottom:0;");
+         else if (lg & UI_GRAVITY_CENTER_V)
+            ui_puts(b2, "top:50%;transform:translateY(-50%);");
+         else ui_puts(b2, "top:0;");
+      }
+      /* Later siblings already paint above earlier ones in luna-ui's hit
+       * order, but a MATCH_PARENT WebView sibling is a full-screen flex
+       * child that can still steal geometry.  A clickable FrameLayout
+       * child (the dialog close button) must win the hit test. */
+      if (ui_is_clickable(vm, view))
+         ui_puts(b2, "z-index:10;");
+      else if (lw == -1 && lh == -1)
+         ui_puts(b2, "pointer-events:none;");
+   } else if (parent_orientation == UI_PARENT_RELATIVE) {
+      /* RelativeLayout align rules.  alignTop+alignRight to a MATCH_PARENT
+       * sibling (nm_webview's close button) is top-right of the parent; the
+       * Parent* forms are the same placement without a target id. */
+      bool top = ui_int(vm, view, "alignParentTop") || ui_int(vm, view, "alignTop");
+      bool bottom = ui_int(vm, view, "alignParentBottom") ||
+                    ui_int(vm, view, "alignBottom");
+      bool left = ui_int(vm, view, "alignParentLeft") || ui_int(vm, view, "alignLeft");
+      bool right = ui_int(vm, view, "alignParentRight") ||
+                   ui_int(vm, view, "alignRight");
+      if (top || bottom || left || right ||
+          (lw == -1 && lh == -1)) {
+         ui_puts(b2, "position:absolute;");
+         if (right) ui_puts(b2, "right:0;");
+         else if (left) ui_puts(b2, "left:0;");
+         else if (lw == -1) { ui_puts(b2, "left:0;right:0;"); }
+         if (bottom) ui_puts(b2, "bottom:0;");
+         else if (top) ui_puts(b2, "top:0;");
+         else if (lh == -1) { ui_puts(b2, "top:0;bottom:0;"); }
+         if (ui_is_clickable(vm, view))
+            ui_puts(b2, "z-index:10;");
+         else
+            /* On a device a non-clickable view returns false from
+             * onTouchEvent and the search continues underneath.  CSS paints
+             * later siblings on top; without this, nm_webview's empty
+             * MATCH_PARENT FrameLayout (declared after the close Button)
+             * ate every press and left the modal stuck over character
+             * select. */
+            ui_puts(b2, "pointer-events:none;");
+      }
    } else if (lg) {
       bool column = parent_orientation != 0;
       if (lg & UI_GRAVITY_CENTER_H)
@@ -37784,19 +38820,20 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
          ui_puts(b2, column ? "margin-top:auto;" : "align-self:flex-end;");
    }
 
-   /* RelativeLayout's alignParentBottom, in a container that stacks: take all
-    * the space above.  It is the rule the SDK's dialogs use to pin their
-    * action button below the list. */
-   if (ui_int(vm, view, "alignParentBottom")) ui_puts(b2, "margin-top:auto;");
+   /* RelativeLayout's alignParentBottom alone, in a non-relative parent that
+    * stacks: take all the space above.  It is the rule the SDK's dialogs use
+    * to pin their action button below the list. */
+   if (parent_orientation != UI_PARENT_RELATIVE &&
+       ui_int(vm, view, "alignParentBottom"))
+      ui_puts(b2, "margin-top:auto;");
 
    if (visibility == 4) ui_puts(b2, "visibility:hidden;");
 
    bool disabled = ui_int(vm, view, "disabled") != 0;
    if (disabled) ui_puts(b2, "opacity:0.45;");
 
-   dvm_ref listener = ui_obj(vm, view, "clickListener",
-                             "Landroid/view/View$OnClickListener;");
-   if ((listener || is_compound) && !disabled) ui_puts(b2, "cursor:pointer;");
+   if ((ui_is_clickable(vm, view) || is_compound) && !disabled)
+      ui_puts(b2, "cursor:pointer;");
    ui_puts(b2, "}");
 
    ui_printf(b, "<div id=\"v%u\" class=\"w %s\">", (unsigned)view, simple);
@@ -37819,7 +38856,10 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
       ui_puts(b, "</span>");
    }
    ui_emit_children(vm, b, css, view,
-                    is_linear ? orientation : (is_frame ? UI_PARENT_FRAME : -1),
+                    is_linear ? orientation
+                              : (is_frame ? UI_PARENT_FRAME
+                                          : (is_relative ? UI_PARENT_RELATIVE
+                                                         : -1)),
                     depth);
    ui_puts(b, "</div>");
 }
@@ -37840,9 +38880,39 @@ static dvm_ref g_ui_clicks[16];
 static int g_ui_nclicks;
 static pthread_mutex_t g_ui_click_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static bool dialog_user_cancelable(struct dvm *vm, dvm_ref dialog);
+static bool dialog_cancel(struct dvm *vm, dvm_ref self,
+                          const union dvm_value *args, int nargs,
+                          union dvm_value *out);
+
 static void ui_click_from_overlay(const char *id)
 {
-   if (!id || id[0] != 'v') return;
+   if (!id || !*id) return;
+   /* The dim behind a cancelable dialog: on a device a press outside the
+    * window cancels it when setCanceledOnTouchOutside is true.  The scrim
+    * has no view id of its own, so name it and answer it here — otherwise
+    * the overlay eats the press and the dialog never comes down. */
+   if (!strcmp(id, "scrim")) {
+      if (!g_ui_vm || g_ui_nwindows <= 0) return;
+      dvm_ref top = g_ui_windows[g_ui_nwindows - 1];
+      if (!dialog_user_cancelable(g_ui_vm, top)) {
+         fprintf(stderr, "[ui] scrim press: top window %u is not cancelable\n",
+                 (unsigned)top);
+         return;
+      }
+      union dvm_value co = { 0 };
+      (void)dvm_get_field(g_ui_vm, top, "cancelOutside", "Z", &co);
+      if (!co.i) {
+         fprintf(stderr, "[ui] scrim press: window %u rejects outside cancel\n",
+                 (unsigned)top);
+         return;
+      }
+      fprintf(stderr, "[ui] scrim press -> cancel window %u\n", (unsigned)top);
+      union dvm_value ignored = { 0 };
+      (void)dialog_cancel(g_ui_vm, top, NULL, 0, &ignored);
+      return;
+   }
+   if (id[0] != 'v') return;
    unsigned long ref = strtoul(id + 1, NULL, 10);
    if (!ref) return;
    pthread_mutex_lock(&g_ui_click_lock);
@@ -37909,10 +38979,28 @@ static void ui_emit_window_box(struct dvm *vm, struct ui_buf *css, dvm_ref windo
    int32_t y = lp ? ui_int(vm, lp, "y") : 0;
 
    ui_printf(css, "#win%u{", (unsigned)window);
-   if (w == -1) ui_puts(css, "left:0;right:0;");
-   else if (w > 0) ui_printf(css, "width:%dpx;", w);
-   if (h == -1) ui_puts(css, "top:0;bottom:0;");
-   else if (h > 0) ui_printf(css, "height:%dpx;", h);
+   /* MATCH_PARENT must establish a real box.  left/right/top/bottom alone are
+    * enough in CSS when the containing block has a size, but `.root` is also a
+    * flex column — and a flex child's `height:100%` of an inset-only parent
+    * collapses to 0 in luna-ui.  WebViewDialog's RelativeLayout is exactly
+    * that child: MATCH_PARENT on MATCH_PARENT, so the dialog painted nothing,
+    * stayed modal, and ate every touch above character select.  Pin the
+    * window with both insets and an explicit size from the surface. */
+   int sw = rt_surface_w(), sh = rt_surface_h();
+   if (w == -1) {
+      ui_puts(css, "left:0;right:0;");
+      if (sw > 0) ui_printf(css, "width:%dpx;", sw);
+      else ui_puts(css, "width:100%;");
+   } else if (w > 0) {
+      ui_printf(css, "width:%dpx;", w);
+   }
+   if (h == -1) {
+      ui_puts(css, "top:0;bottom:0;");
+      if (sh > 0) ui_printf(css, "height:%dpx;", sh);
+      else ui_puts(css, "height:100%;");
+   } else if (h > 0) {
+      ui_printf(css, "height:%dpx;", h);
+   }
 
    /* Horizontal placement, when the width did not already pin both edges. */
    if (w != -1) {
@@ -37944,8 +39032,11 @@ static const char *ui_stylesheet(void)
        * which turned a notification banner into a full-screen yellow panel
        * and pushed its close button, laid out with gravity bottom|end, into
        * the corner of the display instead of the corner of the banner. */
-      ".root{position:fixed;display:flex;flex-direction:column;"
-      "box-sizing:border-box;}"
+      /* Not a flex column: a MATCH_PARENT content root with height:100% inside
+       * a flex parent collapsed to 0 in luna-ui, which made WebViewDialog an
+       * invisible modal.  Block layout + an absolute fill on MATCH_PARENT
+       * roots (see ui_emit_view) matches how the window's own box is sized. */
+      ".root{position:fixed;box-sizing:border-box;}"
       ".w{box-sizing:border-box;}"
       ".label{flex:1 1 auto;}"
       /* The check box a CompoundButton would have drawn from its drawable. */
@@ -37973,7 +39064,7 @@ static void ui_rebuild(struct dvm *vm)
    bool dim = false;
    for (int i = 0; i < g_ui_nwindows; ++i)
       if (ui_window_dims(vm, g_ui_windows[i])) dim = true;
-   if (dim) ui_puts(&b, "<div class=\"scrim\"></div>");
+   if (dim) ui_puts(&b, "<div id=\"scrim\" class=\"scrim\"></div>");
    for (int i = 0; i < g_ui_nwindows; ++i) {
       dvm_ref content = ui_window_content(vm, g_ui_windows[i]);
       if (!content) continue;
@@ -37985,9 +39076,16 @@ static void ui_rebuild(struct dvm *vm)
    ui_puts(&b, "</body>");
    g_ui_building = false;
    if (b.p && css.p) {
-      if (getenv("LUNARIA_UI_DUMP"))
-         fprintf(stderr, "[ui] document (%zu bytes):\n%s\n[ui] style (%zu bytes):\n%s\n",
-                 b.len, b.p, css.len, css.p);
+      if (getenv("LUNARIA_UI_DUMP")) {
+         FILE *df = fopen("/tmp/lunaria-ui.html", "w");
+         if (df) {
+            fprintf(df, "<!DOCTYPE html><html><head><meta charset=utf-8>"
+                    "<style>%s</style></head>%s</html>\n", css.p, b.p);
+            fclose(df);
+            fprintf(stderr, "[ui] document dumped (%zu+%zu bytes) -> "
+                    "/tmp/lunaria-ui.html\n", b.len, css.len);
+         }
+      }
       luna_overlay_set_document(b.p, css.p);
    }
    free(b.p);
@@ -38004,7 +39102,12 @@ static bool ui_is_clickable(struct dvm *vm, dvm_ref view)
    return ui_obj(vm, view, "clickListener",
                  "Landroid/view/View$OnClickListener;") != 0 ||
           ui_int(vm, view, "clickable") != 0 ||
-          ui_is_a(vm, view, "android/widget/CompoundButton");
+          ui_is_a(vm, view, "android/widget/CompoundButton") ||
+          /* Button / ImageButton are clickable by construction on a device,
+           * even before a listener is attached.  WebViewDialog's close control
+           * is exactly that shape. */
+          ui_is_a(vm, view, "android/widget/Button") ||
+          ui_is_a(vm, view, "android/widget/ImageButton");
 }
 
 static dvm_ref ui_click_target(struct dvm *vm, dvm_ref view)
@@ -38026,9 +39129,8 @@ static void ui_dispatch_click(struct dvm *vm, dvm_ref clicked)
 {
    dvm_ref target = ui_click_target(vm, clicked);
    if (!target) {
-      if (getenv("LUNARIA_UI_DUMP"))
-         fprintf(stderr, "[ui] click on v%u: nothing clickable up the tree\n",
-                 (unsigned)clicked);
+      fprintf(stderr, "[ui] click on v%u: nothing clickable up the tree\n",
+              (unsigned)clicked);
       return;
    }
    if (ui_is_a(vm, target, "android/widget/CompoundButton")) {
@@ -39343,6 +40445,8 @@ static const struct rt_method rt_alert_dialog[] = {
    M("findViewById", "(I)Landroid/view/View;", dialog_find_view_by_id),
    M("setCancelable", "(Z)V", dialog_set_cancelable),
    M("setCanceledOnTouchOutside", "(Z)V", dialog_set_canceled_outside),
+   M("setOwnerActivity", "(Landroid/app/Activity;)V", nop_void),
+   M("getOwnerActivity", "()Landroid/app/Activity;", ret_zero),
    M("setOnDismissListener",
      "(Landroid/content/DialogInterface$OnDismissListener;)V",
      dialog_set_dismiss_listener),
@@ -44005,7 +45109,16 @@ static const struct rt_class rt_classes[] = {
      rt_cookie_manager, NULL, NULL },
    { "Landroid/webkit/URLUtil;", "Ljava/lang/Object;", rt_url_util, NULL, NULL },
    { "Landroid/webkit/WebSettings;", "Ljava/lang/Object;", rt_web_settings,
-     NULL, NULL },
+     rt_web_settings_fields, NULL },
+   { "Landroid/webkit/WebView;", "Landroid/view/ViewGroup;", rt_webview,
+     rt_webview_fields, NULL },
+   { "Landroid/webkit/WebViewClient;", "Ljava/lang/Object;",
+     rt_webview_client, NULL, NULL },
+   { "Landroid/webkit/WebChromeClient;", "Ljava/lang/Object;",
+     rt_webchrome_client, NULL, NULL },
+   { "Landroid/webkit/ValueCallback;", "Ljava/lang/Object;", NULL, NULL, NULL },
+   { "Landroid/webkit/DownloadListener;", "Ljava/lang/Object;", NULL, NULL, NULL },
+   { "Landroid/webkit/WebResourceRequest;", "Ljava/lang/Object;", NULL, NULL, NULL },
    { "Landroid/util/Base64;", "Ljava/lang/Object;", rt_base64, NULL, NULL },
    { "Ljava/util/Formatter;", "Ljava/lang/Object;", rt_formatter,
      rt_formatter_fields, NULL },
@@ -44250,6 +45363,10 @@ static const struct rt_class rt_classes[] = {
      rt_package_manager, NULL, NULL },
    { "Landroid/content/pm/PackageInfo;", "Ljava/lang/Object;", rt_package_info,
      rt_package_info_fields, NULL },
+   { "Landroid/content/pm/Signature;", "Ljava/lang/Object;", rt_signature,
+     rt_signature_fields, NULL },
+   { "Landroid/content/pm/SigningInfo;", "Ljava/lang/Object;", rt_signing_info,
+     rt_signing_info_fields, NULL },
    { "Landroid/content/pm/InstallSourceInfo;", "Ljava/lang/Object;",
      rt_install_source_info, NULL, NULL },
    { "Landroid/content/pm/ResolveInfo;", "Ljava/lang/Object;", NULL,
@@ -44371,8 +45488,8 @@ static const struct rt_class rt_classes[] = {
      NULL, NULL },
    { "Landroid/widget/ImageButton;", "Landroid/widget/ImageView;", NULL,
      NULL, NULL },
-   { "Landroid/widget/ProgressBar;", "Landroid/view/View;", rt_view,
-     NULL, NULL },
+   { "Landroid/widget/ProgressBar;", "Landroid/view/View;", rt_progress_bar,
+     rt_progress_bar_fields, NULL },
    { "Landroid/widget/Space;", "Landroid/view/View;", rt_view,
      NULL, NULL },
    { "Landroid/widget/Toast;", "Ljava/lang/Object;", rt_toast,
@@ -44394,7 +45511,8 @@ static const struct rt_class rt_classes[] = {
      rt_xml_parser_fields, NULL },
    { "Landroid/content/res/ColorStateList;", "Ljava/lang/Object;",
      rt_color_state, rt_color_state_fields, NULL },
-   { "Landroid/content/res/Resources;", "Ljava/lang/Object;", rt_resources, NULL,
+   { "Landroid/content/res/Resources;", "Ljava/lang/Object;", rt_resources,
+     rt_resources_fields,
      NULL },
    { "Landroid/content/res/Resources$Theme;", "Ljava/lang/Object;",
      rt_resources_theme, rt_theme_fields, NULL },

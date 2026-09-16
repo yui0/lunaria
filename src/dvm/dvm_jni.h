@@ -116,6 +116,10 @@ void dvm_prefs_flush(struct dvm *vm);
 /* Declared in dvm.h too; repeated here for the loader's frame pump, which
  * reaches the VM through this header. */
 void dvm_ime_frame(struct dvm *vm);
+/* One turn of the main thread's Looper — see dvm.c.  The frame pump calls it
+ * so a Handler.postDelayed() callback runs near its due time instead of
+ * waiting for the guest to call into Java. */
+void dvm_main_looper_tick(struct dvm *vm);
 
 /* The interpreter lock, for callers that cannot include dvm.h.
  *

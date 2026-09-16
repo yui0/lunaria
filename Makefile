@@ -20,6 +20,9 @@ CFLAGS ?= -g -O2 $(WARNINGS)
 CFLAGS += -std=c11
 CPPFLAGS ?= -D_FORTIFY_SOURCE=2
 CPPFLAGS += -Isrc -DANDROID_X86_LINKER # -DVERBOSE_FUNCTIONS
+# Optional host instrumentation for reproducing intermittent emulator memory
+# faults: `make -B SANITIZE=-fsanitize=address lunaria`.
+SANITIZE ?=
 # Default: x86 (32-bit). Use targets below for other ABIs.
 
 # The host operating system, one file per platform.  A build compiles exactly
@@ -163,10 +166,12 @@ macos-deps:
 # used when there is one, so this only reaches the network when it has to.
 SYSLIB_DIR    ?= syslib-arm64
 SYSLIB_LIBM   := $(SYSLIB_DIR)/libm.so
+SYSLIB_LIBC   := $(SYSLIB_DIR)/libc-pure.so
+SYSLIB_LIBZ   := $(SYSLIB_DIR)/libz.so
 BUILD_TOOLS_ZIP ?= build-tools_r34-linux.zip
 BUILD_TOOLS_URL ?= https://dl.google.com/android/repository/$(BUILD_TOOLS_ZIP)
 
-syslib: $(SYSLIB_LIBM)
+syslib: $(SYSLIB_LIBM) $(SYSLIB_LIBC) $(SYSLIB_LIBZ)
 
 $(SYSLIB_LIBM):
 	@mkdir -p $(SYSLIB_DIR)
@@ -189,6 +194,49 @@ $(SYSLIB_LIBM):
 	    unzip -p "$$tmp/bt.zip" "$$entry" > $@; \
 	    rm -rf "$$tmp"; \
 	fi; \
+	head -c 20 $@ | od -An -tu1 -j18 -N1 | grep -q 183 || \
+	    { echo "syslib: $@ is not AArch64" >&2; rm -f $@; exit 1; }
+	@echo "syslib: $@ ready"
+
+$(SYSLIB_LIBC):
+	@mkdir -p $(SYSLIB_DIR)
+	@set -e; \
+	found=""; \
+	for root in "$$LUNARIA_ANDROID_SDK" "$$ANDROID_HOME" "$$ANDROID_SDK_ROOT" /root/image/android; do \
+	    [ -n "$$root" ] || continue; \
+	    cand=`find "$$root" -path '*/renderscript/lib/intermediates/arm64-v8a/libc.so' 2>/dev/null | head -1`; \
+	    if [ -n "$$cand" ]; then found="$$cand"; break; fi; \
+	done; \
+	[ -n "$$found" ] || { echo "syslib: no executable arm64 bionic libc found" >&2; exit 1; }; \
+	echo "syslib: using $$found"; \
+	cp "$$found" $@; \
+	head -c 20 $@ | od -An -tu1 -j18 -N1 | grep -q 183 || \
+	    { echo "syslib: $@ is not AArch64" >&2; rm -f $@; exit 1; }
+	@echo "syslib: $@ ready"
+
+# NDK libz.so files are API stubs (their functions are eight-byte trap
+# veneers), not executable device implementations.  The adjacent libz.a is
+# the real Android C implementation.  Link all of it into one guest DSO so a
+# z_stream remains entirely in Android memory and inflate/crc32 do not cross
+# the emulator ABI on every input block.
+$(SYSLIB_LIBZ):
+	@mkdir -p $(SYSLIB_DIR)
+	@set -e; \
+	archive=""; compiler=""; \
+	for root in "$$LUNARIA_ANDROID_NDK" "$$ANDROID_NDK_HOME" "$$ANDROID_NDK_ROOT" \
+	            "$$ANDROID_HOME/ndk" "$$ANDROID_SDK_ROOT/ndk" /root/image/android/ndk; do \
+	    [ -n "$$root" ] || continue; \
+	    archive=`find "$$root" -path '*/sysroot/usr/lib/aarch64-linux-android/libz.a' 2>/dev/null | head -1`; \
+	    [ -n "$$archive" ] || continue; \
+	    toolroot=$${archive%%/sysroot/usr/lib/aarch64-linux-android/libz.a}; \
+	    compiler="$$toolroot/bin/aarch64-linux-android21-clang"; \
+	    [ -x "$$compiler" ] && break; \
+	    archive=""; compiler=""; \
+	done; \
+	[ -n "$$archive" ] || { echo "syslib: no Android NDK arm64 libz.a found" >&2; exit 1; }; \
+	echo "syslib: linking Android $$archive"; \
+	"$$compiler" -shared -Wl,-soname,libz.so -Wl,--whole-archive \
+	    "$$archive" -Wl,--no-whole-archive -o $@; \
 	head -c 20 $@ | od -An -tu1 -j18 -N1 | grep -q 183 || \
 	    { echo "syslib: $@ is not AArch64" >&2; rm -f $@; exit 1; }
 	@echo "syslib: $@ ready"
@@ -281,10 +329,10 @@ DVM_HDR = src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
 # layer inside the VM publishes the document, and the swap path in arm_exec
 # presents it.  Both sides then resolve to the same single instance of the
 # engine — two copies would each hold half of the state.
-runtime/libjvm.so: trace.o src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/jvm.h src/jvm/jni.h $(DVM_SRC) $(DVM_HDR) luna_overlay.o luna_boot.o luna_ime.o
+runtime/libjvm.so: trace.o src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c src/jvm/jvm.h src/jvm/jni.h $(DVM_SRC) $(DVM_HDR) luna_overlay.o luna_boot.o luna_ime.o
 	mkdir -p runtime
 	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE -Wno-pedantic $(LDFLAGS) $(HOST_SO_LDFLAGS) -shared \
-	    trace.o src/jvm/jvm.c src/jvm/jni_stubs.c $(DVM_SRC) luna_overlay.o luna_boot.o luna_ime.o \
+	    trace.o src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c $(DVM_SRC) luna_overlay.o luna_boot.o luna_ime.o \
 	    -lm $(HOST_CRYPTO_LIBS) $(HOST_ICU_LIBS) \
 	    $(HOST_GL_LIBS) $(HOST_Z_LIBS) -o $@
 
@@ -315,8 +363,9 @@ libpthread.so: runtime/libpthread.so
 	ln -sfn runtime/libpthread.so $@
 
 # arm_exec.o: compiled with C++20 and dynarmic headers; linked into lunaria
-arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/arm.h src/jvm/jvm.h src/binary128.h $(DYNARMIC_LIB)
+arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/arm.h src/jvm/jvm.h src/binary128.h src/linker64.h $(DYNARMIC_LIB)
 	$(CXX) -std=c++20 -O2 -g -fPIC \
+	    $(SANITIZE) \
 	    $(DYNARMIC_INCS) \
 	    $(CPPFLAGS) -D_GNU_SOURCE \
 	    -c src/arm_exec.cpp -o $@
@@ -326,6 +375,9 @@ arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/arm.h src/jvm/jvm.h src/binary12
 # AArch64 long double is binary128 on every host (see the file's header).
 binary128.o: src/binary128.c src/binary128.h
 	$(CC) -std=c11 -O2 -g -fPIC $(CPPFLAGS) -c src/binary128.c -o $@
+
+linker64.o: src/linker64.c src/linker64.h
+	$(CC) -std=c11 -O2 -g -fPIC $(CPPFLAGS) -D_GNU_SOURCE -c src/linker64.c -o $@
 
 # arm.o: code common to the ARM32 and ARM64 execution paths, C11.  Currently
 # the ARM execution lock; anything else neither path owns alone belongs here
@@ -374,7 +426,7 @@ lunaria_os.o: $(LUNA_OS_SRC) src/lunaria_os.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 	    -c $(LUNA_OS_SRC) -o $@
 
-lunaria: loader.o arm_exec.o binary128.o arm.o trace.o stb_vorbis.o $(LUNA_OS_OBJ) libdl.so libpthread.so \
+lunaria: loader.o arm_exec.o binary128.o linker64.o arm.o trace.o stb_vorbis.o $(LUNA_OS_OBJ) libdl.so libpthread.so \
        runtime/libpthread.so $(HOST_BIONIC_LIBC) \
        runtime/libandroid.so runtime/liblog.so \
        runtime/libEGL.so runtime/libOpenSLES.so \
@@ -382,8 +434,9 @@ lunaria: loader.o arm_exec.o binary128.o arm.o trace.o stb_vorbis.o $(LUNA_OS_OB
        runtime/libmediandk.so runtime/libGLESv3.so
 lunaria: runtime/libvulkan.so
 	$(CXX) -std=c++20 -O2 -g $(HOST_EXPORT) \
+	    $(SANITIZE) \
 	    $(LUNARIA_LIBDIRS) $(HOST_RPATH) $(LDFLAGS) \
-	    loader.o arm_exec.o binary128.o arm.o trace.o stb_vorbis.o $(LUNA_OS_OBJ) \
+	    loader.o arm_exec.o binary128.o linker64.o arm.o trace.o stb_vorbis.o $(LUNA_OS_OBJ) \
 	    $(DYNARMIC_LIBS) \
 	    $(HOST_DL_LIBS) -lpthread -ljvm \
 	    $(HOST_WINDOW_LIBS) $(HOST_GL_LIBS) $(HOST_Z_LIBS) $(HOST_CRYPTO_LIBS) \
@@ -514,6 +567,43 @@ test/libschedtest64.so: test/sched_test.c
 	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) \
 	    -Wl,-soname,libschedtest64.so -o $@ $<
 
+test/libfdcallback.so: test/fd_callback_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
+	    -Wl,-soname,libfdcallback.so -o $@ $<
+
+test/libthreadstart.so: test/thread_start_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
+	    -Wl,-soname,libthreadstart.so -o $@ $<
+
+test/libatforktest.so: test/atfork_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
+	    -Wl,-soname,libatforktest.so -o $@ $<
+
+atfork-test: lunaria test/libatforktest.so
+	@timeout -k 2s 12s env LUNARIA_A64_ENGINES=4 \
+	    LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" \
+	    ./lunaria test/libatforktest.so > .atfork.out 2>&1; \
+	grep 'atfork' .atfork.out; \
+	grep -q 'parent .*RESULT PASS' .atfork.out && \
+	grep -q 'child .*RESULT PASS' .atfork.out && ! grep -q 'RESULT FAIL' .atfork.out
+
+# pthread_create must make the new thread runnable now, not at the next frame:
+# a guest that starts a worker and times its answer (an anti-tamper module
+# does exactly that) reads a late start as a failed check.
+thread-start-test: lunaria test/libthreadstart.so
+	@timeout -k 2s 30s env LUNARIA_A64_ENGINES=4 \
+	    LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" \
+	    ./lunaria test/libthreadstart.so > .threadstart.out 2>&1; \
+	grep 'threadstart' .threadstart.out; \
+	grep -q 'RESULT PASS' .threadstart.out && ! grep -q 'RESULT FAIL' .threadstart.out
+
+fd-callback-test: lunaria test/libfdcallback.so
+	@timeout -k 2s 12s env LUNARIA_A64_ENGINES=1 \
+	    LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" \
+	    ./lunaria test/libfdcallback.so > .fdcallback.out 2>&1; \
+	grep 'fdcallback' .fdcallback.out; \
+	grep -q 'RESULT PASS' .fdcallback.out && ! grep -q 'RESULT FAIL' .fdcallback.out
+
 # Scheduler hand-off: a thread parked on a mutex must be woken by the release,
 # not by whether a scheduler pass happens to sample the lock while it is free.
 # armeabi-v7a is not covered — see the comment in test/sched_test.c.
@@ -562,6 +652,14 @@ DYNARMIC_FMT_LIB = $(DYNARMIC_BUILD)/externals/fmt/libfmt.a
 DYNARMIC_MCL_LIB = $(DYNARMIC_BUILD)/externals/mcl/src/libmcl.a
 DYNARMIC_ZYD_LIB = $(DYNARMIC_BUILD)/externals/zydis/libZydis.a
 DYNARMIC_ZYC_LIB = $(DYNARMIC_BUILD)/externals/zydis/zycore/libZycore.a
+# CMake owns the individual object graph, but make still has to know when to
+# invoke CMake.  Depending only on an already-existing archive made edits to
+# Dynarmic source silently leave Lunaria linked against yesterday's code.
+# Keep generated build/ files out of this list; only inputs may trigger it.
+DYNARMIC_SOURCES := $(shell find $(DYNARMIC_DIR)/src \
+	$(DYNARMIC_DIR)/externals/mcl/include \
+	$(DYNARMIC_DIR)/externals/mcl/src \
+	-type f \( -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \) 2>/dev/null)
 
 DYNARMIC_INCS = \
 	-I$(DYNARMIC_DIR)/src \
@@ -582,7 +680,7 @@ DYNARMIC_LIBS = \
 	$(DYNARMIC_ZYD_LIB) $(DYNARMIC_ZYC_LIB)
 endif
 
-$(DYNARMIC_LIB):
+$(DYNARMIC_LIB): $(DYNARMIC_SOURCES) $(DYNARMIC_DIR)/CMakeLists.txt
 	$(CMAKE) -B $(DYNARMIC_BUILD) -S $(DYNARMIC_DIR) \
 	    -DDYNARMIC_WARNINGS_AS_ERRORS=OFF \
 	    -DDYNARMIC_TESTS=OFF \
@@ -692,6 +790,7 @@ fetch: fetch-libunity fetch-btw fetch-blade-soul fetch-openh264
 
 .PHONY: all syslib syslib-clean host-all macos-deps x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
 	        clean install install-bin install-lib test net-test dvm-test regex-test abi-test \
-	        posix-test boot-card-test binary128-test \
+	        posix-test boot-card-test binary128-test fd-callback-test \
+	        thread-start-test \
         fetch fetch-libunity fetch-btw fetch-blade-soul fetch-openh264 \
         dynarmic-build

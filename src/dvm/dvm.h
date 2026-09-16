@@ -176,6 +176,7 @@ dvm_ref dvm_new_array(struct dvm *vm, char elem, const char *elem_desc, uint32_t
 
 struct dvm_class *dvm_object_class(struct dvm *vm, dvm_ref ref);
 const char *dvm_string_utf8(struct dvm *vm, dvm_ref ref);
+uint32_t dvm_string_utf8_length(struct dvm *vm, dvm_ref ref);
 uint32_t dvm_array_length(struct dvm *vm, dvm_ref ref);
 void *dvm_array_data(struct dvm *vm, dvm_ref ref);
 
@@ -214,6 +215,10 @@ void dvm_prefs_flush(struct dvm *vm);
  * connected View, and a pending layout pass runs.  Called from the frame pump
  * without the interpreter lock. */
 void dvm_ime_frame(struct dvm *vm);
+/* One turn of the main thread's Looper — see dvm.c.  The frame pump calls it
+ * so a Handler.postDelayed() callback runs near its due time instead of
+ * waiting for the guest to call into Java. */
+void dvm_main_looper_tick(struct dvm *vm);
 
 /* Caps runaway bytecode (a spin loop in Java would otherwise hang the pump
  * loop, which is cooperative).  0 disables.  Default 200M. */
@@ -311,6 +316,11 @@ void dvm_gil_notify_one_for(uintptr_t channel);
  * without one to hand (the frame pump, the guest scheduler).  NULL before
  * dvm_create(). */
 struct dvm *dvm_current(void);
+
+/* Populate PackageInfo.signatures/signingInfo from the certificate carried by
+ * the installed APK.  This is shared by the bytecode PackageManager paths in
+ * dvm_runtime.c and dvm_jni.c. */
+bool dvm_package_info_add_signatures(struct dvm *vm, dvm_ref package_info);
 
 /* True on a host thread started for bytecode, false on the one that drives the
  * frame pump and the guest CPU.  A wait on the latter has to stay short. */

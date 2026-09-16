@@ -197,13 +197,18 @@ void MachHandler::RemoveCodeBlock(u64 rip) {
 }
 
 std::mutex handler_lock;
-std::optional<MachHandler> mach_handler;
+/* The Mach exception server owns a detached receive thread and is installed
+ * on the process task.  Its lifetime is therefore the process lifetime, not
+ * C++ static-object lifetime.  Destroying an optional<MachHandler> during
+ * static teardown deallocated the port and object while the detached thread
+ * was still executing MessagePump() through `this`, producing use-after-free
+ * failures in libc++ synchronization during otherwise clean shutdown. */
+MachHandler* mach_handler = nullptr;
 
 void RegisterHandler() {
     std::lock_guard<std::mutex> guard(handler_lock);
-    if (!mach_handler) {
-        mach_handler.emplace();
-    }
+    if (!mach_handler)
+        mach_handler = new MachHandler();
 }
 
 }  // anonymous namespace

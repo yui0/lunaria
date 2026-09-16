@@ -1,0 +1,122 @@
+# lunaria.conf — settings that belong to this installation rather than to one
+# run.  Copy to `lunaria.conf` in the directory you start the launcher from --
+# that one place, and no other -- and edit.  `NAME=value`, `#` comments; only
+# LUNARIA_* names are read.  A variable already set in the environment wins, so
+#     LUNARIA_DEVICE=pixel7 ./lunaria-apk.sh game.apk
+# still overrides the file for that one run.
+
+# ---------------------------------------------------------------------------
+# Which device the emulator reports itself as.
+#
+# ro.product.model, ro.product.device, ro.board.platform, ro.hardware, the
+# build id and the fingerprint all have to describe one machine that was
+# actually built, and the platform level has to be one that machine shipped
+# with.  Each profile below is a real retail device, copied out of its getprop;
+# selecting one sets all of those together, including Build.VERSION.SDK_INT.
+#
+#   pixel6     Google Pixel 6      (gs101,      Android 12)   <- default
+#   pixel7     Google Pixel 7      (gs201,      Android 13)
+#   galaxys21  Samsung SM-G991B    (exynos2100, Android 12)
+#   lunaria    the emulator's own identity — names no device that exists
+#
+#LUNARIA_DEVICE=pixel6
+
+# Individual fields, if you need a device that is not in the table.  Anything
+# left unset keeps the selected profile's value; the build id, Build.DISPLAY
+# and the fingerprint are assembled from whatever these finally say, so they
+# cannot end up disagreeing with each other.
+#LUNARIA_DEVICE_MANUFACTURER=Google
+#LUNARIA_DEVICE_BRAND=google
+#LUNARIA_DEVICE_MODEL=Pixel 6
+#LUNARIA_DEVICE_NAME=oriole
+#LUNARIA_DEVICE_DEVICE=oriole
+#LUNARIA_DEVICE_BOARD=oriole
+#LUNARIA_DEVICE_PLATFORM=gs101
+#LUNARIA_DEVICE_HARDWARE=oriole
+#LUNARIA_DEVICE_BUILD_ID=SQ3A.220705.003.A1
+#LUNARIA_DEVICE_INCREMENTAL=8672226
+#LUNARIA_DEVICE_SECURITY_PATCH=2022-07-05
+
+# The platform level.  Unset, it is the one the chosen device shipped with.
+#LUNARIA_SDK_INT=31
+
+# ---------------------------------------------------------------------------
+# Where the guest's own files live (its /data and /storage).  Unset, it is the
+# directory the launcher was started from.
+#
+# Set it, and keep it set: this is the one thing the launcher cannot recreate.
+# Cross Worlds downloads 13.7 GB into it on first run, and a later run pointed
+# somewhere else does not find any of that -- it downloads the lot again.  It
+# also wants a path whose components are ASCII, because a guest that mishandles
+# one then fails for a reason that has nothing to do with the guest.
+#LUNARIA_DATA_ROOT=/var/lunaria
+
+# ---------------------------------------------------------------------------
+# The screen.
+#
+# With neither LUNARIA_SCALE nor a LUNARIA_DEVICE_SCREEN_* override set, the
+# surface defaults to 1024x768 @ 320 dpi (768x1024 in portrait) -- a size an
+# operator can actually use on a desktop, at a density that keeps dp layout
+# correct (512x384 dp, Android's "normal" screen-size bucket).
+#
+# Naming LUNARIA_SCALE switches to scaling the selected device's own panel
+# (Pixel 6: 1080x2400 at 420 dpi) instead, the way `wm size` and `wm density`
+# do on a device: the app's android:screenOrientation decides which way up it
+# is, and the pixels and the density scale together so dp-based layout still
+# comes out right.
+#
+#   0.3   three tenths of the device's screen  (720x324 @ 126dpi landscape)
+#   0.5   half the device's screen
+#   1     the panel at its true size
+#
+#LUNARIA_SCALE=0.3
+
+# An exact surface instead of the default or a fraction of the device's.
+# These are pixels only; the density has its own setting below, so asking for
+# a window size does not silently restate what kind of screen this is.
+#LUNARIA_WIDTH=1024
+#LUNARIA_HEIGHT=768
+#LUNARIA_DPI=420
+
+# A panel that is not the selected device's (portrait, short side first).
+#LUNARIA_DEVICE_SCREEN_WIDTH=1080
+#LUNARIA_DEVICE_SCREEN_HEIGHT=2400
+#LUNARIA_DEVICE_SCREEN_DENSITY=420
+
+# Execution engines for the A64 scheduler.
+#LUNARIA_A64_ENGINES=4
+
+# ---------------------------------------------------------------------------
+# The installed-package ledger this device reports.
+#
+# PackageManager (getInstalledPackages / getPackageInfo) and the device shell's
+# `pm list packages` both answer from it, so they can never disagree.  A device
+# has never had an empty one: an app that targets API 30+ sees itself, whatever
+# its <queries> names, and the force-queryable set -- which on a Google device
+# includes the Play Store and Play services.  Reporting only the caller (which
+# every enumerating loop skips) is what makes Play Core answer
+# PLAY_STORE_NOT_FOUND and a security SDK call the environment unsupported.
+#
+#   default   the built-in ledger for a Pixel-class Google device  <- default
+#   none      only the running app (no device is like this; bisect only)
+#   <path>    a ledger file of your own
+#
+#LUNARIA_PACKAGES=default
+
+# A ledger file, and this setting, are lines of
+#
+#     <package> [uid] [flags] [sourceDir]
+#
+# with `#` comments.  flags is a comma-separated subset of
+#   system      ApplicationInfo.FLAG_SYSTEM
+#   queryable   <application android:forceQueryable="true"> -- visible to any
+#               app with no <queries> entry and no QUERY_ALL_PACKAGES
+#   updated     FLAG_UPDATED_SYSTEM_APP
+# Everything after the package name may be left off, so a bare name is an
+# ordinary installed app.  Separate several with ',' or ';'.  Each entry's
+# sourceDir is created on the guest filesystem as an empty (but well-formed)
+# zip, because `pm list packages -f` prints that path and an app may open it.
+#
+#LUNARIA_PACKAGES_EXTRA=com.facebook.katana;com.instagram.android
+
+# LUNARIA_TRACE_PM=1 prints the ledger as it was built.

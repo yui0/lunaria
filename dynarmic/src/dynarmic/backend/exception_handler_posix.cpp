@@ -190,6 +190,37 @@ void SigHandler::SigAction(int sig, siginfo_t* info, void* raw_context) {
     }
 
     fmt::print(stderr, "Unhandled {} at rip {:#018x}\n", sig == SIGSEGV ? "SIGSEGV" : "SIGBUS", CTX_RIP);
+#    if defined(__linux__)
+    /* backtrace() is not signal-safe and, when RIP itself was loaded from a
+     * corrupted return/call target, has faulted recursively before printing
+     * even one useful frame.  Preserve the kernel-provided machine state
+     * first.  These are scalar reads from ucontext, so this remains useful
+     * even when the host stack cannot be unwound. */
+    fmt::print(stderr,
+               "Host registers: rsp={:#018x} rbp={:#018x} "
+               "rax={:#018x} rbx={:#018x} rcx={:#018x} rdx={:#018x}\n"
+               "                rsi={:#018x} rdi={:#018x} "
+               "r8={:#018x} r9={:#018x} r10={:#018x} r11={:#018x}\n"
+               "                r12={:#018x} r13={:#018x} "
+               "r14={:#018x} r15={:#018x}\n",
+               static_cast<u64>(mctx.gregs[REG_RSP]),
+               static_cast<u64>(mctx.gregs[REG_RBP]),
+               static_cast<u64>(mctx.gregs[REG_RAX]),
+               static_cast<u64>(mctx.gregs[REG_RBX]),
+               static_cast<u64>(mctx.gregs[REG_RCX]),
+               static_cast<u64>(mctx.gregs[REG_RDX]),
+               static_cast<u64>(mctx.gregs[REG_RSI]),
+               static_cast<u64>(mctx.gregs[REG_RDI]),
+               static_cast<u64>(mctx.gregs[REG_R8]),
+               static_cast<u64>(mctx.gregs[REG_R9]),
+               static_cast<u64>(mctx.gregs[REG_R10]),
+               static_cast<u64>(mctx.gregs[REG_R11]),
+               static_cast<u64>(mctx.gregs[REG_R12]),
+               static_cast<u64>(mctx.gregs[REG_R13]),
+               static_cast<u64>(mctx.gregs[REG_R14]),
+               static_cast<u64>(mctx.gregs[REG_R15]));
+    std::fflush(stderr);
+#    endif
 
 #elif defined(MCL_ARCHITECTURE_ARM64)
 

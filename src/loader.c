@@ -178,7 +178,13 @@ static void a64_preload_needed(const char *path, const char *dir,
          int found = 0;
          if (sys) {
             char cand[PATH_MAX];
-            if ((size_t)snprintf(cand, sizeof cand, "%s/%s", sys, needed[i])
+            /* libc is process state, not merely a code DSO.  The copy in the
+             * syslib directory is loaded separately below as a deliberately
+             * filtered pure-code image.  Loading it here would run bionic's
+             * constructors and split pthread/allocator/errno ownership
+             * between bionic and Lunaria's Android ABI implementation. */
+            if (strcmp(needed[i], "libc.so") != 0 &&
+                (size_t)snprintf(cand, sizeof cand, "%s/%s", sys, needed[i])
                 < sizeof cand &&
                 stat(cand, &st) == 0 && arm64_elf_is_arm64(cand)) {
                printf("preloading arm64 platform library: %s\n", cand);
@@ -207,7 +213,8 @@ static void a64_preload_needed(const char *path, const char *dir,
  * frame every run, so a fixed script either fires too early or not at all.
  *
  * This is the same injection path, driven from outside instead: a FIFO whose
- * lines are "x,y" or "x,y,hold" in guest framebuffer coordinates.  Reads are
+ * lines are "x,y" or "x,y,hold", the coordinates being percentages of the
+ * framebuffer by default (see touch_parse_coord below).  Reads are
  * non-blocking and happen once per pump frame, so an empty FIFO costs one
  * read(2) that returns EAGAIN.  Held taps finish on a later frame, which is
  * what a guest expects — a DOWN and an UP in the same frame is not a tap.
@@ -219,12 +226,68 @@ static int g_tf_fd = -2;
 static char g_tf_buf[256];
 static size_t g_tf_len;
 
+/* One coordinate of a tap, for every LUNARIA_TOUCH_* spelling.
+ *
+ * A percentage of the framebuffer is the default reading of a bare number.
+ * The window size is a launch option here (LUNARIA_WIDTH / LUNARIA_HEIGHT)
+ * and a device property everywhere else, but a game's layout is the same
+ * layout at every size: "50,92" presses the button at the bottom middle on
+ * any screen, while the pixel pair that hit it at 1280x720 presses empty
+ * background at 1920x1080.  Coordinates written down once and replayed
+ * against a differently-sized run were exactly the trap the Cross Worlds
+ * notes record ("the old 512,505 now lands on Sign in with X").
+ *
+ * "50%" says the same thing explicitly.  An exact guest pixel is still
+ * reachable as "640px" -- needed when a coordinate came from a screenshot
+ * or a guest-side dump rather than from looking at the layout.
+ *
+ * Returns 0 and leaves *out untouched when the text is not a coordinate.
+ * *end, when given, receives the first character not consumed.
+ */
+static int touch_parse_coord(const char *s, int extent, float *out,
+                             const char **end)
+{
+   char *stop = NULL;
+   double v;
+   if (!s) return 0;
+   while (*s == ' ' || *s == '\t') ++s;
+   v = strtod(s, &stop);
+   if (stop == s) return 0;
+   while (*stop == ' ' || *stop == '\t') ++stop;
+   if (stop[0] == 'p' && stop[1] == 'x') {
+      stop += 2;                      /* guest pixels, verbatim */
+   } else {
+      if (stop[0] == '%') ++stop;     /* "50%" and "50" mean the same thing */
+      v = v * (double)extent / 100.0;
+   }
+   if (v < 0.0) return 0;
+   if (extent > 0 && v > (double)(extent - 1)) v = (double)(extent - 1);
+   *out = (float)v;
+   if (end) *end = stop;
+   return 1;
+}
+
+/* "x,y" in either spelling, as one pair. */
+static int touch_parse_xy(const char *s, float *x, float *y, const char **end)
+{
+   const char *p = NULL;
+   const int w = arm_exec_fb_width(), h = arm_exec_fb_height();
+   if (!touch_parse_coord(s, w, x, &p)) return 0;
+   while (*p == ' ' || *p == '\t') ++p;
+   if (*p != ',') return 0;
+   if (!touch_parse_coord(p + 1, h, y, &p)) return 0;
+   if (end) *end = p;
+   return 1;
+}
+
 static void touch_fifo_line(const char *line, int frame_count)
 {
    float x = -1, y = -1;
    int hold = 6;
-   if (sscanf(line, "%f,%f,%d", &x, &y, &hold) < 2) return;
-   if (x < 0 || y < 0) return;
+   const char *rest = NULL;
+   if (!touch_parse_xy(line, &x, &y, &rest)) return;
+   while (*rest == ' ' || *rest == '\t') ++rest;
+   if (*rest == ',') hold = atoi(rest + 1);
    if (hold < 1) hold = 1;
    arm_exec_touch_push(0, x, y);
    fprintf(stderr, "[loader] TOUCH_FIFO DOWN (%.0f,%.0f) frame %d hold=%d\n",
@@ -270,7 +333,9 @@ static void touch_fifo_tick(int frame_count)
                     path, strerror(errno));
          else
             fprintf(stderr, "[loader] TOUCH_FIFO listening on %s "
-                    "(echo 'x,y[,hold]' > %s)\n", path, path);
+                    "(echo 'x,y[,hold]' > %s; x and y are percentages of "
+                    "the %dx%d framebuffer unless written as '640px')\n",
+                    path, path, arm_exec_fb_width(), arm_exec_fb_height());
       }
    }
    if (g_tf_fd < 0) return;
@@ -313,7 +378,7 @@ static void touch_test_tick(int frame_count)
       const char *tt = getenv("LUNARIA_TOUCH_TEST");
       for (const char *p = tt; p && *p && tt_n < TT_MAX; ) {
          float x = -1, y = -1;
-         if (sscanf(p, "%f,%f", &x, &y) == 2 && x >= 0 && y >= 0) {
+         if (touch_parse_xy(p, &x, &y, NULL)) {
             tt_x[tt_n] = x; tt_y[tt_n] = y; ++tt_n;
          }
          const char *semi = strchr(p, ';');
@@ -525,6 +590,31 @@ static void svc_dump_handler(int sig) {
         arm64_exec_svc_ring_dump();
     else
         arm_exec_svc_ring_dump();
+}
+
+/* A signal handler cannot safely walk the scheduler, allocate C++ containers
+ * or print the resulting thread dump.  In particular, firing SIGALRM during
+ * UE startup used to stop every guest thread at the 30 second mark while the
+ * diagnostic traversed mutable state.  Keep the historical alarm available
+ * for explicit debugging, but never inject it into a normal Android run.
+ * The normal-runtime diagnostic is /tmp/lunaria-threads, consumed by
+ * thread_dump_request_tick() above. */
+static void schedule_unsafe_alarm_dump(void)
+{
+   const char *value = getenv("LUNARIA_UNSAFE_ALARM_DUMP_S");
+   char *end = NULL;
+   long seconds;
+
+   if (!value || !*value) return;
+   errno = 0;
+   seconds = strtol(value, &end, 10);
+   if (errno || end == value || *end || seconds <= 0 || seconds > UINT_MAX) {
+      fprintf(stderr, "[loader] ignoring invalid "
+              "LUNARIA_UNSAFE_ALARM_DUMP_S=%s\n", value);
+      return;
+   }
+   signal(SIGALRM, svc_dump_handler);
+   alarm((unsigned int)seconds);
 }
 
 /* libmono.so @ 0x20000000: mono_defaults struct and key fields */
@@ -1137,62 +1227,6 @@ static void
 pump_run_frame(void (*run_threads)(void))
 {
    static uint64_t budget_us = 0;
-   static uint64_t va_get_clock = 0;
-   static uint64_t va_tick_fetch = 0;
-   static uint64_t va_tick_render = 0;
-   static uint64_t va_tick_pre_engine = 0;
-   static uint64_t va_tick_post_engine = 0;
-   static uint64_t va_tick_input = 0;
-   static uint64_t va_tick_output = 0;
-   static int ue_media_tick_dbg = 0;
-   static int ue_media_tick_inited = 0;
-   static int ue_media_tick_use_a64 = 0;
-
-   if (!ue_media_tick_inited) {
-      /* UE4 video playback uses FMediaClock/FJavaAndroidMediaPlayer to
-       * eventually call MediaPlayer14.updateVideoFrame/getVideoLastFrame.
-       * On Lunaria bring-up the media clock path can miss frames, leaving
-       * the movie texture white. Tick the clock explicitly to re-enter the
-       * native->JNI->SurfaceTexture consumer pipeline. */
-      ue_media_tick_dbg = getenv("LUNARIA_TRACE_MEDIA") ? 1 : 0;
-
-      /* Resolve for the currently active guest arch. */
-      va_get_clock   = arm_exec_lookup_export("_ZN12FMediaModule8GetClockEv");
-      va_tick_fetch  = arm_exec_lookup_export("_ZN11FMediaClock9TickFetchEv");
-      va_tick_render = arm_exec_lookup_export("_ZN11FMediaClock10TickRenderEv");
-      va_tick_pre_engine =
-         arm_exec_lookup_export("_ZN12FMediaModule13TickPreEngineEv");
-      va_tick_post_engine =
-         arm_exec_lookup_export("_ZN12FMediaModule14TickPostEngineEv");
-      va_tick_input = arm_exec_lookup_export("_ZN11FMediaClock9TickInputEv");
-      va_tick_output = arm_exec_lookup_export("_ZN11FMediaClock10TickOutputEv");
-
-      if (!va_get_clock && !va_tick_fetch && !va_tick_render &&
-          !va_tick_pre_engine && !va_tick_post_engine &&
-          !va_tick_input && !va_tick_output) {
-         /* arm64: arm_exec_lookup_export reads the 32-bit dynsym only. */
-         va_get_clock   = arm64_exec_lookup_export("_ZN12FMediaModule8GetClockEv");
-         va_tick_fetch  = arm64_exec_lookup_export("_ZN11FMediaClock9TickFetchEv");
-         va_tick_render = arm64_exec_lookup_export("_ZN11FMediaClock10TickRenderEv");
-         va_tick_pre_engine =
-            arm64_exec_lookup_export("_ZN12FMediaModule13TickPreEngineEv");
-         va_tick_post_engine =
-            arm64_exec_lookup_export("_ZN12FMediaModule14TickPostEngineEv");
-         va_tick_input = arm64_exec_lookup_export("_ZN11FMediaClock9TickInputEv");
-         va_tick_output = arm64_exec_lookup_export("_ZN11FMediaClock10TickOutputEv");
-         ue_media_tick_use_a64 = 1;
-      }
-
-      ue_media_tick_inited = 1;
-      if (ue_media_tick_dbg) {
-         fprintf(stderr,
-                 "[media] UE clock symbols: getClock=0x%llx tickFetch=0x%llx tickRender=0x%llx (a64=%d)\n",
-                 (unsigned long long)va_get_clock,
-                 (unsigned long long)va_tick_fetch,
-                 (unsigned long long)va_tick_render,
-                 ue_media_tick_use_a64);
-      }
-   }
    if (!budget_us) {
       const char *e = getenv("LUNARIA_FRAME_US");
       long v = (e && *e) ? atol(e) : 16000;
@@ -1218,6 +1252,11 @@ pump_run_frame(void (*run_threads)(void))
    const uint64_t t_media = frame_now_ns();
    {
       struct dvm *vm = dvm_jni_vm();
+      /* The main thread's Looper.  A device runs it every turn of the main
+       * loop, so a Handler.postDelayed() callback lands near its due time;
+       * without this it only ran when the guest itself called into Java, which
+       * left armed callbacks seconds late (see dvm_main_looper_tick). */
+      if (vm) dvm_main_looper_tick(vm);
       if (vm) dvm_media_pump_active(vm);
       /* Preferences an apply() left pending: on a device the framework writes
        * them behind the caller's back, and this is that writer. */
@@ -1227,50 +1266,6 @@ pump_run_frame(void (*run_threads)(void))
        * not depend on the guest doing anything. */
       if (vm) dvm_ime_frame(vm);
 
-      /* Drive UE's media clock even when the guest happens to be waiting
-       * on other task graph work; this is the root of "updateVideoFrame
-       * isn't called during playback". */
-      if (va_get_clock) {
-         uint64_t clk = ue_media_tick_use_a64
-            ? (uint64_t)arm64_exec_call(va_get_clock, 0, 0, 0, 0)
-            : (uint64_t)arm_exec_call((uint32_t)va_get_clock, 0, 0, 0, 0);
-
-         if (clk) {
-            /* Also tick the media module stage that usually prepares clocks
-             * and sinks; on Lunaria the engine's pre-engine stage can miss
-             * the media task graph. */
-            if (va_tick_pre_engine) {
-               if (ue_media_tick_use_a64)
-                  (void)arm64_exec_call(va_tick_pre_engine, 0, 0, 0, 0);
-               else
-                  (void)arm_exec_call((uint32_t)va_tick_pre_engine, 0, 0, 0, 0);
-            }
-            if (va_tick_post_engine) {
-               if (ue_media_tick_use_a64)
-                  (void)arm64_exec_call(va_tick_post_engine, 0, 0, 0, 0);
-               else
-                  (void)arm_exec_call((uint32_t)va_tick_post_engine, 0, 0, 0, 0);
-            }
-         }
-
-         if (clk) {
-            if (ue_media_tick_use_a64) {
-               if (va_tick_input)  (void)arm64_exec_call(va_tick_input, clk, 0, 0, 0);
-               if (va_tick_fetch)  (void)arm64_exec_call(va_tick_fetch, clk, 0, 0, 0);
-               if (va_tick_output) (void)arm64_exec_call(va_tick_output, clk, 0, 0, 0);
-               if (va_tick_render) (void)arm64_exec_call(va_tick_render, clk, 0, 0, 0);
-            } else {
-               if (va_tick_input)  (void)arm_exec_call((uint32_t)va_tick_input, (uint32_t)clk, 0, 0, 0);
-               if (va_tick_fetch)  (void)arm_exec_call((uint32_t)va_tick_fetch, (uint32_t)clk, 0, 0, 0);
-               if (va_tick_output) (void)arm_exec_call((uint32_t)va_tick_output, (uint32_t)clk, 0, 0, 0);
-               if (va_tick_render) (void)arm_exec_call((uint32_t)va_tick_render, (uint32_t)clk, 0, 0, 0);
-            }
-         } else if (ue_media_tick_dbg) {
-            fprintf(stderr, "[media] UE clock pointer is 0\n");
-            /* Disable printing after first failure. */
-            ue_media_tick_dbg = 0;
-         }
-      }
    }
    frame_stage_add(FRAME_STAGE_MEDIA, t_media);
 }
@@ -1390,12 +1385,23 @@ run_ue4_game_arm(struct jvm *jvm)
    if (va_set_ver) {
       /* (env, thiz, AndroidVersion, TargetSDKversion, PhoneMake, PhoneModel,
        *  PhoneBuildNumber, OSLanguage) */
-      jobject s_rel   = jvm->native.NewStringUTF(&jvm->env, "12");
-      jobject s_make  = jvm->native.NewStringUTF(&jvm->env, "Lunaria");
-      jobject s_model = jvm->native.NewStringUTF(&jvm->env, "Lunaria Emulator");
-      jobject s_build = jvm->native.NewStringUTF(&jvm->env, "lunaria-1");
+      /* UE asks for the same facts android.os.Build reports, so they come
+       * from the same table.  Hardcoding a second set here was the defect the
+       * property table's own comment warns about: the engine told the game
+       * "Lunaria Emulator / Android 12" while Build told it whatever the
+       * device profile said, and a guest that asks both ways has to get one
+       * answer. */
+      jobject s_rel   = jvm->native.NewStringUTF(&jvm->env,
+                           lunaria_android_release());
+      jobject s_make  = jvm->native.NewStringUTF(&jvm->env,
+                           lunaria_android_property("ro.product.manufacturer"));
+      jobject s_model = jvm->native.NewStringUTF(&jvm->env,
+                           lunaria_android_property("ro.product.model"));
+      jobject s_build = jvm->native.NewStringUTF(&jvm->env,
+                           lunaria_android_property("ro.build.display.id"));
       jobject s_lang  = jvm->native.NewStringUTF(&jvm->env, "en");
-      uint32_t a[8] = { env, ctx, (uint32_t)(uintptr_t)s_rel, 31u,
+      uint32_t a[8] = { env, ctx, (uint32_t)(uintptr_t)s_rel,
+                        (uint32_t)lunaria_sdk_int(),
                         (uint32_t)(uintptr_t)s_make, (uint32_t)(uintptr_t)s_model,
                         (uint32_t)(uintptr_t)s_build, (uint32_t)(uintptr_t)s_lang };
       fprintf(stderr, "[loader] UE4 nativeSetAndroidVersionInformation\n");
@@ -1515,8 +1521,7 @@ run_ue4_game_arm(struct jvm *jvm)
    }
 
    signal(SIGUSR1, svc_dump_handler);
-   signal(SIGALRM, svc_dump_handler);
-   alarm(30);
+   schedule_unsafe_alarm_dump();
 
    int max_frames = 0;
    {
@@ -1855,13 +1860,17 @@ run_ue4_game_arm64(struct jvm *jvm)
       for (int i = 0; i < np; ++i) if (types[i] == 'L') ++nstr;
       uint64_t strs[5];
       int k = 0;
-      strs[k++] = (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env, "12");
-      strs[k++] = (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env, "Lunaria");
-      strs[k++] = (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env, "Lunaria Emulator");
+      strs[k++] = (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env,
+                     lunaria_android_release());
+      strs[k++] = (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env,
+                     lunaria_android_property("ro.product.manufacturer"));
+      strs[k++] = (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env,
+                     lunaria_android_property("ro.product.model"));
       if (nstr >= 5) /* PhoneBuildNumber only in the longer form */
-         strs[k++] = (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env, "lunaria-1");
+         strs[k++] = (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env,
+                        lunaria_android_property("ro.build.display.id"));
       strs[k++] = (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env, "en");
-      uint64_t ints[1] = { 31u }; /* TargetSDKversion, matches Build.VERSION */
+      uint64_t ints[1] = { (uint64_t)lunaria_sdk_int() }; /* matches Build.VERSION */
       uint64_t a[16];
       int na = ue_build_startup_args("nativeSetAndroidVersionInformation", types, np,
                                      env, ctx, strs, k, ints, 1, 0, a,
@@ -2014,8 +2023,7 @@ run_ue4_game_arm64(struct jvm *jvm)
 
    g_dump_arm64 = 1;
    signal(SIGUSR1, svc_dump_handler);
-   signal(SIGALRM, svc_dump_handler);
-   alarm(30);
+   schedule_unsafe_alarm_dump();
 
    int max_frames = 0;
    { const char *mf = getenv("LUNARIA_MAX_FRAMES"); if (mf && *mf) max_frames = atoi(mf); }
@@ -2192,8 +2200,7 @@ run_unity_game_arm64(struct jvm *jvm, jobject existing_context,
    fprintf(stderr, "[loader] arm64 entering Unity render loop\n");
    g_dump_arm64 = 1;
    signal(SIGUSR1, svc_dump_handler);
-   signal(SIGALRM, svc_dump_handler);
-   alarm(30);
+   schedule_unsafe_alarm_dump();
 
    int frame_count = 0, fail_streak = 0, last_ok = -1, resized_after_init = 0;
    int max_frames = 0;
@@ -2705,9 +2712,7 @@ run_jni_game_arm(struct jvm *jvm)
    fprintf(stderr, "[loader] entering render loop\n");
    /* SIGUSR1: dump SVC ring buffer on demand (kill -USR1 <pid>) */
    signal(SIGUSR1, svc_dump_handler);
-   /* SIGALRM: auto-dump after 15s to diagnose first-frame hang */
-   signal(SIGALRM, svc_dump_handler);
-   alarm(15);
+   schedule_unsafe_alarm_dump();
 
    /* 注意: nativeDone() はここでは呼ばない。Unity 5+ では nativeDone() は
     * UnityPlayer.destroy() からの終了処理であり、レンダーループ前に呼ぶと
@@ -2958,10 +2963,45 @@ main(int argc, const char *argv[])
          char *slash = strrchr(dir, '/');
          if (slash) *(slash + 1) = '\0'; else dir[0] = '\0';
 
-         /* libc++_shared.so first */
+         /* Map Android libc's code image only as a pure-code provider.  A
+          * process libc is not an ordinary dlopen dependency: bionic's linker
+          * bootstraps its main-thread TLS, auxv, allocator and libc globals as
+          * one operation before running application constructors.  Running
+          * libc.so's constructors here without that bootstrap produced a
+          * half-initialised libc (Cross Worlds reached a NULL JavaVM call in
+          * UE's fourth constructor).  arm_exec therefore exposes only the
+          * audited stateless routines from this image until that process
+          * bootstrap exists. */
+         {
+            const char *sys = a64_syslib_dir();
+            int have_pure = 0;
+            if (sys) {
+               if ((size_t)snprintf(libpath, sizeof libpath,
+                                    "%s/libc-pure.so", sys) < sizeof libpath &&
+                   stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath))
+                  have_pure = 1;
+               else if ((size_t)snprintf(libpath, sizeof libpath,
+                                         "%s/libc.so", sys) < sizeof libpath &&
+                        stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath))
+                  have_pure = 1; /* legacy syslib layout */
+            }
+            if (have_pure) {
+               printf("preloading arm64 pure-code library: %s\n", libpath);
+               arm64_exec_load_library(libpath, 0);
+            }
+         }
+
+         /* Relocate dependencies before their consumer, as the Android
+          * dynamic linker does.  Loading libc++ directly used to bind its
+          * pthread imports to emulator SVC thunks because the platform libc
+          * had not entered the ELF global scope yet.  Later DSOs then bound
+          * the same names to bionic, producing two incompatible pthread
+          * implementations in one process. */
          snprintf(libpath, sizeof(libpath), "%s%s", dir, "libc++_shared.so");
          if (stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
-            printf("preloading arm64 libc++_shared: %s\n", libpath);
+            a64_preload_needed(libpath, dir, dep_seen, &dep_seen_n);
+            printf("preloading arm64 libc++_shared after dependencies: %s\n",
+                   libpath);
             arm64_exec_load_library(libpath, 0);
          }
          /* Unity IL2CPP + Frame Pacing (must precede libunity PLT bind) */

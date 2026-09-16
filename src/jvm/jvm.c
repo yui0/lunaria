@@ -1509,7 +1509,7 @@ jvm_report_field_access(JNIEnv *env, jobject object, jfieldID field, const char 
 // N == Property method type convention (Long, Float, StaticLong, StaticFloat, etc...)
 // T == C type of return value
 // D == Default return value
-#define gen_jnienv_property_call(N, T, D, ST) \
+#define gen_jnienv_property_call(N, T, D, ST, VMFIRST) \
    static T \
    JNIEnv_Get##N##Field(JNIEnv *p0, jclass p1, jfieldID method) { \
       jvm_report_field_access(p0, p1, method, "Get" #N "Field"); \
@@ -1524,13 +1524,37 @@ jvm_report_field_access(JNIEnv *env, jobject object, jfieldID field, const char 
                                "field access on a null reference"); \
          return (D); \
       } \
+      uint64_t bits = 0; T value = (D); \
+      /* Static and instance fields both live in the bytecode VM when the dex \
+       * defines the class; only the accessor differs. \
+       * \
+       * For a reference field (VMFIRST) this object's own value is asked \
+       * first, because on Android a field read answers for the object it is \
+       * read from.  A stub accessor below is written per class, not per \
+       * object, so consulting it first made every ApplicationInfo in the \
+       * process describe the running package: getInstalledPackages() handed \
+       * back packages that all claimed the caller's packageName, sourceDir \
+       * and uid.  The stub stays as the answer for objects the emulator \
+       * fabricates and stores no field for (a bare AllocObject), which is \
+       * why an unset reference falls through to it rather than reading back \
+       * as null. \
+       * \
+       * Primitive fields keep the stub first.  Those stubs are the device \
+       * state this emulator is currently in -- Configuration, \
+       * DisplayMetrics, MediaCodec.BufferInfo -- and a VM copy of them is a \
+       * stale snapshot, not a second opinion. */ \
+      if ((VMFIRST) && \
+          ((ST) ? dvm_jni_static_field(p0, (jclass)p1, method, false, &bits) \
+                : dvm_jni_field(p0, (jobject)p1, method, false, &bits)) && \
+          bits) { \
+         memcpy(&value, &bits, sizeof(value)); \
+         return value; \
+      } \
       union { T (*fun)(JNIEnv*, jobject); void *ptr; } f; \
       f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), (jmethodID)method); \
       if (f.ptr) return f.fun(p0, p1); \
-      uint64_t bits = 0; T value = (D); \
-      /* Static and instance fields both live in the bytecode VM when the dex \
-       * defines the class; only the accessor differs. */ \
-      if (((ST) ? dvm_jni_static_field(p0, (jclass)p1, method, false, &bits) \
+      if (!(VMFIRST) && \
+          ((ST) ? dvm_jni_static_field(p0, (jclass)p1, method, false, &bits) \
                 : dvm_jni_field(p0, (jobject)p1, method, false, &bits))) { \
          memcpy(&value, &bits, sizeof(value)); \
          return value; \
@@ -1561,19 +1585,19 @@ jvm_report_field_access(JNIEnv *env, jobject object, jfieldID field, const char 
 
 // N == Property type name
 // T == C type of return value
-#define gen_jnienv_property(N, T, D) \
-   gen_jnienv_property_call(N, T, D, 0) \
-   gen_jnienv_property_call(Static##N, T, D, 1)
+#define gen_jnienv_property(N, T, D, VMFIRST) \
+   gen_jnienv_property_call(N, T, D, 0, VMFIRST) \
+   gen_jnienv_property_call(Static##N, T, D, 1, VMFIRST)
 
-gen_jnienv_property(Object, jobject, NULL/*method*/)
-gen_jnienv_property(Boolean, jboolean, false)
-gen_jnienv_property(Byte, jbyte, 0)
-gen_jnienv_property(Char, jchar, 0)
-gen_jnienv_property(Short, jshort, 0)
-gen_jnienv_property(Int, jint, 0)
-gen_jnienv_property(Long, jlong, 0)
-gen_jnienv_property(Float, jfloat, 0)
-gen_jnienv_property(Double, jdouble, 0)
+gen_jnienv_property(Object, jobject, NULL/*method*/, 1)
+gen_jnienv_property(Boolean, jboolean, false, 0)
+gen_jnienv_property(Byte, jbyte, 0, 0)
+gen_jnienv_property(Char, jchar, 0, 0)
+gen_jnienv_property(Short, jshort, 0, 0)
+gen_jnienv_property(Int, jint, 0, 0)
+gen_jnienv_property(Long, jlong, 0, 0)
+gen_jnienv_property(Float, jfloat, 0, 0)
+gen_jnienv_property(Double, jdouble, 0, 0)
 
 static jmethodID
 jvm_make_method(struct jvm *jvm, jclass klass, const char *name, const char *sig)

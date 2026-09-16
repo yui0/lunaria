@@ -332,6 +332,12 @@ const char *dvm_string_utf8(struct dvm *vm, dvm_ref ref)
    return (o && o->kind == DVM_OBJ_STRING) ? o->utf8 : NULL;
 }
 
+uint32_t dvm_string_utf8_length(struct dvm *vm, dvm_ref ref)
+{
+   struct dvm_object *o = dvm__obj(vm, ref);
+   return (o && o->kind == DVM_OBJ_STRING) ? o->utf8_len : 0;
+}
+
 uint32_t dvm_array_length(struct dvm *vm, dvm_ref ref)
 {
    struct dvm_object *o = dvm__obj(vm, ref);
@@ -369,7 +375,11 @@ uint32_t dvm_external_handle(struct dvm *vm, dvm_ref ref)
 /* --- interning ---------------------------------------------------------- */
 
 struct dvm_intern {
-   char *key;
+   /* Points at the pinned String object's immutable utf8 storage.  Keeping a
+    * second strdup here served no ownership purpose and, worse, its unchecked
+    * allocation failure published a NULL key: the next intern operation then
+    * crashed the host in strcmp(). */
+   const char *key;
    dvm_ref ref;
 };
 
@@ -390,7 +400,13 @@ dvm_ref dvm__intern(struct dvm *vm, const char *utf8)
       vm->interns = n;
       vm->interns_cap = cap;
    }
-   vm->interns[vm->ninterns].key = strdup(utf8);
+   /* r was pinned above, so its backing object and utf8 allocation live until
+    * dvm_destroy().  Use that storage as the table key: Java intern strings
+    * are immutable, and one allocation per value is both sufficient and the
+    * only failure-atomic representation. */
+   const char *key = dvm_string_utf8(vm, r);
+   if (!key) return r; /* defensive: never publish a NULL comparison key */
+   vm->interns[vm->ninterns].key = key;
    vm->interns[vm->ninterns].ref = r;
    ++vm->ninterns;
    return r;
@@ -2043,6 +2059,23 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
    memset(out, 0, sizeof *out);
    if (!m) return true;
 
+   /* The return slot is defined before the callee runs.
+    *
+    * Dalvik's result register always holds a value: a void method leaves it
+    * zero, and a method returning int leaves the upper half of the wide view
+    * zero rather than whatever was there.  Here it is a `union dvm_value ret`
+    * declared on the interpreter's own stack at every call site, and the
+    * builtin path writes only as many bytes as the return type has -- RETI
+    * writes four, RETV writes none -- so without this the caller's
+    * `fr->result` carries the bytes that happened to be in that stack slot.
+    * move-result truncates and hides it; anything that reads the wide value,
+    * or a builtin that returns nothing at all, does not.  That is how a 400
+    * from getResponseCode() reached Volley as 0xb021_0000_0190.
+    *
+    * dvm__call_out() already did this for the calls that leave the VM; doing
+    * it here covers every callee kind at the one point they share. */
+   memset(out, 0, sizeof *out);
+
    if (vm->depth >= DVM_MAX_FRAMES) {
       dvm__throw(vm, "java/lang/StackOverflowError", "%d frames", vm->depth);
       return false;
@@ -2187,6 +2220,24 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
        * nothing but frames, registers and dex mappings are live, and none of
        * those move when another thread allocates. */
       if ((vm->steps & (DVM_GIL_YIELD_STEPS - 1)) == 0) dvm_gil_yield(vm);
+      /* And the *execution* lock with it, more often.
+       *
+       * Java reached from guest native code (dvm_jni_invoke) runs with the ARM
+       * execution lock still held, because the SVC handler that called in is
+       * holding it.  Every guest thread in the process is therefore stopped
+       * for as long as that Java call runs -- measured on Cross Worlds: a
+       * single JNI call into the security module's Java side held it for
+       * 1037 ms, and the main-Looper tick that the frame pump drives (and
+       * with it that module's own heartbeat callback) came 691 ms late.  On a
+       * device a JNI transition stops nothing.
+       *
+       * Lock order here is interpreter-outside, execution-inside, so giving
+       * the inner lock back while holding the outer one is the safe
+       * direction, and the top of the dispatch loop is the same safe point
+       * the GIL yield above uses.  arm_lock_yield() is one relaxed load when
+       * nobody is waiting, which is why this can afford the shorter
+       * interval. */
+      if ((vm->steps & (DVM_AEL_YIELD_STEPS - 1)) == 0) arm_lock_yield();
       if (vm->step_limit && ++vm->call_steps > vm->step_limit) {
          fprintf(stderr, "[dvm] step limit reached in %s.%s — aborting the call "
                  "(%llu steps, depth=%d, limit=%llu); call stack:\n",
@@ -3305,6 +3356,10 @@ bool dvm__sched_trace_for(const char *class_name)
  * that starts another into unbounded recursion.  A blocking wait is the
  * opposite case — the work it waits for is in this very queue, so refusing to
  * nest makes the wait unsatisfiable by construction. */
+/* How late a due Runnable may run before it is worth reporting.  Two frames:
+ * below that it is indistinguishable from a device's own scheduling jitter. */
+#define DVM_LOOPER_LATE_MS 32u
+
 static int drain_pending(struct dvm *vm, bool nested)
 {
    if (!vm->npending) return 0;
@@ -3354,6 +3409,7 @@ static int drain_pending(struct dvm *vm, bool nested)
 
       dvm_ref entry = vm->pending_threads[pick];
       bool entry_is_thread = vm->pending_is_thread[pick];
+      const uint64_t entry_due = vm->pending_due_ms[pick];
       for (int i = pick; i + 1 < vm->npending; ++i) {
          vm->pending_threads[i] = vm->pending_threads[i + 1];
          vm->pending_is_thread[i] = vm->pending_is_thread[i + 1];
@@ -3370,6 +3426,28 @@ static int drain_pending(struct dvm *vm, bool nested)
          const int i = 0;
          struct dvm_class *c = dvm_object_class(vm, list[i]);
          struct dvm_method *run = c ? dvm_find_method(vm, c, "run", "()V") : NULL;
+         /* How late this looper is.
+          *
+          * A Handler.postDelayed() callback is a deadline the app may be
+          * relying on, not a hint.  Cross Worlds' anti-tamper module arms one
+          * (NmssSa.TDThreadWait -> Handler(mainLooper).postDelayed(->
+          * nmssNativeSignalToTDThread, ms)) and its native side treats a
+          * signal that does not arrive before its own timer expires as the app
+          * having been frozen.  On a device the main looper is a thread of its
+          * own and fires within a millisecond or two of the due time; here the
+          * queue is drained once per pump frame and only when the guest is
+          * between slices, so a long stretch of native code makes every armed
+          * callback late.  That lateness is invisible unless it is measured,
+          * and it is the difference between an emulator that a timing check
+          * accepts and one it does not. */
+         if (entry_due && now > entry_due + DVM_LOOPER_LATE_MS) {
+            static int late_warned;
+            if (late_warned++ < 64 || dvm__sched_trace())
+               fprintf(stderr, "[sched] %s.run() ran %llu ms after its due "
+                       "time (main-looper callback)\n",
+                       run && run->cls ? run->cls->name : "?",
+                       (unsigned long long)(now - entry_due));
+         }
          if (run && (run->has_code || run->builtin)) {
             union dvm_value ret;
             uint64_t before = vm->steps;
@@ -3469,6 +3547,31 @@ void dvm__run_pending_threads(struct dvm *vm)
    if (vm->drain_depth == 0) dvm__ui_tick(vm);
 }
 int dvm__drain_for_wait(struct dvm *vm) { return drain_pending(vm, true); }
+
+/* One turn of the main thread's Looper, for the frame pump to call.
+ *
+ * On a device the main thread sits in Looper.loop(): a Handler callback whose
+ * delay has elapsed runs within a millisecond or two of its due time, whatever
+ * the game's own threads are doing.  Here the queue was drained only where a
+ * dvm_call happened to unwind to depth 0 — that is, only when the *guest*
+ * called into Java of its own accord.  Between two such calls nothing ran the
+ * looper at all, so an armed callback waited for the guest rather than for its
+ * deadline: Cross Worlds' anti-tamper heartbeat
+ * (NmssSa.TDThreadWait -> Handler(mainLooper).postDelayed(->
+ * nmssNativeSignalToTDThread, ms)) came in 6.7 seconds late, and its native
+ * side reads a signal that late as the process having been frozen.
+ *
+ * The pump's frame is this emulator's main-thread loop, so this belongs in it
+ * next to the other things a device's main thread does every turn. */
+void dvm_main_looper_tick(struct dvm *vm)
+{
+   if (!vm || !vm->npending) return;
+   /* Same contract as dvm_media_pump_active(): called from the frame pump,
+    * which does not carry the interpreter lock. */
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   dvm__run_pending_threads(vm);
+   dvm_gil_leave_to_guest(vm, cookie);
+}
 
 
 /* ------------------------------------------------------------------------ *
@@ -3782,6 +3885,15 @@ void dvm_gil_wait(struct dvm *vm, unsigned ms)
    pthread_mutex_unlock(&g_gil.m);
 
    unsigned d = dvm_gil_unlock_all(vm);
+   /* A blocking VM wait reached from a guest JNI call still owns the ARM
+    * execution lock, and what it is waiting for almost always needs it: the
+    * joined Java thread's own native calls, and the pump that drains the
+    * pending-Runnable queue.  Holding it here stopped every guest thread --
+    * and the pump with them -- for the whole wait, which is the one thing that
+    * guarantees the condition never becomes true.  Give it up for the
+    * duration, exactly as dvm_gil_enter_from_guest() does when GIL is
+    * contended, and take it back in lock order (GIL, then AEL). */
+   unsigned ael = arm_lock_unlock_all();
    struct timespec ts;
    clock_gettime(CLOCK_REALTIME, &ts);
    ts.tv_sec  += (time_t)(ms / 1000u);
@@ -3794,6 +3906,7 @@ void dvm_gil_wait(struct dvm *vm, unsigned ms)
    }
    pthread_mutex_unlock(&g_gil.m);
    dvm_gil_relock(vm, d);
+   arm_lock_relock(ael);
 }
 
 void dvm_gil_wait_for(struct dvm *vm, uintptr_t channel, unsigned ms)
@@ -3814,6 +3927,9 @@ void dvm_gil_wait_for(struct dvm *vm, uintptr_t channel, unsigned ms)
    pthread_mutex_unlock(&g_gil.m);
 
    unsigned d = dvm_gil_unlock_all(vm);
+   /* See dvm_gil_wait(): the execution lock cannot be held across a wait for
+    * something that needs it to happen. */
+   unsigned ael = arm_lock_unlock_all();
    struct timespec ts;
    clock_gettime(CLOCK_REALTIME, &ts);
    ts.tv_sec  += (time_t)(ms / 1000u);
@@ -3832,6 +3948,7 @@ void dvm_gil_wait_for(struct dvm *vm, uintptr_t channel, unsigned ms)
 
    pthread_cond_destroy(&w.cv);
    dvm_gil_relock(vm, d);
+   arm_lock_relock(ael);
 }
 
 struct dvm *dvm_current(void) { return g_gil_vm; }
@@ -4231,8 +4348,7 @@ void dvm_destroy(struct dvm *vm)
    }
    free(vm->dexes);
 
-   for (int i = 0; i < vm->ninterns; ++i)
-      free(vm->interns[i].key);
+   /* intern keys alias their pinned String objects' utf8 storage. */
    free(vm->interns);
 
    for (int i = 0; i < vm->nmissing; ++i)

@@ -179,6 +179,14 @@ static dvm_ref wrapper_for(struct dvm *vm, const char *class_name, uint32_t host
    dvm_ref old = find_wrapper(host);
    if (old) return old;
 
+   /* A miss means this host handle was never the far side of a VM object, so
+    * whatever instance state the VM holds for it is about to be invisible. */
+   if (getenv("LUNARIA_TRACE_FIELDS")) {
+      static int n;
+      if (n++ < 64)
+         fprintf(stderr, "[dvm] no VM object behind host handle 0x%x (%s) — "
+                 "wrapping it empty\n", host, class_name ? class_name : "?");
+   }
    dvm_ref r = dvm_wrap_external(vm, class_name, host);
    if (!r) return 0;
    dvm_pin(vm, r);
@@ -464,6 +472,12 @@ static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
 
    jclass cls = (*env)->FindClass(env, c ? c->name : "java/lang/Object");
    jobject o = (*env)->AllocObject(env, cls);
+   if (getenv("LUNARIA_TRACE_FIELDS")) {
+      static int n;
+      if (n++ < 96)
+         fprintf(stderr, "[dvm] to_jobject @%x (%s) -> host 0x%x\n", r,
+                 c && c->name ? c->name : "?", (unsigned)(uintptr_t)o);
+   }
    struct dvm_object *obj = dvm__obj(vm, r);
    if (obj) {
       obj->host_handle = (uint32_t)(uintptr_t)o;
@@ -621,23 +635,12 @@ static size_t dvm_build_split_arrays(struct dvm *vm, dvm_ref *out_names,
 static void dvm_fill_application_info_paths(struct dvm *vm, dvm_ref ai)
 {
    union dvm_value v;
-   const char *source = lunaria_apk_mount_path();
-   v.l = dvm_new_string(vm, source ? source : "");
+   v.l = dvm_new_string(vm, lunaria_android_apk_path());
    (void)dvm_set_field(vm, ai, "sourceDir", "Ljava/lang/String;", v);
    (void)dvm_set_field(vm, ai, "publicSourceDir", "Ljava/lang/String;", v);
-
-   const char *files = getenv("ANDROID_FILES_DIR");
-   char data_dir[PATH_MAX];
-   snprintf(data_dir, sizeof data_dir, "%s",
-            (files && *files) ? files : "/tmp/lunaria-files");
-   size_t data_len = strlen(data_dir);
-   if (data_len >= 6 && !strcmp(data_dir + data_len - 6, "/files"))
-      data_dir[data_len - 6] = '\0';
-   v.l = dvm_new_string(vm, data_dir);
+   v.l = dvm_new_string(vm, lunaria_android_data_path());
    (void)dvm_set_field(vm, ai, "dataDir", "Ljava/lang/String;", v);
-
-   const char *lib_dir = getenv("ANDROID_NATIVE_LIB_DIR");
-   v.l = dvm_new_string(vm, lib_dir ? lib_dir : "");
+   v.l = dvm_new_string(vm, lunaria_android_native_lib_path());
    (void)dvm_set_field(vm, ai, "nativeLibraryDir", "Ljava/lang/String;", v);
 
    dvm_ref names = 0, dirs = 0;
@@ -659,14 +662,36 @@ static void dvm_fill_application_info_paths(struct dvm *vm, dvm_ref ai)
  * SERVICE_INVALID ("requires Google Play services, but their signature is
  * invalid") instead of SERVICE_MISSING, and an SDK that has a documented
  * no-Play-services path never takes it. */
-static bool pm_query_is_self(struct dvm *vm, const union dvm_value *args,
-                             int nargs)
+static bool pm_query_package(struct dvm *vm, const union dvm_value *args,
+                             int nargs, struct lunaria_android_package *record)
 {
-   if (nargs < 1 || !args[0].l) return true;   /* null name: the caller's own */
-   const char *want = dvm_string_utf8(vm, args[0].l);
-   if (!want || !*want) return true;
-   const char *self = getenv("ANDROID_PACKAGE_NAME");
-   return self && !strcmp(want, self);
+   const char *want = NULL;
+   if (nargs >= 1 && args[0].l) want = dvm_string_utf8(vm, args[0].l);
+   if (!want || !*want) want = getenv("ANDROID_PACKAGE_NAME");
+   if (!want || !lunaria_android_package_find(want, record)) return false;
+   /* A package the caller cannot see is, to that caller, not installed --
+      the same NameNotFoundException a device raises. */
+   return lunaria_android_package_visible(record) != 0;
+}
+
+static void dvm_fill_registered_application_info(
+   struct dvm *vm, dvm_ref ai, const struct lunaria_android_package *record)
+{
+   union dvm_value v = { .l = dvm_new_string(vm, record->name) };
+   (void)dvm_set_field(vm, ai, "packageName", "Ljava/lang/String;", v);
+   v.i = record->target_sdk;
+   (void)dvm_set_field(vm, ai, "targetSdkVersion", "I", v);
+   v.i = record->uid;
+   (void)dvm_set_field(vm, ai, "uid", "I", v);
+   v.i = record->flags;
+   (void)dvm_set_field(vm, ai, "flags", "I", v);
+   v.l = dvm_new_string(vm, record->source_dir);
+   (void)dvm_set_field(vm, ai, "sourceDir", "Ljava/lang/String;", v);
+   (void)dvm_set_field(vm, ai, "publicSourceDir", "Ljava/lang/String;", v);
+   v.l = dvm_new_string(vm, record->data_dir);
+   (void)dvm_set_field(vm, ai, "dataDir", "Ljava/lang/String;", v);
+   v.l = dvm_new_string(vm, record->lib_dir ? record->lib_dir : "");
+   (void)dvm_set_field(vm, ai, "nativeLibraryDir", "Ljava/lang/String;", v);
 }
 
 static bool hook_call_external(void *user, struct dvm *vm, const char *class_name,
@@ -724,7 +749,8 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
    if (!strcmp(method, "getApplicationInfo") &&
        (strstr(class_name, "PackageManager") || strstr(class_name, "Context"))) {
       memset(out, 0, sizeof *out);
-      if (!pm_query_is_self(vm, args, nargs)) {
+      struct lunaria_android_package record;
+      if (!pm_query_package(vm, args, nargs, &record)) {
          /* Handled — the pending exception is the answer, so do not fall
           * through to the "no such external method" path. */
          dvm__throw(vm, "android/content/pm/PackageManager$NameNotFoundException",
@@ -738,13 +764,9 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
       struct dvm_class *bc = dvm_find_class(vm, "android/os/Bundle");
       union dvm_value v = { .l = bc ? dvm_new_object(vm, bc) : 0 };
       (void)dvm_set_field(vm, ai, "metaData", "Landroid/os/Bundle;", v);
+      dvm_fill_registered_application_info(vm, ai, &record);
       const char *pkg = getenv("ANDROID_PACKAGE_NAME");
-      v.l = pkg ? dvm_new_string(vm, pkg) : 0;
-      (void)dvm_set_field(vm, ai, "packageName", "Ljava/lang/String;", v);
-      /* An app cannot target a level the device does not have. */
-      v.i = lunaria_sdk_int();
-      (void)dvm_set_field(vm, ai, "targetSdkVersion", "I", v);
-      dvm_fill_application_info_paths(vm, ai);
+      if (pkg && !strcmp(pkg, record.name)) dvm_fill_application_info_paths(vm, ai);
       dvm_pin(vm, ai);
       out->l = ai;
       return true;
@@ -752,7 +774,8 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
 
    if (!strcmp(method, "getPackageInfo") && strstr(class_name, "PackageManager")) {
       memset(out, 0, sizeof *out);
-      if (!pm_query_is_self(vm, args, nargs)) {
+      struct lunaria_android_package record;
+      if (!pm_query_package(vm, args, nargs, &record)) {
          /* Handled — the pending exception is the answer, so do not fall
           * through to the "no such external method" path. */
          dvm__throw(vm, "android/content/pm/PackageManager$NameNotFoundException",
@@ -764,9 +787,11 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
       dvm_ref pi = pc ? dvm_new_object(vm, pc) : 0;
       dvm_ref ai = ac ? dvm_new_object(vm, ac) : 0;
       if (!pi || !ai) return false;
-      dvm_fill_application_info_paths(vm, ai);
-      union dvm_value v = { .i = lunaria_sdk_int() };
-      (void)dvm_set_field(vm, ai, "targetSdkVersion", "I", v);
+      const char *self_pkg = getenv("ANDROID_PACKAGE_NAME");
+      if (self_pkg && !strcmp(self_pkg, record.name))
+         dvm_fill_application_info_paths(vm, ai);
+      dvm_fill_registered_application_info(vm, ai, &record);
+      union dvm_value v = { 0 };
       /* Same ApplicationInfo the getApplicationInfo path builds: manifest
        * meta-data is read straight off pi.applicationInfo.metaData. */
       {
@@ -783,8 +808,7 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
             (void)dvm_set_field(vm, pi, "splitNames", "[Ljava/lang/String;", sv);
          }
       }
-      const char *pkg = getenv("ANDROID_PACKAGE_NAME");
-      v.l = pkg ? dvm_new_string(vm, pkg) : 0;
+      v.l = dvm_new_string(vm, record.name);
       (void)dvm_set_field(vm, ai, "packageName", "Ljava/lang/String;", v);
       (void)dvm_set_field(vm, pi, "packageName", "Ljava/lang/String;", v);
       v.l = ai;
@@ -796,11 +820,14 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
        * CRCs every value, and died on String.getBytes of null). */
       int32_t vcode = 1;
       const char *vname = NULL;
-      arm_exec_apk_version(&vcode, &vname);
+      if (self_pkg && !strcmp(self_pkg, record.name))
+         arm_exec_apk_version(&vcode, &vname);
       v.i = vcode;
       (void)dvm_set_field(vm, pi, "versionCode", "I", v);
       v.l = vname ? dvm_new_string(vm, vname) : 0;
       (void)dvm_set_field(vm, pi, "versionName", "Ljava/lang/String;", v);
+      if (self_pkg && !strcmp(self_pkg, record.name))
+         (void)dvm_package_info_add_signatures(vm, pi);
       dvm_pin(vm, pi);
       out->l = pi;
       return true;
@@ -1352,8 +1379,21 @@ bool dvm_jni_field_locked(JNIEnv *env, jobject obj, jfieldID field, bool set,
     * own field storage. */
    if (!dvm_find_class(vm, cls)) return false;
 
-   dvm_ref self = wrapper_for(vm, cls, (uint32_t)(uintptr_t)obj);
+   /* A field belongs to the DVM only when this host handle was produced from
+    * a DVM object earlier.  Merely finding a dex/runtime class with the same
+    * name is not ownership: Context.getApplicationInfo(), for example, is a
+    * JVM-stub object whose fields are implemented by jni_stubs.c.  Wrapping
+    * that unknown handle here manufactured an empty DVM ApplicationInfo and
+    * changed a valid nativeLibraryDir into null before the stub layer could
+    * answer. */
+   dvm_ref self = find_wrapper((uint32_t)(uintptr_t)obj);
    if (!self) return false;
+   if (getenv("LUNARIA_TRACE_FIELDS")) {
+      static int n;
+      if (n++ < 96)
+         fprintf(stderr, "[dvm] field host 0x%x -> @%x\n",
+                 (unsigned)(uintptr_t)obj, self);
+   }
 
    if (set) {
       union dvm_value v = { 0 };
@@ -1373,6 +1413,12 @@ bool dvm_jni_field_locked(JNIEnv *env, jobject obj, jfieldID field, bool set,
 
    union dvm_value v = { 0 };
    if (!dvm_get_field(vm, self, name, type, &v)) return false;
+   if (getenv("LUNARIA_TRACE_FIELDS") && type[0] == 'L') {
+      static int n;
+      if (n++ < 128)
+         fprintf(stderr, "[dvm]   %s.%s on @%x = \"%s\"\n", cls, name, self,
+                 v.l ? (dvm_string_utf8(vm, v.l) ?: "<obj>") : "<null>");
+   }
    *bits = 0;
    switch (type[0]) {
       case 'Z': case 'B': case 'C': case 'S': case 'I':

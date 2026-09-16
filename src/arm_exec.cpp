@@ -69,6 +69,7 @@
 #include <sys/un.h>
 #include <sys/select.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -120,6 +121,7 @@ extern "C" void dynarmic_a64_set_progress_hook(void (*fn)(uint64_t compiles,
 
 extern "C" {
 #include "arm_exec.h"
+#include "linker64.h"
 #include "opensl_format.h"
 #include "jvm/jvm.h"
 #include "jvm/jni.h"
@@ -780,7 +782,10 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"__gnu_strerror_r",         SVC_STRERROR_R},
     {"__read_chk",               SVC_LIBC_READ},
     {"__write_chk",              SVC_LIBC_WRITE},
-    {"__pread64_chk",            SVC_PREAD},
+    /* Must use the 64-bit offset path.  Binding this to SVC_PREAD was fine on
+     * A64 only because that case already reads x3 as a full register; keep
+     * the pread64 handler so A32 and the chk prototype stay honest. */
+    {"__pread64_chk",            SVC_PREAD64},
     {"__pwrite64_chk",           SVC_PWRITE},
     {"__strncpy_chk2",           SVC_STRNCPY},
     {"isdigit_l",                SVC_ISDIGIT},
@@ -908,8 +913,10 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"nanosleep",               SVC_NANOSLEEP},
     {"usleep",                  SVC_USLEEP},
     {"getenv",                  SVC_GETENV},
+    {"android_get_application_target_sdk_version", SVC_ANDROID_TARGET_SDK},
+    {"android_get_device_api_level",              SVC_ANDROID_DEVICE_API_LEVEL},
     {"getpid",                  SVC_GETPID},
-    {"getppid",                 SVC_RET0},   /* synthetic pid 1 -> parent 0 */
+    {"getppid",                 SVC_GETPPID},
     {"gettid",                  SVC_GETTID},
     {"sched_yield",             SVC_SCHED_YIELD},
     {"getpagesize",             SVC_GETPAGESIZE},
@@ -1318,8 +1325,9 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"execvp",                  SVC_RETM1},
     {"waitpid",                 SVC_WAITPID},
     {"system",                  SVC_SYSTEM},
-    {"popen",                   SVC_RETM1},
-    {"pclose",                  SVC_RETM1},
+    {"__libc_init",             SVC_LIBC_INIT},
+    {"popen",                   SVC_POPEN},
+    {"pclose",                  SVC_PCLOSE},
     {"socket",                  SVC_NET_SOCKET},
     {"socketpair",              SVC_NET_SOCKETPAIR},
     {"connect",                 SVC_NET_CONNECT},
@@ -1518,7 +1526,7 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"ntohs",        SVC_NET_BSWAP16},
     {"htonl",        SVC_NET_BSWAP32},
     {"ntohl",        SVC_NET_BSWAP32},
-    {"ptrace",       SVC_RETM1},
+    {"ptrace",       SVC_PTRACE},
     {"tkill",        SVC_PTHREAD_KILL},
     {"freeaddrinfo", SVC_NET_FREEADDRINFO},
     {"gai_strerror", SVC_NET_GAI_STRERROR},
@@ -1892,6 +1900,79 @@ static const A64SoftFpAbi *a64_softfp_abi(uint32_t svc) {
     return nullptr;
 }
 
+/* Pure libm and byte/string entry points are safe to satisfy from loaded
+ * Android platform libraries.  They do not share allocator, pthread, stdio,
+ * or errno state with the ABI bridge.  Keeping the bridge ahead of the guest
+ * export for these symbols defeated the platform-library preload entirely:
+ * pow/sincosf/logf and memcpy/memcmp still exited the JIT hundreds of
+ * thousands of times during UE startup. */
+static bool svc_prefers_guest_export(const char *name, uint32_t svc) {
+    /* Android's libc owns pthread state as one ABI.  Mixing its
+     * pthread_internal_t/clone/futex path with the emulator's historical
+     * mutex words creates two incompatible implementations in one process. */
+    if (name && !strncmp(name, "pthread_", sizeof("pthread_") - 1u))
+        return false;
+    if (name && (!strcmp(name, "__errno") ||
+                 !strcmp(name, "__errno_location") ||
+                 !strcmp(name, "gettid")))
+        return false;
+    /* Allocation ownership is no more splittable than pthread ownership.
+     * A pointer returned by one allocator may legally reach realloc/free in
+     * another DSO through ELF interposition.  Android resolves the whole
+     * family to bionic; leaving malloc on Lunaria's SVC heap while pthread
+     * and scoped libc calls use bionic made UE's FMallocBinned2 receive an
+     * unrecognized 0x500... block. */
+    if (name && (!strcmp(name, "malloc") || !strcmp(name, "calloc") ||
+                 !strcmp(name, "realloc") || !strcmp(name, "free") ||
+                 !strcmp(name, "memalign") || !strcmp(name, "aligned_alloc") ||
+                 !strcmp(name, "posix_memalign") || !strcmp(name, "valloc") ||
+                 !strcmp(name, "pvalloc") || !strcmp(name, "malloc_usable_size")))
+        return false;
+    if (svc >= SVC_MATH_F1_BASE && svc < SVC_MATH_F1_BASE + SVC_MATH_F1_COUNT)
+        return true;
+    if (svc >= SVC_MATH_F2_BASE && svc < SVC_MATH_F2_BASE + SVC_MATH_F2_COUNT)
+        return true;
+    if (svc >= SVC_MATH_D1_BASE && svc < SVC_MATH_D1_BASE + SVC_MATH_D1_COUNT)
+        return true;
+    if (svc >= SVC_MATH_D2_BASE && svc < SVC_MATH_D2_BASE + SVC_MATH_D2_COUNT)
+        return true;
+    switch (svc) {
+    case SVC_RINT: case SVC_LOGB: case SVC_FREXP: case SVC_MODF:
+    case SVC_LDEXP: case SVC_SCALBN: case SVC_ISNAN: case SVC_ISINF:
+    case SVC_ILOGB: case SVC_SINCOS: case SVC_FMA:
+    case SVC_FREXPF: case SVC_MODFF: case SVC_LDEXPF: case SVC_SCALBNF:
+    case SVC_SINCOSF: case SVC_FMAF:
+    case SVC_MEMCPY: case SVC_MEMMOVE: case SVC_MEMSET: case SVC_MEMCMP:
+    case SVC_STRLEN: case SVC_STRNLEN: case SVC_STRCPY: case SVC_STRNCPY:
+    case SVC_STRCMP: case SVC_STRNCMP: case SVC_STRCASECMP:
+    case SVC_STRCHR: case SVC_STRRCHR: case SVC_STRSTR: case SVC_STRCASESTR:
+    /* zlib is deliberately *not* here.  It owns the z_stream layout and its
+     * state machine, so the family has to resolve one way or the other as a
+     * whole -- and the whole of it belongs on the host side.
+     *
+     * inflate is not a routine the guest happens to call; it is the platform.
+     * /system/lib64/libz.so is part of Android, not part of the package, so
+     * the emulator answering it is the same arrangement as libEGL, libandroid
+     * or MediaCodec -- no application function body is touched.  Running it in
+     * the guest instead is what made the post-title load unwatchable: a PC
+     * histogram of that phase (LUNARIA_PC_HISTO=1) is 79-98% inside libz.so,
+     * because a UE pak serves every asset through inflate and the title's
+     * content is hundreds of megabytes of it.  One SVC per inflate() call
+     * decodes a whole buffer at host speed; the guest keeps making the same
+     * calls it makes on a device.
+     *
+     * Consistency is preserved by coverage: libUE4.so and libnmsssa.so import
+     * exactly zlibVersion, inflateInit_/inflateInit2_/inflate/inflateReset/
+     * inflateEnd, deflateInit2_/deflate/deflateReset/deflateEnd, compress2,
+     * compressBound and crc32, and every one of those has a host handler, so
+     * no z_stream is ever half-owned.
+     */
+        return true;
+    default:
+        return false;
+    }
+}
+
 // Guest-side ARM stub for pthread_once: actually runs the init routine (an SVC handler cannot re-enter the JIT.
 static constexpr uint32_t PTHREAD_ONCE_STUB = 0x41008000u;
 static constexpr uint32_t MJIV_STUB         = 0x41009000u; /* mono_jit_init_version wrapper */
@@ -1944,6 +2025,7 @@ static uint32_t g_fastmutex_trylock_va = 0;
  * heap window at 0x42000000 — the JNI vtables live at 0x41010000, so the stub
  * page must not start there. */
 static constexpr uint32_t FAST_SYNC64_PAGE = 0x41100000u;
+static constexpr uint32_t FAST_MUTEX_TYPE64 = FAST_SYNC64_PAGE + 0x1000u;
 /* Linux supplies an executable rt_sigreturn restorer in every signal frame.
  * Keep ours in the last cache line of the already-executable fast-stub window;
  * arm_malloc() is data/heap memory and MemoryReadCode must reject it. */
@@ -1981,6 +2063,13 @@ static constexpr uint32_t TLS64_TID_OFF    = 0xBF4u;
  * words sit in; the handler still runs the first time per thread and stamps
  * the pointer here, so the stub can never invent one. */
 static constexpr uint32_t TLS64_ERRNO_OFF  = 0xBFCu;
+/* The words above are part of Lunaria's synthetic TLS ABI, not bionic's TCB.
+ * A CLONE_SETTLS value is owned and laid out by guest libc and must remain
+ * completely opaque to the emulator. */
+static bool a64_has_private_tls(GuestVA tls) {
+    const uint32_t off = a64_canon_va(tls);
+    return off >= TLS_WINDOW_BASE && off < TLS_WINDOW_END;
+}
 static uint32_t g_fast64_getspecific_va  = 0;
 static uint32_t g_fast64_gettid_va       = 0;
 static uint32_t g_fast64_clock_gettime_va = 0;
@@ -2002,6 +2091,9 @@ static uint32_t g_fast64_memset_va       = 0;
 static uint32_t g_fast64_strcmp_va       = 0;
 static uint32_t g_fast64_strncmp_va      = 0;
 static uint32_t g_fast64_memmove_va      = 0;
+static uint32_t g_fast64_memchr_va       = 0;
+static uint32_t g_fast64_feof_va         = 0;
+static uint32_t g_fast64_fgets_va        = 0;
 static uint32_t g_fast64_mutex_lock_va   = 0;
 static uint32_t g_fast64_mutex_unlock_va = 0;
 static uint32_t g_fast64_iswalnum_va     = 0;
@@ -2046,6 +2138,11 @@ static uint32_t lookup_direct_va_static(const char *name)
 /* A64 guest-side stubs installed after init; NULL until then. */
 static uint32_t lookup_direct_va_fast64(const char *name)
 {
+    extern bool g_guest_bionic_loaded;
+    if (g_guest_bionic_loaded && name &&
+        (!strncmp(name, "pthread_", 8) || !strcmp(name, "gettid") ||
+         !strcmp(name, "__errno") || !strcmp(name, "__errno_location")))
+        return 0;
     if (g_fastmutex_lock_va) {
         if (strcmp(name, "pthread_mutex_lock") == 0)    return g_fastmutex_lock_va;
         if (strcmp(name, "pthread_mutex_unlock") == 0)  return g_fastmutex_unlock_va;
@@ -2072,12 +2169,21 @@ static uint32_t lookup_direct_va_fast64(const char *name)
     if (g_fast64_memmove_va &&
         (strcmp(name, "memmove") == 0 || strcmp(name, "__memmove_chk") == 0))
         return g_fast64_memmove_va;
+    if (g_fast64_memchr_va && strcmp(name, "memchr") == 0)
+        return g_fast64_memchr_va;
+    if (g_fast64_feof_va && strcmp(name, "feof") == 0)
+        return g_fast64_feof_va;
+    if (g_fast64_fgets_va && strcmp(name, "fgets") == 0)
+        return g_fast64_fgets_va;
     if (g_fast64_strcmp_va && strcmp(name, "strcmp") == 0)
         return g_fast64_strcmp_va;
     if (g_fast64_strncmp_va &&
         (strcmp(name, "strncmp") == 0 || strcmp(name, "__strncmp_chk") == 0))
         return g_fast64_strncmp_va;
-    if (g_fast64_mutex_lock_va) {
+    /* Diagnostic correctness mode: route every mutex operation through the
+     * C handler so acquisition/release history is observable.  The normal
+     * implementation remains the inline bionic-style fast path. */
+    if (g_fast64_mutex_lock_va && !lunaria_env("LUNARIA_SLOW_MUTEX")) {
         if (strcmp(name, "pthread_mutex_lock") == 0)   return g_fast64_mutex_lock_va;
         if (strcmp(name, "pthread_mutex_unlock") == 0) return g_fast64_mutex_unlock_va;
     }
@@ -2142,6 +2248,8 @@ static uint32_t lookup_symbol_direct_va(const char *name) {
     if (strcmp(name, "stdin") == 0 || strcmp(name, "stdout") == 0 ||
         strcmp(name, "stderr") == 0 || strcmp(name, "__sF") == 0)
         return misc_stdio();
+    if (strcmp(name, "environ") == 0 || strcmp(name, "__environ") == 0)
+        return misc_environ();
     return 0;
 }
 
@@ -2505,6 +2613,29 @@ static void a64_report_narrowed(uint32_t va, unsigned argi, GuestVA full) {
             "— %s\n", g_a64_cur_svc, svc_symbol_name(g_a64_cur_svc), argi,
             (unsigned long)full, va, guest_pc_lr_str());
 }
+/* Diagnostic: an address that escaped into the guest through an SVC whose
+ * result is not declared a pointer.
+ *
+ * The declared-pointer path below already refuses one, but a handler that
+ * answers with ret64() or by passing its value straight through does not go
+ * near that check -- and the guest cannot tell the difference.  It stores the
+ * value, dereferences it later, and faults on an address that is not part of
+ * the guest process at all.
+ *
+ * Outside the 4 GiB image window a guest VA *is* a host VA by construction, so
+ * "mapped" is the whole test: an address the guest mapped is its own memory,
+ * and one it did not is a pointer into the emulator.  The range bound keeps a
+ * genuine 64-bit integer result (a nanosecond clock, a file offset) out of the
+ * report. */
+static inline void a64_check_host_ret(uint32_t svc_no, uint64_t v) {
+    if (v < 0x100000000000ull || v >= 0x800000000000ull) return;
+    if (a64_is_guest_va(v) || a64_mapped((GuestVA)v)) return;
+    static std::set<uint32_t> reported;
+    if (reported.size() >= 32u || !reported.insert(svc_no).second) return;
+    fprintf(stderr, "[arm64] svc=%u(%s) returned 0x%llx, which the guest has "
+            "not mapped — %s\n", svc_no,
+            svc_symbol_name(svc_no), (unsigned long long)v, guest_pc_lr_str());
+}
 static inline void a64_check_narrowed(uint32_t va) {
     if (!g_a64_identity_arena || !va) return;
     for (unsigned i = 0; i < 8; ++i) {
@@ -2700,6 +2831,10 @@ static uint32_t guest_word_load(ArmMemory &mem, GuestVA va) {
  * without appearing here was written by guest code.  Armed at runtime (an
  * address is not known before the guest allocates it), diagnostics only. */
 static GuestVA g_mwatch;
+/* A64 data watchpoint used to trace emulator-visible state back to the guest
+ * instruction which changed it.  It deliberately works only through memory
+ * callbacks; LUNARIA_A64_FASTMEM=0 is therefore required. */
+static std::atomic<uint64_t> g_a64_watch_va{0};
 /* The guest function a host-driven callback is currently running, so the word
  * narrator can name the context that took the lock rather than only the tid
  * it borrowed. */
@@ -3069,6 +3204,13 @@ static void arm64_apply_mem_config(Dynarmic::A64::UserConfig &cfg) {
      * Android's bionic already has the required non-ZVA implementation.  Do
      * not advertise an operation this CPU model cannot execute. */
     if (!g_a64_arena_identity) return;
+    if (const char *w = lunaria_env("LUNARIA_A64_WATCH")) {
+        const uint64_t va = strtoull(w, nullptr, 0);
+        g_a64_watch_va.store(va, std::memory_order_relaxed);
+        if (va)
+            fprintf(stderr, "[a64-watch] watching stores overlapping 0x%llx..0x%llx\n",
+                    (unsigned long long)va, (unsigned long long)(va + 4u));
+    }
     const char *e = lunaria_env("LUNARIA_A64_FASTMEM");
     if ((e && (e[0] == '0' || e[0] == 'n')) || lunaria_env("LUNARIA_WATCH")) {
         fprintf(stderr, "[mem] a64 fastmem disabled\n");
@@ -3077,7 +3219,14 @@ static void arm64_apply_mem_config(Dynarmic::A64::UserConfig &cfg) {
     cfg.fastmem_pointer = 0;
     cfg.fastmem_address_space_bits = 64;
     cfg.silently_mirror_fastmem = false;
-    cfg.recompile_on_fastmem_failure = true;
+    /* libc's generic strlen/memcpy instructions occasionally see an invalid
+     * or not-yet-tagged pointer during SDK probing.  That one fault must not
+     * permanently recompile the shared instruction without fastmem: all
+     * later, valid calls would then take a C++ callback for every byte/load.
+     * Cross Worlds measured 27.8 million such callbacks in ten seconds while
+     * MountPakFiles was running.  Keep the identity address model and handle
+     * only the particular fault through MemoryRead/Write. */
+    cfg.recompile_on_fastmem_failure = false;
     /* Exclusive accesses go inline.  This does not bypass the global monitor
      * — it emits it: the reservation is still recorded in ctx.excl_mon under
      * the monitor's spin lock, the store still clears every other processor's
@@ -3087,10 +3236,12 @@ static void arm64_apply_mem_config(Dynarmic::A64::UserConfig &cfg) {
      * MemoryRead callback and every STXR another one that additionally walks
      * the whole processor table; UE4 takes a reservation on every refcount, so
      * that is the guest's inner loop, not an edge case. */
-    cfg.fastmem_exclusive_access = true;
+    const char *xe = lunaria_env("LUNARIA_A64_FASTMEM_EXCLUSIVE");
+    cfg.fastmem_exclusive_access = !(xe && (xe[0] == '0' || xe[0] == 'n'));
     cfg.recompile_on_exclusive_fastmem_failure = true;
-    fprintf(stderr, "[mem] a64 fastmem enabled (identity VA, base=0x%llx)\n",
-            (unsigned long long)A64_GUEST_BASE);
+    fprintf(stderr, "[mem] a64 fastmem enabled (identity VA, base=0x%llx, "
+            "exclusive=%s)\n", (unsigned long long)A64_GUEST_BASE,
+            cfg.fastmem_exclusive_access ? "inline" : "callback");
 }
 
 /* Which TLS pages in the window are in use.  The page used to be `BASE + tid *
@@ -3104,6 +3255,53 @@ static std::vector<bool> g_tls_page_used;
  * The TLS allocator is consequently shared state, even though the old
  * cooperative scheduler happened to serialize every caller. */
 static std::recursive_mutex g_a64_tls_mx;
+/* POSIX TZ/tzset state is process-wide.  The Java runtime occasionally uses
+ * it to perform a named-zone conversion, so native libc conversions must use
+ * the same lock or one instant can be observed in two different zones. */
+static std::recursive_mutex g_guest_timezone_mx;
+static thread_local unsigned g_guest_timezone_depth;
+
+extern "C" const char *arm_exec_device_timezone(void)
+{
+    const char *zone = lunaria_env("LUNARIA_TIMEZONE");
+    return zone && *zone ? zone : "Asia/Tokyo";
+}
+/* The device has one timezone for the life of the process, so install it once
+ * and leave it installed.
+ *
+ * This used to save the host's TZ, set the device zone for the conversion and
+ * put the host's value back afterwards.  Two things are wrong with that.  The
+ * process environment is not a place to keep a per-call setting: `setenv` can
+ * reallocate `environ` under any other thread reading it, and every conversion
+ * that does not go through this pair -- the Java runtime's, and libc's own
+ * `strftime %Z` -- sees whichever of the two zones happens to be installed at
+ * that instant.  And the restore is wrong even on its own: this host runs with
+ * `TZ=` (set, empty), which POSIX defines as UTC, so putting "the old value"
+ * back left the process in UTC rather than in no particular state.  One
+ * instant then came back as 16:23:37 from one call and 07:23:38 from the next
+ * -- nine hours apart, from the same second -- which is what a clock-tamper
+ * check is looking for and is not a state a device can be in.
+ *
+ * The lock stays: glibc's tz conversions share one internal state and the
+ * guest reaches them from several engines at once. */
+static void arm_exec_timezone_install(void)
+{
+    static bool installed = false;
+    if (installed) return;
+    installed = true;
+    setenv("TZ", arm_exec_device_timezone(), 1);
+    tzset();
+}
+extern "C" void arm_exec_timezone_lock(void)
+{
+    g_guest_timezone_mx.lock();
+    if (g_guest_timezone_depth++ == 0) arm_exec_timezone_install();
+}
+extern "C" void arm_exec_timezone_unlock(void)
+{
+    if (g_guest_timezone_depth) --g_guest_timezone_depth;
+    g_guest_timezone_mx.unlock();
+}
 
 /* Defined once the thread table exists: on exhaustion it says who is holding
  * the pages, because a TCB belongs to a thread and every page no live thread
@@ -3742,33 +3940,432 @@ static uint64_t g_global_ticks = 0;   /* updated from run loop / AddTicks */
 static uint64_t g_step_after_mark = 0; /* LUNARIA_STEP_AFTER: halt Run() once crossed */
 static bool     g_stepa_requested = false;
 
-// Host FILE* table for ARM fopen/fclose/fread/fwrite/fseek/ftell.
-static FILE*    g_file_tab[256] = {};
+/* Host FILE* table for ARM fopen/fclose/fread/fwrite/fseek/ftell.
+ *
+ * A C stream is an object with identity: two threads that each fopen() a file
+ * get two streams, and one thread's fclose() never turns another thread's
+ * stream into someone else's file.  A table of 256 slots handed to the guest
+ * by index gives neither guarantee for free:
+ *
+ *  - claiming a slot was a plain scan-then-store with no lock, so two threads
+ *    opening at the same time both saw slot k empty and both took it.  One
+ *    FILE* was lost and both guest streams then named the *same* file.
+ *  - a slot freed by fclose() was handed straight back out, so a guest that
+ *    still held the old shim silently started reading the new file.
+ *
+ * Both were live here.  UE4's memory poll (fopen "/proc/meminfo", fopen
+ * "/proc/self/status", fclose) runs several dozen times a second on one
+ * thread while the security module walks its own files on another; they
+ * collided on slot 1, and the module's `while (!feof(f)) fgets(...)` loop
+ * then never reached an end of file, because the other thread kept reopening
+ * the slot underneath it.  That loop ran at over a million SVCs a second and
+ * took two thirds of the execution lock away from the game.
+ *
+ * So: one lock around every claim and release, a rotating cursor so a freed
+ * slot is not the next one handed out, and a generation counter stamped into
+ * the guest shim.  A shim whose generation no longer matches its slot names a
+ * stream that has been closed; it resolves to NULL, which is what every
+ * caller here already treats as "this stream is finished". */
+static FILE*      g_file_tab[256] = {};
+static uint32_t   g_file_gen[256] = {};
+static uint32_t   g_file_cursor   = 1;
+static std::mutex g_file_lock;
 
-static FILE* resolve_file(ArmExecCtx &ctx, uint32_t h) {
-    if (h == 0) return nullptr;
-    uint32_t idx = (h < 256u) ? h : ctx.mem.read32(h); /* shim stores idx at [0] */
-    return (idx > 0 && idx < 256u) ? g_file_tab[idx] : nullptr;
+/* Guest FILE layouts.
+ *
+ * A32 keeps the historic opaque shim: slot/gen at 0/4 and a short fd at 14.
+ * A64 uses a small C-shaped object the in-guest feof/fgets stubs can read
+ * without leaving the JIT.  slot/gen stay private to the emulator; p/r/flags/
+ * base are the stdio cursor.  __SEOF is bionic's 0x20.  base == 0 means the
+ * stream is not memory-backed and feof/fgets fall through to the SVC. */
+enum {
+    FILE_SHIM_IDX = 0, FILE_SHIM_GEN = 4, FILE_SHIM_FD = 14, FILE_SHIM_A32 = 32,
+    GFILE_P = 0, GFILE_R = 8, GFILE_FLAGS = 12,
+    GFILE_SLOT = 16, GFILE_GEN = 20, GFILE_BASE = 24,
+    GFILE_SIZE = 32, GFILE_FD = 36, GFILE_A64 = 40,
+    GFILE_SEOF = 0x20, GFILE_SRD = 0x0004,
+    /* Emulator-private: stream came from the synth /proc freelist.  Never a
+     * bionic flag — feof/fgets stubs only look at SEOF/SRD. */
+    GFILE_POOLED = 0x0100,
+    GFILE_PRELOAD_MAX = 8u << 20, /* 8 MiB: covers NMSS kits, not pak bodies */
+};
+
+/* Release a slot and retire its generation.  Returns the stream that was in
+ * it, already detached from the table, for the caller to fclose(). */
+static FILE *file_table_detach(uint32_t idx, uint32_t gen, bool check_gen) {
+    if (idx == 0 || idx >= 256u) return nullptr;
+    std::lock_guard<std::mutex> guard(g_file_lock);
+    if (check_gen && g_file_gen[idx] != gen) return nullptr;
+    FILE *f = g_file_tab[idx];
+    g_file_tab[idx] = nullptr;
+    ++g_file_gen[idx];
+    return f;
 }
 
-// Register a host FILE* into g_file_tab and return a guest shim VA.
-static uint32_t register_file(ArmExecCtx &ctx, FILE *f) {
-    if (!f) return 0u;
-    uint32_t idx = 0;
-    for (uint32_t k = 1; k < 256; ++k)
+/* Streams the emulator backs with memory rather than a file.
+ *
+ * /proc has no backing store on Linux, so the emulator's answers for it are
+ * formatted into a buffer and handed to the guest through fmemopen(3) -- see
+ * synth_guest_task_stream().  fmemopen does not take ownership of the buffer,
+ * so the stream has to: every guest stream is closed through
+ * guest_stream_close() below, which releases the buffer with it.  Keeping
+ * that in one place is what stops a memory stream from being fclose()d
+ * somewhere that forgets the buffer -- and this is a polling path, so a leak
+ * there is unbounded rather than one-off. */
+static std::map<FILE *, char *> g_synth_streams;
+static std::mutex               g_synth_stream_lock;
+
+static void synth_stream_own(FILE *f, char *buf) {
+    if (!f || !buf) { free(buf); return; }
+    std::lock_guard<std::mutex> guard(g_synth_stream_lock);
+    g_synth_streams[f] = buf;
+}
+
+/* fclose(3) for a stream the guest was handed. */
+static int guest_stream_close(FILE *f) {
+    if (!f) return 0;
+    char *buf = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(g_synth_stream_lock);
+        auto it = g_synth_streams.find(f);
+        if (it != g_synth_streams.end()) {
+            buf = it->second;
+            g_synth_streams.erase(it);
+        }
+    }
+    const int r = fclose(f);
+    free(buf);
+    return r;
+}
+
+/* The (index, generation) pair a guest stream handle names.  A handle below
+ * 256 is a bare index from the arm_malloc-failed path in register_file() and
+ * carries no generation. */
+static void file_handle_parts(ArmExecCtx &ctx, GuestVA h, uint32_t *idx,
+                              uint32_t *gen, bool *stamped) {
+    *stamped = (h >= 256u);
+    if (!*stamped) { *idx = (uint32_t)h; *gen = 0u; return; }
+    if (ctx.is_arm64) {
+        *idx = ctx.mem.read32(h + GFILE_SLOT);
+        *gen = ctx.mem.read32(h + GFILE_GEN);
+    } else {
+        *idx = ctx.mem.read32(h + FILE_SHIM_IDX);
+        *gen = ctx.mem.read32(h + FILE_SHIM_GEN);
+    }
+}
+
+/* Guest-visible address of a stream shim (A64 promotes; A32 is bare). */
+static GuestVA guest_file_va(ArmExecCtx &ctx, uint32_t shim) {
+    if (!shim) return 0;
+    return ctx.is_arm64 ? (GuestVA)a64_guest_va(shim) : (GuestVA)shim;
+}
+
+/* Backing offset of a stream handle the guest handed back. */
+static uint32_t file_shim_backing(ArmExecCtx &ctx, GuestVA h) {
+    if (!h || h < 256u) return (uint32_t)h;
+    if (ctx.is_arm64 && a64_is_guest_va(h))
+        return (uint32_t)(h - A64_GUEST_BASE);
+    return (uint32_t)h;
+}
+
+/* Some callers keep a stream handle as a bare backing offset (no
+ * A64_GUEST_BASE tag).  Canonicalize before touching the shim. */
+static GuestVA gfile_shim_va(ArmExecCtx &ctx, GuestVA h) {
+    if (!ctx.is_arm64 || h < 256u) return h;
+    if (a64_is_guest_va(h)) return h;
+    if (h < A64_GUEST_SIZE) return A64_GUEST_BASE + h;
+    return h;
+}
+
+/* True when an A64 shim has a guest-side read buffer (base != 0). */
+static bool gfile_buffered(ArmExecCtx &ctx, GuestVA h) {
+    if (!ctx.is_arm64 || h < 256u) return false;
+    h = gfile_shim_va(ctx, h);
+    return ctx.mem.read64(h + GFILE_BASE) != 0;
+}
+
+/* Attach a full-file guest buffer so feof/fgets run without an SVC.
+ *
+ * Android's stdio is buffered userspace: a line walk never traps per line.
+ * The emulator used to SVC on every fgets/feof against a host FILE*, which
+ * under Cross Worlds' CSV/kit parse was ~18% of every JIT exit.  Preloading
+ * the readable bytes into guest memory and pointing the shim's cursor at them
+ * is the same contract; the host FILE* is kept only for fileno/fclose. */
+static void gfile_attach_bytes(ArmExecCtx &ctx, uint32_t shim,
+                               const void *src, uint32_t n) {
+    if (!ctx.is_arm64 || !shim || !src || n > GFILE_PRELOAD_MAX) return;
+    const uint32_t buf = arm_malloc(ctx, n + 1u);
+    if (!buf) return;
+    uint8_t *dst = ctx.mem.ptr(buf);
+    memcpy(dst, src, n);
+    dst[n] = 0;
+    const GuestVA gbuf = a64_guest_va(buf);
+    ctx.mem.write64(shim + GFILE_P, gbuf);
+    ctx.mem.write32(shim + GFILE_R, n);
+    ctx.mem.write32(shim + GFILE_FLAGS, (uint32_t)GFILE_SRD);
+    ctx.mem.write64(shim + GFILE_BASE, gbuf);
+    ctx.mem.write32(shim + GFILE_SIZE, n);
+}
+
+static void gfile_attach_buffer(ArmExecCtx &ctx, uint32_t shim, FILE *f) {
+    if (!ctx.is_arm64 || !shim || !f) return;
+    /* Synthetic /proc streams already own a host buffer — copy it once into
+     * the guest instead of fseek/fread through fmemopen (Cross Worlds' NMSS
+     * helper opens /proc/<tid>/status continuously; the double trip was a
+     * large share of every fopen under the execution lock). */
+    {
+        const char *owned = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(g_synth_stream_lock);
+            auto it = g_synth_streams.find(f);
+            if (it != g_synth_streams.end()) owned = it->second;
+        }
+        if (owned) {
+            gfile_attach_bytes(ctx, shim, owned, (uint32_t)strlen(owned));
+            return;
+        }
+    }
+    const long pos = ftell(f);
+    if (pos < 0) return;
+    if (fseek(f, 0, SEEK_END) != 0) return;
+    const long sz = ftell(f);
+    if (sz < 0 || (unsigned long)sz > GFILE_PRELOAD_MAX) {
+        (void)fseek(f, pos, SEEK_SET);
+        return;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) return;
+
+    const uint32_t n = (uint32_t)sz;
+    const uint32_t buf = arm_malloc(ctx, n + 1u);
+    if (!buf) {
+        (void)fseek(f, pos, SEEK_SET);
+        return;
+    }
+    uint8_t *dst = ctx.mem.ptr(buf);
+    size_t got = 0;
+    /* Preload can run for milliseconds on kit/CSV opens; other guest threads
+     * (RenderThread, NMSS) must not sit behind the lock for every small file. */
+    {
+        ArmLockDropped unlock_for_fread;
+        got = fread(dst, 1, n, f);
+    }
+    if (got != (size_t)n) {
+        arm_free(ctx, buf);
+        (void)fseek(f, pos, SEEK_SET);
+        return;
+    }
+    dst[n] = 0;
+    const GuestVA gbuf = a64_guest_va(buf);
+    ctx.mem.write64(shim + GFILE_P, gbuf);
+    ctx.mem.write32(shim + GFILE_R, n);
+    ctx.mem.write32(shim + GFILE_FLAGS, (uint32_t)GFILE_SRD);
+    ctx.mem.write64(shim + GFILE_BASE, gbuf);
+    ctx.mem.write32(shim + GFILE_SIZE, n);
+}
+
+/* popen() streams carry two things a plain FILE* does not: the buffer the
+ * command's output lives in (fmemopen does not copy it) and the status
+ * pclose() has to return.  Keyed by the handle popen() gave the guest. */
+struct GuestPopen { char *buffer; int status; };
+static std::map<uint32_t, GuestPopen> g_popen_status;
+
+static FILE* resolve_file(ArmExecCtx &ctx, GuestVA h) {
+    if (h == 0) return nullptr;
+    uint32_t idx = 0, gen = 0;
+    bool stamped = false;
+    file_handle_parts(ctx, h, &idx, &gen, &stamped);
+    if (idx == 0 || idx >= 256u) return nullptr;
+    std::lock_guard<std::mutex> guard(g_file_lock);
+    if (stamped && g_file_gen[idx] != gen) return nullptr;
+    return g_file_tab[idx];
+}
+
+/* Recycled A64 GFILE shims for synthetic /proc streams.
+ *
+ * Cross Worlds' security module opens /proc/<tid>/status for every live
+ * thread in a tight loop.  Each fopen used to arm_malloc a shim + preload
+ * buffer and each fclose freed both; while presents were frozen that pair
+ * was ~half of all SVCs (alongside the guest's own tiny string mallocs).
+ * Keep a freelist of (shim, content buffer) and a single immortal host
+ * FILE* placeholder so the host never fmemopen/fclose on the poll path. */
+struct SynthGFileRec {
+    uint32_t shim;
+    uint32_t buf;
+    uint32_t cap;
+};
+static std::vector<SynthGFileRec> g_synth_gfile_free;
+static std::mutex                 g_synth_gfile_mu;
+static FILE                      *g_synth_placeholder = nullptr;
+
+static FILE *synth_placeholder_file(void) {
+    if (!g_synth_placeholder) {
+        static char body = '\n';
+        g_synth_placeholder = fmemopen(&body, 1, "r");
+    }
+    return g_synth_placeholder;
+}
+
+static bool is_synth_placeholder(FILE *f) {
+    return f && g_synth_placeholder && f == g_synth_placeholder;
+}
+
+/* Claim a file-table slot for `f`.  Returns 0 on exhaustion (and does not
+ * fclose `f` — the caller owns that decision). */
+static bool file_table_claim(FILE *f, uint32_t *idx_out, uint32_t *gen_out) {
+    if (!f || !idx_out || !gen_out) return false;
+    uint32_t idx = 0, gen = 0;
+    std::lock_guard<std::mutex> guard(g_file_lock);
+    for (uint32_t n = 0; n < 255u; ++n) {
+        const uint32_t k = 1u + ((g_file_cursor - 1u + n) % 255u);
         if (!g_file_tab[k]) { idx = k; break; }
+    }
+    if (!idx) return false;
+    g_file_tab[idx] = f;
+    gen = ++g_file_gen[idx];
+    g_file_cursor = 1u + (idx % 255u);
+    *idx_out = idx;
+    *gen_out = gen;
+    return true;
+}
+
+/* Hand the guest a memory-backed /proc stream without a fresh host FILE* or
+ * a fresh guest allocation on the steady-state poll. */
+static uint32_t register_synth_gfile(ArmExecCtx &ctx, const char *src,
+                                     uint32_t n) {
+    if (!ctx.is_arm64 || !src || n > GFILE_PRELOAD_MAX) return 0u;
+    FILE *ph = synth_placeholder_file();
+    if (!ph) return 0u;
+
+    SynthGFileRec rec = {};
+    {
+        std::lock_guard<std::mutex> g(g_synth_gfile_mu);
+        if (!g_synth_gfile_free.empty()) {
+            rec = g_synth_gfile_free.back();
+            g_synth_gfile_free.pop_back();
+        }
+    }
+
+    uint32_t idx = 0, gen = 0;
+    if (!file_table_claim(ph, &idx, &gen)) {
+        std::lock_guard<std::mutex> g(g_synth_gfile_mu);
+        if (rec.shim) g_synth_gfile_free.push_back(rec);
+        fprintf(stderr, "[register_synth_gfile] ERROR: g_file_tab full\n");
+        return 0u;
+    }
+
+    uint32_t shim = rec.shim;
+    if (!shim) {
+        shim = arm_malloc(ctx, (uint32_t)GFILE_A64);
+        if (!shim) {
+            (void)file_table_detach(idx, gen, true);
+            return 0u;
+        }
+        memset(ctx.mem.ptr(shim), 0, (size_t)GFILE_A64);
+        rec.shim = shim;
+    }
+
+    const uint32_t need = n + 1u;
+    uint32_t cap = rec.cap;
+    if (!rec.buf || cap < need) {
+        if (rec.buf) arm_free(ctx, rec.buf);
+        cap = need < 512u ? 512u : need;
+        rec.buf = arm_malloc(ctx, cap);
+        rec.cap = rec.buf ? cap : 0u;
+        if (!rec.buf) {
+            (void)file_table_detach(idx, gen, true);
+            {
+                std::lock_guard<std::mutex> g(g_synth_gfile_mu);
+                g_synth_gfile_free.push_back(rec);
+            }
+            return 0u;
+        }
+    }
+
+    uint8_t *dst = ctx.mem.ptr(rec.buf);
+    memcpy(dst, src, n);
+    dst[n] = 0;
+    const GuestVA gbuf = a64_guest_va(rec.buf);
+    ctx.mem.write64(shim + GFILE_P, gbuf);
+    ctx.mem.write32(shim + GFILE_R, n);
+    ctx.mem.write32(shim + GFILE_FLAGS, (uint32_t)(GFILE_SRD | GFILE_POOLED));
+    ctx.mem.write32(shim + GFILE_SLOT, idx);
+    ctx.mem.write32(shim + GFILE_GEN, gen);
+    ctx.mem.write64(shim + GFILE_BASE, gbuf);
+    ctx.mem.write32(shim + GFILE_SIZE, n);
+    ctx.mem.write32(shim + GFILE_FD, (uint32_t)-1);
+    return shim;
+}
+
+/* Recycle a pooled synth GFILE after fclose. */
+static void synth_gfile_recycle(ArmExecCtx &ctx, GuestVA fh) {
+    if (!ctx.is_arm64 || fh < 256u) return;
+    fh = gfile_shim_va(ctx, fh);
+    if (!(ctx.mem.read32(fh + GFILE_FLAGS) & (uint32_t)GFILE_POOLED)) return;
+    const GuestVA base = ctx.mem.read64(fh + GFILE_BASE);
+    SynthGFileRec rec = {};
+    rec.shim = file_shim_backing(ctx, fh);
+    rec.buf = base ? file_shim_backing(ctx, base) : 0u;
+    /* Capacity is not in the shim; keep whatever we last allocated by
+     * reading SIZE as a lower bound and rounding up to the freelist's
+     * previous entry size when known.  Under-size is corrected on reuse. */
+    const uint32_t sz = ctx.mem.read32(fh + GFILE_SIZE);
+    rec.cap = rec.buf ? (sz + 1u < 512u ? 512u : sz + 1u) : 0u;
+    ctx.mem.write64(fh + GFILE_BASE, 0);
+    ctx.mem.write64(fh + GFILE_P, 0);
+    ctx.mem.write32(fh + GFILE_R, 0);
+    ctx.mem.write32(fh + GFILE_FLAGS, 0);
+    ctx.mem.write32(fh + GFILE_SIZE, 0);
+    std::lock_guard<std::mutex> g(g_synth_gfile_mu);
+    if (g_synth_gfile_free.size() < 64u)
+        g_synth_gfile_free.push_back(rec);
+    else {
+        /* Cap the pool so a burst of concurrent opens cannot pin guest RAM. */
+        if (rec.buf) arm_free(ctx, rec.buf);
+        if (rec.shim) arm_free(ctx, rec.shim);
+    }
+}
+
+/* Register a host FILE* into g_file_tab and return a guest shim backing off.
+ * `reader` asks for the A64 memory-backed fgets/feof path. */
+static uint32_t register_file(ArmExecCtx &ctx, FILE *f, bool reader = false) {
+    if (!f) return 0u;
+    uint32_t idx = 0, gen = 0;
+    {
+        std::lock_guard<std::mutex> guard(g_file_lock);
+        /* Start where the last claim left off, so a slot released a moment
+         * ago is the last one reused rather than the first. */
+        for (uint32_t n = 0; n < 255u; ++n) {
+            const uint32_t k = 1u + ((g_file_cursor - 1u + n) % 255u);
+            if (!g_file_tab[k]) { idx = k; break; }
+        }
+        if (idx) {
+            g_file_tab[idx] = f;
+            gen = ++g_file_gen[idx];
+            g_file_cursor = 1u + (idx % 255u);
+        }
+    }
     if (!idx) {
         fprintf(stderr, "[register_file] ERROR: g_file_tab full (256 entries)\n");
         fclose(f);
         return 0u;
     }
-    g_file_tab[idx] = f;
-    uint32_t shim = arm_malloc(ctx, 32u);
+    const uint32_t shim_bytes = ctx.is_arm64 ? (uint32_t)GFILE_A64
+                                             : (uint32_t)FILE_SHIM_A32;
+    uint32_t shim = arm_malloc(ctx, shim_bytes);
     if (shim) {
-        ctx.mem.write32(shim, idx);
-        if (uint8_t *p = (uint8_t*)ctx.mem.ptr(shim)) {
-            uint16_t fd16 = (uint16_t)fileno(f);
-            memcpy(p + 14, &fd16, 2);
+        memset(ctx.mem.ptr(shim), 0, shim_bytes);
+        if (ctx.is_arm64) {
+            ctx.mem.write32(shim + GFILE_SLOT, idx);
+            ctx.mem.write32(shim + GFILE_GEN, gen);
+            ctx.mem.write32(shim + GFILE_FD, (uint32_t)fileno(f));
+            if (reader) gfile_attach_buffer(ctx, shim, f);
+        } else {
+            ctx.mem.write32(shim + FILE_SHIM_IDX, idx);
+            ctx.mem.write32(shim + FILE_SHIM_GEN, gen);
+            if (uint8_t *p = (uint8_t*)ctx.mem.ptr(shim)) {
+                uint16_t fd16 = (uint16_t)fileno(f);
+                memcpy(p + FILE_SHIM_FD, &fd16, 2);
+            }
         }
         return shim;
     }
@@ -3880,7 +4477,7 @@ static const char *synth_guest_maps(void);
  * The base is what the fast gettid stub already writes into the guest's TLS
  * (TLS64_TID_OFF), so this is the numbering the guest was reading anyway. */
 enum { GUEST_TID_BASE = 1000u };
-static inline uint32_t guest_pid(void)              { return GUEST_TID_BASE; }
+static uint32_t guest_pid(void);
 static inline uint32_t guest_tid_of(uint32_t tid)   { return GUEST_TID_BASE + tid; }
 
 /* The parent process.  Every Android app process is forked from the zygote, so
@@ -3909,34 +4506,211 @@ static const char *guest_comm(void) {
 static const char *synth_guest_stat(void);
 static const char *synth_guest_status(void);
 
+// Process-wide dispositions reported by every /proc/<pid-or-tid>/status.
+static std::map<std::pair<uint32_t, int>, GuestVA> g_sighandlers;
+static uint32_t guest_pid(void);
+static GuestVA signal_handler_load(uint32_t pid, int sig)
+{
+    auto it = g_sighandlers.find({pid, sig});
+    return it == g_sighandlers.end() ? 0 : it->second;
+}
+static void signal_handler_store(uint32_t pid, int sig, GuestVA handler)
+{
+    if (handler > 1u) g_sighandlers[{pid, sig}] = handler;
+    else g_sighandlers.erase({pid, sig});
+}
+static bool signal_handler_erase(uint32_t pid, int sig)
+{
+    return g_sighandlers.erase({pid, sig}) != 0;
+}
+static void signal_handlers_exec_reset(uint32_t pid)
+{
+    for (auto it = g_sighandlers.begin(); it != g_sighandlers.end(); )
+        if (it->first.first == pid) it = g_sighandlers.erase(it);
+        else ++it;
+}
+static void signal_handlers_fork_copy(uint32_t parent, uint32_t child)
+{
+    for (const auto &entry : g_sighandlers)
+        if (entry.first.first == parent)
+            g_sighandlers[{child, entry.first.second}] = entry.second;
+}
+/* Defined with the per-thread signal state below.  procfs needs the value
+ * while it builds each task entry, before the SVC implementation appears. */
+static uint64_t signal_mask_load(uint32_t tid);
+/* no_new_privs is a process attribute and a one-way Linux ABI state.  Android
+ * installs the app seccomp policy in zygote while it still has privilege and
+ * the child inherits that filter; that does not imply NNP=1.  Keep the two
+ * observations independent, just as the kernel does. */
+static bool g_guest_no_new_privs = false;
+static uint64_t guest_sigcgt_mask(uint32_t pid) {
+    uint64_t mask = 0;
+    for (const auto &entry : g_sighandlers)
+        if (entry.first.first == pid && entry.first.second > 0 &&
+            entry.first.second <= 64 && entry.second > 1u)
+            mask |= 1ull << (unsigned)(entry.first.second - 1);
+    return mask;
+}
+
 /* Synthetic /proc/<pid>/task.  Anti-tamper code enumerates the process's own
  * threads through this directory and treats an empty or missing one as "the
  * process is being traced/hollowed"; nmss aborts on it.  The guest threads are
  * real objects the scheduler owns, so list them.  Defined after g_threads. */
-static const char *synth_guest_task_dir(const char *tail);
+static const char *synth_guest_task_dir(uint32_t pid, const char *tail);
+static bool synth_guest_task_bytes(const char *path, char **out_buf,
+                                   size_t *out_len);
+static uint32_t guest_process_of_tid(uint32_t linux_tid);
+static const char *synth_guest_proc_root(void);
 
 // Synthetic /proc/self/maps.
 static const char *synthetic_proc_path(const char *path) {
     if (path) {
+        if (lunaria_env("LUNARIA_TRACE_PROC") &&
+            (!strncmp(path, "/proc/", 6) || !strncmp(path, "/sys/", 5))) {
+            static unsigned shown;
+            if (shown++ < 512)
+                fprintf(stderr, "[proc] caller-pid=%u tid=%u open %s\n",
+                        guest_pid(), guest_tid_of(g_current_tid), path);
+        }
+        /* The app's reported parent is zygote, so its proc record must be a
+         * different process.  The generic rules used to answer these paths
+         * with the application's own name and Pid 1000, contradicting
+         * getppid()==811 in a way no Android kernel can produce. */
+        if (!strcmp(path, "/proc/811/status") ||
+            !strcmp(path, "/proc/811/cmdline")) {
+            static char parent_status[64] = "";
+            static char parent_cmdline[64] = "";
+            char *slot = strstr(path, "status") ? parent_status : parent_cmdline;
+            if (!slot[0]) {
+                char buf[64];
+                snprintf(buf, sizeof buf, "/tmp/lunaria-proc-zygote-%s-XXXXXX",
+                         slot == parent_status ? "status" : "cmdline");
+                int fd = mkstemp(buf);
+                if (fd >= 0) {
+                    if (slot == parent_status) {
+                        static const char body[] =
+                            "Name:\tzygote64\nState:\tS (sleeping)\n"
+                            "Tgid:\t811\nPid:\t811\nPPid:\t1\n"
+                            "Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n"
+                            "TracerPid:\t0\nNStgid:\t811\nNSpid:\t811\n"
+                            "Seccomp:\t2\nNoNewPrivs:\t0\nThreads:\t8\n";
+                        if (write(fd, body, sizeof body - 1) < 0) { }
+                    } else {
+                        static const char body[] = "zygote64";
+                        if (write(fd, body, sizeof body) < 0) { }
+                    }
+                    close(fd);
+                    snprintf(slot, 64, "%s", buf);
+                }
+            }
+            return slot[0] ? slot : nullptr;
+        }
+        /* /proc itself.  Since Android 9 an app's /proc is mounted with
+         * hidepid, so the process list it can enumerate is its own processes
+         * and nothing else -- but it is always enumerable.  The emulator used
+         * to answer opendir("/proc") with NULL, which is a state no device
+         * can be in and exactly what a process-scanning sensor looks for.
+         *
+         * Only the entry names matter to a reader walking this; every open
+         * underneath goes back through the rules below. */
+        if (!strcmp(path, "/proc") || !strcmp(path, "/proc/")) {
+            return synth_guest_proc_root();
+        }
         /* /proc/<pid>/task[/<tid>/...] — the thread list and its per-thread
          * files.  Matched before the /stat rule below so that
          * /proc/1/task/57/stat is the *thread's* stat, not the process's. */
         if (!strncmp(path, "/proc/", 6)) {
             const char *p = path + 6;
             const char *sl = strchr(p, '/');
+            uint32_t requested_pid = guest_pid();
+            if (sl && strncmp(p, "self/", 5)) {
+                char *end = nullptr;
+                unsigned long n = strtoul(p, &end, 10);
+                if (end == sl && n <= UINT32_MAX) requested_pid = (uint32_t)n;
+            }
             if (sl && !strncmp(sl, "/task", 5) &&
                 (sl[5] == '\0' || sl[5] == '/')) {
-                if (const char *d = synth_guest_task_dir(sl + 5)) return d;
+                if (const char *d = synth_guest_task_dir(requested_pid, sl + 5)) return d;
+            }
+            /* Linux also exposes every thread directly as /proc/<tid>/... .
+             * NMSS enumerates /proc/<pid>/task and then uses that spelling.
+             * The old generic /status rule below returned the process record
+             * (Pid 1000) for every listed TID, so /proc/1003/status claimed
+             * to describe pid 1000.  Route a live non-main TID to the same
+             * per-thread files generated for /proc/<pid>/task/<tid>. */
+            if (sl && p[0] >= '0' && p[0] <= '9') {
+                char *end = nullptr;
+                unsigned long linux_tid = strtoul(p, &end, 10);
+                const uint32_t owner = end == sl && linux_tid <= UINT32_MAX
+                    ? guest_process_of_tid((uint32_t)linux_tid) : 0u;
+                if (owner) {
+                    if (!strcmp(sl, "/status") || !strcmp(sl, "/stat") ||
+                        !strcmp(sl, "/comm")) {
+                        char tail[64];
+                        snprintf(tail, sizeof tail, "/%lu%s", linux_tid, sl);
+                        if (const char *d = synth_guest_task_dir(owner, tail)) return d;
+                    }
+                }
             }
         }
-        // /proc/self/maps or /proc/<pid>/maps -> synthetic guest map.
+        /* Generic process files are valid only for the current process or a
+         * still-live thread belonging to it.  In particular, a thread may
+         * exit between readdir(/proc/<pid>/task) and open(/proc/<tid>/status).
+         * Falling through here used to substitute the caller's own status for
+         * that vanished TID; Linux returns ENOENT and never changes the
+         * identity of the requested proc record. */
         const char *slash = strrchr(path, '/');
-        if (slash && !strcmp(slash, "/maps") && !strncmp(path, "/proc/", 6))
+        bool proc_subject_live = false;
+        if (slash && !strncmp(path, "/proc/", 6)) {
+            const char *subject = path + 6;
+            if (subject + 4 == slash && !memcmp(subject, "self", 4)) {
+                proc_subject_live = true;
+            } else {
+                char *end = nullptr;
+                unsigned long n = strtoul(subject, &end, 10);
+                if (end == slash && n <= UINT32_MAX) {
+                    const uint32_t id = (uint32_t)n;
+                    proc_subject_live = id == guest_pid() ||
+                        guest_process_of_tid(id) == guest_pid();
+                }
+            }
+        }
+        // /proc/self/maps or /proc/<live-pid-or-tid>/maps.
+        if (slash && proc_subject_live && !strcmp(slash, "/maps"))
             return synth_guest_maps();
-        if (slash && !strcmp(slash, "/stat") && !strncmp(path, "/proc/", 6))
+        if (slash && proc_subject_live && !strcmp(slash, "/stat"))
             return synth_guest_stat();
-        if (slash && !strcmp(slash, "/status") && !strncmp(path, "/proc/", 6))
+        if (slash && proc_subject_live && !strcmp(slash, "/status"))
             return synth_guest_status();
+        /* /proc/<pid>/mountinfo describes the process's mount namespace, not
+         * a privileged host resource.  Falling through to the blanket /proc
+         * block returned ENOENT for the guest's own pid, an impossible result
+         * on Android.  Expose a small, self-consistent Android namespace and
+         * never leak the macOS staging paths into it. */
+        if (slash && !strcmp(slash, "/mountinfo") &&
+            !strncmp(path, "/proc/", 6)) {
+            static char mountinfo_f[64] = "";
+            if (!mountinfo_f[0]) {
+                char buf[64];
+                strcpy(buf, "/tmp/lunaria-proc-mountinfo-XXXXXX");
+                int fd = mkstemp(buf);
+                if (fd >= 0) {
+                    static const char body[] =
+                        "20 1 0:20 / / ro,seclabel,relatime - rootfs rootfs ro\n"
+                        "21 20 0:21 / /system ro,seclabel,relatime - ext4 /dev/block/dm-0 ro\n"
+                        "22 20 0:22 / /vendor ro,seclabel,relatime - ext4 /dev/block/dm-1 ro\n"
+                        "23 20 0:23 / /data rw,seclabel,nosuid,nodev,noatime - f2fs /dev/block/dm-2 rw\n"
+                        "24 20 0:24 / /storage/emulated rw,nosuid,nodev,noexec,noatime - sdcardfs /data/media rw\n"
+                        "25 20 0:5 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n"
+                        "26 20 0:6 / /sys rw,nosuid,nodev,noexec,relatime - sysfs sysfs rw\n"
+                        "27 20 0:7 / /dev rw,nosuid,relatime - tmpfs tmpfs rw,mode=755\n";
+                    if (write(fd, body, sizeof body - 1) < 0) { }
+                    close(fd);
+                    snprintf(mountinfo_f, sizeof mountinfo_f, "%s", buf);
+                }
+            }
+            return mountinfo_f[0] ? mountinfo_f : nullptr;
+        }
         if (slash && (!strcmp(slash, "/cmdline") ||
                       !strcmp(slash, "/statm") || !strcmp(slash, "/oom_score") ||
                       !strcmp(slash, "/oom_score_adj")) &&
@@ -4081,6 +4855,13 @@ static const char *synthetic_proc_path(const char *path) {
 static std::map<std::string, uint32_t> g_exported_syms;
 // A64 exports are architectural 64-bit guest VAs.
 static std::map<std::string, GuestVA> g_exported_syms64;
+static bool g_ln64_inited = false;
+bool g_guest_bionic_loaded = false;
+
+static void *ln64_guest_ptr(uint32_t off, size_t len, void *user) {
+    ArmExecCtx *ctx = static_cast<ArmExecCtx *>(user);
+    return ctx ? ctx->mem.try_ptr((GuestVA)off, len) : nullptr;
+}
 
 /* ELF global-scope symbol resolution (interposition).
  *
@@ -4115,6 +4896,13 @@ struct PendingXlibReloc {
     uint32_t    type;   /* R_ARM_JUMP_SLOT / GLOB_DAT / ABS32 */
 };
 static std::vector<PendingXlibReloc> g_pending_xlib_relocs;
+
+struct PendingA64Reloc {
+    uint32_t    addr;
+    int64_t     addend;
+    std::string sym;
+};
+static std::vector<PendingA64Reloc> g_pending_a64_relocs;
 
 // High-water mark of all loaded library segments (page-rounded up).
 static uint32_t g_lib_load_end = 0u;
@@ -4152,10 +4940,16 @@ struct ArmSignalWaitState {
     uint64_t sem_until_ns = 0;
     GuestVA waiting_futex = 0;
     uint32_t futex_val = 0;
+    bool futex_timed = false;
+    uint64_t futex_until_ns = 0;
+    bool futex_raw_result = false;
     GuestVA waiting_cond = 0;
     uint32_t waiting_join = 0;
     GuestVA join_retval_ptr = 0;
     bool join_is_waitpid = false;
+    /* system() waits for a child the same way, but its answer is the wait(2)
+     * status itself rather than the child's pid and an int*. */
+    bool join_is_system = false;
     GuestVA waiting_mutex = 0;
     GuestVA waiting_rwlock = 0;
     bool rwlock_want_write = false;
@@ -4173,6 +4967,7 @@ struct ArmSignalWaitState {
 };
 
 enum { A64_SIGNAL_DEPTH_MAX = 4 };
+enum { GUEST_ATFORK_MAX = 128 };
 struct ArmSignalFrameState {
     GuestVA si = 0;
     GuestVA uc = 0;
@@ -4187,6 +4982,21 @@ struct ArmSignalFrameState {
 // Cooperative guest threads.
 struct ArmThread {
     uint32_t                     id = 0;       /* pthread_self value (2-based) */
+    /* Linux process identity is not pthread identity.  Ordinary pthreads
+     * inherit these values; a fork/system child gets a new pid.  Keeping
+     * every executable image in pid 1000 made an exec'd helper appear in its
+     * parent's /proc/1000/task and made its getpid()==the pid passed in argv
+     * as its parent, a state no Android kernel can produce. */
+    uint32_t                     process_pid = GUEST_TID_BASE;
+    uint32_t                     process_ppid = GUEST_PPID;
+    /* Linux task comm for this process.  exec replaces it with the basename
+     * of the new executable; pthreads keep the process name unless they later
+     * set their own thread name. */
+    char                         process_comm[16]{};
+    /* pthread_atfork child handlers pending at the fork return boundary.
+     * Fixed storage keeps the state plain and directly translatable to C. */
+    std::array<GuestVA, GUEST_ATFORK_MAX> atfork_child{};
+    uint16_t                     atfork_child_n = 0;
     std::array<uint32_t, 16>     regs{};
     std::array<uint64_t, 32>     regs64{};     /* A64 x0–x30 + pad; PC/SP/LR also here */
     // A64 SIMD/FP state.
@@ -4234,6 +5044,9 @@ struct ArmThread {
     GuestVA                      stack_base = 0; /* architectural stack VA */
     uint64_t                     stack_size = 0; /* 0 -> THREAD_STACK_SIZE */
     GuestVA                      entry_pc = 0;   /* pthread_create start PC */
+    GuestVA                      start_arg = 0;  /* original start_routine arg */
+    uint32_t                     creator_tid = 0;
+    uint64_t                     creator_slices = 0;
     bool                         finished = false;
     uint32_t                     defer_count = 0; /* empty-callback deferrals */
     uint32_t                     stuck_pc = 0;   /* PC of repeated zero-instruction fault */
@@ -4252,6 +5065,36 @@ struct ArmThread {
      * account it directly. */
     uint64_t                     total_ns = 0;   /* cumulative wall time on CPU */
     uint64_t                     slices = 0;     /* slices actually run */
+    /* What /proc/<tid>/status reports as voluntary/nonvoluntary context
+     * switches: a slice that ended because the thread parked or slept gave
+     * the CPU up, and one that ended any other way was taken from it.  These
+     * two counters are read by anti-debug code -- a process being stepped has
+     * a characteristic ratio -- and a status file that does not have them at
+     * all describes no Linux. */
+    uint64_t                     vol_switches = 0;
+    uint64_t                     nonvol_switches = 0;
+    /* A descriptor this thread was parked on became ready.  Like an expired
+     * sleep, that is a reason to run which needs no agreement from the frame
+     * pass: an idle engine may take the thread at once, in the barriered mode
+     * too.  Without it a socket that became writable was noticed by the fd
+     * service in half a millisecond and then waited for the next pass -- tens
+     * of milliseconds -- before anything ran the thread that cared. */
+    bool                         io_ready = false;
+    /* When pthread_create published this thread, on the host monotonic clock.
+     *
+     * Android starts a created thread on another CPU: the caller returns and
+     * the new thread is already running, microseconds later.  Here it goes on
+     * a ready queue and waits for an engine, and a caller that creates a
+     * worker and then waits for it to answer sees that queueing delay as the
+     * worker being unresponsive.  Measuring it is the difference between "the
+     * thread refused to answer" and "the thread had not started yet". */
+    uint64_t                     created_ns = 0;
+    /* When an engine took this thread in hand, against created_ns above.  The
+     * wait splits in two and the halves have different causes: time before
+     * this is the thread sitting on a queue with nobody to run it, time after
+     * it is an engine that has the thread but not yet the execution lock or
+     * its own registers back.  One number cannot be acted on; two can. */
+    uint64_t                     engine_ns = 0;
     uint64_t                     ticks_per_ms = 0; /* measured rate, EWMA */
     bool                         is_arm64 = false; /* run on the A64 engine pool */
     /* An engine is executing this thread's slice right now.  With one engine a
@@ -4259,6 +5102,12 @@ struct ArmThread {
      * question; with a pool the pump hands slices out and keeps going, and the
      * next pass must not dispatch a thread that is already on an engine. */
     bool                         running = false;
+    /* Linux scheduling attributes are guest-visible process state even though
+     * host execution remains cooperative.  Keep them per guest thread so
+     * pthread_{get,set}schedparam round-trips instead of either lying about
+     * success or making middleware retry an unimplemented syscall forever. */
+    int                          sched_policy = GUEST_SCHED_OTHER;
+    int                          sched_priority = 0;
     // sem_wait blocking: published directly by sem_post or the deadline heap.
     GuestVA                      waiting_sem = 0;
     uint32_t                     sem_skip_passes = 0; /* retained for diagnostics */
@@ -4267,6 +5116,9 @@ struct ArmThread {
     // futex_wait parking: a worker that FUTEX_WAITs on `waiting_futex` while the guest word still equals `futex_val` is.
     GuestVA                      waiting_futex = 0;
     uint32_t                     futex_val = 0;
+    bool                         futex_timed = false;
+    uint64_t                     futex_until_ns = 0;
+    bool                         futex_raw_result = false;
     // pthread_cond_wait parking: workers remain de-scheduled until a matching signal/broadcast instead of returning.
     GuestVA                      waiting_cond = 0;
     /* pthread_join parking: a worker that joins another guest thread stays
@@ -4286,6 +5138,9 @@ struct ArmThread {
      * thread either way.  Set, it means join_retval_ptr is waitpid's int*
      * and the call answers with the child's pid, not with 0. */
     bool                         join_is_waitpid = false;
+    /* Set when the park serves system(): the call answers with the wait(2)
+     * status and writes nothing through a pointer. */
+    bool                         join_is_system = false;
     /* What the thread returned: pthread_exit's argument, or the start
      * routine's own return value.  pthread_join used to write 0 through the
      * caller's void** whatever the thread had produced, so a worker that
@@ -4394,6 +5249,57 @@ struct ArmThread {
  * and retired slots are emptied in place (id 0, finished) and handed to the
  * next pthread_create rather than erased. */
 static std::deque<ArmThread> g_threads;
+
+static uint32_t guest_pid(void)
+{
+    if (!g_current_tid) return GUEST_TID_BASE;
+    for (const ArmThread &t : g_threads)
+        if (t.id == g_current_tid && !t.finished)
+            return t.process_pid ? t.process_pid : GUEST_TID_BASE;
+    return GUEST_TID_BASE;
+}
+
+static uint32_t current_guest_ppid(void)
+{
+    if (!g_current_tid) return GUEST_PPID;
+    for (const ArmThread &t : g_threads)
+        if (t.id == g_current_tid && !t.finished)
+            return t.process_ppid ? t.process_ppid : GUEST_PPID;
+    return GUEST_PPID;
+}
+
+static uint32_t guest_process_of_tid(uint32_t linux_tid)
+{
+    if (linux_tid == GUEST_TID_BASE) return GUEST_TID_BASE;
+    if (linux_tid <= GUEST_TID_BASE) return 0;
+    const uint32_t sched_tid = linux_tid - GUEST_TID_BASE;
+    for (const ArmThread &t : g_threads)
+        if (t.id == sched_tid && !t.finished)
+            return t.process_pid;
+    return 0;
+}
+
+static void inherit_process_identity(ArmThread &child)
+{
+    child.process_pid = guest_pid();
+    child.process_ppid = current_guest_ppid();
+    for (const ArmThread &t : g_threads) {
+        if (!t.finished && t.process_pid == child.process_pid &&
+            t.process_comm[0]) {
+            snprintf(child.process_comm, sizeof child.process_comm, "%s",
+                     t.process_comm);
+            break;
+        }
+    }
+}
+
+static void set_process_comm(ArmThread &thread, const char *path)
+{
+    const char *name = path ? strrchr(path, '/') : nullptr;
+    name = name ? name + 1 : path;
+    snprintf(thread.process_comm, sizeof thread.process_comm, "%s",
+             name && *name ? name : guest_comm());
+}
 static bool mtrace_addr(GuestVA va);
 
 namespace a64par { void sched_poke(void); }
@@ -4419,6 +5325,10 @@ static bool fd_try_complete(ArmExecCtx &ctx, ArmThread &t);
 static void fd_wake_all_ready(ArmExecCtx &ctx);
 static void fd_deadline_republish(void);
 
+namespace guest_net {
+void choreo_refresh_alooper_deadline(uint32_t tid, uint64_t due_ns);
+}
+
 /* Release one recursive level of a guest pthread mutex and, on the final
  * release, hand it directly to the oldest parked waiter.  Guest fast stubs run
  * outside AEL, so every word update must remain a CAS even though SVC handlers
@@ -4435,6 +5345,17 @@ static void fd_deadline_republish(void);
  * other type takes exactly the path it took before. */
 static constexpr uint32_t MUTEX_SLOW_BIT = 0x40000000u;
 static inline uint32_t mutex_state(uint32_t w) { return w & ~MUTEX_SLOW_BIT; }
+
+static void fast64_recursive_mutex_set(ArmMemory &mem, GuestVA mva, bool on)
+{
+    const uint32_t slot = (uint32_t)((mva >> 2) & 0xffu);
+    const GuestVA p = FAST_MUTEX_TYPE64 + (GuestVA)slot * 8u;
+    uint64_t cur = 0;
+    std::memcpy(&cur, mem.ptr(p), sizeof(cur));
+    if (on) cur = mva;
+    else if (cur == mva) cur = 0;
+    std::memcpy(mem.ptr(p), &cur, sizeof(cur));
+}
 
 /* PTHREAD_MUTEX_{NORMAL,RECURSIVE,ERRORCHECK}, as bionic numbers them. */
 enum { GUEST_MUTEX_NORMAL = 0, GUEST_MUTEX_RECURSIVE = 1,
@@ -4560,6 +5481,16 @@ static const char *maps_device_path(const char *host, char *buf, size_t bufsz)
     const char *base = strrchr(host, '/');
     base = base ? base + 1 : host;
 
+    /* libc-pure.so is Lunaria's backing image for the guest process's bionic
+     * libc text.  The suffix is an implementation detail, not an installed
+     * Android DSO: exposing it through /proc/maps and dl_iterate_phdr makes
+     * those two kernel/linker interfaces describe a library that cannot
+     * exist on a device.  Both interfaces must use libc's device identity. */
+    if (!strcmp(base, "libc-pure.so")) {
+        snprintf(buf, bufsz, "/system/lib64/libc.so");
+        return buf;
+    }
+
     /* Anything under the guest's own data directory keeps its guest spelling:
      * find "/data/<pkg>/" and rebuild from there. */
     char needle[256];
@@ -4589,37 +5520,145 @@ static const char *maps_device_path(const char *host, char *buf, size_t bufsz)
                 snprintf(buf, bufsz, "/system/lib64/%s", base);
                 return buf;
             }
-        snprintf(buf, bufsz, "/data/app/~~lunaria==/%s-1==/lib/arm64/%s",
-                 pkg, base);
+        snprintf(buf, bufsz, "%s/%s", lunaria_android_native_lib_path(), base);
         return buf;
     }
     return "";   /* not a file a device would name here */
 }
 
+/* The device and inode /proc/<pid>/maps reports for a file-backed mapping.
+ *
+ * A line that names a file and reports `00:00 0` cannot come out of a Linux
+ * kernel: a pathname in maps means there is a file behind the mapping, and a
+ * file has a device and an inode.  Emulator detection reads exactly this.
+ *
+ * The inode is the backing file's real one, so two mappings of the same
+ * library agree and two different libraries differ, which is the property a
+ * reader can actually check.  The device is the Android mount the guest path
+ * belongs to -- the host's own st_dev describes this machine's filesystems,
+ * not the device being imitated.
+ */
+static void maps_device_id(const char *host_path, const char *guest_path,
+                           uint64_t saved_inode, unsigned *maj, unsigned *min,
+                           unsigned long long *ino)
+{
+    *maj = 0; *min = 0; *ino = 0;
+    if (!guest_path || !*guest_path) return;
+    struct stat st;
+    if (host_path && *host_path && stat(host_path, &st) == 0)
+        *ino = (unsigned long long)st.st_ino;
+    else
+        *ino = (unsigned long long)saved_inode;
+    if (!*ino) return;
+    /* Major 253 is device-mapper, which is what /system and /data sit on for
+     * every device with dm-verity; the sdcard view is a fuse mount. */
+    if (!strncmp(guest_path, "/storage/", 9)) { *maj = 0x00; *min = 0x1e; }
+    else if (!strncmp(guest_path, "/system/", 8)) { *maj = 0xfd; *min = 0x00; }
+    else { *maj = 0xfd; *min = 0x05; }
+}
+
+/* Everything /proc/<pid>/maps says about this process, as one number.
+ *
+ * Reading the file is how an anti-tamper library looks at the address space,
+ * and Cross Worlds' does it in a closed loop: open, read a few lines, close,
+ * open again, for the whole run.  Rendering the answer costs a stat(2) per
+ * loaded ELF region plus a temporary file, and it was being paid on every one
+ * of those opens while holding the ARM execution lock -- fopen was the single
+ * largest holder of that lock during the post-title load, at 16-18% of the
+ * wall clock, which is time no other engine could run guest code in.
+ *
+ * A kernel re-renders the file per read because it is reading state that may
+ * have changed.  This is the same statement made cheaply: every input the
+ * text is built from, digested.  Same inputs, same bytes, so a reader that
+ * sees the cached file sees exactly what a fresh render would have produced.
+ */
+static uint64_t guest_maps_key(void)
+{
+    uint64_t h = 1469598103934665603ull;          /* FNV-1a, 64-bit */
+    auto mix = [&h](uint64_t v) {
+        h ^= v;
+        h *= 1099511628211ull;
+    };
+    mix(g_a64_maps_gen.load(std::memory_order_acquire));
+    mix(g_guest_proc_arm64 ? 1u : 0u);
+    mix(guest_pid());
+    mix(g_heap_size);
+    mix(g_mmap_next);
+    mix(g_mmap2_base);
+    mix(g_mmap2_next);
+    for (const auto &r : g_loaded_regions) {
+        mix(r.lo); mix(r.hi); mix(r.flags);
+        mix(r.file_off); mix(r.backing_inode); mix(r.process_pid);
+    }
+    for (const auto &t : g_threads) {
+        if (!t.id || t.finished || !t.stack_base || !t.stack_size) continue;
+        mix(t.id); mix(t.stack_base); mix(t.stack_size);
+    }
+    return h;
+}
+
 static const char *synth_guest_maps(void) {
-    static char file[64] = "";
+    /* One backing file per reader.  A single process-wide name let one guest
+     * thread unlink the file another had just been handed but not yet opened,
+     * which procfs cannot do to a reader. */
+    static thread_local char file[64] = "";
+    /* Re-render only when an input changed -- and, so that a change this
+     * process did not make (a backing file deleted underneath a mapping, which
+     * only the stat(2) below can see) still shows up, at least once a second
+     * regardless.  See guest_maps_key(). */
+    static thread_local uint64_t cached_key = 0;
+    static thread_local uint64_t cached_ms  = 0;
+    const uint64_t key    = guest_maps_key();
+    const uint64_t now_ms = host_mono_ns() / 1000000ull;
+    if (file[0] && key == cached_key && now_ms - cached_ms < 1000ull)
+        return file;
     char buf[64];
     strcpy(buf, "/tmp/lunaria-maps-XXXXXX");
     int fd = mkstemp(buf);
     if (fd < 0) return file[0] ? file : nullptr;
+    cached_key = key;
+    cached_ms  = now_ms;
     std::string out;
     char line[512];
-    auto emit_a64 = [&](GuestVA lo, GuestVA hi, const char *perm, const char *name) {
+    auto emit_a64 = [&](GuestVA lo, GuestVA hi, const char *perm,
+                        uint64_t off, unsigned maj, unsigned min,
+                        unsigned long long ino, const char *name) {
         if (hi <= lo) return;
-        snprintf(line, sizeof line,
-                 "%016llx-%016llx %s 00000000 00:00 0          %s\n",
-                 (unsigned long long)lo, (unsigned long long)hi, perm, name);
+        /* The kernel pads the inode field out to a fixed column and then
+         * writes the pathname; a mapping with no name ends at the inode. */
+        if (name && *name)
+            snprintf(line, sizeof line,
+                     "%012llx-%012llx %s %08llx %02x:%02x %-10llu %s\n",
+                     (unsigned long long)lo, (unsigned long long)hi, perm,
+                     (unsigned long long)off, maj, min, ino, name);
+        else
+            snprintf(line, sizeof line,
+                     "%012llx-%012llx %s %08llx %02x:%02x %llu \n",
+                     (unsigned long long)lo, (unsigned long long)hi, perm,
+                     (unsigned long long)off, maj, min, ino);
         out += line;
     };
-    auto emit_a32 = [&](uint32_t lo, uint32_t hi, const char *perm, const char *name) {
+    auto emit_a32 = [&](uint32_t lo, uint32_t hi, const char *perm,
+                        uint64_t off, unsigned maj, unsigned min,
+                        unsigned long long ino, const char *name) {
         if (hi <= lo) return;
-        snprintf(line, sizeof line,
-                 "%08x-%08x %s 00000000 00:00 0          %s\n",
-                 lo, hi, perm, name);
+        if (name && *name)
+            snprintf(line, sizeof line,
+                     "%08x-%08x %s %08llx %02x:%02x %-10llu %s\n",
+                     lo, hi, perm, (unsigned long long)off, maj, min, ino, name);
+        else
+            snprintf(line, sizeof line,
+                     "%08x-%08x %s %08llx %02x:%02x %llu \n",
+                     lo, hi, perm, (unsigned long long)off, maj, min, ino);
         out += line;
+    };
+    auto anon_a64 = [&](GuestVA lo, GuestVA hi, const char *perm,
+                        const char *name) {
+        emit_a64(lo, hi, perm, 0, 0, 0, 0, name);
     };
 
     for (const auto &r : g_loaded_regions) {
+        if (r.process_pid != guest_pid()) continue;
         char perm[5];
         perm[0] = (r.flags & 4u) ? 'r' : '-';
         perm[1] = (r.flags & 2u) ? 'w' : '-';
@@ -4627,26 +5666,37 @@ static const char *synth_guest_maps(void) {
         perm[3] = 'p'; perm[4] = '\0';
         char dev[PATH_MAX];
         const char *nm = maps_device_path(r.path.c_str(), dev, sizeof dev);
+        char deleted_name[PATH_MAX + 16];
+        struct stat backing_st;
+        if (nm && *nm && stat(r.path.c_str(), &backing_st) != 0 && r.backing_inode) {
+            snprintf(deleted_name, sizeof deleted_name, "%s (deleted)", nm);
+            nm = deleted_name;
+        }
+        unsigned maj = 0, min = 0;
+        unsigned long long ino = 0;
+        maps_device_id(r.path.c_str(), nm, r.backing_inode, &maj, &min, &ino);
         if (g_guest_proc_arm64)
-            emit_a64(a64_guest_va(r.lo), a64_guest_va(r.hi), perm, nm);
+            emit_a64(a64_guest_va(r.lo), a64_guest_va(r.hi), perm,
+                     r.file_off, maj, min, ino, nm);
         else
-            emit_a32(r.lo, r.hi, perm, nm);
+            emit_a32(r.lo, r.hi, perm, r.file_off, maj, min, ino, nm);
     }
 
     /* Image-window heap + mmap bump arenas (backing offsets). */
     if (g_guest_proc_arm64) {
-        emit_a64(a64_guest_va(HEAP_BASE),
+        anon_a64(a64_guest_va(HEAP_BASE),
                  a64_guest_va(HEAP_BASE + g_heap_size),
                  "rw-p", "[heap]");
         if (g_mmap_next > MMAP_BASE)
-            emit_a64(a64_guest_va(MMAP_BASE), a64_guest_va(g_mmap_next),
-                     "rw-p", "[anon:mmap]");
+            anon_a64(a64_guest_va(MMAP_BASE), a64_guest_va(g_mmap_next),
+                     "rw-p", "[anon:libc_malloc]");
         uint32_t m2n = g_mmap2_next ? g_mmap2_next : g_mmap2_base;
         if (m2n > g_mmap2_base)
-            emit_a64(a64_guest_va(g_mmap2_base), a64_guest_va(m2n),
+            anon_a64(a64_guest_va(g_mmap2_base), a64_guest_va(m2n),
                      "rw-p", "[anon:mmap2]");
     } else {
-        emit_a32(HEAP_BASE, HEAP_BASE + g_heap_size, "rw-p", "[heap]");
+        emit_a32(HEAP_BASE, HEAP_BASE + g_heap_size, "rw-p", 0, 0, 0, 0,
+                 "[heap]");
     }
 
     /* High guest==host mappings (anonymous mmap outside the image window). */
@@ -4665,25 +5715,34 @@ static const char *synth_guest_maps(void) {
              * emulator's own architecture.  "[anon:a64]" said "something that
              * is not the app made this mapping", which is precisely what a
              * map-scanning anti-tamper library is looking for. */
-            emit_a64(m.lo, m.hi, perm, "");
+            anon_a64(m.lo, m.hi, perm, "");
         }
     }
 
     if (g_guest_proc_arm64) {
-        emit_a64(a64_guest_va(STACK_BASE),
+        anon_a64(a64_guest_va(STACK_BASE),
                  a64_guest_va(STACK_BASE + STACK_SIZE),
                  "rw-p", "[stack]");
+        /* The kernel stopped labelling thread stacks "[stack:<tid>]" in 4.5,
+         * and every Android release this emulator claims to be runs a later
+         * kernel, so that spelling is itself an artefact.  What a device shows
+         * instead is bionic's own name for the mapping it allocates for a new
+         * thread's stack and TLS, set with PR_SET_VMA_ANON_NAME. */
         for (const auto &t : g_threads) {
             if (!t.id || t.finished || !t.stack_base || !t.stack_size) continue;
-            /* The kernel writes the thread's own id here — the literal word
-             * "tid" is not a number any reader can parse, and a reader that
-             * cross-checks these against /proc/<pid>/task sees a mismatch. */
-            char stk[32];
-            snprintf(stk, sizeof stk, "[stack:%u]", guest_tid_of(t.id));
-            emit_a64(t.stack_base, t.stack_base + t.stack_size, "rw-p", stk);
+            char stk[48];
+            snprintf(stk, sizeof stk, "[anon:stack_and_tls:%u]",
+                     guest_tid_of(t.id));
+            anon_a64(t.stack_base, t.stack_base + t.stack_size, "rw-p", stk);
         }
+        /* Every Linux process has these two, mapped by the kernel above the
+         * stack.  A process with no [vdso] has had its address space built by
+         * something that is not the kernel. */
+        anon_a64(A64_VVAR_BASE, A64_VVAR_BASE + 0x4000ull, "r--p", "[vvar]");
+        anon_a64(A64_VDSO_BASE, A64_VDSO_BASE + 0x2000ull, "r-xp", "[vdso]");
     } else {
-        emit_a32(STACK_BASE, STACK_BASE + STACK_SIZE, "rw-p", "[stack]");
+        emit_a32(STACK_BASE, STACK_BASE + STACK_SIZE, "rw-p", 0, 0, 0, 0,
+                 "[stack]");
     }
 
     if (write(fd, out.data(), out.size()) < 0) { /* best effort */ }
@@ -4718,7 +5777,231 @@ static const char *thread_name_of(uint32_t tid);
  * /proc/self/task/<tid>/stat never lists the directory first, and finding
  * nothing there is exactly the "this process is being hollowed out" answer
  * anti-tamper code looks for. */
-static void synth_guest_task_refresh(const char *root) {
+static void write_guest_status(FILE *fp, uint32_t tgid, uint32_t tid,
+                               uint32_t ppid, const char *comm,
+                               char st, const char *st_name, unsigned threads,
+                               uint64_t vol, uint64_t nonvol,
+                               uint64_t sigblk);
+
+/* How many threads of `target_pid` a reader may enumerate.  g_threads also
+ * holds threads that have finished but not been joined, and slots retired by
+ * a join and kept for reuse; neither is written below, so neither may be
+ * counted in Threads: — a reader that compares the count against the entries
+ * it can find (an anti-tamper library does exactly that) would see threads it
+ * cannot enumerate and conclude they are hidden. */
+static unsigned synth_guest_task_live(uint32_t target_pid) {
+    unsigned live = target_pid == GUEST_TID_BASE ? 1u : 0u;
+    for (const auto &th : g_threads)
+        if (th.id && !th.finished && th.process_pid == target_pid) ++live;
+    return live;
+}
+
+/* Build the numeric entries visible in /proc from the live process table.
+ * The backing directory is shared by every guest process, so merely adding
+ * the current caller leaves exited helper pids behind forever.  A kernel
+ * procfs directory is a snapshot at readdir time: retired pids disappear,
+ * while every still-live process with the app uid remains visible. */
+static const char *synth_guest_proc_root(void)
+{
+    static char root[64];
+    DIR *dir;
+    struct dirent *de;
+    char path[PATH_MAX];
+
+    if (!root[0]) {
+        char tmpl[] = "/tmp/lunaria-proc-root-XXXXXX";
+        if (!mkdtemp(tmpl)) return nullptr;
+        snprintf(root, sizeof root, "%s", tmpl);
+    }
+
+    dir = opendir(root);
+    if (dir) {
+        while ((de = readdir(dir)) != nullptr) {
+            char *end;
+            (void)strtoul(de->d_name, &end, 10);
+            if (de->d_name[0] && *end == '\0') {
+                snprintf(path, sizeof path, "%s/%s", root, de->d_name);
+                (void)rmdir(path);
+            }
+        }
+        closedir(dir);
+    }
+
+    snprintf(path, sizeof path, "%s/%u", root, GUEST_TID_BASE);
+    (void)mkdir(path, 0555);
+    for (const ArmThread &th : g_threads) {
+        if (!th.id || th.finished || !th.process_pid) continue;
+        snprintf(path, sizeof path, "%s/%u", root, th.process_pid);
+        (void)mkdir(path, 0555);
+    }
+    snprintf(path, sizeof path, "%s/self", root);
+    (void)mkdir(path, 0555);
+    return root;
+}
+
+static const char *guest_process_comm(uint32_t pid)
+{
+    for (const ArmThread &th : g_threads)
+        if (th.id && !th.finished && th.process_pid == pid &&
+            th.process_comm[0])
+            return th.process_comm;
+    return guest_comm();
+}
+
+/* Scheduler id of a process leader.  The original app's leader is the
+ * scheduler's distinguished thread 0; an exec/fork child has pid == tid. */
+static uint32_t guest_process_leader_tid(uint32_t pid)
+{
+    if (pid == GUEST_TID_BASE) return 0;
+    for (const ArmThread &th : g_threads)
+        if (th.id && !th.finished && th.process_pid == pid &&
+            guest_tid_of(th.id) == pid)
+            return th.id;
+    return 0;
+}
+
+/* `S` or `R` in /proc: is this thread waiting for something, or on a CPU?
+ * Shared by the per-thread files and by the process record, which has to name
+ * the same state for the leader as its own task entry does. */
+static bool guest_thread_is_parked(const ArmThread &th)
+{
+    return th.sleep_until_ns || th.waiting_cond || th.waiting_mutex ||
+           th.waiting_rwlock || th.waiting_sem || th.waiting_futex ||
+           th.waiting_join || th.waiting_fds || th.waiting_signal;
+}
+
+/* Write one thread's comm/stat/status under `root`.  Index 0 is the process's
+ * main thread (scheduler thread 0); index i>0 is g_threads[i-1].  Nothing is
+ * written for a slot that is not a live thread of this process. */
+/* Which of a task directory's three files to produce. */
+enum SynthTaskFile { SYNTH_TASK_COMM, SYNTH_TASK_STAT, SYNTH_TASK_STATUS };
+
+/* Format one of them into `fp`.
+ *
+ * The bytes are the same whether they end up in a file under the synthetic
+ * task directory (for opendir/openat, which need a path) or in a memory
+ * stream handed straight to the guest's fopen().  One generator so the two
+ * cannot drift: a reader that opens /proc/<pid>/task/<tid>/status through
+ * stdio and the same reader using openat must not see different answers for
+ * the same thread at the same moment.
+ *
+ * `i` indexes g_threads + 1; 0 is the process's own leader thread. */
+static bool synth_guest_task_emit(FILE *fp, uint32_t target_pid, size_t i,
+                                  unsigned live, enum SynthTaskFile which) {
+    uint32_t sched_tid = 0;
+    if (!fp) return false;
+    if (!i && target_pid != GUEST_TID_BASE) return false;
+    if (i) {
+        if (i - 1 >= g_threads.size()) return false;
+        if (g_threads[i - 1].finished) return false;
+        if (g_threads[i - 1].process_pid != target_pid) return false;
+        sched_tid = g_threads[i - 1].id;
+        if (!sched_tid) return false;
+    }
+    const uint32_t tid = i ? guest_tid_of(sched_tid) : target_pid;
+    /* comm is the thread's name on a device — the one pthread_setname_np
+     * set, which is also what this emulator shows in its own dumps.
+     * Writing "lunaria" into every entry made a process whose threads are
+     * all called the same thing, which no UE title has. */
+    const char *nm = thread_name_of(sched_tid);
+    char comm[16];
+    if (tid == target_pid)
+        snprintf(comm, sizeof comm, "%s", guest_process_comm(target_pid));
+    else if (!nm || nm[0] == '?')
+        snprintf(comm, sizeof comm, "%s", guest_process_comm(target_pid));
+    else
+        snprintf(comm, sizeof comm, "%s", nm);
+    if (which == SYNTH_TASK_COMM) {
+        fprintf(fp, "%s\n", comm);
+        return true;
+    }
+    /* What the thread is actually doing.  Every entry used to say `R`, so
+     * a thread parked in nanosleep for a second looked to anything reading
+     * /proc as if it were spinning — which is not a state any device can
+     * be in, and is exactly what an anti-tamper library checks after it
+     * puts one of its own threads to sleep.  A parked thread is `S`
+     * (interruptible sleep), a running one is `R`, and a
+     * finished-but-unjoined one is not listed at all (above). */
+    char st = 'R';
+    const char *st_name = "running";
+    uint64_t cpu_ns = 0;
+    /* The process's own main thread is a thread like any other.  Leaving it
+     * out of this and reporting a constant `R` made the one thread every
+     * reader looks at first — an Android app's Java main thread, which spends
+     * essentially all of its life parked in the looper's epoll — claim to be
+     * on a CPU forever while its utime stood still, which is what a stopped
+     * process looks like. */
+    const ArmThread *self = nullptr;
+    if (i) {
+        self = &g_threads[i - 1];
+    } else {
+        for (const ArmThread &th : g_threads)
+            if (!th.id && !th.finished) { self = &th; break; }
+    }
+    if (self) {
+        cpu_ns = self->cpu_ns;
+        if (guest_thread_is_parked(*self)) { st = 'S'; st_name = "sleeping"; }
+    }
+    /* utime.  A thread that has run for minutes and reports zero CPU time
+     * has not run at all as far as /proc is concerned — and with guest
+     * sleeps honoured, a thread that sleeps really does stop consuming
+     * host CPU, so zero here is what a watchdog sees for a thread that is
+     * merely idle *and* for one that has been stopped by a debugger.  The
+     * scheduler knows exactly how long it gave this thread; report it, in
+     * the USER_HZ ticks /proc is written in. */
+    const unsigned long long utime = (unsigned long long)(cpu_ns / 10000000ull);
+    if (which == SYNTH_TASK_STAT) {
+        fprintf(fp,
+                "%u (%s) %c %u %u %u 0 -1 4194368 0 0 0 0 %llu 0 0 0 "
+                "20 0 %u 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                tid, comm, st,
+                i ? g_threads[i - 1].process_ppid : guest_ppid(),
+                target_pid, target_pid,
+                utime, live);
+        return true;
+    }
+    write_guest_status(fp, target_pid, tid,
+                       i ? g_threads[i - 1].process_ppid : guest_ppid(),
+                       comm, st, st_name, live,
+                       i ? g_threads[i - 1].vol_switches : 0ull,
+                       i ? g_threads[i - 1].nonvol_switches : 0ull,
+                       signal_mask_load(sched_tid));
+    return true;
+}
+
+/* The on-disk copy of one task entry, for the callers that need a path:
+ * opendir(3) has to walk a directory and openat(2) has to name a file. */
+static void synth_guest_task_write_entry(const char *root, uint32_t target_pid,
+                                         size_t i, unsigned live) {
+    uint32_t sched_tid = 0;
+    if (!i && target_pid != GUEST_TID_BASE) return;
+    if (i) {
+        if (i - 1 >= g_threads.size()) return;
+        if (g_threads[i - 1].finished) return;
+        if (g_threads[i - 1].process_pid != target_pid) return;
+        sched_tid = g_threads[i - 1].id;
+        if (!sched_tid) return;
+    }
+    const uint32_t tid = i ? guest_tid_of(sched_tid) : target_pid;
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof dir, "%s/%u", root, tid);
+    if (mkdir(dir, 0755) != 0 && errno != EEXIST) return;
+    static const struct { const char *name; enum SynthTaskFile which; } kFiles[] = {
+        { "comm",   SYNTH_TASK_COMM   },
+        { "stat",   SYNTH_TASK_STAT   },
+        { "status", SYNTH_TASK_STATUS },
+    };
+    for (const auto &e : kFiles) {
+        char f[PATH_MAX + 16];
+        snprintf(f, sizeof f, "%s/%s", dir, e.name);
+        if (FILE *fp = fopen(f, "w")) {
+            (void)synth_guest_task_emit(fp, target_pid, i, live, e.which);
+            fclose(fp);
+        }
+    }
+}
+
+static void synth_guest_task_refresh(const char *root, uint32_t target_pid) {
     /* Drop entries for threads that have gone: a stale directory would list
      * threads that no longer exist, which is the same kind of lie in the
      * other direction. */
@@ -4742,111 +6025,318 @@ static void synth_guest_task_refresh(const char *root) {
      * Threads: — a reader that compares the count against the entries it can
      * enumerate (an anti-tamper library does exactly that) would see threads
      * it cannot find and conclude they are hidden. */
-    unsigned live = 1;
-    for (const auto &th : g_threads)
-        if (th.id && !th.finished) ++live;
-    for (size_t i = 0; i <= g_threads.size(); ++i) {
-        uint32_t sched_tid = 0;
-        if (i) {
-            if (g_threads[i - 1].finished) continue;
-            sched_tid = g_threads[i - 1].id;
-            if (!sched_tid) continue;
-        }
-        const uint32_t tid = guest_tid_of(sched_tid);
-        char dir[PATH_MAX];
-        snprintf(dir, sizeof dir, "%s/%u", root, tid);
-        if (mkdir(dir, 0755) != 0 && errno != EEXIST) continue;
-        /* comm is the thread's name on a device — the one pthread_setname_np
-         * set, which is also what this emulator shows in its own dumps.
-         * Writing "lunaria" into every entry made a process whose threads are
-         * all called the same thing, which no UE title has. */
-        const char *nm = thread_name_of(sched_tid);
-        char comm[16];
-        if (!i || !nm || nm[0] == '?')
-            snprintf(comm, sizeof comm, "%s", guest_comm());
-        else
-            snprintf(comm, sizeof comm, "%s", nm);
-        char f[PATH_MAX + 16];
-        char line[320];
-        snprintf(f, sizeof f, "%s/comm", dir);
-        if (FILE *fp = fopen(f, "w")) { fprintf(fp, "%s\n", comm); fclose(fp); }
-        /* What the thread is actually doing.  Every entry used to say `R`, so
-         * a thread parked in nanosleep for a second looked to anything reading
-         * /proc as if it were spinning — which is not a state any device can
-         * be in, and is exactly what an anti-tamper library checks after it
-         * puts one of its own threads to sleep.  A parked thread is `S`
-         * (interruptible sleep), a running one is `R`, and a
-         * finished-but-unjoined one is not listed at all (above). */
-        char st = 'R';
-        const char *st_name = "running";
-        uint64_t cpu_ns = 0;
-        if (i) {
-            const ArmThread &th = g_threads[i - 1];
-            cpu_ns = th.cpu_ns;
-            if (th.sleep_until_ns || th.waiting_cond || th.waiting_mutex ||
-                th.waiting_rwlock || th.waiting_sem || th.waiting_futex ||
-                th.waiting_join || th.waiting_fds || th.waiting_signal) {
-                st = 'S';
-                st_name = "sleeping";
-            }
-        } else {
-            for (const auto &th : g_threads)
-                if (th.id == 0) { cpu_ns = th.cpu_ns; break; }
-        }
-        /* utime.  A thread that has run for minutes and reports zero CPU time
-         * has not run at all as far as /proc is concerned — and with guest
-         * sleeps honoured, a thread that sleeps really does stop consuming
-         * host CPU, so zero here is what a watchdog sees for a thread that is
-         * merely idle *and* for one that has been stopped by a debugger.  The
-         * scheduler knows exactly how long it gave this thread; report it, in
-         * the USER_HZ ticks /proc is written in. */
-        const unsigned long long utime = (unsigned long long)(cpu_ns / 10000000ull);
-        snprintf(f, sizeof f, "%s/stat", dir);
-        if (FILE *fp = fopen(f, "w")) {
-            snprintf(line, sizeof line,
-                     "%u (%s) %c %u %u %u 0 -1 4194368 0 0 0 0 %llu 0 0 0 "
-                     "20 0 %u 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-                     tid, comm, st, guest_ppid(), guest_pid(), guest_pid(),
-                     utime, live);
-            fputs(line, fp);
-            fclose(fp);
-        }
-        snprintf(f, sizeof f, "%s/status", dir);
-        if (FILE *fp = fopen(f, "w")) {
-            fprintf(fp, "Name:\t%s\nState:\t%c (%s)\nTgid:\t%u\n"
-                        "Pid:\t%u\nPPid:\t%u\n"
-                        "Uid:\t10000\t10000\t10000\t10000\n"
-                        "Gid:\t10000\t10000\t10000\t10000\n"
-                        "Threads:\t%u\n",
-                    comm, st, st_name, guest_pid(), tid, guest_ppid(), live);
-            fclose(fp);
-        }
-    }
+    const unsigned live = synth_guest_task_live(target_pid);
+    for (size_t i = 0; i <= g_threads.size(); ++i)
+        synth_guest_task_write_entry(root, target_pid, i, live);
 }
 
-static const char *synth_guest_task_dir(const char *tail) {
-    static char root[64] = "";
-    if (!root[0]) {
-        strcpy(root, "/tmp/lunaria-proc-task-XXXXXX");
-        if (!mkdtemp(root)) { root[0] = '\0'; return nullptr; }
+static const char *synth_guest_task_dir(uint32_t pid, const char *tail) {
+    /* A process owns its task directory.  Reusing one host directory for the
+     * app and an exec()-spawned helper lets whichever process reads second
+     * replace the first process's snapshot underneath it -- something procfs
+     * cannot do, and it also exposes the helper as an app pthread. */
+    static std::map<uint32_t, std::string> roots;
+    std::string &root = roots[pid];
+    if (root.empty()) {
+        char tmpl[] = "/tmp/lunaria-proc-task-XXXXXX";
+        if (!mkdtemp(tmpl)) { roots.erase(pid); return nullptr; }
+        root = tmpl;
     }
-    static char out[PATH_MAX];
-    synth_guest_task_refresh(root);
+    /* Path mapping is called concurrently by guest pthreads.  A process-wide
+     * scratch buffer lets one thread replace another thread's /proc path
+     * between synthetic_proc_path() and fopen(), which cannot happen in the
+     * kernel pathname lookup.  Keep only the returned spelling thread-local;
+     * the per-process task snapshot itself remains shared. */
+    static thread_local char out[PATH_MAX];
     if (!tail || !tail[0] || !strcmp(tail, "/")) {
-        snprintf(out, sizeof out, "%s", root);
+        /* Build one coherent snapshot before opendir().  Do not tear it down
+         * while the caller walks the open directory and opens each TID's
+         * status file: mutating a directory behind getdents produced missing
+         * and duplicate entries that no Linux procfs can return. */
+        synth_guest_task_refresh(root.c_str(), pid);
+        snprintf(out, sizeof out, "%s", root.c_str());
         return out;
     }
-    snprintf(out, sizeof out, "%s%s", root, tail);
+    snprintf(out, sizeof out, "%s%s", root.c_str(), tail);
+    /* procfs is read at open time, every time: /proc/<pid>/task/<tid>/status
+     * describes the thread as it is now, not as it was when some other thread
+     * last listed the directory.  Writing the entry once and leaving it froze
+     * State: and utime for the rest of the run, so a watchdog polling a thread
+     * it had just signalled saw it never leave the state it was parked in --
+     * which on a device means the process is stopped under a debugger.
+     *
+     * Regenerate the one entry that was asked for.  Rebuilding all of them
+     * would be both wrong (an open of one thread's file must not disturb a
+     * directory walk another thread is in the middle of) and expensive: a UE
+     * title has ~90 threads and this path runs hundreds of times a second. */
+    uint32_t want_tid = 0;
+    {
+        const char *q = tail + 1;
+        while (*q >= '0' && *q <= '9') want_tid = want_tid * 10u + (uint32_t)(*q++ - '0');
+        if (q == tail + 1 || (*q && *q != '/')) want_tid = 0;
+    }
+    if (want_tid) {
+        const unsigned live = synth_guest_task_live(pid);
+        size_t idx = SIZE_MAX;
+        if (want_tid == pid && pid == GUEST_TID_BASE) {
+            idx = 0;
+        } else {
+            for (size_t i = 0; i < g_threads.size(); ++i)
+                if (g_threads[i].id && !g_threads[i].finished &&
+                    g_threads[i].process_pid == pid &&
+                    guest_tid_of(g_threads[i].id) == want_tid) {
+                    idx = i + 1;
+                    break;
+                }
+        }
+        if (idx != SIZE_MAX) {
+            synth_guest_task_write_entry(root.c_str(), pid, idx, live);
+            return out;
+        }
+        /* No such thread any more.  Remove only this stale entry.  Rebuilding
+         * the whole backing directory here mutates it underneath a DIR that
+         * may still be walking the snapshot which produced this TID.  Linux
+         * lets that walk continue and only makes this particular open fail.
+         *
+         * Return NULL, not `out`: after unlink the path is gone, and handing
+         * the caller a dead pathname made fopen fall through to a host open
+         * of a missing file.  That is ENOENT either way, but NULL keeps the
+         * synthetic_proc_path contract ("substitute or nothing") and lets
+         * the /proc/ blocked-open path set errno in one place. */
+        char stale[PATH_MAX];
+        char leaf[PATH_MAX + 16];
+        snprintf(stale, sizeof stale, "%s/%u", root.c_str(), want_tid);
+        snprintf(leaf, sizeof leaf, "%s/stat", stale);   unlink(leaf);
+        snprintf(leaf, sizeof leaf, "%s/comm", stale);   unlink(leaf);
+        snprintf(leaf, sizeof leaf, "%s/status", stale); unlink(leaf);
+        rmdir(stale);
+        return nullptr;
+    }
+    /* A malformed/non-TID tail cannot name a task entry. */
     return out;
 }
 
 /* How many of the guest's threads are alive, for the two files that report it
  * next to a list a reader can check it against. */
 static unsigned guest_live_threads(void) {
-    unsigned live = 1;
+    const uint32_t pid = guest_pid();
+    unsigned live = pid == GUEST_TID_BASE ? 1u : 0u;
     for (const auto &th : g_threads)
-        if (th.id && !th.finished) ++live;
+        if (th.id && !th.finished && th.process_pid == pid) ++live;
     return live;
+}
+
+/* A per-thread /proc file as a stream, without touching the filesystem.
+ *
+ * procfs has no backing store: the kernel formats the answer while the caller
+ * is inside open(2), in the caller's own context, and nothing is written
+ * anywhere.  Serving these through the synthetic task directory meant every
+ * guest fopen() of one thread's status first created a directory and wrote
+ * three host files -- comm, stat and status -- and did all of it holding the
+ * ARM execution lock, which stops every other guest thread.
+ *
+ * Cross Worlds' security module polls /proc/<pid>/task/<tid>/status for every
+ * thread in the process, continuously, for the whole run.  During the load
+ * after the title screen that made fopen the single largest holder of the
+ * execution lock (a quarter to a third of everything the emulator spent
+ * outside guest code), for a file the guest reads three lines of.
+ *
+ * So: format the same bytes into memory and hand back a stream over them.
+ * Same generator, same content, no host file and no directory to keep in
+ * step.  Callers that genuinely need a path -- opendir(3) walking the task
+ * list, openat(2) naming a file -- still get the on-disk copy.
+ *
+ * Returns NULL when `path` is not one of these files, and the caller falls
+ * through to its existing handling.
+ */
+static bool synth_guest_task_bytes(const char *path, char **out_buf,
+                                   size_t *out_len) {
+    if (!path || !out_buf || !out_len || strncmp(path, "/proc/", 6) != 0)
+        return false;
+    *out_buf = nullptr;
+    *out_len = 0;
+
+    /* /proc/self/... is the calling process — rewrite before the numeric
+     * parse so fopen/open share one generator with /proc/<pid>/.... */
+    char self_buf[64];
+    if (!strncmp(path, "/proc/self/", 11)) {
+        snprintf(self_buf, sizeof self_buf, "/proc/%u/%s",
+                 guest_pid(), path + 11);
+        path = self_buf;
+    }
+
+    /* /proc/<pid>/task/<tid>/<leaf> and the equivalent /proc/<tid>/<leaf>. */
+    const char *p = path + 6;
+    char *end = nullptr;
+    unsigned long first = strtoul(p, &end, 10);
+    if (end == p || *end != '/' || first > UINT32_MAX) return false;
+
+    uint32_t pid = (uint32_t)first;
+    uint32_t tid = (uint32_t)first;
+    const char *leaf = end;
+    if (!strncmp(leaf, "/task/", 6)) {
+        const char *q = leaf + 6;
+        unsigned long n = strtoul(q, &end, 10);
+        if (end == q || *end != '/' || n > UINT32_MAX) return false;
+        tid = (uint32_t)n;
+        leaf = end;
+    } else {
+        /* The bare /proc/<tid>/… spelling names a thread of whichever
+         * process owns it, which is not necessarily <tid> itself. */
+        const uint32_t owner = guest_process_of_tid(tid);
+        if (!owner) return false;
+        pid = owner;
+    }
+
+    enum SynthTaskFile which;
+    if (!strcmp(leaf, "/status"))    which = SYNTH_TASK_STATUS;
+    else if (!strcmp(leaf, "/stat")) which = SYNTH_TASK_STAT;
+    else if (!strcmp(leaf, "/comm")) which = SYNTH_TASK_COMM;
+    else return false;
+
+    /* Which g_threads entry the tid names; 0 is the process leader. */
+    size_t idx = SIZE_MAX;
+    if (tid == pid && pid == GUEST_TID_BASE) {
+        idx = 0;
+    } else {
+        for (size_t i = 0; i < g_threads.size(); ++i)
+            if (g_threads[i].id && !g_threads[i].finished &&
+                g_threads[i].process_pid == pid &&
+                guest_tid_of(g_threads[i].id) == tid) {
+                idx = i + 1;
+                break;
+            }
+    }
+    /* A thread that has exited between a readdir and this open is ENOENT on
+     * Linux, never somebody else's record. */
+    if (idx == SIZE_MAX) return false;
+
+    /* NMSS polls every thread's status continuously.  Reformatting the full
+     * /proc status blob (and walking every mapped module for VmExe/VmLib) on
+     * every fopen was the hottest host path under that poll.  A few ms of
+     * reuse is still a correct snapshot: the kernel's own file is also a
+     * point-in-time read, not a live view. */
+    struct TaskBytesCache {
+        uint32_t pid, tid;
+        int which;
+        uint64_t until_ns;
+        char *buf;
+        size_t len;
+    };
+    static thread_local TaskBytesCache cache{};
+    const uint64_t now = host_mono_ns();
+    if (cache.buf && cache.pid == pid && cache.tid == tid &&
+        cache.which == (int)which && now < cache.until_ns) {
+        char *copy = (char *)malloc(cache.len + 1);
+        if (!copy) return false;
+        memcpy(copy, cache.buf, cache.len);
+        copy[cache.len] = 0;
+        *out_buf = copy;
+        *out_len = cache.len;
+        return true;
+    }
+
+    char *buf = nullptr;
+    size_t len = 0;
+    FILE *mem = open_memstream(&buf, &len);
+    if (!mem) return false;
+    const bool ok = synth_guest_task_emit(mem, pid, idx,
+                                          synth_guest_task_live(pid), which);
+    (void)fclose(mem);
+    if (!ok || !buf) { free(buf); return false; }
+
+    free(cache.buf);
+    cache.pid = pid;
+    cache.tid = tid;
+    cache.which = (int)which;
+    /* NMSS polls every thread's status continuously.  Reformatting the full
+     * blob on every fopen was the hottest host path under that poll.  A short
+     * TTL is still a correct point-in-time snapshot (as the kernel file is). */
+    cache.until_ns = now + 250'000'000ull; /* ~250 ms */
+    cache.len = len;
+    cache.buf = (char *)malloc(len + 1);
+    if (cache.buf) {
+        memcpy(cache.buf, buf, len);
+        cache.buf[len] = 0;
+    }
+
+    *out_buf = buf;
+    *out_len = len;
+    return true;
+}
+
+/* open(2) on /proc/<tid>/{status,stat,comm}: same bytes as fopen, but NMSS
+ * also uses open+read.  mkstemp+write on every open was as hot as the
+ * formatter; reuse one memfd per path for the task-bytes TTL. */
+static int synth_guest_task_open_fd(const char *path)
+{
+#if defined(__linux__)
+    struct ProcOpenCache {
+        char path[PATH_MAX];
+        uint64_t until_ns;
+        int fd;
+    };
+    static std::mutex mu;
+    static ProcOpenCache cache = {};
+
+    const uint64_t now = host_mono_ns();
+    {
+        std::lock_guard<std::mutex> g(mu);
+        if (cache.fd >= 0 && now < cache.until_ns &&
+            !strcmp(cache.path, path))
+            return dup(cache.fd);
+        if (cache.fd >= 0) {
+            close(cache.fd);
+            cache.fd = -1;
+        }
+    }
+
+    char *bytes = nullptr;
+    size_t blen = 0;
+    if (!synth_guest_task_bytes(path, &bytes, &blen) || !bytes || !blen)
+        return -1;
+
+    int fd = memfd_create("lunaria-proc", MFD_CLOEXEC);
+    if (fd < 0) {
+        free(bytes);
+        return -1;
+    }
+    ssize_t w = write(fd, bytes, blen);
+    free(bytes);
+    if (w < 0 || (size_t)w != blen) {
+        close(fd);
+        return -1;
+    }
+    if (lseek(fd, 0, SEEK_SET) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    {
+        std::lock_guard<std::mutex> g(mu);
+        snprintf(cache.path, sizeof cache.path, "%s", path);
+        cache.until_ns = now + 250'000'000ull;
+        cache.fd = fd;
+    }
+    return dup(fd);
+#else
+    (void)path;
+    return -1;
+#endif
+}
+
+/* Format a synthetic task file into an fmemopen stream.  A32 fopen and any
+ * caller that still wants a host FILE* use this; A64 prefers
+ * synth_guest_task_bytes + register_synth_gfile. */
+static FILE *synth_guest_task_stream(const char *path) {
+    char *buf = nullptr;
+    size_t len = 0;
+    if (!synth_guest_task_bytes(path, &buf, &len) || !buf)
+        return nullptr;
+    FILE *out = fmemopen(buf, len, "r");
+    if (!out) { free(buf); return nullptr; }
+    synth_stream_own(out, buf);
+    return out;
 }
 
 /* Field 22 of /proc/<pid>/stat is the process start time in USER_HZ ticks
@@ -4882,8 +6372,22 @@ static void guest_vm_pages(unsigned long long *vsize_pages,
     }
 }
 
+/* The state a process reports for itself is its leader thread's state, not a
+ * constant.  See guest_thread_is_parked(). */
+static char guest_process_state(uint32_t pid)
+{
+    const uint32_t leader = guest_process_leader_tid(pid);
+    for (const ArmThread &th : g_threads)
+        if (th.id == leader && !th.finished)
+            return guest_thread_is_parked(th) ? 'S' : 'R';
+    return 'R';
+}
+
 static const char *synth_guest_stat(void) {
-    static char file[64] = "";
+    /* Each opener gets independent backing, like a procfs file description.
+     * Rewriting one global temporary while another guest thread reads it
+     * produced torn records and reset that reader's offset underneath it. */
+    static thread_local char file[64] = "";
     if (!file[0]) {
         char buf[64]; strcpy(buf, "/tmp/lunaria-stat-XXXXXX");
         int fd = mkstemp(buf);
@@ -4900,20 +6404,164 @@ static const char *synth_guest_stat(void) {
         : (unsigned long long)(STACK_BASE + STACK_SIZE);
     unsigned long long vpages = 0, rpages = 0;
     guest_vm_pages(&vpages, &rpages);
-    const unsigned long long utime =
-        g_guest_cpu_ns.load(std::memory_order_relaxed) / 10000000ull;
+    const uint32_t pid = guest_pid();
+    uint64_t process_cpu_ns = pid == GUEST_TID_BASE
+        ? g_guest_cpu_ns.load(std::memory_order_relaxed) : 0;
+    if (pid != GUEST_TID_BASE)
+        for (const ArmThread &th : g_threads)
+            if (th.id && !th.finished && th.process_pid == pid)
+                process_cpu_ns += th.cpu_ns;
+    const unsigned long long utime = process_cpu_ns / 10000000ull;
     fprintf(fp,
-            "%u (%s) R %u %u %u 0 -1 4194304 0 0 0 0 %llu 0 0 0 20 0 %u 0 "
+            "%u (%s) %c %u %u %u 0 -1 4194304 0 0 0 0 %llu 0 0 0 20 0 %u 0 "
             "%llu %llu %llu 0 0 0 %llu 0 0 0 0 0 0 0 0 0 0 0 0\n",
-            guest_pid(), guest_comm(), guest_ppid(), guest_pid(), guest_pid(),
+            pid, guest_process_comm(pid), guest_process_state(pid),
+            guest_ppid(), pid, pid,
             utime, guest_live_threads(), guest_starttime_ticks(),
             vpages * 4096ull, rpages, stack_top);
     fclose(fp);
     return file;
 }
 
+
+/* Guest CPU topology, via sysconf / /proc/cpuinfo / /sys / status Cpus_allowed
+ * — must stay consistent (the host may have dozens of cores). */
+static unsigned guest_ncpu(void)
+{
+    const char *platform = lunaria_android_property("ro.board.platform");
+    if (platform && (!strcmp(platform, "gs101") ||
+                     !strcmp(platform, "gs201") ||
+                     !strcmp(platform, "exynos2100")))
+        return 8u;
+    return 4u;
+}
+
+/* /proc/<pid>/status, and /proc/<pid>/task/<tid>/status, as the kernel writes
+ * them.
+ *
+ * This used to emit sixteen of the fifty-odd lines Linux emits, in an order
+ * the kernel does not use.  Every field below is one a reader can ask for, and
+ * several are exactly what an anti-debug or anti-emulator check reads:
+ * TracerPid, the Cap* masks, SigQ/SigPnd, Seccomp_filters, Cpus_allowed and
+ * the two context-switch counters.  A file that simply does not contain them
+ * is not a file any kernel produced, and "the key is missing" is indis-
+ * tinguishable from "the key says something is wrong".
+ *
+ * Everything here is taken from state the emulator actually has: the memory
+ * figures come from the host mapping of the guest arena, the switch counters
+ * from the scheduler, the signal mask from the handlers the guest installed.
+ * The constants are the ones an installed Android app really has -- uid/gid in
+ * the 10000 range, the app group list, an empty effective capability set and
+ * the bounding set a zygote child keeps. */
+static void write_guest_status(FILE *fp, uint32_t tgid, uint32_t tid,
+                               uint32_t ppid, const char *comm,
+                               char st, const char *st_name, unsigned threads,
+                               uint64_t vol, uint64_t nonvol,
+                               uint64_t sigblk)
+{
+    if (lunaria_env("LUNARIA_TRACE_PROC") && sigblk) {
+        fprintf(stderr, "[proc-status] tgid=%u tid=%u SigBlk=%016llx\n",
+                tgid, tid, (unsigned long long)sigblk);
+    }
+    unsigned long long vpages = 0, rpages = 0;
+    guest_vm_pages(&vpages, &rpages);
+    const unsigned long long vsize_kb = vpages * 4ull;
+    const unsigned long long rss_kb   = rpages * 4ull;
+    /* VmExe and VmLib are the text of the main image and of everything else
+     * mapped with it.  Both were zero, which says the process is executing no
+     * code at all -- not a state a running process can report.  Take them from
+     * the modules actually mapped: the largest executable image is the one the
+     * process was started from. */
+    unsigned long long exe_kb = 0, lib_kb = 0;
+    for (const auto &r : g_loaded_regions) {
+        if (r.process_pid != tgid) continue;
+        if (!(r.flags & 1u) || r.hi <= r.lo) continue;
+        const unsigned long long kb = (unsigned long long)(r.hi - r.lo) / 1024ull;
+        if (kb > exe_kb) { lib_kb += exe_kb; exe_kb = kb; }
+        else             { lib_kb += kb; }
+    }
+    const unsigned ncpu = guest_ncpu();
+    char cpumask[32];
+    if (ncpu >= 64) snprintf(cpumask, sizeof cpumask, "ffffffffffffffff");
+    else snprintf(cpumask, sizeof cpumask, "%llx",
+                  (unsigned long long)((1ull << ncpu) - 1ull));
+    fprintf(fp,
+            "Name:\t%s\n"
+            "Umask:\t0077\n"
+            "State:\t%c (%s)\n"
+            "Tgid:\t%u\n"
+            "Ngid:\t0\n"
+            "Pid:\t%u\n"
+            "PPid:\t%u\n"
+            "TracerPid:\t0\n"
+            "Uid:\t10000\t10000\t10000\t10000\n"
+            "Gid:\t10000\t10000\t10000\t10000\n"
+            "FDSize:\t256\n"
+            "Groups:\t3003 9997 20000 50000 \n"
+            "NStgid:\t%u\n"
+            "NSpid:\t%u\n"
+            "NSpgid:\t%u\n"
+            "NSsid:\t%u\n"
+            "VmPeak:\t%8llu kB\n"
+            "VmSize:\t%8llu kB\n"
+            "VmLck:\t%8llu kB\n"
+            "VmPin:\t%8llu kB\n"
+            "VmHWM:\t%8llu kB\n"
+            "VmRSS:\t%8llu kB\n"
+            "RssAnon:\t%8llu kB\n"
+            "RssFile:\t%8llu kB\n"
+            "RssShmem:\t%8llu kB\n"
+            "VmData:\t%8llu kB\n"
+            "VmStk:\t%8llu kB\n"
+            "VmExe:\t%8llu kB\n"
+            "VmLib:\t%8llu kB\n"
+            "VmPTE:\t%8llu kB\n"
+            "VmSwap:\t%8llu kB\n"
+            "HugetlbPages:\t%8llu kB\n"
+            "CoreDumping:\t0\n"
+            "THP_enabled:\t1\n"
+            "Threads:\t%u\n"
+            "SigQ:\t0/%u\n"
+            "SigPnd:\t0000000000000000\n"
+            "ShdPnd:\t0000000000000000\n"
+            "SigBlk:\t%016llx\n"
+            "SigIgn:\t0000000000000000\n"
+            "SigCgt:\t%016llx\n"
+            "CapInh:\t0000000000000000\n"
+            "CapPrm:\t0000000000000000\n"
+            "CapEff:\t0000000000000000\n"
+            "CapBnd:\t0000000000000000\n"
+            "CapAmb:\t0000000000000000\n"
+            "NoNewPrivs:\t%u\n"
+            "Seccomp:\t2\n"
+            "Seccomp_filters:\t1\n"
+            "Speculation_Store_Bypass:\tthread vulnerable\n"
+            "SpeculationIndirectBranch:\tconditional enabled\n"
+            "Cpus_allowed:\t%s\n"
+            "Cpus_allowed_list:\t0-%u\n"
+            "Mems_allowed:\t1\n"
+            "Mems_allowed_list:\t0\n"
+            "voluntary_ctxt_switches:\t%llu\n"
+            "nonvoluntary_ctxt_switches:\t%llu\n",
+            comm, st, st_name, tgid, tid, ppid,
+            tgid, tid, tgid, tgid,
+            vsize_kb, vsize_kb, 0ull, 0ull,
+            rss_kb, rss_kb,
+            rss_kb, 0ull, 0ull,
+            vsize_kb > rss_kb ? vsize_kb - rss_kb : 0ull,
+            (unsigned long long)(THREAD_STACK_SIZE / 1024u),
+            exe_kb, lib_kb,
+            (unsigned long long)(rss_kb / 512u + 4ull), 0ull, 0ull,
+            threads, 12288u,
+            (unsigned long long)sigblk,
+            (unsigned long long)guest_sigcgt_mask(tgid),
+            g_guest_no_new_privs ? 1u : 0u,
+            cpumask, ncpu ? ncpu - 1u : 0u,
+            (unsigned long long)vol, (unsigned long long)nonvol);
+}
+
 static const char *synth_guest_status(void) {
-    static char file[64] = "";
+    static thread_local char file[64] = "";
     if (!file[0]) {
         char buf[64]; strcpy(buf, "/tmp/lunaria-proc-status-XXXXXX");
         int fd = mkstemp(buf);
@@ -4923,19 +6571,23 @@ static const char *synth_guest_status(void) {
     }
     FILE *fp = fopen(file, "w");
     if (!fp) return nullptr;
-    unsigned long long vpages = 0, rpages = 0;
-    guest_vm_pages(&vpages, &rpages);
     /* Uid was 1000 (the platform's `system` user) while getuid() answered
      * 10000; a process cannot disagree with itself about who it is.  An
      * installed app is in the 10000+ range, which is what getuid() says. */
-    fprintf(fp,
-            "Name:\t%s\nState:\tR (running)\nTgid:\t%u\nPid:\t%u\nPPid:\t%u\n"
-            "Uid:\t10000\t10000\t10000\t10000\n"
-            "Gid:\t10000\t10000\t10000\t10000\n"
-            "TracerPid:\t0\n"
-            "VmSize:\t%llu kB\nVmRSS:\t%llu kB\nThreads:\t%u\n",
-            guest_comm(), guest_pid(), guest_pid(), guest_ppid(),
-            vpages * 4ull, rpages * 4ull, guest_live_threads());
+    const uint32_t pid = guest_pid();
+    uint64_t vol = 0, nonvol = 0;
+    for (const auto &th : g_threads) {
+        if (th.id && !th.finished && th.process_pid == pid) {
+            vol += th.vol_switches;
+            nonvol += th.nonvol_switches;
+        }
+    }
+    const uint32_t leader_tid = guest_process_leader_tid(pid);
+    write_guest_status(fp, pid, pid, guest_ppid(), guest_process_comm(pid),
+                       guest_process_state(pid),
+                       guest_process_state(pid) == 'S' ? "sleeping" : "running",
+                       guest_live_threads(), vol, nonvol,
+                       signal_mask_load(leader_tid));
     fclose(fp);
     return file;
 }
@@ -4997,9 +6649,29 @@ static void thread_name_set(uint32_t tid, const char *nm) {
         cls = THREAD_CLASS_HTTP;
     else if (strstr(nm, "RenderThread") || strstr(nm, "RHIThread"))
         cls = THREAD_CLASS_RENDER;
-    else if (strstr(nm, "AsyncLoading"))
+    else if (strstr(nm, "AsyncLoading") ||
+             strstr(nm, "PoolThread") || strstr(nm, "TaskGraph"))
+        /* PoolThread / TaskGraph run FGenericReadRequest::PerformRequest for
+         * FPakPrecacher.  Leaving them as PLAIN let NMSS's /proc status poll
+         * own the engines for tens of seconds; in-flight IAsyncReadRequests
+         * were then destroyed from NewRequestsToLowerComplete → ForceQuit
+         * ("must not be deleted until they are completed").  Same floor as
+         * AsyncLoading so the IO workers finish before priority is lowered. */
         cls = THREAD_CLASS_ASYNC_LOAD;
     g_thread_class[tid].store(cls, std::memory_order_relaxed);
+}
+
+/* clone(2) copies the creating thread's comm into the child; bionic only
+ * calls prctl(PR_SET_NAME) afterwards, and only when the caller named the
+ * thread.  With no name of its own the child fell back to the *process* name
+ * in /proc/<pid>/task/<tid>/comm and status, which is the right answer only
+ * when the main thread created it -- a worker started by a named pool thread
+ * reports that pool thread's name on a device, and a reader that samples the
+ * thread table twice notices the difference. */
+static void thread_name_inherit(uint32_t child, uint32_t parent) {
+    if (child >= THREAD_TID_MAX || parent >= THREAD_TID_MAX) return;
+    if (!g_thread_name[parent][0]) return;
+    thread_name_set(child, g_thread_name[parent]);
 }
 
 // A64 scheduler: telling a spinning thread from a working one.
@@ -5088,8 +6760,8 @@ static uint32_t g_watch_flag_last = 0;
 // semaphore counters keyed by guest sem_t VA
 static std::map<GuestVA, int32_t> g_sems;
 
-// Signal handler table: VA registered via sigaction().
-static std::map<int, GuestVA> g_sighandlers;
+// Signal handler table is declared with the synthetic /proc implementation:
+// both sigaction and /proc/status expose the same process-wide dispositions.
 /* Linux signal numbers the emulator raises on the guest's behalf. */
 static constexpr int GUEST_SIGTRAP = 5;
 /* One blocked-signal mask per *guest* thread.
@@ -5252,7 +6924,41 @@ static void a64_fill_signal_frame(ArmExecCtx &ctx, int sig, uint32_t target_tid,
  * used to walk g_threads is a load. */
 static std::array<ArmThread *, 256> g_thread_by_tid{};
 static std::vector<ArmThread *> g_free_thread_slots;
-static std::vector<uint8_t>     g_free_tids;
+
+/* Ids given back by threads that have ended, oldest first.
+ *
+ * Linux hands out a tid by walking `last_pid` forward and only reuses a number
+ * after the counter has wrapped the whole pid space, so a number is free for
+ * tens of thousands of clones before it can name a thread again.  A LIFO stack
+ * does the exact opposite: it hands the number of the thread that died most
+ * recently to the next thread created, which for a title that spawns one
+ * short-lived worker per request means one tid naming a dozen unrelated
+ * threads a second.  Nothing on a device can observe that, and an integrity
+ * monitor walking /proc/<pid>/task sees a tid it read moments ago now carrying
+ * a different name, start address and stack — the signature of a hijacked
+ * thread.  Keep the queue in arrival order and take from the front, so the
+ * emulator reuses the number that has been free the longest, as the kernel's
+ * wrap does. */
+#define GUEST_FREE_TID_MAX 256u
+static uint8_t  g_free_tids[GUEST_FREE_TID_MAX];
+static unsigned g_free_tid_head;   /* next to hand out */
+static unsigned g_free_tid_count;
+
+static void guest_tid_release(uint32_t id) {
+    if (!id || g_free_tid_count >= GUEST_FREE_TID_MAX) return;
+    g_free_tids[(g_free_tid_head + g_free_tid_count) % GUEST_FREE_TID_MAX] =
+        (uint8_t)id;
+    ++g_free_tid_count;
+}
+
+static uint32_t guest_tid_take_oldest(void) {
+    uint32_t id;
+    if (!g_free_tid_count) return 0;
+    id = g_free_tids[g_free_tid_head];
+    g_free_tid_head = (g_free_tid_head + 1u) % GUEST_FREE_TID_MAX;
+    --g_free_tid_count;
+    return id;
+}
 
 /* The slot, whether or not the thread has ended. */
 static inline ArmThread *thread_slot_by_tid(uint32_t tid) {
@@ -5282,21 +6988,17 @@ static uint32_t alloc_guest_tid() {
      * pthread_create, ENOSYS-equivalent for fork()). */
     static constexpr uint32_t MAX_GUEST_TID = AUDIO_CB_TID - 1u;
     static uint32_t s_next_tid = 2;
-    if (!g_free_tids.empty()) {
-        uint32_t nid = g_free_tids.back();
-        g_free_tids.pop_back();
+    /* A number no thread has ever carried first, exactly as the kernel's
+     * forward-walking counter does before it wraps.  Only once the space is
+     * exhausted does a number come back, and then the one that has been free
+     * the longest. */
+    if (s_next_tid <= MAX_GUEST_TID)
+        return s_next_tid++;
+    if (uint32_t nid = guest_tid_take_oldest())
         return nid;
-    }
-    uint32_t nid = s_next_tid;
-    // Prefer a never-before-used id: recycling one after pthread_join confuses anything that keys long-lived per-thread state.
-    if (nid > MAX_GUEST_TID) {
-        for (nid = 2u; nid <= MAX_GUEST_TID; ++nid)
-            if (!g_thread_by_tid[nid]) break;
-        if (nid > MAX_GUEST_TID) return 0;
-    } else {
-        ++s_next_tid;
-    }
-    return nid;
+    for (uint32_t nid = 2u; nid <= MAX_GUEST_TID; ++nid)
+        if (!g_thread_by_tid[nid]) return nid;
+    return 0;
 }
 
 static void thread_retire(uint32_t id) {
@@ -5310,7 +7012,7 @@ static void thread_retire(uint32_t id) {
     sem_waiter_remove_tid(id);
     thread_index_forget(id);
     thread_sched_forget(id);
-    g_free_tids.push_back((uint8_t)id);
+    guest_tid_release(id);
     *t = ArmThread{};
     t->finished = true;
     g_free_thread_slots.push_back(t);
@@ -5331,6 +7033,15 @@ static void thread_retire(uint32_t id) {
  * an SVC; the direct hand-off normally wins, but the poll is what observes an
  * inline unlock that raced with parking. */
 static std::deque<uint8_t>      g_ready_queue;
+/* Newly-created threads also enter the ordinary ready queue.  This side queue
+ * only lets an idle engine find a first slice promptly; g_in_ready makes the
+ * two queue entries one logical runnable state. */
+static std::deque<uint8_t>      g_start_queue;
+static std::atomic<size_t>      g_starts_pending{0};
+static inline void start_queue_publish(void)
+{
+    g_starts_pending.store(g_start_queue.size(), std::memory_order_release);
+}
 static std::deque<uint8_t>      g_wait_poll;
 static std::array<bool, 256>    g_in_ready{};
 /* How many times the pass has taken each thread out of the ready queue.
@@ -5427,6 +7138,10 @@ static void thread_mark_ready_ex(uint32_t tid, bool urgent)
     ArmThread *t = thread_slot_by_tid(tid);
     if (!t || t->finished || t->running) return;
     g_in_ready[tid] = true;
+    if (!t->slices) {
+        g_start_queue.push_back((uint8_t)tid);
+        start_queue_publish();
+    }
     if (urgent) g_ready_queue.push_front((uint8_t)tid);
     else        g_ready_queue.push_back((uint8_t)tid);
     a64par::sched_poke();
@@ -5446,7 +7161,14 @@ static void thread_sched_update(ArmThread &t)
     sleep_heap_remove(t.id);
     if (thread_has_sync_wait(t)) {
         thread_mark_blocked(t.id);
-        if (const uint64_t due = thread_deadline_ns(t))
+        const uint64_t due = thread_deadline_ns(t);
+        if (t.waiting_sem && lunaria_env("LUNARIA_TRACE_SEM"))
+            fprintf(stderr, "[sem] park tid=%u sem=0x%llx timed=%d due=%llu "
+                    "in=%.3fms\n", t.id, (unsigned long long)t.waiting_sem,
+                    (int)t.sem_timed, (unsigned long long)due,
+                    due ? (double)((int64_t)due - (int64_t)host_mono_ns()) / 1e6
+                        : -1.0);
+        if (due)
             sleep_heap_push(t.id, due);
     } else if (thread_sleeping(t))
         sleep_heap_push(t.id, t.sleep_until_ns);
@@ -5543,6 +7265,28 @@ static void cond_wake_missed_note(const char *what, GuestVA cva, uint32_t lr)
             what, (unsigned long long)cva, g_current_tid, lr);
 }
 
+/* Is this svc entry the rewound return half of the wait `t` actually parked
+ * in?  A parked wait is resumed by re-executing the very same instruction, so
+ * the mutex operand it presents is the mutex it released.  Anything else is a
+ * *different* call on a thread whose parked record was never finished, and
+ * taking the return path for it would acquire a mutex the guest never asked
+ * for and return without waiting.  Honour what the guest asked instead, and
+ * say so: the stale record is an emulator bug, not a guest one. */
+static bool cond_reacq_matches(ArmThread &t, GuestVA mutex, uint32_t lr)
+{
+    if (t.cond_reacq == mutex) return true;
+    static int said;
+    if (said++ < 8)
+        fprintf(stderr, "[cond] BUG: tid=%u entered a wait on mutex=0x%llx "
+                "while a parked wait on mutex=0x%llx was never finished — "
+                "dropping the stale record (lr=0x%08x)\n",
+                t.id, (unsigned long long)mutex,
+                (unsigned long long)t.cond_reacq, lr);
+    t.cond_reacq = 0;
+    t.wait_result = 0;
+    return false;
+}
+
 static bool cond_reacquire_or_park(ArmExecCtx &ctx, ArmThread &t, GuestVA mva)
 {
     if (!mva) return true;
@@ -5550,6 +7294,16 @@ static bool cond_reacquire_or_park(ArmExecCtx &ctx, ArmThread &t, GuestVA mva)
     for (;;) {
         const uint32_t raw = guest_word_load(ctx.mem, mva);
         const uint32_t w = mutex_state(raw);
+        /* The scheduler may have made this thread runnable only after an
+         * inline guest lock path acquired the mutex.  In that case the POSIX
+         * postcondition is already satisfied.  Incrementing the count here
+         * silently turns a NORMAL mutex into a recursive one: the caller's
+         * matching unlock leaves depth one behind and its next lock becomes
+         * a self-deadlock (Cross Worlds then spun in timedwait for minutes).
+         * A cond wait reacquires exactly once, irrespective of which of the
+         * two legitimate acquisition paths won the race. */
+        if (w >= 0x100u && (w & 0xffu) == owner)
+            return true;
         if (w >= 0x100u && (w & 0xffu) != owner) {
             t.waiting_mutex = mva;
             guest_mutex_mark_contended(ctx.mem, mva);
@@ -5569,10 +7323,14 @@ static void arm_signal_save_wait(ArmThread &t, ArmSignalWaitState &w) {
     w.sem_until_ns = t.sem_until_ns;
     w.waiting_futex = t.waiting_futex;
     w.futex_val = t.futex_val;
+    w.futex_timed = t.futex_timed;
+    w.futex_until_ns = t.futex_until_ns;
+    w.futex_raw_result = t.futex_raw_result;
     w.waiting_cond = t.waiting_cond;
     w.waiting_join = t.waiting_join;
     w.join_retval_ptr = t.join_retval_ptr;
     w.join_is_waitpid = t.join_is_waitpid;
+    w.join_is_system = t.join_is_system;
     w.waiting_mutex = t.waiting_mutex;
     w.waiting_rwlock = t.waiting_rwlock;
     w.rwlock_want_write = t.rwlock_want_write;
@@ -5596,10 +7354,14 @@ static void arm_signal_clear_wait(ArmThread &t) {
     t.sem_until_ns = 0;
     t.waiting_futex = 0;
     t.futex_val = 0;
+    t.futex_timed = false;
+    t.futex_until_ns = 0;
+    t.futex_raw_result = false;
     t.waiting_cond = 0;
     t.waiting_join = 0;
     t.join_retval_ptr = 0;
     t.join_is_waitpid = false;
+    t.join_is_system = false;
     t.waiting_mutex = 0;
     t.waiting_rwlock = 0;
     t.rwlock_want_write = false;
@@ -5623,10 +7385,14 @@ static void arm_signal_restore_wait(ArmThread &t, const ArmSignalWaitState &w) {
     t.sem_until_ns = w.sem_until_ns;
     t.waiting_futex = w.waiting_futex;
     t.futex_val = w.futex_val;
+    t.futex_timed = w.futex_timed;
+    t.futex_until_ns = w.futex_until_ns;
+    t.futex_raw_result = w.futex_raw_result;
     t.waiting_cond = w.waiting_cond;
     t.waiting_join = w.waiting_join;
     t.join_retval_ptr = w.join_retval_ptr;
     t.join_is_waitpid = w.join_is_waitpid;
+    t.join_is_system = w.join_is_system;
     t.waiting_mutex = w.waiting_mutex;
     t.waiting_rwlock = w.waiting_rwlock;
     t.rwlock_want_write = w.rwlock_want_write;
@@ -5659,8 +7425,8 @@ static bool a64_deliver_pending_signal(ArmExecCtx &ctx, ArmThread &t) {
     const int sig = a64_pending_signal(t);
     if (!sig) return false;
     if (t.signal_depth >= A64_SIGNAL_DEPTH_MAX) return false;
-    auto hi = g_sighandlers.find(sig);
-    if (hi == g_sighandlers.end() || hi->second <= 1u) {
+    const GuestVA installed_handler = signal_handler_load(t.process_pid, sig);
+    if (installed_handler <= 1u) {
         t.pending_signals &= ~(1ull << (unsigned)(sig - 1));
         return false;
     }
@@ -5717,7 +7483,7 @@ static bool a64_deliver_pending_signal(ArmExecCtx &ctx, ArmThread &t) {
                           frame.si, frame.uc);
     if (!si_va || !uc_va) return false;
 
-    GuestVA handler = hi->second;
+    GuestVA handler = installed_handler;
     if (handler < 0x100000000ull && !a64_is_guest_va(handler))
         handler = a64_guest_va((BackingOffset)(uint32_t)handler);
     const GuestVA restorer = a64_sig_restorer(ctx);
@@ -5740,6 +7506,18 @@ static bool a64_deliver_pending_signal(ArmExecCtx &ctx, ArmThread &t) {
     ++t.signal_depth;
     t.pending_signals &= ~(1ull << (unsigned)(sig - 1));
     signal_mask_store(t.id, resume_mask | (1ull << (unsigned)(sig - 1)));
+    /* Which wait the signal interrupted decides what the interrupted call
+     * has to report.  A device answers EINTR for a sleep, a poll/read and a
+     * semaphore; a condition variable and a mutex are restarted underneath
+     * the caller.  Naming it here is the only way to see which one a guest
+     * was actually in. */
+    fprintf(stderr, "[signal] interrupted tid=%u wait: sleep=%d fds=%d sem=%d "
+            "futex=%d cond=%d mutex=%d rwlock=%d join=%d egl=%d\n", t.id,
+            frame.wait.sleep_until_ns != 0, (int)frame.wait.waiting_fds,
+            frame.wait.waiting_sem != 0, frame.wait.waiting_futex != 0,
+            frame.wait.waiting_cond != 0, frame.wait.waiting_mutex != 0,
+            frame.wait.waiting_rwlock != 0, frame.wait.waiting_join != 0,
+            frame.wait.waiting_egl_sync != 0);
     fprintf(stderr, "[signal] deliver sig=%d to tid=%u pc=0x%llx depth=%u\n",
             sig, t.id, (unsigned long long)handler, (unsigned)t.signal_depth);
     return true;
@@ -5962,6 +7740,34 @@ static bool mtrace_addr(GuestVA va) {
     }();
     return a && a == va;
 }
+struct MutexHistoryEvent {
+    GuestVA mva;
+    uint32_t tid, lr, before, after;
+    char op;
+};
+static std::array<MutexHistoryEvent, 4096> g_mutex_history{};
+static uint32_t g_mutex_history_pos;
+static void mutex_history(char op, GuestVA mva, uint32_t before, uint32_t after,
+                          uint32_t lr)
+{
+    if (!lunaria_env("LUNARIA_SLOW_MUTEX")) return;
+    g_mutex_history[g_mutex_history_pos++ & (g_mutex_history.size() - 1u)] =
+        {mva, g_current_tid, lr, before, after, op};
+}
+static void mutex_history_dump(GuestVA mva)
+{
+    if (!lunaria_env("LUNARIA_SLOW_MUTEX")) return;
+    fprintf(stderr, "[mutex-history] mutex=0x%llx newest last:\n",
+            (unsigned long long)mva);
+    const uint32_t begin = g_mutex_history_pos > g_mutex_history.size()
+                         ? g_mutex_history_pos - (uint32_t)g_mutex_history.size() : 0u;
+    for (uint32_t i = begin; i < g_mutex_history_pos; ++i) {
+        const MutexHistoryEvent &e = g_mutex_history[i & (g_mutex_history.size() - 1u)];
+        if (e.mva != mva) continue;
+        fprintf(stderr, "  %c tid=%u lr=0x%08x word %08x -> %08x\n",
+                e.op, e.tid, e.lr, e.before, e.after);
+    }
+}
 static std::map<GuestVA, uint32_t> g_futex_wait_addrs; /* uaddr -> count of waiting threads */
 static std::map<GuestVA, std::vector<uint8_t>> g_futex_waiters;
 static std::map<GuestVA, std::vector<uint8_t>> g_sem_waiters;
@@ -6064,6 +7870,9 @@ static uint32_t futex_wake_parked(GuestVA uaddr, uint32_t max_wake)
         if (!tp || tp->finished || tp->waiting_futex != uaddr)
             continue;
         tp->waiting_futex = 0;
+        tp->futex_timed = false;
+        tp->futex_until_ns = 0;
+        tp->futex_raw_result = false;
         tp->regs[0] = 0;
         tp->regs64[0] = 0;
         /* WAIT publishes its state inside the SVC, before the engine has
@@ -6110,6 +7919,37 @@ static uint32_t futex_publish_wake(GuestVA uaddr, uint32_t max_wake)
     return wake_count;
 }
 
+/* FUTEX_REQUEUE/CMP_REQUEUE move blocked waiters from a condition word to the
+ * associated mutex word without making them runnable.  Bionic broadcasts use
+ * exactly this shape (often nr_wake == 0), so treating every non-WAIT command
+ * as WAKE strands the entire condvar wait set on the old address. */
+static uint32_t futex_requeue_parked(GuestVA from, GuestVA to,
+                                     uint32_t max_move)
+{
+    if (!from || !to || from == to || !max_move) return 0;
+    auto it = g_futex_waiters.find(from);
+    if (it == g_futex_waiters.end()) return 0;
+    std::vector<uint8_t> moved;
+    auto &src = it->second;
+    for (auto p = src.begin(); p != src.end() && moved.size() < max_move; ) {
+        ArmThread *t = thread_slot_by_tid(*p);
+        if (!t || t->finished || t->waiting_futex != from) {
+            p = src.erase(p);
+            continue;
+        }
+        t->waiting_futex = to;
+        moved.push_back(*p);
+        p = src.erase(p);
+    }
+    if (src.empty()) g_futex_waiters.erase(it);
+    for (uint8_t tid : moved) futex_waiter_add(tid, to);
+    if (!moved.empty()) {
+        futex_wait_addr_remove(from, (uint32_t)moved.size());
+        g_futex_wait_addrs[to] += (uint32_t)moved.size();
+    }
+    return (uint32_t)moved.size();
+}
+
 static void sem_wake_parked(GuestVA sva, uint32_t max_wake)
 {
     auto sit = g_sems.find(sva);
@@ -6144,7 +7984,12 @@ static void sem_wake_parked(GuestVA sva, uint32_t max_wake)
  * "svc=0(?)" for every raw syscall a guest makes, which is the one entry that
  * can be any of twenty things — and the anti-tamper module makes nothing but
  * raw syscalls, so that is exactly where the ring stops being able to answer. */
-struct SvcTraceEnt { uint32_t svc, lr, r0, tid, raw; };
+/* `ns` is what turns the ring from "what it called" into "when it called it".
+ * A security module that waits on a helper thread and then reports a failure
+ * leaves the same call list whether it waited a millisecond or a second, and
+ * only the second one is a real wait; without the clock the dump cannot tell
+ * a starved scheduler from a refused answer. */
+struct SvcTraceEnt { uint32_t svc, lr, r0, tid, raw; uint64_t ns; };
 static SvcTraceEnt g_svc_ring[1024];
 static uint32_t    g_svc_ring_pos = 0;
 // Dedicated main-thread (tid=0) ring so worker SVC calls don't overwrite it
@@ -6155,13 +8000,15 @@ static uint32_t    g_svc_ring_main_pos = 0;
  * the time a thread reaches abort() the calls that led it there have been
  * overwritten by other threads' traffic, and "what was this thread doing" is
  * the whole question when an anti-tamper module decides to kill the app. */
-enum { SVC_TID_RING = 32 };
+/* Security/integrity workers often perform hundreds of allocator calls while
+ * assembling one report.  Keep enough history that the syscall which caused
+ * the report is not overwritten by that formatting work. */
+enum { SVC_TID_RING = 2048 };
 static SvcTraceEnt g_svc_ring_by_tid[THREAD_TID_MAX][SVC_TID_RING];
 static uint32_t    g_svc_ring_by_tid_pos[THREAD_TID_MAX];
 /* Per-SVC call counts.  A slow guest is usually a guest that leaves the JIT too
  * often, and the ring only shows the last 1024 calls — the histogram says which
  * entry points are actually worth turning into guest-side code. */
-static std::unordered_map<uint32_t, uint64_t> g_svc_hist;
 static uint64_t g_svc_total = 0;
 // Guest instructions retired, so throughput can be compared run to run.
 static uint64_t g_guest_ticks = 0;
@@ -6229,11 +8076,9 @@ static double emu_uptime_s(void) {
  * handler that opens a file is worth thousands of pthread_getspecific. */
 static constexpr uint32_t SVC_TIME_MAX = 4096u;
 static std::atomic<uint64_t> g_svc_ns_by_no[SVC_TIME_MAX];
-/* Calls per SVC number, always counted.  The old per-number histogram lived in
- * a std::map behind LUNARIA_SVC_STATS, and that switch also takes every SVC
- * back under the execution lock (the diagnostics inside the handlers are not
- * thread-safe) — so asking "how often is this called" changed the thing being
- * measured.  One relaxed increment into a flat array does not. */
+/* Calls per SVC number, always counted.  One relaxed increment into a flat
+ * array keeps the count independent of the execution lock and does not change
+ * the thing being measured. */
 static std::atomic<uint64_t> g_svc_calls_by_no[SVC_TIME_MAX];
 /* And raw `svc #0` by syscall number.  One tenth of this title's exits from
  * the JIT are svc 0, which as one bucket says nothing: a raw nanosleep, a raw
@@ -6253,18 +8098,11 @@ static std::atomic<uint64_t> g_slice_eng_ns{0}, g_slice_regs_ns{0},
 
 static void svc_hist_dump(void) {
     std::vector<std::pair<uint64_t, uint32_t>> v;
-    v.reserve(g_svc_hist.size());
-    for (auto &e : g_svc_hist) v.push_back({e.second, e.first});
-    /* The flat array counts every SVC whether or not the map is on, and it is
-     * the only source that does not itself change the run (see
-     * g_svc_calls_by_no).  Numbers at or above SVC_TIME_MAX are only in the
-     * map, so both are read. */
-    if (v.empty())
-        for (uint32_t i = 0; i < SVC_TIME_MAX; ++i) {
-            const uint64_t c =
-                g_svc_calls_by_no[i].load(std::memory_order_relaxed);
-            if (c) v.push_back({c, i});
-        }
+    for (uint32_t i = 0; i < SVC_TIME_MAX; ++i) {
+        const uint64_t c =
+            g_svc_calls_by_no[i].load(std::memory_order_relaxed);
+        if (c) v.push_back({c, i});
+    }
     std::sort(v.begin(), v.end(), std::greater<>());
     const double up = emu_uptime_s();
     fprintf(stderr, "[svc-hist] %llu SVCs total, %zu distinct; "
@@ -6314,10 +8152,6 @@ static void svc_hist_dump(void) {
     for (size_t i = 0; i < byt.size() && i < 24; ++i) {
         uint64_t calls =
             g_svc_calls_by_no[byt[i].second].load(std::memory_order_relaxed);
-        if (!calls) {
-            auto it = g_svc_hist.find(byt[i].second);
-            if (it != g_svc_hist.end()) calls = it->second;
-        }
         fprintf(stderr, "  %8.3fs  %5.1f%%  svc=%u(%s)%s\n",
                 (double)byt[i].first / 1e9,
                 all_ns ? 100.0 * (double)byt[i].first / (double)all_ns : 0.0,
@@ -6330,42 +8164,65 @@ static void svc_hist_dump(void) {
     }
 }
 
-/* The histogram costs a hash lookup per SVC, so it stays off unless asked for
- * (LUNARIA_SVC_STATS=1); the cheap total is always kept. */
-static int g_svc_stats = -1;
 static void svc_ring_record(uint32_t svc, uint32_t lr, uint32_t r0,
                             uint32_t raw = 0) {
     if (!g_svc_total) (void)emu_uptime_s();   /* start the throughput clock */
     ++g_svc_total;
-    if (g_svc_stats < 0) g_svc_stats = lunaria_env("LUNARIA_SVC_STATS") ? 1 : 0;
-    if (g_svc_stats) ++g_svc_hist[svc];
     if (svc < SVC_TIME_MAX)
         g_svc_calls_by_no[svc].fetch_add(1, std::memory_order_relaxed);
-    g_svc_ring[g_svc_ring_pos++ & 1023] = {svc, lr, r0, g_current_tid, raw};
+    const uint64_t now = host_mono_ns();
+    g_svc_ring[g_svc_ring_pos++ & 1023] = {svc, lr, r0, g_current_tid, raw, now};
     if (g_current_tid == 0)
-        g_svc_ring_main[g_svc_ring_main_pos++ & 255] = {svc, lr, r0, 0, raw};
+        g_svc_ring_main[g_svc_ring_main_pos++ & 255] = {svc, lr, r0, 0, raw, now};
     if (g_current_tid < THREAD_TID_MAX) {
         const uint32_t t = g_current_tid;
         g_svc_ring_by_tid[t][g_svc_ring_by_tid_pos[t]++ & (SVC_TID_RING - 1)] =
-            {svc, lr, r0, t, raw};
+            {svc, lr, r0, t, raw, now};
     }
 }
 
 /* The last SVCs of one guest thread, oldest first. */
+/* A tid is a slot, and slots are recycled.  The per-tid ring has to start
+ * empty for the thread that now owns the slot, or a dump mixes two lifetimes:
+ * a spawn trace read this way showed a poll/usleep loop that belonged to a
+ * thread which had already exited, and pointed the investigation at the
+ * wrong library. */
+static void svc_ring_reset_tid(uint32_t tid) {
+    if (tid >= THREAD_TID_MAX) return;
+    std::memset(g_svc_ring_by_tid[tid], 0, sizeof g_svc_ring_by_tid[tid]);
+    g_svc_ring_by_tid_pos[tid] = 0;
+}
+
 static void svc_ring_dump_tid(uint32_t tid) {
     if (tid >= THREAD_TID_MAX) return;
     fprintf(stderr, "[arm_exec] last SVCs of tid=%u (%s), oldest first:\n",
             tid, thread_name_of(tid));
     const uint32_t pos = g_svc_ring_by_tid_pos[tid];
+    /* Times are milliseconds before the newest entry, so the bottom of the
+     * dump reads 0 and the gaps above it are the waits. */
+    const uint64_t last =
+        g_svc_ring_by_tid[tid][(pos - 1u) & (SVC_TID_RING - 1)].ns;
+    unsigned shown = 0;
     for (uint32_t i = 0; i < SVC_TID_RING; ++i) {
         const SvcTraceEnt &e = g_svc_ring_by_tid[tid][(pos + i) & (SVC_TID_RING - 1)];
         if (!e.svc && !e.lr && !e.raw) continue;
+        /* Allocation mechanics drown the Android-facing observations this
+         * diagnostic exists to expose.  They remain in the ring and global
+         * histogram; omit only their repetitive printout. */
+        if (e.svc == SVC_MALLOC || e.svc == SVC_FREE ||
+            e.svc == SVC_CALLOC || e.svc == SVC_REALLOC ||
+            e.svc == SVC_PTHREAD_MUTEX_INIT ||
+            e.svc == SVC_PTHREAD_MUTEX_DESTROY)
+            continue;
+        const double ago = e.ns && last >= e.ns
+                               ? (double)(last - e.ns) / 1e6 : 0.0;
         if (e.svc)
-            fprintf(stderr, "  svc=%u(%s) lr=0x%08x r0=0x%08x\n",
-                    e.svc, svc_symbol_name(e.svc), e.lr, e.r0);
+            fprintf(stderr, "  -%8.1f ms  svc=%u(%s) lr=0x%08x r0=0x%08x\n",
+                    ago, e.svc, svc_symbol_name(e.svc), e.lr, e.r0);
         else
-            fprintf(stderr, "  raw syscall %u lr=0x%08x r0=0x%08x\n",
-                    e.raw, e.lr, e.r0);
+            fprintf(stderr, "  -%8.1f ms  raw syscall %u lr=0x%08x r0=0x%08x\n",
+                    ago, e.raw, e.lr, e.r0);
+        if (++shown >= 512) break;
     }
 }
 static void svc_ring_dump(void) {
@@ -6423,6 +8280,34 @@ static uint32_t errno_va(ArmExecCtx &ctx, uint32_t tid) {
     return va;
 }
 
+/* What the *guest* reads when it evaluates `errno` on the thread running
+ * right now — which is not the same question as "what did errno_va() name".
+ *
+ * bionic's `errno` is `*__errno()`, and __errno() is answered in guest code
+ * out of the thread's own TLS page (TLS64_ERRNO_OFF) without ever entering a
+ * handler.  TLS stores a backing offset; the fast stub OR's A64_GUEST_BASE
+ * before returning so the architectural LDR lands on the same cell.  A
+ * handler that writes errno_va()'s cell has therefore only set errno if that
+ * TLS slot names the same backing — when they disagree (or when the returned
+ * pointer was left bare and the LDR missed the arena entirely) the guest
+ * acts on a stale / zero errno: non-blocking connect() reported as
+ * EINPROGRESS but read back as 0 is closed instead of waited for.  Returns
+ * the value the guest would see and, through `ptr_out`, the backing cell.
+ *
+ * Reads TPIDR_EL0's backing directly: that is the register the guest's own
+ * `mrs x9, tpidr_el0` sees, not this emulator's tid -> page table, so a
+ * mismatch between the two shows up here rather than being papered over. */
+static uint32_t guest_errno_view(ArmExecCtx &ctx, uint32_t *ptr_out)
+{
+    if (ptr_out) *ptr_out = 0;
+    if (!ctx.is_arm64) return 0;
+    const uint64_t tls = g_tpidr_el0_val;
+    if (!tls) return 0;
+    const uint32_t cell = ctx.mem.read32((GuestVA)(tls + TLS64_ERRNO_OFF));
+    if (ptr_out) *ptr_out = cell;
+    return cell ? ctx.mem.read32((GuestVA)cell) : 0u;
+}
+
 /* Set the calling guest thread's errno.  A handler that reports failure
  * without one leaves the guest reading whatever the thread last stored. */
 /* ---- state behind the entry points that stopped being templates -------- */
@@ -6450,7 +8335,7 @@ struct GuestAtforkSlot {
     std::atomic<uint8_t> state{0}; /* 0 free, 1 being written, 2 published */
     GuestVA prepare = 0, parent = 0, child = 0;
 };
-static std::array<GuestAtforkSlot, 128> g_guest_atfork;
+static std::array<GuestAtforkSlot, GUEST_ATFORK_MAX> g_guest_atfork;
 
 /* Children created by fork().  A forked child is a guest thread sharing this
  * address space (see SVC_FORK), so waiting for one is waiting for that thread
@@ -6512,6 +8397,50 @@ static int32_t fork_child_reap(uint32_t tid)
     return status;
 }
 
+/* A forked child's own descriptor table.
+ *
+ * fork() gives the child a copy of the parent's descriptors, and the ordinary
+ * thing a child does before exec is to move a pipe end onto its stdout.  Every
+ * guest thread in this emulator shares one host descriptor table, so doing
+ * that for real would move the *emulator's* stdout onto the guest's pipe and
+ * the run would lose its log from that point on.  Record the child's changes
+ * instead: nothing but the child can observe them until its image is replaced,
+ * and execve() below is where they are applied. */
+static std::mutex g_child_fd_lock;
+static std::map<uint32_t, std::map<int, int>> g_child_fds;
+/* Almost every process never forks, and read/write are hot.  One relaxed load
+ * says whether the map can possibly have anything in it. */
+static std::atomic<uint32_t> g_child_fd_maps{0};
+
+static void child_fd_set(uint32_t tid, int newfd, int oldfd)
+{
+    std::lock_guard<std::mutex> g(g_child_fd_lock);
+    auto &proc = g_child_fds[tid];
+    if (proc.empty()) g_child_fd_maps.fetch_add(1, std::memory_order_relaxed);
+    proc[newfd] = oldfd;
+}
+
+static int child_fd_get(uint32_t tid, int fd)
+{
+    if (!g_child_fd_maps.load(std::memory_order_relaxed)) return fd;
+    std::lock_guard<std::mutex> g(g_child_fd_lock);
+    auto proc = g_child_fds.find(tid);
+    if (proc == g_child_fds.end()) return fd;
+    auto slot = proc->second.find(fd);
+    return slot == proc->second.end() ? fd : slot->second;
+}
+
+static void child_fd_forget(uint32_t tid)
+{
+    if (!g_child_fd_maps.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> g(g_child_fd_lock);
+    auto proc = g_child_fds.find(tid);
+    if (proc == g_child_fds.end()) return;
+    if (!proc->second.empty())
+        g_child_fd_maps.fetch_sub(1, std::memory_order_relaxed);
+    g_child_fds.erase(proc);
+}
+
 /* __cxa_thread_atexit_impl registrations belong to the guest thread, not to
  * whichever host worker happens to run one of its slices.  Independently
  * published fixed slots keep registration lock-free and stable while a
@@ -6546,28 +8475,22 @@ static std::unordered_map<GuestVA, size_t> g_sysprop_index_by_handle;
 
 static const char *sysprop_value_for(const char *name, bool is_arm64) {
     if (!name) return "";
-    static char sdk_str[8];
-    if (!sdk_str[0]) snprintf(sdk_str, sizeof sdk_str, "%d", lunaria_sdk_int());
-    const std::pair<const char *, const char *> props[] = {
-        {"ro.build.version.sdk",     sdk_str},
-        {"ro.build.version.release", lunaria_android_release()},
-        {"ro.product.cpu.abi",       "armeabi-v7a"},
-        {"ro.product.cpu.abi2",      ""},
-        {"ro.product.cpu.abilist",   "armeabi-v7a,armeabi"},
-        {"ro.product.manufacturer",  "Lunaria"},
-        {"ro.product.model",         "Lunaria"},
-        {"ro.product.board",         "lunaria"},
-        {"ro.hardware",              "lunaria"},
-    };
-    for (auto &p : props)
-        if (!strcmp(name, p.first)) return p.second;
+    /* The ABI list describes the image this context is running; everything
+     * else describes the device, and the device is described in exactly one
+     * place -- the same table android.os.Build is a view of.  Two tables were
+     * two answers to one question (ro.product.model said "Lunaria" while
+     * Build.MODEL said "berry"), which no Android device can produce. */
     if (is_arm64) {
         if (!strcmp(name, "ro.product.cpu.abi") ||
             !strcmp(name, "ro.product.cpu.abilist") ||
             !strcmp(name, "ro.product.cpu.abilist64"))
             return "arm64-v8a";
+    } else {
+        if (!strcmp(name, "ro.product.cpu.abi"))     return "armeabi-v7a";
+        if (!strcmp(name, "ro.product.cpu.abilist")) return "armeabi-v7a,armeabi";
     }
-    return "";
+    if (!strcmp(name, "ro.product.cpu.abi2")) return "";
+    return lunaria_android_property(name);
 }
 
 static GuestVA sysprop_alloc_handle(ArmExecCtx &ctx) {
@@ -6630,6 +8553,32 @@ static uint64_t g_guest_abort_count = 0;
  * registered at all — nothing but a wake could ever have moved it. */
 enum { ALOOPER_TID_BITS = 4096 };
 static std::atomic<uint64_t> g_alooper_wake_bits[ALOOPER_TID_BITS / 64];
+
+/* pthread_cond_signal that found no waiter, attributed to the signalling
+ * thread.  Swappy's ChoreographerThread notify_all's Filters; when those
+ * signals land before Filter0/1 have entered wait, Swappy burns its
+ * MAX_CALLBACKS_BEFORE_IDLE (10) budget, goes idle, and present freezes —
+ * Filters then wait forever for a vsync that will never be re-posted
+ * (Cross Worlds: "633 signal(s) found no waiter", then
+ * "park with no queued choreographer callback").  drive_ndk_choreographer
+ * reads this to hold the next vsync until Filters have had a turn. */
+static std::atomic<uint64_t> g_cond_orphan_signal_tid_bits[ALOOPER_TID_BITS / 64];
+
+static void cond_orphan_signal_note(uint32_t tid)
+{
+    if (tid == 0 || tid >= ALOOPER_TID_BITS) return;
+    g_cond_orphan_signal_tid_bits[tid / 64].fetch_or(
+        1ull << (tid % 64), std::memory_order_relaxed);
+}
+
+static bool cond_orphan_signal_take(uint32_t tid)
+{
+    if (tid == 0 || tid >= ALOOPER_TID_BITS) return false;
+    const uint64_t bit = 1ull << (tid % 64);
+    return (g_cond_orphan_signal_tid_bits[tid / 64].fetch_and(
+                ~bit, std::memory_order_relaxed) & bit) != 0;
+}
+
 /* The thread-local Looper owns one implicit reference.  acquire/release alter
  * only the extra native references and therefore never drop below one while
  * its guest thread exists. */
@@ -6700,8 +8649,20 @@ static void alooper_wake_set(uint32_t tid) {
  * ALOOPER_POLL_WAKE at once and none of them ever blocks again — measured as
  * `ended by: quantum 100%` with the frame pump starved out entirely. */
 static std::atomic<bool> g_alooper_wake_unnamed{false};
-static void alooper_wake_unnamed(void) {
+static void alooper_wake_unnamed(uint64_t handle, uint32_t caller_tid) {
     g_alooper_wake_unnamed.store(true, std::memory_order_release);
+    /* ALooper_forThread()/ALooper_prepare() only ever hand out handles in
+     * [ARM_ALOOPER_BASE, +ALOOPER_TID_BITS), so a legitimate handle never
+     * reaches here.  Every hit is therefore either a NULL/garbage argument
+     * the guest passed, or a Looper this emulator never minted (a private
+     * android::Looper the guest's own code constructed directly) — worth
+     * seeing so a future fix has evidence instead of a guess. */
+    static uint32_t reported = 0;
+    if (reported++ < 32)
+        fprintf(stderr, "[alooper] wake with unrecognised handle=0x%llx "
+                "caller_tid=%u — delivered to whichever parked Looper "
+                "notices first\n",
+                (unsigned long long)handle, caller_tid);
 }
 static bool alooper_wake_take(uint32_t tid) {
     if (tid < ALOOPER_TID_BITS) {
@@ -6736,6 +8697,11 @@ static std::vector<ALooperFd> g_alooper_fds;
  * process-wide counter made one thread's callback look like another's nested
  * one, so both picked the same JIT and the same guest stack. */
 static thread_local int g_cb_depth = 0;
+/* A callback can suspend the pump's current scheduling pass.  Idle engines
+ * must still dispatch runnable threads while that callback waits; restricting
+ * them to expired sleepers prevents a newly created producer from starting.
+ * Count waits, rather than callbacks, so nested/concurrent waits are balanced. */
+static unsigned g_callback_waiters = 0;
 /* Guest-thread slices nested on this host thread.
  *
  * A callback that waits drives the scheduler while it waits, so a guest
@@ -6823,7 +8789,8 @@ static void mutex_owner_sanity(uint32_t tid, GuestVA mva, uint32_t word,
  * call_guest_abi* grants the word before the next Run(), after letting other
  * guest threads progress.  No unlock-enter, no steal of the owner byte. */
 struct CbLockWait {
-    enum Kind : uint8_t { Idle = 0, Mu = 1, Rd = 2, Wr = 3, Cond = 4 };
+    enum Kind : uint8_t { Idle = 0, Mu = 1, Rd = 2, Wr = 3, Cond = 4,
+                          Sleep = 5 };
     Kind     kind = Idle;
     GuestVA  mva = 0;
     uint32_t owner = 0; /* mutex: (tid+1)&0xff */
@@ -7083,32 +9050,36 @@ struct GuestEglSurfRec {
 static std::vector<GuestEglSurfRec> g_egl_surf_tab;
 static constexpr uint32_t ARM_EGL_SURFTAB_BASE = 0x20u;
 static EGLContext  g_egl_ctx  = EGL_NO_CONTEXT;
+/* init_host_egl owns the native window while the launch card is visible.
+ * The first Android eglCreateWindowSurface transfers that window to the
+ * application and may select a different EGLConfig. */
+static bool g_egl_guest_window_created = false;
 
-// Window / EGL surface size.
-static int g_fb_w = 1280;
-static int g_fb_h = 720;
+// Window / EGL surface size.  The initial value is the emulated display —
+// the device profile's panel, turned the way the app asked for and scaled by
+// LUNARIA_SCALE (see lunaria_screen() in src/jvm/jni_stubs.c).  It is not a
+// constant after that: the guest may name a view size, and the operator may
+// drag the window edge, and both are surface changes the guest is told about.
+static int g_fb_w = 0;
+static int g_fb_h = 0;
 
 static void init_fb_size_from_env(void) {
     static bool done = false;
     if (done) return;
     done = true;
-    if (const char *e = lunaria_env("LUNARIA_WIDTH")) {
-        int v = atoi(e);
-        if (v >= 64 && v <= 4096) g_fb_w = v;
-    }
-    if (const char *e = lunaria_env("LUNARIA_HEIGHT")) {
-        int v = atoi(e);
-        if (v >= 64 && v <= 4096) g_fb_h = v;
-    }
+    const struct lunaria_screen *scr = lunaria_screen();
+    g_fb_w = scr->width;
+    g_fb_h = scr->height;
 }
 
 extern "C" int arm_exec_fb_width(void)  { init_fb_size_from_env(); return g_fb_w; }
 extern "C" int arm_exec_fb_height(void) { init_fb_size_from_env(); return g_fb_h; }
 
 // Screen density in dpi, shared by every surface that reports it to the guest.
+// Same source as the pixel count, so an app that computes dp from the two
+// cannot find them describing different displays.
 static long lunaria_screen_dpi(void) {
-    long dpi = lunaria_env_long("LUNARIA_DPI", 420);
-    return dpi > 0 ? dpi : 420;
+    return lunaria_screen()->density;
 }
 
 static constexpr uint32_t ARM_ACONFIG = 0xACF60001u;
@@ -7120,6 +9091,15 @@ static int32_t acfg_int_value(uint32_t which) {
     // dp = px * 160 / dpi (Android's density-independent pixel).
     const int wdp = (int)((long)w * 160 / dpi);
     const int hdp = (int)((long)h * 160 / dpi);
+    // Android's screen-size and screen-long buckets are properties of the dp
+    // surface, not fixed facts about a phone: the framework derives them from
+    // smallestWidthDp and the long/short aspect ratio (the same numbers the
+    // "swNNNdp" resource qualifiers use), so a panel that is not the Pixel 6's
+    // must not keep reporting the Pixel 6's buckets — an app's own resource
+    // selection (layout-normal vs layout-xlarge, layout-long vs -notlong)
+    // would silently disagree with the surface it is actually given.
+    const int smallest_dp = wdp < hdp ? wdp : hdp;
+    const int longest_dp  = wdp < hdp ? hdp : wdp;
     switch (which) {
     case ACFG_I_MCC:          return 0;   /* no SIM — matches TelephonyManager */
     case ACFG_I_MNC:          return 0;
@@ -7130,8 +9110,18 @@ static int32_t acfg_int_value(uint32_t which) {
     case ACFG_I_NAVIGATION:   return 1;   /* NONAV */
     case ACFG_I_KEYSHIDDEN:   return 3;   /* SOFT — on-screen keyboard only */
     case ACFG_I_NAVHIDDEN:    return 2;   /* YES */
-    case ACFG_I_SCREENSIZE:   return 2;   /* NORMAL (phone) */
-    case ACFG_I_SCREENLONG:   return 2;   /* YES (16:9 and taller) */
+    case ACFG_I_SCREENSIZE:
+        /* smallestWidthDp thresholds, matching the sw320/480/720dp resource
+         * qualifier boundaries the framework itself uses. */
+        if (smallest_dp >= 720) return 4;  /* XLARGE */
+        if (smallest_dp >= 480) return 3;  /* LARGE */
+        if (smallest_dp >= 320) return 2;  /* NORMAL */
+        return 1;                          /* SMALL */
+    case ACFG_I_SCREENLONG:
+        /* Android calls a screen "long" at an aspect ratio of 1.75:1 or
+         * more (roughly 16:9); 4:3 (1.33) and similar are "notlong". */
+        return (longest_dp * 100 >= smallest_dp * 175) ? 2 /* YES */
+                                                        : 1 /* NO */;
     case ACFG_I_UIMODETYPE:   return 1;   /* NORMAL */
     case ACFG_I_UIMODENIGHT:  return 1;   /* NO */
     case ACFG_I_LAYOUTDIR:    return 1;   /* LTR */
@@ -7142,11 +9132,80 @@ static int32_t acfg_int_value(uint32_t which) {
     }
 }
 
+/* The locale the emulated device is configured in.
+ *
+ * A device has one, and an app picks its language from it.  Cross Worlds shows
+ * Japanese on a Japanese device and falls back to its own source language --
+ * every string rendered as "(ko)<Korean>" -- when it cannot tell.  This
+ * emulator hardcoded en/US in three separate places (AConfiguration here,
+ * java.util.Locale's default and android.os.LocaleList in the VM) with no way
+ * to say otherwise, so every guest was told it was on a US-English device
+ * whatever the machine around it was set to.
+ *
+ * LUNARIA_LOCALE names it outright ("ja-JP", "ja_JP" or just "ja").  Failing
+ * that it follows this machine's own LC_ALL / LC_MESSAGES / LANG, which is
+ * what "the device this emulator stands in for" means when nobody has said
+ * otherwise.  This project's emulated handset is configured as ja/JP when
+ * the host exposes only the non-geographic C/POSIX locale; callers can always
+ * select another device locale explicitly with LUNARIA_LOCALE. */
+extern "C" void arm_exec_device_locale(char *lang2, char *country2)
+{
+    static char lang[3] = "";
+    static char country[3] = "";
+    if (!lang[0]) {
+        const char *spec = lunaria_env("LUNARIA_LOCALE");
+        const char *source = "LUNARIA_LOCALE";
+        /* C/POSIX is a formatting locale, not a device language.  Build and
+         * launcher environments commonly set LC_ALL=C.UTF-8 while preserving
+         * the user's actual language in LANG.  Stopping at the first nonempty
+         * variable therefore turned a ja_JP host into an en_US Android device
+         * and made Cross Worlds fall back to its Korean source strings. */
+        auto usable = [](const char *s) {
+            return s && *s && strcmp(s, "C") != 0 &&
+                   strncmp(s, "C.", 2) != 0 && strncmp(s, "POSIX", 5) != 0 &&
+                   isalpha((unsigned char)s[0]) &&
+                   isalpha((unsigned char)s[1]);
+        };
+        if (!usable(spec)) { spec = getenv("LC_ALL"); source = "LC_ALL"; }
+        if (!usable(spec)) { spec = getenv("LC_MESSAGES"); source = "LC_MESSAGES"; }
+        if (!usable(spec)) { spec = getenv("LANG"); source = "LANG"; }
+        /* "ja_JP.UTF-8", "ja-JP", "ja".  "C" and "POSIX" name no place. */
+        char l[3] = "ja", c[3] = "JP";
+        if (usable(spec)) {
+            l[0] = (char)tolower((unsigned char)spec[0]);
+            l[1] = (char)tolower((unsigned char)spec[1]);
+            l[2] = '\0';
+            const char *sep = spec + 2;
+            if ((*sep == '_' || *sep == '-') &&
+                isalpha((unsigned char)sep[1]) && isalpha((unsigned char)sep[2])) {
+                c[0] = (char)toupper((unsigned char)sep[1]);
+                c[1] = (char)toupper((unsigned char)sep[2]);
+                c[2] = '\0';
+            } else {
+                /* A language with no region: the app still needs one, and a
+                 * region that contradicts the language is worse than the
+                 * conventional pairing. */
+                c[0] = (char)toupper((unsigned char)l[0]);
+                c[1] = (char)toupper((unsigned char)l[1]);
+                c[2] = '\0';
+            }
+        }
+        memcpy(lang, l, 3);
+        memcpy(country, c, 3);
+        fprintf(stderr, "[locale] device locale %s_%s (from %s)\n",
+                lang, country, usable(spec) ? source : "fallback");
+    }
+    if (lang2) { lang2[0] = lang[0]; lang2[1] = lang[1]; lang2[2] = '\0'; }
+    if (country2) { country2[0] = country[0]; country2[1] = country[1];
+                    country2[2] = '\0'; }
+}
+
 struct GuestAConfiguration {
     int32_t fields[ACFG_I_COUNT]{};
     int32_t sdk_version = 31;
     char language[3] = "en";
     char country[3] = "US";
+    GuestAConfiguration() { arm_exec_device_locale(language, country); }
 };
 
 static GuestAConfiguration acfg_device_default() {
@@ -7438,8 +9497,12 @@ static bool join_try_complete(ArmExecCtx &ctx, ArmThread &joiner,
     const uint32_t joined = joiner.waiting_join;
     /* waitpid() reports the child's pid and an int status; pthread_join()
      * reports 0 and the void* the thread produced. */
-    const uint64_t result = joiner.join_is_waitpid ? joined : 0u;
-    if (joiner.join_is_waitpid) {
+    uint64_t result = joiner.join_is_waitpid ? joined : 0u;
+    if (joiner.join_is_system) {
+        /* system() hands the status straight back, the way the shell's own
+         * exit code reaches the caller on a device. */
+        result = (uint64_t)(uint32_t)fork_child_reap(joined);
+    } else if (joiner.join_is_waitpid) {
         const int32_t status = fork_child_reap(joined);
         if (joiner.join_retval_ptr)
             ctx.mem.write32(joiner.join_retval_ptr, (uint32_t)status);
@@ -7453,6 +9516,7 @@ static bool join_try_complete(ArmExecCtx &ctx, ArmThread &joiner,
     joiner.waiting_join = 0;
     joiner.join_retval_ptr = 0;
     joiner.join_is_waitpid = false;
+    joiner.join_is_system = false;
     joiner.regs[0] = (uint32_t)result;
     joiner.regs64[0] = result;
     if (join_reap) join_reap->push_back(joined);
@@ -8108,6 +10172,9 @@ static void call_guest_abi32(ArmExecCtx &ctx, uint32_t fn_va, const GuestArg *ar
                              int nargs, char ret_kind, GuestRet *out);
 static void call_guest_abi64(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *args,
                              int nargs, char ret_kind, GuestRet *out);
+/* Loader constructors use a private callback JIT but retain AEL, keeping the
+ * entire link operation atomic. */
+static thread_local bool g_cb64_keep_ael;
 static void call_guest_abi(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *args,
                            int nargs, char ret_kind, GuestRet *out);
 
@@ -8390,6 +10457,69 @@ static uint64_t host_mono_ns() {
     return (uint64_t)ts.tv_sec * 1'000'000'000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* Earliest host time at which drive_ndk_choreographer() would deliver a
+ * queued callback for `tid`, or 0 if none.  ALooper_pollOnce must not park
+ * past this: on a device the Choreographer's eventfd becomes readable then. */
+static uint64_t ndk_choreo_looper_due_ns(uint32_t tid)
+{
+    uint64_t earliest_due = 0;
+    for (const NdkChoreoCb &c : g_ndk_choreo_q) {
+        if (c.tid != tid) continue;
+        if (!earliest_due || c.due_ns < earliest_due) earliest_due = c.due_ns;
+    }
+    if (!earliest_due) return 0;
+    auto nv = g_ndk_choreo_next_vsync.find(tid);
+    if (nv != g_ndk_choreo_next_vsync.end() && nv->second > earliest_due) {
+        /* Honour a short pace gate; ignore one that has drifted far ahead of
+         * the callback's own due time — that is a stuck virtual clock, not a
+         * vsync, and waiting on it left SwappyChoreographer in ALooper_pollOnce
+         * for tens of seconds while Filter0/1 starved for their signal. */
+        const uint64_t gate = nv->second;
+        if (gate <= earliest_due + 4 * A_VSYNC_PERIOD_NS)
+            return gate;
+    }
+    return earliest_due;
+}
+
+/* AChoreographer posting must wake the owning Looper, same as the platform's
+ * eventfd write.  Without it a thread parked in ALooper_pollOnce(-1) with
+ * deadline_ms=-1 only notices the new callback when something else happens to
+ * re-check ready() — and when ready() also gated on a stuck next_vsync, the
+ * check never succeeded (Cross Worlds: tid=90 "still in ALooper_pollOnce
+ * after 15s" with tens of thousands of re-polls returning 0). */
+static void ndk_choreo_arm_looper(uint32_t tid, uint64_t due_ns)
+{
+    if (!tid || !due_ns) return;
+    uint64_t wake_at = due_ns;
+    auto nv = g_ndk_choreo_next_vsync.find(tid);
+    if (nv != g_ndk_choreo_next_vsync.end() && nv->second > wake_at &&
+        nv->second <= due_ns + 4 * A_VSYNC_PERIOD_NS)
+        wake_at = nv->second;
+    /* Publish into the sleep-timer heap so a delayed post is not waited out
+     * solely by the 0.5 ms fd poll. */
+    sleep_park_announce(wake_at);
+    guest_net::choreo_refresh_alooper_deadline(tid, wake_at);
+    /* Do not alooper_wake_set from inside the owning thread's own choreographer
+     * callback: that leaves the wake bit set so the very next park returns
+     * ALOOPER_POLL_WAKE immediately, before the vsync gate opens, and the
+     * Looper spins on wake/no-op-drive.  The park deadline (from
+     * ndk_choreo_looper_due_ns) and the sleep timer are the correct wake.
+     *
+     * A post from *another* thread must wake the owner immediately — that is
+     * the platform's Choreographer eventfd write.  Restricting the wake to
+     * "due within 250 µs" left SwappyChoreographer parked with deadline=-1
+     * for tens of seconds after postFrameCallbacks queued a 1 ms delayed
+     * callback (Cross Worlds: "tid=91 was 21043ms late").  The owner re-enters
+     * pollOnce, sees the queued due, and parks with the real choreo deadline.
+     *
+     * Same-thread posts outside a callback still need a wake: the Looper may
+     * already be parked with deadline_ms=-1 from before the queue was filled. */
+    if (tid != g_current_tid || !g_in_cb()) {
+        alooper_wake_set(tid);
+        if (g_ctx) fd_wake_all_ready(*g_ctx);
+    }
+}
+
 static void post_choreographer_callback(GuestVA fn_va, GuestVA data_va,
                                         bool wide64, uint64_t delay_ms,
                                         uint32_t choreo_handle) {
@@ -8410,6 +10540,7 @@ static void post_choreographer_callback(GuestVA fn_va, GuestVA data_va,
     }
     c.due_ns = host_mono_ns() + delay_ms * 1'000'000ull;
     g_ndk_choreo_q.push_back(c);
+    ndk_choreo_arm_looper(c.tid, c.due_ns);
 }
 
 /* AChoreographer_registerRefreshRateCallback(chore, cb, data) — API 30+.
@@ -8439,6 +10570,7 @@ static void post_refresh_rate_callback(GuestVA fn_va, GuestVA data_va,
             (unsigned long long)fn_va, g_current_tid, c.tid,
             (unsigned long long)A_VSYNC_PERIOD_NS);
     g_ndk_choreo_q.push_back(c);
+    ndk_choreo_arm_looper(c.tid, c.due_ns);
 }
 
 static void drop_refresh_rate_callback(GuestVA fn_va, GuestVA data_va) {
@@ -8452,9 +10584,26 @@ static void drop_refresh_rate_callback(GuestVA fn_va, GuestVA data_va) {
 }
 
 // AChoreographer_frameCallback's first parameter is a `long` — 32 bits under armeabi-v7a, 64 under arm64-v8a.
+/* Diagnostic for the swappy::ChoreographerFilter catch-up spin (see
+ * PROGRESS.md, Cross Worlds section): confirms whether the *gap* between
+ * successive deliveries to one callback address is actually the steady
+ * ~16.67ms drive_ndk_choreographer()'s own next_vsync gate should produce,
+ * or whether it grows — which would mean this side is not calling the
+ * callback often enough, rather than the guest's own arithmetic diverging.
+ * Also times the callback body itself, since a callback that is slow to
+ * return is indistinguishable from a late delivery in the [pc] histogram
+ * alone. Opt-in: LUNARIA_TRACE_CHOREO_GAP=1. */
+static bool choreo_gap_trace_on(void) {
+    static const bool on = [] {
+        const char *e = lunaria_env("LUNARIA_TRACE_CHOREO_GAP");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+
 static void fire_choreographer_callback(ArmExecCtx &ctx, GuestVA fn_va,
                                         GuestVA data_va, bool wide64,
-                                        bool refresh_rate = false) {
+                                        bool refresh_rate, uint64_t frame_time_ns) {
     if (!fn_va) return;
     uint64_t first;
     if (refresh_rate) {
@@ -8462,8 +10611,9 @@ static void fire_choreographer_callback(ArmExecCtx &ctx, GuestVA fn_va,
         first = A_VSYNC_PERIOD_NS;
         wide64 = true;
     } else {
-        /* Now, on the guest's monotonic clock: this callback is the vsync. */
-        g_choreo_frame_ns = host_mono_ns();
+        /* The caller's ideal delivery time, not raw host_mono_ns(): see
+         * drive_ndk_choreographer() for why. */
+        g_choreo_frame_ns = frame_time_ns;
         first = g_choreo_frame_ns;
     }
     const bool wide = wide64 || ctx.is_arm64;
@@ -8472,7 +10622,29 @@ static void fire_choreographer_callback(ArmExecCtx &ctx, GuestVA fn_va,
     args[0].v.u  = wide ? first : (uint32_t)first;
     args[1].kind = ctx.is_arm64 ? 'J' : 'I';
     args[1].v.u  = data_va;
+    if (!choreo_gap_trace_on() || refresh_rate) {
+        call_guest_abi(ctx, fn_va, args, 2, 'V', nullptr);
+        return;
+    }
+    static std::unordered_map<GuestVA, uint64_t> last_delivered_ns;
+    static std::unordered_map<GuestVA, uint64_t> call_n;
+    const uint64_t t0 = host_mono_ns();
+    uint64_t &last = last_delivered_ns[fn_va];
+    const uint64_t gap_ns = last ? (t0 - last) : 0;
+    last = t0;
     call_guest_abi(ctx, fn_va, args, 2, 'V', nullptr);
+    const uint64_t dur_ns = host_mono_ns() - t0;
+    uint64_t &n = call_n[fn_va];
+    /* The first ~500 calls, then every 500th: enough to see the trend this
+     * finding needs (whether gap_ms drifts upward over the run) without
+     * drowning the log at ~60 Hz. */
+    if (n < 500 || (n % 500) == 0)
+        fprintf(stderr, "[choreo-gap] fn=0x%llx tid=%u #%llu gap=%.2fms "
+                "callback_took=%.2fms\n",
+                (unsigned long long)fn_va, g_current_tid,
+                (unsigned long long)n, (double)gap_ns / 1e6,
+                (double)dur_ns / 1e6);
+    ++n;
 }
 
 /* When the next frame callback queued for this thread's Looper comes due, or
@@ -8490,35 +10662,104 @@ static uint64_t ndk_choreo_next_due_for(uint32_t tid)
 
 /* Deliver queued NDK choreographer callbacks — called from the Looper poll
  * (and the other pump/idle sites) on the thread that registered them. */
+static void schedule_threads(uint64_t slice);
 static void drive_ndk_choreographer(ArmExecCtx &ctx) {
     if (g_in_cb() || g_ndk_choreo_q.empty()) return;
     uint64_t now = host_mono_ns();
     uint64_t &next_vsync = g_ndk_choreo_next_vsync[g_current_tid];
-    if (now < next_vsync) return;
-    std::vector<NdkChoreoCb> due;
-    for (size_t i = 0; i < g_ndk_choreo_q.size(); ) {
-        if (g_ndk_choreo_q[i].tid == g_current_tid &&
-            g_ndk_choreo_q[i].due_ns <= now) {
-            due.push_back(g_ndk_choreo_q[i]);
-            g_ndk_choreo_q.erase(g_ndk_choreo_q.begin() + (long)i);
-        } else {
-            ++i;
-        }
+    /* A virtual vsync clock that sits more than a few periods ahead of the
+     * wall clock is not pacing — it is a stuck gate that parked the Looper
+     * (see ndk_choreo_looper_due_ns).  Snap it before the early return. */
+    if (next_vsync && next_vsync > now + 4 * A_VSYNC_PERIOD_NS) {
+        static uint64_t gate_snaps = 0;
+        if (gate_snaps++ < 16)
+            fprintf(stderr, "[achoreo] tid=%u vsync gate was %lldms ahead of "
+                    "wall clock — snapping (Looper would never wake)\n",
+                    g_current_tid,
+                    (long long)((next_vsync - now) / 1'000'000ull));
+        next_vsync = now;
     }
-    if (due.empty()) return;
-    next_vsync = now + A_VSYNC_PERIOD_NS;
+    if (now < next_vsync) return;
+    /* One vsync → one callback.  Pulling every due entry at once (after a
+     * late snap) drained Swappy's MAX_CALLBACKS_BEFORE_IDLE before Filter0/1
+     * could park, then present froze with an empty choreographer queue. */
+    size_t best = SIZE_MAX;
+    for (size_t i = 0; i < g_ndk_choreo_q.size(); ++i) {
+        if (g_ndk_choreo_q[i].tid != g_current_tid) continue;
+        if (g_ndk_choreo_q[i].due_ns > now) continue;
+        if (best == SIZE_MAX ||
+            g_ndk_choreo_q[i].due_ns < g_ndk_choreo_q[best].due_ns)
+            best = i;
+    }
+    if (best == SIZE_MAX) return;
+    NdkChoreoCb c = g_ndk_choreo_q[best];
+    g_ndk_choreo_q.erase(g_ndk_choreo_q.begin() + (long)best);
+    /* The timestamp handed to the callback is a virtual vsync clock, not
+     * wall-clock "now": next_vsync used to be reset to `now + period` on
+     * every delivery, which means a call that came late for any reason —
+     * this guest thread parked in ALooper_pollOnce with nothing to wake it
+     * but a due callback, and did not get its next real scheduler slice for
+     * seconds — reported that whole delay to the guest as if it were the
+     * real elapsed frame time.  Measured on Cross Worlds: tid=90
+     * (SwappyChoreographer) sat in exactly that state for 21 real seconds
+     * once, and swappy::ChoreographerFilter's own catch-up loop (which
+     * assumes vsync drift is small and bridges it a period at a time) spent
+     * a correspondingly growing share of the run trying to reconcile a
+     * timestamp series that had a real 21-second jump in it — this is not a
+     * bug in swappy's arithmetic, it is this side reporting a delay as if it
+     * were the frame's actual timing.
+     *
+     * A real device does not do this: a vsync IRQ fires on schedule
+     * regardless of what the app's Looper thread happens to be doing, and a
+     * catch-up of more than a few periods is simply dropped frames.  Advance
+     * the virtual clock by exactly one period from where it logically was,
+     * and once the backlog exceeds a few periods, accept that those frames
+     * were skipped (snap to `now`) instead of asking the guest to reconcile
+     * an unbounded gap. */
+    if (!next_vsync) next_vsync = now;                 /* first callback ever */
+    /* frameTimeNanos is the timestamp of the vsync which has already fired.
+     * It must never describe the next vsync: Swappy subtracts this value from
+     * its current monotonic time, and a timestamp one period in the future
+     * underflows that unsigned duration.  The observed result was Filter1
+     * entering this_thread::sleep_for(42748 seconds) while Filter0 spun and
+     * presentation stopped. */
+    uint64_t frame_time = next_vsync;
+    static constexpr uint64_t kMaxBacklogNs = 4 * A_VSYNC_PERIOD_NS;
+    if (now > frame_time + kMaxBacklogNs) {
+        static uint64_t dropped_reports = 0;
+        if (dropped_reports++ < 16)
+            fprintf(stderr, "[achoreo] tid=%u was %lldms late for its own "
+                    "vsync (parked with nothing to wake it?) — treating the "
+                    "backlog as dropped frames, not debt to repay\n",
+                    g_current_tid,
+                    (long long)((now - frame_time) / 1'000'000ull));
+        frame_time = now;
+    }
+    const uint64_t delivered_frame = frame_time;
+    next_vsync = frame_time + A_VSYNC_PERIOD_NS;
+    /* Prior notify found no Filter waiter: wait one period so they can park
+     * before the next signal (Swappy's idle budget is only 10 frames). */
+    if (cond_orphan_signal_take(g_current_tid)) {
+        const uint64_t hold = host_mono_ns() + A_VSYNC_PERIOD_NS;
+        if (hold > next_vsync) next_vsync = hold;
+    }
     static std::unordered_map<uint32_t, uint64_t> fired;
     uint64_t &fn_n = fired[g_current_tid];
     static const bool verbose = lunaria_env("LUNARIA_TRACE_CHOREO") != nullptr;
     const bool log = (verbose || fn_n < 4 || (fn_n % 600) == 0);
     if (log)
-        fprintf(stderr, "[achoreo] firing %zu callback(s) on tid=%u (#%llu)\n",
-                due.size(), g_current_tid, (unsigned long long)fn_n);
+        fprintf(stderr, "[achoreo] firing 1 callback on tid=%u (#%llu)\n",
+                g_current_tid, (unsigned long long)fn_n);
     ++fn_n;
-    for (auto &c : due)
-        fire_choreographer_callback(ctx, c.fn, c.data, c.wide64, c.refresh_rate);
+    fire_choreographer_callback(ctx, c.fn, c.data, c.wide64, c.refresh_rate,
+                                delivered_frame);
     if (log)
         fprintf(stderr, "[achoreo] fired, back on tid=%u\n", g_current_tid);
+    /* Hand the CPU to Filter0/1 (and anyone else ready) before this Looper
+     * can poll again — g_yield_requested alone left the same tid running
+     * under NMSS load and burned Swappy's idle budget with orphan signals. */
+    g_yield_requested = true;
+    schedule_threads(200'000'000ULL);
 }
 
 // glMapBufferRange shadows: host pointers can't be exposed to the guest.
@@ -8669,6 +10910,11 @@ static constexpr GLenum GL_TEXTURE_EXTERNAL_OES_GUEST = 0x8D65u;
 static inline GLenum gl_host_tex_target(GLenum t) {
     return t == GL_TEXTURE_EXTERNAL_OES_GUEST ? (GLenum)0x0DE1u /* GL_TEXTURE_2D */ : t;
 }
+/* An Android external texture is not storage owned by the texture name.  Its
+ * image comes from the SurfaceTexture's BufferQueue/EGLImage.  Since the host
+ * shader uses sampler2D, represent that imported image with a private host 2D
+ * texture instead of aliasing it onto unrelated guest-owned storage. */
+static std::map<GLuint, GLuint> g_gl_external_backing;
 
 /* ---- EGLImage (OES_EGL_image / KHR_image_base) -------------------------- *
  *
@@ -9148,6 +11394,24 @@ GL_DECL(GLboolean, glIsQuery,            GLuint)
  * properties of the single host GL implementation, so cache them once while a
  * context is current and answer from that. */
 static std::string g_gl_ctx_string[5];
+/* GL identity belongs to the emulated Android device, not to the desktop
+ * compositor which happens to execute its draws.  Passing Mesa's host
+ * renderer through made one process claim to be a Pixel 6/gs101 everywhere
+ * else and an AMD desktop here -- a combination no Android driver can
+ * produce.  Capability strings remain host-derived below: unlike identity,
+ * advertising an extension the renderer cannot execute would be incorrect. */
+static const char *guest_gl_identity_string(GLenum name) {
+    switch (name) {
+    case 0x1F00 /* GL_VENDOR */:   return "ARM";
+    case 0x1F01 /* GL_RENDERER */: return "Mali-G78";
+    case 0x1F02 /* GL_VERSION */:
+        return "OpenGL ES 3.2 v1.r32p1-00bet0";
+    case 0x8B8C /* GL_SHADING_LANGUAGE_VERSION */:
+        return "OpenGL ES GLSL ES 3.20";
+    default: return nullptr;
+    }
+}
+
 static void gl_cache_context_strings() {
     static const GLenum names[5] = {
         0x1F00 /*GL_VENDOR*/, 0x1F01 /*GL_RENDERER*/, 0x1F02 /*GL_VERSION*/,
@@ -9156,7 +11420,9 @@ static void gl_cache_context_strings() {
     if (!pfn_glGetString) return;
     for (int i = 0; i < 5; ++i) {
         if (!g_gl_ctx_string[i].empty()) continue;
-        const GLubyte *s = pfn_glGetString(names[i]);
+        const char *identity = guest_gl_identity_string(names[i]);
+        const GLubyte *s = identity ? (const GLubyte *)identity
+                                    : pfn_glGetString(names[i]);
         if (s) g_gl_ctx_string[i] = (const char *)s;
     }
 }
@@ -10590,9 +12856,26 @@ static int  g_ndk_input_pipe[2] = { -1, -1 };
 static bool g_ndk_input_attached = false;
 static int64_t g_ndk_touch_down_ns = 0;
 
+/* "The guest has stopped reading its input queue."
+ *
+ * A full queue is not a busy one.  Nothing else produces events but the
+ * operator, and a person cannot generate 256 of them before the application
+ * looks; the queue only fills when AInputQueue_getEvent is no longer being
+ * called at all -- a readiness that went to the wrong Looper, or a guest
+ * thread that stopped polling.  Dropping silently turns that into "the button
+ * does not respond", which says nothing about where to look. */
+static void ndk_input_queue_full(void) {
+    static uint64_t dropped = 0;
+    if (dropped == 0 || (dropped % 64) == 0)
+        fprintf(stderr, "[ainput] input queue full (256 events unread, %llu "
+                "dropped) — the guest has stopped calling "
+                "AInputQueue_getEvent\n", (unsigned long long)dropped);
+    ++dropped;
+}
+
 static void ndk_input_push(int action, float x, float y) {
     if (g_ndk_input_pipe[0] < 0) return;      /* no queue handed out yet */
-    if (g_ndk_input_q.size() >= 256) return;
+    if (g_ndk_input_q.size() >= 256) { ndk_input_queue_full(); return; }
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     const int64_t now = (int64_t)ts.tv_sec * 1'000'000'000ll + ts.tv_nsec;
@@ -10607,7 +12890,7 @@ static void ndk_input_push(int action, float x, float y) {
 
 static void ndk_input_push_key(int action, int keycode, int metastate) {
     if (g_ndk_input_pipe[0] < 0) return;
-    if (g_ndk_input_q.size() >= 256) return;
+    if (g_ndk_input_q.size() >= 256) { ndk_input_queue_full(); return; }
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     const int64_t now = (int64_t)ts.tv_sec * 1'000'000'000ll + ts.tv_nsec;
@@ -11520,9 +13803,15 @@ static int egl_host_choose_config(const int32_t *attribs, uint32_t *out,
     return (int)ok;
 }
 
-static uint32_t egl_host_create_context(uint32_t share_handle,
+static uint32_t egl_host_create_context(uint32_t config_handle,
+                                        uint32_t share_handle,
                                         const int32_t *attribs) {
     if (g_egl_dpy == EGL_NO_DISPLAY || !g_egl_cfg) return 0u;
+    EGLConfig config = resolve_egl_config(config_handle);
+    if (!config) {
+        egl_set_guest_error(EGL_BAD_CONFIG);
+        return 0u;
+    }
     static const EGLint fallback_es31[] = {
         EGL_CONTEXT_MAJOR_VERSION, 3,
         EGL_CONTEXT_MINOR_VERSION, 1,
@@ -11556,42 +13845,34 @@ static uint32_t egl_host_create_context(uint32_t share_handle,
         normalized.push_back(EGL_NONE);
     }
     const EGLint *want = attribs ? normalized.data() : fallback_es31;
-    // Always share with the first context we made, whatever the guest asked for.
-    EGLContext share = g_egl_ctx != EGL_NO_CONTEXT ? g_egl_ctx
-                                                   : resolve_egl_context(share_handle);
-    EGLContext nctx = eglCreateContext(g_egl_dpy, g_egl_cfg, share, want);
-    if (nctx == EGL_NO_CONTEXT)
-        nctx = eglCreateContext(g_egl_dpy, g_egl_cfg, share, fallback_es31);
-    if (nctx == EGL_NO_CONTEXT)
-        nctx = eglCreateContext(g_egl_dpy, g_egl_cfg, share, fallback_es3);
-    if (nctx == EGL_NO_CONTEXT)
-        nctx = eglCreateContext(g_egl_dpy, g_egl_cfg, share, fallback_es2);
-    if (nctx == EGL_NO_CONTEXT && share != EGL_NO_CONTEXT) {
-        /* Retry unshared before giving up — some drivers reject a share list
-         * whose config differs from the new context's. */
-        nctx = eglCreateContext(g_egl_dpy, g_egl_cfg, EGL_NO_CONTEXT, want);
-        if (nctx == EGL_NO_CONTEXT)
-            nctx = eglCreateContext(g_egl_dpy, g_egl_cfg, EGL_NO_CONTEXT, fallback_es31);
-        if (nctx == EGL_NO_CONTEXT)
-            nctx = eglCreateContext(g_egl_dpy, g_egl_cfg, EGL_NO_CONTEXT, fallback_es3);
-        if (nctx == EGL_NO_CONTEXT)
-            nctx = eglCreateContext(g_egl_dpy, g_egl_cfg, EGL_NO_CONTEXT, fallback_es2);
+    /* Android's share group is exactly the context supplied by the caller.
+     * The old bridge forced every guest context to share with Lunaria's
+     * private overlay context and also discarded the selected EGLConfig.
+     * Besides exposing host-only objects to the application, that produces
+     * EGL_BAD_MATCH when UE creates its rendering contexts/configs in the
+     * order used during the hand-off from the launch renderer to RHI. */
+    EGLContext share = (share_handle && share_handle != ~0u)
+        ? resolve_egl_context(share_handle) : EGL_NO_CONTEXT;
+    if (share_handle && share_handle != ~0u && share == EGL_NO_CONTEXT) {
+        egl_set_guest_error(EGL_BAD_CONTEXT);
+        return 0u;
     }
-    bool aliased = false;
-    if (nctx == EGL_NO_CONTEXT) {
-        if (g_egl_ctx == EGL_NO_CONTEXT) return 0u;
-        nctx = g_egl_ctx;
-        aliased = true;
-    }
-    if (g_egl_ctx == EGL_NO_CONTEXT) g_egl_ctx = nctx;
+    EGLContext nctx = eglCreateContext(g_egl_dpy, config, share, want);
+    if (nctx == EGL_NO_CONTEXT)
+        nctx = eglCreateContext(g_egl_dpy, config, share, fallback_es31);
+    if (nctx == EGL_NO_CONTEXT)
+        nctx = eglCreateContext(g_egl_dpy, config, share, fallback_es3);
+    if (nctx == EGL_NO_CONTEXT)
+        nctx = eglCreateContext(g_egl_dpy, config, share, fallback_es2);
+    if (nctx == EGL_NO_CONTEXT) return 0u;
     g_egl_ctx_tab.push_back(nctx);
     uint32_t handle = ARM_EGL_CTXTAB_BASE + (uint32_t)(g_egl_ctx_tab.size() - 1);
     EGLint client_major = 0, client_minor = 0;
     eglQueryContext(g_egl_dpy, nctx, EGL_CONTEXT_MAJOR_VERSION, &client_major);
     eglQueryContext(g_egl_dpy, nctx, EGL_CONTEXT_MINOR_VERSION, &client_minor);
-    fprintf(stderr, "[arm_exec] eglCreateContext -> %p (handle 0x%x, share=%p%s, "
-            "requested ES%d%s, actual ES%d.%d)\n", nctx, handle, share,
-            aliased ? ", aliased" : "", (int)requested_major,
+    fprintf(stderr, "[arm_exec] eglCreateContext -> %p (handle 0x%x, cfg=0x%x, share=%p, "
+            "requested ES%d%s, actual ES%d.%d)\n", nctx, handle, config_handle,
+            share, (int)requested_major,
             has_minor ? ".minor-explicit" : "", (int)client_major,
             (int)client_minor);
     return handle;
@@ -11608,9 +13889,15 @@ static int egl_host_make_current(uint32_t draw_h, uint32_t read_h,
     if (ectx == EGL_NO_CONTEXT) {
         /* The thread is releasing its binding, so it stops being a GL thread
          * and goes back to the engine pool. */
+        EGLBoolean ok = (g_egl_dpy != EGL_NO_DISPLAY)
+            ? eglMakeCurrent(g_egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                             EGL_NO_CONTEXT)
+            : EGL_FALSE;
+        if (!ok) return EGL_FALSE;
         g_egl_tid_ctx.erase(g_current_tid);
         g_egl_tid_surf.erase(g_current_tid);
         gl_tid_unmark(g_current_tid);
+        egl_note_bound(0u, EGL_NO_SURFACE);
         return EGL_TRUE;
     }
     EGLBoolean ok = (g_egl_dpy != EGL_NO_DISPLAY)
@@ -11742,7 +14029,7 @@ extern "C" int arm_exec_egl_choose_config(const int32_t *attribs, uint32_t *out,
 
 extern "C" uint32_t arm_exec_egl_create_context(uint32_t share,
                                                 const int32_t *attribs) {
-    return egl_host_create_context(share, attribs);
+    return egl_host_create_context(ARM_EGL_CONFIG, share, attribs);
 }
 
 /* Android's eglCreatePbufferSurface returns a distinct guest handle backed by a
@@ -11879,7 +14166,10 @@ extern "C" void arm_exec_upload_texture_rgba(int tex, const uint8_t *rgba,
     GLint prev = 0;
     if (pfn_glGetIntegerv)
         pfn_glGetIntegerv(0x8069 /* GL_TEXTURE_BINDING_2D */, &prev);
-    pfn_glBindTexture(target, (GLuint)tex);
+    auto external = g_gl_external_backing.find((GLuint)tex);
+    const GLuint host_tex = external == g_gl_external_backing.end()
+                                ? (GLuint)tex : external->second;
+    pfn_glBindTexture(target, host_tex);
     if (pfn_glPixelStorei)
         pfn_glPixelStorei(0x0CF5 /* UNPACK_ALIGNMENT */, 4);
 
@@ -11888,8 +14178,9 @@ extern "C" void arm_exec_upload_texture_rgba(int tex, const uint8_t *rgba,
      * every frame would only keep raising GL errors inside the guest's own
      * command stream.  Ask once and remember the answer. */
     static std::set<GLuint> rejected;
-    auto known = g_gl_tex_size.find((GLuint)tex);
-    if (rejected.count((GLuint)tex)) {
+    auto known = external == g_gl_external_backing.end()
+                     ? g_gl_tex_size.find((GLuint)tex) : g_gl_tex_size.end();
+    if (rejected.count(host_tex)) {
         pfn_glBindTexture(target, (GLuint)prev);
         return;
     }
@@ -11904,7 +14195,7 @@ extern "C" void arm_exec_upload_texture_rgba(int tex, const uint8_t *rgba,
                             pixels);
         GLenum err = pfn_glGetError ? pfn_glGetError() : 0;
         if (err) {
-            rejected.insert((GLuint)tex);
+            rejected.insert(host_tex);
             fprintf(stderr, "[media] texture %d (%dx%d) will not take an RGBA8 "
                     "frame (GL 0x%04x); video frames are not being presented\n",
                     tex, dw, dh, (unsigned)err);
@@ -11920,7 +14211,8 @@ extern "C" void arm_exec_upload_texture_rgba(int tex, const uint8_t *rgba,
         }
         pfn_glTexImage2D(target, 0, 0x1908 /* RGBA */, w, h, 0,
                          0x1908, 0x1401 /* UNSIGNED_BYTE */, rgba);
-        g_gl_tex_size[(GLuint)tex] = { (GLsizei)w, (GLsizei)h };
+        if (external == g_gl_external_backing.end())
+            g_gl_tex_size[(GLuint)tex] = { (GLsizei)w, (GLsizei)h };
     }
     pfn_glBindTexture(target, (GLuint)prev);
 }
@@ -11929,6 +14221,7 @@ extern "C" void arm_exec_upload_texture_rgba(int tex, const uint8_t *rgba,
 static void schedule_threads(uint64_t slice);
 /* Walk a guest AArch64 frame-pointer chain (defined next to the stall dump). */
 static void a64_dump_guest_backtrace(const char *what, uint32_t tid, uint64_t fp);
+static uint64_t a64_module_base_for(uint64_t va);
 /* The last SVCs the guest made, with their call sites (defined above). */
 static void svc_ring_dump(void);
 // Runs one A64 thread slice; defined after Arm64Callbacks.
@@ -12041,10 +14334,12 @@ static std::atomic<uint64_t> g_pump_run_deadline_ns{0};
 static std::atomic<uint64_t> g_pump_run_seq{0};
 static std::mutex              g_pump_watch_mx;
 static std::condition_variable g_pump_watch_cv;
+static std::thread             g_pump_watch_thread;
+static std::atomic<bool>       g_pump_watch_stop{false};
 
 static void pump_preempt_watchdog(void) {
     std::unique_lock<std::mutex> lk(g_pump_watch_mx);
-    for (;;) {
+    while (!g_pump_watch_stop.load(std::memory_order_acquire)) {
         Dynarmic::A64::Jit *j = g_pump_run_jit.load(std::memory_order_acquire);
         if (!j) {
             /* Nothing armed.  A missed notify costs latency, not a stall. */
@@ -12083,7 +14378,7 @@ static void pump_preempt_watchdog(void) {
 static void pump_preempt_arm(Dynarmic::A64::Jit *j) {
     static std::once_flag once;
     std::call_once(once, [] {
-        std::thread(pump_preempt_watchdog).detach();
+        g_pump_watch_thread = std::thread(pump_preempt_watchdog);
     });
     g_pump_run_seq.fetch_add(1, std::memory_order_acq_rel);
     g_pump_run_deadline_ns.store(host_mono_ns() + a64_slice_quantum_ns(),
@@ -12094,6 +14389,13 @@ static void pump_preempt_arm(Dynarmic::A64::Jit *j) {
 
 static void pump_preempt_disarm(void) {
     g_pump_run_jit.store(nullptr, std::memory_order_release);
+}
+
+static void pump_preempt_shutdown(void) {
+    pump_preempt_disarm();
+    g_pump_watch_stop.store(true, std::memory_order_release);
+    g_pump_watch_cv.notify_all();
+    if (g_pump_watch_thread.joinable()) g_pump_watch_thread.join();
 }
 
 /* Guest instructions the frame pump's own call runs between scheduling points.
@@ -12311,6 +14613,35 @@ static void arsc_ensure_loaded() {
 }
 
 // Returns the Res_value dataType, or 0 when the id cannot be resolved.
+/* ResTable_config orientation byte (offset 12).  ORIENTATION_ANY is 0. */
+enum { ARSC_ORIENT_PORT = 1, ARSC_ORIENT_LAND = 2 };
+
+/* Device orientation for resource selection: the framebuffer the guest is
+ * drawing into, not the host's idea of a closed laptop lid.  Cross Worlds'
+ * WebViewDialog close button sizes its margins from @dimen resources that
+ * have separate port/land values; returning the first TYPE chunk (always the
+ * default) put the land window on portrait margins and left the control in
+ * the wrong place. */
+static uint8_t arsc_device_orientation(void)
+{
+    if (g_fb_w <= 0 || g_fb_h <= 0) init_fb_size_from_env();
+    if (g_fb_w <= 0 || g_fb_h <= 0) return 0;
+    return g_fb_w >= g_fb_h ? (uint8_t)ARSC_ORIENT_LAND : (uint8_t)ARSC_ORIENT_PORT;
+}
+
+/* Whether this TYPE chunk's config is usable for the current device, and how
+ * specific it is.  Higher score wins; -1 means incompatible (must skip).
+ * Only orientation is scored today — density/locale can grow the same way. */
+static int arsc_config_score(const uint8_t *cfg, size_t cfg_n, uint8_t want_orient)
+{
+    if (cfg_n < 13) return 0;
+    uint8_t orient = cfg[12];
+    if (orient != 0 && want_orient != 0 && orient != want_orient) return -1;
+    int score = 0;
+    if (orient != 0 && orient == want_orient) score += 10;
+    return score;
+}
+
 static uint8_t arsc_lookup(uint32_t resid, uint32_t *data_out) {
     arsc_ensure_loaded();
     if (g_arsc.size() < 12 || !resid) return 0;
@@ -12319,6 +14650,11 @@ static uint8_t arsc_lookup(uint32_t resid, uint32_t *data_out) {
     uint8_t want_pkg = (uint8_t)(resid >> 24);
     uint8_t want_type = (uint8_t)((resid >> 16) & 0xff);
     uint16_t want_entry = (uint16_t)(resid & 0xffff);
+    const uint8_t want_orient = arsc_device_orientation();
+
+    uint8_t best_dtype = 0;
+    uint32_t best_dval = 0;
+    int best_score = -1;
 
     uint16_t table_hs;
     memcpy(&table_hs, b + 2, 2);
@@ -12346,6 +14682,13 @@ static uint8_t arsc_lookup(uint32_t resid, uint32_t *data_out) {
             memcpy(&entries_start, b + j + 16, 4);
             if (type_id != want_type || want_entry >= entry_count) { j += s2; continue; }
 
+            /* ResTable_type header is 20 bytes; the config blob runs to h2. */
+            int score = 0;
+            if (h2 > 20) {
+                score = arsc_config_score(b + j + 20, (size_t)h2 - 20u, want_orient);
+                if (score < 0) { j += s2; continue; }
+            }
+
             size_t oo = j + h2 + (size_t)want_entry * 4u;
             if (oo + 4 > j + s2) { j += s2; continue; }
             uint32_t eoff;
@@ -12362,12 +14705,18 @@ static uint8_t arsc_lookup(uint32_t resid, uint32_t *data_out) {
             uint8_t dtype = b[v + 3];
             uint32_t dval;
             memcpy(&dval, b + v + 4, 4);
-            if (data_out) *data_out = dval;
-            return dtype;
+            if (score >= best_score) {
+                best_score = score;
+                best_dtype = dtype;
+                best_dval = dval;
+            }
+            j += s2;
         }
         i += cs;
     }
-    return 0;
+    if (best_score < 0) return 0;
+    if (data_out) *data_out = best_dval;
+    return best_dtype;
 }
 
 static uint8_t arsc_style_lookup(uint32_t style, uint32_t attr,
@@ -13066,6 +15415,14 @@ static bool obb_read(const std::string &name, std::vector<uint8_t> &out) {
     return zip_read_entry(g_obb_fp, it->second, name, out);
 }
 
+static bool host_regular_stat(const std::string &fp, uint64_t &len_out) {
+    struct stat sb;
+    if (stat(fp.c_str(), &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_size < 0)
+        return false;
+    len_out = (uint64_t)sb.st_size;
+    return true;
+}
+
 static bool read_host_regular(const std::string &fp, std::vector<uint8_t> &out) {
     struct stat sb;
     if (stat(fp.c_str(), &sb) != 0 || !S_ISREG(sb.st_mode)) return false;
@@ -13120,16 +15477,25 @@ static void files_roots_scan(void)
     });
 }
 
-static bool files_tree_read(const std::string &rel, std::vector<uint8_t> &out) {
+static bool files_tree_resolve(const std::string &rel, std::string &host_out,
+                               uint64_t &len_out) {
     const char *ext = lunaria_env("ANDROID_EXTERNAL_FILES_DIR");
     if (!ext || !*ext || rel.empty()) return false;
-    if (read_host_regular(std::string(ext) + "/" + rel, out)) return true;
+    std::string p = std::string(ext) + "/" + rel;
+    if (host_regular_stat(p, len_out)) { host_out = std::move(p); return true; }
     files_roots_scan();
     for (int i = 0; i < g_files_nroots; ++i) {
-        if (read_host_regular(std::string(g_files_roots[i]) + "/" + rel, out))
-            return true;
+        p = std::string(g_files_roots[i]) + "/" + rel;
+        if (host_regular_stat(p, len_out)) { host_out = std::move(p); return true; }
     }
     return false;
+}
+
+static bool files_tree_read(const std::string &rel, std::vector<uint8_t> &out) {
+    std::string host;
+    uint64_t len = 0;
+    if (!files_tree_resolve(rel, host, len)) return false;
+    return read_host_regular(host, out);
 }
 
 struct Stream { std::vector<uint8_t> data; size_t pos = 0; };
@@ -13185,10 +15551,23 @@ extern "C" const char *arm_exec_apk_entry_path(const char *name) {
 
 // NDK AAsset table (outside asset_bridge namespace)
 /* pos is the stream cursor shared by AAsset_read/seek; getBuffer bypasses it,
- * exactly as the NDK does. */
-struct GuestAsset { std::vector<uint8_t> data; uint32_t buf_va; uint64_t pos; };
+ * exactly as the NDK does.
+ *
+ * host_path: when the entry is a real host file (InstalledContent, unpacked
+ * APK dir, …), openFileDescriptor returns that FD instead of dumping the
+ * whole buffer into a temp file.  Large assets stay unbuffered until
+ * getBuffer/read forces a materialize — matching AASSET_MODE_RANDOM/STREAMING. */
+struct GuestAsset {
+    std::vector<uint8_t> data;
+    uint32_t buf_va = 0;
+    uint64_t pos = 0;
+    uint64_t length = 0;
+    std::string host_path;
+};
 static std::map<uint32_t, GuestAsset> g_assets;
 static uint32_t g_next_asset_handle = 0xA55E7000u;
+/* Defer buffering past this size when a host path is known (shader archives). */
+static constexpr uint64_t kAAssetDeferBytes = 64u * 1024u;
 
 struct GuestAssetDir {
     std::vector<std::string> names;
@@ -13456,8 +15835,6 @@ static int apk_path_locate(const char *path, char *buf, size_t bufsz,
 }
 
 // Android filesystem prefixes that exist on every device but not on the host — remapped into a writable sandbox.
-// Guest CPU topology via sysconf / /proc/cpuinfo / /sys — must stay consistent (host may have dozens of cores.
-static constexpr int GUEST_NCPU = 4;
 
 static const char *guest_sys_cpu_file(const char *tag, const char *content) {
     // Stable paths under /tmp; rewritten each process start is fine.
@@ -13705,6 +16082,68 @@ static const char *map_guest_path(const char *path, char *buf, size_t bufsz) {
             return buf;
         }
     }
+    /* /data/app/~~INSTALLER==/<pkg>-<ver>==/<file>
+     * Security modules (libnmsssa, A6241C93595) open the app's on-device APK
+     * to verify its signing certificate — via the device-canonical path, not
+     * the real host path.  Without this mapping the open() fails with ENOENT,
+     * the certificate check reads nothing, and nmss reports code=102. */
+    if (strncmp(path, "/data/app/~~", 12) == 0) {
+        const char *eq1 = strstr(path + 12, "==/");
+        if (eq1) {
+            const char *after_installer = eq1 + 3;
+            const char *eq2 = strstr(after_installer, "==/");
+            if (eq2) {
+                const char *fname = eq2 + 3;
+                if (strcmp(fname, "base.apk") == 0) {
+                    const char *apk = lunaria_env("ANDROID_APK_FILE");
+                    if (!apk || !*apk) apk = lunaria_env("ANDROID_PACKAGE_CODE_PATH");
+                    if (apk && *apk && (size_t)snprintf(buf, bufsz, "%s", apk) < bufsz)
+                        return buf;
+                }
+                /* .../split_<name>.apk is how a device names an installed
+                 * split beside base.apk, and an engine that is told
+                 * getPackageCodePath() derives the split paths from it by
+                 * that convention rather than asking PackageManager.  The
+                 * launcher already knows where each split was staged. */
+                if (!strncmp(fname, "split_", 6)) {
+                    const char *want = fname + 6;
+                    size_t wlen = strlen(want);
+                    if (wlen > 4 && !strcmp(want + wlen - 4, ".apk")) wlen -= 4;
+                    const char *list = lunaria_env("ANDROID_SPLIT_APKS");
+                    for (const char *e = list; e && *e; ) {
+                        const char *bar = strchr(e, '|');
+                        const char *sep = strchr(e, ';');
+                        if (!sep) sep = e + strlen(e);
+                        if (bar && bar < sep &&
+                            (size_t)(bar - e) == wlen &&
+                            !strncmp(e, want, wlen)) {
+                            const size_t plen = (size_t)(sep - (bar + 1));
+                            if (plen < bufsz) {
+                                std::memcpy(buf, bar + 1, plen);
+                                buf[plen] = '\0';
+                                return buf;
+                            }
+                        }
+                        e = (*sep == ';') ? sep + 1 : sep;
+                    }
+                }
+                /* .../lib/<abi>/<file> is where the app's own libraries live
+                 * on a device, and it is the spelling the module list already
+                 * reports for them (see a64_device_path).  ApplicationInfo
+                 * .nativeLibraryDir now hands the guest the same one, so it
+                 * has to open: resolve it to the staged lib directory. */
+                if (!strncmp(fname, "lib/", 4)) {
+                    const char *rest = strchr(fname + 4, '/');
+                    const char *libdir = lunaria_env("ANDROID_NATIVE_LIB_DIR");
+                    if (libdir && *libdir) {
+                        if ((size_t)snprintf(buf, bufsz, "%s%s", libdir,
+                                             rest ? rest : "") < bufsz)
+                            return buf;
+                    }
+                }
+            }
+        }
+    }
     /* A relative path is the guest's, resolved against the guest's cwd — never
      * against this process's.  Resolving it here means every caller of
      * map_guest_path gets it for free, in the same namespace as the absolute
@@ -13761,9 +16200,30 @@ static const char *map_guest_path(const char *path, char *buf, size_t bufsz) {
                                   : "/tmp/lunaria-proc-cpuinfo";
             if (FILE *f = fopen(p, "w")) {
                 if (arm64) {
-                    for (int i = 0; i < GUEST_NCPU; ++i)
+                    const char *platform =
+                        lunaria_android_property("ro.board.platform");
+                    const unsigned ncpu = guest_ncpu();
+                    for (unsigned i = 0; i < ncpu; ++i) {
+                        /* /proc/cpuinfo describes the CPUs in the SoC named
+                         * by ro.board.platform.  Eight identical A76 cores
+                         * while Build/HARDWARE said Pixel 6 / gs101 described
+                         * no Android device and was directly visible to code
+                         * that compares the two interfaces.
+                         *
+                         * Keep this data-driven by the device profile, not by
+                         * an application: Tensor gs101 is 4xA55, 2xA76,
+                         * 2xX1; gs201 replaces the middle pair with A78; and
+                         * Exynos 2100 is 4xA55, 3xA78, 1xX1.  MIDR part IDs
+                         * are architectural values published by Arm. */
+                        unsigned part = 0xd0b; /* Cortex-A76 fallback */
+                        if (platform && !strcmp(platform, "gs101"))
+                            part = i < 4 ? 0xd05 : (i < 6 ? 0xd0b : 0xd44);
+                        else if (platform && !strcmp(platform, "gs201"))
+                            part = i < 4 ? 0xd05 : (i < 6 ? 0xd41 : 0xd44);
+                        else if (platform && !strcmp(platform, "exynos2100"))
+                            part = i < 4 ? 0xd05 : (i < 7 ? 0xd41 : 0xd44);
                         fprintf(f,
-                            "processor\t: %d\n"
+                            "processor\t: %u\n"
                             "BogoMIPS\t: 38.40\n"
                             "Features\t: fp asimd evtstrm aes pmull sha1 sha2 "
                             "crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc "
@@ -13771,12 +16231,14 @@ static const char *map_guest_path(const char *path, char *buf, size_t bufsz) {
                             "CPU implementer\t: 0x41\n"
                             "CPU architecture: 8\n"
                             "CPU variant\t: 0x3\n"
-                            "CPU part\t: 0xd0b\n"
-                            "CPU revision\t: 0\n\n", i);
+                            "CPU part\t: 0x%03x\n"
+                            "CPU revision\t: 0\n\n", i, part);
+                    }
                 } else {
-                    for (int i = 0; i < GUEST_NCPU; ++i)
+                    const unsigned ncpu = guest_ncpu();
+                    for (unsigned i = 0; i < ncpu; ++i)
                         fprintf(f,
-                            "processor\t: %d\n"
+                            "processor\t: %u\n"
                             "model name\t: ARMv7 Processor rev 3 (v7l)\n"
                             "BogoMIPS\t: 38.40\n"
                             "Features\t: swp half thumb fastmult vfp edsp neon "
@@ -13801,7 +16263,7 @@ static const char *map_guest_path(const char *path, char *buf, size_t bufsz) {
         strcmp(path, "/sys/devices/system/cpu/possible") == 0 ||
         strcmp(path, "/sys/devices/system/cpu/online") == 0) {
         char content[32];
-        snprintf(content, sizeof content, "0-%d\n", GUEST_NCPU - 1);
+        snprintf(content, sizeof content, "0-%u\n", guest_ncpu() - 1u);
         const char *f = guest_sys_cpu_file("topo", content);
         return f ? f : path;
     }
@@ -13810,7 +16272,7 @@ static const char *map_guest_path(const char *path, char *buf, size_t bufsz) {
         char *end = nullptr;
         long cpu = strtol(num, &end, 10);
         if (end != num && (*end == '/' || *end == '\0')) {
-            if (cpu < 0 || cpu >= GUEST_NCPU) {
+            if (cpu < 0 || (unsigned)cpu >= guest_ncpu()) {
                 snprintf(buf, bufsz, "/tmp/lunaria-no-such-cpu/%ld", cpu);
                 return buf;
             }
@@ -13881,14 +16343,21 @@ static const char *map_guest_path(const char *path, char *buf, size_t bufsz) {
     if (!root) return path;
     /* Create the first path component so mkdir("/Metadata") and open of a file
      * under it do not fail on a missing parent that only exists on a device
-     * because the whole image was there already. */
+     * because the whole image was there already.
+     *
+     * Only do this when the path has a subdirectory component after the first
+     * slash: for "/Metadata/file.txt" we pre-create "/Metadata"; for a
+     * top-level name like "/libnmsssa.so" we must NOT create a directory with
+     * that name, because nmss opens "/libnmsssa.so" as an anti-forensics check
+     * — finding it present (even as a directory) tells the library it is being
+     * analysed and triggers code=102.  On a real device the path does not exist
+     * at all; ENOENT is the correct answer. */
     const char *slash = strchr(path + 1, '/');
-    char top[PATH_MAX];
-    if (slash)
+    if (slash) {
+        char top[PATH_MAX];
         snprintf(top, sizeof top, "%s%.*s", root, (int)(slash - path), path);
-    else
-        snprintf(top, sizeof top, "%s%s", root, path);
-    mkdir(top, 0755);
+        mkdir(top, 0755);
+    }
     static int warned = 0;
     static const int cap = [] {
         const char *s = lunaria_env("LUNARIA_TRACE_FS");
@@ -13940,6 +16409,412 @@ extern "C" const char *arm_exec_map_guest_path(const char *path, char *buf,
     return map_guest_path(path, buf, bufsz);
 }
 
+/* ------------------------------------------------------------------------ *
+ * The device's own command-line tools, reached through execve()
+ * ------------------------------------------------------------------------ *
+ *
+ * An Android application can start a child process and run the platform's
+ * utilities in it; the shell and the package manager are on every device and
+ * are not privileged.  Cross Worlds' security module does exactly that during
+ * start-up:
+ *
+ *     fork() -> dup3(pipe_write, 1) -> execve("/system/bin/sh",
+ *               {"sh", "-c", "pm list packages -f | grep -w ..."})
+ *
+ * and reads the installed-package list back through the pipe.  With execve
+ * unimplemented the child died with 127 and the module got nothing, which is
+ * indistinguishable from a device whose package manager has been hidden.
+ *
+ * These utilities are part of the device this emulator presents, so they are
+ * implemented here rather than borrowed from the host: `pm` answers from the
+ * same package model the guest's PackageManager already reports through JNI,
+ * and the host's own /system (which does not exist) is never consulted.  Each
+ * stage is a plain "bytes in, bytes out" function so a pipeline is a fold, and
+ * nothing needs a real process. */
+
+/* Starting a program image the guest itself supplied.
+ *
+ * Defined next to the ELF loader further down; declared here because the
+ * device shell, system() and execve() all reach it before that point. */
+static int guest_program_spawn(const std::vector<std::string> &words,
+                               uint32_t parent_tid, uint32_t *child_tid);
+static bool guest_program_become(const std::vector<std::string> &words);
+
+/* "The answer is not ready": the calling guest thread has been parked on a
+ * child it started, and the child's exit status reaches it through the thread
+ * table when that child ends — the same way waitpid() is answered. */
+constexpr int kDeviceCommandParked = -2;
+
+struct DeviceCmdBuf {
+    std::string text;
+};
+
+/* pm list packages [-f] [-3|-s|-e|-d|-u] [filter]
+ *
+ * This is a view of the same registry PackageManager uses. */
+static int device_cmd_pm(int argc, char *const argv[], std::string &out) {
+    if (argc < 2 || strcmp(argv[1], "list") != 0 ||
+        (argc >= 3 && strcmp(argv[2], "packages") != 0)) {
+        return 1;   /* pm prints usage and fails for anything else */
+    }
+    bool with_path = false;
+    const char *filter = nullptr;
+    for (int i = 3; i < argc; ++i) {
+        if (argv[i][0] == '-') {
+            if (!strcmp(argv[i], "-f")) with_path = true;
+            continue;
+        }
+        filter = argv[i];
+    }
+    bool system_only = false, third_party_only = false;
+    for (int i = 3; i < argc; ++i) {
+        if (!strcmp(argv[i], "-s")) system_only = true;
+        if (!strcmp(argv[i], "-3")) third_party_only = true;
+    }
+    const size_t count = lunaria_android_package_count();
+    for (size_t i = 0; i < count; ++i) {
+        struct lunaria_android_package pkg;
+        if (!lunaria_android_package_at(i, &pkg)) continue;
+        const bool system = (pkg.flags & LUNARIA_APP_FLAG_SYSTEM) != 0;
+        if (system_only && !system) continue;
+        if (third_party_only && system) continue;
+        if (filter && *filter && !strstr(pkg.name, filter)) continue;
+        char line[PATH_MAX + 128];
+        if (with_path)
+            snprintf(line, sizeof line, "package:%s=%s\n",
+                     pkg.source_dir, pkg.name);
+        else
+            snprintf(line, sizeof line, "package:%s\n", pkg.name);
+        out += line;
+    }
+    return 0;
+}
+
+// grep [-w] [-i] [-v] [-E] PATTERN — the subset a device's toybox grep shares.
+static int device_cmd_grep(int argc, char *const argv[], const std::string &in,
+                           std::string &out) {
+    bool word = false, ignore_case = false, invert = false;
+    const char *pattern = nullptr;
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i][0] == '-' && argv[i][1]) {
+            for (const char *f = argv[i] + 1; *f; ++f) {
+                if (*f == 'w') word = true;
+                else if (*f == 'i') ignore_case = true;
+                else if (*f == 'v') invert = true;
+            }
+            continue;
+        }
+        if (!pattern) pattern = argv[i];
+    }
+    if (!pattern) return 2;             /* grep with no pattern is a usage error */
+    const size_t plen = strlen(pattern);
+    bool any = false;
+    size_t at = 0;
+    while (at <= in.size()) {
+        const size_t nl = in.find('\n', at);
+        const size_t end = (nl == std::string::npos) ? in.size() : nl;
+        if (at == end && nl == std::string::npos) break;
+        std::string line = in.substr(at, end - at);
+        bool hit = false;
+        if (!plen) {
+            hit = true;                 /* the empty pattern matches every line */
+        } else {
+            std::string hay = line, needle = pattern;
+            if (ignore_case) {
+                for (char &c : hay) c = (char)tolower((unsigned char)c);
+                for (char &c : needle) c = (char)tolower((unsigned char)c);
+            }
+            for (size_t p = hay.find(needle); p != std::string::npos;
+                 p = hay.find(needle, p + 1)) {
+                if (word) {
+                    const bool lo = p == 0 ||
+                        (!isalnum((unsigned char)hay[p - 1]) && hay[p - 1] != '_');
+                    const size_t after = p + needle.size();
+                    const bool hi = after >= hay.size() ||
+                        (!isalnum((unsigned char)hay[after]) && hay[after] != '_');
+                    if (!lo || !hi) continue;
+                }
+                hit = true;
+                break;
+            }
+        }
+        if (hit != invert) { out += line; out += '\n'; any = true; }
+        if (nl == std::string::npos) break;
+        at = nl + 1;
+    }
+    return any ? 0 : 1;                 /* grep's "nothing matched" exit status */
+}
+
+/* Split one pipeline stage into words, honouring the quoting a shell does.
+ * Returns false for an unterminated quote, which a shell also refuses. */
+static bool device_split_words(const char *s, std::vector<std::string> &words) {
+    std::string cur;
+    bool have = false;
+    while (*s) {
+        if (isspace((unsigned char)*s)) {
+            if (have) { words.push_back(cur); cur.clear(); have = false; }
+            ++s;
+            continue;
+        }
+        if (*s == '\'' || *s == '"') {
+            const char quote = *s++;
+            while (*s && *s != quote) { cur += *s++; }
+            if (*s != quote) return false;
+            ++s;
+            have = true;
+            continue;
+        }
+        if (*s == '\\' && s[1]) { cur += s[1]; s += 2; have = true; continue; }
+        cur += *s++;
+        have = true;
+    }
+    if (have) words.push_back(cur);
+    return true;
+}
+
+static int device_run_command(const std::vector<std::string> &words,
+                              const std::string &in, std::string &out,
+                              bool background);
+/* A shell's argument is a job list, not one pipeline: see device_run_jobs. */
+static int device_run_jobs(const char *cmdline, std::string &out,
+                           bool background);
+
+/* sh -c "<pipeline>" — a pipeline of the device's own utilities.
+ *
+ * Only the pipe operator is interpreted.  A shell built-in or an operator this
+ * does not implement is reported the way a shell reports a command it cannot
+ * run (127) rather than silently succeeding, so a caller that depends on one
+ * still sees a failure instead of an empty, plausible-looking answer. */
+static int device_run_pipeline(const char *cmdline, std::string &out,
+                               bool background) {
+    std::vector<std::string> stages;
+    {
+        std::string cur;
+        for (const char *p = cmdline; *p; ++p) {
+            if (*p == '\'' || *p == '"') {
+                const char quote = *p;
+                cur += *p++;
+                while (*p && *p != quote) cur += *p++;
+                if (*p) cur += *p;
+                continue;
+            }
+            if (*p == '|' && p[1] != '|') { stages.push_back(cur); cur.clear(); continue; }
+            cur += *p;
+        }
+        stages.push_back(cur);
+    }
+    std::string carry;
+    int status = 0;
+    for (const std::string &stage : stages) {
+        std::vector<std::string> words;
+        if (!device_split_words(stage.c_str(), words)) return 2;
+        if (words.empty()) continue;
+        std::string produced;
+        status = device_run_command(words, carry, produced, background);
+        if (status == kDeviceCommandParked) {
+            /* A guest program image runs as a thread of its own, so its output
+             * cannot be folded into a pipeline the way a built-in's can.  On
+             * its own it is the whole command and the caller waits for it;
+             * inside a pipeline there is nothing honest to hand the next
+             * stage, so refuse rather than pass an empty buffer along. */
+            if (stages.size() == 1u) return kDeviceCommandParked;
+            fprintf(stderr, "[exec] %s: a guest program image cannot be a "
+                            "stage of a pipeline here\n", words[0].c_str());
+            out.clear();
+            return 126;
+        }
+        if (status == 127) { out.clear(); return 127; }
+        carry.swap(produced);
+    }
+    out = carry;
+    return status;
+}
+
+/* A shell's `-c` argument, and system()'s, is a *job list*: pipelines
+ * separated by `;` or `&`, where `&` means the shell does not wait for that
+ * job.  Reading the whole string as one foreground pipeline is not a
+ * simplification, it is a different behaviour: a program started with
+ * `prog &` is a daemon that never exits, so the caller that "waits for the
+ * shell" waits for the life of the process.  Cross Worlds' security module
+ * starts its helper exactly that way, and the game stopped there.
+ *
+ * `&&` and `||` are not separators here — they are operators this shell does
+ * not implement, and they stay inside the stage text so the pipeline reports
+ * the command it cannot run instead of quietly running half of it.
+ *
+ * The status is the last foreground job's, as a shell reports it; a
+ * background job contributes none (its status is 0 to the caller). */
+static int device_run_jobs(const char *cmdline, std::string &out,
+                           bool background)
+{
+    struct Job { std::string text; bool bg; };
+    std::vector<Job> jobs;
+    {
+        std::string cur;
+        for (const char *p = cmdline; *p; ++p) {
+            if (*p == '\'' || *p == '"') {
+                const char quote = *p;
+                cur += *p++;
+                while (*p && *p != quote) cur += *p++;
+                if (*p) cur += *p;
+                continue;
+            }
+            if (*p == '\\' && p[1]) { cur += *p++; cur += *p; continue; }
+            if (*p == '&' && p[1] == '&') { cur += *p++; cur += *p; continue; }
+            if (*p == '|' && p[1] == '|') { cur += *p++; cur += *p; continue; }
+            if (*p == '&' || *p == ';') {
+                jobs.push_back({ cur, *p == '&' });
+                cur.clear();
+                continue;
+            }
+            cur += *p;
+        }
+        /* Text after the last separator is a foreground job; nothing after it
+         * means the last separator already closed the list. */
+        bool tail = false;
+        for (char c : cur) if (!isspace((unsigned char)c)) { tail = true; break; }
+        if (tail || jobs.empty()) jobs.push_back({ cur, false });
+    }
+    std::string produced;
+    int status = 0;
+    for (const Job &j : jobs) {
+        bool empty = true;
+        for (char c : j.text) if (!isspace((unsigned char)c)) { empty = false; break; }
+        if (empty) continue;
+        produced.clear();
+        const int rc = device_run_pipeline(j.text.c_str(), produced,
+                                           background || j.bg);
+        if (rc == kDeviceCommandParked) { out.clear(); return rc; }
+        if (j.bg) continue;      /* a background job's status is not the list's */
+        status = rc;
+        out = produced;
+    }
+    return status;
+}
+
+static int device_run_command(const std::vector<std::string> &words,
+                              const std::string &in, std::string &out,
+                              bool background) {
+    std::vector<char *> argv;
+    argv.reserve(words.size() + 1);
+    for (const std::string &w : words) argv.push_back(const_cast<char *>(w.c_str()));
+    argv.push_back(nullptr);
+    const int argc = (int)words.size();
+
+    const char *name = strrchr(argv[0], '/');
+    name = name ? name + 1 : argv[0];
+
+    if (!strcmp(name, "sh") || !strcmp(name, "system")) {
+        /* sh -c "<list>"; an interactive shell has no meaning here.  The
+         * argument is a job list, not a single pipeline: `prog &` is how a
+         * program is started without waiting for it. */
+        for (int i = 1; i < argc; ++i)
+            if (!strcmp(argv[i], "-c") && i + 1 < argc)
+                return device_run_jobs(argv[i + 1], out, background);
+        return 127;
+    }
+    if (!strcmp(name, "pm"))   return device_cmd_pm(argc, argv.data(), out);
+    if (!strcmp(name, "grep")) return device_cmd_grep(argc, argv.data(), in, out);
+    if (!strcmp(name, "cat"))  { out = in; return 0; }
+    if (!strcmp(name, "echo")) {
+        for (int i = 1; i < argc; ++i) {
+            if (i > 1) out += ' ';
+            out += argv[i];
+        }
+        out += '\n';
+        return 0;
+    }
+    /* Not one of the device's utilities.  It may still be a program the guest
+     * wrote into its own filesystem and is entitled to run — Cross Worlds'
+     * security module drops one in files/ and starts it — so hand it to the
+     * program loader.  A file that is there but is not a program image this
+     * emulator can start is reported the way a shell reports one (126), never
+     * as a success. */
+    {
+        char hostbuf[PATH_MAX];
+        const char *host = map_guest_path(argv[0], hostbuf, sizeof hostbuf);
+        struct stat st {};
+        if (host && stat(host, &st) == 0 && S_ISREG(st.st_mode)) {
+            uint32_t child = 0;
+            if (guest_program_spawn(words, g_current_tid, &child) == 0) {
+                /* `prog &`: the shell reports the job and returns.  A daemon
+                 * started this way never exits, so waiting for it is not a
+                 * slow answer, it is no answer — the caller stops there for
+                 * the life of the process. */
+                if (background) {
+                    fprintf(stderr, "[exec] %s: started in the background as "
+                            "tid=%u\n", argv[0], child);
+                    return 0;
+                }
+                /* The caller is a guest thread waiting for its own child, the
+                 * same park waitpid() uses.  Signalled through the thread
+                 * table rather than answered here: the child has to run
+                 * first, and this handler is what is keeping it from doing
+                 * that. */
+                if (ArmThread *t = arm_thread_by_tid(g_current_tid)) {
+                    t->waiting_join = child;
+                    t->join_retval_ptr = 0;
+                    t->join_is_waitpid = false;
+                    t->join_is_system = true;
+                }
+                g_yield_requested = true;
+                return kDeviceCommandParked;
+            }
+            fprintf(stderr, "[exec] %s: found, but could not be started as a "
+                            "program image\n", argv[0]);
+            return 126;
+        }
+    }
+    fprintf(stderr, "[exec] %s: no such device utility — the guest asked for a "
+                    "program this emulator does not provide\n", argv[0]);
+    return 127;
+}
+
+/* Run what execve() was pointed at.  Returns the exit status, or -1 when the
+ * path names nothing this device has (the caller then reports ENOENT). */
+static int device_exec(const char *path, const std::vector<std::string> &words,
+                       std::string &out) {
+    if (!path || !*path) return -1;
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    static const char *const known[] = { "sh", "pm", "grep", "cat", "echo",
+                                         "toybox", "toolbox", nullptr };
+    bool have = false;
+    for (const char *const *k = known; *k; ++k)
+        if (!strcmp(name, *k)) { have = true; break; }
+    if (!have) return -1;
+    std::vector<std::string> effective = words;
+    if (effective.empty()) effective.push_back(name);
+    /* toybox/toolbox dispatch on argv[0] or on their first argument. */
+    if ((!strcmp(name, "toybox") || !strcmp(name, "toolbox")) &&
+        effective.size() > 1)
+        effective.erase(effective.begin());
+    return device_run_command(effective, std::string(), out, false);
+}
+
+/* bionic's open flags use the Linux/Android ARM ABI, which is not the host
+ * x86_64 ABI for the directory/direct/no-follow/large-file group.  Passing
+ * 0x4000 through made Android O_DIRECTORY become host O_DIRECT; consequently
+ * open("/proc/self/task", O_DIRECTORY) failed with EINVAL. */
+static int host_open_flags(int guest)
+{
+    constexpr int G_O_DIRECTORY = 0x00004000;
+    constexpr int G_O_NOFOLLOW  = 0x00008000;
+    constexpr int G_O_DIRECT    = 0x00010000;
+    constexpr int G_O_LARGEFILE = 0x00020000;
+    int host = guest & ~(G_O_DIRECTORY | G_O_NOFOLLOW |
+                         G_O_DIRECT | G_O_LARGEFILE);
+    if (guest & G_O_DIRECTORY) host |= O_DIRECTORY;
+    if (guest & G_O_NOFOLLOW)  host |= O_NOFOLLOW;
+#ifdef O_DIRECT
+    if (guest & G_O_DIRECT)    host |= O_DIRECT;
+#endif
+#ifdef O_LARGEFILE
+    if (guest & G_O_LARGEFILE) host |= O_LARGEFILE;
+#endif
+    return host;
+}
+
 // Host open() for a guest path string (file:// URI, APK asset fallback).
 static int guest_open_path(const char *path, int flags, mode_t mode) {
     if (!path) return -1;
@@ -13950,6 +16825,13 @@ static int guest_open_path(const char *path, int flags, mode_t mode) {
             if (sl) path = sl;
         }
     }
+    /* Same in-memory /proc/<tid>/{status,stat,comm} fopen uses.  open(2)
+     * must not fall through to the host /proc block for a live guest tid
+     * and invent ENOENT — NMSS opens these with open, not fopen. */
+    if ((flags & O_ACCMODE) == O_RDONLY || (flags & O_ACCMODE) == 0) {
+        const int fd = synth_guest_task_open_fd(path);
+        if (fd >= 0) return fd;
+    }
     // Synth guest /proc before map; never fall through to host /proc (x86 maps/cpuinfo/auxv confuse ARM Unity / Boehm /.
     if (const char *subst = synthetic_proc_path(path))
         path = subst;
@@ -13959,13 +16841,17 @@ static int guest_open_path(const char *path, int flags, mode_t mode) {
         static int blocked = 0;
         if (blocked++ < 16)
             fprintf(stderr, "[guest_open] blocked host /proc: %s\n", path);
+        /* Match fopen: a vanished /proc/<tid>/… is ENOENT, never a stale
+         * errno from an earlier call.  NMSS retries on wrong errno forever. */
+        errno = ENOENT;
         return -1;
     }
-    int fd = open(path, flags, mode);
+    const int host_flags = host_open_flags(flags);
+    int fd = open(path, host_flags, mode);
     if (fd < 0) {
         char cache[PATH_MAX];
         if (apk_extract_to_cache(path, cache, sizeof cache))
-            fd = open(cache, flags, mode);
+            fd = open(cache, host_flags, mode);
     }
     // Mono reads <assembly>.
     if (fd < 0 && strstr(path, ".config")) {
@@ -14005,8 +16891,9 @@ static int guest_openat_path(int dirfd, const char *path, int flags, mode_t mode
     }
     if (dirfd == AT_FDCWD || path[0] == '/' || strncmp(path, "file://", 7) == 0)
         return guest_open_path(path, flags, mode);
-    return openat(dirfd, path, flags, mode);
+    return openat(dirfd, path, host_open_flags(flags), mode);
 }
+
 
 static int guest_unlinkat_path(int dirfd, const char *path, int flags) {
     if (!path) { errno = EFAULT; return -1; }
@@ -14104,6 +16991,154 @@ static bool aasset_load_bytes(const char *fname, std::vector<uint8_t> &data,
         return true;
     }
     return false;
+}
+
+/* Resolve a host file path without reading contents.  Used so openFileDescriptor
+ * can return a real FD (Android APK/OBB assets often do this) and so large
+ * InstalledContent opens do not memcpy 28 MiB into the guest twice. */
+static bool aasset_resolve_host(const char *fname, std::string &host_out,
+                                uint64_t &len_out, const char **via_out = nullptr) {
+    if (!fname || !*fname) return false;
+    auto via = [&](const char *tag) {
+        if (via_out) *via_out = tag;
+    };
+    if (fname[0] == '/') {
+        char mapped[PATH_MAX];
+        const char *p = map_guest_path(fname, mapped, sizeof mapped);
+        const char *path = p ? p : fname;
+        if (asset_bridge::host_regular_stat(path, len_out)) {
+            host_out = path;
+            via("fs");
+            return true;
+        }
+        const char *ext = lunaria_env("ANDROID_EXTERNAL_FILES_DIR");
+        if (ext && *ext) {
+            size_t el = strlen(ext);
+            if (strncmp(path, ext, el) == 0 && path[el] == '/') {
+                const char *rest = path + el + 1;
+                if (strncmp(rest, "InstalledContent/", 17) == 0) {
+                    rest += 17;
+                    if (asset_bridge::files_tree_resolve(rest, host_out, len_out)) {
+                        via("files");
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+    if (fname[0] == '.' && fname[1] == '/')
+        fname += 2;
+
+    static const char *prefixes[] = {
+        "assets/", "base/assets/", "UnityDataAssetPack/assets/", nullptr
+    };
+    for (int pi = 0; prefixes[pi]; pi++) {
+        std::string entry = std::string(prefixes[pi]) + fname;
+        if (const char *hp = arm_exec_apk_entry_path(entry.c_str())) {
+            if (asset_bridge::host_regular_stat(hp, len_out)) {
+                host_out = hp;
+                via("apk");
+                return true;
+            }
+        }
+    }
+    if (const char *hp = arm_exec_apk_entry_path(fname)) {
+        if (asset_bridge::host_regular_stat(hp, len_out)) {
+            host_out = hp;
+            via("apk");
+            return true;
+        }
+    }
+    if (asset_bridge::files_tree_resolve(fname, host_out, len_out)) {
+        via("files");
+        return true;
+    }
+    return false;
+}
+
+static uint64_t aasset_length(const GuestAsset &a) {
+    return a.length ? a.length : (uint64_t)a.data.size();
+}
+
+/* Ensure data[] + buf_va exist (getBuffer / bytewise read). */
+static bool aasset_materialize(ArmExecCtx &ctx, GuestAsset &a) {
+    if (a.buf_va && !a.data.empty()) return true;
+    if (a.data.empty()) {
+        if (a.host_path.empty()) {
+            if (a.length == 0) {
+                /* empty asset */
+            } else {
+                return false;
+            }
+        } else {
+            ArmLockDropped unlock_for_asset;
+            if (!asset_bridge::read_host_regular(a.host_path, a.data))
+                return false;
+            a.length = a.data.size();
+        }
+    }
+    if (a.buf_va) return true;
+    const size_t n = a.data.size();
+    uint32_t va = arm_malloc(ctx, (uint32_t)n + 1u);
+    if (!va) return false;
+    uint8_t *dst = ctx.mem.ptr(va);
+    if (!dst) { arm_free(ctx, va); return false; }
+    if (n >= 65536u) {
+        ArmLockDropped unlock_for_copy;
+        if (n) memcpy(dst, a.data.data(), n);
+        dst[n] = 0;
+    } else {
+        if (n) memcpy(dst, a.data.data(), n);
+        dst[n] = 0;
+    }
+    a.buf_va = va;
+    return true;
+}
+
+/* Android openFileDescriptor: prefer a real host FD over writing a temp copy. */
+static int aasset_open_file_descriptor(GuestAsset &a, int64_t *start,
+                                       int64_t *length) {
+    if (!a.host_path.empty()) {
+        int fd;
+        {
+            ArmLockDropped unlock_for_open;
+            fd = open(a.host_path.c_str(), O_RDONLY | O_CLOEXEC);
+        }
+        if (fd < 0) return -1;
+        if (start) *start = 0;
+        if (length) *length = (int64_t)aasset_length(a);
+        return fd;
+    }
+    if (a.data.empty() && a.length > 0)
+        return -1; /* needs materialize first — caller should load bytes */
+    char tmpl[] = "/tmp/lunaria-asset-XXXXXX";
+    int fd;
+    {
+        ArmLockDropped unlock_for_tmp;
+        fd = mkstemp(tmpl);
+        if (fd < 0) return -1;
+        if (!a.data.empty()) {
+            const uint8_t *p = a.data.data();
+            size_t left = a.data.size();
+            while (left) {
+                ssize_t wr = write(fd, p, left);
+                if (wr < 0) {
+                    if (errno == EINTR) continue;
+                    close(fd);
+                    unlink(tmpl);
+                    return -1;
+                }
+                p += (size_t)wr;
+                left -= (size_t)wr;
+            }
+        }
+        lseek(fd, 0, SEEK_SET);
+        unlink(tmpl);
+    }
+    if (start) *start = 0;
+    if (length) *length = (int64_t)aasset_length(a);
+    return fd;
 }
 
 /* Same lookup, for callers outside the JNI SVC path — the bytecode
@@ -14569,10 +17604,25 @@ static bool try_asset_jni(ArmExecCtx &ctx, uint32_t svc, std::array<uint64_t,16>
         uint32_t hpath = jni_arg_word(ctx, regs, variant, 0);
         const char *rel = N.GetStringUTFChars(env, (jstring)(uintptr_t)hpath, nullptr);
         if (!rel) { regs[0] = 0; return true; }
+        char namebuf[PATH_MAX];
+        {
+            size_t n = 0;
+            while (n + 1 < sizeof namebuf && rel[n]) {
+                namebuf[n] = rel[n];
+                ++n;
+            }
+            namebuf[n] = '\0';
+            if (rel[n]) { regs[0] = 0; return true; }
+        }
         std::vector<uint8_t> data;
         const char *via = nullptr;
-        if (!aasset_load_bytes(rel, data, &via)) {
-            fprintf(stderr, "[asset] open MISS %s\n", rel);
+        bool ok;
+        {
+            ArmLockDropped unlock_for_asset;
+            ok = aasset_load_bytes(namebuf, data, &via);
+        }
+        if (!ok) {
+            fprintf(stderr, "[asset] open MISS %s\n", namebuf);
             regs[0] = 0;
             return true;
         }
@@ -14582,7 +17632,7 @@ static bool try_asset_jni(ArmExecCtx &ctx, uint32_t svc, std::array<uint64_t,16>
         g_streams[h] = Stream{ std::move(data), 0 };
         g_last_stream = h;
         fprintf(stderr, "[asset] open %s via %s -> stream 0x%x (%zu bytes)\n",
-                rel, via ? via : "?", h, sz);
+                namebuf, via ? via : "?", h, sz);
         regs[0] = h;
         return true;
     }
@@ -15245,12 +18295,18 @@ struct SockState {
     uint64_t tx = 0, rx = 0;         /* payload bytes moved on this fd */
     uint64_t tx_mark = 0, rx_mark = 0;   /* totals as last reported */
     int64_t  mark_ms = 0;            /* when the last report went out */
+    int64_t  last_recv_call_ms = 0;  /* opt-in: distinguish peer wait from guest delay */
     /* A dial-out the guest is still waiting on.  The answer it eventually
      * reads out of SO_ERROR decides whether the address is usable, and a
      * connect that is abandoned leaves no other trace: the socket is closed
      * with no bytes on it, which looks the same as one that was never used. */
     bool     connecting = false;
     int64_t  connect_started_ms = 0;
+    /* How many times the guest asked poll()/select() about this descriptor
+     * while the dial-out was pending.  "Abandoned after 1 ms" has two very
+     * different causes -- the guest waited and was told nothing, or the guest
+     * never waited at all -- and the byte counts cannot tell them apart. */
+    uint32_t connect_polls = 0;
     /* A connect() that failed synchronously (not EINPROGRESS) rather than
      * one still pending.  Measured directly on this host: after such a
      * failure, a real poll()/select() on the fd never reports it ready —
@@ -15265,6 +18321,14 @@ struct SockState {
     int      sync_connect_errno = 0;
 };
 static std::map<int, SockState> g_socks;
+/* Dial-outs presently pending.  poll() is one of the hottest handlers in a UE
+ * title (tens of thousands a second), so the per-descriptor bookkeeping above
+ * is only walked while there is actually a connect in flight. */
+static std::atomic<unsigned> g_connect_pending{0};
+/* The guest PC that closed the descriptor, for the abandoned-dial-out report.
+ * Written by the close handlers immediately before forget(); "who gave up on
+ * this address" is the whole question and the byte counts cannot answer it. */
+static uint32_t g_close_lr = 0;
 
 /* How many live sockets are in the sync_connect_failed state.
  *
@@ -15661,11 +18725,23 @@ static void forget(int fd) {
      * decides whether a peer 180 ms away is reachable at all, and it is
      * invisible everywhere else. */
     if (s && s->connecting) {
+        g_connect_pending.fetch_sub(1, std::memory_order_relaxed);
         static int n = 0;
-        if (n++ < 48 || trace())
+        if (n++ < 48 || trace()) {
+            /* ...and what `errno` said on the way out.  A guest that walks
+             * away from an in-flight connect without polling did not
+             * recognise EINPROGRESS, so the value it could actually read is
+             * the first thing to check before blaming its own logic. */
+            uint32_t gcell = 0, gval = 0;
+            if (g_ctx) gval = guest_errno_view(*g_ctx, &gcell);
             fprintf(stderr, "[net] connect fd=%d -> %s abandoned after %lldms "
-                    "(never read SO_ERROR)\n", fd, s->peer[0] ? s->peer : "?",
-                    (long long)(now_ms() - s->connect_started_ms));
+                    "(never read SO_ERROR; polled %u time%s; closed by "
+                    "lr=0x%08x; guest errno cell 0x%08x = %u)\n",
+                    fd, s->peer[0] ? s->peer : "?",
+                    (long long)(now_ms() - s->connect_started_ms),
+                    s->connect_polls, s->connect_polls == 1 ? "" : "s",
+                    g_close_lr, gcell, gval);
+        }
     }
     if (s && s->sync_connect_failed)
         g_sync_connect_failures.fetch_sub(1, std::memory_order_relaxed);
@@ -15837,6 +18913,18 @@ static int fd_wait_read_ready(void *vp) {
 }
 static void fd_wait_free_read(void *vp) { delete static_cast<FdWaitReadCtx *>(vp); }
 
+// The write-side twin of FdWaitReadCtx, for a blocking send() on a full
+// socket buffer — parked exactly like a blocking recv() (see SVC_NET_SEND).
+struct FdWaitWriteCtx { int fd; };
+static int fd_wait_write_ready(void *vp) {
+    auto *c = static_cast<FdWaitWriteCtx *>(vp);
+    struct pollfd p = { c->fd, POLLOUT, 0 };
+    if (poll(&p, 1, 0) > 0) return 1;
+    const SockState *s = state(c->fd);
+    return (s && s->sync_connect_failed) ? 1 : 0;
+}
+static void fd_wait_free_write(void *vp) { delete static_cast<FdWaitWriteCtx *>(vp); }
+
 struct FdWaitALooperCtx {
     ArmMemory *mem;
     GuestVA out_fd, out_ev, out_data;
@@ -15844,7 +18932,18 @@ struct FdWaitALooperCtx {
     uint32_t self_tid;
 };
 static int fd_wait_alooper_ready(void *vp);
-static int fd_wait_alooper_expire(void *vp) { (void)vp; return -3; }
+static int fd_wait_alooper_expire(void *vp) {
+    auto *c = static_cast<FdWaitALooperCtx *>(vp);
+    /* A deadline set from ndk_choreo_looper_due_ns means the wait ended
+     * because a frame callback is due, not because the guest asked for a
+     * timeout.  ALOOPER_POLL_CALLBACK (-2) matches the platform: the next
+     * pollOnce entry runs drive_ndk_choreographer. */
+    const uint64_t now_ns = host_mono_ns();
+    for (const auto &cb : g_ndk_choreo_q)
+        if (cb.tid == c->self_tid && cb.due_ns <= now_ns)
+            return -2;
+    return -3;
+}
 static void fd_wait_free_alooper(void *vp) { delete static_cast<FdWaitALooperCtx *>(vp); }
 
 struct GuestFdWait {
@@ -15954,6 +19053,15 @@ static GuestFdWait make_read_wait(int fd) {
     w.deadline_ms = -1;
     return w;
 }
+static GuestFdWait make_write_wait(int fd) {
+    GuestFdWait w;
+    w.ready = fd_wait_write_ready;
+    w.ctx = new FdWaitWriteCtx{fd};
+    w.free_ctx = fd_wait_free_write;
+    w.retry = true;
+    w.deadline_ms = -1;
+    return w;
+}
 static GuestFdWait make_alooper_wait(ArmMemory *mem, GuestVA out_fd,
                                      GuestVA out_ev, GuestVA out_data, bool is64,
                                      uint32_t self_tid, int64_t deadline) {
@@ -15974,27 +19082,60 @@ static int fd_wait_alooper_ready(void *vp) {
      * takes another thread's input queue readiness and the owner never sees
      * its own events. */
     const uint32_t my_looper = ARM_ALOOPER_BASE + c->self_tid;
-    for (auto &e : g_alooper_fds) {
+    /* One poll(2) call for every candidate fd, not one call per fd: with N
+     * descriptors registered on a Looper this was N syscalls on every single
+     * pollOnce/pollAll re-check (hundreds of times a second while parked),
+     * and worse, the loop returned on the first *ready* entry it found in
+     * vector order — an fd that is nearly always readable (a busy pipe
+     * registered first) could keep shadowing one registered after it that
+     * only occasionally has data, since each call started the scan over
+     * from the front. Polling every fd in the same syscall still favours
+     * vector order when more than one is ready in the same instant (matching
+     * the previous, simpler priority), but at least it costs one syscall and
+     * treats every registered fd as a candidate on every check instead of
+     * bailing out at the first hit before the rest were even examined. */
+    struct pollfd pfds[64];
+    int idx[64];
+    nfds_t np = 0;
+    for (size_t i = 0; i < g_alooper_fds.size() && np < 64; ++i) {
+        const ALooperFd &e = g_alooper_fds[i];
         if (e.fd < 0) continue;
         if (e.looper && e.looper != my_looper) continue;
-        struct pollfd pfd = { e.fd, POLLIN, 0 };
-        if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLIN)) continue;
-        if (c->out_fd) c->mem->write32(c->out_fd, (uint32_t)e.fd);
-        if (c->out_ev) c->mem->write32(c->out_ev, 1u);
-        if (c->out_data) {
-            if (c->is64) std::memcpy(c->mem->ptr(c->out_data), &e.data, 8);
-            else c->mem->write32(c->out_data, (uint32_t)e.data);
+        pfds[np] = { e.fd, POLLIN, 0 };
+        idx[np] = (int)i;
+        ++np;
+    }
+    if (np && poll(pfds, np, 0) > 0) {
+        for (nfds_t i = 0; i < np; ++i) {
+            if (!(pfds[i].revents & POLLIN)) continue;
+            const ALooperFd &e = g_alooper_fds[idx[i]];
+            if (c->out_fd) c->mem->write32(c->out_fd, (uint32_t)e.fd);
+            if (c->out_ev) c->mem->write32(c->out_ev, 1u);
+            if (c->out_data) {
+                if (c->is64) std::memcpy(c->mem->ptr(c->out_data), &e.data, 8);
+                else c->mem->write32(c->out_data, (uint32_t)e.data);
+            }
+            return e.ident ? e.ident : -2;
         }
-        return e.ident ? e.ident : -2;
     }
     if (alooper_wake_take(c->self_tid)) return -1;  /* ALOOPER_POLL_WAKE */
     const uint64_t now_ns = host_mono_ns();
+    /* Match drive_ndk_choreographer: wake only when a callback is due AND the
+     * vsync gate is open (or stuck far ahead).  The park deadline covers the
+     * short pace wait so we do not busy-complete the wait every 0.5 ms. */
+    uint64_t earliest_due = 0;
+    for (const auto &cb : g_ndk_choreo_q) {
+        if (cb.tid != c->self_tid) continue;
+        if (!earliest_due || cb.due_ns < earliest_due) earliest_due = cb.due_ns;
+    }
+    if (!earliest_due || earliest_due > now_ns) return 0;
     auto nv = g_ndk_choreo_next_vsync.find(c->self_tid);
-    if (nv == g_ndk_choreo_next_vsync.end() || now_ns >= nv->second)
-        for (const auto &cb : g_ndk_choreo_q)
-            if (cb.tid == c->self_tid && cb.due_ns <= now_ns)
-                return -2;
-    return 0;
+    if (nv != g_ndk_choreo_next_vsync.end() && now_ns < nv->second) {
+        if (nv->second <= earliest_due + 4 * A_VSYNC_PERIOD_NS)
+            return 0; /* short pace: deadline will wake */
+        /* stuck gate */
+    }
+    return -2;
 }
 
 static std::map<uint32_t, GuestFdWait> g_fd_waits;
@@ -16003,18 +19144,16 @@ static std::map<uint32_t, GuestFdWait> g_fd_waits;
  * cooperative scheduler.  The main thread drives the host frame pump from its
  * own Run(), so it keeps the old in-handler wait (where wait_slice() does run
  * the other threads). */
-/* LUNARIA_FD_PARK=1 deschedudles a guest thread that blocks in read() or
- * ALooper_pollOnce() onto the descriptor instead of leaving it asleep inside
- * the engine that issued it.  That is the right emulation and much cheaper —
- * an engine asleep in read(2) is one fewer engine for every other guest
- * thread, and an event loop that is answered POLL_TIMEOUT at once spins — but
- * it changes when a guest thread is observed to be running, and Cross Worlds'
- * security module is watching.  Off until that is understood. */
+/* Deschedule a guest thread that blocks in in read()/accept() onto its fd,
+ * exactly as the kernel does.  Leaving this opt-in consumed one host engine
+ * per blocked guest thread; once the pool was exhausted, dozens of ready
+ * threads (including the nmss client and helper) stopped for tens of seconds.
+ * LUNARIA_FD_PARK=0 remains as a scheduler diagnostic. */
 static bool fd_park_enabled(void) {
     static int on = -1;
     if (on < 0) {
         const char *e = lunaria_env("LUNARIA_FD_PARK");
-        on = (e && (e[0] == '1' || e[0] == 'y')) ? 1 : 0;
+        on = (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N')) ? 0 : 1;
     }
     return on != 0;
 }
@@ -16034,7 +19173,11 @@ static bool can_park_current(void) {
     /* A guest thread with a slot in the table can be descheduled and resumed;
      * the loader's own thread (tid 0) drives the frame pump from its own Run()
      * and a host-driven callback has no slot to park in. */
-    if (g_current_tid == 0 || g_in_cb()) return false;
+    /* A callback can drive the scheduler while waiting.  Threads dispatched
+     * inside that callback still have their own saved context and must park
+     * normally.  Testing the outer callback depth instead traps their read
+     * inside the host wait loop and prevents the callback's writer resuming. */
+    if (g_current_tid == 0 || ctx_innermost_is_cb()) return false;
     for (const auto &t : g_threads)
         if (t.id == g_current_tid) return !t.finished;
     return false;
@@ -16048,19 +19191,60 @@ static bool can_park_current(void) {
  * 20 ms ceiling a TCP connect whose handshake takes 17 ms was a coin flip, and
  * the loser walked down its whole address list declaring every one of them
  * dead.  A guest thread that can park costs nothing while it waits, so it
- * waits exactly as long as it asked, forever included.  The host thread (tid 0)
- * is the one running the frame pump, so an *unbounded* wait there would stop
- * presenting for good; only that case keeps a ceiling.  Finite timeouts are
- * always honoured. */
+ * waits exactly as long as it asked, forever included.  Finite timeouts are
+ * always honoured.
+ *
+ * A thread that cannot park still must not be told a lie, and it does not
+ * have to be: the loop that serves it calls wait_slice() and sleeps 200 us
+ * between polls, so it hands the ARM execution lock over and lets the
+ * scheduler run every time round.  On an engine that is exactly what a
+ * blocked thread should look like, so it waits as asked there too.
+ *
+ * The one host thread that cannot be allowed to wait unboundedly is the one
+ * driving the frame pump -- everything it runs, including a guest thread
+ * dispatched inline because the engine pool was busy, is the frame.  Only
+ * that thread keeps a ceiling.
+ *
+ * This mattered: Cross Worlds' settings fetch dials a CDN this host reaches
+ * in about 200 ms, the helper thread it spawns to wait for the handshake was
+ * cut off at 20 ms and told nothing was ready, and the title put up
+ * "Settings failed to load" in three runs out of four.  With the wait
+ * honoured the same connect answers `SO_ERROR=0 ... after 209ms` and the
+ * download runs. */
 static int64_t wait_deadline_ms(long want_ms, bool parkable) {
     if (want_ms >= 0) return now_ms() + want_ms;
     if (parkable) return INT64_MAX;          /* infinite, and free */
-    return now_ms() + block_ms();
+    if (g_a64_is_worker) return INT64_MAX;   /* an engine: loop and yield */
+    return now_ms() + block_ms();            /* the frame pump: bounded */
+}
+
+/* Is the deadline above the emulator's own ceiling rather than the guest's
+ * request?  Only the unbounded wait on a thread that cannot park hits it.
+ *
+ * This distinction is the whole point of the ceiling.  Returning 0 from
+ * poll(2) is a statement of fact -- "nothing became ready in the time you
+ * asked for" -- and it is false here, because the guest did not ask for this
+ * time.  A caller walking a DNS answer reads that false timeout as "this
+ * address is dead" and moves to the next one; Cross Worlds' settings fetch
+ * does exactly that, and its "Settings failed to load" dialog is the result
+ * (measured: connect to the peer abandoned after 19-21 ms, which is
+ * block_ms(), with SO_ERROR never read -- while the same peer answers in
+ * 21 ms from this host, and a run where it landed just inside the ceiling
+ * went straight through).
+ *
+ * EINTR says what actually happened: the wait was cut short by something that
+ * is not the descriptors.  It is a documented outcome of poll(2)/select(2)
+ * and epoll_wait(2), every caller that can retry does retry it, and unlike a
+ * fabricated timeout it carries no claim about the peer.  The ceiling still
+ * does its job -- the pump thread never waits unbounded -- it just stops
+ * lying about why it came back. */
+static bool wait_deadline_is_ceiling(long want_ms, bool parkable) {
+    return want_ms < 0 && !parkable && !g_a64_is_worker;
 }
 
 // Wait until `events` is possible on `fd`, at most `budget_ms`.
 static int wait_ready(int fd, short events, long budget_ms) {
-    const int64_t deadline = now_ms() + budget_ms;
+    const int64_t deadline = budget_ms < 0 ? INT64_MAX : now_ms() + budget_ms;
     for (;;) {
         struct pollfd pfd { fd, events, 0 };
         int rc = ::poll(&pfd, 1, 0);
@@ -16122,7 +19306,30 @@ static long timeval_ms(ArmExecCtx &ctx, GuestVA tv) {
     return (long)(sec * 1000 + usec / 1000);
 }
 
+void choreo_refresh_alooper_deadline(uint32_t tid, uint64_t due_ns)
+{
+    if (!tid || !due_ns) return;
+    auto wit = g_fd_waits.find(tid);
+    if (wit == g_fd_waits.end()) return;
+    if (!wit->second.what || strcmp(wit->second.what, "ALooper_pollOnce") != 0)
+        return;
+    const uint64_t now_ns = host_mono_ns();
+    int64_t choreo_ms = now_ms();
+    if (due_ns > now_ns)
+        choreo_ms += (int64_t)((due_ns - now_ns + 999999ull) / 1000000ull);
+    else
+        choreo_ms += 1;
+    if (wit->second.deadline_ms < 0 || choreo_ms < wit->second.deadline_ms)
+        wit->second.deadline_ms = choreo_ms;
+    fd_deadline_republish();
+}
+
 } /* namespace guest_net */
+
+/* How many parked poll/select/read waits exist, readable without the
+ * execution lock.  The timer thread below asks this several hundred times a
+ * second and must not take the lock to find out there is nothing to do. */
+static std::atomic<size_t> g_fd_waits_pending{0};
 
 static void fd_deadline_republish(void)
 {
@@ -16133,6 +19340,8 @@ static void fd_deadline_republish(void)
         if (d >= 0 && d > now && d < least) least = d;
     }
     g_fd_next_deadline_ms.store(least, std::memory_order_relaxed);
+    g_fd_waits_pending.store(guest_net::g_fd_waits.size(),
+                             std::memory_order_release);
 }
 
 /* Complete one parked poll/select/epoll/read wait when its ready() says so.
@@ -16146,6 +19355,24 @@ static bool fd_try_complete(ArmExecCtx &ctx, ArmThread &t)
         return true;
     }
     int rc = wit->second.ready ? wit->second.ready(wit->second.ctx) : 0;
+    /* The revents the guest will read, captured before the wait record goes
+     * away: "poll said ready" and "poll said the right thing" are different
+     * claims, and only the second one makes the guest act. */
+    char rv_seen[128] = "";
+    if (rc > 0 && wit->second.ready == guest_net::fd_wait_poll_ready) {
+        const auto *pc = static_cast<const guest_net::FdWaitPollCtx *>(wit->second.ctx);
+        size_t used = 0;
+        for (uint32_t i = 0; i < pc->n && i < 6 && used + 32 < sizeof rv_seen;
+             ++i) {
+            const uint32_t w = ctx.mem.read32(pc->fds + (GuestVA)i * 8u + 4u);
+            used += (size_t)snprintf(rv_seen + used, sizeof rv_seen - used,
+                                     " %d/ev=0x%x/rv=0x%x",
+                                     (int)ctx.mem.read32(pc->fds +
+                                                         (GuestVA)i * 8u),
+                                     (unsigned)(w & 0xffffu),
+                                     (unsigned)(w >> 16));
+        }
+    }
     const bool timed_out =
         rc == 0 && wit->second.deadline_ms >= 0 &&
         guest_net::now_ms() >= wit->second.deadline_ms;
@@ -16160,13 +19387,31 @@ static bool fd_try_complete(ArmExecCtx &ctx, ArmThread &t)
             wit->second.last_report_ms = now;
             fprintf(stderr,
                     "[net] tid=%u still in %s after %llds "
-                    "(%llu re-polls) on%s\n",
+                    "(%llu re-polls) on%s deadline_ms=%lld now_ms=%lld "
+                    "choreo_due=%llu\n",
                     t.id, wit->second.what,
                     (long long)(waited / 1000),
                     (unsigned long long)wit->second.polls,
-                    wit->second.fds.c_str());
+                    rv_seen[0] ? rv_seen : wit->second.fds.c_str(),
+                    (long long)wit->second.deadline_ms,
+                    (long long)now,
+                    (unsigned long long)ndk_choreo_looper_due_ns(t.id));
         }
         return false;
+    }
+    /* How a descriptor wait ended.  A guest that polls, is told nothing, and
+     * walks away from an address that was reachable is the failure this is
+     * here to explain: "ready" and "timed out" and "woken with nothing" are
+     * three different bugs and the byte counts cannot tell them apart. */
+    if (guest_net::g_connect_pending.load(std::memory_order_relaxed)) {
+        static int n = 0;
+        if (n++ < 64)
+            fprintf(stderr, "[net] %s wait ended tid=%u rc=%d %s after %lldms"
+                    " on%s\n",
+                    wit->second.what ? wit->second.what : "fd", t.id, rc,
+                    timed_out ? "(deadline)" : "(ready)",
+                    (long long)(guest_net::now_ms() - wit->second.started_ms),
+                    wit->second.fds.c_str());
     }
     if (wit->second.retry) {
         guest_net::g_fd_waits.erase(wit);
@@ -16208,6 +19453,7 @@ static void fd_wake_all_ready(ArmExecCtx &ctx)
         if (!tp || tp->finished || tp->running || !tp->waiting_fds) continue;
         if (!fd_try_complete(ctx, *tp)) continue;
         g_in_wait_poll[tid] = false;
+        tp->io_ready = true;
         thread_mark_ready(tid);
     }
 }
@@ -16223,10 +19469,10 @@ static void set_cur_tid_fast(ArmExecCtx &ctx, ArmThread &t) {
     if (!ctx.is_arm64) return;
     g_tpidr_el0_val   = t.tls64;
     g_tpidrro_el0_val = t.tls64;
-    if (g_fast64_mutex_lock_va)
+    if (a64_has_private_tls(t.tls64) && g_fast64_mutex_lock_va)
         ctx.mem.write32((GuestVA)(t.tls64 + TLS64_OWNER_OFF),
                         (t.id + 1u) & 0xffu);
-    if (g_fast64_gettid_va)
+    if (a64_has_private_tls(t.tls64) && g_fast64_gettid_va)
         ctx.mem.write32((GuestVA)(t.tls64 + TLS64_TID_OFF), guest_tid_of(t.id));
 }
 
@@ -16389,7 +19635,7 @@ static uint64_t guest_abstime_to_rel_ns(int clockid, uint64_t abs_ns)
     return abs_ns > now_ns ? abs_ns - now_ns : 0;
 }
 
-/* LUNARIA_GUEST_SLEEP=1 makes a guest sleep last as long as the guest asked.
+/* Guest sleeps last as long as the guest asked.
  *
  * It ought to be the default and the machinery for it is now here and
  * measured: sleeps park instead of holding an engine, sleep_timer_thread()
@@ -16408,22 +19654,19 @@ static uint64_t guest_abstime_to_rel_ns(int clockid, uint64_t abs_ns)
  * single largest thing keeping the guest inside the JIT: one exit every
  * ~200k guest instructions instead of one every ~5k.
  *
- * It is still not the default, for one reason: with sleeps honoured the
- * module reaches a "report and die" path about a minute in, and the game
- * never gets to the character select it otherwise reaches in 106 seconds.
- * A default that kills the app is worse than a slow one, so this stays a
- * switch until that detection is understood — everything known about it is
- * in PROGRESS.md under the 2026-09-03 entries.
- *
- * LUNARIA_GUEST_SLEEP=1 asks for the correct behaviour, and is worth a great
- * deal: one exit from the JIT every ~200k guest instructions instead of one
- * every ~5k. */
+ * The security failure previously exposed by correct sleeps was not timing
+ * detection: the extracted nmss helper's blocking accept() was cut off after
+ * LUNARIA_NET_BLOCK_MS (20 ms) and returned EINTR before its client arrived.
+ * The helper thread therefore exited and never answered nmssv.  Blocking
+ * socket operations now wait with the guest scheduler running, as Android
+ * does, so correct guest sleeps can be the default.  Set
+ * LUNARIA_GUEST_SLEEP=0 only for comparison/debugging. */
 static bool guest_sleep_enabled(void)
 {
     static int on = -1;
     if (on < 0) {
         const char *e = lunaria_env("LUNARIA_GUEST_SLEEP");
-        on = (e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y')) ? 1 : 0;
+        on = (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N')) ? 0 : 1;
     }
     return on != 0;
 }
@@ -16512,21 +19755,94 @@ static void a64_lock_boost_drop(void) {
 static std::mutex              g_sleep_timer_mx;
 static std::condition_variable g_sleep_timer_cv;
 static std::atomic<bool>       g_sleep_timer_stop{false};
+static std::thread             g_sleep_timer_host_thread;
+/* Virtual Linux tracing state.  Host ptrace must never be used for a guest:
+ * it would inspect Lunaria rather than the emulated process.  PTRACE_TRACEME
+ * belongs to a task/process, not to the kernel or emulator.  Keeping one
+ * process-wide bool made an exec'ed NMSS helper inherit the app's earlier
+ * TRACEME attempt and receive EPERM, which on Linux means "already traced".
+ * Keep this C-shaped because the process model is intended to move out of the
+ * C++ execution engine. */
+#define GUEST_PTRACE_PROCESS_MAX 64u
+static uint32_t g_guest_ptrace_traceme_pids[GUEST_PTRACE_PROCESS_MAX];
+static unsigned g_guest_ptrace_traceme_count;
+
+static bool guest_ptrace_traceme_started(uint32_t pid)
+{
+    unsigned i;
+    for (i = 0; i < g_guest_ptrace_traceme_count; ++i)
+        if (g_guest_ptrace_traceme_pids[i] == pid) return true;
+    return false;
+}
+
+static bool guest_ptrace_traceme_start(uint32_t pid)
+{
+    if (guest_ptrace_traceme_started(pid)) return false;
+    if (g_guest_ptrace_traceme_count >= GUEST_PTRACE_PROCESS_MAX) return false;
+    g_guest_ptrace_traceme_pids[g_guest_ptrace_traceme_count++] = pid;
+    return true;
+}
+
+/* Descriptor readiness, on the kernel's schedule rather than the frame's.
+ *
+ * A guest thread parked in poll/select was only ever completed by a scheduler
+ * pass, so it learned that its socket had become writable up to a whole frame
+ * late -- 40 ms during this title's load, when the pass rate is around 25/s.
+ * A device's poll returns microseconds after the connect completes, and the
+ * gap is visible to any guest that gives an operation a bounded time: this
+ * title's socket layer arms a connect, waits, and walks on to the next address
+ * about 10 ms later, so it was abandoning addresses that had already answered.
+ *
+ * The readiness test itself is the wait's own non-blocking host poll, which is
+ * what fd_try_complete() runs; all that was missing was somebody to run it
+ * between passes. */
+static void fd_service_ready(void)
+{
+    if (!g_fd_waits_pending.load(std::memory_order_acquire)) return;
+    if (!g_ctx) return;
+    {
+        ArmLockGuard g;
+        fd_wake_all_ready(*g_ctx);
+    }
+    sched_pass_notify();
+    a64par::sched_poke();
+}
 
 static void sleep_timer_thread(void)
 {
     std::unique_lock<std::mutex> lk(g_sleep_timer_mx);
     while (!g_sleep_timer_stop.load(std::memory_order_relaxed)) {
+        /* While a descriptor wait is outstanding the timer also owns the
+         * "has it become ready" question, so it never sleeps longer than the
+         * latency that answer is allowed to have. */
+        const bool fds_parked =
+            g_fd_waits_pending.load(std::memory_order_acquire) != 0;
+        const uint64_t fd_poll_ns = 500000ull;   /* 0.5 ms */
         const uint64_t due = g_sleep_next_due_ns.load(std::memory_order_relaxed);
         if (due == UINT64_MAX) {
             /* Nothing parked.  Re-check on the next announcement, and once a
              * second regardless so a lost notify costs latency, not a stall. */
-            g_sleep_timer_cv.wait_for(lk, std::chrono::seconds(1));
+            if (fds_parked) {
+                lk.unlock();
+                fd_service_ready();
+                lk.lock();
+                g_sleep_timer_cv.wait_for(lk,
+                    std::chrono::nanoseconds(fd_poll_ns));
+            } else {
+                g_sleep_timer_cv.wait_for(lk, std::chrono::seconds(1));
+            }
             continue;
         }
         const uint64_t now = host_mono_ns();
         if (due > now) {
-            g_sleep_timer_cv.wait_for(lk, std::chrono::nanoseconds(due - now));
+            uint64_t wait_ns = due - now;
+            if (fds_parked) {
+                lk.unlock();
+                fd_service_ready();
+                lk.lock();
+                if (wait_ns > fd_poll_ns) wait_ns = fd_poll_ns;
+            }
+            g_sleep_timer_cv.wait_for(lk, std::chrono::nanoseconds(wait_ns));
             continue;
         }
         /* Due.  Notifying is not enough on its own: in the default barriered
@@ -16543,6 +19859,7 @@ static void sleep_timer_thread(void)
         }
         sched_pass_notify();
         a64par::sched_poke();
+        fd_service_ready();
         lk.lock();
     }
 }
@@ -16551,8 +19868,16 @@ static void sleep_timer_start(void)
 {
     static std::once_flag once;
     std::call_once(once, [] {
-        std::thread(sleep_timer_thread).detach();
+        g_sleep_timer_host_thread = std::thread(sleep_timer_thread);
     });
+}
+
+static void sleep_timer_shutdown(void)
+{
+    g_sleep_timer_stop.store(true, std::memory_order_release);
+    g_sleep_timer_cv.notify_all();
+    if (g_sleep_timer_host_thread.joinable())
+        g_sleep_timer_host_thread.join();
 }
 
 static void sleep_park_announce(uint64_t due_ns)
@@ -16622,7 +19947,13 @@ static void sleep_heap_wake_due(void)
             continue;
         }
         const uint64_t due = thread_deadline_ns(*tp);
-        if (!due || due != e.deadline_ns) continue; /* stale generation */
+        if (!due || due != e.deadline_ns) {
+            if (tp->waiting_sem && lunaria_env("LUNARIA_TRACE_SEM"))
+                fprintf(stderr, "[sem] heap-stale tid=%u due=%llu entry=%llu\n",
+                        e.tid, (unsigned long long)due,
+                        (unsigned long long)e.deadline_ns);
+            continue; /* stale generation */
+        }
         if (due > now) {
             g_sleep_heap.push_back(e);
             std::push_heap(g_sleep_heap.begin(), g_sleep_heap.end(),
@@ -16655,6 +19986,9 @@ static void sleep_heap_wake_due(void)
         }
         if (tp->waiting_sem && tp->sem_timed) {
             const GuestVA sva = tp->waiting_sem;
+            if (lunaria_env("LUNARIA_TRACE_SEM"))
+                fprintf(stderr, "[sem] timeout tid=%u sem=0x%llx\n",
+                        e.tid, (unsigned long long)sva);
             sem_waiter_remove(e.tid, sva);
             tp->waiting_sem = 0;
             tp->sem_timed = false;
@@ -16665,6 +19999,28 @@ static void sleep_heap_wake_due(void)
             if (g_ctx)
                 if (uint32_t eva = errno_va(*g_ctx, e.tid))
                     g_ctx->mem.write32(eva, 110u /* ETIMEDOUT */);
+            thread_mark_ready(e.tid);
+            continue;
+        }
+        if (tp->waiting_futex && tp->futex_timed) {
+            const GuestVA uaddr = tp->waiting_futex;
+            const bool raw_result = tp->futex_raw_result;
+            futex_waiter_remove(e.tid, uaddr);
+            futex_wait_addr_remove(uaddr);
+            tp->waiting_futex = 0;
+            tp->futex_timed = false;
+            tp->futex_until_ns = 0;
+            tp->futex_raw_result = false;
+            if (raw_result) {
+                tp->regs[0] = (uint32_t)-(int32_t)ETIMEDOUT;
+                tp->regs64[0] = (uint64_t)-(int64_t)ETIMEDOUT;
+            } else {
+                tp->regs[0] = ~0u;
+                tp->regs64[0] = UINT64_MAX;
+                if (g_ctx)
+                    if (uint32_t eva = errno_va(*g_ctx, e.tid))
+                        g_ctx->mem.write32(eva, ETIMEDOUT);
+            }
             thread_mark_ready(e.tid);
             continue;
         }
@@ -16703,7 +20059,37 @@ void guest_sleep_ns(uint64_t req_ns)
      * `usleep(0)` loops churn hundreds of thousands of context switches a
      * second for thirteen instructions of guest code apiece. */
     if (!req_ns) { request_cooperative_yield(); return; }
-    if (g_current_tid == 0) { maybe_schedule_on_wait(); return; }
+    if (g_current_tid == 0) {
+        /* The guest's main thread has no ArmThread slot to park, so the only
+         * way to honour its sleep is to wait here.  This used to run one
+         * scheduler pass and return, which made usleep() free on this one
+         * thread: `make sched-test` spent 128 usleep(1000) calls in two
+         * milliseconds, so every bounded wait on the main thread expired
+         * before the thread it was waiting for had a chance to answer.  That
+         * is the shape of this title's own socket layer -- arm a connect
+         * watcher, wait, and walk to the next address -- and it was walking
+         * the whole address list in a few milliseconds.
+         *
+         * A device keeps the other cores running while this thread sleeps, so
+         * drive the scheduler across the wait instead of blocking flat.
+         * Inside a scheduler pass there is already a driver above this frame:
+         * yield to it rather than re-entering. */
+        if (g_scheduling) { maybe_schedule_on_wait(); return; }
+        const uint64_t main_due = host_mono_ns() + req_ns;
+        sleep_park_announce(main_due);
+        do {
+            maybe_schedule_on_wait();
+            if (g_ctx) {
+                drive_aaudio_callbacks(*g_ctx);
+                drive_opensles_callbacks(*g_ctx);
+                drive_java_choreographer(*g_ctx);
+                drive_ndk_choreographer(*g_ctx);
+            }
+            if (host_mono_ns() >= main_due) break;
+            sched_idle_wait();
+        } while (host_mono_ns() < main_due);
+        return;
+    }
 
     /* Every sleep parks, whatever its length, because that is what a sleep
      * is: the thread stops running and its core goes to somebody else.
@@ -16723,6 +20109,34 @@ void guest_sleep_ns(uint64_t req_ns)
     if (!guest_sleep_enabled()) { request_cooperative_yield(); return; }
     if (req_ns > kMaxSleepNs) req_ns = kMaxSleepNs;
     sleep_timer_start();
+    /* A sleep made from inside a host-driven callback is the callback's, not
+     * the guest thread's whose identity it borrows -- the same distinction
+     * pthread_cond_wait makes a few hundred lines down, and for the same
+     * reason: the callback has its own JIT and stack, while the ArmThread
+     * named by g_current_tid is somewhere else entirely.
+     *
+     * Parking that thread record left the callback itself running, so the
+     * sleep never gave the CPU to anybody: threads the callback had just
+     * created did not start, and on a device they start at once on another
+     * core.  Cross Worlds' nmssNativeRun is exactly this shape -- it runs as
+     * a JNI callback, starts two threads, and polls for their answer across a
+     * few short sleeps -- and it was deciding "Need Security License" while
+     * those threads sat unstarted for a quarter of a second.
+     *
+     * File it as a deadline on the callback's own wait record instead.  The
+     * JIT halts here and call_guest_abi* drives the other engines until the
+     * deadline passes, which is what the sleeping thread's core does on a
+     * device. */
+    if (ctx_innermost_is_cb()) {
+        g_cb_lock_wait.kind = CbLockWait::Sleep;
+        g_cb_lock_wait.from_slice = g_slice_depth > 0;
+        g_cb_lock_wait.mva = 0;
+        g_cb_lock_wait.owner = 0;
+        g_cb_lock_wait.deadline_ns = host_mono_ns() + req_ns;
+        g_cb_lock_wait.timed = true;
+        g_yield_requested = true;
+        return;
+    }
     {
         /* The thread table is shared: this is the one branch of a sleep that
          * is not thread-local, which is why the sleep SVCs themselves run
@@ -16869,6 +20283,11 @@ static void net_trace_data(const char *what, int fd, const uint8_t *p, ssize_t n
         fputc((c >= 32 && c < 127) ? c : '.', stderr);
     }
     fputc('\n', stderr);
+    if (show <= 32) {
+        fprintf(stderr, "[net] %s hex:", what);
+        for (size_t i = 0; i < show; ++i) fprintf(stderr, " %02x", p[i]);
+        fputc('\n', stderr);
+    }
 }
 
 /* A libc call that fails hands back -1 *and* an errno; the return value alone
@@ -17123,6 +20542,14 @@ static inline void gl_tid_mark(uint32_t tid, uint32_t svc) {
  * log line of its own. */
 static bool raw_syscall_lockfree(uint64_t a64_nr) {
     switch (a64_nr) {
+    case 57u:   /* close           -> host close / child_fd table          */
+    case 62u:   /* lseek           -> host lseek                          */
+    case 63u:   /* read            -> drops lock itself when it blocks;
+                 * non-blocking file reads also need no emulator state     */
+    case 64u:   /* write           -> already ArmLockDropped inside        */
+    case 67u:   /* pread64         -> same class as read                   */
+    case 68u:   /* pwrite64                                                */
+    case 78u:   /* readv                                                   */
     case 101u:  /* nanosleep       -> case 162, guest_sleep_ns()  */
     case 115u:  /* clock_nanosleep -> case 265, guest_sleep_ns()  */
     case 124u:  /* sched_yield     -> case 158, request_cooperative_yield() */
@@ -17140,7 +20567,7 @@ static bool svc_lockfree(uint32_t no) {
         const char *diag[] = {
             "LUNARIA_TRACE_MEMMOVE", "LUNARIA_TRACE_STRCPY", "LUNARIA_WATCH64_STR",
             "LUNARIA_WRANGE", "LUNARIA_ALLOC_WATCH", "LUNARIA_TRACE_SVC",
-            "LUNARIA_SVC_HISTO", "LUNARIA_WATCH64", "LUNARIA_SVC_STATS",
+            "LUNARIA_SVC_HISTO", "LUNARIA_WATCH64",
             /* The allocator diagnostics keep their own call-site tables. */
             "LUNARIA_TRACE_ALLOC_VA", "LUNARIA_TRACE_HEAP",
             /* The socket trace keeps per-call static counters. */
@@ -17190,9 +20617,13 @@ static bool svc_lockfree(uint32_t no) {
 
         /* The UE string hooks: same class as the libc ones above — they read
          * their arguments and the guest's own memory and touch nothing the
-         * emulator owns. */
+         * emulator owns.  UTF8→TCHAR Init and UxCsv::FetchRow (short-string
+         * path only; long rows resume the guest) are the same: ReloadInfoAll
+         * held the execution lock on svc1482/1483 for most of the post-title
+         * window while every other engine waited. */
         for (uint32_t n : {SVC_UE_STRICMP, SVC_UE_STRNICMP, SVC_UE_FINDCHAR,
-                           SVC_UE_REPLACE_INLINE}) set(n);
+                           SVC_UE_REPLACE_INLINE, SVC_UE_UTF8_TO_TCHAR,
+                           SVC_UXCSV_FETCHROW}) set(n);
 
         /* The libc allocator.  It is emulator state, but it is *its own*
          * state and it has its own lock (g_heap_mu) — see the comment there.
@@ -17306,6 +20737,16 @@ static bool svc_lockfree(uint32_t no) {
          * nothing but queueing for the lock and giving it back. */
         for (uint32_t n : {SVC_USLEEP, SVC_SLEEP, SVC_NANOSLEEP, SVC_CLOCK_NANOSLEEP,
                            SVC_SCHED_YIELD}) set(n);
+
+        /* stdio over a guest FILE*.  feof/fgets/fileno/fread only touch the
+         * shim and (on the slow path) the host FILE table under g_file_lock —
+         * nothing the ARM execution lock protects.  fopen/fclose own the same
+         * table lock plus the heap lock; Cross Worlds' NMSS helper polls
+         * /proc/<tid>/status continuously and used to serialise the whole
+         * guest behind every open. */
+        for (uint32_t n : {SVC_FEOF, SVC_FGETS, SVC_FILENO, SVC_LIBC_FREAD,
+                           SVC_LIBC_FSEEK, SVC_LIBC_FTELL,
+                           SVC_LIBC_FOPEN, SVC_LIBC_FCLOSE}) set(n);
         return t;
     }();
     return no < tbl.size() && tbl[no];
@@ -18404,6 +21845,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             int fd = (int)(int64_t)g_svc_args64[0];
             int rc = 0;
             if (fd > 2) {
+                guest_net::g_close_lr = lr;
                 guest_net::forget(fd);
                 rc = close(fd);
             } else if (fd < 0) {
@@ -18440,6 +21882,91 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             ret64(rc < 0 ? (uint64_t)-(int64_t)errno : 0u);
             break;
         }
+        case 61: { /* AArch64 __NR_getdents64 */
+            if (!ctx.is_arm64) { ret32((uint32_t)-(int32_t)ENOSYS); break; }
+            const int fd = (int)(int64_t)g_svc_args64[0];
+            const GuestVA out_va = g_svc_args64[1];
+            const uint64_t count64 = g_svc_args64[2];
+            if ((!out_va && count64) || count64 > (uint64_t)INT_MAX) {
+                ret64((uint64_t)-(int64_t)(count64 > (uint64_t)INT_MAX ? EINVAL : EFAULT));
+                break;
+            }
+            void *out = count64 ? ctx.mem.ptr(out_va) : nullptr;
+            if (count64 && !out) { ret64((uint64_t)-(int64_t)EFAULT); break; }
+            ssize_t rc;
+#if defined(__linux__) && defined(SYS_getdents64)
+            {
+                ArmLockDropped unlocked;
+                (void)unlocked;
+                rc = (ssize_t)::syscall(SYS_getdents64, fd, out, (size_t)count64);
+            }
+#elif defined(__APPLE__) && defined(SYS_getdirentries64)
+            /* Darwin and Linux expose different dirent wire layouts.  Read
+             * Darwin records from the descriptor and translate them to the
+             * Linux arm64 linux_dirent64 ABI expected by bionic:
+             * ino64, off64, reclen16, type8, name[].  No DIR object is kept,
+             * so close/lseek/dup retain normal kernel descriptor semantics. */
+            rc = -1;
+            if (count64 == 0) {
+                rc = 0;
+            } else {
+                char *tmp = (char *)malloc((size_t)count64);
+                if (!tmp) {
+                    errno = ENOMEM;
+                } else {
+                    long base = 0;
+                    ssize_t got;
+                    {
+                        ArmLockDropped unlocked;
+                        (void)unlocked;
+                        got = (ssize_t)::syscall(SYS_getdirentries64, fd, tmp,
+                                                 (int)count64, &base);
+                    }
+                    if (got >= 0) {
+                        size_t in_at = 0, out_at = 0;
+                        off_t resume = (off_t)base;
+                        bool malformed = false;
+                        while (in_at + offsetof(struct dirent, d_name) <= (size_t)got) {
+                            const struct dirent *de =
+                                (const struct dirent *)(const void *)(tmp + in_at);
+                            if (de->d_reclen < offsetof(struct dirent, d_name) + 1u ||
+                                in_at + de->d_reclen > (size_t)got) {
+                                errno = EIO;
+                                malformed = true;
+                                break;
+                            }
+                            const size_t name_len = strnlen(de->d_name, de->d_namlen);
+                            const size_t guest_len = (19u + name_len + 1u + 7u) & ~(size_t)7u;
+                            if (out_at + guest_len > (size_t)count64) {
+                                (void)lseek(fd, resume, SEEK_SET);
+                                break;
+                            }
+                            unsigned char *dst = (unsigned char *)out + out_at;
+                            const uint64_t ino = (uint64_t)de->d_ino;
+                            const int64_t next = (int64_t)de->d_seekoff;
+                            const uint16_t reclen = (uint16_t)guest_len;
+                            memcpy(dst + 0, &ino, sizeof ino);
+                            memcpy(dst + 8, &next, sizeof next);
+                            memcpy(dst + 16, &reclen, sizeof reclen);
+                            dst[18] = de->d_type;
+                            memcpy(dst + 19, de->d_name, name_len);
+                            memset(dst + 19 + name_len, 0, guest_len - 19 - name_len);
+                            out_at += guest_len;
+                            in_at += de->d_reclen;
+                            resume = (off_t)de->d_seekoff;
+                        }
+                        rc = malformed ? -1 : (ssize_t)out_at;
+                    }
+                    free(tmp);
+                }
+            }
+#else
+            errno = ENOSYS;
+            rc = -1;
+#endif
+            ret64(rc < 0 ? (uint64_t)-(int64_t)errno : (uint64_t)rc);
+            break;
+        }
         case 62: { /* AArch64 __NR_lseek */
             if (!ctx.is_arm64) { ret32(~0u); break; }
             off_t rc = lseek((int)(int64_t)g_svc_args64[0],
@@ -18450,22 +21977,81 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         case 63: { /* AArch64 __NR_read */
             if (!ctx.is_arm64) { ret32((uint32_t)dup2((int)r0, (int)r1)); break; }
+            const int fd = child_fd_get(g_current_tid,
+                                        (int)(int64_t)g_svc_args64[0]);
             GuestVA buf_va = g_svc_args64[1];
             size_t count = a64_buf_len(g_svc_args64[2]);
             void *buf = buf_va ? ctx.mem.ptr(buf_va) : nullptr;
             ssize_t rc = -1;
+            bool guest_blocking = false;
             if (buf) {
-                /* read(2) blocks.  Holding the execution lock across it stops
-                 * every other engine at its next SVC for the length of the I/O
-                 * — and if the descriptor is a pipe, the guest thread that
-                 * would write to it is one of them. */
-                ArmLockDropped unlocked;
-                (void)unlocked;
-                rc = read((int)(int64_t)g_svc_args64[0], buf, count);
+                struct pollfd pfd = { fd, POLLIN, 0 };
+                const int ready = poll(&pfd, 1, 0);
+                guest_blocking =
+                    guest_net::is_guest_socket(fd)
+                        ? !guest_net::guest_nonblock(fd)
+                        : !(fcntl(fd, F_GETFL) & O_NONBLOCK);
+                const bool can_park = ready == 0 && guest_blocking &&
+                                      guest_net::fd_park_enabled() &&
+                                      guest_net::can_park_current();
+                if (can_park) {
+                    guest_net::GuestFdWait w = guest_net::make_read_wait(fd);
+                    w.what = "raw read";
+                    w.started_ms = guest_net::now_ms();
+                    w.last_report_ms = w.started_ms;
+                    char path[96] = {0};
+                    if (luna_os_fd_path(fd, path, sizeof path) != 0)
+                        path[0] = '\0';
+                    const guest_net::SockState *ss = guest_net::state(fd);
+                    char desc[256];
+                    snprintf(desc, sizeof desc,
+                             " fd=%d path=%s%s%s caller=0x%llx",
+                             fd, path[0] ? path : "?",
+                             ss && ss->peer[0] ? " peer=" : "",
+                             ss && ss->peer[0] ? ss->peer : "",
+                             (unsigned long long)lr);
+                    w.fds = desc;
+                    fprintf(stderr, "[fd-park] tid=%u raw read%s\n",
+                            g_current_tid, desc);
+                    guest_net::g_fd_waits[g_current_tid] = std::move(w);
+                    for (auto &t : g_threads)
+                        if (t.id == g_current_tid) {
+                            t.waiting_fds = true;
+                            break;
+                        }
+                    fd_deadline_republish();
+                    g_svc_retry = true;
+                    break;
+                }
+                /* Regular files return immediately.  A non-parkable blocking
+                 * caller still waits without excluding the other guest CPUs. */
+                {
+                    std::optional<ArmLockDropped> unlocked;
+                    if (ready == 0 && guest_blocking) unlocked.emplace();
+                    rc = read(fd, buf, count);
+                }
             } else {
                 errno = EFAULT;
             }
-            ret64(rc < 0 ? (uint64_t)-(int64_t)errno : (uint64_t)rc);
+            if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
+                guest_net::is_guest_socket(fd) && guest_blocking)
+                errno = EINTR;
+            if (lunaria_env("LUNARIA_TRACE_READ")) {
+                char path[96] = {0};
+                if (luna_os_fd_path(fd, path, sizeof path) != 0) path[0] = '\0';
+                const guest_net::SockState *ss = guest_net::state(fd);
+                fprintf(stderr,
+                        "[raw-read] fd=%d req=%zu -> %zd errno=%d tid=%u "
+                        "path=%s peer=%s caller=0x%llx\n",
+                        fd, count, rc, rc < 0 ? errno : 0, g_current_tid,
+                        path[0] ? path : "?",
+                        ss && ss->peer[0] ? ss->peer : "-",
+                        (unsigned long long)lr);
+            }
+            guest_net::net_count(fd, true, rc);
+            ret64(rc < 0 ? (uint64_t)-(int64_t)
+                          guest_net::host_errno_to_guest_linux(errno)
+                         : (uint64_t)rc);
             break;
         }
         case 64: { /* AArch64 __NR_write */
@@ -18474,10 +22060,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             size_t count = a64_buf_len(g_svc_args64[2]);
             const void *buf = buf_va ? ctx.mem.ptr(buf_va) : nullptr;
             ssize_t rc = -1;
+            /* A forked child writes through its own descriptor table. */
+            const int wfd = child_fd_get(g_current_tid,
+                                         (int)(int64_t)g_svc_args64[0]);
             if (buf) {
                 ArmLockDropped unlocked;   /* blocks; see __NR_read above */
                 (void)unlocked;
-                rc = write((int)(int64_t)g_svc_args64[0], buf, count);
+                rc = write(wfd, buf, count);
             } else {
                 errno = EFAULT;
             }
@@ -18486,7 +22075,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         case 66: { /* AArch64 __NR_writev */
             if (!ctx.is_arm64) { ret32((uint32_t)-(int32_t)ENOSYS); break; }
-            const int fd = (int)(int64_t)g_svc_args64[0];
+            const int fd = child_fd_get(g_current_tid,
+                                        (int)(int64_t)g_svc_args64[0]);
             const GuestVA iov_va = g_svc_args64[1];
             const uint64_t count64 = g_svc_args64[2];
             if ((!iov_va && count64) || count64 > IOV_MAX) {
@@ -18613,9 +22203,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 ret64((uint64_t)-(int64_t)EINVAL);
                 break;
             }
-            GuestVA previous = 0;
-            if (auto it = g_sighandlers.find(sig); it != g_sighandlers.end())
-                previous = it->second;
+            GuestVA previous = signal_handler_load(guest_pid(), sig);
             /* Linux arm64 kernel_sigaction: handler, flags, restorer, mask. */
             if (old) {
                 ctx.mem.write64(old, previous);
@@ -18625,8 +22213,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             }
             if (act) {
                 const GuestVA handler = ctx.mem.read64(act);
-                if (handler > 1u) g_sighandlers[sig] = handler;
-                else g_sighandlers.erase(sig);
+                signal_handler_store(guest_pid(), sig, handler);
             }
             ret64(0);
             break;
@@ -18652,6 +22239,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 mask &= ~(1ull << (19 - 1));
                 signal_mask_store(g_current_tid, mask);
             }
+            if (lunaria_env("LUNARIA_TRACE_PROC")) {
+                fprintf(stderr,
+                        "[sigmask] raw-rt tid=%u how=%d set=0x%llx oldp=0x%llx size=%zu new=%016llx\n",
+                        g_current_tid, how, (unsigned long long)set,
+                        (unsigned long long)old, set_size,
+                        (unsigned long long)signal_mask_load(g_current_tid));
+            }
             ret64(0);
             break;
         }
@@ -18661,8 +22255,19 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
              * prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, addr, len, name).
              * The label is diagnostic metadata and has no host-side semantic
              * effect, but Linux reports success when the range is valid. */
-            constexpr uint64_t kPrSetVma = 0x53564d41ull;
+            constexpr uint64_t kPrSetVma        = 0x53564d41ull;
             constexpr uint64_t kPrSetVmaAnonName = 0ull;
+            /* PR_GET_SECCOMP and PR_GET_NO_NEW_PRIVS are separate kernel
+             * state.  Android's zygote-installed filter is inherited, while
+             * no_new_privs starts clear and changes only if this process sets
+             * the one-way flag.  /proc status reports the same stored value.
+             *
+             * PR_SET_NAME (15) / PR_GET_NAME (16) name the host thread so that
+             * `ps -T` shows the guest's own name — handled in SVC_PRCTL.
+             * PR_SET_VMA is handled below. */
+            constexpr uint64_t kPrGetSeccomp    = 21ull;
+            constexpr uint64_t kPrSetNoNewPrivs = 38ull;
+            constexpr uint64_t kPrGetNoNewPrivs = 39ull;
             if (g_svc_args64[0] == kPrSetVma &&
                 g_svc_args64[1] == kPrSetVmaAnonName) {
                 const GuestVA addr = g_svc_args64[2];
@@ -18672,6 +22277,18 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     ret64((uint64_t)-(int64_t)EFAULT);
                 else
                     ret64(0);
+            } else if (g_svc_args64[0] == kPrGetSeccomp) {
+                ret64(2); /* SECCOMP_MODE_FILTER — matches /proc/self/status */
+            } else if (g_svc_args64[0] == kPrSetNoNewPrivs) {
+                if (g_svc_args64[1] != 1 || g_svc_args64[2] ||
+                    g_svc_args64[3] || g_svc_args64[4])
+                    ret64((uint64_t)-(int64_t)EINVAL);
+                else {
+                    g_guest_no_new_privs = true;
+                    ret64(0);
+                }
+            } else if (g_svc_args64[0] == kPrGetNoNewPrivs) {
+                ret64(g_guest_no_new_privs ? 1u : 0u);
             } else {
                 ret64((uint64_t)-(int64_t)EINVAL);
             }
@@ -18749,8 +22366,80 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 (void)unlocked;
                 rc = ::connect(fd, (struct sockaddr *)&ss, length);
             }
-            ret64(rc < 0 ? (uint64_t)-(int64_t)guest_net::host_errno_to_guest_linux(errno)
-                         : 0u);
+            if (rc == 0) { fd_wake_all_ready(ctx); ret64(0); break; }
+            const int cerr = errno;
+            if (cerr != EINPROGRESS && cerr != EALREADY) {
+                ret64((uint64_t)-(int64_t)
+                      guest_net::host_errno_to_guest_linux(cerr));
+                break;
+            }
+            /* Every socket this emulator hands out is O_NONBLOCK on the host
+             * (see guest_net::adopt) so that a blocking guest call cannot
+             * freeze the cooperative scheduler.  The libc entry point pays
+             * that back by waiting the dial-out out when the guest never asked
+             * for a non-blocking socket; this raw stub did not, so the same
+             * connect(2) meant two different things depending on which way the
+             * guest reached it.
+             *
+             * Cross Worlds reaches it this way.  It creates a plain blocking
+             * socket, sets SO_SNDTIMEO/SO_RCVTIMEO and dials -- and got
+             * EINPROGRESS back, which for a socket it never made non-blocking
+             * is an answer no kernel gives.  It read that as "this address is
+             * dead", closed the descriptor within a few milliseconds and moved
+             * to the next one, walking the whole CDN address list without ever
+             * completing a connection: every port-80 dial-out in the run was
+             * abandoned inside 32 ms while the TLS ones (which take the libc
+             * path) connected normally.  With no settings fetched the title
+             * falls back to its own source language, which is why every string
+             * came out tagged "(ko)". */
+            if (guest_net::guest_nonblock(fd)) {
+                if (guest_net::SockState *cs = guest_net::state(fd)) {
+                    if (!cs->connecting)
+                        guest_net::g_connect_pending.fetch_add(
+                            1, std::memory_order_relaxed);
+                    cs->connecting = true;
+                    cs->connect_started_ms = guest_net::now_ms();
+                    cs->connect_polls = 0;
+                }
+                ret64((uint64_t)-(int64_t)
+                      guest_net::host_errno_to_guest_linux(EINPROGRESS));
+                break;
+            }
+            {
+                const int rev = guest_net::wait_ready(fd, POLLOUT,
+                                                      guest_net::connect_ms());
+                if (rev <= 0) {
+                    const int werr = rev < 0 ? errno : ETIMEDOUT;
+                    fprintf(stderr, "[net] connect fd=%d -> %s failed: %s "
+                            "(blocking, raw)\n", fd,
+                            guest_net::state(fd) ? guest_net::state(fd)->peer : "?",
+                            strerror(werr));
+                    ret64((uint64_t)-(int64_t)
+                          guest_net::host_errno_to_guest_linux(werr));
+                    break;
+                }
+                int soerr = 0;
+                socklen_t sl = sizeof soerr;
+                if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) != 0)
+                    soerr = errno;
+                if (soerr) {
+                    fprintf(stderr, "[net] connect fd=%d -> %s failed: %s "
+                            "(blocking, raw)\n", fd,
+                            guest_net::state(fd) ? guest_net::state(fd)->peer : "?",
+                            strerror(soerr));
+                    ret64((uint64_t)-(int64_t)
+                          guest_net::host_errno_to_guest_linux(soerr));
+                    break;
+                }
+                if (guest_net::SockState *cs = guest_net::state(fd)) {
+                    if (cs->connecting)
+                        guest_net::g_connect_pending.fetch_sub(
+                            1, std::memory_order_relaxed);
+                    cs->connecting = false;
+                }
+                fd_wake_all_ready(ctx);
+                ret64(0);
+            }
             break;
         }
         case 242: { /* AArch64 __NR_accept4 */
@@ -18762,6 +22451,25 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             struct sockaddr_storage ss{};
             socklen_t n = sizeof ss;
             int made = ::accept(fd, (struct sockaddr *)&ss, &n);
+            if (made < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
+                !guest_net::guest_nonblock(fd) && guest_net::can_park_current()) {
+                {
+                    ArmLockGuard wait_table_locked;
+                    guest_net::GuestFdWait w = guest_net::make_read_wait(fd);
+                    w.what = "accept4";
+                    w.started_ms = guest_net::now_ms();
+                    w.last_report_ms = w.started_ms;
+                    char b[32];
+                    snprintf(b, sizeof b, " fd=%d", fd);
+                    w.fds = b;
+                    guest_net::g_fd_waits[g_current_tid] = std::move(w);
+                    for (auto &t : g_threads)
+                        if (t.id == g_current_tid) { t.waiting_fds = true; break; }
+                    fd_deadline_republish();
+                }
+                g_svc_retry = true;
+                break;
+            }
             if (made >= 0) {
                 if (flags & GUEST_SOCK_NONBLOCK)
                     (void)fcntl(made, F_SETFL, O_NONBLOCK);
@@ -18793,6 +22501,509 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             if (len && !p) { ret64((uint64_t)-(int64_t)EFAULT); break; }
             if (len) arc4random_buf(p, len);
             ret64((uint64_t)len);
+            break;
+        }
+        /* Socket I/O on an fd this raw path already created (see case 198
+         * __NR_socket / case 203 __NR_connect above).  NMSS reaches connect()
+         * this way; anything that also dials with raw syscalls instead of
+         * the libc symbol table would connect successfully and then get
+         * -ENOSYS on its first send/recv/setsockopt/getsockopt/shutdown,
+         * which the default case below used to answer silently.  These
+         * mirror the libc SVC_NET_* handlers' behaviour (host errno
+         * translation, the non-blocking-socket EAGAIN/EINTR distinction,
+         * fd_wake_all_ready on progress) rather than re-deriving it. */
+        case 206: { /* AArch64 __NR_sendto (also covers send(): addr/alen 0) */
+            if (!ctx.is_arm64) { ret64((uint64_t)-(int64_t)ENOSYS); break; }
+            const int fd = (int)(int64_t)g_svc_args64[0];
+            const GuestVA buf = g_svc_args64[1];
+            const size_t len = a64_buf_len(g_svc_args64[2]);
+            const int flags = (int)g_svc_args64[3] | MSG_NOSIGNAL;
+            const GuestVA da = g_svc_args64[4];
+            socklen_t alen = (socklen_t)g_svc_args64[5];
+            struct sockaddr_storage ss{};
+            if (da && alen && alen <= sizeof ss) {
+                memcpy(&ss, ctx.mem.ptr(da), alen);
+                guest_net::fixup_guest_sockaddr(ss, alen);
+            } else alen = 0;
+            if (!buf || !len) { ret64(0); break; }
+            auto once = [&]() -> ssize_t {
+                return alen ? ::sendto(fd, ctx.mem.ptr(buf), len, flags,
+                                      (struct sockaddr *)&ss, alen)
+                            : ::send(fd, ctx.mem.ptr(buf), len, flags);
+            };
+            ssize_t n = once();
+            int err = n < 0 ? errno : 0;
+            if (n < 0 && (err == EAGAIN || err == EWOULDBLOCK) &&
+                !guest_net::guest_nonblock(fd) && guest_net::can_park_current()) {
+                {
+                    ArmLockGuard wait_table_locked;
+                    guest_net::GuestFdWait w = guest_net::make_write_wait(fd);
+                    w.what = "sendto";
+                    w.started_ms = guest_net::now_ms();
+                    w.last_report_ms = w.started_ms;
+                    char b[32]; snprintf(b, sizeof b, " fd=%d", fd);
+                    w.fds = b;
+                    guest_net::g_fd_waits[g_current_tid] = std::move(w);
+                    for (auto &t : g_threads)
+                        if (t.id == g_current_tid) { t.waiting_fds = true; break; }
+                    fd_deadline_republish();
+                }
+                g_svc_retry = true;
+                break;
+            }
+            if (n < 0 && (err == EAGAIN || err == EWOULDBLOCK) &&
+                !guest_net::guest_nonblock(fd) &&
+                guest_net::wait_ready(fd, POLLOUT, -1) > 0) {
+                n = once();
+                err = n < 0 ? errno : 0;
+            }
+            if (n < 0) {
+                ret64((uint64_t)-(int64_t)guest_net::host_errno_to_guest_linux(
+                    (err == EAGAIN || err == EWOULDBLOCK) ? guest_net::blocked_errno(fd) : err));
+                break;
+            }
+            if (n > 0) guest_net::log_tls_alert("sent", ctx.mem.ptr(buf), (size_t)n);
+            guest_net::net_count(fd, false, n);
+            if (n > 0 && guest_net::is_guest_socket(fd)) fd_wake_all_ready(ctx);
+            ret64((uint64_t)n);
+            break;
+        }
+        case 207: { /* AArch64 __NR_recvfrom (also covers recv(): addr/alen 0) */
+            if (!ctx.is_arm64) { ret64((uint64_t)-(int64_t)ENOSYS); break; }
+            const int fd = (int)(int64_t)g_svc_args64[0];
+            const GuestVA buf = g_svc_args64[1];
+            const size_t len = a64_buf_len(g_svc_args64[2]);
+            const int flags = (int)g_svc_args64[3];
+            const GuestVA sa = g_svc_args64[4];
+            const GuestVA slp = g_svc_args64[5];
+            struct sockaddr_storage ss{};
+            socklen_t alen = sizeof ss;
+            if (!buf || !len) { ret64(0); break; }
+            auto once = [&]() -> ssize_t {
+                return sa ? ::recvfrom(fd, ctx.mem.ptr(buf), len, flags,
+                                      (struct sockaddr *)&ss, &alen)
+                          : ::recv(fd, ctx.mem.ptr(buf), len, flags);
+            };
+            ssize_t n = once();
+            int err = n < 0 ? errno : 0;
+            if (n < 0 && (err == EAGAIN || err == EWOULDBLOCK) &&
+                !guest_net::guest_nonblock(fd) && guest_net::can_park_current()) {
+                {
+                    ArmLockGuard wait_table_locked;
+                    guest_net::GuestFdWait w = guest_net::make_read_wait(fd);
+                    w.what = "recvfrom";
+                    w.started_ms = guest_net::now_ms();
+                    w.last_report_ms = w.started_ms;
+                    char b[32]; snprintf(b, sizeof b, " fd=%d", fd);
+                    w.fds = b;
+                    guest_net::g_fd_waits[g_current_tid] = std::move(w);
+                    for (auto &t : g_threads)
+                        if (t.id == g_current_tid) { t.waiting_fds = true; break; }
+                    fd_deadline_republish();
+                }
+                g_svc_retry = true;
+                break;
+            }
+            if (n < 0 && (err == EAGAIN || err == EWOULDBLOCK) &&
+                !guest_net::guest_nonblock(fd) &&
+                guest_net::wait_ready(fd, POLLIN, -1) > 0) {
+                n = once();
+                err = n < 0 ? errno : 0;
+            }
+            if (n < 0) {
+                ret64((uint64_t)-(int64_t)guest_net::host_errno_to_guest_linux(
+                    (err == EAGAIN || err == EWOULDBLOCK) ? guest_net::blocked_errno(fd) : err));
+                break;
+            }
+            if (sa && slp) {
+                socklen_t cap = ctx.mem.read32(slp);
+                socklen_t k = alen < cap ? alen : cap;
+                guest_net::fixup_host_sockaddr_for_guest(&ss, alen);
+                if (k) memcpy(ctx.mem.ptr(sa), &ss, k);
+                ctx.mem.write32(slp, (uint32_t)alen);
+            }
+            guest_net::net_count(fd, true, n);
+            ret64((uint64_t)n);
+            break;
+        }
+        case 208: case 209: { /* AArch64 __NR_setsockopt / __NR_getsockopt */
+            if (!ctx.is_arm64) { ret64((uint64_t)-(int64_t)ENOSYS); break; }
+            const int fd = (int)(int64_t)g_svc_args64[0];
+            const int guest_level = (int)g_svc_args64[1];
+            const int level = guest_net::fixup_guest_sockopt_level(guest_level);
+            const int name = guest_net::fixup_guest_sockopt_name(guest_level,
+                                                                  (int)g_svc_args64[2]);
+            const GuestVA val = g_svc_args64[3];
+            if (nr == 208) {
+                socklen_t l = (socklen_t)g_svc_args64[4];
+                if (l > 256) l = 256;
+                uint8_t tmp[256] = {};
+                if (val && l) memcpy(tmp, ctx.mem.ptr(val), l);
+                if (level == SOL_SOCKET && (name == SO_RCVTIMEO || name == SO_SNDTIMEO)) {
+                    struct timeval tv{};
+                    if (l >= 16) memcpy(&tv, tmp, sizeof tv);
+                    if (::setsockopt(fd, level, name, &tv, sizeof tv) != 0)
+                        ret64((uint64_t)-(int64_t)guest_net::host_errno_to_guest_linux(errno));
+                    else ret64(0);
+                    break;
+                }
+                if (::setsockopt(fd, level, name, val ? tmp : nullptr, l) != 0)
+                    ret64((uint64_t)-(int64_t)guest_net::host_errno_to_guest_linux(errno));
+                else ret64(0);
+                break;
+            }
+            const GuestVA lp = g_svc_args64[4];
+            socklen_t l = lp ? ctx.mem.read32(lp) : 0;
+            if (l > 256) l = 256;
+            uint8_t tmp[256] = {};
+            if (::getsockopt(fd, level, name, tmp, &l) != 0) {
+                ret64((uint64_t)-(int64_t)guest_net::host_errno_to_guest_linux(errno));
+                break;
+            }
+            if (level == SOL_SOCKET && name == SO_ERROR && l >= 4) {
+                if (guest_net::SockState *s = guest_net::state(fd))
+                    if (s->connecting) {
+                        int soerr = 0; memcpy(&soerr, tmp, 4);
+                        guest_net::g_connect_pending.fetch_sub(
+                            1, std::memory_order_relaxed);
+                        s->connecting = false;
+                    }
+            }
+            if (val && l) memcpy(ctx.mem.ptr(val), tmp, l);
+            if (lp) ctx.mem.write32(lp, (uint32_t)l);
+            ret64(0);
+            break;
+        }
+        case 210: { /* AArch64 __NR_shutdown */
+            if (!ctx.is_arm64) { ret64((uint64_t)-(int64_t)ENOSYS); break; }
+            const int fd = (int)(int64_t)g_svc_args64[0];
+            const int how = (int)g_svc_args64[1];
+            if (::shutdown(fd, how) != 0)
+                ret64((uint64_t)-(int64_t)guest_net::host_errno_to_guest_linux(errno));
+            else {
+                fd_wake_all_ready(ctx);
+                ret64(0);
+            }
+            break;
+        }
+        case 211: case 212: { /* AArch64 __NR_sendmsg / __NR_recvmsg */
+            if (!ctx.is_arm64) { ret64((uint64_t)-(int64_t)ENOSYS); break; }
+            const int fd = (int)(int64_t)g_svc_args64[0];
+            const GuestVA mh = g_svc_args64[1];
+            const int flags = (int)g_svc_args64[2] | (nr == 211 ? MSG_NOSIGNAL : 0);
+            if (!mh) { ret64((uint64_t)-(int64_t)EINVAL); break; }
+            constexpr uint32_t W = 8u; /* AArch64 only reaches here */
+            const GuestVA name_va = guest_net::get_ptr(ctx, mh);
+            const uint32_t namelen = ctx.mem.read32(mh + W);
+            const GuestVA iov = guest_net::get_ptr(ctx, mh + 2 * W);
+            uint64_t iovlen = ctx.mem.read64(mh + 3 * W);
+            if (iovlen > 64) iovlen = 64;
+            struct iovec hv[64];
+            for (uint64_t i = 0; i < iovlen; ++i) {
+                const GuestVA base = guest_net::get_ptr(ctx, iov + (GuestVA)(i * 2 * W));
+                const uint64_t l = ctx.mem.read64(iov + (GuestVA)(i * 2 * W + W));
+                hv[i].iov_base = base ? (void *)ctx.mem.ptr(base) : nullptr;
+                hv[i].iov_len = (size_t)l;
+            }
+            struct sockaddr_storage ss{};
+            struct msghdr hm{};
+            hm.msg_iov = hv;
+            hm.msg_iovlen = (size_t)iovlen;
+            if (name_va && namelen && namelen <= sizeof ss) {
+                memcpy(&ss, ctx.mem.ptr(name_va), namelen);
+                hm.msg_name = &ss;
+                hm.msg_namelen = namelen;
+            }
+            auto once = [&]() -> ssize_t {
+                return nr == 211 ? ::sendmsg(fd, &hm, flags) : ::recvmsg(fd, &hm, flags);
+            };
+            ssize_t n = once();
+            int err = n < 0 ? errno : 0;
+            if (n < 0 && (err == EAGAIN || err == EWOULDBLOCK) &&
+                !guest_net::guest_nonblock(fd) && guest_net::can_park_current()) {
+                {
+                    ArmLockGuard wait_table_locked;
+                    guest_net::GuestFdWait w = nr == 211
+                        ? guest_net::make_write_wait(fd) : guest_net::make_read_wait(fd);
+                    w.what = nr == 211 ? "sendmsg" : "recvmsg";
+                    w.started_ms = guest_net::now_ms();
+                    w.last_report_ms = w.started_ms;
+                    char b[32]; snprintf(b, sizeof b, " fd=%d", fd);
+                    w.fds = b;
+                    guest_net::g_fd_waits[g_current_tid] = std::move(w);
+                    for (auto &t : g_threads)
+                        if (t.id == g_current_tid) { t.waiting_fds = true; break; }
+                    fd_deadline_republish();
+                }
+                g_svc_retry = true;
+                break;
+            }
+            if (n < 0 && (err == EAGAIN || err == EWOULDBLOCK) &&
+                !guest_net::guest_nonblock(fd) &&
+                guest_net::wait_ready(fd, nr == 211 ? POLLOUT : POLLIN, -1) > 0) {
+                n = once();
+                err = n < 0 ? errno : 0;
+            }
+            if (n < 0) {
+                ret64((uint64_t)-(int64_t)guest_net::host_errno_to_guest_linux(
+                    (err == EAGAIN || err == EWOULDBLOCK) ? guest_net::blocked_errno(fd) : err));
+                break;
+            }
+            guest_net::net_count(fd, nr == 212, n);
+            if (nr == 212 && name_va && hm.msg_namelen) {
+                guest_net::fixup_host_sockaddr_for_guest(&ss, hm.msg_namelen);
+                memcpy(ctx.mem.ptr(name_va), &ss,
+                       hm.msg_namelen < namelen ? hm.msg_namelen : namelen);
+                ctx.mem.write32(mh + W, hm.msg_namelen);
+                ctx.mem.write32(mh + 4 * W, 0);
+                ctx.mem.write32(mh + 6 * W, (uint32_t)(hm.msg_flags & ~MSG_CTRUNC));
+            }
+            ret64((uint64_t)n);
+            break;
+        }
+        case 25: { /* AArch64 __NR_fcntl */
+            if (!ctx.is_arm64) { ret64((uint64_t)-(int64_t)ENOSYS); break; }
+            const int fd = (int)(int64_t)g_svc_args64[0];
+            const int cmd = (int)g_svc_args64[1];
+            const uint64_t arg = g_svc_args64[2];
+            /* Only the forms this emulator's guests are known to issue via
+             * the raw path: getting/setting O_NONBLOCK (bionic's socket
+             * helpers do this without going through the libc symbol when
+             * they were resolved before libc's global scope was ready) and
+             * FD_CLOEXEC.  Anything else reaches the real host fcntl, which
+             * is safe for the descriptor kinds this emulator hands out
+             * (real host fds), but its guest-visible F_* constants are not
+             * translated here — unlike SVC_LIBC_FCNTL, this path is only
+             * exercised for sockets today. */
+            if (cmd == F_GETFL) {
+                int fl = ::fcntl(fd, F_GETFL);
+                if (fl < 0) { ret64((uint64_t)-(int64_t)guest_net::host_errno_to_guest_linux(errno)); break; }
+                ret64((uint64_t)fl);
+                break;
+            }
+            if (cmd == F_SETFL) {
+                if (::fcntl(fd, F_SETFL, (int)arg) != 0) {
+                    ret64((uint64_t)-(int64_t)guest_net::host_errno_to_guest_linux(errno));
+                    break;
+                }
+                if (guest_net::SockState *s = guest_net::state(fd))
+                    s->nonblock = (arg & 0x800u) != 0;   /* bionic O_NONBLOCK */
+                ret64(0);
+                break;
+            }
+            if (cmd == F_GETFD || cmd == F_SETFD) {
+                int r = (cmd == F_GETFD) ? ::fcntl(fd, F_GETFD)
+                                         : ::fcntl(fd, F_SETFD, (int)arg);
+                if (r < 0) { ret64((uint64_t)-(int64_t)guest_net::host_errno_to_guest_linux(errno)); break; }
+                ret64((uint64_t)r);
+                break;
+            }
+            ret64((uint64_t)-(int64_t)EINVAL);
+            break;
+        }
+        case 29: { /* AArch64 __NR_ioctl */
+            if (!ctx.is_arm64) { ret64((uint64_t)-(int64_t)ENOSYS); break; }
+            const int fd = (int)(int64_t)g_svc_args64[0];
+            const uint64_t req = g_svc_args64[1];
+            const GuestVA argp_va = g_svc_args64[2];
+            /* FIONBIO/FIONREAD are the two ioctls a socket actually needs;
+             * bionic's <sys/ioctl.h> defines them with the same numeric
+             * value this host does (both come from the same kernel uapi
+             * header), so no translation table is needed the way fcntl's
+             * F_* constants sometimes do. */
+            if (req == FIONBIO) {
+                if (!argp_va) { ret64((uint64_t)-(int64_t)EFAULT); break; }
+                const int32_t nb = (int32_t)ctx.mem.read32(argp_va);
+                if (::ioctl(fd, FIONBIO, &nb) != 0) {
+                    ret64((uint64_t)-(int64_t)guest_net::host_errno_to_guest_linux(errno));
+                    break;
+                }
+                if (guest_net::SockState *s = guest_net::state(fd))
+                    s->nonblock = nb != 0;
+                ret64(0);
+                break;
+            }
+            if (req == FIONREAD) {
+                int avail = 0;
+                if (::ioctl(fd, FIONREAD, &avail) != 0) {
+                    ret64((uint64_t)-(int64_t)guest_net::host_errno_to_guest_linux(errno));
+                    break;
+                }
+                if (argp_va) ctx.mem.write32(argp_va, (uint32_t)avail);
+                ret64(0);
+                break;
+            }
+            /* An ioctl this path does not know is not "successful and did
+             * nothing" — that is indistinguishable from silent data loss to
+             * a caller that checks the result.  Linux answers an unknown
+             * request against a socket with ENOTTY. */
+            ret64((uint64_t)-(int64_t)ENOTTY);
+            break;
+        }
+        case 19: { /* AArch64 __NR_eventfd2(initval, flags) */
+            if (!ctx.is_arm64) { ret64((uint64_t)-(int64_t)ENOSYS); break; }
+            const unsigned initval = (unsigned)g_svc_args64[0];
+            const unsigned flags = (unsigned)g_svc_args64[1];
+            const int fd = luna_os_event_open(initval, (flags & 0x800u) != 0);
+            if (fd < 0) ret64((uint64_t)-(int64_t)guest_net::host_errno_to_guest_linux(errno));
+            else ret64((uint64_t)fd);
+            break;
+        }
+        case 2020: { /* epoll_create1(flags) — remapped from AArch64 nr=20,
+                      * which the shared switch's case 20 already claims for
+                      * getpid (see the A64 raw-syscall number remap table). */
+            if (!ctx.is_arm64) { ret64((uint64_t)-(int64_t)ENOSYS); break; }
+            const int fd = luna_os_poll_create(/*cloexec=*/1);
+            if (fd < 0) ret64((uint64_t)-(int64_t)guest_net::host_errno_to_guest_linux(errno));
+            else ret64((uint64_t)fd);
+            break;
+        }
+        case 21: { /* AArch64 __NR_epoll_ctl(epfd, op, fd, event) */
+            if (!ctx.is_arm64) { ret64((uint64_t)-(int64_t)ENOSYS); break; }
+            const int epfd = (int)(int64_t)g_svc_args64[0];
+            const int op = (int)g_svc_args64[1];
+            const int fd = (int)(int64_t)g_svc_args64[2];
+            const GuestVA ev = g_svc_args64[3];
+            luna_os_poll_event he{};
+            if (ev) {
+                he.events = ctx.mem.read32(ev);
+                he.data = ctx.mem.read64(ev + 8);   /* A64 epoll_event: 16 bytes */
+            }
+            if (luna_os_poll_ctl(epfd, op, fd, ev ? &he : nullptr) != 0)
+                ret64((uint64_t)-(int64_t)guest_net::host_errno_to_guest_linux(errno));
+            else ret64(0);
+            break;
+        }
+        case 22: { /* AArch64 __NR_epoll_pwait(epfd, events, maxevents, timeout_ms, sigmask, sigsetsize) */
+            if (!ctx.is_arm64) { ret64((uint64_t)-(int64_t)ENOSYS); break; }
+            const int epfd = (int)(int64_t)g_svc_args64[0];
+            const GuestVA evs = g_svc_args64[1];
+            int maxev = (int)g_svc_args64[2];
+            const long want = (long)(int32_t)g_svc_args64[3];
+            if (maxev < 0) maxev = 0;
+            if (maxev > 256) maxev = 256;
+            ArmExecCtx *cp = &ctx;
+            auto epoll_once = [cp, epfd, maxev, evs]() -> int {
+                luna_os_poll_event he[256];
+                int rc = luna_os_poll_wait(epfd, he, maxev, 0);
+                for (int i = 0; i < rc && evs; ++i) {
+                    const GuestVA at = evs + (GuestVA)i * 16u;
+                    cp->mem.write32(at, he[i].events);
+                    cp->mem.write64(at + 8, he[i].data);
+                }
+                return rc;
+            };
+            int rc = epoll_once();
+            if (rc < 0) { ret64((uint64_t)-(int64_t)guest_net::host_errno_to_guest_linux(errno)); break; }
+            if (rc > 0 || want == 0) { ret64((uint64_t)rc); break; }
+            const bool parkable = guest_net::can_park_current();
+            const int64_t deadline = guest_net::wait_deadline_ms(want, parkable);
+            if (rc == 0 && want != 0 && parkable) {
+                ArmLockGuard wait_locked;
+                guest_net::GuestFdWait w =
+                    guest_net::make_epoll_wait(ctx, epfd, maxev, evs, true, deadline);
+                w.what = "epoll_pwait";
+                w.started_ms = guest_net::now_ms();
+                w.last_report_ms = w.started_ms;
+                char b[32]; snprintf(b, sizeof b, " epfd=%d", epfd);
+                w.fds = b;
+                guest_net::g_fd_waits[g_current_tid] = std::move(w);
+                for (auto &t : g_threads)
+                    if (t.id == g_current_tid) { t.waiting_fds = true; break; }
+                fd_deadline_republish();
+                g_yield_requested = true;
+                ret64(0);   /* overwritten by the scheduler when the wait ends */
+                break;
+            }
+            while (rc == 0 && guest_net::now_ms() < deadline) {
+                { ArmLockDropped unlocked; (void)unlocked;
+                  struct timespec nap{0, 200000}; nanosleep(&nap, nullptr); }
+                rc = epoll_once();
+                if (rc < 0) break;
+            }
+            if (rc < 0) { ret64((uint64_t)-(int64_t)guest_net::host_errno_to_guest_linux(errno)); break; }
+            if (rc == 0 && guest_net::wait_deadline_is_ceiling(want, parkable)) {
+                ret64((uint64_t)-(int64_t)EINTR);
+                break;
+            }
+            ret64((uint64_t)rc);
+            break;
+        }
+        case 73: { /* AArch64 __NR_ppoll(fds, nfds, timeout_ts, sigmask, sigsetsize) */
+            if (!ctx.is_arm64) { ret64((uint64_t)-(int64_t)ENOSYS); break; }
+            const GuestVA fds = g_svc_args64[0];
+            uint32_t n = (uint32_t)g_svc_args64[1];
+            const GuestVA ts_va = g_svc_args64[2];
+            if (n > 1024) n = 1024;
+            /* NULL timeout means wait forever, matching poll(-1); a
+             * non-NULL struct timespec is converted to the same
+             * millisecond budget SVC_NET_POLL works in. */
+            const long want = ts_va
+                ? (long)(guest_timespec_ns(ctx, ts_va) / 1'000'000ull)
+                : -1L;
+            if (!fds || !n) {
+                { ArmLockGuard yield_locked; guest_net::wait_slice(); }
+                ret64(0);
+                break;
+            }
+            ArmExecCtx *cp = &ctx;
+            auto poll_once = [cp, fds, n]() -> int {
+                struct pollfd hp[1024];
+                memcpy(hp, cp->mem.ptr(fds), (size_t)n * 8u);
+                for (uint32_t i = 0; i < n; ++i) hp[i].revents = 0;
+                int rc = ::poll(hp, n, 0);
+                if (guest_net::g_sync_connect_failures.load(std::memory_order_relaxed)) {
+                    for (uint32_t i = 0; i < n; ++i) {
+                        if (hp[i].revents) continue;
+                        const guest_net::SockState *s = guest_net::state(hp[i].fd);
+                        if (s && s->sync_connect_failed) {
+                            hp[i].revents = (short)((hp[i].events & (POLLIN | POLLOUT)) | POLLERR | POLLHUP);
+                            ++rc;
+                        }
+                    }
+                }
+                if (rc > 0) memcpy(cp->mem.ptr(fds), hp, (size_t)n * 8u);
+                return rc;
+            };
+            int rc = poll_once();
+            if (rc < 0) { ret64((uint64_t)-(int64_t)guest_net::host_errno_to_guest_linux(errno)); break; }
+            if (rc > 0 || want == 0) { ret64((uint64_t)rc); break; }
+            const bool parkable = guest_net::can_park_current();
+            const int64_t deadline = guest_net::wait_deadline_ms(want, parkable);
+            if (rc == 0 && want != 0 && parkable) {
+                ArmLockGuard poll_wait_locked;
+                guest_net::GuestFdWait w = guest_net::make_poll_wait(ctx, fds, n, deadline);
+                w.what = "ppoll";
+                w.started_ms = guest_net::now_ms();
+                w.last_report_ms = w.started_ms;
+                char b[32]; snprintf(b, sizeof b, " n=%u", n);
+                w.fds = b;
+                guest_net::g_fd_waits[g_current_tid] = std::move(w);
+                for (auto &t : g_threads)
+                    if (t.id == g_current_tid) { t.waiting_fds = true; break; }
+                fd_deadline_republish();
+                g_yield_requested = true;
+                ret64(0);   /* overwritten by the scheduler when the wait ends */
+                break;
+            }
+            while (rc == 0 && guest_net::now_ms() < deadline) {
+                { ArmLockDropped unlocked; (void)unlocked;
+                  struct timespec nap{0, 200000}; nanosleep(&nap, nullptr); }
+                rc = poll_once();
+                if (rc < 0) break;
+            }
+            if (rc < 0) { ret64((uint64_t)-(int64_t)guest_net::host_errno_to_guest_linux(errno)); break; }
+            if (rc == 0 && guest_net::wait_deadline_is_ceiling(want, parkable)) {
+                ret64((uint64_t)-(int64_t)EINTR);
+                break;
+            }
+            if (rc == 0) {
+                std::vector<struct pollfd> hp(n);
+                memcpy(hp.data(), ctx.mem.ptr(fds), (size_t)n * 8u);
+                for (auto &p : hp) p.revents = 0;
+                memcpy(ctx.mem.ptr(fds), hp.data(), (size_t)n * 8u);
+            }
+            ret64((uint64_t)rc);
             break;
         }
         case 90:  /* __NR_mmap  (addr,len,prot,flags,fd in r0-r4, off in r5 bytes) */
@@ -18896,7 +23107,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                    * which getppid() cannot return: it takes no arguments and
                    * has no failure mode.  Cross Worlds' anti-tamper module is
                    * the caller. */
-            ret32(guest_ppid()); break;
+            ret32(current_guest_ppid()); break;
         case 5:   /* __NR_open(path, flags, mode) */
         case 322: { /* __NR_openat(dfd, path, flags, mode) */
             const char *path = ctx.mem.cstr(nr == 5 ? r0 : r1);
@@ -18926,6 +23137,16 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 ret64(fd < 0 ? (uint64_t)-(int64_t)errno : (uint64_t)fd);
             else
                 ret32((uint32_t)fd);
+            if (lunaria_env("LUNARIA_TRACE_OPEN"))
+                fprintf(stderr,
+                        "[raw-openat] nr=%u dfd=%lld path=%s flags=%#x "
+                        "-> fd=%d errno=%d tid=%u lr=0x%x\n",
+                        nr,
+                        (long long)(nr == 5 ? AT_FDCWD :
+                            (ctx.is_arm64 ? (int64_t)g_svc_args64[0]
+                                          : (int32_t)r0)),
+                        path ? path : "(null)", flags, fd,
+                        fd < 0 ? errno : 0, g_current_tid, lr);
             break;
         }
         case 224: /* __NR_gettid */
@@ -19028,6 +23249,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             }
             ArmThread t{};
             t.id = nid;
+            t.creator_tid = g_current_tid;
+            if (ArmThread *creator = arm_thread_by_tid(g_current_tid))
+                t.creator_slices = creator->slices;
+            inherit_process_identity(t);
             t.is_arm64 = true;
             const auto gpr = g_svc_jit64->GetRegisters();
             for (size_t i = 0; i < 31; ++i) t.regs64[i] = gpr[i];
@@ -19059,8 +23284,18 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 slot = &g_threads.back();
             }
             g_thread_by_tid[nid] = slot;
+            thread_name_inherit(nid, g_current_tid);
+            /* clone(2) returns the kernel TID of the child and
+             * CLONE_PARENT_SETTID stores that exact same value.  `nid` is
+             * only Lunaria's scheduler slot; exposing it here while the
+             * child's raw gettid() returns guest_tid_of(nid) gives bionic two
+             * identities for one pthread.  In particular pthread_internal_t
+             * caches the parent-written value while mutex ownership and
+             * pthread_gettid_np observe gettid(), so recursive ownership and
+             * teardown cease to describe the same thread. */
+            const uint32_t child_guest_tid = guest_tid_of(nid);
             if ((flags & kParentSetTid) && parent_tid_va)
-                ctx.mem.write32(parent_tid_va, nid);
+                ctx.mem.write32(parent_tid_va, child_guest_tid);
             thread_mark_ready(nid);
             fprintf(stderr, "[clone] tid=%u pc=0x%llx sp=0x%llx tls=0x%llx "
                     "ctid=0x%llx flags=0x%llx\n", nid,
@@ -19069,7 +23304,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     (unsigned long long)t.tls64,
                     (unsigned long long)t.clear_tid_va,
                     (unsigned long long)flags);
-            ret64(nid);
+            ret64(child_guest_tid);
             break;
         }
         case 93: { /* AArch64 __NR_exit: terminate only the calling thread */
@@ -19147,13 +23382,30 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 if (bad_fu_r++ < 8)
                     fprintf(stderr, "[futex/raw] bad uaddr=0x%llx op=%lu val=%lu lr=0x%x tid=%u — EINVAL\n",
                             (unsigned long long)fu_uaddr, r1, r2, lr, g_current_tid);
-                uint32_t eva = errno_va(ctx, g_current_tid);
-                if (eva) ctx.mem.write32(eva, 22u /* EINVAL */);
-                ret32(~0u);
+                ret64((uint64_t)-(int64_t)EINVAL);
                 break;
             }
             uint32_t cmd = r1 & 0x7fu; /* strip FUTEX_PRIVATE_FLAG */
-            if (cmd != 0u && cmd != 9u) { /* FUTEX_WAKE / FUTEX_REQUEUE etc. */
+            if (cmd == 3u || cmd == 4u) { /* FUTEX_REQUEUE / CMP_REQUEUE */
+                if (cmd == 4u && ctx.mem.read32(fu_uaddr) != (uint32_t)argp(5)) {
+                    ret64((uint64_t)-(int64_t)EAGAIN);
+                    break;
+                }
+                const uint32_t nwake = (uint32_t)std::min<GuestVA>(r2, 256u);
+                const uint32_t woke = futex_publish_wake(fu_uaddr, nwake);
+                const uint32_t nmove = (uint32_t)std::min<GuestVA>(argp(3), 65536u);
+                const uint32_t moved = futex_requeue_parked(
+                    fu_uaddr, argp(4), nmove);
+                if (ftrace_addr(fu_uaddr) || ftrace_addr(argp(4)))
+                    fprintf(stderr, "[ftrace] REQUEUE/raw from=0x%llx to=0x%llx "
+                            "wake=%u moved=%u tid=%u lr=0x%08x\n",
+                            (unsigned long long)fu_uaddr,
+                            (unsigned long long)argp(4), woke, moved,
+                            g_current_tid, lr);
+                ret32(woke + moved);
+                break;
+            }
+            if (cmd != 0u && cmd != 9u) { /* FUTEX_WAKE and wake-like ops. */
                 uint32_t nwake = (uint32_t)std::min<GuestVA>(r2, 256u);
                 const uint32_t woke = futex_publish_wake(fu_uaddr, nwake);
                 const uint32_t tokens = futex_token_count(fu_uaddr);
@@ -19173,12 +23425,27 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 }
                 ret32(woke); break;
             }
-            if (ctx.mem.read32(fu_uaddr) != r2) { ret32(0); break; } /* value already changed */
+            if (ctx.mem.read32(fu_uaddr) != r2) {
+                ret64((uint64_t)-(int64_t)EAGAIN);
+                break;
+            }
+            const GuestVA timeout_va = argp(3);
+            uint64_t futex_deadline = 0;
+            if (timeout_va) {
+                uint64_t rel = guest_timespec_ns(ctx, timeout_va);
+                if (cmd == 9u) { /* FUTEX_WAIT_BITSET takes an absolute time. */
+                    const int clock_id = (r1 & 0x100u)
+                        ? CLOCK_REALTIME : CLOCK_MONOTONIC;
+                    rel = guest_abstime_to_rel_ns(clock_id, rel);
+                }
+                const uint64_t now = host_mono_ns();
+                futex_deadline = rel > UINT64_MAX - now ? UINT64_MAX : now + rel;
+            }
             bool changed = false;
             if (g_current_tid == 0 && !g_scheduling && !g_threads.empty()) {
                 ++g_futex_wait_addrs[fu_uaddr];
-                int spin_limit = (int)env_ticks("LUNARIA_FUTEX_SPINS", 500);
-                for (int spin = 0; spin < spin_limit && !changed; ++spin) {
+                while (!changed &&
+                       (!futex_deadline || host_mono_ns() < futex_deadline)) {
                     schedule_threads(20'000'000ULL);
                     drive_aaudio_callbacks(ctx);
                     drive_opensles_callbacks(ctx);
@@ -19204,6 +23471,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 if (ArmThread *t = arm_thread_by_tid(g_current_tid)) {
                     t->waiting_futex = fu_uaddr;
                     t->futex_val     = r2;
+                    t->futex_timed = timeout_va != 0;
+                    t->futex_until_ns = futex_deadline;
+                    t->futex_raw_result = true;
                     futex_waiter_add(g_current_tid, fu_uaddr);
                 }
                 g_yield_requested = true;
@@ -19211,9 +23481,252 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 break;
             }
             if (changed) { ret32(0); break; }
-            uint32_t eva = errno_va(ctx, g_current_tid);
-            if (eva) ctx.mem.write32(eva, 110u /* ETIMEDOUT */);
-            ret32(~0u);
+            ret64((uint64_t)-(int64_t)ETIMEDOUT);
+            break;
+        }
+        case 119: { /* A64 __NR_sched_setscheduler(pid, policy, param). */
+            const uint32_t tid = r0 ? (uint32_t)r0 : g_current_tid;
+            ArmThread *t = thread_slot_by_tid(tid);
+            const int policy = (int)(int32_t)r1 & ~0x40000000;
+            const GuestVA param = argp(2);
+            const int prio = param ? (int)ctx.mem.read32(param) : -1;
+            const bool rt = policy == GUEST_SCHED_FIFO || policy == GUEST_SCHED_RR;
+            const bool valid_policy = rt || policy == GUEST_SCHED_OTHER ||
+                policy == GUEST_SCHED_BATCH || policy == GUEST_SCHED_IDLE;
+            if (!t) ret64((uint64_t)-(int64_t)ESRCH);
+            else if (!param) ret64((uint64_t)-(int64_t)EFAULT);
+            else if (!valid_policy || (rt ? (prio < 1 || prio > 99) : prio != 0))
+                ret64((uint64_t)-(int64_t)EINVAL);
+            else {
+                t->sched_policy = policy;
+                t->sched_priority = prio;
+                ret64(0);
+            }
+            break;
+        }
+        case 120: { /* A64 __NR_sched_getscheduler(pid). */
+            const uint32_t tid = r0 ? (uint32_t)r0 : g_current_tid;
+            ArmThread *t = thread_slot_by_tid(tid);
+            ret64(t ? (uint64_t)t->sched_policy
+                    : (uint64_t)-(int64_t)ESRCH);
+            break;
+        }
+        case 121: { /* A64 __NR_sched_getparam(pid, struct sched_param *). */
+            const uint32_t tid = r0 ? (uint32_t)r0 : g_current_tid;
+            ArmThread *t = thread_slot_by_tid(tid);
+            const GuestVA param = argp(1);
+            if (!t) ret64((uint64_t)-(int64_t)ESRCH);
+            else if (!param) ret64((uint64_t)-(int64_t)EFAULT);
+            else {
+                ctx.mem.write32(param, (uint32_t)t->sched_priority);
+                ret64(0);
+            }
+            break;
+        }
+        /* dup3/execve are how a forked child hands its own fd table to the
+         * program it is about to become.  Both were falling through to the
+         * ENOSYS default, so Cross Worlds' security module forked a helper
+         * that could not start: it exits 127, its AF_UNIX endpoint
+         * (files/nmssv) is never bound, the parent's connect() to it fails,
+         * and the module reports "Need Security License" and later aborts
+         * the process.  Report what they were asked to do first; the
+         * implementation follows below. */
+        case 24: { /* AArch64 __NR_dup3(oldfd, newfd, flags) */
+            /* 24 is a different call on ARM32 (getuid), and this switch is
+             * shared — the same guard cases 35 and 48 use above. */
+            if (!ctx.is_arm64) {
+                if (uint32_t eva = errno_va(ctx, g_current_tid))
+                    ctx.mem.write32(eva, ENOSYS);
+                ret32(~0u);
+                break;
+            }
+            const int oldfd = (int)(int32_t)r0, newfd = (int)(int32_t)r1;
+            if (oldfd == newfd) {          /* dup3 rejects this, dup2 allows it */
+                ret64((uint64_t)-(int64_t)EINVAL);
+                break;
+            }
+            if (fork_child_by_tid(g_current_tid)) {
+                child_fd_set(g_current_tid, newfd, oldfd);
+                ret64((uint64_t)newfd);
+                break;
+            }
+            const int rc = dup3(oldfd, newfd, (int)r2);
+            ret64(rc < 0 ? (uint64_t)-(int64_t)errno : (uint64_t)rc);
+            break;
+        }
+        case 221: { /* AArch64 __NR_execve(path, argv[], envp[]) */
+            /* 221 is fcntl64 on ARM32; same guard as 24 above. */
+            if (!ctx.is_arm64) {
+                if (uint32_t eva = errno_va(ctx, g_current_tid))
+                    ctx.mem.write32(eva, ENOSYS);
+                ret32(~0u);
+                break;
+            }
+            const char *path = ctx.mem.cstr(argp(0));
+            std::vector<std::string> words;
+            if (const GuestVA vec = argp(1)) {
+                for (unsigned i = 0; i < 256u; ++i) {
+                    const GuestVA s = ctx.mem.read64(vec + (GuestVA)i * 8u);
+                    if (!s) break;
+                    const char *w = ctx.mem.cstr(s);
+                    words.push_back(w ? w : "");
+                }
+            }
+            if (!path) {
+                fprintf(stderr,
+                        "[exec] invalid execve address: path=0x%llx "
+                        "argv=0x%llx envp=0x%llx sp=0x%llx lr=0x%x tid=%u\n",
+                        (unsigned long long)argp(0),
+                        (unsigned long long)argp(1),
+                        (unsigned long long)argp(2),
+                        (unsigned long long)(g_svc_jit64
+                            ? g_svc_jit64->GetSP() : 0),
+                        lr, g_current_tid);
+            }
+            /* An empty grep pattern here is not a shell-parser artefact: argv
+             * has already been copied out of guest memory.  It means the
+             * process-building code observed an empty Android identity.  Keep
+             * the producer's syscall window and frame chain at the point of
+             * use, before exec replaces the child and waitpid destroys it. */
+            if (words.size() >= 3u &&
+                words[1] == "-c" &&
+                words[2].find("pm list packages") != std::string::npos &&
+                words[2].ends_with("grep -w ")) {
+                fprintf(stderr, "[exec] empty package identity in shell command "
+                                "on tid=%u — producer history follows:\n",
+                        g_current_tid);
+                svc_ring_dump_tid(g_current_tid);
+                if (GuestForkChild *child = fork_child_by_tid(g_current_tid)) {
+                    fprintf(stderr, "[exec] pre-fork parent tid=%u history:\n",
+                            child->parent_tid);
+                    svc_ring_dump_tid(child->parent_tid);
+                }
+                if (g_svc_jit64)
+                    a64_dump_guest_backtrace("empty pm grep", g_current_tid,
+                                             g_svc_jit64->GetRegister(29));
+            }
+            std::string produced;
+            const int status = device_exec(path, words, produced);
+            if (status < 0) {
+                /* Not one of the device's own utilities.  It may still be a
+                 * program the guest dropped in its data directory and is
+                 * entitled to run: this thread of control then *becomes* that
+                 * program, which is what execve means.  The tid does not
+                 * change, so the parent's waitpid() still names this child. */
+                if (fork_child_by_tid(g_current_tid) &&
+                    guest_program_become(words)) {
+                    fprintf(stderr, "[exec] execve(\"%s\") tid=%u: this "
+                            "thread is now that program\n", path,
+                            g_current_tid);
+                    /* The descriptor moves the child made before exec are
+                     * the program's, so they stay: the write path resolves
+                     * through them (child_fd_get). */
+                    ret64(0);
+                    break;
+                }
+                char hostbuf[PATH_MAX];
+                const char *host = path ? map_guest_path(path, hostbuf,
+                                                         sizeof hostbuf)
+                                        : nullptr;
+                struct stat est {};
+                if (!host || stat(host, &est) != 0) {
+                    fprintf(stderr, "[exec] execve(\"%s\") tid=%u: no such "
+                            "program on this device\n",
+                            path ? path : "(null)", g_current_tid);
+                    ret64((uint64_t)-(int64_t)ENOENT);
+                    break;
+                }
+                unsigned char eh[64] = {};
+                if (FILE *f = fopen(host, "rb")) {
+                    if (fread(eh, 1, sizeof eh, f) != sizeof eh) { }
+                    fclose(f);
+                }
+                const bool is_elf = eh[0] == 0x7f && eh[1] == 'E' &&
+                                    eh[2] == 'L' && eh[3] == 'F';
+                uint16_t etype = 0, emach = 0;
+                uint64_t entry = 0;
+                memcpy(&etype, eh + 16, 2);
+                memcpy(&emach, eh + 18, 2);
+                memcpy(&entry, eh + 24, 8);
+                fprintf(stderr, "[exec] execve(\"%s\") tid=%u: %lld-byte %s "
+                        "(class=%u type=%u machine=%u entry=0x%llx) — running a "
+                        "second guest program image is not implemented\n",
+                        path, g_current_tid, (long long)est.st_size,
+                        is_elf ? "ELF" : "non-ELF file", eh[4], etype, emach,
+                        (unsigned long long)entry);
+                if (const char *dump = lunaria_env("LUNARIA_DUMP_DIR")) {
+                    char save[PATH_MAX];
+                    const char *leaf = strrchr(host, '/');
+                    snprintf(save, sizeof save, "%s/lunaria-exec-%s", dump,
+                             leaf ? leaf + 1 : "image");
+                    FILE *in = fopen(host, "rb");
+                    FILE *out = in ? fopen(save, "wb") : nullptr;
+                    if (in && out) {
+                        char chunk[65536];
+                        size_t n;
+                        while ((n = fread(chunk, 1, sizeof chunk, in)) > 0)
+                            if (fwrite(chunk, 1, n, out) != n) break;
+                        fprintf(stderr, "[exec]   image saved to %s\n", save);
+                    }
+                    if (in) fclose(in);
+                    if (out) fclose(out);
+                }
+                ret64((uint64_t)-(int64_t)ENOEXEC);
+                break;
+            }
+            {
+                /* Each argument in quotes.  Joined by spaces, an argument
+                 * that is the empty string is invisible, and "the guest
+                 * passed a name that came out empty" then reads exactly like
+                 * "the guest passed no name" — which are different bugs. */
+                std::string joined;
+                for (size_t i = 0; i < words.size(); ++i) {
+                    if (i) joined += ' ';
+                    joined += '"';
+                    joined += words[i];
+                    joined += '"';
+                }
+                fprintf(stderr, "[exec] execve(\"%s\") tid=%u argv=[%s] -> "
+                        "status %d, %zu bytes\n", path ? path : "(null)",
+                        g_current_tid, joined.c_str(), status,
+                        produced.size());
+            }
+            /* The program's stdout is whatever the child moved onto fd 1
+             * before exec (typically a pipe back to its parent). */
+            if (!produced.empty()) {
+                const int outfd = child_fd_get(g_current_tid, 1);
+                size_t done = 0;
+                while (done < produced.size()) {
+                    const ssize_t n = write(outfd, produced.data() + done,
+                                            produced.size() - done);
+                    if (n <= 0) break;
+                    done += (size_t)n;
+                }
+            }
+            /* execve never returns: this thread of control has become the
+             * program, and the program has now finished.  End it exactly the
+             * way exit() ends a forked child, so the parent's waitpid() reads
+             * the status back. */
+            guest_thread_atexit_run(ctx, g_current_tid);
+            if (fork_child_by_tid(g_current_tid)) {
+                guest_thread_cleanup_run(ctx, g_current_tid);
+                fork_child_mark_exited(g_current_tid,
+                                       (int32_t)((status & 0xff) << 8));
+                child_fd_forget(g_current_tid);
+                if (ArmThread *t = arm_thread_by_tid(g_current_tid)) {
+                    t->exit_value = (uint32_t)(status & 0xff);
+                    t->finished = true;
+                    join_wake_on_target_exit(ctx, g_current_tid);
+                }
+                g_yield_requested = true;
+                ret32(0);
+                break;
+            }
+            /* execve() outside a forked child replaces the process itself,
+             * which this model cannot do — say so instead of pretending. */
+            fprintf(stderr, "[exec] execve() from the main process image is "
+                    "not supported (only fork()+exec is)\n");
+            ret64((uint64_t)-(int64_t)ENOEXEC);
             break;
         }
         default: {
@@ -19393,14 +23906,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         uintptr_t midx = (uintptr_t)mid;
         const char *mname = "?";
         const char *msig = nullptr;
-        /* How long this call holds the ARM execution lock.
+        /* How long this call into Java takes.
          *
-         * A JNI call runs guest Java in the DVM, and the DVM has no lock of
-         * its own — it relies on the execution lock, so the whole interpreter
-         * runs with every other guest thread shut out.  One call measured
-         * 874 ms that way, which is 874 ms in which no sleeper can be woken
-         * and no other thread can make a syscall.  Naming the method is the
-         * first step to not doing that. */
+         * The DVM's dispatch loop now offers the ARM execution lock back
+         * every DVM_AEL_YIELD_STEPS bytecodes, so a long call no longer shuts
+         * every other guest thread out for its whole duration — but it is
+         * still a call that ran for most of a second inside one JNI
+         * transition, and naming the method is how the next one gets found. */
         struct JniCallTimer {
             const char *const *name;
             uint64_t t0;
@@ -19411,8 +23923,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 if (ms >= 50) {
                     static int n_slow = 0;
                     if (n_slow++ < 40)
-                        fprintf(stderr, "[jni-slow] %s held the execution lock "
-                                "%llu ms\n", *name ? *name : "?",
+                        fprintf(stderr, "[jni-slow] %s ran %llu ms inside "
+                                "one JNI call\n", *name ? *name : "?",
                                 (unsigned long long)ms);
                 }
             }
@@ -19554,8 +24066,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 : nullptr;
             char val[256]; val[0] = '\0';
             if (key && !strcmp(key, "ue4.displaymetrics.dpi")) {
-                // "xdpi,ydpi,densityDpi" — LUNARIA_DPI overrides the default.
-                long dpi = lunaria_env_long("LUNARIA_DPI", 420);
+                // "xdpi,ydpi,densityDpi" — one answer for the whole
+                // process, from the emulated display.
+                long dpi = lunaria_screen_dpi();
                 if (dpi < 1) dpi = 420;
                 snprintf(val, sizeof val, "%ld.0,%ld.0,%ld", dpi, dpi, dpi);
             } else if (key && !strcmp(key, "audiomanager.optimalSampleRate")) {
@@ -19703,9 +24216,30 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 fprintf(stderr, "[arm_jni] CallObjectMethodA: %s returned broken handle "
                         "0x%x (mid=0x%x obj=0x%lx)\n", mname, res,
                         (unsigned)(uintptr_t)mid, r1);
-            else if (lunaria_env("LUNARIA_TRACE_JNI"))
-                fprintf(stderr, "[arm_jni] CallObjectMethodA: %s -> 0x%x (mid=0x%x obj=0x%lx)\n",
-                        mname, res, (unsigned)(uintptr_t)mid, r1);
+            else if (lunaria_env("LUNARIA_TRACE_JNI")) {
+                /* A handle number says nothing about whether the answer was
+                 * the one Android would have given.  When the call returns a
+                 * String, show the text: an identity API that answers with an
+                 * empty string is indistinguishable from a working one in the
+                 * handle alone, and that is exactly the failure this trace
+                 * exists to catch. */
+                const char *ret = msig ? strrchr(msig, ')') : nullptr;
+                if (res && ret && !strcmp(ret + 1, "Ljava/lang/String;")) {
+                    const char *utf = jvm->native.GetStringUTFChars(
+                        env, (jstring)AS_OBJ(res), nullptr);
+                    fprintf(stderr, "[arm_jni] CallObjectMethodA: %s -> \"%s\" "
+                            "(0x%x mid=0x%x obj=0x%lx)\n", mname,
+                            utf ? utf : "<null>", res,
+                            (unsigned)(uintptr_t)mid, r1);
+                    if (utf)
+                        jvm->native.ReleaseStringUTFChars(
+                            env, (jstring)AS_OBJ(res), utf);
+                } else {
+                    fprintf(stderr, "[arm_jni] CallObjectMethodA: %s -> 0x%x "
+                            "(mid=0x%x obj=0x%lx)\n", mname, res,
+                            (unsigned)(uintptr_t)mid, r1);
+                }
+            }
             ret32(res);
         } else {
             if (lunaria_env("LUNARIA_TRACE_JNI"))
@@ -20119,6 +24653,167 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                                               g_svc_jit64->GetRegister(29));
             }
         }
+        /* DetectCallBack is the anti-tamper module announcing a finding, and
+         * it is the last thing that happens before it starts the thread that
+         * ends the process.  Whatever this emulator got wrong, the module
+         * observed it in the calls immediately before this one — so record
+         * them here rather than at the abort, which happens on a *different*
+         * thread whose own history is only the sleep it waited out.
+         *
+         * This reads our own SVC history and the guest's frame chain, not the
+         * module's logic. */
+        if (mname && !strcmp(mname, "DetectCallBack")) {
+            static int n = 0;
+            if (n++ < 4) {
+                const char *msig = nullptr;
+                if (midx > 0 && midx <= 65536) {
+                    auto &mo = jvm->objects[midx - 1];
+                    if (mo.type == jvm_object::JVM_OBJECT_METHOD &&
+                        mo.method.signature.data)
+                        msig = mo.method.signature.data;
+                }
+                const int variant = (int)svc_no - 61;
+                const uint32_t a0 = jni_arg_word(ctx, regs, variant, 0);
+                const uint32_t a1 = jni_arg_word(ctx, regs, variant, 1);
+                const uint32_t a2 = jni_arg_word(ctx, regs, variant, 2);
+                const char *message = nullptr;
+                const char *message_kind = "out-of-range";
+                /* The shipped NMSS API uses (int,String,boolean).  Keep the
+                 * signature check: treating an arbitrary integer argument as
+                 * a JNI handle would make diagnostics alter a healthy run. */
+                if (a1 > 0 && a1 <= 65536u) {
+                    const auto &arg = jvm->objects[a1 - 1];
+                    switch (arg.type) {
+                    case jvm_object::JVM_OBJECT_STRING:
+                        message_kind = "String";
+                        if (msig && !strcmp(msig, "(ILjava/lang/String;Z)V"))
+                            message = arg.string.data;
+                        break;
+                    case jvm_object::JVM_OBJECT_CLASS:  message_kind = "Class"; break;
+                    case jvm_object::JVM_OBJECT_METHOD: message_kind = "Method"; break;
+                    case jvm_object::JVM_OBJECT_ARRAY:  message_kind = "Array"; break;
+                    case jvm_object::JVM_OBJECT_NONE:   message_kind = "free"; break;
+                    default:                            message_kind = "Object"; break;
+                    }
+                }
+                fprintf(stderr,
+                        "[detect] signature=%s code=%d message=%s "
+                        "message-handle=0x%x(%s) appExit=%u "
+                        "raw-args=[0x%x,0x%x,0x%x]\n",
+                        msig ? msig : "?", (int32_t)a0,
+                        message ? message : "<null>", a1, message_kind,
+                        a2, a0, a1, a2);
+                fprintf(stderr, "[detect] DetectCallBack on tid=%u — the calls "
+                        "it made on the way here:\n", g_current_tid);
+                svc_ring_dump_tid(g_current_tid);
+                if (ctx.is_arm64 && g_svc_jit64) {
+                    /* The policy dispatcher calls its final sensor through
+                     * x22 and resumes at image+0x105af0.  The sensor prologue
+                     * saves the caller's x22 at fp-32.  Recovering that saved
+                     * register from the ordinary frame chain identifies the
+                     * actual callback without detouring or rewriting it. */
+                    uint64_t fp = g_svc_jit64->GetRegister(29);
+                    unsigned depth;
+                    for (depth = 0; depth < 32 && fp; ++depth) {
+                        const uint8_t *frame;
+                        uint64_t next;
+                        uint64_t ret;
+                        uint64_t saved_x22;
+                        if (fp & 7u) break;
+                        frame = ctx.mem.try_ptr((GuestVA)fp, 16);
+                        if (!frame) break;
+                        memcpy(&next, frame, 8);
+                        memcpy(&ret, frame + 8, 8);
+                        if (a64_canon_va(ret) == 0x27185af0u && fp >= 32u &&
+                            ctx.mem.try_ptr((GuestVA)(fp - 32u), 8)) {
+                            memcpy(&saved_x22,
+                                   ctx.mem.ptr((GuestVA)(fp - 32u)), 8);
+                            fprintf(stderr,
+                                    "[detect] final policy callback x22="
+                                    "0x%llx (canon=0x%08x, frame=%u)\n",
+                                    (unsigned long long)saved_x22,
+                                    a64_canon_va(saved_x22), depth);
+                            break;
+                        }
+                        if (!ret || next <= fp) break;
+                        fp = next;
+                    }
+                    /* Where the failing verdict's inputs live.
+                     *
+                     * The scan function at image+0x1d6498 decides with
+                     * `bl image+0x1d8b34`; that callee issues no syscall and
+                     * only tallies fields of the module's context object,
+                     * which other threads filled in earlier.  Its inputs are
+                     * [P+0x4d0] and [[P+0x350]+0xf0], where P is
+                     * image+0x24dc40(ctx) -- and that accessor is nothing but
+                     * `ldr x0,[x0,#0x18]`, so P is [ctx+0x18].
+                     *
+                     * ctx is the scan function's x20.  Its prologue puts
+                     * x29 at sp+0x50 and saves x20 at sp+0x40, so the saved
+                     * register is at fp-0x10 of the frame one step outside
+                     * the one that returns to image+0x1d73bc.  Printing the
+                     * addresses is what makes the producing store findable:
+                     * feed [P+0x4d0] back in as LUNARIA_A64_WATCH and the
+                     * store watchpoint names the writing PC.  Nothing here
+                     * touches the guest -- it reads the ordinary frame
+                     * chain. */
+                    fp = g_svc_jit64->GetRegister(29);
+                    for (depth = 0; depth < 32 && fp; ++depth) {
+                        const uint8_t *frame;
+                        uint64_t next;
+                        uint64_t ret;
+                        if (fp & 7u) break;
+                        frame = ctx.mem.try_ptr((GuestVA)fp, 16);
+                        if (!frame) break;
+                        memcpy(&next, frame, 8);
+                        memcpy(&ret, frame + 8, 8);
+                        if (a64_canon_va(ret) == 0x272573bcu) {
+                            /* P is on the scan function's own frame.  Its
+                             * prologue leaves x29 at sp+0x50 and then drops
+                             * sp by 0x520, and at image+0x1d64e0 it stores
+                             * the accessor's result with `str x0,[sp,#0xe0]`
+                             * -- so P sits at x29-0x490.  (The x20 slot in
+                             * the frame holds the *caller's* x20, not the
+                             * live ctx, which is why reading it gave 0.) */
+                            uint64_t scan_fp = next;
+                            uint64_t p_obj = 0, q_obj = 0;
+                            if (scan_fp >= 0x490u &&
+                                ctx.mem.try_ptr((GuestVA)(scan_fp - 0x490u), 8))
+                                memcpy(&p_obj,
+                                       ctx.mem.ptr((GuestVA)(scan_fp - 0x490u)), 8);
+                            if (p_obj &&
+                                ctx.mem.try_ptr((GuestVA)(p_obj + 0x350u), 8))
+                                memcpy(&q_obj,
+                                       ctx.mem.ptr((GuestVA)(p_obj + 0x350u)), 8);
+                            fprintf(stderr,
+                                    "[detect] verdict inputs: scan-fp=0x%llx "
+                                    "P=0x%llx flag=[P+0x4d0]@0x%llx"
+                                    "=%u Q=[P+0x350]=0x%llx mode=[Q+0xf0]@"
+                                    "0x%llx=%u (frame=%u)\n",
+                                    (unsigned long long)scan_fp,
+                                    (unsigned long long)p_obj,
+                                    (unsigned long long)(p_obj + 0x4d0u),
+                                    p_obj && ctx.mem.try_ptr(
+                                        (GuestVA)(p_obj + 0x4d0u), 1)
+                                        ? *ctx.mem.ptr((GuestVA)(p_obj + 0x4d0u))
+                                        : 0u,
+                                    (unsigned long long)q_obj,
+                                    (unsigned long long)(q_obj + 0xf0u),
+                                    q_obj && ctx.mem.try_ptr(
+                                        (GuestVA)(q_obj + 0xf0u), 4)
+                                        ? ctx.mem.read32((GuestVA)(q_obj + 0xf0u))
+                                        : 0u,
+                                    depth);
+                            break;
+                        }
+                        if (!ret || next <= fp) break;
+                        fp = next;
+                    }
+                    a64_dump_guest_backtrace("DetectCallBack", g_current_tid,
+                                             g_svc_jit64->GetRegister(29));
+                }
+            }
+        }
         /* ForceQuit is the guest abandoning startup.  FJavaWrapper::CallVoidMethod
          * is the only lr the bridge sees, so surface the return-address chain —
          * otherwise there is nothing to identify which check gave up. */
@@ -20315,7 +25010,37 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     ARM_STR(r2), ARM_STR(r3))); break;
 
     // 95-103: GetXxxField
-    case 95:  RET_OBJ(jvm->native.GetObjectField(env,AS_OBJ(r1),AS_FID(r2))); break;
+    case 95: {
+        jobject fv = jvm->native.GetObjectField(env, AS_OBJ(r1), AS_FID(r2));
+        /* Same reason as the CallObjectMethodA trace: an identity field that
+         * reads back empty is invisible in a handle number, and native SDKs
+         * take their view of the install from these fields. */
+        if (lunaria_env("LUNARIA_TRACE_JNI")) {
+            const char *fname = nullptr, *fsig = nullptr;
+            uintptr_t fidx = (uintptr_t)AS_FID(r2);
+            if (fidx > 0 && fidx <= 65536) {
+                auto &fo = jvm->objects[fidx - 1];
+                if (fo.type == jvm_object::JVM_OBJECT_METHOD) {
+                    fname = fo.method.name.data;
+                    fsig  = fo.method.signature.data;
+                }
+            }
+            if (fv && fsig && !strcmp(fsig, "Ljava/lang/String;")) {
+                const char *utf = jvm->native.GetStringUTFChars(
+                    env, (jstring)fv, nullptr);
+                fprintf(stderr, "[arm_jni] GetObjectField: %s -> \"%s\"\n",
+                        fname ? fname : "?", utf ? utf : "<null>");
+                if (utf)
+                    jvm->native.ReleaseStringUTFChars(env, (jstring)fv, utf);
+            } else {
+                fprintf(stderr, "[arm_jni] GetObjectField: %s (%s) -> 0x%x\n",
+                        fname ? fname : "?", fsig ? fsig : "?",
+                        (unsigned)(uintptr_t)fv);
+            }
+        }
+        RET_OBJ(fv);
+        break;
+    }
     case 96:  ret32((uint32_t)jvm->native.GetBooleanField(env,AS_OBJ(r1),AS_FID(r2))); break;
     case 97:  ret32((uint32_t)jvm->native.GetByteField(env,AS_OBJ(r1),AS_FID(r2))); break;
     case 98:  ret32((uint32_t)jvm->native.GetCharField(env,AS_OBJ(r1),AS_FID(r2))); break;
@@ -20793,6 +25518,11 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 g_svc_retptr = true;
                 ret32(STR_SCRATCH);
             }
+            /* The bridge always returns a separate guest-owned buffer.  JNI's
+             * optional flag describes that returned pointer, not the host
+             * JVM's intermediate pointer. */
+            if (const GuestVA is_copy_va = argp(2))
+                *ctx.mem.ptr(is_copy_va) = JNI_TRUE;
             /* The host side of the same contract: what GetStringUTFChars
              * hands out has to be given back, or every string the guest reads
              * leaks a copy in the JVM. */
@@ -21555,6 +26285,19 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (!s1 && !s2) { ret32(0); break; }
         if (!s1) { ret32((uint32_t)-1); break; }
         if (!s2) { ret32(1); break; }
+        /* A spawned Android helper is a separate process even though the
+         * emulator schedules it in the same host address space.  This trace
+         * exposes which procfs field that process actually parses; it is
+         * diagnostic only and never changes the comparison. */
+        if (lunaria_env("LUNARIA_TRACE_PROC") &&
+            guest_pid() != GUEST_TID_BASE) {
+            static unsigned helper_strncmp_logs = 0;
+            if (helper_strncmp_logs++ < 512u)
+                fprintf(stderr,
+                        "[proc-parse] pid=%u tid=%u strncmp(%.*s, %.*s, %zu)\n",
+                        guest_pid(), guest_tid_of(g_current_tid),
+                        96, s1, 96, s2, n);
+        }
         ret32((uint32_t)strncmp(s1, s2, n));
         break;
     }
@@ -21619,17 +26362,24 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 uint64_t fp  = g_svc_jit64->GetRegister(29);
                 uint64_t tls = g_tpidr_el0_val;
                 fprintf(stderr, "[arm_exec] abort a64 sp=0x%llx fp=0x%llx tls=0x%llx "
-                        "guard(tls+0x28)=0x%llx saved(fp-8)=0x%llx\n",
+                        "guard(tls+0x28)=0x%llx saved(fp-16)=0x%llx\n",
                         (unsigned long long)g_svc_jit64->GetSP(),
                         (unsigned long long)fp,
                         (unsigned long long)tls,
                         (unsigned long long)(tls ? ctx.mem.read64(tls + 0x28u) : 0),
-                        (unsigned long long)(fp >= 8 ? ctx.mem.read64(fp - 8u) : 0));
+                        (unsigned long long)(fp >= 16 ? ctx.mem.read64(fp - 16u) : 0));
             }
             /* What this thread did on its way here.  An anti-tamper module
              * kills the app from a thread of its own, and the checks that
              * decided it are the calls immediately before. */
             if (first) svc_ring_dump_tid(g_current_tid);
+            /* Where it was called from, with module attribution.  abort() is
+             * also how a C++ runtime reports that it could not unwind, and
+             * that failure is about *which* frames are on the stack -- so the
+             * frames are the evidence, not the register dump above. */
+            if (first && ctx.is_arm64 && g_svc_jit64)
+                a64_dump_guest_backtrace("abort", g_current_tid,
+                                         g_svc_jit64->GetRegister(29));
             // On first abort, dump the guest stack to reveal the failing mono function.
             if (first) {
                 uint32_t sp = regs[13];
@@ -21709,6 +26459,17 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 CLOCK_REALTIME, guest_timespec_ns(ctx, argp(1)));
             const uint64_t now = host_mono_ns();
             sem_until_ns = rel > UINT64_MAX - now ? UINT64_MAX : now + rel;
+        }
+        if (lunaria_env("LUNARIA_TRACE_SEM")) {
+            static int en = 0;
+            if (en++ < 200)
+                fprintf(stderr, "[sem] %s sem=0x%llx val=%d tid=%u lr=0x%08x"
+                        " rel=%.3fms\n", timed ? "timedwait" : "wait",
+                        (unsigned long long)sva,
+                        g_sems.count(sva) ? g_sems[sva] : 0,
+                        g_current_tid, lr,
+                        timed ? (double)(sem_until_ns - host_mono_ns()) / 1e6
+                              : -1.0);
         }
         if (g_current_tid == 0 && !g_scheduling) {
             /* Main has no ArmThread slot to park.  Pump until a real post or
@@ -21807,6 +26568,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 break;
             }
             t.id = nid;
+            inherit_process_identity(t);
+            /* POSIX/Linux: a newly-created pthread inherits a copy of the
+             * creating thread's signal mask.  Leaving a reused tid's slot at
+             * zero (or at its previous owner's value) made pthread_sigmask(),
+             * signal delivery and /proc/<tid>/status disagree as soon as the
+             * caller created a worker after blocking a signal. */
+            signal_mask_store(t.id, signal_mask_load(g_current_tid));
             uint32_t stack_top = new_stack_lo + new_stack_sz - 16;
             t.stack_base = new_stack_lo;
             t.stack_size = new_stack_sz;
@@ -21823,6 +26591,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 GuestVA arg64 = g_svc_args64[3];
                 t.regs64.fill(0);
                 t.regs64[0] = arg64; /* x0 = start_routine arg */
+                t.start_arg = arg64;
                 t.stack_base = a64_guest_va((BackingOffset)new_stack_lo);
                 t.sp64 = a64_guest_va(stack_top);
                 t.lr64 = a64_guest_va(SENTINEL_ADDR);
@@ -21831,6 +26600,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 t.regs64[30] = t.lr64;
             }
             t.cpsr = (r2 & 1u) ? 0x30u : 0x10u;
+            t.created_ns = host_mono_ns();
+            svc_ring_reset_tid(t.id);
             t.detached = (attr_flags & 1u) != 0;   /* PTHREAD_CREATE_DETACHED */
             /* tids are handed out again after a join, so a descriptor wait
              * left behind by the previous owner must not be inherited. */
@@ -21852,6 +26623,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                  * addresses; only the new slot has to be indexed. */
                 g_thread_by_tid[slot->id] = slot;
             }
+            thread_name_inherit(t.id, g_current_tid);
             thread_mark_ready(t.id);
             if (r0) {
                 if (t.is_arm64) {
@@ -21876,6 +26648,75 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
              * caller still holds.  A thread started only to report something
              * carries what it found in exactly those two places, and neither
              * is reachable any other way once the caller has returned. */
+            /* LUNARIA_THREAD_SPAWN_TRACE=<hex offset in the entry's image>:
+             * when a thread starts at that offset, say what the *creating*
+             * thread had just been doing.  A module that decides something
+             * and then starts a thread to act on it leaves the decision only
+             * in the creator's own history -- by the time the new thread
+             * reports, its caller is long gone.  Offsets, not addresses:
+             * an image the app wrote at runtime lands at a different base
+             * every run. */
+            if (const char *sp_want = lunaria_env("LUNARIA_THREAD_SPAWN_TRACE")) {
+                const uint64_t off_want = strtoull(sp_want, nullptr, 16);
+                const uint64_t base = a64_module_base_for(t.entry_pc);
+                if (off_want && base && t.entry_pc - base == off_want) {
+                    fprintf(stderr, "[spawn] tid=%u starts at +0x%llx; creator "
+                            "tid=%u history follows\n", t.id,
+                            (unsigned long long)off_want, g_current_tid);
+                    svc_ring_dump_tid(g_current_tid);
+                    if (g_svc_jit64)
+                        a64_dump_guest_backtrace("spawn creator", g_current_tid,
+                                                 g_svc_jit64->GetRegister(29));
+                    /* The deciding thread reads nothing through the emulator:
+                     * it acts on state its siblings in the same image
+                     * gathered earlier.  Those siblings *do* call in here, so
+                     * their histories are where an answer this emulator got
+                     * wrong would show.  Dump every live thread that runs in
+                     * the same image. */
+                    /* The thread argument is where a decision already made
+                     * is handed over: the evaluator in this image branches on
+                     * one int in it. */
+                    {
+                        const GuestVA arg =
+                            (GuestVA)(t.is_arm64 ? t.regs64[0] : r3);
+                        fprintf(stderr, "[spawn]  arg=0x%llx:",
+                                (unsigned long long)arg);
+                        for (uint32_t o = 0; o < 0x40 && ctx.mem.ptr(arg + o);
+                             o += 8)
+                            fprintf(stderr, " +%02x=%016llx", o,
+                                    (unsigned long long)ctx.mem.read64(arg + o));
+                        fprintf(stderr, "\n");
+                    }
+                    /* The creator is stopped inside the routine that made
+                     * the decision, so its callee-saved registers still hold
+                     * that routine's locals -- including the object whose one
+                     * int the verdict is read from. */
+                    if (g_svc_jit64) {
+                        for (int rr = 19; rr <= 28; ++rr) {
+                            const uint64_t v = g_svc_jit64->GetRegister((size_t)rr);
+                            fprintf(stderr, "[spawn]  x%d=0x%llx", rr,
+                                    (unsigned long long)v);
+                            if (v > 0x1000 && ctx.mem.ptr((GuestVA)v) &&
+                                ctx.mem.ptr((GuestVA)v + 0x1f)) {
+                                fprintf(stderr, " ->");
+                                for (uint32_t o = 0; o < 0x20; o += 4)
+                                    fprintf(stderr, " %08x",
+                                            ctx.mem.read32((GuestVA)v + o));
+                            }
+                            fprintf(stderr, "\n");
+                        }
+                    }
+                    fprintf(stderr, "[spawn] siblings in the same image:\n");
+                    for (const auto &st : g_threads) {
+                        if (st.finished || st.id == g_current_tid) continue;
+                        if (a64_module_base_for(st.entry_pc) != base) continue;
+                        fprintf(stderr, "[spawn]  tid=%u entry=+0x%llx\n",
+                                st.id,
+                                (unsigned long long)(st.entry_pc - base));
+                        svc_ring_dump_tid(st.id);
+                    }
+                }
+            }
             if (const char *want = lunaria_env("LUNARIA_THREAD_ARG_DUMP")) {
                 const uint64_t fn_want = strtoull(want, nullptr, 16);
                 const uint64_t fn_got = t.is_arm64 ? t.entry_pc : t.entry_pc;
@@ -21892,6 +26733,66 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                         for (int rr = 19; rr <= 28; ++rr)
                             fprintf(stderr, "[thread-arg]   x%d=0x%llx\n", rr,
                                     (unsigned long long)g_svc_jit64->GetRegister((size_t)rr));
+                    if (g_svc_jit64) {
+                        const GuestVA creator_sp = g_svc_jit64->GetSP();
+                        fprintf(stderr, "[thread-arg]   creator-sp=0x%llx\n",
+                                (unsigned long long)creator_sp);
+                        for (uint32_t o = 0; o < 0xc0; o += 16)
+                            fprintf(stderr, "[thread-arg]   sp+0x%02x %016llx %016llx\n",
+                                    o,
+                                    (unsigned long long)ctx.mem.read64(creator_sp + o),
+                                    (unsigned long long)ctx.mem.read64(creator_sp + o + 8));
+                        for (int rr : {22, 24}) {
+                            const GuestVA p = g_svc_jit64->GetRegister((size_t)rr);
+                            fprintf(stderr, "[thread-arg]   *x%d(%llx)=%08x\n", rr,
+                                    (unsigned long long)p,
+                                    p ? ctx.mem.read32(p) : 0u);
+                        }
+                        /* Walk the AArch64 frame chain while the creator is
+                         * stopped in pthread_create.  The creator's own local
+                         * decision bytes live below its x29; the SVC wrapper's
+                         * current SP only exposes libc temporaries.  Keep this
+                         * opt-in with THREAD_ARG_DUMP because dumping a whole
+                         * parent frame is intentionally verbose. */
+                        GuestVA fp = (GuestVA)g_svc_jit64->GetRegister(29);
+                        for (unsigned depth = 0; depth < 12 && fp; ++depth) {
+                            if (!ctx.mem.ptr(fp) || !ctx.mem.ptr(fp + 15)) break;
+                            const GuestVA next = (GuestVA)ctx.mem.read64(fp);
+                            const uint64_t saved_lr = ctx.mem.read64(fp + 8);
+                            fprintf(stderr,
+                                    "[thread-arg]   frame[%u] fp=0x%llx next=0x%llx lr=0x%llx\n",
+                                    depth, (unsigned long long)fp,
+                                    (unsigned long long)next,
+                                    (unsigned long long)saved_lr);
+                            const uint32_t lr32 = (uint32_t)saved_lr;
+                            if (lr32 >= 0x27000000u && lr32 < 0x28000000u &&
+                                fp >= 0x180 && ctx.mem.ptr(fp - 0x180)) {
+                                const GuestVA base = fp - 0x180;
+                                fprintf(stderr,
+                                        "[thread-arg]   module parent locals base=0x%llx\n",
+                                        (unsigned long long)base);
+                                for (uint32_t o = 0; o < 0x1a0; o += 16)
+                                    fprintf(stderr,
+                                            "[thread-arg]     fp-180+0x%03x %016llx %016llx\n",
+                                            o,
+                                            (unsigned long long)ctx.mem.read64(base + o),
+                                            (unsigned long long)ctx.mem.read64(base + o + 8));
+                            }
+                            if (next <= fp || next - fp > 0x100000u) break;
+                            fp = next;
+                        }
+                    }
+                    svc_ring_dump_tid(g_current_tid);
+                    fprintf(stderr, "[thread-arg]   preceding SVCs (newest first):\n");
+                    for (uint32_t bi = 0, shown = 0; bi < 1024u && shown < 80u; ++bi) {
+                        const SvcTraceEnt &e =
+                            g_svc_ring[(g_svc_ring_pos - 1u - bi) & 1023u];
+                        if (!e.svc && !e.lr) continue;
+                        fprintf(stderr,
+                                "[thread-arg]     svc=%-5u lr=0x%08x r0=0x%08x tid=%u\n",
+                                e.svc, e.lr, e.r0, e.tid);
+                        ++shown;
+                    }
                 }
             }
             if (lunaria_env("LUNARIA_TRACE_JOBS") && r3 >= 0x1000u) {
@@ -22075,6 +26976,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         ret32(ARM_ALOOPER_BASE + g_current_tid); break;
     case SVC_ALOOPER_POLLONCE: case SVC_ALOOPER_POLLALL: {
         // ALooper_pollOnce(timeoutMillis, outFd, outEvents, outData).
+        // ALooper_pollAll keeps polling until the result is not CALLBACK; we
+        // approximate that by draining due NDK choreographer callbacks here
+        // before waiting (bionic's do/while around pollOnce).
+        const bool poll_all = (svc_no == SVC_ALOOPER_POLLALL);
         int32_t timeout_ms = (int32_t)r0;
         static uint32_t alooper_poll_count = 0;
         if (alooper_poll_count++ < 8)
@@ -22085,6 +26990,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
          * registered them — including worker threads, which bail out of the
          * spin loop below before the drive_* calls are reached. */
         drive_ndk_choreographer(ctx);
+        (void)poll_all;
 
         auto deliver = [&](const ALooperFd &e) {
             if (r1) ctx.mem.write32(r1, (uint32_t)e.fd);
@@ -22164,8 +27070,44 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             const bool is64 = ctx.is_arm64;
             ArmMemory *mem = &ctx.mem;
             const uint32_t self_tid = g_current_tid;
-            const int64_t alooper_deadline =
+            /* Real Choreographer wakes the Looper when a posted callback is
+             * due.  An infinite park (deadline_ms=-1) with only that as the
+             * wake source left SwappyChoreographer in ALooper_pollOnce for
+             * 15–60s of ready()-is-0 re-polls whenever the vsync gate and
+             * the callback due time disagreed — set the wait's deadline to
+             * when drive_ndk_choreographer would next deliver. */
+            int64_t alooper_deadline =
                 timeout_ms > 0 ? guest_net::now_ms() + timeout_ms : -1;
+            if (const uint64_t choreo_at = ndk_choreo_looper_due_ns(self_tid)) {
+                const uint64_t now_ns = host_mono_ns();
+                int64_t choreo_ms = guest_net::now_ms();
+                if (choreo_at > now_ns)
+                    choreo_ms += (int64_t)((choreo_at - now_ns + 999999ull) /
+                                          1000000ull);
+                else
+                    choreo_ms += 1; /* due now: wake on the next timer tick */
+                if (alooper_deadline < 0 || choreo_ms < alooper_deadline)
+                    alooper_deadline = choreo_ms;
+                static uint32_t park_choreo_logs;
+                if (park_choreo_logs++ < 32)
+                    fprintf(stderr, "[alooper] park tid=%u choreo_deadline_in=%lldms "
+                            "timeout=%d q_due=%llu\n",
+                            self_tid,
+                            (long long)(choreo_ms - guest_net::now_ms()),
+                            timeout_ms, (unsigned long long)choreo_at);
+            } else {
+                /* Empty queue is correct Android behaviour: Swappy's
+                 * ChoreographerThread stops re-posting after
+                 * MAX_CALLBACKS_BEFORE_IDLE and waits for postFrameCallbacks()
+                 * from the swap path.  Do not invent vsyncs here — that races
+                 * Filter ahead of RHI (signal with no waiter) and freezes
+                 * present. */
+                static uint32_t park_empty_logs;
+                if (park_empty_logs++ < 16)
+                    fprintf(stderr, "[alooper] park tid=%u timeout=%d with no "
+                            "queued choreographer callback\n",
+                            self_tid, timeout_ms);
+            }
             guest_net::GuestFdWait w = guest_net::make_alooper_wait(
                 mem, out_fd, out_ev, out_data, is64, self_tid, alooper_deadline);
             w.what = "ALooper_pollOnce";
@@ -22178,6 +27120,24 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             g_yield_requested = true;
             ret32((uint32_t)-3);   /* replaced by the scheduler on wake */
             break;
+        }
+
+        /* Reaching the in-handler wait is exceptional: ordinary guest
+         * threads have a scheduler slot and park above.  Name the context
+         * that prevented parking so a Looper which monopolises the execution
+         * lock can be attributed to the actual Android callback/thread
+         * contract instead of inferred from an aggregate lock profile. */
+        {
+            static unsigned fallback_reports;
+            if (fallback_reports++ < 16)
+                fprintf(stderr,
+                        "[alooper] cannot park: timeout=%d tid=%u "
+                        "ctx_cb=%d cb_depth=%d slice_depth=%d "
+                        "callback=0x%llx scheduling=%d fd_park_disabled=%d\n",
+                        timeout_ms, g_current_tid,
+                        (int)ctx_innermost_is_cb(), g_cb_depth, g_slice_depth,
+                        (unsigned long long)g_cb_fn_cur, (int)g_scheduling,
+                        (int)guest_net::fd_park_disabled());
         }
 
         // Blocking wait: schedule workers / check wake / re-poll fds.
@@ -22302,7 +27262,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     break;
                 }
         } else {
-            alooper_wake_unnamed();
+            alooper_wake_unnamed(r0, g_current_tid);
         }
         fd_wake_all_ready(ctx);
         ret32(0u); break;
@@ -22418,20 +27378,24 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     case SVC_ASENSOR_GETNAME:
     case SVC_ASENSOR_GETVENDOR: {
-        static uint32_t name_va = 0, vend_va = 0;
-        if (!name_va) {
-            name_va = arm_malloc(ctx, 32);
-            vend_va = arm_malloc(ctx, 32);
-            if (name_va) {
-                memset(ctx.mem.ptr(name_va), 0, 32);
-                memcpy(ctx.mem.ptr(name_va), "Lunaria Accel", 14);
-            }
-            if (vend_va) {
-                memset(ctx.mem.ptr(vend_va), 0, 32);
-                memcpy(ctx.mem.ptr(vend_va), "Lunaria", 8);
-            }
-        }
-        ret32(svc_no == SVC_ASENSOR_GETVENDOR ? vend_va : name_va);
+        /* A sensor names the part and the company that made it, not the
+         * device and certainly not the emulator: "Lunaria"/"Lunaria Accel"
+         * was one more place the process said what it really was.  Both come
+         * from the active device profile, which carries the IMU its board
+         * actually has. */
+        static uint32_t acc_va = 0, gyr_va = 0, vend_va = 0;
+        const struct lunaria_device *dev = lunaria_device();
+        auto put = [&](uint32_t &slot, const char *text) {
+            if (slot) return;
+            const size_t n = strlen(text) + 1u;
+            slot = arm_malloc(ctx, (uint32_t)n);
+            if (slot) memcpy(ctx.mem.ptr(slot), text, n);
+        };
+        put(acc_va,  dev->accel_name);
+        put(gyr_va,  dev->gyro_name);
+        put(vend_va, dev->sensor_vendor);
+        if (svc_no == SVC_ASENSOR_GETVENDOR) { ret32(vend_va); break; }
+        ret32(r0 == ARM_ASENSOR_GYRO ? gyr_va : acc_va);
         break;
     }
     case SVC_ASENSOR_GETRES: {
@@ -22633,17 +27597,61 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         if (g_egl_dpy == EGL_NO_DISPLAY || !g_egl_cfg)
             { ret32(0u); break; }
+        EGLConfig cfg = resolve_egl_config((uint32_t)r1);
+        if (!cfg) {
+            egl_set_guest_error(EGL_BAD_CONFIG);
+            ret32(0u);
+            break;
+        }
+        /* The window initially belongs to Lunaria's launch-card context.
+         * EGL requires a window surface and the context made current to it to
+         * have compatible configs.  Returning that bootstrap surface for an
+         * arbitrary Android config made UE's first makeCurrent fail with
+         * EGL_BAD_MATCH.  Android hands the native window to the application
+         * here, so rebuild the host objects once with the chosen config. */
+        if (!g_egl_guest_window_created) {
+            if (g_egl_dpy != EGL_NO_DISPLAY)
+                eglMakeCurrent(g_egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                               EGL_NO_CONTEXT);
+            if (g_egl_surf != EGL_NO_SURFACE)
+                eglDestroySurface(g_egl_dpy, g_egl_surf);
+            if (g_egl_ctx != EGL_NO_CONTEXT)
+                eglDestroyContext(g_egl_dpy, g_egl_ctx);
+            g_egl_surf = EGL_NO_SURFACE;
+            g_egl_ctx = EGL_NO_CONTEXT;
+            egl_note_bound(0u, EGL_NO_SURFACE);
+
+            static const EGLint host_es31[] = {
+                EGL_CONTEXT_MAJOR_VERSION, 3,
+                EGL_CONTEXT_MINOR_VERSION, 1, EGL_NONE
+            };
+            static const EGLint host_es3[] = {
+                EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE
+            };
+            static const EGLint host_es2[] = {
+                EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE
+            };
+            g_egl_ctx = eglCreateContext(g_egl_dpy, cfg, EGL_NO_CONTEXT,
+                                         host_es31);
+            if (g_egl_ctx == EGL_NO_CONTEXT)
+                g_egl_ctx = eglCreateContext(g_egl_dpy, cfg, EGL_NO_CONTEXT,
+                                             host_es3);
+            if (g_egl_ctx == EGL_NO_CONTEXT)
+                g_egl_ctx = eglCreateContext(g_egl_dpy, cfg, EGL_NO_CONTEXT,
+                                             host_es2);
+            g_egl_guest_window_created = true;
+        }
         if (g_egl_surf == EGL_NO_SURFACE && g_glfw) {
             EGLNativeWindowType native_win =
                 (EGLNativeWindowType)luna_os_native_window(g_glfw);
             g_egl_surf = eglCreateWindowSurface(
-                g_egl_dpy, g_egl_cfg, native_win, nullptr);
+                g_egl_dpy, cfg, native_win, nullptr);
         }
         if (g_egl_surf == EGL_NO_SURFACE) {
             const EGLint pb_attribs[] = {
                 EGL_WIDTH, arm_exec_fb_width(), EGL_HEIGHT, arm_exec_fb_height(), EGL_NONE
             };
-            g_egl_surf = eglCreatePbufferSurface(g_egl_dpy, g_egl_cfg, pb_attribs);
+            g_egl_surf = eglCreatePbufferSurface(g_egl_dpy, cfg, pb_attribs);
         }
         fprintf(stderr, "[arm_exec] eglCreateWindowSurface -> %p (glfw=%d)\n",
                 g_egl_surf, g_glfw != nullptr);
@@ -22679,7 +27687,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_EGL_CREATECTX: {
         // eglCreateContext(dpy, cfg, share, attribs).
         auto attrs = read_egl_attribs(ctx, argp(3));
-        ret32(egl_host_create_context(r2, attrs.data()));
+        ret32(egl_host_create_context((uint32_t)r1, (uint32_t)r2,
+                                      attrs.data()));
         break;
     }
     case SVC_EGL_MAKECURRENT: {
@@ -22723,30 +27732,34 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (g_glfw) glfwPollEvents();
         if (g_guest_egl_swap_count <= 2)
             gl_sample_fbos_at_present();
-        gl_present_fallback_blit();
-        /* The emulator's own windows go on last, over the finished guest
-         * frame, exactly where the system compositor puts an Android dialog. */
-        luna_overlay_present(g_fb_w, g_fb_h);
-        maybe_dump_screenshot(g_guest_egl_swap_count - 1, true);
-        /* The present blocks until the compositor hands back a buffer — a
-         * whole vsync interval when the queue is full — and it was doing so
-         * with the ARM execution lock held, so every other engine stopped for
-         * the duration.  It was the single largest holder during Cross Worlds'
-         * load: 46% of a 46% hold.
+        /* Present, and everything the emulator composites into it, is host GL
+         * and nothing else.  The present itself blocks until the compositor
+         * hands back a buffer — a whole vsync interval when the queue is full
+         * — and the composite before it draws the overlay and the fallback
+         * blit, which is more host GPU work again.  Holding the ARM execution
+         * lock across all of it stopped every other engine for the length of
+         * a frame, every frame: on a device the other threads keep running
+         * while one thread waits inside eglSwapBuffers.
          *
-         * Nothing between here and the relock touches emulator state; the call
-         * is EGL's alone.  A guest thread that has touched GL only ever runs
-         * on this host thread (see svc_touches_gl), and this host thread is
-         * here, so no other engine can issue a GL call while the lock is
-         * down. */
+         * Nothing between the unlock and the relock touches emulator state;
+         * the calls are EGL's and the overlay's alone.  A guest thread that
+         * has touched GL only ever runs on this host thread (see
+         * svc_touches_gl), and this host thread is here, so no other engine
+         * can issue a GL call while the lock is down. */
         EGLBoolean ok;
         {
             unsigned swap_depth = arm_lock_unlock_all();
+            gl_present_fallback_blit();
+            /* The emulator's own windows go on last, over the finished guest
+             * frame, exactly where the system compositor puts an Android
+             * dialog. */
+            luna_overlay_present(g_fb_w, g_fb_h);
+            maybe_dump_screenshot(g_guest_egl_swap_count - 1, true);
             ok = eglSwapBuffers(g_egl_dpy, g_egl_surf);
+            gl_restore_texture_units();
             arm_lock_relock(swap_depth);
         }
         if (ok) egl_on_swap_complete();
-        gl_restore_texture_units();
         {
             
             static uint64_t last_draw = 0, last_clear = 0, sn = 0;
@@ -22764,7 +27777,21 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         ret32((uint32_t)ok);
         break;
     }
-    case SVC_EGL_DESTROYSURF: ret32(EGL_TRUE); break;
+    case SVC_EGL_DESTROYSURF: {
+        EGLSurface dead = egl_resolve_guest_surface((uint32_t)r1);
+        EGLBoolean ok = dead != EGL_NO_SURFACE && g_egl_dpy != EGL_NO_DISPLAY
+            ? eglDestroySurface(g_egl_dpy, dead) : EGL_FALSE;
+        if (ok && dead == g_egl_surf) {
+            g_egl_surf = EGL_NO_SURFACE;
+            if (g_egl_bound_surf == dead)
+                g_egl_bound_surf = EGL_NO_SURFACE;
+        }
+        if (r1 >= ARM_EGL_SURFTAB_BASE &&
+            r1 - ARM_EGL_SURFTAB_BASE < g_egl_surf_tab.size() && ok)
+            g_egl_surf_tab[r1 - ARM_EGL_SURFTAB_BASE].host = EGL_NO_SURFACE;
+        ret32((uint32_t)ok);
+        break;
+    }
     case SVC_EGL_DESTROYCTX:
         ret32((uint32_t)egl_host_destroy_context(r1));
         break;
@@ -23170,7 +28197,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_GL_GetString: {
         // Stash GL string in rotating scratch; return as guest pointer.
-        const char *s = pfn_glGetString ? (const char*)pfn_glGetString((GLenum)r0) : nullptr;
+        const char *s = guest_gl_identity_string((GLenum)r0);
+        if (!s && pfn_glGetString)
+            s = (const char*)pfn_glGetString((GLenum)r0);
         std::string filtered;
         if (r0 == 0x1F03 /* GL_EXTENSIONS */) {
             /* The extension string decides whether the engine believes the
@@ -23234,8 +28263,23 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             pfn_glReadPixels((GLint)r0,(GLint)r1,(GLsizei)r2,(GLsizei)r3,(GLenum)fmt,(GLenum)type,ARM_PTR(pva));
         }
         break;
-    case SVC_GL_Flush:  if (pfn_glFlush)  pfn_glFlush();  break;
-    case SVC_GL_Finish: if (pfn_glFinish) pfn_glFinish(); break;
+/* A draw, a flush and a finish are the three GL entry points that can block in
+ * the driver: the command buffer fills, or the call waits for the GPU.  Under
+ * Cross Worlds' world load one glDrawElements held the ARM execution lock for
+ * 37 ms, which stopped all four A64 engines -- and with them the guest's own
+ * watchdog and looper threads -- for longer than two frames.  On a device a
+ * thread blocked in the driver stops nothing else.
+ *
+ * The same reasoning as the present (see SVC_EGL_SWAPBUF): a guest thread that
+ * has touched GL only ever runs on this host thread, so with the lock down no
+ * other engine can issue a GL call, and the driver call itself touches no
+ * emulator state. */
+    case SVC_GL_Flush:
+        if (pfn_glFlush)  { ArmLockDropped gl_unlocked; pfn_glFlush();  }
+        break;
+    case SVC_GL_Finish:
+        if (pfn_glFinish) { ArmLockDropped gl_unlocked; pfn_glFinish(); }
+        break;
 
     
     case SVC_GL_GenBuffers:
@@ -23278,6 +28322,20 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_GL_BindTexture: {
         GLenum guest_tgt = (GLenum)r0;
         GLenum host_tgt = gl_host_tex_target(guest_tgt);
+        GLuint host_tex = (GLuint)r1;
+        if (guest_tgt == GL_TEXTURE_EXTERNAL_OES_GUEST && host_tex) {
+            auto found = g_gl_external_backing.find(host_tex);
+            if (found == g_gl_external_backing.end()) {
+                GLuint backing = 0;
+                if (pfn_glGenTextures) pfn_glGenTextures(1, &backing);
+                if (backing) {
+                    g_gl_external_backing[host_tex] = backing;
+                    host_tex = backing;
+                }
+            } else {
+                host_tex = found->second;
+            }
+        }
         g_gl_texture_bindings[g_gl_active_texture][guest_tgt] = (GLuint)r1;
         if (guest_tgt != host_tgt)
             g_gl_texture_bindings[g_gl_active_texture][host_tgt] = (GLuint)r1;
@@ -23288,29 +28346,30 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         {
             if (pfn_glGetError)
                 while (pfn_glGetError() != 0) {}
-            if (pfn_glBindTexture) pfn_glBindTexture(host_tgt, (GLuint)r1);
+            if (pfn_glBindTexture) pfn_glBindTexture(host_tgt, host_tex);
             // If the loaded pointer left the binding at 0, retry via dlsym.
             GLint bound = -1;
             if (pfn_glGetIntegerv)
                 pfn_glGetIntegerv(0x8069 /* GL_TEXTURE_BINDING_2D */, &bound);
-            if (host_tgt == 0x0DE1u && (GLint)r1 != 0 && bound != (GLint)r1 &&
+            if (host_tgt == 0x0DE1u && host_tex != 0 && bound != (GLint)host_tex &&
                 g_libgles2) {
                 using Fn = void (*)(GLenum, GLuint);
                 static Fn dl_bt = nullptr;
                 if (!dl_bt) dl_bt = (Fn)dlsym(g_libgles2, "glBindTexture");
                 if (dl_bt) {
-                    dl_bt(host_tgt, (GLuint)r1);
+                    dl_bt(host_tgt, host_tex);
                     if (pfn_glGetIntegerv)
                         pfn_glGetIntegerv(0x8069, &bound);
                     static int fix = 0;
                     if (fix++ < 8)
                         fprintf(stderr, "[gl] BindTexture dlsym-retry tex=%lu "
-                                "bound=%d tid=%u\n", r1, bound, g_current_tid);
+                                "host=%u bound=%d tid=%u\n", r1, host_tex,
+                                bound, g_current_tid);
                 }
             }
             GLenum err = pfn_glGetError ? pfn_glGetError() : 0;
             if (g_guest_egl_swap_count <= 2 && g_current_tid >= 40 &&
-                (r1 != 0u || err != 0 || bound != (GLint)r1)) {
+                (r1 != 0u || err != 0 || bound != (GLint)host_tex)) {
                 static int n = 0;
                 if (n++ < 40) {
                     GLint active = 0, istex = 0;
@@ -23320,8 +28379,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     static PFist fist = (PFist)eglGetProcAddress("glIsTexture");
                     if (fist) istex = fist((GLuint)r1);
                     fprintf(stderr, "[gl] BindTexture tgt=0x%x->0x%x tex=%lu want_unit=0x%x "
-                            "host_active=0x%x host_bound2d=%d istex=%d err=0x%x tid=%u\n",
-                            guest_tgt, host_tgt, r1, g_gl_active_texture, active, bound, istex, err,
+                            "host=%u host_active=0x%x host_bound2d=%d istex=%d err=0x%x tid=%u\n",
+                            guest_tgt, host_tgt, r1, host_tex, g_gl_active_texture, active, bound, istex, err,
                             g_current_tid);
                 }
             }
@@ -23345,7 +28404,19 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         break;
     case SVC_GL_DeleteTextures:
-        if (pfn_glDeleteTextures && r1) pfn_glDeleteTextures((GLsizei)r0,(const GLuint*)ctx.mem.ptr(r1)); break;
+        if (pfn_glDeleteTextures && r1) {
+            for (uint32_t i = 0; i < r0; ++i) {
+                GLuint guest = ctx.mem.read32(r1 + i * 4u);
+                auto external = g_gl_external_backing.find(guest);
+                if (external != g_gl_external_backing.end()) {
+                    GLuint backing = external->second;
+                    pfn_glDeleteTextures(1, &backing);
+                    g_gl_external_backing.erase(external);
+                }
+            }
+            pfn_glDeleteTextures((GLsizei)r0,(const GLuint*)ctx.mem.ptr(r1));
+        }
+        break;
     case SVC_GL_TexParameteri:
         // LUNARIA_TRACE_GLCALLER: record the guest return address (caller) of the texture-parameter loop that immediately.
         if (lunaria_env("LUNARIA_TRACE_GLCALLER")) {
@@ -24101,7 +29172,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         gl_restore_texture_units();
         gl_draw_census("DrawArrays", (GLenum)r0, (GLsizei)r2);
         gl_trace_fb0_draw("DrawArrays", (GLenum)r0, (GLsizei)r2);
-        if (pfn_glDrawArrays) pfn_glDrawArrays((GLenum)r0,(GLint)r1,(GLsizei)r2);
+        if (pfn_glDrawArrays) {
+            ArmLockDropped gl_unlocked;   /* see SVC_GL_Flush */
+            pfn_glDrawArrays((GLenum)r0,(GLint)r1,(GLsizei)r2);
+        }
         gl_trace_fb0_draw_after();
         if (gldraw_traced() && pfn_glGetError) {
             GLenum e = pfn_glGetError();
@@ -24187,7 +29261,11 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             {
                 const void *idx = gl_index_source(r3);
                 if (pfn_glDrawElements && gl_index_valid)
-                    pfn_glDrawElements((GLenum)r0,(GLsizei)r1,(GLenum)r2, idx);
+                    {
+                        ArmLockDropped gl_unlocked;  /* see SVC_GL_Flush */
+                        pfn_glDrawElements((GLenum)r0,(GLsizei)r1,(GLenum)r2,
+                                           idx);
+                    }
             }
             {
                 GLenum e = pfn_glGetError ? pfn_glGetError() : 0;
@@ -24573,6 +29651,31 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_LIBC_CLOSE:
         if ((int)r0 > 2) {
+            guest_net::g_close_lr = lr;
+            /* Abandoning a dial-out that was still in flight is a decision
+             * some caller made; the lr alone is a thunk.  Name the chain. */
+            if (guest_net::SockState *cs = guest_net::state((int)r0))
+                if (cs->connecting) {
+                    static int bn = 0;
+                    if (bn++ < 3) {
+                        fprintf(stderr, "[net] abandoned connect on tid=%u — "
+                                "the calls it made on the way here:\n",
+                                g_current_tid);
+                        svc_ring_dump_tid(g_current_tid);
+                    }
+                }
+            /* A real epoll interest set drops a descriptor the moment its
+             * last reference closes; g_alooper_fds does not, since it is not
+             * epoll itself, so a close(2) the guest made without first
+             * calling ALooper_removeFd left a stale ident/data cookie behind.
+             * The fd number is then free for the next socket()/open(), which
+             * inherits a registration that was never its own — a completely
+             * unrelated subsystem's readiness would be delivered with the
+             * old cookie. */
+            g_alooper_fds.erase(
+                std::remove_if(g_alooper_fds.begin(), g_alooper_fds.end(),
+                               [&](const ALooperFd &e){ return e.fd == (int)r0; }),
+                g_alooper_fds.end());
             guest_net::forget((int)r0);
             ret32((uint32_t)close((int)r0));
         } else ret32(0);
@@ -24774,14 +29877,40 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 if (n++ < 32 || trace()) {
                     SockState *s = state(fd);
                     fprintf(stderr, "[net] connect fd=%d -> %s in progress "
-                            "(non-blocking; the guest polls for it)\n", fd,
-                            s ? s->peer : "?");
+                            "(non-blocking; the guest polls for it) "
+                            "[state=%s nb=%d type=0x%x lr=0x%08x]\n", fd,
+                            s ? s->peer : "?", s ? "yes" : "MISSING",
+                            s ? (s->nonblock ? 1 : 0) : -1, s ? s->type : -1,
+                            lr);
                 }
                 if (SockState *cs = state(fd)) {
+                    if (!cs->connecting)
+                        g_connect_pending.fetch_add(1, std::memory_order_relaxed);
                     cs->connecting = true;
                     cs->connect_started_ms = now_ms();
+                    cs->connect_polls = 0;
                 }
                 fail(EINPROGRESS);
+                /* What the guest will read out of errno.  An in-flight
+                 * connect is only waited for if the caller recognises the
+                 * error as retryable -- OpenSSL's BIO closes the socket and
+                 * walks to the next address when it does not -- so the value
+                 * that actually lands in the guest's errno slot is the whole
+                 * question. */
+                {
+                    static int en = 0;
+                    if (en++ < 32 || trace()) {
+                        const uint32_t eva = errno_va(ctx, g_current_tid);
+                        uint32_t gcell = 0;
+                        const uint32_t gval = guest_errno_view(ctx, &gcell);
+                        fprintf(stderr, "[net] connect fd=%d EINPROGRESS -> "
+                                "errno slot 0x%08x = %u (tid=%u); the guest "
+                                "reads errno from 0x%08x = %u%s\n", fd, eva,
+                                eva ? ctx.mem.read32(eva) : 0u, g_current_tid,
+                                gcell, gval,
+                                gcell == eva ? "" : "  <-- NOT the same cell");
+                    }
+                }
                 break;
             }
             // Blocking connect: one-off and worth waiting out, unlike a read.
@@ -24853,6 +29982,25 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             socklen_t alen = sizeof ss;
             int nfd = ::accept(fd, (struct sockaddr *)&ss, &alen);
             if (nfd < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
+                !guest_nonblock(fd) && can_park_current()) {
+                {
+                    ArmLockGuard wait_table_locked;
+                    GuestFdWait w = make_read_wait(fd);
+                    w.what = svc_no == SVC_NET_ACCEPT4 ? "accept4" : "accept";
+                    w.started_ms = now_ms();
+                    w.last_report_ms = w.started_ms;
+                    char b[32];
+                    snprintf(b, sizeof b, " fd=%d", fd);
+                    w.fds = b;
+                    g_fd_waits[g_current_tid] = std::move(w);
+                    for (auto &t : g_threads)
+                        if (t.id == g_current_tid) { t.waiting_fds = true; break; }
+                    fd_deadline_republish();
+                }
+                g_svc_retry = true;
+                break;
+            }
+            if (nfd < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
                 !guest_nonblock(fd)) {
                 if (wait_ready(fd, POLLIN, block_ms()) > 0)
                     nfd = ::accept(fd, (struct sockaddr *)&ss, &alen);
@@ -24897,14 +30045,39 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 ? ::sendto(fd, ctx.mem.ptr(buf), len, flags,
                            (struct sockaddr *)&ss, alen)
                 : ::send(fd, ctx.mem.ptr(buf), len, flags);
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
-                !guest_nonblock(fd) && wait_ready(fd, POLLOUT, block_ms()) > 0)
+            int send_err = n < 0 ? errno : 0;
+            /* A full send buffer is the same shape as an empty recv one: park
+             * the guest thread that can be parked instead of busy-polling the
+             * descriptor from inside this handler (see SVC_NET_RECV above). */
+            if (n < 0 && (send_err == EAGAIN || send_err == EWOULDBLOCK) &&
+                !guest_nonblock(fd) && can_park_current()) {
+                {
+                    ArmLockGuard wait_table_locked;
+                    GuestFdWait w = make_write_wait(fd);
+                    w.what = "send";
+                    w.started_ms = now_ms();
+                    w.last_report_ms = w.started_ms;
+                    char b[32];
+                    snprintf(b, sizeof b, " fd=%d", fd);
+                    w.fds = b;
+                    g_fd_waits[g_current_tid] = std::move(w);
+                    for (auto &t : g_threads)
+                        if (t.id == g_current_tid) { t.waiting_fds = true; break; }
+                    fd_deadline_republish();
+                }
+                g_svc_retry = true;
+                break;
+            }
+            if (n < 0 && (send_err == EAGAIN || send_err == EWOULDBLOCK) &&
+                !guest_nonblock(fd) && wait_ready(fd, POLLOUT, -1) > 0) {
                 n = alen ? ::sendto(fd, ctx.mem.ptr(buf), len, flags,
                                     (struct sockaddr *)&ss, alen)
                          : ::send(fd, ctx.mem.ptr(buf), len, flags);
+                send_err = n < 0 ? errno : 0;
+            }
             if (n < 0) {
-                fail((errno == EAGAIN || errno == EWOULDBLOCK) ? blocked_errno(fd)
-                                                               : errno);
+                fail((send_err == EAGAIN || send_err == EWOULDBLOCK) ? blocked_errno(fd)
+                                                                     : send_err);
                 break;
             }
             if (n > 0) log_tls_alert("sent", ctx.mem.ptr(buf), (size_t)n);
@@ -24934,6 +30107,27 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             struct sockaddr_storage ss{};
             socklen_t alen = sizeof ss;
             if (!buf || !len) { ok(0); break; }
+            /* A transfer-total gap alone is ambiguous: the peer may have
+             * paused, or the guest may simply not have called recv while it
+             * processed the preceding record.  Report that distinction only
+             * when requested; FIONREAD is observational and does not consume
+             * or otherwise alter the socket. */
+            if (SockState *s = state(fd)) {
+                const int64_t t = now_ms();
+                const int64_t gap = s->last_recv_call_ms
+                    ? t - s->last_recv_call_ms : 0;
+                s->last_recv_call_ms = t;
+                const char *timing = lunaria_env("LUNARIA_NET_TIMING");
+                if (timing && *timing && strcmp(timing, "0") && gap >= 250) {
+                    int queued = -1;
+                    (void)::ioctl(fd, FIONREAD, &queued);
+                    fprintf(stderr,
+                            "[net-timing] fd=%d %s guest recv gap=%lldms "
+                            "kernel-queued=%d requested=%zu tid=%u\n",
+                            fd, s->peer[0] ? s->peer : "?", (long long)gap,
+                            queued, len, g_current_tid);
+                }
+            }
             auto once = [&]() -> ssize_t {
                 return (svc_no == SVC_NET_RECVFROM)
                     ? ::recvfrom(fd, ctx.mem.ptr(buf), len, flags,
@@ -24942,11 +30136,15 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             };
             ssize_t n = once();
             int recv_err = n < 0 ? errno : 0;
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
-                !guest_nonblock(fd) && wait_ready(fd, POLLIN, block_ms()) > 0) {
-                n = once();
-                recv_err = n < 0 ? errno : 0;
-            }
+            /* Park before waiting.  A guest thread with a slot to park in
+             * costs nothing while it waits and can wait exactly as long as a
+             * blocking recv is supposed to; wait_ready(fd, POLLIN, -1) below
+             * never returns 0 (its deadline is unbounded), so trying that
+             * first left this branch dead code and every blocking recv
+             * busy-polled the descriptor from inside this handler at 200 us
+             * granularity for as long as the peer stayed quiet — one host
+             * engine held the whole time, which is exactly the resource a
+             * park is supposed to give back to the scheduler. */
             if (n < 0 && (recv_err == EAGAIN || recv_err == EWOULDBLOCK) &&
                 !guest_nonblock(fd) && can_park_current()) {
                 /* Android blocking recv does not turn into EINTR merely
@@ -24972,6 +30170,17 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 }
                 g_svc_retry = true;
                 break;
+            }
+            /* Cannot park (this is the frame pump's own thread, which has no
+             * slot to be resumed into): the correctness the guest asked for
+             * still stands, so wait the way SVC_NET_ACCEPT/etc. do — a
+             * bounded busy-loop that yields the execution lock every 200 us
+             * (wait_slice(), inside wait_ready) so other guest threads keep
+             * running while this one waits. */
+            if (n < 0 && (recv_err == EAGAIN || recv_err == EWOULDBLOCK) &&
+                !guest_nonblock(fd) && wait_ready(fd, POLLIN, -1) > 0) {
+                n = once();
+                recv_err = n < 0 ? errno : 0;
             }
             if (n < 0) {
                 fail((recv_err == EAGAIN || recv_err == EWOULDBLOCK)
@@ -25042,15 +30251,41 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             }
             ssize_t n = (svc_no == SVC_NET_SENDMSG) ? ::sendmsg(fd, &hm, flags)
                                                     : ::recvmsg(fd, &hm, flags);
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
+            int msg_err = n < 0 ? errno : 0;
+            /* Park before waiting — see SVC_NET_RECV.  The retry re-issues
+             * this same SVC, which re-reads msghdr from guest memory, so
+             * nothing here needs to survive the park. */
+            if (n < 0 && (msg_err == EAGAIN || msg_err == EWOULDBLOCK) &&
+                !guest_nonblock(fd) && can_park_current()) {
+                {
+                    ArmLockGuard wait_table_locked;
+                    GuestFdWait w = svc_no == SVC_NET_SENDMSG
+                        ? make_write_wait(fd) : make_read_wait(fd);
+                    w.what = svc_no == SVC_NET_SENDMSG ? "sendmsg" : "recvmsg";
+                    w.started_ms = now_ms();
+                    w.last_report_ms = w.started_ms;
+                    char b[32];
+                    snprintf(b, sizeof b, " fd=%d", fd);
+                    w.fds = b;
+                    g_fd_waits[g_current_tid] = std::move(w);
+                    for (auto &t : g_threads)
+                        if (t.id == g_current_tid) { t.waiting_fds = true; break; }
+                    fd_deadline_republish();
+                }
+                g_svc_retry = true;
+                break;
+            }
+            if (n < 0 && (msg_err == EAGAIN || msg_err == EWOULDBLOCK) &&
                 !guest_nonblock(fd) &&
                 wait_ready(fd, svc_no == SVC_NET_SENDMSG ? POLLOUT : POLLIN,
-                           block_ms()) > 0)
+                           -1) > 0) {
                 n = (svc_no == SVC_NET_SENDMSG) ? ::sendmsg(fd, &hm, flags)
                                                 : ::recvmsg(fd, &hm, flags);
+                msg_err = n < 0 ? errno : 0;
+            }
             if (n < 0) {
-                fail((errno == EAGAIN || errno == EWOULDBLOCK) ? blocked_errno(fd)
-                                                               : errno);
+                fail((msg_err == EAGAIN || msg_err == EWOULDBLOCK) ? blocked_errno(fd)
+                                                                   : msg_err);
                 break;
             }
             net_count(fd, svc_no == SVC_NET_RECVMSG, n);
@@ -25130,6 +30365,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                                 "SO_ERROR=%d (%s) after %lldms\n", fd, s->peer,
                                 soerr, soerr ? strerror(soerr) : "connected",
                                 (long long)(now_ms() - s->connect_started_ms));
+                    g_connect_pending.fetch_sub(1, std::memory_order_relaxed);
                     s->connecting = false;
                 }
             }
@@ -25230,6 +30466,14 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 if (rc < 0) break;
             }
             if (rc < 0) { fail(errno); break; }
+            /* The emulator's ceiling, not the guest's timeout: say so rather
+             * than reporting an empty fd_set the guest never asked about.
+             * The sets are left as the guest wrote them, which is what a
+             * kernel does when select(2) is interrupted. */
+            if (rc == 0 && wait_deadline_is_ceiling(budget, parkable)) {
+                fail(EINTR);
+                break;
+            }
             if (rc == 0) select_clear();
             ok(rc);
             break;
@@ -25280,6 +30524,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             };
             int rc = poll_once();
             if (rc < 0) { fail(errno); break; }
+            /* Only while a dial-out is pending: see g_connect_pending. */
+            if (g_connect_pending.load(std::memory_order_relaxed))
+                for (uint32_t i = 0; i < n; ++i) {
+                    SockState *ps =
+                        state((int)ctx.mem.read32(fds + (GuestVA)i * 8u));
+                    if (ps && ps->connecting) ++ps->connect_polls;
+                }
             if (trace()) {
                 static int np = 0;
                 if (np++ < 200) {
@@ -25292,8 +30543,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                                  (unsigned)(ctx.mem.read32(fds + (GuestVA)i * 8u + 4u) >> 16));
                         d += b;
                     }
-                    fprintf(stderr, "[net] poll n=%u want=%ld rc=%d tid=%u%s\n",
-                            n, want, rc, g_current_tid, d.c_str());
+                    fprintf(stderr, "[net] poll n=%u want=%ld rc=%d tid=%u "
+                            "lr=0x%08x%s\n",
+                            n, want, rc, g_current_tid, lr, d.c_str());
                 }
             }
             /* Everything above this line is the guest's own pollfd array and
@@ -25363,6 +30615,15 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 if (rc < 0) break;
             }
             if (rc < 0) { fail(errno); break; }
+            /* See wait_deadline_is_ceiling(): the guest asked to wait until
+             * something happened, and nothing did — but this is not the
+             * moment it asked about, so it is not a timeout.  revents is left
+             * as the guest wrote it, which is what a kernel does when poll(2)
+             * is interrupted. */
+            if (rc == 0 && wait_deadline_is_ceiling(want, parkable)) {
+                fail(EINTR);
+                break;
+            }
             if (rc == 0) {
                 std::vector<struct pollfd> hp(n);
                 std::memcpy(hp.data(), ctx.mem.ptr(fds), (size_t)n * 8u);
@@ -25442,6 +30703,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 if (rc < 0) break;
             }
             if (rc < 0) { fail(errno); break; }
+            /* See wait_deadline_is_ceiling(): this is the emulator's ceiling,
+             * not the timeout the guest asked about, so it is not a timeout. */
+            if (rc == 0 && wait_deadline_is_ceiling(want, parkable)) {
+                fail(EINTR);
+                break;
+            }
             ok(rc);
             break;
         }
@@ -25788,6 +31055,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (req == GUEST_FIONBIO || req == (unsigned long)FIONBIO) {
             int on = argp(2) ? (int)ctx.mem.read32(argp(2)) : 0;
             if (guest_net::SockState *s = guest_net::state(fd)) s->nonblock = on != 0;
+            if (guest_net::trace())
+                fprintf(stderr, "[net] ioctl FIONBIO fd=%d on=%d tid=%u "
+                        "lr=0x%08x\n", fd, on != 0, g_current_tid, lr);
             ret32(0);
             break;
         }
@@ -25828,18 +31098,21 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                         fd, len, g_current_tid, lr);
             if (poll0 == 0) {
                 may_block = true;
-                /* On the cooperative engine the thread that will write to this
-                 * descriptor only runs if this one runs it. */
-                if (!g_a64_is_worker && !g_threads.empty())
-                    for (int spin = 0; spin < 20 && poll(&pfd, 1, 0) == 0; ++spin)
-                        schedule_threads(20'000'000ULL);
-                /* Still nothing.  A guest thread that can be descheduled parks
-                 * on the descriptor instead of sleeping inside the engine that
-                 * is running it: an engine asleep in read(2) is one fewer
-                 * engine for every other guest thread, and UE keeps several
-                 * threads blocked on event pipes at once — enough to leave the
-                 * pool with nothing to run at all.  The scheduler re-issues
-                 * this same read when the descriptor is readable. */
+                /* A guest thread that can be descheduled parks on the
+                 * descriptor instead of sleeping inside the engine that is
+                 * running it: an engine asleep in read(2) is one fewer engine
+                 * for every other guest thread, and UE keeps several threads
+                 * blocked on event pipes at once — enough to leave the pool
+                 * with nothing to run at all.  The scheduler re-issues this
+                 * same read when the descriptor is readable.
+                 *
+                 * Parking comes first.  Pumping the scheduler here is what a
+                 * thread does when it *cannot* park, and doing it before the
+                 * park attempt meant every blocking read on a quiet
+                 * descriptor spent up to 400 ms inside the execution lock
+                 * first — with every other guest thread stopped for the
+                 * duration.  A device does not run the writer on the reader's
+                 * core; it deschedules the reader. */
                 /* Only a descriptor the guest asked to block on may park.
                  * Every socket is non-blocking on the host, so O_NONBLOCK
                  * there says nothing; guest_nonblock() is what the guest
@@ -25849,10 +31122,21 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     guest_net::is_guest_socket(fd)
                         ? !guest_net::guest_nonblock(fd)
                         : !(fcntl(fd, F_GETFL) & O_NONBLOCK);
-                if (ctx.is_arm64 && guest_blocking &&
-                    guest_net::fd_park_enabled() &&
-                    guest_net::can_park_current() &&
-                    poll(&pfd, 1, 0) == 0) {
+                const bool can_park = ctx.is_arm64 && guest_blocking &&
+                                      guest_net::fd_park_enabled() &&
+                                      guest_net::can_park_current();
+                /* The frame pump's own thread has no slot to park in, so it
+                 * is the only thread that can run the writer this read is
+                 * waiting for.  It may pump for one frame's worth of time —
+                 * beyond that the display has stopped, and the honest answer
+                 * is to wait on the descriptor with the lock dropped (below)
+                 * like any other blocking read. */
+                if (!can_park && !g_a64_is_worker && !g_threads.empty()) {
+                    const uint64_t until = host_mono_ns() + 16'000'000ULL;
+                    while (poll(&pfd, 1, 0) == 0 && host_mono_ns() < until)
+                        schedule_threads(2'000'000ULL);
+                }
+                if (can_park && poll(&pfd, 1, 0) == 0) {
                     guest_net::GuestFdWait w = guest_net::make_read_wait(fd);
                     w.what = "read";
                     w.started_ms = guest_net::now_ms();
@@ -25893,7 +31177,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
          * report EINTR, the one would-block answer a blocking reader retries. */
         if (nr < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
             guest_net::is_guest_socket(fd) && !guest_net::guest_nonblock(fd)) {
-            if (guest_net::wait_ready(fd, POLLIN, guest_net::block_ms()) > 0) {
+            if (guest_net::wait_ready(fd, POLLIN, -1) > 0) {
                 if (ctx.is_arm64)
                     nr = a64_guest_read(ctx.mem, g_svc_args64[1], len, fd);
                 else
@@ -25937,14 +31221,46 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         const void *buf = ctx.is_arm64 ? (const void *)ctx.mem.ptr(g_svc_args64[1])
                                        : (const void *)ctx.mem.ptr(r1);
         size_t n = ctx.is_arm64 ? a64_buf_len(g_svc_args64[2]) : (size_t)r2;
-        ssize_t nw = buf ? write((int)r0, buf, n) : (ssize_t)-1;
+        /* A forked child writes through its own descriptor table (see
+         * child_fd_set): the number it uses is not this process's. */
+        r0 = (unsigned long)(uint32_t)child_fd_get(g_current_tid, (int)r0);
+        const bool socket_write = guest_net::is_guest_socket((int)r0);
+        /* Host SIGPIPE belongs to Lunaria, not to the emulated process.  A
+         * guest write(2) to a closed socket must return EPIPE so the guest's
+         * own signal disposition can decide what follows; it must never kill
+         * the emulator host process. */
+        ssize_t nw = buf ? (socket_write
+                                ? send((int)r0, buf, n, MSG_NOSIGNAL)
+                                : write((int)r0, buf, n))
+                         : (ssize_t)-1;
         /* Same forced-O_NONBLOCK compensation the read path needs: a socket
-         * the guest believes is blocking must never answer EAGAIN. */
+         * the guest believes is blocking must never answer EAGAIN.  Park
+         * before waiting — see SVC_NET_RECV/SEND — instead of busy-polling
+         * the descriptor from inside this handler for as long as the send
+         * buffer stays full. */
         if (nw < 0 && buf && (errno == EAGAIN || errno == EWOULDBLOCK) &&
             guest_net::is_guest_socket((int)r0) &&
             !guest_net::guest_nonblock((int)r0)) {
-            if (guest_net::wait_ready((int)r0, POLLOUT, guest_net::block_ms()) > 0)
-                nw = write((int)r0, buf, n);
+            if (guest_net::can_park_current()) {
+                {
+                    ArmLockGuard wait_table_locked;
+                    guest_net::GuestFdWait w = guest_net::make_write_wait((int)r0);
+                    w.what = "write";
+                    w.started_ms = guest_net::now_ms();
+                    w.last_report_ms = w.started_ms;
+                    char b[32];
+                    snprintf(b, sizeof b, " fd=%d", (int)r0);
+                    w.fds = b;
+                    guest_net::g_fd_waits[g_current_tid] = std::move(w);
+                    for (auto &t : g_threads)
+                        if (t.id == g_current_tid) { t.waiting_fds = true; break; }
+                    fd_deadline_republish();
+                }
+                g_svc_retry = true;
+                break;
+            }
+            if (guest_net::wait_ready((int)r0, POLLOUT, -1) > 0)
+                nw = send((int)r0, buf, n, MSG_NOSIGNAL);
             if (nw < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
                 errno = EINTR;
         }
@@ -26022,54 +31338,145 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         if (lunaria_env("LUNARIA_TRACE_OPEN"))
             fprintf(stderr, "[fopen] %s mode=%s\n", path ? path : "(null)", mode ? mode : "(null)");
+        /* A thread's own /proc files come straight out of memory: procfs is
+         * generated at open time and never written anywhere, and going
+         * through the synthetic task directory instead made this the hottest
+         * filesystem path in the emulator.  See synth_guest_task_bytes(). */
+        if (mode && mode[0] == 'r') {
+            if (ctx.is_arm64) {
+                char *bytes = nullptr;
+                size_t blen = 0;
+                if (synth_guest_task_bytes(path, &bytes, &blen) && bytes) {
+                    const uint32_t shim =
+                        register_synth_gfile(ctx, bytes, (uint32_t)blen);
+                    free(bytes);
+                    retptr(guest_file_va(ctx, shim));
+                    break;
+                }
+            } else if (FILE *mem = synth_guest_task_stream(path)) {
+                retptr(guest_file_va(ctx, register_file(ctx, mem, true)));
+                break;
+            }
+        }
         if (const char *subst = synthetic_proc_path(path)) path = subst;
         if (path && (!strncmp(path, "/proc/", 6) || !strcmp(path, "/proc"))) {
             static int blocked = 0;
             if (blocked++ < 16)
                 fprintf(stderr, "[fopen] blocked host /proc: %s\n", path);
+            /* Linux returns ENOENT for a thread that has exited between
+             * readdir and open — never a NULL stream with errno left stale. */
+            arm_set_errno(ctx, ENOENT);
             ret32(0);
             break;
         }
+        /* A C stream is byte-oriented; a directory is consumed through
+         * opendir/readdir.  Darwin permits fopen(3) on a directory but its
+         * first fgets(3) fails with EISDIR without setting EOF.  Android's
+         * callers commonly use `while (!feof()) fgets(...)`; exposing that
+         * Darwin-only half-open stream therefore spins forever.  Reject the
+         * stream at fopen, as bionic does for a non-readable proc node, while
+         * leaving open/opendir directory semantics untouched. */
+        if (path && mode && mode[0] == 'r') {
+            struct stat st;
+            if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                arm_set_errno(ctx, EISDIR);
+                ret32(0);
+                break;
+            }
+        }
+        /* Path translation and the synthetic /proc formatter above are the
+         * real cost; the host open(2) is not.  fopen/fclose run without the
+         * ARM execution lock (svc_lockfree) so NMSS's status poll does not
+         * park RenderThread behind every open. */
         FILE *f = (path && mode) ? fopen(path, mode) : nullptr;
         if (!f && path && mode) {
             char cache[PATH_MAX];
             if (apk_extract_to_cache(path, cache, sizeof cache))
                 f = fopen(cache, mode);
         }
-        ret32(register_file(ctx, f)); break;
+        if (!f) {
+            if (path && mode) arm_set_errno(ctx, errno ? errno : ENOENT);
+            ret32(0);
+            break;
+        }
+        const bool reader = mode && mode[0] == 'r';
+        retptr(guest_file_va(ctx, register_file(ctx, f, reader))); break;
     }
     case SVC_LIBC_FFLUSH: {
         /* fflush(NULL) flushes every output stream. */
         if (!r0) {
+            std::lock_guard<std::mutex> guard(g_file_lock);
             for (size_t i = 1; i < sizeof g_file_tab / sizeof *g_file_tab; ++i)
                 if (g_file_tab[i]) fflush(g_file_tab[i]);
             ret32(0); break;
         }
-        uint32_t idx = (r0 < 256u) ? (uint32_t)r0 : ctx.mem.read32(r0);
-        FILE *f = (idx > 0 && idx < 256u) ? g_file_tab[idx] : nullptr;
+        FILE *f = resolve_file(ctx, (uint32_t)r0);
         ret32(f ? (uint32_t)fflush(f) : 0u);
         break;
     }
     case SVC_LIBC_FCLOSE: {
-        uint32_t idx = (r0 && r0 < 256u) ? r0 : (r0 ? ctx.mem.read32(r0) : 0u);
-        if (lunaria_env("LUNARIA_TRACE_OPEN") && r0)
-            fprintf(stderr, "[fclose] r0=%#lx idx=%u tab=%p lr=%#x\n",
-                    r0, idx, (idx > 0 && idx < 256u) ? (void*)g_file_tab[idx] : nullptr, lr);
-        if (idx > 0 && idx < 256u && g_file_tab[idx]) {
-            fclose(g_file_tab[idx]); g_file_tab[idx] = nullptr;
+        const GuestVA fh = ctx.is_arm64 ? g_svc_args64[0] : (GuestVA)r0;
+        uint32_t idx = 0, gen = 0;
+        bool stamped = false;
+        if (fh) file_handle_parts(ctx, fh, &idx, &gen, &stamped);
+        const bool pooled = fh && ctx.is_arm64 && fh >= 256u &&
+            (ctx.mem.read32(gfile_shim_va(ctx, fh) + GFILE_FLAGS) &
+             (uint32_t)GFILE_POOLED);
+        /* Free the guest read buffer before detaching the host stream.
+         * Pooled synth /proc streams recycle the shim+buffer instead. */
+        if (pooled) {
+            synth_gfile_recycle(ctx, fh);
+        } else if (fh && ctx.is_arm64 && gfile_buffered(ctx, fh)) {
+            const GuestVA base = ctx.mem.read64(fh + GFILE_BASE);
+            const uint32_t back = file_shim_backing(ctx, base);
+            if (back) arm_free(ctx, back);
+            ctx.mem.write64(fh + GFILE_BASE, 0);
+            ctx.mem.write64(fh + GFILE_P, 0);
+            ctx.mem.write32(fh + GFILE_R, 0);
         }
-        if (r0 >= 256u) arm_free(ctx, r0); /* free the shim */
+        FILE *f = fh ? file_table_detach(idx, gen, stamped) : nullptr;
+        if (lunaria_env("LUNARIA_TRACE_OPEN") && fh)
+            fprintf(stderr, "[fclose] r0=%#llx idx=%u tab=%p lr=%#x\n",
+                    (unsigned long long)fh, idx, (void*)f, lr);
+        if (f && !is_synth_placeholder(f)) guest_stream_close(f);
+        if (fh >= 256u && !pooled) arm_free(ctx, file_shim_backing(ctx, fh));
         ret32(0); break;
     }
     case SVC_FDOPEN: {
         int fd = (int)(int32_t)r0;
         const char *mode = ctx.mem.cstr(r1);
         FILE *f = (fd >= 0 && mode) ? fdopen(dup(fd), mode) : nullptr;
-        ret32(register_file(ctx, f)); break;
+        const bool reader = mode && mode[0] == 'r';
+        retptr(guest_file_va(ctx, register_file(ctx, f, reader))); break;
     }
     case SVC_STRERROR_R: {
-        
         int errnum = (int)(int32_t)r0;
+        /* What the caller believes errno is, against what this thread's errno
+         * slot actually holds.  A guest that formats "Success" straight after
+         * a call this emulator failed is not reading the errno it was given,
+         * and that is invisible everywhere else. */
+        {
+            static int sn = 0;
+            if (sn++ < 24) {
+                const uint32_t eva = errno_va(ctx, g_current_tid);
+                const uint32_t held = eva ? ctx.mem.read32(eva) : 0u;
+                if ((uint32_t)errnum != held) {
+                    uint32_t cached = 0;
+                    if (ctx.is_arm64) {
+                        const uint64_t tls =
+                            arm64_tls_for_tid(ctx, g_current_tid);
+                        if (tls)
+                            cached = ctx.mem.read32(
+                                (GuestVA)(tls + TLS64_ERRNO_OFF));
+                    }
+                    fprintf(stderr, "[errno] strerror_r(%d) but tid=%u slot "
+                            "0x%08x holds %u (tls cache 0x%08x -> %u) "
+                            "lr=0x%08x\n",
+                            errnum, g_current_tid, eva, held, cached,
+                            cached ? ctx.mem.read32((GuestVA)cached) : 0u, lr);
+                }
+            }
+        }
         uint8_t *buf = ctx.mem.ptr(r1);
         size_t buflen = (size_t)r2;
         if (buf && buflen) {
@@ -26088,13 +31495,33 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_LIBC_FREAD: {
+        GuestVA fh = ctx.is_arm64 ? g_svc_args64[3] : (GuestVA)r3;
+        if (ctx.is_arm64) fh = gfile_shim_va(ctx, fh);
         void *buf = ctx.is_arm64 ? (void *)ctx.mem.ptr(g_svc_args64[0])
                                  : (void *)ctx.mem.ptr(r0);
-        FILE *f = resolve_file(ctx, r3);
         size_t sz = ctx.is_arm64 ? a64_buf_len(g_svc_args64[1]) : (size_t)r1;
         size_t nm = ctx.is_arm64 ? a64_buf_len(g_svc_args64[2]) : (size_t)r2;
-        long pos = (f && lunaria_env("LUNARIA_TRACE_READ")) ? ftell(f) : -1;
         uint32_t n = 0u;
+        if (buf && sz && nm && gfile_buffered(ctx, fh)) {
+            size_t want = sz * nm;
+            int32_t left = (int32_t)ctx.mem.read32(fh + GFILE_R);
+            GuestVA cur = ctx.mem.read64(fh + GFILE_P);
+            size_t take = want;
+            if (left <= 0 || !cur) take = 0;
+            else if ((size_t)left < take) take = (size_t)left;
+            if (take) {
+                memcpy(buf, ctx.mem.ptr(cur), take);
+                ctx.mem.write64(fh + GFILE_P, cur + take);
+                ctx.mem.write32(fh + GFILE_R, (uint32_t)(left - (int32_t)take));
+            }
+            if (take < want)
+                ctx.mem.write32(fh + GFILE_FLAGS,
+                    ctx.mem.read32(fh + GFILE_FLAGS) | (uint32_t)GFILE_SEOF);
+            n = sz ? (uint32_t)(take / sz) : 0u;
+            ret32(n); break;
+        }
+        FILE *f = resolve_file(ctx, fh);
+        long pos = (f && lunaria_env("LUNARIA_TRACE_READ")) ? ftell(f) : -1;
         if (buf && f) {
             size_t total = sz * nm;
             if (ctx.is_arm64 && total && sz == 1) {
@@ -26110,36 +31537,73 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (lunaria_env("LUNARIA_TRACE_READ")) {
             static uint64_t frc = 0;
             if (frc++ < 4000)
-                fprintf(stderr, "[fread] file=%#lx pos=%ld sz=%zu n=%zu -> %u fd=%d lr=0x%08x\n",
-                        r3, pos, sz, nm, n, f ? fileno(f) : -1, lr);
+                fprintf(stderr, "[fread] file=%#llx pos=%ld sz=%zu n=%zu -> %u fd=%d lr=0x%08x\n",
+                        (unsigned long long)fh, pos, sz, nm, n, f ? fileno(f) : -1, lr);
         }
         ret32(n); break;
     }
     case SVC_LIBC_FWRITE: {
         const void *buf = ctx.is_arm64 ? (const void *)ctx.mem.ptr(g_svc_args64[0])
                                        : (const void *)ctx.mem.ptr(r0);
-        FILE *f = resolve_file(ctx, r3);
+        const GuestVA fh = ctx.is_arm64 ? g_svc_args64[3] : (GuestVA)r3;
+        FILE *f = resolve_file(ctx, fh);
         size_t sz = ctx.is_arm64 ? a64_buf_len(g_svc_args64[1]) : (size_t)r1;
         size_t nm = ctx.is_arm64 ? a64_buf_len(g_svc_args64[2]) : (size_t)r2;
         ret32((buf && f) ? (uint32_t)fwrite(buf, sz, nm, f) : 0u); break;
     }
     case SVC_LIBC_FSEEK: {
-        FILE *f = resolve_file(ctx, r0);
-        int rc = f ? fseek(f, (long)(int32_t)r1, (int)r2) : -1;
+        const GuestVA fh = ctx.is_arm64 ? g_svc_args64[0] : (GuestVA)r0;
+        const long off = ctx.is_arm64 ? (long)(int64_t)g_svc_args64[1]
+                                      : (long)(int32_t)r1;
+        const int whence = ctx.is_arm64 ? (int)g_svc_args64[2] : (int)r2;
+        if (gfile_buffered(ctx, fh)) {
+            const int32_t size = (int32_t)ctx.mem.read32(fh + GFILE_SIZE);
+            const GuestVA base = ctx.mem.read64(fh + GFILE_BASE);
+            int32_t cur_off = size - (int32_t)ctx.mem.read32(fh + GFILE_R);
+            int32_t neu = cur_off;
+            if (whence == SEEK_SET) neu = (int32_t)off;
+            else if (whence == SEEK_CUR) neu = cur_off + (int32_t)off;
+            else if (whence == SEEK_END) neu = size + (int32_t)off;
+            else { ret32(~0u); break; }
+            if (neu < 0 || neu > size) { ret32(~0u); break; }
+            ctx.mem.write64(fh + GFILE_P, base + (GuestVA)(uint32_t)neu);
+            ctx.mem.write32(fh + GFILE_R, (uint32_t)(size - neu));
+            ctx.mem.write32(fh + GFILE_FLAGS,
+                ctx.mem.read32(fh + GFILE_FLAGS) & ~(uint32_t)GFILE_SEOF);
+            ret32(0); break;
+        }
+        FILE *f = resolve_file(ctx, fh);
+        int rc = f ? fseek(f, off, whence) : -1;
         if (lunaria_env("LUNARIA_TRACE_READ")) {
             static uint64_t fsc = 0;
             if (fsc++ < 4000)
-                fprintf(stderr, "[fseek] file=%#lx off=%ld whence=%lu -> %d fd=%d lr=0x%08x\n",
-                        r0, (long)(int32_t)r1, r2, rc, f ? fileno(f) : -1, lr);
+                fprintf(stderr, "[fseek] file=%#llx off=%ld whence=%d -> %d fd=%d lr=0x%08x\n",
+                        (unsigned long long)fh, off, whence, rc, f ? fileno(f) : -1, lr);
         }
         ret32(f ? (uint32_t)rc : ~0u); break;
     }
     case SVC_LIBC_FTELL: {
-        FILE *f = resolve_file(ctx, r0);
+        const GuestVA fh = ctx.is_arm64 ? g_svc_args64[0] : (GuestVA)r0;
+        if (gfile_buffered(ctx, fh)) {
+            const int32_t size = (int32_t)ctx.mem.read32(fh + GFILE_SIZE);
+            const int32_t left = (int32_t)ctx.mem.read32(fh + GFILE_R);
+            ret32((uint32_t)(size - left)); break;
+        }
+        FILE *f = resolve_file(ctx, fh);
         ret32(f ? (uint32_t)ftell(f) : ~0u); break;
     }
     case SVC_LIBC_REWIND: {
-        FILE *f = resolve_file(ctx, r0);
+        const GuestVA fh = ctx.is_arm64 ? g_svc_args64[0] : (GuestVA)r0;
+        if (gfile_buffered(ctx, fh)) {
+            const GuestVA base = ctx.mem.read64(fh + GFILE_BASE);
+            const int32_t size = (int32_t)ctx.mem.read32(fh + GFILE_SIZE);
+            ctx.mem.write64(fh + GFILE_P, base);
+            ctx.mem.write32(fh + GFILE_R, (uint32_t)size);
+            ctx.mem.write32(fh + GFILE_FLAGS,
+                ctx.mem.read32(fh + GFILE_FLAGS) & ~(uint32_t)GFILE_SEOF);
+            break;
+        }
+        FILE *f = resolve_file(ctx, fh);
         if (f) rewind(f);
         break; /* void */
     }
@@ -26166,13 +31630,18 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         if (!f) { ret32(0); break; }
         // freopen() reuses the caller's FILE*, so the guest handle stays valid; only a fresh stream needs a new shim.
-        if (old && f == old) { ret32(r2); break; }
-        ret32(register_file(ctx, f));
+        if (old && f == old) {
+            if (ctx.is_arm64) retptr(r2);
+            else ret32(r2);
+            break;
+        }
+        const bool reader = mode[0] == 'r';
+        retptr(guest_file_va(ctx, register_file(ctx, f, reader)));
         break;
     }
     case SVC_LIBC_TMPFILE: {
         FILE *f = tmpfile();
-        ret32(register_file(ctx, f));
+        retptr(guest_file_va(ctx, register_file(ctx, f, true)));
         break;
     }
     case SVC_LIBC_TMPNAM: {
@@ -26812,7 +32281,19 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_GETENV: {
         const char *name = ctx.mem.cstr(r0);
-        const char *val = name ? getenv(name) : nullptr;
+        /* getenv observes the guest process, never Lunaria's host launch
+         * environment.  Leaking DYLD_LIBRARY_PATH, TMPDIR and LUNARIA_* here
+         * contradicts the `environ` data symbol and describes a macOS process
+         * that cannot exist on Android. */
+        const char *val = nullptr;
+        if (name) {
+            if (!strcmp(name, "PATH"))
+                val = "/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin";
+            else if (!strcmp(name, "ANDROID_ROOT")) val = "/system";
+            else if (!strcmp(name, "ANDROID_DATA")) val = "/data";
+            else if (!strcmp(name, "ANDROID_PACKAGE_NAME"))
+                val = lunaria_env("ANDROID_PACKAGE_NAME");
+        }
         if (lunaria_env("LUNARIA_TRACE_GETENV"))
             fprintf(stderr, "[getenv] %s -> %s\n", name ? name : "(null)", val ? val : "(null)");
         if (val) {
@@ -26826,14 +32307,21 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     /* An app's pid, and the same number the main thread's gettid() answers.
      * This used to be 1 — init — while gettid() answered from a different
      * number space entirely; see guest_pid(). */
-    case SVC_GETPID: ret32(guest_pid()); break;
+    /* Both answer from the same two numbers Java reports, so native and
+     * bytecode cannot disagree about what this app targets. */
+    case SVC_ANDROID_TARGET_SDK:
+        ret32((uint32_t)lunaria_app_target_sdk()); break;
+    case SVC_ANDROID_DEVICE_API_LEVEL:
+        ret32((uint32_t)lunaria_sdk_int()); break;
+    case SVC_GETPID:  ret32(guest_pid()); break;
+    case SVC_GETPPID: ret32(current_guest_ppid()); break;
     case SVC_GETTID: ret32(guest_tid_of(g_current_tid)); break;
     /* An Android app process is never uid 0.  The host often is, and handing
      * that through made getuid() look like root — which then skipped every
      * "are we a normal app" check.  FIRST_APPLICATION_UID is 10000. */
     case SVC_GETUID:
     case SVC_GETEUID:
-        ret32(10000u);
+        ret32((uint32_t)arm_exec_guest_uid());
         break;
     /* struct passwd *getpwuid(uid_t uid)
      *
@@ -26959,12 +32447,17 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_PRCTL: {
-        /* PR_SET_NAME / PR_GET_NAME are the only options Unity/IL2CPP uses
-         * here (the log showed option 15).  Applied to the host thread that
-         * is running this guest tid, which is what `ps -T` then shows. */
+        /* PR_SET_NAME / PR_GET_NAME: applied to the host thread that is
+         * running this guest tid, so `ps -T` shows the guest's own name.
+         * PR_GET_SECCOMP / PR_GET_NO_NEW_PRIVS: must match /proc/self/status.
+         * Android's zygote-installed seccomp filter is inherited independently
+         * of the process's one-way no_new_privs state. */
         long op = (long)(int32_t)arg32(0);
-        constexpr long kPrSetName = 15;
-        constexpr long kPrGetName = 16;
+        constexpr long kPrSetName      = 15;
+        constexpr long kPrGetName      = 16;
+        constexpr long kPrGetSeccomp   = 21;
+        constexpr long kPrSetNoNewPrivs = 38;
+        constexpr long kPrGetNoNewPrivs = 39;
         if (op == kPrSetName) {
             const char *nm = ctx.mem.cstr(argp(1));
             if (nm && *nm) luna_os_thread_name(nm);
@@ -26979,6 +32472,17 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 memcpy(ctx.mem.ptr(dst), nm, n < 16 ? n + 1 : 16);
             }
             ret32(0);
+        } else if (op == kPrGetSeccomp) {
+            ret32(2); /* SECCOMP_MODE_FILTER — consistent with /proc/self/status */
+        } else if (op == kPrSetNoNewPrivs) {
+            if (arg32(1) != 1u || arg32(2) || arg32(3) || arg32(4))
+                ret32((uint32_t)-(int32_t)EINVAL);
+            else {
+                g_guest_no_new_privs = true;
+                ret32(0);
+            }
+        } else if (op == kPrGetNoNewPrivs) {
+            ret32(g_guest_no_new_privs ? 1u : 0u);
         } else {
             ret32(0);
         }
@@ -27090,6 +32594,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             next &= ~(1ull << (9 - 1));
             next &= ~(1ull << (19 - 1));
         }
+        if (lunaria_env("LUNARIA_TRACE_PROC")) {
+            fprintf(stderr,
+                    "[sigmask] pthread tid=%u how=%d set=0x%llx old=%016llx new=%016llx\n",
+                    g_current_tid, how, (unsigned long long)set,
+                    (unsigned long long)old, (unsigned long long)next);
+        }
         if (oset) {
             if (uint8_t *p = ctx.mem.try_ptr(oset, 8)) memcpy(p, &old, 8);
             else { ret32(22u); goto sigmask_done; }
@@ -27106,6 +32616,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         memset(ctx.mem.ptr(info), 0, n);
         int hit = 0;
         for (const auto &m : g_module_phdrs) {
+            if (m.process_pid != guest_pid()) continue;
             if (m.is_64 != ctx.is_arm64) continue;
             GuestVA lo = m.load_bias, hi = m.load_bias;
             const uint8_t *ph = ctx.mem.ptr(m.phdr_va);
@@ -27201,7 +32712,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         case 40: /* _SC_PAGE_SIZE (distinct enum value in current bionic) */
             ret32(4096u); break;
         case 96: case 97: /* _SC_NPROCESSORS_CONF / ONLN */
-            ret32((uint32_t)GUEST_NCPU); break;
+            ret32(guest_ncpu()); break;
         case 6:  /* _SC_CLK_TCK */
             ret32(100u); break;
         case 0x62: /* _SC_PHYS_PAGES — was falling through to 1 (4 KiB "RAM") */
@@ -27249,8 +32760,18 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_DL_ITERATE_PHDR: {
         GuestVA cb = ctx.is_arm64 ? g_svc_args64[0] : (GuestVA)r0;
         GuestVA data = ctx.is_arm64 ? g_svc_args64[1] : (GuestVA)r1;
+        const bool trace_unwind = lunaria_env("LUNARIA_TRACE_UNWIND") != nullptr;
         int32_t callback_rc = 0;
         if (!cb) { ret32(0); break; }
+        if (trace_unwind)
+            fprintf(stderr, "[unwind-trace] dl_iterate_phdr tid=%u lr=0x%llx "
+                            "cb=0x%llx data=0x%llx search_pc=0x%llx "
+                            "data1=0x%llx modules=%zu\n",
+                    g_current_tid, (unsigned long long)lr,
+                    (unsigned long long)cb, (unsigned long long)data,
+                    (unsigned long long)(data ? ctx.mem.read64(data) : 0),
+                    (unsigned long long)(data ? ctx.mem.read64(data + 8u) : 0),
+                    g_module_phdrs.size());
         /* The whole of bionic's `struct dl_phdr_info`, and its real size.
          *
          * It used to hand out 32 bytes (16 on ARM32) and say so in the `size`
@@ -27265,7 +32786,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
          * compares `size` against sizeof(struct dl_phdr_info) saw a struct
          * from a system that is not Android. */
         const uint32_t info_size = ctx.is_arm64 ? 64u : 40u;
-        const uint64_t adds = (uint64_t)g_module_phdrs.size();
+        uint64_t adds = 0;
+        for (const auto &m : g_module_phdrs)
+            if (m.process_pid == guest_pid() && m.is_64 == ctx.is_arm64)
+                ++adds;
         /* dl_iterate_phdr is how a C++ unwinder finds .eh_frame_hdr: it adds
          * dlpi_addr to the PT_GNU_EH_FRAME segment's p_vaddr and expects the
          * table's version byte (1) there.  If the loader placed the segment
@@ -27278,6 +32802,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             if (!checked) {
                 checked = true;
                 for (const auto &m : g_module_phdrs) {
+                    if (m.process_pid != guest_pid()) continue;
                     if (m.is_64 != ctx.is_arm64) continue;
                     const uint32_t phent = ctx.is_arm64 ? 56u : 32u;
                     for (uint16_t i = 0; i < m.phnum; ++i) {
@@ -27301,6 +32826,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             }
         }
         for (const auto &m : g_module_phdrs) {
+            if (m.process_pid != guest_pid()) continue;
             if (m.is_64 != ctx.is_arm64) continue;
             uint32_t info_backing = arm_malloc(ctx, info_size);
             if (!info_backing) { callback_rc = -1; break; }
@@ -27330,6 +32856,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 callback_rc = call_guest_cb(ctx, (uint32_t)cb, (uint32_t)info,
                                             info_size, (uint32_t)data, 0);
             }
+            if (trace_unwind)
+                fprintf(stderr, "[unwind-trace]   module=%s bias=0x%llx "
+                                "phdr=0x%llx phnum=%u rc=%d\n",
+                        ctx.mem.cstr(m.name_va) ?: "?",
+                        (unsigned long long)m.load_bias,
+                        (unsigned long long)m.phdr_va, m.phnum, callback_rc);
             arm_free(ctx, info_backing);
             if (callback_rc != 0) break; /* POSIX/bionic early-stop contract */
         }
@@ -28208,7 +33740,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
          * set — a guest that pins a worker and then verifies the pin has to
          * see its own write, not the default. */
         uint32_t bytes = r1 < 4u ? 0u : (r1 > 128u ? 128u : r1);
-        uint32_t mask = (1u << GUEST_NCPU) - 1u;
+        uint32_t mask = (1u << guest_ncpu()) - 1u;
         if (auto it = g_sched_affinity.find(g_current_tid); it != g_sched_affinity.end())
             mask = it->second;
         if (r2 && bytes >= 4u) {
@@ -29825,6 +35357,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             old &= ~(1ull << (19 - 1));
             signal_mask_store(g_current_tid, old);
         }
+        if (lunaria_env("LUNARIA_TRACE_PROC")) {
+            fprintf(stderr,
+                    "[sigmask] libc tid=%u how=%d set=0x%llx new=%016llx\n",
+                    g_current_tid, how, (unsigned long long)set_va,
+                    (unsigned long long)signal_mask_load(g_current_tid));
+        }
         ret32(0);
         break;
     }
@@ -29836,15 +35374,26 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         GuestVA old_act_va = ctx.is_arm64 ? g_svc_args64[2] : (GuestVA)r2;
         // Fill `oldact` *before* installing the new one.
         if (old_act_va) {
-            GuestVA prev = 0;
-            if (auto it = g_sighandlers.find(signum); it != g_sighandlers.end())
-                prev = it->second;
+            GuestVA prev = signal_handler_load(guest_pid(), signum);
             if (ctx.is_arm64) {
-                // bionic aarch64 libc-facing layout: flags then handler.
-                ctx.mem.write64(old_act_va, 0);
-                ctx.mem.write64(old_act_va + 8, prev);
-                ctx.mem.write64(old_act_va + 16, 0);
-                ctx.mem.write64(old_act_va + 24, 0);
+                /* This is the libc entry point, so the caller passes bionic's
+                 * public `struct sigaction`.  On LP64 that struct puts the
+                 * flags first -- it is not the glibc layout and not
+                 * kernel_sigaction either:
+                 *   +0 sa_flags (int, padded), +8 handler/sigaction,
+                 *   +16 sa_mask, +24 sa_restorer.
+                 * Reading the handler from +0 read sa_flags instead, so a
+                 * handler installed through libc was never registered: nmss
+                 * installs one for signal 28 and then pings a worker thread
+                 * with pthread_kill(t, 28); with no handler the ping was
+                 * delivered nowhere, the worker never answered, and the
+                 * module reported "Security Alert (code 2)" and aborted.
+                 * The raw rt_sigaction syscall keeps the kernel layout (see
+                 * case 134). */
+                ctx.mem.write32(old_act_va + 0u, 0);  /* sa_flags */
+                ctx.mem.write64(old_act_va + 8u, prev);
+                ctx.mem.write64(old_act_va + 16u, 0); /* sa_mask */
+                ctx.mem.write64(old_act_va + 24u, 0); /* sa_restorer */
             } else {
                 uint32_t o = (uint32_t)old_act_va;
                 ctx.mem.write32(o, (uint32_t)prev);
@@ -29862,22 +35411,26 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 static int sa_raw = 0;
                 if (sa_raw++ < 24)
                     fprintf(stderr, "[sigaction] sig=%d act=0x%llx raw_handler=0x%llx "
-                            "canon=%08x\n",
+                            "canon=%08x words=[%llx %llx %llx %llx]\n",
                             signum, (unsigned long long)new_act_va,
                             (unsigned long long)sa_handler,
-                            a64_canon_va(sa_handler));
+                            a64_canon_va(sa_handler),
+                            (unsigned long long)ctx.mem.read64(new_act_va + 0u),
+                            (unsigned long long)ctx.mem.read64(new_act_va + 8u),
+                            (unsigned long long)ctx.mem.read64(new_act_va + 16u),
+                            (unsigned long long)ctx.mem.read64(new_act_va + 24u));
             } else {
                 sa_handler = ctx.mem.read32((uint32_t)new_act_va);
             }
             if (sa_handler > 1u /* not SIG_DFL(0) or SIG_IGN(1) */) {
-                g_sighandlers[signum] = sa_handler;
+                signal_handler_store(guest_pid(), signum, sa_handler);
                 static int sa_log = 0;
                 if (sa_log++ < 20)
                     fprintf(stderr, "[sigaction] sig=%d handler=0x%llx\n",
                             signum, (unsigned long long)sa_handler);
             } else {
                 // SIG_DFL / SIG_IGN: drop the handler.  Probes such as.
-                if (g_sighandlers.erase(signum)) {
+                if (signal_handler_erase(guest_pid(), signum)) {
                     static int sa_rst = 0;
                     if (sa_rst++ < 20)
                         fprintf(stderr, "[sigaction] sig=%d reset to %s\n", signum,
@@ -29893,10 +35446,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         int signum = (int)r0;
         GuestVA handler_va = ctx.is_arm64 ? g_svc_args64[1] : (GuestVA)r1;
         GuestVA old_handler = 0;
-        auto it = g_sighandlers.find(signum);
-        if (it != g_sighandlers.end()) old_handler = it->second;
+        old_handler = signal_handler_load(guest_pid(), signum);
         if (handler_va > 1u /* not SIG_DFL/SIG_IGN */) {
-            g_sighandlers[signum] = handler_va;
+            signal_handler_store(guest_pid(), signum, handler_va);
             static int bsd_log = 0;
             if (bsd_log++ < 20)
                 fprintf(stderr, "[bsd_signal] sig=%d handler=0x%llx\n",
@@ -29916,6 +35468,28 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         guest_raise_signal(ctx, tid, sig);
         ret32(0);
+        break;
+    }
+
+    case SVC_PTRACE: {
+        /* Linux/Android ptrace(request, pid, addr, data).  PTRACE_TRACEME is
+         * commonly used to make a process non-debuggable and is required to
+         * succeed when no tracer is attached.  The old shared RETM1 template
+         * made every ordinary process look as if another debugger owned it. */
+        const long request = (long)(int64_t)argp(0);
+        static uint32_t ptrace_log = 0;
+        if (ptrace_log++ < 32)
+            fprintf(stderr, "[ptrace] request=%ld pid=%lld addr=0x%llx data=0x%llx tid=%u\n",
+                    request, (long long)(int64_t)argp(1),
+                    (unsigned long long)argp(2), (unsigned long long)argp(3),
+                    g_current_tid);
+        if (request == 0 /* PTRACE_TRACEME */ &&
+            guest_ptrace_traceme_start(guest_pid())) {
+            ret32(0);
+        } else {
+            arm_set_errno(ctx, EPERM);
+            ret32((uint32_t)-1);
+        }
         break;
     }
 
@@ -29977,10 +35551,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             fprintf(stderr, "[pthread_kill] target=0x%08x sig=%d lr=0x%08x\n",
                     target_tid, sig, lr);
 
-        GuestVA handler_va = 0;
-        auto it = g_sighandlers.find(sig);
-        if (it != g_sighandlers.end() && it->second > 1u)
-            handler_va = it->second;
+        GuestVA handler_va = signal_handler_load(guest_pid(), sig);
 
         /* A pthread-directed signal belongs to the target's architectural
          * context.  Calling its handler here, on the sender's SVC stack, is a
@@ -30107,7 +35678,20 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 ret32(~0u);
                 break;
             }
-            if (cmd != 0u && cmd != 9u) { /* FUTEX_WAKE / FUTEX_REQUEUE etc. */
+            if (cmd == 3u || cmd == 4u) { /* FUTEX_REQUEUE / CMP_REQUEUE */
+                if (cmd == 4u && ctx.mem.read32(fu_uaddr) != (uint32_t)argp(6)) {
+                    ret32((uint32_t)-(int32_t)EAGAIN);
+                    break;
+                }
+                const uint32_t nwake = (uint32_t)std::min<GuestVA>(r3, 256u);
+                const uint32_t woke = futex_publish_wake(fu_uaddr, nwake);
+                const uint32_t nmove = (uint32_t)std::min<GuestVA>(argp(4), 65536u);
+                const uint32_t moved = futex_requeue_parked(
+                    fu_uaddr, argp(5), nmove);
+                ret32(woke + moved);
+                break;
+            }
+            if (cmd != 0u && cmd != 9u) { /* FUTEX_WAKE and wake-like ops. */
                 uint32_t nwake = (uint32_t)std::min<GuestVA>(r3, 256u);
                 const uint32_t woke = futex_publish_wake(fu_uaddr, nwake);
                 const uint32_t tokens = futex_token_count(fu_uaddr);
@@ -30128,13 +35712,29 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 ret32(woke);
                 break;
             }
-            if (ctx.mem.read32(fu_uaddr) != r3) { ret32(0); break; } /* word already changed */
+            if (ctx.mem.read32(fu_uaddr) != r3) {
+                if (uint32_t eva = errno_va(ctx, g_current_tid))
+                    ctx.mem.write32(eva, EAGAIN);
+                ret32(~0u);
+                break;
+            }
+            const GuestVA timeout_va = argp(4);
+            uint64_t futex_deadline = 0;
+            if (timeout_va) {
+                uint64_t rel = guest_timespec_ns(ctx, timeout_va);
+                if (cmd == 9u) {
+                    const int clock_id = (r2 & 0x100u)
+                        ? CLOCK_REALTIME : CLOCK_MONOTONIC;
+                    rel = guest_abstime_to_rel_ns(clock_id, rel);
+                }
+                const uint64_t now = host_mono_ns();
+                futex_deadline = rel > UINT64_MAX - now ? UINT64_MAX : now + rel;
+            }
             bool changed = false;
             if (g_current_tid == 0 && !g_scheduling && !g_threads.empty()) {
                 ++g_futex_wait_addrs[fu_uaddr];
-                // Give worker threads up to LUNARIA_FUTEX_SPINS×20M ticks to change the futex word.
-                int spin_limit = (int)env_ticks("LUNARIA_FUTEX_SPINS", 500);
-                for (int spin = 0; spin < spin_limit && !changed; ++spin) {
+                while (!changed &&
+                       (!futex_deadline || host_mono_ns() < futex_deadline)) {
                     schedule_threads(20'000'000ULL);
                     drive_aaudio_callbacks(ctx);
                     drive_opensles_callbacks(ctx);
@@ -30157,6 +35757,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 if (ArmThread *t = arm_thread_by_tid(g_current_tid)) {
                     t->waiting_futex = fu_uaddr;
                     t->futex_val     = r3;
+                    t->futex_timed = timeout_va != 0;
+                    t->futex_until_ns = futex_deadline;
+                    t->futex_raw_result = false;
                     futex_waiter_add(g_current_tid, fu_uaddr);
                 }
                 g_yield_requested = true;
@@ -30172,29 +35775,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 ret32(0);
                 break;
             }
-            {
-                static uint64_t timed = 0;
-                if (lunaria_env("LUNARIA_TRACE_FUTEX") && timed < 256)
-                    fprintf(stderr, "[futex] WAIT timeout uaddr=0x%llx val=%lu tid=%u (#%llu)\n",
-                            (unsigned long long)fu_uaddr, r3, g_current_tid, (unsigned long long)timed);
-                ++timed;
-                // After repeated timeouts on a stuck Baselib lock (word stays.
-                static std::map<GuestVA, int> force_n;
-                int thr = (int)lunaria_env_long("LUNARIA_FUTEX_FORCE_UNLOCK_AFTER", 8);
-                int en = (int)lunaria_env_long("LUNARIA_FUTEX_FORCE_UNLOCK", 0);
-                if (en && thr > 0 && ++force_n[fu_uaddr] >= thr &&
-                    ctx.mem.read32(fu_uaddr) == r3) {
-                    ctx.mem.write32(fu_uaddr, 0u);
-                    (void)futex_publish_wake(fu_uaddr, 1u);
-                    if (force_n[fu_uaddr] == thr || lunaria_env("LUNARIA_TRACE_FUTEX"))
-                        fprintf(stderr, "[futex] FORCE unlock uaddr=0x%llx "
-                                "(was val=%lu, timeouts=%d)\n",
-                                (unsigned long long)fu_uaddr, r3, force_n[fu_uaddr]);
-                    force_n[fu_uaddr] = 0;
-                    ret32(0);
-                    break;
-                }
-            }
+            static uint64_t timed = 0;
+            if (lunaria_env("LUNARIA_TRACE_FUTEX") && timed < 256)
+                fprintf(stderr, "[futex] WAIT timeout uaddr=0x%llx val=%lu tid=%u (#%llu)\n",
+                        (unsigned long long)fu_uaddr, r3, g_current_tid,
+                        (unsigned long long)timed);
+            ++timed;
             uint32_t eva = errno_va(ctx, g_current_tid);
             if (eva) ctx.mem.write32(eva, 110u /* ETIMEDOUT */);
             if (g_current_tid != 0) g_yield_requested = true; /* worker: yield slice */
@@ -30203,6 +35789,25 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         case 224: /* __NR_gettid */
             ret32(g_current_tid ? g_current_tid : 1u);
+            break;
+        case 119: { /* A64 __NR_sched_setscheduler(pid, policy, param) */
+            const int policy = (int)(int32_t)r1;
+            if (policy == GUEST_SCHED_OTHER || policy == GUEST_SCHED_BATCH ||
+                policy == GUEST_SCHED_IDLE) {
+                ret32(0);
+            } else {
+                if (uint32_t eva = errno_va(ctx, g_current_tid))
+                    ctx.mem.write32(eva, EPERM);
+                ret32(~0u);
+            }
+            break;
+        }
+        case 120: /* A64 __NR_sched_getscheduler: all guest threads use CFS. */
+            ret32(GUEST_SCHED_OTHER);
+            break;
+        case 121: /* A64 __NR_sched_getparam(pid, struct sched_param *). */
+            if (r1) ctx.mem.write32(r1, 0u);
+            ret32(0);
             break;
         case 5: { /* __NR_open(path, flags, mode) */
             int fd = guest_open_path(ctx.mem.cstr(r1), (int)r2, (mode_t)r3);
@@ -30222,7 +35827,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             break;
         case 123: /* A64: sched_getaffinity — report GUEST_NCPU cores available */
             if (r3 && r2 >= 4u) {
-                uint32_t mask = (1u << GUEST_NCPU) - 1u;
+                uint32_t mask = (1u << guest_ncpu()) - 1u;
                 ctx.mem.write32(r3, mask);
             }
             ret32(0);
@@ -30260,13 +35865,17 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_ERRNO_ADDR: {
         const uint32_t eva = errno_va(ctx, g_current_tid);
-        /* Publish it in this thread's TLS so the in-guest stub answers every
-         * later call and never comes back here; see TLS64_ERRNO_OFF. */
+        /* Publish the *backing* offset in TLS.  The in-guest stub promotes it
+         * with movk to A64_GUEST_BASE before returning, so architectural LDR
+         * of `*__errno()` hits the same cell handlers write through errno_va.
+         * Returning a bare offset in x0 made the guest load from host VA
+         * 0x00xxxxxx (outside the identity arena) and always see errno 0 —
+         * which is how NMSS treated EINPROGRESS connect as a hard failure. */
         if (eva && ctx.is_arm64) {
             const uint64_t tls = arm64_tls_for_tid(ctx, g_current_tid);
             if (tls) ctx.mem.write32((GuestVA)(tls + TLS64_ERRNO_OFF), eva);
         }
-        ret32(eva);
+        retptr(eva);
         break;
     }
     case SVC_SYSPROP_GET: {
@@ -31097,12 +36706,71 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_FGETS: {
-        FILE *f = resolve_file(ctx, r2);
+        GuestVA fh = ctx.is_arm64 ? g_svc_args64[2] : (GuestVA)r2;
+        if (ctx.is_arm64) fh = gfile_shim_va(ctx, fh);
         GuestVA dst_va = ctx.is_arm64 ? g_svc_args64[0] : (GuestVA)r0;
         int lim = ctx.is_arm64 ? (int)g_svc_args64[1] : (int)r1;
-        if (!f || !dst_va || lim <= 0) { ret32(0); break; }
+        if (!dst_va || lim <= 0) { ret32(0); break; }
         char *dst = (char *)ctx.mem.ptr(dst_va);
-        char *p = fgets(dst, lim, f);
+        char *p = nullptr;
+        /* Memory-backed A64 streams: the C fgets() over the guest buffer. */
+        if (gfile_buffered(ctx, fh)) {
+            if (ctx.mem.read32(fh + GFILE_FLAGS) & (uint32_t)GFILE_SEOF) {
+                p = nullptr;
+            } else {
+                int32_t left = (int32_t)ctx.mem.read32(fh + GFILE_R);
+                GuestVA cur = ctx.mem.read64(fh + GFILE_P);
+                if (left <= 0 || !cur) {
+                    ctx.mem.write32(fh + GFILE_FLAGS,
+                        ctx.mem.read32(fh + GFILE_FLAGS) | (uint32_t)GFILE_SEOF);
+                } else {
+                    char *out = dst;
+                    int room = lim - 1;
+                    while (room > 0 && left > 0) {
+                        const uint8_t *bp = ctx.mem.ptr(cur);
+                        if (!bp) break;
+                        char c = (char)*bp;
+                        cur += 1; left -= 1; room -= 1;
+                        *out++ = c;
+                        if (c == '\n') break;
+                    }
+                    ctx.mem.write64(fh + GFILE_P, cur);
+                    ctx.mem.write32(fh + GFILE_R, (uint32_t)left);
+                    if (out == dst) {
+                        ctx.mem.write32(fh + GFILE_FLAGS,
+                            ctx.mem.read32(fh + GFILE_FLAGS) | (uint32_t)GFILE_SEOF);
+                    } else {
+                        *out = '\0';
+                        p = dst;
+                    }
+                }
+            }
+        } else {
+            FILE *f = resolve_file(ctx, fh);
+            if (!f) { ret32(0); break; }
+            p = fgets(dst, lim, f);
+            if (p && lunaria_env("LUNARIA_TRACE_PROC") &&
+                guest_pid() != GUEST_TID_BASE) {
+                static unsigned helper_fgets_logs = 0;
+                if (helper_fgets_logs++ < 768u)
+                    fprintf(stderr, "[proc-line] pid=%u tid=%u %.*s",
+                            guest_pid(), guest_tid_of(g_current_tid), 255, dst);
+            }
+            if (!p && ferror(f)) {
+                static std::atomic<unsigned> reported{0};
+                const unsigned n = reported.fetch_add(1, std::memory_order_relaxed);
+                if (n < 16) {
+                    char path[PATH_MAX] = {0};
+                    const int fd = fileno(f);
+                    if (fd >= 0) (void)luna_os_fd_path(fd, path, sizeof path);
+                    fprintf(stderr,
+                            "[fgets] read error file=%#llx fd=%d errno=%d path=%s "
+                            "lr=0x%08x tid=%u\n",
+                            (unsigned long long)fh, fd, errno, path, lr,
+                            g_current_tid);
+                }
+            }
+        }
         if (ctx.is_arm64) {
             if (p) retarg0();
             else ret32(0);
@@ -31112,12 +36780,24 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_FILENO: {
-        FILE *f = resolve_file(ctx, r0);
+        const GuestVA fh = ctx.is_arm64 ? g_svc_args64[0] : (GuestVA)r0;
+        if (ctx.is_arm64 && fh >= 256u) {
+            ret32(ctx.mem.read32(fh + GFILE_FD));
+            break;
+        }
+        FILE *f = resolve_file(ctx, fh);
         ret32(f ? (uint32_t)fileno(f) : ~0u);
         break;
     }
     case SVC_FEOF: {
-        FILE *f = resolve_file(ctx, r0);
+        GuestVA fh = ctx.is_arm64 ? g_svc_args64[0] : (GuestVA)r0;
+        if (ctx.is_arm64) fh = gfile_shim_va(ctx, fh);
+        if (gfile_buffered(ctx, fh)) {
+            ret32((ctx.mem.read32(fh + GFILE_FLAGS) & (uint32_t)GFILE_SEOF)
+                  ? 1u : 0u);
+            break;
+        }
+        FILE *f = resolve_file(ctx, fh);
         ret32(f ? (uint32_t)feof(f) : 1u);
         break;
     }
@@ -31125,9 +36805,28 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         const char *path = ctx.mem.cstr(r0);
         char od_mapped[PATH_MAX];
         path = map_guest_path(path, od_mapped, sizeof od_mapped);
-        // Directory enumeration must never expose host process IDs/fds.
+        /* Answer /proc from the same synthesis the raw openat path uses.
+         * These two used to disagree: a guest that reached
+         * /proc/<pid>/task through bionic's openat got the synthetic
+         * directory and enumerated its threads, while the same path through
+         * opendir(3) was refused outright -- one interface saying the
+         * directory exists and the other saying it does not, in one process.
+         * What must stay hidden is the *host's* /proc, and the synthesis is
+         * what hides it: anything it does not cover is still refused, but
+         * with the errno a missing path has rather than a bare zero. */
         if (path && (!strncmp(path, "/proc/", 6) || !strcmp(path, "/proc"))) {
-            ret32(0); break;
+            const char *subst = synthetic_proc_path(path);
+            if (!subst) {
+                static int blocked = 0;
+                if (blocked++ < 16 || lunaria_env("LUNARIA_TRACE_DIR"))
+                    fprintf(stderr, "[opendir] no synthetic /proc for %s\n",
+                            path);
+                if (uint32_t eva = errno_va(ctx, g_current_tid))
+                    ctx.mem.write32(eva, (uint32_t)ENOENT);
+                ret32(0);
+                break;
+            }
+            path = subst;
         }
         DIR *d = path ? opendir(path) : nullptr;
         if (d) {
@@ -31297,8 +36996,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
              * owner/count word.  ERRORCHECK needs EDEADLK/EPERM decisions the
              * guest stub cannot make, so only that type carries the slow bit
              * that routes every operation through the handler. */
-            ctx.mem.write32(mva, type == GUEST_MUTEX_ERRORCHECK ? MUTEX_SLOW_BIT
-                                                                : 0u);
+            ctx.mem.write32(mva,
+                            type == GUEST_MUTEX_ERRORCHECK ? MUTEX_SLOW_BIT : 0u);
+            fast64_recursive_mutex_set(ctx.mem, mva,
+                                       type == GUEST_MUTEX_RECURSIVE);
             if (type != GUEST_MUTEX_NORMAL) g_mutex_type[mva] = type;
             else g_mutex_type.erase(mva);
         }
@@ -31322,23 +37023,36 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             }
         }
         /* A self-relock that is not ERRORCHECK and not RECURSIVE is a guest
-         * bug the platform answers with a deadlock, and this emulator has been
-         * answering with a silent recursion — the owner re-enters a critical
-         * section it believes is exclusive, and whatever that section protects
-         * is torn by its own thread.  Recursing here keeps the old behaviour
-         * (turning it into a deadlock would hang the title rather than explain
-         * it), but it no longer happens quietly. */
+         * bug the platform answers with a deadlock.  Never turn it into silent
+         * recursion: the owner would re-enter a section it believes is
+         * exclusive and tear the state that section protects. */
         if (guest_mutex_type_of(mva) == GUEST_MUTEX_NORMAL) {
             const uint32_t w = mutex_state(guest_word_load(ctx.mem, mva));
             if (w >= 0x100u && (w & 0xffu) == owner) {
                 static std::set<GuestVA> said;
-                if (said.size() < 32u && said.insert(mva).second)
+                const bool first = said.size() < 32u && said.insert(mva).second;
+                if (first)
                     fprintf(stderr, "[mutex] tid=%u re-locked NORMAL mutex "
-                            "0x%llx it already holds (depth %u, lr=0x%08x) — a "
-                            "device deadlocks here; recursing\n",
+                            "0x%llx it already holds (depth %u, lr=0x%08x) — "
+                            "a device deadlocks; returning 0 because the lock "
+                            "postcondition already holds (parking here froze "
+                            "Swappy ChoreographerFilter on Cross Worlds)\n",
                             g_current_tid, (unsigned long long)mva, w >> 8, lr);
+                mutex_history('S', mva, guest_word_load(ctx.mem, mva),
+                              guest_word_load(ctx.mem, mva), lr);
+                if (first) mutex_history_dump(mva);
+                /* Do not park.  A self-wait can never be satisfied: the only
+                 * unlocker is this thread, and it is the waiter.  That hung
+                 * Filter0 (mutex word held-by-tid == waiter) and stopped
+                 * presents after the title.  The critical section is already
+                 * owned, so the lock's postcondition is true — same judgment
+                 * cond_reacquire_or_park makes when the inline stub won the
+                 * race.  Depth is left unchanged so one unlock still clears. */
+                ret32(0);
+                break;
             }
         }
+        if (g_svc_retry) break;
         /* Under LUNARIA_A64_ENGINES>1 another engine can grab the word
          * between a "free" load and the CAS.  Returning EBUSY there let the
          * guest walk into the critical section unlocked (FPakPrecacher /
@@ -31353,22 +37067,39 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                         "word=0x%08x\n", (unsigned long long)mva, g_current_tid, lr, raw);
             if (w >= 0x100u && (w & 0xffu) != owner) {
                 if (g_current_tid != 0 && !g_in_cb()) {
+                    bool parked = false;
                     for (auto &t : g_threads)
                         if (t.id == g_current_tid) {
                             t.waiting_mutex = mva;
                             t.wait_result = 0;
+                            parked = true;
                             break;
                         }
-                    /* Say the mutex is contended before parking, so the
-                     * owner's inline unlock traps and wakes us. */
-                    guest_mutex_mark_contended(ctx.mem, mva);
-                    /* Rewind onto this svc rather than answering it: nothing
-                     * has been acquired yet.  When the thread runs again the
-                     * handler starts over and competes for the word itself --
-                     * see guest_mutex_release() for why ownership is never
-                     * handed over from outside. */
-                    g_svc_retry = true;
-                    break;
+                    if (parked) {
+                        /* Say the mutex is contended before parking, so the
+                         * owner's inline unlock traps and wakes us. */
+                        guest_mutex_mark_contended(ctx.mem, mva);
+                        /* Rewind onto this svc rather than answering it:
+                         * nothing has been acquired yet.  When the thread
+                         * runs again the handler starts over and competes for
+                         * the word itself -- see guest_mutex_release() for
+                         * why ownership is never handed over from outside. */
+                        g_svc_retry = true;
+                        break;
+                    }
+                    /* A nonzero tid is not proof that this register file is
+                     * scheduler-owned.  The UE GameThread can run as the
+                     * primary execution context while retaining its Android
+                     * tid.  It has no ArmThread record to park; marking an
+                     * SVC retry here merely executes this same lock again and
+                     * busy-spins forever (Cross Worlds did so for 136 s after
+                     * Adventure Start).  Treat it like the primary context:
+                     * run the owner and retry the CAS only after that work.
+                     * This is still a blocking pthread_mutex_lock, not a
+                     * fabricated timeout or successful return. */
+                    schedule_threads(env_ticks("LUNARIA_THREAD_TICKS",
+                                               200'000'000ULL));
+                    continue;
                 }
                 /* A callback the host drove into the guest runs on its own
                  * JIT and stack, while the thread it is charged to sits
@@ -31392,9 +37123,26 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 schedule_threads(env_ticks("LUNARIA_THREAD_TICKS", 200'000'000ULL));
                 continue;
             }
+            /* Taking a free NORMAL mutex: drop a sticky MUTEX_SLOW_BIT left
+             * by an earlier contention.  The inline stub refuses any word
+             * with bit 30 set (it cannot decide ERRORCHECK), so a flag that
+             * survives the last waiter turns every later uncontended lock
+             * into an SVC.  Cross Worlds' ReloadInfoAll spent ~47% of its
+             * SVCs in pthread_mutex_lock on FUObjectHashTables / archetype
+             * lookup for exactly that reason.  ERRORCHECK keeps the bit;
+             * waiters still present keep it so their owner's unlock traps. */
+            uint32_t slow = raw & MUTEX_SLOW_BIT;
+            if (w < 0x100u && slow &&
+                guest_mutex_type_of(mva) != GUEST_MUTEX_ERRORCHECK) {
+                unsigned waiters = 0;
+                for (const auto &t : g_threads)
+                    if (!t.finished && t.waiting_mutex == mva) ++waiters;
+                if (waiters == 0) slow = 0;
+            }
             if (guest_word_cas(ctx.mem, mva, raw,
-                               (raw & MUTEX_SLOW_BIT) |
-                               ((w & ~0xffu) + 0x100u) | owner)) {
+                               slow | ((w & ~0xffu) + 0x100u) | owner)) {
+                mutex_history('L', mva, raw,
+                              slow | ((w & ~0xffu) + 0x100u) | owner, lr);
                 mutex_owner_sanity(g_current_tid, mva,
                                    (w & ~0xffu) + 0x100u, "pthread_mutex_lock");
                 ret32(0);
@@ -31436,16 +37184,22 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             }
         }
         if (mva) {
+            const uint32_t before = guest_word_load(ctx.mem, mva);
             if (mtrace_addr(mva))
                 fprintf(stderr, "[mtrace] unlock mutex=0x%llx tid=%u lr=0x%08x "
                         "word=0x%08x\n", (unsigned long long)mva, g_current_tid,
                         lr, guest_word_load(ctx.mem, mva));
             guest_mutex_release(ctx.mem, mva, g_current_tid);
+            mutex_history('U', mva, before, guest_word_load(ctx.mem, mva), lr);
         }
         ret32(0); break;
     }
     case SVC_PTHREAD_MUTEX_DESTROY:
-        if (GuestVA mva = argp(0)) { ctx.mem.write32(mva, 0u); g_mutex_type.erase(mva); }
+        if (GuestVA mva = argp(0)) {
+            ctx.mem.write32(mva, 0u);
+            fast64_recursive_mutex_set(ctx.mem, mva, false);
+            g_mutex_type.erase(mva);
+        }
         ret32(0); break;
 
     // ---- pthread cond ---------------------------------------------------
@@ -31510,6 +37264,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
              * guest never sent. */
             if (!woke) {
                 if (CondStat *cs = cond_stat(cva)) ++cs->lost;
+                cond_orphan_signal_note(g_current_tid);
                 cond_wake_missed_note("signal", cva, lr);
             }
         }
@@ -31563,6 +37318,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
              * broadcasts were never tallied. */
             if (!woke) {
                 if (CondStat *cs = cond_stat(cva)) ++cs->lost;
+                cond_orphan_signal_note(g_current_tid);
                 cond_wake_missed_note("broadcast", cva, lr);
             }
         }
@@ -31810,7 +37566,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
          * TriggerType already 2 in the guest's own memory). */
         if (ArmThread *rt = (g_current_tid != 0 && !ctx_innermost_is_cb())
                                 ? arm_thread_by_tid(g_current_tid) : nullptr)
-            if (rt->cond_reacq) {
+            if (rt->cond_reacq && cond_reacq_matches(*rt, mutex, lr)) {
                 if (!cond_reacquire_or_park(ctx, *rt, rt->cond_reacq)) {
                     g_svc_retry = true;
                     break;
@@ -32131,10 +37887,23 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         /* The return path of a wait that has already parked — the same two
          * halves as the untimed wait above, and the same reason.  wait_result
          * carries the ETIMEDOUT a expired deadline left behind, which POSIX
-         * also requires be delivered with the mutex held. */
-        if (ArmThread *rt = (g_current_tid && !g_in_cb())
+         * also requires be delivered with the mutex held.
+         *
+         * The predicate must be ctx_innermost_is_cb(), exactly as the untimed
+         * wait uses, and never the looser g_in_cb(): the two differ for a
+         * guest slice running nested inside a host-driven callback, which
+         * schedule_threads() produces routinely.  With g_in_cb() here, such a
+         * call skipped both halves — it neither finished the parked wait nor
+         * parked a new one — and left cond_reacq set.  The thread's *next*
+         * pthread_cond_(timed)wait then took this return path for the stale
+         * record: it acquired a mutex the guest had not asked for and never
+         * unlocks, and returned without waiting.  The next FEvent::Wait on
+         * that event is then a self-lock on a NORMAL mutex, which is a real
+         * deadlock (seen as the game thread re-locking its own event mutex
+         * and the title sitting at one present for a minute). */
+        if (ArmThread *rt = (g_current_tid != 0 && !ctx_innermost_is_cb())
                                 ? arm_thread_by_tid(g_current_tid) : nullptr)
-            if (rt->cond_reacq) {
+            if (rt->cond_reacq && cond_reacq_matches(*rt, mutex, lr)) {
                 if (!cond_reacquire_or_park(ctx, *rt, rt->cond_reacq)) {
                     g_svc_retry = true;
                     break;
@@ -32182,7 +37951,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                            (uint64_t)(delta_ns > cap_ns ? cap_ns : delta_ns);
             }
         }
-        if (g_current_tid != 0 && !g_in_cb()) {
+        if (g_current_tid != 0 && !ctx_innermost_is_cb()) {
             for (auto &t : g_threads)
                 if (t.id == g_current_tid) {
                     t.waiting_cond = cond;
@@ -32203,8 +37972,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
 
         /* Main JIT cannot be parked in g_threads, and a host-driven callback
          * must not park the thread it borrows — see the untimed wait.  Honour
-         * the deadline with a real host sleep instead of one schedule pass. */
-        if (g_in_cb()) {
+         * the deadline with a real host sleep instead of one schedule pass.
+         *
+         * "Is a callback the innermost context" is the question, for the same
+         * reason as the park above: a slice nested inside a callback is a
+         * guest thread and owns an ArmThread slot. */
+        if (ctx_innermost_is_cb()) {
             host_cond_register(g_cb_cond_wait, cond);
             g_cb_lock_wait.kind = CbLockWait::Cond;
             g_cb_lock_wait.from_slice = g_slice_depth > 0;
@@ -32779,7 +38552,11 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
          * so the answer depended on whether anything else had initialised the
          * zone yet — the same time_t came back as UTC on one call and as the
          * host's zone on the next, nine hours apart. */
-        if (svc_no == SVC_LOCALTIME_R) { tzset(); localtime_r(&t, &tmv); }
+        if (svc_no == SVC_LOCALTIME_R) {
+            arm_exec_timezone_lock();
+            localtime_r(&t, &tmv);
+            arm_exec_timezone_unlock();
+        }
         else gmtime_r(&t, &tmv);
         if (out) write_guest_tm(ctx, out, tmv);
         ret32(out);
@@ -32792,17 +38569,28 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             ? (time_t)ctx.mem.read64(argp(0))
             : (time_t)(int32_t)ctx.mem.read32(argp(0));
         struct tm tmv;
-        if (svc_no == SVC_LOCALTIME) { tzset(); localtime_r(&t, &tmv); }
+        if (svc_no == SVC_LOCALTIME) {
+            arm_exec_timezone_lock();
+            localtime_r(&t, &tmv);
+            arm_exec_timezone_unlock();
+        }
         else gmtime_r(&t, &tmv);
         if (tm_static) write_guest_tm(ctx, tm_static, tmv);
         retptr(tm_static);
-        // Spin detection: log LR, r0 (time_t addr), and the actual time value the first time, then periodically.
+        /* Spin detection: LR, r0 (the time_t address) and the broken-down
+         * time, the first few times and then periodically.
+         *
+         * Name which of the two calls this is.  Both share this case, and the
+         * label said "localtime" for a gmtime as well -- so the ordinary
+         * pairing of one gmtime and one localtime over the same instant read
+         * back as the same call answering nine hours apart, which is what a
+         * clock-tamper check looks like and cost a hunt. */
         {
             static uint32_t lt_ctr = 0; static uint32_t lt_lr0 = 0;
-            
             if (lt_ctr++ < 3 || (lt_ctr % 50000 == 0))
-                fprintf(stderr, "[localtime-spin] #%u lr=0x%08x r0=0x%08lx t=%ld "
+                fprintf(stderr, "[%s-spin] #%u lr=0x%08x r0=0x%08lx t=%ld "
                         "hh:mm:ss=%02d:%02d:%02d\n",
+                        svc_no == SVC_LOCALTIME ? "localtime" : "gmtime",
                         lt_ctr, lr, r0, (long)t, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
             if (lr != lt_lr0 && lt_ctr > 1) { lt_ctr = 0; lt_lr0 = lr; }
         }
@@ -32813,7 +38601,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         struct tm tmv;
         read_guest_tm(ctx, tm_va, tmv);
         tmv.tm_isdst = -1;
+        arm_exec_timezone_lock();
         time_t t = mktime(&tmv);
+        arm_exec_timezone_unlock();
         // mktime normalizes the struct in place (tm_wday/tm_yday/tm_isdst and, on bionic/glibc, tm_gmtoff/tm_zone).
         if (tm_va) write_guest_tm(ctx, tm_va, tmv);
         if (ctx.is_arm64) ret64((uint64_t)(int64_t)t);
@@ -33161,8 +38951,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
      * throw that away — the guest's own unmapped reads land on the scratch
      * page here and would come back as a successful read of zeroes — so each
      * remote range is checked against the guest's mappings first.
-     * "Remote" is this same address space: the emulated process is one
-     * process, and its pid is the 1 that getpid() reports. */
+     * "Remote" must name the caller's guest process.  Fork/exec helpers have
+     * their own PID even though their storage lives in this host process, so
+     * accepting a historical hard-coded PID would both reject the app's real
+     * PID and allow a helper to inspect the wrong process. */
     case SVC_PROCESS_VM_READV: {
         int      pid   = (int)arg32(0);
         GuestVA  liov  = argp_n(1);
@@ -33174,7 +38966,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 ctx.mem.write32(eva, (uint32_t)err);
             RET_SSIZE(-1);
         };
-        if (pid != 0 && pid != 1) { pv_fail(ESRCH); break; }
+        if (pid != 0 && (uint32_t)pid != guest_pid()) {
+            pv_fail(ESRCH);
+            break;
+        }
         if (!liov || !riov || lcnt > 1024 || rcnt > 1024) { pv_fail(EINVAL); break; }
 
         const uint32_t W = ctx.is_arm64 ? 8u : 4u;
@@ -33288,7 +39083,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         const uint32_t setsize = (uint32_t)argp(1);
         const GuestVA  maskp   = argp(2);
         if (setsize < 4u || !maskp) { arm_set_errno(ctx, EINVAL); ret32(~0u); break; }
-        uint32_t mask = ctx.mem.read32((uint32_t)maskp) & ((1u << GUEST_NCPU) - 1u);
+        uint32_t mask = ctx.mem.read32((uint32_t)maskp) &
+                        ((1u << guest_ncpu()) - 1u);
         if (!mask) { arm_set_errno(ctx, EINVAL); ret32(~0u); break; }
         g_sched_affinity[g_current_tid] = mask;
         ret32(0);
@@ -33514,8 +39310,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
          * but its buffer is guest memory the host libc must not adopt: hand
          * the mode through and let the host allocate. */
         const GuestVA sp = argp(0);
-        uint32_t idx = (sp && sp < 256u) ? (uint32_t)sp : (sp ? ctx.mem.read32(sp) : 0u);
-        FILE *f = (idx > 0 && idx < 256u) ? g_file_tab[idx] : nullptr;
+        FILE *f = resolve_file(ctx, (uint32_t)sp);
         if (!f) { ret32(~0u); break; }
         const int mode = (int)argp(2);
         const size_t size = (size_t)argp(3);
@@ -33556,15 +39351,148 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
 
     case SVC_SYSTEM: {
-        /* system(cmd).  There is no shell inside the guest — nothing in the
-         * emulator materialises /system/bin/sh — and running the command on
-         * the *host* would put a guest string on the host's shell, which is
-         * not what an emulated process may do.  So the honest answer is the
-         * one POSIX defines for exactly this: system(NULL) reports that no
-         * command processor is available, and a real command fails. */
-        if (!argp(0)) { ret32(0); break; }
-        arm_set_errno(ctx, ENOENT);
-        ret32(~0u);
+        /* system(cmd) — run the command on the *device's* shell (see
+         * device_run_pipeline), never on the host's: a guest string must not
+         * reach this machine's /bin/sh.  system(NULL) asks whether a command
+         * processor exists, and now one does.
+         *
+         * The return value is wait(2)-encoded, the same as the status
+         * waitpid() would report for the shell. */
+        const char *cmd = ctx.mem.cstr(argp(0));
+        if (!cmd) { ret32(1); break; }   /* system(NULL): a shell is available */
+        /* The command line itself, because what the guest asked the shell to
+         * do is the only thing that says which of the shell's behaviours it
+         * depends on — a trailing `&` above all. */
+        fprintf(stderr, "[exec] system(\"%s\") tid=%u\n", cmd, g_current_tid);
+        std::string produced;
+        const int status = device_run_jobs(cmd, produced, false);
+        if (status == kDeviceCommandParked) {
+            /* Parked on the child; join_try_complete() puts the wait(2)
+             * status in x0 when it ends, exactly as it does for waitpid(). */
+            ret32(0);
+            break;
+        }
+        for (size_t done = 0; done < produced.size();) {
+            const ssize_t n = write(1, produced.data() + done,
+                                    produced.size() - done);
+            if (n <= 0) break;
+            done += (size_t)n;
+        }
+        ret32((uint32_t)((status & 0xff) << 8));
+        break;
+    }
+
+    case SVC_LIBC_INIT: {
+        /* bionic's crt entry:
+         *
+         *   __libc_init(void *raw_args, void (*onexit)(void),
+         *               int (*slingshot)(int, char **, char **),
+         *               structors_array_t const *structors)
+         *
+         * raw_args is the initial process stack this emulator built for the
+         * image (see guest_program_stack): argc, the argv pointers and their
+         * terminator, then envp and its terminator.  It does not return — the
+         * program's main() decides the exit status.
+         *
+         * The image's init array has already run: the loader runs it for
+         * every object it maps.  `structors` is deliberately not walked again
+         * here, because running a constructor twice is not a conservative
+         * choice, it is a wrong one.
+         *
+         * main() is entered by handing this thread over to it rather than by
+         * calling it from inside this handler: a helper started this way is
+         * usually a server that does not return, and a nested call would keep
+         * it inside one SVC for the life of the program. */
+        const GuestVA raw = argp(0);
+        const GuestVA main_fn = argp(2);
+        const uint64_t argc = raw ? ctx.mem.read64(raw) : 0;
+        const GuestVA argv = raw ? raw + 8u : 0;
+        const GuestVA envp = argv ? argv + (GuestVA)(argc + 1u) * 8u : 0;
+        fprintf(stderr, "[exec] __libc_init: entering main(argc=%llu) at "
+                "0x%llx on tid=%u\n", (unsigned long long)argc,
+                (unsigned long long)main_fn, g_current_tid);
+        if (!ctx.is_arm64 || !g_svc_jit64 || !main_fn) {
+            ret32(0);
+            break;
+        }
+        g_svc_jit64->SetRegister(1, argv);
+        g_svc_jit64->SetRegister(2, envp);
+        for (size_t i = 3; i < 30; ++i) g_svc_jit64->SetRegister(i, 0);
+        /* main() returns to the sentinel, which is how every other guest
+         * thread here ends: the scheduler turns that into the thread's exit
+         * value, and fork_child_mark_exited() turns it into the status the
+         * parent's waitpid()/system() reads. */
+        g_svc_jit64->SetRegister(30, a64_guest_va(SENTINEL_ADDR));
+        g_svc_jit64->SetPC(main_fn);
+        ret64(argc);   /* x0 = argc; the dispatcher copies regs[0] into it */
+        break;
+    }
+
+    case SVC_POPEN: {
+        /* popen(cmd, mode).  The command runs on the device's shell and its
+         * output is the stream the caller reads; "w" has nothing to feed, so
+         * it is refused rather than answered with a stream that discards. */
+        const char *cmd = ctx.mem.cstr(argp(0));
+        const char *mode = ctx.mem.cstr(argp(1));
+        if (!cmd || !mode || mode[0] != 'r') {
+            arm_set_errno(ctx, EINVAL);
+            ret32(0);
+            break;
+        }
+        fprintf(stderr, "[exec] popen(\"%s\") tid=%u\n", cmd, g_current_tid);
+        std::string produced;
+        const int status = device_run_jobs(cmd, produced, false);
+        if (status == kDeviceCommandParked) {
+            /* popen() has to hand back a stream of the command's output, and a
+             * guest program image writes to its descriptors rather than into a
+             * buffer this can capture.  Say the stream could not be opened
+             * instead of returning an empty one that looks like success. */
+            arm_set_errno(ctx, ENOSYS);
+            ret32(0);
+            break;
+        }
+        /* The stream owns its copy: fmemopen does not copy the buffer, and
+         * `produced` dies at the end of this handler. */
+        char *owned = (char *)malloc(produced.size() + 1u);
+        if (!owned) { arm_set_errno(ctx, ENOMEM); ret32(0); break; }
+        memcpy(owned, produced.data(), produced.size());
+        owned[produced.size()] = '\0';
+        FILE *f = fmemopen(owned, produced.size(), "r");
+        if (!f) { free(owned); arm_set_errno(ctx, ENOMEM); ret32(0); break; }
+        const uint32_t handle = register_file(ctx, f, true);
+        if (handle) g_popen_status[handle] = { owned, status };
+        else { fclose(f); free(owned); }
+        retptr(guest_file_va(ctx, handle));
+        break;
+    }
+    case SVC_PCLOSE: {
+        /* pclose() returns the command's wait(2)-encoded status, which is the
+         * whole point of it — a plain fclose() would lose that. */
+        const GuestVA fh = ctx.is_arm64 ? g_svc_args64[0] : (GuestVA)r0;
+        FILE *f = resolve_file(ctx, fh);
+        auto slot = g_popen_status.find(file_shim_backing(ctx, fh));
+        if (!f || slot == g_popen_status.end()) {
+            arm_set_errno(ctx, EBADF);
+            ret32(~0u);
+            break;
+        }
+        {
+            if (ctx.is_arm64 && gfile_buffered(ctx, fh)) {
+                const GuestVA base = ctx.mem.read64(fh + GFILE_BASE);
+                const uint32_t back = file_shim_backing(ctx, base);
+                if (back) arm_free(ctx, back);
+            }
+            uint32_t idx = 0, gen = 0;
+            bool stamped = false;
+            file_handle_parts(ctx, fh, &idx, &gen, &stamped);
+            if (FILE *closing = file_table_detach(idx, gen, stamped))
+                guest_stream_close(closing);
+            if (fh >= 256u) arm_free(ctx, file_shim_backing(ctx, fh));
+        }
+        free(slot->second.buffer);
+        const int status = slot->second.status;
+        g_popen_status.erase(slot);
+        ret32((uint32_t)((status & 0xff) << 8));
         break;
     }
 
@@ -33608,15 +39536,27 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
          * only to exec() gains nothing here — this only helps the
          * fork-without-exec shape.
          *
-         * This does not corrupt locks the way a real fork's child does:
-         * nothing else in the process was actually duplicated, so every
-         * mutex some other thread holds is still held by a thread that is
-         * still really running — there is no phantom parent-side owner for
-         * the child to inherit and never release.  pthread_atfork's "child"
-         * handlers exist precisely to repair that phantom-owner problem, so
-         * they are deliberately not invoked below: there is nothing here for
-         * them to fix, and running them against a still-live owner would be
-         * the wrong action, not a conservative one. */
+         * The shared-address-space compromise does not remove pthread_atfork's
+         * observable contract: libraries also use the handlers to publish
+         * process-local state unrelated to mutex ownership.  They therefore
+         * run below in the same order and on the same side of the snapshot as
+         * Linux, even though full address-space isolation remains to do. */
+        /* POSIX ordering is prepare handlers in reverse registration order,
+         * then the address-space snapshot, then parent/child handlers in
+         * registration order.  Calling prepare after the copy means its lock
+         * and allocator changes are absent from the child; omitting child
+         * handlers leaves those locks permanently in the pre-fork state. */
+        for (size_t i = g_guest_atfork.size(); i-- > 0;) {
+            auto &slot = g_guest_atfork[i];
+            if (slot.state.load(std::memory_order_acquire) != 2 ||
+                !slot.prepare) continue;
+            if (ctx.is_arm64)
+                (void)call_guest_cb64(ctx, slot.prepare, 0, 0, 0, 0,
+                                      nullptr, 0);
+            else
+                (void)call_guest_cb(ctx, (uint32_t)slot.prepare, 0, 0);
+        }
+
         bool spawned = false;
         uint32_t child_tid = 0;
         if (ctx.is_arm64 && g_svc_jit64) {
@@ -33634,14 +39574,38 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     g_thread_stack_next += (uint32_t)size;
                 }
                 uint32_t nid = new_lo ? alloc_guest_tid() : 0;
-                uint8_t *dst = new_lo ? ctx.mem.ptr((GuestVA)new_lo) : nullptr;
+                const GuestVA new_base = new_lo ? a64_guest_va(new_lo) : 0;
+                uint8_t *dst = new_base ? ctx.mem.ptr(new_base) : nullptr;
                 const uint8_t *src = new_lo ? ctx.mem.ptr((GuestVA)base) : nullptr;
                 if (new_lo && nid && dst && src) {
                     std::memcpy(dst, src, (size_t)size);
                     ArmThread t{};
                     t.id = nid;
+                    /* fork inherits the caller's task comm; exec below may
+                     * subsequently replace it with the image basename. */
+                    inherit_process_identity(t);
+                    /* fork creates a process, not another pthread in the
+                     * caller's process.  Its first thread's tid equals pid. */
+                    t.process_ppid = guest_pid();
+                    t.process_pid = guest_tid_of(nid);
+                    signal_handlers_fork_copy(t.process_ppid, t.process_pid);
+                    signal_mask_store(t.id,
+                                      signal_mask_load(g_current_tid));
+                    for (const auto &slot : g_guest_atfork) {
+                        if (slot.state.load(std::memory_order_acquire) != 2 ||
+                            !slot.child) continue;
+                        if (t.atfork_child_n < t.atfork_child.size())
+                            t.atfork_child[t.atfork_child_n++] = slot.child;
+                    }
                     t.is_arm64 = true;
-                    t.stack_base = (GuestVA)new_lo;
+                    /* g_thread_stack_next/free store backing offsets.  A64
+                     * registers and ArmThread::stack_base store canonical
+                     * guest VAs.  Mixing the two made fork children lose the
+                     * 0x7000... VA prefix (observed child SP 0x406ff560 for
+                     * parent SP 0x7000405ff560), then rebased every saved
+                     * pointer with a delta between two different address
+                     * spaces. */
+                    t.stack_base = new_base;
                     t.stack_size = size;
                     std::array<uint64_t, 31> gpr = g_svc_jit64->GetRegisters();
                     for (size_t i = 0; i < 31; ++i) t.regs64[i] = gpr[i];
@@ -33650,7 +39614,53 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     t.fpcr64 = g_svc_jit64->GetFpcr();
                     t.fpsr64 = g_svc_jit64->GetFpsr();
                     t.pstate64 = g_svc_jit64->GetPstate();
-                    t.sp64 = (base != new_lo) ? (new_lo + (cur_sp - base)) : cur_sp;
+                    t.sp64 = (base != new_base)
+                           ? (new_base + (cur_sp - base)) : cur_sp;
+                    /* A real fork() gives the child its stack at the *same*
+                     * virtual addresses, so every pointer the caller already
+                     * holds into its own stack stays valid.  This model has
+                     * one address space, so the child's copy necessarily sits
+                     * somewhere else — and then the copy alone is not a fork:
+                     * the child resumes with x29 (and any other register or
+                     * saved slot holding a stack address) still naming the
+                     * *parent's* live stack, and reads locals out from under
+                     * a parent that is meanwhile running its own frames.
+                     *
+                     * That is what broke the security module's package
+                     * census.  Its popen() shape is
+                     *   snprintf(cmd_on_stack, "pm list packages -f | grep -w %s", pkg)
+                     *   fork(); <child> execve("/system/bin/sh", {"sh","-c",cmd})
+                     * and `cmd` reaches the child as a parent-stack address.
+                     * By the time the child dereferenced it the parent had
+                     * returned into waitpid() and overwritten the tail, so
+                     * execve() saw a command with the package name cut off
+                     * ("... | grep -w ") — or, when the clobber reached the
+                     * path slot, no program name at all.  Non-deterministic,
+                     * because it is a race against the parent's own frames.
+                     *
+                     * So rebase the child onto its copy: every GPR that names
+                     * a word inside the parent's stack, and every such word
+                     * saved in the live part of the copy itself (the frame
+                     * chain, spilled locals, argv vectors) moves by the same
+                     * delta.  Below the resume SP nothing is live, so only
+                     * [sp, top) is walked. */
+                    if (base != new_base) {
+                        const uint64_t delta = new_base - base;
+                        const uint64_t top = base + size;
+                        for (size_t i = 0; i < 31; ++i)
+                            if (t.regs64[i] >= base && t.regs64[i] < top)
+                                t.regs64[i] += delta;
+                        uint64_t scan = cur_sp & ~(uint64_t)7;
+                        for (; scan + 8 <= top; scan += 8) {
+                            uint8_t *slot = dst + (size_t)(scan - base);
+                            uint64_t word;
+                            std::memcpy(&word, slot, sizeof word);
+                            if (word >= base && word < top) {
+                                word += delta;
+                                std::memcpy(slot, &word, sizeof word);
+                            }
+                        }
+                    }
                     t.pc64 = g_svc_jit64->GetPC(); /* resumes past the svc, same as the parent */
                     t.entry_pc = t.pc64;
                     /* fork() gives the child its own copy of the thread's
@@ -33681,6 +39691,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                         }
                         g_thread_by_tid[slot->id] = slot;
                     }
+                    thread_name_inherit(t.id, g_current_tid);
                     thread_mark_ready(t.id);
                     child_tid = t.id;
                     spawned = true;
@@ -33692,16 +39703,6 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     g_thread_stack_free[(uint32_t)size].push_back(new_lo);
                 }
             }
-        }
-        for (size_t i = g_guest_atfork.size(); i-- > 0;) {
-            auto &slot = g_guest_atfork[i];
-            if (slot.state.load(std::memory_order_acquire) != 2 ||
-                !slot.prepare) continue;
-            if (ctx.is_arm64)
-                (void)call_guest_cb64(ctx, slot.prepare, 0, 0, 0, 0,
-                                      nullptr, 0);
-            else
-                (void)call_guest_cb(ctx, (uint32_t)slot.prepare, 0, 0);
         }
         if (!spawned) arm_set_errno(ctx, ENOSYS);
         for (auto &slot : g_guest_atfork) {
@@ -34613,12 +40614,15 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_ACHOREOGRAPHER_POSTDELAY: {
         // void AChoreographer_postFrameCallbackDelayed(ch[r0], cb[r1], data[r2], delay[r3])
+        const uint64_t delay_ms = ctx.is_arm64 ? g_svc_args64[3] : (uint64_t)r3;
         static int n = 0;
         if (n < 8 || (n % 600) == 0)
-            fprintf(stderr, "[achoreo] postFrameCallbackDelayed cb=0x%08lx data=0x%08lx delay=%lu lr=0x%08x tid=%u\n",
-                    r1, r2, r3, lr, g_current_tid);
+            fprintf(stderr, "[achoreo] postFrameCallbackDelayed cb=0x%08lx data=0x%08lx delay=%llu lr=0x%08x tid=%u\n",
+                    (unsigned long)argp(1), (unsigned long)argp(2),
+                    (unsigned long long)delay_ms, lr, g_current_tid);
         ++n;
-        post_choreographer_callback(argp(1), argp(2), /*wide64=*/false, r3, r0);
+        post_choreographer_callback(argp(1), argp(2), /*wide64=*/false, delay_ms,
+                                    (uint32_t)argp(0));
         break;
     }
     case SVC_ACHOREOGRAPHER_REG_RR: {
@@ -34700,11 +40704,27 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             if (ctx.is_arm64) ctx.mem.write64(out, a64_guest_va(ARM_AINPUTEVENT));
             else              ctx.mem.write32((uint32_t)out, ARM_AINPUTEVENT);
         }
-        static int n = 0;
-        if (n++ < 32)
-            fprintf(stderr, "[ainput] getEvent action=%d at %.0f,%.0f (%zu left)\n",
-                    g_ndk_input_cur.action, (double)g_ndk_input_cur.x,
-                    (double)g_ndk_input_cur.y, g_ndk_input_q.size());
+        /* Not a hard cap.  A counter that stops at N makes "the guest stopped
+         * reading its input queue" and "the log stopped printing" the same
+         * picture, and the first of those is a real failure this emulator has
+         * had before (a readiness delivered to the wrong Looper, after which
+         * AInputQueue_getEvent is never called again).  Print the opening
+         * events, then one in every hundred, and always the first read after a
+         * quiet spell -- so a gap in the stream is a gap in the stream. */
+        {
+            static uint64_t n = 0;
+            static int64_t last_ms = 0;
+            const int64_t now = guest_net::now_ms();
+            const bool after_gap = last_ms && now - last_ms >= 1000;
+            if (n < 32 || (n % 100) == 0 || after_gap)
+                fprintf(stderr, "[ainput] getEvent #%llu action=%d at %.0f,%.0f "
+                        "(%zu left)%s\n", (unsigned long long)n,
+                        g_ndk_input_cur.action, (double)g_ndk_input_cur.x,
+                        (double)g_ndk_input_cur.y, g_ndk_input_q.size(),
+                        after_gap ? " — first read after a quiet spell" : "");
+            last_ms = now;
+            ++n;
+        }
         ret32(0u);
         break;
     }
@@ -34840,36 +40860,85 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             ? (g_svc_args64[1] ? (const char *)ctx.mem.ptr(g_svc_args64[1]) : nullptr)
             : (r1 ? (const char *)ctx.mem.ptr(r1) : nullptr);
         if (!fname) { ret32(0); break; }
-        std::vector<uint8_t> data;
-        const char *via = nullptr;
-        if (!aasset_load_bytes(fname, data, &via)) {
-            if (lunaria_env("LUNARIA_TRACE_ASSET"))
-                fprintf(stderr, "[AAsset] open MISS %s\n", fname);
-            ret32(0); break;
+        /* Copy the name before dropping the lock: the guest string lives in
+         * shared memory other engines may unmap, and the load itself is
+         * host I/O (Cross Worlds opens a 28 MiB shader archive here). */
+        char namebuf[PATH_MAX];
+        {
+            size_t n = 0;
+            while (n + 1 < sizeof namebuf && fname[n]) {
+                namebuf[n] = fname[n];
+                ++n;
+            }
+            namebuf[n] = '\0';
+            if (fname[n]) { ret32(0); break; } /* truncated */
         }
-        uint32_t buf_va = arm_malloc(ctx, (uint32_t)data.size() + 1u);
-        if (!buf_va) { ret32(0); break; }
-        uint8_t *dst = ctx.mem.ptr(buf_va);
-        memcpy(dst, data.data(), data.size());
-        dst[data.size()] = 0;
+        const int mode = ctx.is_arm64 ? (int)g_svc_args64[2] : (int)r2;
+        /* NDK: UNKNOWN=0 RANDOM=1 STREAMING=2 BUFFER=3.  BUFFER wants getBuffer;
+         * RANDOM/STREAMING typically openFileDescriptor — keep host path only. */
+        const bool want_buffer = (mode == 3);
+
+        std::string host;
+        uint64_t host_len = 0;
+        const char *via = nullptr;
+        bool have_host = false;
+        {
+            ArmLockDropped unlock_for_asset;
+            have_host = aasset_resolve_host(namebuf, host, host_len, &via);
+        }
+
+        GuestAsset asset;
+        if (have_host && !want_buffer && host_len >= kAAssetDeferBytes) {
+            asset.host_path = std::move(host);
+            asset.length = host_len;
+            asset.pos = 0;
+            asset.buf_va = 0;
+        } else {
+            std::vector<uint8_t> data;
+            bool ok;
+            {
+                ArmLockDropped unlock_for_asset;
+                if (have_host) {
+                    ok = asset_bridge::read_host_regular(host, data);
+                    if (ok && !via) via = "fs";
+                } else {
+                    ok = aasset_load_bytes(namebuf, data, &via);
+                }
+            }
+            if (!ok) {
+                if (lunaria_env("LUNARIA_TRACE_ASSET"))
+                    fprintf(stderr, "[AAsset] open MISS %s\n", namebuf);
+                ret32(0); break;
+            }
+            asset.data = std::move(data);
+            asset.length = asset.data.size();
+            asset.pos = 0;
+            asset.host_path = have_host ? std::move(host) : std::string();
+            if (!aasset_materialize(ctx, asset)) { ret32(0); break; }
+        }
+
         uint32_t handle = g_next_asset_handle;
         g_next_asset_handle += 4u;
-        g_assets[handle] = GuestAsset{ std::move(data), buf_va, 0u };
-        fprintf(stderr, "[AAsset] open %s via %s -> handle 0x%x (%zu bytes)\n",
-                fname, via ? via : "?", handle, g_assets[handle].data.size());
+        const size_t reported = (size_t)asset.length;
+        const char *how = asset.data.empty() ? "fd-defer" : "buffered";
+        g_assets[handle] = std::move(asset);
+        fprintf(stderr, "[AAsset] open %s via %s -> handle 0x%x (%zu bytes, %s)\n",
+                namebuf, via ? via : "?", handle, reported, how);
         ret32(handle);
         break;
     }
     case SVC_AASSET_GETBUFFER: {
         // AAsset_getBuffer(AAsset* asset[r0]) -> const void*
         auto it = g_assets.find(r0);
-        ret32(it != g_assets.end() ? it->second.buf_va : 0u);
+        if (it == g_assets.end()) { ret32(0); break; }
+        if (!aasset_materialize(ctx, it->second)) { ret32(0); break; }
+        ret32(it->second.buf_va);
         break;
     }
     case SVC_AASSET_GETLENGTH: {
         // AAsset_getLength(AAsset* asset[r0]) -> off_t (32-bit)
         auto it = g_assets.find(r0);
-        ret32(it != g_assets.end() ? (uint32_t)it->second.data.size() : 0u);
+        ret32(it != g_assets.end() ? (uint32_t)aasset_length(it->second) : 0u);
         break;
     }
     case SVC_AASSET_READ: {
@@ -34879,12 +40948,33 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         GuestAsset &a = it->second;
         const GuestVA dst = argp_n(1);
         const uint64_t want = ctx.is_arm64 ? (uint64_t)argp_n(2) : (uint64_t)arg32(2);
-        uint64_t left = a.data.size() - a.pos; /* pos never passes size, see seek */
+        const uint64_t alen = aasset_length(a);
+        if (a.pos > alen) a.pos = alen;
+        uint64_t left = alen - a.pos;
         uint64_t n = want < left ? want : left;
         if (n && dst) {
-            uint8_t *p = ctx.mem.try_ptr(dst, (size_t)n);
-            if (!p) { arm_set_errno(ctx, EFAULT); ret32((uint32_t)-1); break; }
-            memcpy(p, a.data.data() + a.pos, (size_t)n);
+            /* Prefer host pread for deferred assets — avoids a full 28 MiB copy
+             * when the guest only samples the header. */
+            if (a.data.empty() && !a.host_path.empty()) {
+                uint8_t *p = ctx.mem.try_ptr(dst, (size_t)n);
+                if (!p) { arm_set_errno(ctx, EFAULT); ret32((uint32_t)-1); break; }
+                ssize_t got;
+                {
+                    ArmLockDropped unlock_for_pread;
+                    int fd = open(a.host_path.c_str(), O_RDONLY | O_CLOEXEC);
+                    if (fd < 0) { arm_set_errno(ctx, errno); ret32((uint32_t)-1); break; }
+                    got = pread(fd, p, (size_t)n, (off_t)a.pos);
+                    int e = errno;
+                    close(fd);
+                    if (got < 0) { arm_set_errno(ctx, e); ret32((uint32_t)-1); break; }
+                }
+                n = (uint64_t)got;
+            } else {
+                if (!aasset_materialize(ctx, a)) { ret32((uint32_t)-1); break; }
+                uint8_t *p = ctx.mem.try_ptr(dst, (size_t)n);
+                if (!p) { arm_set_errno(ctx, EFAULT); ret32((uint32_t)-1); break; }
+                memcpy(p, a.data.data() + a.pos, (size_t)n);
+            }
         } else if (n && !dst) {
             ret32((uint32_t)-1);
             break;
@@ -34913,12 +41003,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         } else {
             off = (int32_t)arg32(1); whence = (int)arg32(2);
         }
+        const int64_t alen = (int64_t)aasset_length(a);
         int64_t base = whence == SEEK_CUR ? (int64_t)a.pos
-                     : whence == SEEK_END ? (int64_t)a.data.size()
+                     : whence == SEEK_END ? alen
                      : whence == SEEK_SET ? 0
                      : -1;
         int64_t np = base + off;
-        if (base < 0 || np < 0 || (uint64_t)np > a.data.size()) {
+        if (base < 0 || np < 0 || np > alen) {
             wide ? ret64(~0ull) : ret32((uint32_t)-1);
             break;
         }
@@ -34930,20 +41021,25 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_AASSET_GETREMAINING64: {
         auto it = g_assets.find(r0);
         if (it == g_assets.end()) { ret64(0); break; }
+        const uint64_t alen = aasset_length(it->second);
         ret64(svc_no == SVC_AASSET_GETLENGTH64
-                  ? (uint64_t)it->second.data.size()
-                  : (uint64_t)(it->second.data.size() - it->second.pos));
+                  ? alen
+                  : (alen - it->second.pos));
         break;
     }
     case SVC_AASSET_GETREMAINING: {
         auto it = g_assets.find(r0);
         if (it == g_assets.end()) { ret32(0); break; }
-        ret32((uint32_t)(it->second.data.size() - it->second.pos));
+        ret32((uint32_t)(aasset_length(it->second) - it->second.pos));
         break;
     }
     case SVC_AASSET_ISALLOCATED:
-        // The whole entry is already in memory, so getBuffer never copies.
-        ret32(g_assets.count(r0) ? 1u : 0u);
+        /* 1 only when getBuffer already has a stable guest mapping — deferred
+         * host-backed assets are not allocated until materialize. */
+        {
+            auto it = g_assets.find(r0);
+            ret32(it != g_assets.end() && it->second.buf_va ? 1u : 0u);
+        }
         break;
     case SVC_AASSET_CLOSE: {
         auto it = g_assets.find(r0);
@@ -35006,23 +41102,20 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_AASSET_OPENFD32: {
         auto it = g_assets.find(r0);
         if (it == g_assets.end()) { ret32((uint32_t)-1); break; }
-        char tmpl[] = "/tmp/lunaria-asset-XXXXXX";
-        int fd = mkstemp(tmpl);
-        if (fd < 0) { ret32((uint32_t)-1); break; }
-        const auto &data = it->second.data;
-        if (!data.empty()) {
-            size_t wr = write(fd, data.data(), data.size());
-            (void)wr;
+        GuestAsset &a = it->second;
+        if (a.host_path.empty() && a.data.empty() && a.length > 0) {
+            if (!aasset_materialize(ctx, a)) { ret32((uint32_t)-1); break; }
         }
-        lseek(fd, 0, SEEK_SET);
-        unlink(tmpl);
+        int64_t start = 0, length = 0;
+        int fd = aasset_open_file_descriptor(a, &start, &length);
+        if (fd < 0) { arm_set_errno(ctx, errno); ret32((uint32_t)-1); break; }
         if (r1) {
             if (!ctx.mem.try_ptr(r1, 4)) { close(fd); arm_set_errno(ctx, EFAULT); ret32((uint32_t)-1); break; }
-            ctx.mem.write32(r1, 0u);
+            ctx.mem.write32(r1, (uint32_t)start);
         }
         if (r2) {
             if (!ctx.mem.try_ptr(r2, 4)) { close(fd); arm_set_errno(ctx, EFAULT); ret32((uint32_t)-1); break; }
-            ctx.mem.write32(r2, (uint32_t)data.size());
+            ctx.mem.write32(r2, (uint32_t)length);
         }
         ret32((uint32_t)fd);
         break;
@@ -35030,24 +41123,20 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_AASSET_OPENFD64: {
         auto it = g_assets.find(r0);
         if (it == g_assets.end()) { ret32((uint32_t)-1); break; }
-        char tmpl[] = "/tmp/lunaria-asset-XXXXXX";
-        int fd = mkstemp(tmpl);
-        if (fd < 0) { ret32((uint32_t)-1); break; }
-        const auto &data = it->second.data;
-        if (!data.empty()) {
-            size_t wr = write(fd, data.data(), data.size());
-            (void)wr;
+        GuestAsset &a = it->second;
+        if (a.host_path.empty() && a.data.empty() && a.length > 0) {
+            if (!aasset_materialize(ctx, a)) { ret32((uint32_t)-1); break; }
         }
-        lseek(fd, 0, SEEK_SET);
-        unlink(tmpl);
-        const uint64_t len = (uint64_t)data.size();
+        int64_t start = 0, length = 0;
+        int fd = aasset_open_file_descriptor(a, &start, &length);
+        if (fd < 0) { arm_set_errno(ctx, errno); ret32((uint32_t)-1); break; }
         if (r1) {
             if (!ctx.mem.try_ptr(r1, 8)) { close(fd); arm_set_errno(ctx, EFAULT); ret32((uint32_t)-1); break; }
-            ctx.mem.write64(r1, 0ull);
+            ctx.mem.write64(r1, (uint64_t)start);
         }
         if (r2) {
             if (!ctx.mem.try_ptr(r2, 8)) { close(fd); arm_set_errno(ctx, EFAULT); ret32((uint32_t)-1); break; }
-            ctx.mem.write64(r2, len);
+            ctx.mem.write64(r2, (uint64_t)length);
         }
         ret32((uint32_t)fd);
         break;
@@ -35367,6 +41456,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_DUP2:
+        /* In a forked child this is the child's own descriptor table, which
+         * is not this process's — see child_fd_set() next to fork(). */
+        if (fork_child_by_tid(g_current_tid) && (int)r0 != (int)r1) {
+            child_fd_set(g_current_tid, (int)r1, (int)r0);
+            ret32((uint32_t)(int32_t)r1);
+            break;
+        }
         ret32((uint32_t)(int32_t)dup2((int)r0, (int)r1));
         break;
     case SVC_CLOCK_GETRES: {
@@ -35686,7 +41782,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             ret32(0);
             break;
         }
-        uint32_t fshim = register_file(ctx, file);
+        uint32_t fshim = register_file(ctx, file, true);
         if (!fshim) { ret32(0); break; }
         if (name && strstr(name, ".dll")) {
             static int open_log = 0;
@@ -35694,21 +41790,26 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 fprintf(stderr, "[mono_file_map_open] OK: %s shim=%#x fd=%d\n",
                         open_name, fshim, fileno(file));
         }
-        ret32(fshim);
+        retptr(guest_file_va(ctx, fshim));
         break;
     }
     case SVC_MONO_FILE_MAP_FD: {
-        uint32_t fshim = r0;
+        const GuestVA fshim = ctx.is_arm64 ? g_svc_args64[0] : (GuestVA)r0;
         if (!fshim) { ret32(~0u); break; }
-        uint16_t fd16 = 0;
-        if (uint8_t *p = (uint8_t*)ctx.mem.ptr(fshim))
-            memcpy(&fd16, p + 14, 2);
+        int fd = -1;
+        if (ctx.is_arm64 && fshim >= 256u)
+            fd = (int)ctx.mem.read32(fshim + GFILE_FD);
+        else if (uint8_t *p = (uint8_t*)ctx.mem.ptr(fshim)) {
+            uint16_t fd16 = 0;
+            memcpy(&fd16, p + FILE_SHIM_FD, 2);
+            fd = (int)fd16;
+        }
         FILE *f = resolve_file(ctx, fshim);
-        int fd = f ? fileno(f) : (int)fd16;
+        if (f) fd = fileno(f);
         static int fd_log = 0;
         if (fd_log++ < 6)
-            fprintf(stderr, "[mono_file_map_fd] shim=%#x fd16=%u host=%d lr=0x%08x\n",
-                    fshim, (unsigned)fd16, fd, lr);
+            fprintf(stderr, "[mono_file_map_fd] shim=%#llx host=%d lr=0x%08x\n",
+                    (unsigned long long)fshim, fd, lr);
         ret32((uint32_t)fd);
         break;
     }
@@ -35779,12 +41880,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_MONO_FILE_MAP_CLOSE: {
         // mono_file_map_close(FILE*): close host fd behind guest shim.
-        FILE *f = resolve_file(ctx, r0);
-        if (f) {
-            for (uint32_t k = 1; k < 256; ++k)
-                if (g_file_tab[k] == f) { g_file_tab[k] = nullptr; break; }
-            fclose(f);
-        }
+        uint32_t idx = 0, gen = 0;
+        bool stamped = false;
+        file_handle_parts(ctx, r0, &idx, &gen, &stamped);
+        if (FILE *f = file_table_detach(idx, gen, stamped)) guest_stream_close(f);
         if (r0 >= 256u) arm_free(ctx, r0);
         ret32(0);
         break;
@@ -36813,10 +42912,11 @@ public:
         if ((ex == E::UndefinedInstruction || ex == E::UnpredictableInstruction ||
              ex == E::DecodeError) && jit) {
             constexpr int GUEST_SIGILL = 4; /* Linux/ARM signal number */
-            auto sh = g_sighandlers.find(GUEST_SIGILL);
-            if (sh != g_sighandlers.end() && sh->second > 1u) {
+            const GuestVA sigill_handler =
+                signal_handler_load(guest_pid(), GUEST_SIGILL);
+            if (sigill_handler > 1u) {
                 auto &regs = jit->Regs();
-                uint32_t handler = (uint32_t)sh->second;
+                uint32_t handler = (uint32_t)sigill_handler;
                 static int sigill_log = 0;
                 if (sigill_log++ < 8)
                     fprintf(stderr, "[sigill] undefined instr 0x%08x at 0x%08x -> "
@@ -37326,9 +43426,25 @@ static void schedule_threads(uint64_t slice) {
         if (t.waiting_sem) {
             GuestVA sva = t.waiting_sem;
             auto it = g_sems.find(sva);
+            /* sem_timedwait's deadline is checked here, beside the cond and
+             * futex ones.  It used to be checked nowhere on this path: a
+             * waiter whose semaphore was never posted stayed parked for the
+             * life of the process, whatever absolute time it had asked for.
+             * `make sched-test` fails on exactly that, and a guest that arms
+             * a worker and waits a bounded time for its answer -- the shape
+             * every socket operation in this title's own net layer has --
+             * never gets its answer back. */
+            const bool sem_timed_out =
+                t.sem_timed && host_mono_ns() >= t.sem_until_ns;
             if (it != g_sems.end() && it->second > 0) {
                 --it->second;
-                t.regs[0] = 0;
+                t.regs[0]   = 0;
+                t.regs64[0] = 0;
+            } else if (sem_timed_out) {
+                t.regs[0]   = ~0u;
+                t.regs64[0] = ~0ull;
+                if (uint32_t eva = errno_va(ctx, t.id))
+                    ctx.mem.write32(eva, 110u /* ETIMEDOUT */);
             } else {
                 return false;
             }
@@ -37344,9 +43460,11 @@ static void schedule_threads(uint64_t slice) {
             const bool woken =
                 (tok != g_futex_wake_tokens.end() && tok->second > 0u);
             const bool changed = (ctx.mem.read32(uaddr) != t.futex_val);
+            const bool timed_out = t.futex_timed &&
+                                   host_mono_ns() >= t.futex_until_ns;
             if (woken) {
                 if (--tok->second == 0u) g_futex_wake_tokens.erase(tok);
-            } else if (!changed) {
+            } else if (!changed && !timed_out) {
                 return false;
             }
             if (ftrace_addr(uaddr))
@@ -37354,7 +43472,22 @@ static void schedule_threads(uint64_t slice) {
                         "changed=%d word=0x%08x\n", (unsigned long long)uaddr,
                         t.id, (int)woken, (int)changed, ctx.mem.read32(uaddr));
             futex_waiter_remove(t.id, uaddr);
+            const bool raw_result = t.futex_raw_result;
             t.waiting_futex = 0;
+            t.futex_timed = false;
+            t.futex_until_ns = 0;
+            t.futex_raw_result = false;
+            if (timed_out && !woken && !changed) {
+                if (raw_result) {
+                    t.regs[0] = (uint32_t)-(int32_t)ETIMEDOUT;
+                    t.regs64[0] = (uint64_t)-(int64_t)ETIMEDOUT;
+                } else {
+                    const uint32_t eva = errno_va(ctx, t.id);
+                    if (eva) ctx.mem.write32(eva, ETIMEDOUT);
+                    t.regs[0] = ~0u;
+                    t.regs64[0] = UINT64_MAX;
+                }
+            }
             auto wa = g_futex_wait_addrs.find(uaddr);
             if (wa != g_futex_wait_addrs.end() && wa->second > 0u && --wa->second == 0u)
                 g_futex_wait_addrs.erase(wa);
@@ -37533,16 +43666,40 @@ static void schedule_threads(uint64_t slice) {
          * unprocessed entry as queued and does not duplicate it. */
         std::deque<uint8_t> batch;
         batch.swap(g_ready_queue);
+        auto start_new_threads = [&] {
+            for (unsigned guard = 0; guard < 64u && !g_start_queue.empty();
+                 ++guard) {
+                const uint8_t tid = g_start_queue.front();
+                g_start_queue.pop_front();
+                start_queue_publish();
+                if (!g_in_ready[tid]) continue;
+                ArmThread *tp = thread_slot_by_tid(tid);
+                if (!tp || tp->finished || tp->running || tp->slices) {
+                    g_in_ready[tid] = false;
+                    continue;
+                }
+                g_in_ready[tid] = false;
+                ++g_ready_pops[tid];
+                if (thread_needs_poll(*tp)) { thread_mark_blocked(tid); continue; }
+                sched_run_thread(*tp);
+                drive_opensles_callbacks(ctx);
+            }
+        };
         auto drain = [&](std::deque<uint8_t> &q, size_t budget) {
+        start_new_threads();
         for (size_t n = 0; n < budget && !q.empty(); ++n) {
             arm_lock_yield();
+            start_new_threads();
             const uint8_t tid = q.front();
             q.pop_front();
             if (!g_in_ready[tid]) continue;
+            ArmThread *tp = thread_slot_by_tid(tid);
+            if (!tp || tp->finished || tp->running) {
+                g_in_ready[tid] = false;
+                continue;
+            }
             g_in_ready[tid] = false;
             ++g_ready_pops[tid];
-            ArmThread *tp = thread_slot_by_tid(tid);
-            if (!tp || tp->finished || tp->running) continue;
             if (thread_needs_poll(*tp)) {
                 thread_mark_blocked(tid);
                 continue;
@@ -37564,15 +43721,34 @@ static void schedule_threads(uint64_t slice) {
                         (unsigned long long)tp->pc64);
             }
             sched_run_thread(*tp);
+            /* OpenSL ES buffer-queue callbacks are audio-device events, not
+             * display events.  Running them only from
+             * arm64_exec_run_pending_threads() tied a 21 ms audio buffer to
+             * the renderer's 20--35 Hz pump in heavy scenes: the sink would
+             * finish a buffer, then wait for the next video frame before the
+             * guest mixer was asked for another one.  Check the device-played
+             * boundary after every guest scheduling slice instead.  The
+             * callback helper is re-entrancy guarded, and sched_run_thread()
+             * has finished using tp before the callback is allowed to create
+             * or retire guest threads. */
+            drive_opensles_callbacks(ctx);
         }
         };
         /* The batch first, so nothing that was queued when the pass began can
-         * be skipped, then whatever arrived while it ran — a sleep that came
-         * due wants to run in this pass, not the next one, and deferring it
-         * costs the latency the sleep heap exists to avoid. */
+         * be skipped, then one snapshot of whatever arrived while it ran.  Do
+         * not drain the live queue directly: an urgent sleeper re-queues at
+         * its head from inside sched_run_thread(), can be selected again in
+         * the same fixed budget, and leaves the old tail untouched forever.
+         * Cross Worlds exposed exactly that after a scene transition:
+         * RenderThread 2 stayed ready and present stopped while short-sleep
+         * workers repeatedly consumed this second drain.  New arrivals while
+         * the snapshot runs remain in g_ready_queue for the next pass. */
         const size_t batch_n = batch.size();
         drain(batch, batch_n);
-        drain(g_ready_queue, g_ready_queue.size());
+        std::deque<uint8_t> arrivals;
+        arrivals.swap(g_ready_queue);
+        drain(arrivals, arrivals.size());
+        start_new_threads();
 
     }
 
@@ -37771,6 +43947,8 @@ static void call_guest_abi32(ArmExecCtx &ctx, uint32_t fn_va, const GuestArg *ar
         ? atof(getenv("LUNARIA_CB_SECONDS")) : 120.0;
     for (;;) {
         bool lock_abandon = false;
+        const bool waiting = g_cb_lock_wait.kind != CbLockWait::Idle;
+        if (waiting) __atomic_add_fetch(&g_callback_waiters, 1u, __ATOMIC_RELEASE);
         while (g_cb_lock_wait.kind != CbLockWait::Idle) {
             if (cb_lock_wait_try_grant(ctx)) break;
             if (g_cb_lock_wait.kind != CbLockWait::Cond &&
@@ -37781,6 +43959,7 @@ static void call_guest_abi32(ArmExecCtx &ctx, uint32_t fn_va, const GuestArg *ar
             }
             cb_lock_wait_progress(ctx, depth);
         }
+        if (waiting) __atomic_sub_fetch(&g_callback_waiters, 1u, __ATOMIC_RELEASE);
         if (lock_abandon) break;
         if (g_cb_resume_result_pending) {
             jit.Regs()[0] = g_cb_resume_result;
@@ -37922,6 +44101,61 @@ struct AudioCbIdentity {
     }
 };
 
+/* A Java Thread is also a Linux thread in ART.  DVM bytecode workers are host
+ * pthreads, but until now JNI callbacks from all of them borrowed whichever
+ * native guest tid this host thread happened to have last observed.  That
+ * merges mutex ownership between unrelated Android threads: a Volley callback
+ * entered UE while its borrowed tid was asleep in FEvent::Wait, appeared to
+ * re-lock the waiter's own NORMAL mutex, and stopped rendering.  Keep a real
+ * Android tid and TLS for the lifetime of every DVM host worker.
+ *
+ * This is deliberately not an ArmThread slot.  Java -> JNI is executed by
+ * call_guest_abi* as a host-driven callback and its blocking operations use
+ * CbLockWait.  Publishing the callback as a scheduler thread lets the ready
+ * queue resume the callback JIT's transient PC/registers as if they were a
+ * normal pthread, executing the same native callback twice and starving the
+ * render thread. */
+static thread_local uint32_t g_dvm_guest_tid;
+static thread_local GuestVA  g_dvm_guest_tls;
+
+extern "C" void arm_exec_dvm_thread_attach(void)
+{
+    if (!g_ctx || g_dvm_guest_tid) return;
+    ArmLockGuard locked;
+    const uint32_t tid = alloc_guest_tid();
+    if (!tid) return;
+    thread_name_set(tid, "DvmThread");
+    g_dvm_guest_tid = tid;
+    g_current_tid = tid;
+    if (g_ctx->is_arm64) {
+        g_dvm_guest_tls = arm64_tls_for_tid(*g_ctx, tid);
+        g_tpidr_el0_val = g_dvm_guest_tls;
+        g_tpidrro_el0_val = g_dvm_guest_tls;
+        if (a64_has_private_tls(g_dvm_guest_tls) && g_fast64_mutex_lock_va)
+            g_ctx->mem.write32(g_dvm_guest_tls + TLS64_OWNER_OFF,
+                               (tid + 1u) & 0xffu);
+        if (a64_has_private_tls(g_dvm_guest_tls) && g_fast64_gettid_va)
+            g_ctx->mem.write32(g_dvm_guest_tls + TLS64_TID_OFF,
+                               guest_tid_of(tid));
+    }
+}
+
+extern "C" void arm_exec_dvm_thread_detach(void)
+{
+    if (!g_ctx || !g_dvm_guest_tid) return;
+    ArmLockGuard locked;
+    const uint32_t tid = g_dvm_guest_tid;
+    if (g_ctx->is_arm64) arm64_tls_release(*g_ctx, tid);
+    guest_tid_release(tid);
+    g_dvm_guest_tid = 0;
+    g_dvm_guest_tls = 0;
+    g_current_tid = 0;
+    if (g_ctx->is_arm64) {
+        g_tpidr_el0_val = 0;
+        g_tpidrro_el0_val = 0;
+    }
+}
+
 // Pump every started AAudio stream's data callback once with a silent burst.
 static void drive_aaudio_callbacks(ArmExecCtx &ctx) {
     if (g_in_cb() || g_aaudio_streams.empty()) return;
@@ -37982,9 +44216,24 @@ static void drive_opensles_callbacks(ArmExecCtx &ctx) {
         /* Without a card there is nothing to measure, so the metronome stays:
          * the guest's mixer still has to run at the right speed. */
         if (!sink && now < q.next_due) continue;
-        if (sink && (!q.end_count ||
-                     luna_os_audio_played_frames() < q.end_frame[q.end_head]))
-            continue;
+        /* A real OpenSL mixer refills while a fraction of a period is still
+         * standing in the sink, not only once the sink has gone completely
+         * silent -- the callback and the enqueue it does take real time, and
+         * asking only after the buffer already finished playing leaves zero
+         * margin for that.  One period of headroom is the same margin the
+         * ALSA buffer size above gives the host side; ask for the next
+         * buffer once the device is within that much of catching up to the
+         * oldest one still queued, instead of requiring it to have already
+         * caught up. */
+        if (sink && q.end_count) {
+            const uint64_t played = luna_os_audio_played_frames();
+            const uint64_t end = q.end_frame[q.end_head];
+            const uint64_t low_water_frames =
+                (uint64_t)q.rate * q.period_ns / 1'000'000'000ull;
+            if (played + low_water_frames < end) continue;
+        } else if (sink) {
+            continue;   /* nothing tracked to measure the sink's headroom against */
+        }
         /* Bound the work one pump pass may hand the guest.  Each retirement
          * runs guest code that enqueues the next buffer, and a sink that
          * cannot be filled (writes failing, rate mismatch) would otherwise
@@ -38018,7 +44267,9 @@ static void drive_opensles_callbacks(ArmExecCtx &ctx) {
                         luna_os_audio_queued_frames());
             ++pump_n;
         } while (sink && q.queued && ++retired_now < 64u && q.end_count &&
-                 luna_os_audio_played_frames() >= q.end_frame[q.end_head]);
+                 luna_os_audio_played_frames() +
+                         (uint64_t)q.rate * q.period_ns / 1'000'000'000ull >=
+                     q.end_frame[q.end_head]);
     }
 }
 
@@ -38183,15 +44434,17 @@ static void set_cur_tid(ArmExecCtx &ctx, uint32_t tid) {
     egl_sync_current_context(tid);
     if (egl_t0) g_slice_egl_ns += host_mono_ns() - egl_t0;
     if (ctx.is_arm64) {
-        uint64_t tls = arm64_tls_for_tid(ctx, tid);
+        ArmThread *thread = thread_slot_by_tid(tid);
+        uint64_t tls = thread && thread->tls64
+                     ? thread->tls64 : arm64_tls_for_tid(ctx, tid);
         g_tpidr_el0_val = tls;
         g_tpidrro_el0_val = tls;
         /* Cache it on the thread so the slice prologue needs no lock. */
         for (auto &t : g_threads)
             if (t.id == tid) { t.tls64 = tls; break; }
-        if (g_fast64_mutex_lock_va)
+        if (a64_has_private_tls(tls) && g_fast64_mutex_lock_va)
             ctx.mem.write32((GuestVA)(tls + TLS64_OWNER_OFF), (tid + 1u) & 0xffu);
-        if (g_fast64_gettid_va)
+        if (a64_has_private_tls(tls) && g_fast64_gettid_va)
             ctx.mem.write32((GuestVA)(tls + TLS64_TID_OFF), guest_tid_of(tid));
     }
     if (g_fastmutex_lock_va) ctx.mem.write32(CUR_TID_VA, tid + 1u);
@@ -38205,6 +44458,35 @@ static void build_misc_data_page(ArmExecCtx &ctx) {
         sl_store(ctx, va, sl_guest_ptr(ctx, va));
     // Fake stdin/stdout/stderr / __sF blob (opaque FILE stand-ins)
     ctx.mem.map(misc_stdio(), 256u);
+    /* `environ` is a data symbol containing char **, not a function.  Never
+     * expose the host environment (it contains macOS paths and launcher
+     * internals); publish the small process environment an Android zygote
+     * child normally inherits. */
+    {
+        static const char *const envv[] = {
+            "PATH=/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin",
+            "ANDROID_ROOT=/system",
+            "ANDROID_DATA=/data",
+            nullptr
+        };
+        GuestVA str = misc_env_strings();
+        for (uint32_t i = 0; envv[i]; ++i) {
+            const size_t n = strlen(envv[i]) + 1u;
+            memcpy(ctx.mem.ptr(str), envv[i], n);
+            if (ctx.is_arm64)
+                ctx.mem.write64(misc_env_array() + i * 8u, a64_guest_va((uint32_t)str));
+            else
+                ctx.mem.write32(misc_env_array() + i * 4u, (uint32_t)str);
+            str += (GuestVA)n;
+        }
+        if (ctx.is_arm64) {
+            ctx.mem.write64(misc_env_array() + 3u * 8u, 0);
+            ctx.mem.write64(misc_environ(), a64_guest_va(misc_env_array()));
+        } else {
+            ctx.mem.write32(misc_env_array() + 3u * 4u, 0);
+            ctx.mem.write32(misc_environ(), misc_env_array());
+        }
+    }
     /* The stack-protector cookie.  bionic randomises it once per process and
      * keeps the low byte zero so a string overflow cannot run past it; do the
      * same, because the guest reads this word directly. */
@@ -38792,6 +45074,34 @@ static void relink_pending_xlib_relocs(ArmExecCtx &ctx) {
                 fixed, keep);
 }
 
+/* DT_NEEDED objects are discovered incrementally.  An unresolved AArch64
+ * import must remain eligible for rebinding when its provider is mapped;
+ * keeping the initial unknown-call trampoline forever is not ELF linking. */
+static void relink_pending_a64_relocs(ArmExecCtx &ctx) {
+    if (g_pending_a64_relocs.empty()) return;
+    size_t keep = 0;
+    unsigned fixed = 0;
+    for (size_t i = 0; i < g_pending_a64_relocs.size(); ++i) {
+        auto &pr = g_pending_a64_relocs[i];
+        auto it = g_exported_syms64.find(pr.sym);
+        if (it == g_exported_syms64.end()) {
+            if (keep != i) g_pending_a64_relocs[keep] = std::move(pr);
+            ++keep;
+            continue;
+        }
+        const uint64_t val = it->second + (uint64_t)pr.addend;
+        std::memcpy(ctx.mem.ptr(pr.addr), &val, sizeof(val));
+        if (fixed < 8)
+            fprintf(stderr, "[relink64] %s -> 0x%llx (slot 0x%08x)\n",
+                    pr.sym.c_str(), (unsigned long long)val, pr.addr);
+        ++fixed;
+    }
+    g_pending_a64_relocs.resize(keep);
+    if (fixed)
+        fprintf(stderr, "[relink64] resolved %u late import(s), %zu still unbound\n",
+                fixed, keep);
+}
+
 static bool load_elf(ArmExecCtx &ctx, const char *path,
                      uint32_t &jni_onload_va, uint32_t base_addr,
                      bool ctors_via_cb) {
@@ -38829,7 +45139,9 @@ static bool load_elf(ArmExecCtx &ctx, const char *path,
         if(!is_exidx) {
             // Record each PT_LOAD with accurate ELF permissions so synth_guest_maps can mark code r-xp and data rw-p.
             g_loaded_regions.push_back({va & ~0xfffu, ((va+msz)+0xfffu) & ~0xfffu,
-                                        phdrs[i].p_flags, path});
+                                        phdrs[i].p_flags,
+                                        (uint64_t)phdrs[i].p_offset & ~0xfffull,
+                                        path, (uint64_t)st.st_ino});
             guest_rx_bounds_refresh();
         }
     }
@@ -39975,7 +46287,16 @@ extern "C" void arm_exec_request_quit(void) { g_guest_quit.store(true); }
 
 extern "C" int arm_exec_glfw_should_close(void) {
     if (g_guest_quit.load()) return 1;
-    return (g_glfw && glfwWindowShouldClose(g_glfw)) ? 1 : 0;
+    if (g_glfw && glfwWindowShouldClose(g_glfw)) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            fprintf(stderr, "[arm_exec] window close requested by the host "
+                            "window system\n");
+        }
+        return 1;
+    }
+    return 0;
 }
 
 // Run one cooperative scheduling pass: every runnable guest thread gets a tick-budgeted slice on the auxiliary JIT.
@@ -40548,6 +46869,234 @@ static void stbv_on_read_compressed_info(ArmExecCtx &ctx, uint64_t this_va,
     d.v = v;
     d.channels = stb_vorbis_get_info(v).channels;
     g_stbv_by_this[this_va] = d;
+    static int nok = 0;
+    if (nok++ < 16)
+        fprintf(stderr, "[vorbis] host decoder ready this=0x%llx size=%u "
+                        "channels=%d\n", (unsigned long long)this_va,
+                        buf_size, d.channels);
+}
+
+/* ------------------------------------------------------------------------ *
+ * Host implementations of guest functions, without touching the guest
+ * ------------------------------------------------------------------------ *
+ *
+ * A handful of the functions a UE title spends its life in are ones the host
+ * already has, bit-identical and hundreds of times faster: AES-256-ECB, SHA-1
+ * and single/triple DES-CBC.  On this title they are not a detail.  Sampling
+ * the guest PC over the boot sequence (LUNARIA_PC_HISTO=1):
+ *
+ *     39.0%  FAES::DecryptData        18.1%  FSHA1::Update
+ *
+ * and during the load that follows the title screen the pak content decrypt
+ * (DES_ncbc_encrypt) is most of what is left.  A phone runs the same ARM code
+ * natively and gets to the world in seconds; here it is minutes, and none of
+ * it is the JIT being slow -- it is the emulator declining to answer a
+ * question it can answer.
+ *
+ * How they used to be installed, and why that is gone
+ * ---------------------------------------------------
+ * The previous mechanism overwrote the function's first instruction in guest
+ * memory with `svc #N` and kept the displaced instruction in a resume stub.
+ * That is a patch: it changes the bytes the guest can read back, so any
+ * self-checksum over its own text sees a different image than the one that
+ * was loaded -- and this title ships a security module that does exactly that.
+ * It also meant the emulator was editing code it does not own, which is where
+ * the "the hooks introduce bugs" experience comes from.
+ *
+ * What replaces it
+ * ----------------
+ * Nothing is written, and no SVC is involved.  Dynarmic asks for the bytes of
+ * an instruction through MemoryReadCode() when it *translates* a block, and
+ * that is a separate path from the loads the guest itself issues.  So the
+ * translator is handed a `brk` at the hooked function's entry while every
+ * guest read of that address -- a checksum, a disassembler, dladdr, the
+ * module's own copy of itself -- still sees the original instruction, because
+ * guest memory was never changed.  Execution reaches ExceptionRaised(), the
+ * host implementation runs from the guest's own registers, and the PC is set
+ * to x30: an ABI-correct return from a function whose body was never entered.
+ *
+ * The entry addresses come from the module's .dynsym by name -- the same
+ * lookup the dynamic linker does -- so nothing here hardcodes an offset and a
+ * build that does not export the symbol simply keeps its own code.
+ *
+ * This replaces selected exported application functions without changing the
+ * bytes visible to the guest.  It is enabled by default; an explicit
+ * LUNARIA_CODE_HOOKS=0 disables the mechanism for comparison runs.
+ */
+struct CodeHookDef {
+    const char *sym;
+    uint32_t handler;
+    uint8_t width1, width2; /* Stricmp overload metadata; zero otherwise. */
+};
+
+/* The handler numbers are the emulator's own index into the host
+ * implementations in CallSVC below; they are not an instruction the guest
+ * ever executes.  Sharing them keeps one implementation of each function. */
+static const CodeHookDef kCodeHookSyms[] = {
+    /* FAES::DecryptData(uint8* Contents, uint32 NumBytes,
+     *                   const uint8* Key, uint32 KeyLen) — AES-256-ECB in
+     * place.  The FAESKey overload at -4 is a `b` to this entry, so both
+     * reach the hook. */
+    { "_ZN4FAES11DecryptDataEPhjPKhj", SVC_FAES_DECRYPT, 0, 0 },
+    /* FSHA1::HashBuffer(const void*, uint64, uint8* OutHash) — the whole-
+     * buffer form, which is what pak index verification calls and where
+     * FSHA1::Update's time is spent. */
+    { "_ZN5FSHA110HashBufferEPKvyPh", SVC_FSHA1_HASHBUFFER, 0, 0 },
+    /* OpenSSL DES-CBC, as this title's content decryption uses it.  The key
+     * schedule stays the guest's: DES_set_key* builds the public OpenSSL
+     * layout, which is the object the host's implementation expects. */
+    { "DES_ncbc_encrypt", SVC_DES_NCBC, 0, 0 },
+    { "DES_ede3_cbc_encrypt", SVC_DES_EDE3_CBC, 0, 0 },
+    { "_Z10CityHash64PKcj", SVC_CITYHASH64, 0, 0 },
+    { "_Z10CityHash32PKcj", SVC_CITYHASH32, 0, 0 },
+    /* UTF-16 Stricmp/Strnicmp only.  ReloadInfoAll's stall PC is inside
+     * Stricmp while FNk*InfoManager::Load inserts CSV keys into maps; the
+     * guest fold-table loop is the wrong place to spend that time. */
+    { "_ZN23FGenericPlatformStricmp7StricmpEPKDsS1_",
+      SVC_UE_STRICMP, 2, 2 },
+    { "_ZN23FGenericPlatformStricmp8StrnicmpEPKDsS1_y",
+      SVC_UE_STRNICMP, 2, 2 },
+    { "_ZN5UxCsv8FetchRowEv", SVC_UXCSV_FETCHROW, 0, 0 },
+    { "_ZN17TStringConversionI20FUTF8ToTCHAR_ConvertLi128EE4InitEPKciN21ENullTerminatedString4TypeE",
+      SVC_UE_UTF8_TO_TCHAR, 0, 0 },
+    { "_ZN7FString13ReplaceInlineEPKDsS1_N11ESearchCase4TypeE",
+      SVC_UE_REPLACE_INLINE, 0, 0 },
+    { "_ZNK15TStringViewImplIDsE8FindCharEDsRi",
+      SVC_UE_FINDCHAR, 2, 0 },
+    { "_ZNK15TStringViewImplIcE8FindCharEcRi",
+      SVC_UE_FINDCHAR, 1, 0 },
+    { "_ZN16FVorbisAudioInfo18ReadCompressedInfoEPKhjP17FSoundQualityInfo",
+      SVC_STB_VORBIS_INFO, 0, 0 },
+    { "_ZN16FVorbisAudioInfo18ReadCompressedDataEPhbj",
+      SVC_STB_VORBIS_READ, 0, 0 },
+    { "_ZN16FVorbisAudioInfo20StreamCompressedDataEPhbj",
+      SVC_STB_VORBIS_READ, 0, 0 },
+};
+
+enum { CODE_HOOK_MAX = sizeof kCodeHookSyms / sizeof kCodeHookSyms[0] };
+
+/* `brk #0x4855`.  Any immediate does; this one is distinct from the RET probe
+ * LUNARIA_TRACE_A64_RET uses so a stray report cannot be mistaken for it. */
+static constexpr uint32_t CODE_HOOK_BRK = 0xd4200000u | (0x4855u << 5);
+
+/* Installed hooks, as a flat array: there are at most a handful, the lookup
+ * is on the translator's path, and a range test rejects almost every address
+ * before any of it is searched. */
+static uint32_t g_code_hook_va[CODE_HOOK_MAX];
+static uint32_t g_code_hook_handler[CODE_HOOK_MAX];
+static unsigned g_code_hook_n;
+static uint32_t g_code_hook_lo = 0xffffffffu;
+static uint32_t g_code_hook_hi;
+/* Set by a partial host implementation when this invocation must continue in
+ * the guest resume veneer instead of returning to x30.  Host callback entry
+ * is serialized per engine, but the flag is thread-local because engines run
+ * concurrently. */
+static thread_local bool g_code_hook_guest_resume;
+static thread_local uint32_t g_code_hook_site;
+
+/* The handler for a canonical guest address, or 0 when it is not hooked. */
+static inline uint32_t a64_code_hook_for(uint32_t canon) {
+    if (canon < g_code_hook_lo || canon > g_code_hook_hi) return 0;
+    for (unsigned i = 0; i < g_code_hook_n; ++i)
+        if (g_code_hook_va[i] == canon) return g_code_hook_handler[i];
+    return 0;
+}
+
+/* Resolve the table against everything mapped so far.  Called after each
+ * module publishes its exports, and idempotent: a symbol already installed is
+ * not installed twice, and the first module to define one wins, which is the
+ * scope order the linker itself used. */
+static void a64_install_code_hooks(ArmExecCtx &ctx) {
+    static bool disabled = [] {
+        const char *e = lunaria_env("LUNARIA_CODE_HOOKS");
+        return e && !strcmp(e, "0");
+    }();
+    if (disabled) return;
+    for (const CodeHookDef &d : kCodeHookSyms) {
+        auto it = g_exported_syms64.find(d.sym);
+        if (it == g_exported_syms64.end()) continue;
+        const uint32_t canon = a64_canon_va(it->second);
+        if (!canon || g_code_hook_n >= CODE_HOOK_MAX) continue;
+        bool have = false;
+        for (unsigned i = 0; i < g_code_hook_n; ++i)
+            if (g_code_hook_va[i] == canon) { have = true; break; }
+        if (have) continue;
+        if (d.handler == SVC_UE_STRICMP || d.handler == SVC_UE_STRNICMP) {
+            /* UE's case-fold table is part of the function's contract.  Find
+             * the adjacent adrp/add which materialises it; builds with a
+             * different prologue stay on their own implementation. */
+            uint32_t adrp = 0, add = 0;
+            uint64_t pair_va = 0;
+            for (uint32_t k = 0; k < 3; ++k) {
+                const uint32_t a = ctx.mem.read32(canon + k * 4u);
+                const uint32_t b = ctx.mem.read32(canon + k * 4u + 4u);
+                const uint32_t rd = a & 31u;
+                if ((a & 0x9f000000u) == 0x90000000u &&
+                    (b & 0xffc00000u) == 0x91000000u &&
+                    rd == (b & 31u) && rd == ((b >> 5) & 31u)) {
+                    adrp = a; add = b; pair_va = it->second + k * 4u;
+                    break;
+                }
+            }
+            if (!pair_va) continue;
+            int64_t page = (int64_t)(((adrp >> 5) & 0x7ffffu) << 2) |
+                           (int64_t)((adrp >> 29) & 3u);
+            if (page & (1ll << 20)) page -= 1ll << 21;
+            const uint64_t base = (pair_va & ~0xfffull) +
+                                  (uint64_t)(page * 4096ll);
+            const uint64_t off = (uint64_t)((add >> 10) & 0xfffu) <<
+                                 (((add >> 22) & 1u) ? 12 : 0);
+            const GuestVA table = (GuestVA)(base + off);
+            const uint8_t *fold = ctx.mem.ptr(table);
+            if (!fold) continue;
+            StricmpSite st{};
+            st.w1 = d.width1; st.w2 = d.width2;
+            std::memcpy(st.fold, fold, sizeof st.fold);
+            g_stricmp_sites[canon] = st;
+        }
+        if (d.handler == SVC_UE_FINDCHAR)
+            g_ue_findchar_sites[canon] = d.width1;
+        if (d.handler == SVC_UE_REPLACE_INLINE ||
+            d.handler == SVC_UXCSV_FETCHROW ||
+            d.handler == SVC_UE_UTF8_TO_TCHAR ||
+            d.handler == SVC_STB_VORBIS_INFO ||
+            d.handler == SVC_STB_VORBIS_READ) {
+            /* Unsupported shapes resume through a private veneer containing
+             * the two displaced instructions.  Guest image bytes are never
+             * changed; the translator alone substitutes the entry BRK. */
+            const uint32_t o0 = ctx.mem.read32(canon);
+            const uint32_t o1 = ctx.mem.read32(canon + 4u);
+            if (a64_insn_is_pc_relative(o0) || a64_insn_is_pc_relative(o1) ||
+                g_ue_stub_next + 0x20u > UE_STUB_BASE + 0x1000u)
+                continue;
+            const uint32_t stub = g_ue_stub_next;
+            g_ue_stub_next += 0x20u;
+            ctx.mem.map(stub, 0x20u);
+            ctx.mem.write32(stub, o0);
+            ctx.mem.write32(stub + 4u, o1);
+            ctx.mem.write32(stub + 8u, 0x58000050u); /* ldr x16,#8 */
+            ctx.mem.write32(stub + 12u, 0xd61f0200u); /* br x16 */
+            const GuestVA resume = a64_guest_va(canon + 8u);
+            std::memcpy(ctx.mem.ptr(stub + 16u), &resume, sizeof resume);
+            g_ue_replace_resume[canon] = stub;
+        }
+        g_code_hook_va[g_code_hook_n] = canon;
+        g_code_hook_handler[g_code_hook_n] = d.handler;
+        ++g_code_hook_n;
+        if (canon < g_code_hook_lo) g_code_hook_lo = canon;
+        if (canon > g_code_hook_hi) g_code_hook_hi = canon;
+        /* A hot utility such as Stricmp can already have been translated by
+         * a relocation-time callback before the main DSO finished publishing
+         * all exports.  Registration changes what MemoryReadCode supplies at
+         * this address, so every extant translation cache must forget it. */
+        const GuestVA hook_va = a64_guest_va(canon);
+        a64_invalidate_main_jit(ctx, hook_va, 4u);
+        a64_invalidate_engines(hook_va, 4u);
+        cb_invalidate_all(hook_va, 4u);
+        fprintf(stderr, "[hook] %s @0x%08x -> host implementation "
+                "(guest code unchanged; LUNARIA_CODE_HOOKS=0 to disable)\n",
+                d.sym, canon);
+    }
 }
 
 class Arm64Callbacks : public Dynarmic::A64::UserCallbacks {
@@ -40632,6 +47181,22 @@ public:
                 (unsigned long long)va, (unsigned long long)pc, where);
     }
     uint64_t cur_pc(void) { return jit64 ? jit64->GetPC() : 0; }
+    void watch_store(uint64_t va, const void *value, size_t bytes) {
+        const uint64_t watch = g_a64_watch_va.load(std::memory_order_relaxed);
+        if (!watch || va + bytes <= watch || va >= watch + 4u) return;
+        uint64_t raw = 0;
+        std::memcpy(&raw, value, std::min(bytes, sizeof raw));
+        const uint64_t pc = cur_pc();
+        const uint64_t base = a64_module_base_for(pc);
+        fprintf(stderr, "[a64-watch] store va=0x%llx size=%zu value=0x%llx "
+                        "pc=0x%llx",
+                (unsigned long long)va, bytes, (unsigned long long)raw,
+                (unsigned long long)pc);
+        if (base)
+            fprintf(stderr, " image+0x%llx", (unsigned long long)(pc - base));
+        fprintf(stderr, " tid=%u\n", g_current_tid);
+        dump_regs("a64-watch store");
+    }
     uint8_t  MemoryRead8 (uint64_t va) override {
         mem_cb_seen_at(va, cur_pc());
         return *ctx->mem.ptr((GuestVA)va); }
@@ -40661,10 +47226,10 @@ public:
             return std::nullopt;
         if (!a64_is_guest_va(va) && va >= A64_GUEST_SIZE) {
             // 64-bit mapping: guest-generated code (Boehm-GC / Mono stubs).
-            if (a64_mapped(va)) return ctx->mem.read32((GuestVA)va);
+            if (a64_executable(va)) return ctx->mem.read32((GuestVA)va);
             static int nx64 = 0;
             if (nx64++ < 8)
-                fprintf(stderr, "[arm64] MemoryReadCode reject unmapped va=0x%llx\n",
+                fprintf(stderr, "[arm64] MemoryReadCode reject unmapped/non-X va=0x%llx\n",
                         (unsigned long long)va);
             return std::nullopt;
         }
@@ -40672,7 +47237,28 @@ public:
         if (c < 0x1000u)
             return std::nullopt;
         if (guest_range_hits_rx(c, 4)) {
+            /* A function the host implements: the *translator* is given a
+             * brk, the guest's own copy of the instruction is untouched.
+             * See a64_install_code_hooks(). */
+            if (a64_code_hook_for(c)) return CODE_HOOK_BRK;
             uint32_t insn = ctx->mem.read32(c);
+            /* Non-mutating return probe.  Translation sees a BRK only at a
+             * requested RET; ExceptionRaised logs x0 and performs that RET.
+             * Guest memory is never patched, and execution is identical
+             * apart from leaving the JIT at the function boundary. */
+            if (insn == 0xd65f03c0u) {
+                const char *spec = lunaria_env("LUNARIA_TRACE_A64_RET");
+                const char *p = spec;
+                while (p && *p) {
+                    char *end = nullptr;
+                    const uint64_t target = strtoull(p, &end, 16);
+                    if (end == p) break;
+                    if (a64_canon_va(target) == c)
+                        return 0xd4298a40u; /* brk #0x4c52 ("LR") */
+                    if (*end != ',') break;
+                    p = end + 1;
+                }
+            }
             return insn;
         }
         // Trampoline page (incl. lazy unknown-symbol slots up to JNI table).
@@ -40715,18 +47301,21 @@ public:
         mem_cb_seen_at(va, cur_pc());
         uint32_t c = a64_canon_va(va);
         if (guest_range_hits_rx(c, 1) || runtime_ro(c, 1)) return;
+        watch_store(va, &v, sizeof v);
         if (g_wrange_hi) wrange_log(c, v, 1, jit64 ? (uint32_t)jit64->GetPC() : 0, 0, "a64-write8");
         *ctx->mem.ptr((GuestVA)va) = v; }
     void MemoryWrite16(uint64_t va, uint16_t v) override {
         mem_cb_seen_at(va, cur_pc());
         uint32_t c = a64_canon_va(va);
         if (guest_range_hits_rx(c, 2) || runtime_ro(c, 2)) return;
+        watch_store(va, &v, sizeof v);
         if (g_wrange_hi) wrange_log(c, v, 2, jit64 ? (uint32_t)jit64->GetPC() : 0, 0, "a64-write16");
         std::memcpy(ctx->mem.ptr((GuestVA)va), &v, 2); }
     void MemoryWrite64(uint64_t va, uint64_t v) override {
         mem_cb_seen_at(va, cur_pc());
         uint32_t c = a64_canon_va(va);
         if (guest_range_hits_rx(c, 8) || runtime_ro(c, 8)) return;
+        watch_store(va, &v, sizeof v);
         if (g_wrange_hi) wrange_log(c, (uint32_t)v, 8, jit64 ? (uint32_t)jit64->GetPC() : 0, 0, "a64-write64");
         if (c >= ENV_SLOT64_BASE && c < ENV_SLOT64_BASE + 32u) {
             static int sw = 0;
@@ -40745,6 +47334,7 @@ public:
                         (unsigned long long)va, c, v);
             return;
         }
+        watch_store(va, &v, sizeof v);
         if (g_wrange_hi) wrange_log(c, v, 4, jit64 ? (uint32_t)jit64->GetPC() : 0, 0, "a64-write32");
         if (c >= ENV_SLOT64_BASE && c < ENV_SLOT64_BASE + 32u) {
             static int sw = 0;
@@ -40756,6 +47346,7 @@ public:
         mem_cb_seen_at(va, cur_pc());
         uint32_t c = a64_canon_va(va);
         if (guest_range_hits_rx(c, 16) || runtime_ro(c, 16)) return;
+        watch_store(va, &v, sizeof v);
         if (g_wrange_hi) wrange_log(c, (uint32_t)v[0], 16, jit64 ? (uint32_t)jit64->GetPC() : 0, 0, "a64-write128");
         std::memcpy(ctx->mem.ptr((GuestVA)va), &v, 16); }
 
@@ -40768,11 +47359,14 @@ public:
         uint8_t *p = ctx->mem.ptr((GuestVA)va);
         if (((uintptr_t)p & (sizeof(T) - 1u)) == 0) {
             auto *a = reinterpret_cast<std::atomic<T> *>(p);
-            return a->compare_exchange_strong(expected, desired);
+            const bool ok = a->compare_exchange_strong(expected, desired);
+            if (ok) watch_store(va, &desired, sizeof desired);
+            return ok;
         }
         T current;
         std::memcpy(&current, p, sizeof current);
         if (current != expected) return false;
+        watch_store(va, &desired, sizeof desired);
         std::memcpy(p, &desired, sizeof desired);
         return true;
     }
@@ -41021,8 +47615,34 @@ public:
                 return;
             }
         }
-        fprintf(stderr, "[arm64] InterpreterFallback pc=0x%llx n=%zu\n",
-                (unsigned long long)pc, n);
+        /* "The JIT cannot translate this" is only actionable with the
+         * instruction itself: without the word there is nothing to look up and
+         * nothing to implement, and the thread comes straight back here, so a
+         * single undecodable instruction printed 300 000 identical lines in
+         * one run of Cross Worlds.  Report each PC once, with the words around
+         * it and the thread, and count the repeats. */
+        {
+            static std::mutex ifb_mu;
+            static std::map<uint64_t, uint64_t> ifb_seen;
+            std::lock_guard<std::mutex> lk(ifb_mu);
+            uint64_t &hits = ifb_seen[pc];
+            if (!hits++ && ifb_seen.size() <= 32u) {
+                fprintf(stderr, "[arm64] InterpreterFallback pc=0x%llx n=%zu "
+                        "tid=%u lr=0x%llx — dynarmic cannot translate:\n",
+                        (unsigned long long)pc, n, g_current_tid,
+                        (unsigned long long)(jit64 ? jit64->GetRegister(30) : 0));
+                for (int k = -2; k <= 2; ++k) {
+                    const uint64_t at = pc + (uint64_t)(int64_t)(k * 4);
+                    fprintf(stderr, "[arm64]   %c 0x%llx: %08x\n",
+                            k ? ' ' : '>', (unsigned long long)at,
+                            ctx ? ctx->mem.read32((GuestVA)at) : 0u);
+                }
+            } else if ((hits % 100000u) == 0u) {
+                fprintf(stderr, "[arm64] InterpreterFallback pc=0x%llx: %llu "
+                        "times — the thread cannot get past it\n",
+                        (unsigned long long)pc, (unsigned long long)hits);
+            }
+        }
         if (jit64 && ((!a64_is_guest_va(pc) && pc > 0xffffffffull) ||
                       pc == 0x7f800000ull || (pc & 0xfff00000ull) == 0x7f800000ull)) {
             static int ifb_dumps = 0;
@@ -41040,6 +47660,52 @@ public:
 
     void ExceptionRaised(uint64_t pc, Dynarmic::A64::Exception ex) override {
         using E = Dynarmic::A64::Exception;
+        /* A hooked function entry.  Run the host implementation over the
+         * guest's own registers and return the way the function would have:
+         * the body is never entered, and nothing in guest memory was altered
+         * to arrange it.  x30 is read before the handler runs, because a
+         * handler is free to use the register file it was given. */
+        if (ex == E::Breakpoint && ctx && jit64) {
+            const uint32_t handler = a64_code_hook_for(a64_canon_va(pc));
+            if (handler) {
+                const uint64_t ret_to = jit64->GetRegister(30);
+                g_code_hook_guest_resume = false;
+                g_code_hook_site = a64_canon_va(pc);
+                CallSVC(handler);
+                g_code_hook_site = 0;
+                if (g_code_hook_guest_resume)
+                    g_code_hook_guest_resume = false;
+                else
+                    jit64->SetPC(ret_to);
+                return;
+            }
+        }
+        if (ex == E::Breakpoint && ctx && jit64 &&
+            ctx->mem.read32((GuestVA)pc) == 0xd65f03c0u) {
+            const char *spec = lunaria_env("LUNARIA_TRACE_A64_RET");
+            const char *p = spec;
+            const uint32_t cpc = a64_canon_va(pc);
+            bool requested = false;
+            while (p && *p) {
+                char *end = nullptr;
+                const uint64_t target = strtoull(p, &end, 16);
+                if (end == p) break;
+                if (a64_canon_va(target) == cpc) { requested = true; break; }
+                if (*end != ',') break;
+                p = end + 1;
+            }
+            if (requested) {
+                fprintf(stderr,
+                        "[a64-ret] pc=0x%llx canon=0x%08x x0=0x%llx "
+                        "lr=0x%llx tid=%u\n",
+                        (unsigned long long)pc, cpc,
+                        (unsigned long long)jit64->GetRegister(0),
+                        (unsigned long long)jit64->GetRegister(30),
+                        g_current_tid);
+                jit64->SetPC(jit64->GetRegister(30));
+                return;
+            }
+        }
         if (ex == E::NoExecuteFault) {
             // Sentinel return: quiet halt (do not dump).
             if (pc_in_sentinel((GuestVA)pc)) {
@@ -41058,6 +47724,9 @@ public:
                             (unsigned long long)pc, (unsigned long long)lr,
                             (unsigned long long)x0,
                             pc < 0x1000u ? " (null)" : " (preferred/non-X)");
+                if (nxpc == 1)
+                    a64_dump_guest_backtrace("null-call", g_current_tid,
+                                             jit64->GetRegister(29));
                 uint32_t clr = a64_canon_va(lr);
                 if (clr >= 0x10004u && clr < 0x40000000u &&
                     !pc_in_sentinel((GuestVA)lr) && ctx) {
@@ -41069,9 +47738,12 @@ public:
                 if (nxpc <= 12) {
                     fprintf(stderr, "[arm64]   insn@lr-4=%08x %s\n", insn_m4,
                             lr_after_call ? "call" : "not-call");
-                        fprintf(stderr, "[arm64]   x8=%llx x19=%llx x20=%llx x21=%llx x22=%llx "
+                        fprintf(stderr, "[arm64]   x8=%llx x16=%llx x17=%llx "
+                                "x19=%llx x20=%llx x21=%llx x22=%llx "
                                 "x23=%llx x24=%llx x25=%llx x26=%llx\n",
                                 (unsigned long long)jit64->GetRegister(8),
+                            (unsigned long long)jit64->GetRegister(16),
+                            (unsigned long long)jit64->GetRegister(17),
                             (unsigned long long)jit64->GetRegister(19),
                             (unsigned long long)jit64->GetRegister(20),
                             (unsigned long long)jit64->GetRegister(21),
@@ -41080,6 +47752,23 @@ public:
                             (unsigned long long)jit64->GetRegister(24),
                                 (unsigned long long)jit64->GetRegister(25),
                                 (unsigned long long)jit64->GetRegister(26));
+                        uint64_t x16 = jit64->GetRegister(16), at_x16 = 0;
+                        const uint32_t x16_off = a64_canon_va(x16);
+                        /* Code and GOT pointers in an Android PIE are allowed
+                         * to be the narrow process VA.  a64_mapped() tests the
+                         * high architectural alias and therefore made the old
+                         * diagnostic claim every low GOT word was zero.  Read
+                         * the same backing offset the ELF loader populated;
+                         * x17 beside it is what Dynarmic's fastmem load saw. */
+                        if (ctx && x16_off >= 0x1000u &&
+                            x16_off <= UINT32_MAX - sizeof at_x16)
+                            std::memcpy(&at_x16, ctx->mem.ptr(x16_off),
+                                        sizeof at_x16);
+                        fprintf(stderr, "[arm64]   GOT[x16=0x%llx/off=0x%08x]="
+                                "0x%llx fastmem-x17=0x%llx\n",
+                                (unsigned long long)x16, x16_off,
+                                (unsigned long long)at_x16,
+                                (unsigned long long)jit64->GetRegister(17));
                         /* A NULL indirect call is almost always "the object I
                          * was handed is not what I think it is".  The first
                          * word behind each callee-saved pointer is its vtable,
@@ -41092,6 +47781,20 @@ public:
                         auto readable = [](uint64_t v) {
                             return a64_is_guest_va(v) || a64_mapped(v);
                         };
+                        const uint64_t wide = jit64->GetRegister(21);
+                        if (readable(wide)) {
+                            char msg[384];
+                            size_t mi = 0;
+                            while (mi + 1 < sizeof msg) {
+                                uint16_t ch = 0;
+                                std::memcpy(&ch, ctx->mem.ptr((GuestVA)wide + mi * 2u), 2);
+                                if (!ch) break;
+                                msg[mi++] = ch == '\n' || ch == '\r' ? ' ' :
+                                            (ch < 0x80u ? (char)ch : '?');
+                            }
+                            msg[mi] = '\0';
+                            fprintf(stderr, "[arm64]   utf16(x21)=\"%s\"\n", msg);
+                        }
                         for (int rr = 19; rr <= 26; ++rr) {
                             uint64_t rv = jit64->GetRegister(rr);
                             if (!readable(rv)) continue;
@@ -41181,7 +47884,7 @@ public:
                 if (jit64 && ctx && insn == 0xd4200020u) {
                     uint64_t fp = jit64->GetRegister(29);
                     uint64_t tls = g_tpidr_el0_val;
-                    uint64_t saved = fp >= 8 ? ctx->mem.read64(fp - 8u) : 0;
+                    uint64_t saved = fp >= 16 ? ctx->mem.read64(fp - 16u) : 0;
                     uint64_t live = tls ? ctx->mem.read64(tls + 0x28u) : 0;
                     fprintf(stderr, "[arm64]   stack-canary fp=0x%llx "
                             "saved=0x%llx tls=0x%llx live=0x%llx "
@@ -41266,9 +47969,8 @@ public:
         GuestVA handler = 0;
         {
             ArmLockGuard g;   /* g_sighandlers and the guest heap are shared */
-            auto it = g_sighandlers.find(GUEST_SIGTRAP);
-            if (it == g_sighandlers.end() || it->second <= 1u) return false;
-            handler = it->second;
+            handler = signal_handler_load(guest_pid(), GUEST_SIGTRAP);
+            if (handler <= 1u) return false;
         }
         uint64_t regs[31];
         for (int i = 0; i < 31; ++i) regs[i] = jit64->GetRegister((size_t)i);
@@ -41479,7 +48181,9 @@ public:
          * answer, and a build whose prologue does not match that pattern is
          * left alone (see stricmp_hook_install). */
         if (svc_no == SVC_UE_STRICMP || svc_no == SVC_UE_STRNICMP) {
-            const uint32_t site = a64_canon_va(jit64->GetPC() - 4u);
+            const uint32_t site = g_code_hook_site
+                                      ? g_code_hook_site
+                                      : a64_canon_va(jit64->GetPC() - 4u);
             auto it = g_stricmp_sites.find(site);
             int32_t r = 0;
             if (it != g_stricmp_sites.end()) {
@@ -41516,6 +48220,273 @@ public:
             return;
         }
 
+        /* UxCsv::FetchRow over UxBufferReader.
+         *
+         * Guest FetchRow does one virtual Read() and several basic_string
+         * ops per input byte.  UxBufferReader already exposes one contiguous
+         * [base,size,current] range (offsets 0x10/0x18/0x20; vptr matches
+         * _ZTV14UxBufferReader+16).  Walk that range once on the host.
+         *
+         * UxCsv layout (from the guest body): reader @+8, columns @+0x28,
+         * vector<string> begin/end/cap @+0x30/+0x38/+0x40.  libc++ string is
+         * the alternate layout: short size*2 in byte0, long cap|1,size,data.
+         * Long buffers are FMemory (_Znwm/_ZdlPv), so grow/shrink through
+         * those guest entry points — never arm_malloc. */
+        if (svc_no == SVC_UXCSV_FETCHROW) {
+            const uint32_t site = g_code_hook_site
+                                      ? g_code_hook_site
+                                      : a64_canon_va(jit64->GetPC() - 4u);
+            auto resume_guest = [&]() {
+                auto rs = g_ue_replace_resume.find(site);
+                if (rs != g_ue_replace_resume.end()) {
+                    jit64->SetPC(a64_guest_va(rs->second));
+                    g_code_hook_guest_resume = true;
+                    return;
+                }
+                fprintf(stderr, "[uxcsv] missing guest resume veneer @0x%08x\n",
+                        site);
+                jit64->SetRegister(0, 0);
+            };
+            const GuestVA self = jit64->GetRegister(0);
+            uint8_t *cp = self ? ctx->mem.ptr(self) : nullptr;
+            GuestVA reader = 0, vptr = 0, base = 0, current = 0;
+            uint64_t size = 0, columns = 0;
+            GuestVA vb = 0, ve = 0, vc = 0;
+            if (cp) {
+                std::memcpy(&reader, cp + 8, 8);
+                std::memcpy(&columns, cp + 0x28, 8);
+                std::memcpy(&vb, cp + 0x30, 8);
+                std::memcpy(&ve, cp + 0x38, 8);
+                std::memcpy(&vc, cp + 0x40, 8);
+            }
+            uint8_t *rp = reader ? ctx->mem.ptr(reader) : nullptr;
+            if (rp) {
+                std::memcpy(&vptr, rp, 8);
+                std::memcpy(&base, rp + 16, 8);
+                std::memcpy(&size, rp + 24, 8);
+                std::memcpy(&current, rp + 32, 8);
+            }
+            auto vt = g_exported_syms64.find("_ZTV14UxBufferReader");
+            const GuestVA want_vptr = vt == g_exported_syms64.end()
+                                           ? 0 : vt->second + 16u;
+            /* Prior row left size==columns; capacity must hold that many
+             * string slots.  First row (empty vector) resumes the guest so
+             * it owns the initial vector growth. */
+            const bool shape_ok = cp && rp && want_vptr && vptr == want_vptr &&
+                                  columns && columns <= 1024u &&
+                                  vb && ve >= vb && vc >= ve &&
+                                  ve - vb == columns * 24u &&
+                                  vc - vb >= columns * 24u &&
+                                  current >= base && current - base <= size &&
+                                  size <= (64u << 20);
+            if (!shape_ok) {
+                resume_guest();
+                return;
+            }
+            uint8_t *src = ctx->mem.ptr(base);
+            if (!src) {
+                resume_guest();
+                return;
+            }
+            struct CsvField { char *p; size_t n, cap; };
+            CsvField *fields = (CsvField *)calloc((size_t)columns,
+                                                  sizeof(CsvField));
+            if (!fields) {
+                resume_guest();
+                return;
+            }
+            bool parsed = true;
+            size_t pos = (size_t)(current - base);
+            auto append = [](CsvField *f, uint8_t ch) -> bool {
+                if (f->n == f->cap) {
+                    const size_t nc = f->cap ? f->cap * 2u : 32u;
+                    void *np = realloc(f->p, nc);
+                    if (!np) return false;
+                    f->p = (char *)np;
+                    f->cap = nc;
+                }
+                f->p[f->n++] = (char)ch;
+                return true;
+            };
+            for (uint64_t col = 0; parsed && col < columns; ++col) {
+                CsvField *f = &fields[col];
+                if (pos >= size) { parsed = false; break; }
+                uint8_t ch = src[pos++];
+                if (ch == '"') {
+                    bool closed = false;
+                    while (pos < size) {
+                        ch = src[pos++];
+                        if (ch == '\r') continue;
+                        if (ch != '"') {
+                            if (!append(f, ch)) parsed = false;
+                            if (!parsed) break;
+                            continue;
+                        }
+                        if (pos < size && src[pos] == '"') {
+                            ++pos;
+                            if (!append(f, '"')) parsed = false;
+                            if (!parsed) break;
+                            continue;
+                        }
+                        closed = true;
+                        if (pos < size) {
+                            ch = src[pos++];
+                            if (ch == '\r' && pos < size) ch = src[pos++];
+                            if (ch != ',' && ch != '\n') parsed = false;
+                        }
+                        break;
+                    }
+                    if (!closed) parsed = false;
+                } else {
+                    for (;;) {
+                        if (ch == '\r') {
+                            if (pos >= size) break;
+                            ch = src[pos++];
+                            continue;
+                        }
+                        if (ch == ',' || ch == '\n') break;
+                        if (!append(f, ch)) { parsed = false; break; }
+                        if (pos >= size) break;
+                        ch = src[pos++];
+                    }
+                }
+            }
+            /* Short-string path only.  Long libc++ strings allocate through
+             * UE's FMemory (_Znwm), which means call_guest_abi64 — that cannot
+             * run while this SVC is lockfree, and holding the execution lock
+             * for every row was the post-title stall (svc1482).  A row that
+             * needs a long buffer, or that would free a prior long buffer,
+             * resumes the guest body so FMemory owns the growth. */
+            if (parsed) {
+                for (uint64_t col = 0; parsed && col < columns; ++col) {
+                    if (fields[col].n > 22u) parsed = false;
+                    uint8_t *sp = ctx->mem.ptr(vb + col * 24u);
+                    if (!sp) { parsed = false; break; }
+                    uint64_t cap_word = 0;
+                    std::memcpy(&cap_word, sp, 8);
+                    if (cap_word & 1u) parsed = false;
+                }
+            }
+            if (parsed) {
+                for (uint64_t col = 0; col < columns; ++col) {
+                    uint8_t *sp = ctx->mem.ptr(vb + col * 24u);
+                    const CsvField *f = &fields[col];
+                    std::memset(sp, 0, 24);
+                    sp[0] = (uint8_t)(f->n * 2u);
+                    if (f->n) std::memcpy(sp + 1, f->p, f->n);
+                }
+                const GuestVA next = base + pos;
+                std::memcpy(rp + 32, &next, 8);
+                jit64->SetRegister(0, 1);
+            }
+            for (uint64_t col = 0; col < columns; ++col) free(fields[col].p);
+            free(fields);
+            if (parsed) return;
+            resume_guest();
+            return;
+        }
+
+        /* Host TStringConversion<FUTF8ToTCHAR_Convert, 128>::Init when the
+         * UTF-16 output fits in the object's 128-TCHAR inline buffer.
+         *
+         * Layout (from the guest body): inline TCHAR[128] at +0, heap ptr at
+         * +0x100 (0 = inline), String ptr at +0x108, length at +0x110.
+         * Longer outputs resume the guest so it owns FMemory growth. */
+        if (svc_no == SVC_UE_UTF8_TO_TCHAR) {
+            const uint32_t site = g_code_hook_site
+                                      ? g_code_hook_site
+                                      : a64_canon_va(jit64->GetPC() - 4u);
+            const GuestVA self = jit64->GetRegister(0);
+            const GuestVA src_va = jit64->GetRegister(1);
+            int32_t len = (int32_t)jit64->GetRegister(2);
+            const uint32_t nullterm = (uint32_t)jit64->GetRegister(3);
+            uint8_t *obj = self ? ctx->mem.ptr(self) : nullptr;
+            const uint8_t *src = src_va ? ctx->mem.ptr(src_va) : nullptr;
+            bool handled = false;
+            if (obj && src && len >= 0 && len < (1 << 20)) {
+                /* Count UTF-16 code units (surrogate pairs = 2). */
+                uint32_t out_n = 0;
+                for (int32_t i = 0; i < len; ) {
+                    uint32_t cp;
+                    uint8_t c = src[i++];
+                    if (c < 0x80u) cp = c;
+                    else if ((c & 0xe0u) == 0xc0u && i < len) {
+                        cp = (uint32_t)(c & 0x1fu) << 6;
+                        cp |= (uint32_t)(src[i++] & 0x3fu);
+                    } else if ((c & 0xf0u) == 0xe0u && i + 1 < len) {
+                        cp = (uint32_t)(c & 0x0fu) << 12;
+                        cp |= (uint32_t)(src[i++] & 0x3fu) << 6;
+                        cp |= (uint32_t)(src[i++] & 0x3fu);
+                    } else if ((c & 0xf8u) == 0xf0u && i + 2 < len) {
+                        cp = (uint32_t)(c & 0x07u) << 18;
+                        cp |= (uint32_t)(src[i++] & 0x3fu) << 12;
+                        cp |= (uint32_t)(src[i++] & 0x3fu) << 6;
+                        cp |= (uint32_t)(src[i++] & 0x3fu);
+                    } else {
+                        cp = 0x3fu; /* same replacement the guest uses */
+                    }
+                    out_n += (cp > 0xffffu) ? 2u : 1u;
+                    if (out_n > 128u) break;
+                }
+                const uint32_t total = out_n + (nullterm ? 1u : 0u);
+                if (total <= 128u) {
+                    GuestVA heap = 0;
+                    std::memcpy(&heap, obj + 0x100, 8);
+                    /* Inline-only path: do not free a prior heap buffer here —
+                     * Init is constructed onto fresh storage in this title's
+                     * call sites.  A lingering heap ptr means another shape. */
+                    if (!heap) {
+                        uint16_t *dst = (uint16_t *)obj;
+                        uint32_t o = 0;
+                        for (int32_t i = 0; i < len && o < out_n; ) {
+                            uint32_t cp;
+                            uint8_t c = src[i++];
+                            if (c < 0x80u) cp = c;
+                            else if ((c & 0xe0u) == 0xc0u && i < len) {
+                                cp = (uint32_t)(c & 0x1fu) << 6;
+                                cp |= (uint32_t)(src[i++] & 0x3fu);
+                            } else if ((c & 0xf0u) == 0xe0u && i + 1 < len) {
+                                cp = (uint32_t)(c & 0x0fu) << 12;
+                                cp |= (uint32_t)(src[i++] & 0x3fu) << 6;
+                                cp |= (uint32_t)(src[i++] & 0x3fu);
+                            } else if ((c & 0xf8u) == 0xf0u && i + 2 < len) {
+                                cp = (uint32_t)(c & 0x07u) << 18;
+                                cp |= (uint32_t)(src[i++] & 0x3fu) << 12;
+                                cp |= (uint32_t)(src[i++] & 0x3fu) << 6;
+                                cp |= (uint32_t)(src[i++] & 0x3fu);
+                            } else {
+                                cp = 0x3fu;
+                            }
+                            if (cp > 0xffffu) {
+                                cp -= 0x10000u;
+                                dst[o++] = (uint16_t)(0xd800u | (cp >> 10));
+                                dst[o++] = (uint16_t)(0xdc00u | (cp & 0x3ffu));
+                            } else {
+                                dst[o++] = (uint16_t)cp;
+                            }
+                        }
+                        if (nullterm && o < 128u) dst[o] = 0;
+                        const uint64_t zero = 0;
+                        const uint64_t self64 = (uint64_t)self;
+                        const uint32_t len32 = out_n; /* length excludes NUL */
+                        std::memcpy(obj + 0x100, &zero, 8);
+                        std::memcpy(obj + 0x108, &self64, 8);
+                        std::memcpy(obj + 0x110, &len32, 4);
+                        handled = true;
+                    }
+                }
+            }
+            if (handled) return;
+            auto rs = g_ue_replace_resume.find(site);
+            if (rs != g_ue_replace_resume.end()) {
+                jit64->SetPC(a64_guest_va(rs->second));
+                g_code_hook_guest_resume = true;
+                return;
+            }
+            fprintf(stderr, "[utf8] missing guest resume veneer @0x%08x\n", site);
+            return;
+        }
+
         /* Host-side FString::ReplaceInline, in-place shape only.
          *
          * This title mounts 68 paks holding 570k files at run time, and every
@@ -41540,7 +48511,9 @@ public:
          * cursor by the whole search length, so overlapping matches are not
          * replaced twice. */
         if (svc_no == SVC_UE_REPLACE_INLINE) {
-            const uint32_t site = a64_canon_va(jit64->GetPC() - 4u);
+            const uint32_t site = g_code_hook_site
+                                      ? g_code_hook_site
+                                      : a64_canon_va(jit64->GetPC() - 4u);
             const uint64_t self      = jit64->GetRegister(0);
             const uint64_t search_va = jit64->GetRegister(1);
             const uint64_t repl_va   = jit64->GetRegister(2);
@@ -41594,6 +48567,7 @@ public:
             auto rs = g_ue_replace_resume.find(site);
             if (rs != g_ue_replace_resume.end()) {
                 jit64->SetPC(a64_guest_va(rs->second));
+                g_code_hook_guest_resume = true;
                 return;
             }
             /* Installed without a stub is a bug in the install, not a case to
@@ -42060,6 +49034,26 @@ public:
             return;
         }
 
+        /* Observe ReadCompressedInfo, open an independent host decoder over
+         * the same input, then resume the untouched guest function so it
+         * still fills FSoundQualityInfo and its private decoder state. */
+        if (svc_no == SVC_STB_VORBIS_INFO) {
+            const uint32_t site = a64_canon_va(jit64->GetPC() - 4u);
+            stbv_on_read_compressed_info(*ctx, jit64->GetRegister(0),
+                                         jit64->GetRegister(1),
+                                         (uint32_t)jit64->GetRegister(2));
+            auto rs = g_ue_replace_resume.find(site);
+            if (rs != g_ue_replace_resume.end()) {
+                jit64->SetPC(a64_guest_va(rs->second));
+                g_code_hook_guest_resume = true;
+                return;
+            }
+            fprintf(stderr, "[vorbis] ReadCompressedInfo @0x%08x has no "
+                            "resume stub\n", site);
+            jit64->SetPC(jit64->GetRegister(30));
+            return;
+        }
+
         /* Host Ogg Vorbis decode via stb_vorbis — see SVC_STB_VORBIS_READ in
          * arm.h.  FVorbisAudioInfo::ReadCompressedData/StreamCompressedData
          * share one signature: (uint8* Destination, bool bLooping,
@@ -42068,19 +49062,36 @@ public:
          * contract for both, which is why one SVC answers both symbols (see
          * the hook installation below). */
         if (svc_no == SVC_STB_VORBIS_READ) {
+            const uint32_t site = a64_canon_va(jit64->GetPC() - 4u);
             const uint64_t this_va = jit64->GetRegister(0);
             const uint64_t dst_va  = jit64->GetRegister(1);
             const bool looping     = (jit64->GetRegister(2) & 1u) != 0;
             const uint32_t want    = (uint32_t)jit64->GetRegister(3);
             bool finished = true;
-            StbVorbisDecoder *d = nullptr;
-            {
-                std::lock_guard<std::mutex> lk(g_stbv_mu);
-                auto it = g_stbv_by_this.find(this_va);
-                if (it != g_stbv_by_this.end() && it->second.v) d = &it->second;
-            }
             uint8_t *dst = dst_va ? (uint8_t *)ctx->mem.ptr((GuestVA)dst_va) : nullptr;
-            if (d && dst && want) {
+            std::unique_lock<std::mutex> lk(g_stbv_mu);
+            auto it = g_stbv_by_this.find(this_va);
+            StbVorbisDecoder *d =
+                it != g_stbv_by_this.end() && it->second.v ? &it->second : nullptr;
+            if (!d || !dst || !want) {
+                lk.unlock();
+                auto rs = g_ue_replace_resume.find(site);
+                if (rs != g_ue_replace_resume.end()) {
+                    static int nmiss = 0;
+                    if (nmiss++ < 16)
+                        fprintf(stderr, "[vorbis] no host decoder for "
+                                "this=0x%llx; resuming guest implementation\n",
+                                (unsigned long long)this_va);
+                    jit64->SetPC(a64_guest_va(rs->second));
+                    g_code_hook_guest_resume = true;
+                    return;
+                }
+                fprintf(stderr, "[vorbis] reader @0x%08x has no resume stub\n",
+                        site);
+                jit64->SetPC(jit64->GetRegister(30));
+                return;
+            }
+            {
                 const int channels = d->channels > 0 ? d->channels : 1;
                 uint32_t filled = 0;
                 const uint32_t want_shorts = want / 2u;
@@ -42108,15 +49119,6 @@ public:
                             (unsigned long long)this_va, want, filled * 2u,
                             filled < want_shorts ? " (short — padded with silence)" : "",
                             (int)looping, (int)finished);
-            } else {
-                /* No decoder for this `this` (ReadCompressedInfo missed it —
-                 * open_memory failed, or this call arrived before it) — answer
-                 * with silence rather than leaving Destination uninitialised. */
-                if (dst && want) memset(dst, 0, want);
-                static int nmiss = 0;
-                if (nmiss++ < 16)
-                    fprintf(stderr, "[vorbis] read this=0x%llx: no decoder — "
-                            "silence (%u bytes)\n", (unsigned long long)this_va, want);
             }
             jit64->SetRegister(0, finished ? 1u : 0u);
             return;
@@ -42255,6 +49257,16 @@ public:
         if (svc_no == 0) {
             uint64_t x8 = jit64->GetRegister(8);
             uint32_t nr = (uint32_t)x8;
+            if (lunaria_env("LUNARIA_TRACE_RAW_HOT") && nr < 512u) {
+                static uint64_t hot[512] = {};
+                const uint64_t n = ++hot[nr];
+                if (n == 100000u || (n % 1000000u) == 0u)
+                    fprintf(stderr, "[raw-hot] nr_a64=%u calls=%llu tid=%u "
+                            "pc=0x%llx lr=0x%llx\n", nr,
+                            (unsigned long long)n, g_current_tid,
+                            (unsigned long long)jit64->GetPC(),
+                            (unsigned long long)x30);
+            }
             if (nr == 98u) nr = 240u;       /* futex */
             else if (nr == 178u) nr = 224u; /* gettid */
             else if (nr == 172u) nr = 20u;  /* getpid */
@@ -42268,6 +49280,11 @@ public:
             else if (nr == 101u) nr = 162u; /* nanosleep */
             else if (nr == 115u) nr = 265u; /* clock_nanosleep */
             else if (nr == 124u) nr = 158u; /* sched_yield */
+            /* AArch64's own epoll_create1 is also numbered 20, which the line
+             * above already claims for getpid (172's target here) — move it
+             * out of the way instead of losing epoll_create1 to a duplicate
+             * case label / silently answering it with the guest's pid. */
+            else if (nr == 20u) nr = 2020u; /* epoll_create1 */
             regs32[7] = nr;
             if (lunaria_env("LUNARIA_TRACE_SVC0") && nr != 240u && nr != 224u) {
                 static int n = 0;
@@ -42389,9 +49406,11 @@ public:
             }
             jit64->SetRegister(0, rp);
         } else if (g_svc_ret64) {
+            a64_check_host_ret(svc_no, regs32[0]);
             jit64->SetRegister(0, regs32[0]);
         } else {
             // Pass the result through; but ~0u means error (-1 / MAP_FAILED / EBADF).
+            a64_check_host_ret(svc_no, regs32[0]);
             jit64->SetRegister(0, regs32[0] == 0xffffffffull ? ~0ull : regs32[0]);
         }
 
@@ -42407,6 +49426,57 @@ public:
         if (g_current_tid < TICKS_TID_MAX)
             g_guest_ticks_by_tid[g_current_tid].fetch_add(
                 t, std::memory_order_relaxed);
+        /* Observe an indirect A64 call without changing guest code.  The
+         * configured address is the instruction immediately after BL/BLR.
+         * At the first callee block exit LR still names that address; after
+         * RET the PC names it.  This works where a PC-range sample cannot,
+         * because Dynarmic reports the destination after a block has ended.
+         *
+         * LUNARIA_TRACE_A64_CALL=hex-return-pc */
+        if (jit64) {
+            static uint64_t call_return_pc;
+            static uint32_t call_return_canon;
+            static unsigned call_trace_left;
+            static bool call_trace_init;
+            uint64_t pc;
+            uint64_t lr;
+            if (!call_trace_init) {
+                const char *e;
+                call_trace_init = true;
+                e = lunaria_env("LUNARIA_TRACE_A64_CALL");
+                if (e) {
+                    call_return_pc = strtoull(e, nullptr, 16);
+                    call_return_canon = a64_canon_va(call_return_pc);
+                    call_trace_left = 64;
+                }
+            }
+            pc = jit64->GetPC();
+            lr = jit64->GetRegister(30);
+            if (call_trace_left && a64_canon_va(lr) == call_return_canon &&
+                a64_canon_va(pc) != call_return_canon) {
+                fprintf(stderr,
+                        "[a64-call] target/block=0x%llx return=0x%llx "
+                        "x0=0x%llx x1=0x%llx x22=0x%llx tid=%u\n",
+                        (unsigned long long)pc,
+                        (unsigned long long)call_return_pc,
+                        (unsigned long long)jit64->GetRegister(0),
+                        (unsigned long long)jit64->GetRegister(1),
+                        (unsigned long long)jit64->GetRegister(22),
+                        g_current_tid);
+                --call_trace_left;
+            } else if (call_trace_left &&
+                       a64_canon_va(pc) == call_return_canon) {
+                fprintf(stderr,
+                        "[a64-call] returned=0x%llx x0=0x%llx x1=0x%llx "
+                        "x22=0x%llx tid=%u\n",
+                        (unsigned long long)call_return_pc,
+                        (unsigned long long)jit64->GetRegister(0),
+                        (unsigned long long)jit64->GetRegister(1),
+                        (unsigned long long)jit64->GetRegister(22),
+                        g_current_tid);
+                --call_trace_left;
+            }
+        }
         /* LUNARIA_TRACE_A64_PCRANGE=lo:hi logs A64 JIT block exits in one
          * guest-PC range.  Keeping this in the cycle callback avoids a code
          * hook on every instruction when tracing is disabled. */
@@ -42427,14 +49497,23 @@ public:
             }
             const uint64_t pc = jit64->GetPC();
             if (trace_left && pc >= trace_lo && pc < trace_hi) {
+                const GuestVA x22 = jit64->GetRegister(22);
+                const GuestVA x24 = jit64->GetRegister(24);
                 fprintf(stderr, "[a64_pcr] pc=%08llx x0=%016llx x1=%016llx "
-                        "x19=%016llx x20=%016llx x21=%016llx lr=%016llx\n",
+                        "x19=%016llx x20=%016llx x21=%016llx x22=%016llx "
+                        "x23=%016llx x24=%016llx v22=%08x v24=%08x "
+                        "lr=%016llx\n",
                         (unsigned long long)pc,
                         (unsigned long long)jit64->GetRegister(0),
                         (unsigned long long)jit64->GetRegister(1),
                         (unsigned long long)jit64->GetRegister(19),
                         (unsigned long long)jit64->GetRegister(20),
                         (unsigned long long)jit64->GetRegister(21),
+                        (unsigned long long)x22,
+                        (unsigned long long)jit64->GetRegister(23),
+                        (unsigned long long)x24,
+                        ctx->mem.try_ptr(x22, 4) ? ctx->mem.read32(x22) : 0u,
+                        ctx->mem.try_ptr(x24, 4) ? ctx->mem.read32(x24) : 0u,
                         (unsigned long long)jit64->GetRegister(30));
                 --trace_left;
             }
@@ -42725,7 +49804,10 @@ static uint64_t a64_heavy_worker_floor(uint32_t tid) {
     case THREAD_CLASS_RENDER:
         return env_ticks("LUNARIA_RENDER_THREAD_TICKS", 5'000'000ULL);
     case THREAD_CLASS_ASYNC_LOAD:
-        return env_ticks("LUNARIA_ASYNC_LOADING_TICKS", 5'000'000ULL);
+        /* FPakPrecacher / FGenericReadRequest need enough continuous work to
+         * finish before NewRequestsToLowerComplete destroys the request.
+         * 5M was still losing to NMSS /proc poll under ReloadInfoAll. */
+        return env_ticks("LUNARIA_ASYNC_LOADING_TICKS", 20'000'000ULL);
     default:
         return 0;
     }
@@ -42942,6 +50024,90 @@ static const char *arm_lock_tag_name(uint32_t tg)
     return buf;
 }
 
+/* Where the guest's instructions actually go.
+ *
+ * "The emulator is slow" and "the guest has a lot to do" look identical from
+ * the outside: both are a thread that runs and never stops.  A slice that
+ * ends on its quantum ends at an arbitrary instruction, so the PC at that
+ * moment is a uniform time sample of guest execution -- the same thing a
+ * sampling profiler collects on a device.  LUNARIA_PC_HISTO=1 keeps those
+ * samples; the slice report names the addresses that own the run.
+ *
+ * Samples are taken only from quantum ends.  A slice that ended in an SVC
+ * ended where the guest asked the emulator for something, and counting those
+ * would measure the SVC table, which the [slice] SVC census already does. */
+static std::mutex                       g_pc_histo_mx;
+static std::map<uint64_t, uint64_t>     g_pc_histo;
+static std::map<uint64_t, uint64_t>     g_pc_histo_mod;
+static uint64_t                         g_pc_histo_n;
+
+static bool pc_histo_on(void) {
+    static const bool on = [] {
+        const char *e = lunaria_env("LUNARIA_PC_HISTO");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+
+static void pc_histo_add(uint64_t pc) {
+    if (!pc) return;
+    const uint64_t base = a64_module_base_for(pc);
+    std::lock_guard<std::mutex> lk(g_pc_histo_mx);
+    ++g_pc_histo[pc];
+    ++g_pc_histo_mod[base];
+    ++g_pc_histo_n;
+}
+
+/* The name a guest address has in the image it belongs to. */
+static const char *a64_module_name_for(uint64_t base) {
+    if (!base || !g_ctx) return "(anonymous)";
+    for (const auto &m : g_module_phdrs) {
+        if (!m.is_64 || m.load_bias != (GuestVA)base) continue;
+        const char *n = g_ctx->mem.cstr(m.name_va);
+        if (n && *n) {
+            const char *slash = std::strrchr(n, '/');
+            return slash ? slash + 1 : n;
+        }
+    }
+    return "(unknown image)";
+}
+
+static void pc_histo_report(void) {
+    if (!pc_histo_on()) return;
+    std::map<uint64_t, uint64_t> pcs, mods;
+    uint64_t total;
+    {
+        std::lock_guard<std::mutex> lk(g_pc_histo_mx);
+        pcs.swap(g_pc_histo);
+        mods.swap(g_pc_histo_mod);
+        total = g_pc_histo_n;
+        g_pc_histo_n = 0;
+    }
+    if (!total) return;
+    std::vector<std::pair<uint64_t, uint64_t>> by_mod(mods.begin(), mods.end());
+    std::sort(by_mod.begin(), by_mod.end(),
+              [](const std::pair<uint64_t, uint64_t> &a,
+                 const std::pair<uint64_t, uint64_t> &b) { return a.second > b.second; });
+    fprintf(stderr, "[pc] %llu quantum samples, by image:",
+            (unsigned long long)total);
+    for (size_t i = 0; i < by_mod.size() && i < 6u; ++i)
+        fprintf(stderr, " %s %llu%%", a64_module_name_for(by_mod[i].first),
+                (unsigned long long)(by_mod[i].second * 100ull / total));
+    fprintf(stderr, "\n");
+    std::vector<std::pair<uint64_t, uint64_t>> by_pc(pcs.begin(), pcs.end());
+    std::sort(by_pc.begin(), by_pc.end(),
+              [](const std::pair<uint64_t, uint64_t> &a,
+                 const std::pair<uint64_t, uint64_t> &b) { return a.second > b.second; });
+    for (size_t i = 0; i < by_pc.size() && i < 12u; ++i) {
+        if (by_pc[i].second * 200ull < total) break;  /* below 0.5%: noise */
+        const uint64_t base = a64_module_base_for(by_pc[i].first);
+        fprintf(stderr, "[pc]   %5.1f%%  %s+0x%llx\n",
+                100.0 * (double)by_pc[i].second / (double)total,
+                a64_module_name_for(base),
+                (unsigned long long)(by_pc[i].first - base));
+    }
+}
+
 static void slice_report(void) {
     static double every = -1.0, last = 0.0;
     struct timespec ts;
@@ -42977,6 +50143,7 @@ static void slice_report(void) {
             (double)rel / (double)n / 1000.0,
             (double)epi / (double)n / 1000.0,
             (unsigned long long)(tot ? (tot - run) * 100ull / tot : 0ull));
+    pc_histo_report();
     /* How often the guest leaves the JIT.
      *
      * The rate inside Run() is the whole speed question: an SVC is a JIT exit,
@@ -43004,8 +50171,7 @@ static void slice_report(void) {
      * what to fix without a name on the callers.  g_svc_calls_by_no is
      * counted unconditionally (see svc_ring_record), so this is a read of
      * numbers that already exist rather than a measurement that changes the
-     * run — unlike LUNARIA_SVC_STATS, which forces every SVC back under the
-     * execution lock to keep its histogram coherent. */
+     * run. */
     {
         static uint64_t last_calls[SVC_TIME_MAX];
         std::vector<std::pair<uint64_t, uint32_t>> top_svc;
@@ -43238,6 +50404,7 @@ static void sched64_run_thread(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, ui
         return;
     }
     const uint64_t sl_t0 = host_mono_ns();
+    if (!t.slices) t.engine_ns = sl_t0;
     const unsigned caller_depth = arm_lock_unlock_all();
     /* The engine belongs to this host thread and is cached on it; only
      * building it walks the shared table, so only that needs the lock. */
@@ -43295,6 +50462,22 @@ static void sched64_run_thread(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, ui
      * on the pump and nowhere else) has a context to make current. */
     if (t.tls64 && !gl_tid_marked(t.id)) set_cur_tid_fast(ctx, t);
     else { ArmLockGuard g; set_cur_tid(ctx, t.id); }
+    t.io_ready = false;   /* consumed: this slice is the run it asked for */
+    if (t.atfork_child_n) {
+        /* This is the child's fork-return boundary: its registers/TLS and
+         * process identity are installed, but the instruction after fork has
+         * not run.  Child handlers run in registration order.  Clear the
+         * pending list first so a handler that itself forks cannot replay the
+         * outer handlers on a later slice. */
+        std::array<GuestVA, GUEST_ATFORK_MAX> handlers = t.atfork_child;
+        const uint16_t count = t.atfork_child_n;
+        t.atfork_child_n = 0;
+        t.atfork_child.fill(0);
+        for (uint16_t i = 0; i < count; ++i)
+            if (handlers[i])
+                (void)call_guest_cb64(ctx, handlers[i], 0, 0, 0, 0,
+                                      nullptr, 0);
+    }
     if (g_slice_detail) {
         const uint64_t sl_tid = host_mono_ns();
         g_slice_eng_ns  += sl_eng  - sl_t0;
@@ -43370,6 +50553,9 @@ static void sched64_run_thread(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, ui
     ts.sp64 = j64.GetSP();
     ts.lr64 = j64.GetRegister(30);
     ts.pc64 = j64.GetPC();
+    /* A quantum end is a time sample of guest execution; see pc_histo_add. */
+    if (pc_histo_on() && !cb64.ticks_remaining)
+        pc_histo_add(ts.pc64);
     // Mirror low halves for any A32-shaped helpers that still read t.regs.
     for (size_t r = 0; r < 8; ++r)
         ts.regs[r] = (uint32_t)ts.regs64[r];
@@ -43378,7 +50564,45 @@ static void sched64_run_thread(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, ui
     ts.regs[15] = (uint32_t)ts.pc64;
     ts.total_ticks += cb64.ticks_total;
     ts.total_ns    += slice_elapsed_ns;
+    /* First slice: say how long the thread sat on the ready queue before an
+     * engine picked it up.  See ArmThread::created_ns for why that number is
+     * worth a line of log. */
+    if (ts.slices == 0 && ts.created_ns) {
+        static uint64_t late_ms = 0;
+        if (!late_ms) {
+            const char *e = lunaria_env("LUNARIA_THREAD_START_LATE_MS");
+            late_ms = e ? (uint64_t)strtoull(e, nullptr, 0) : 8ull;
+            if (!late_ms) late_ms = UINT64_MAX;
+        }
+        /* sl_t2 is the instant Run() was entered, which is the last moment
+         * before the thread's first guest instruction.  This used to read the
+         * clock *here*, at the end of the slice, and call the result "time
+         * before the first instruction" -- so a thread whose first slice ran
+         * for 200 ms was reported as having started 200 ms late.  Those were
+         * the numbers the JIT prewarm was built on; they were the first
+         * slice's own duration, not a start latency.  Report both, each
+         * measured where it happens. */
+        const uint64_t wait_ns =
+            sl_t2 > ts.created_ns ? sl_t2 - ts.created_ns : 0ull;
+        if (late_ms != UINT64_MAX && wait_ns / 1000000ull >= late_ms) {
+            const uint64_t queued_ns = ts.engine_ns > ts.created_ns
+                                           ? ts.engine_ns - ts.created_ns : 0ull;
+            fprintf(stderr, "[sched] tid=%u first instruction %.1f ms after "
+                    "pthread_create (%.1f ms on the ready queue, %.1f ms in "
+                    "the engine prologue); first slice ran %.1f ms "
+                    "(entry 0x%llx)\n",
+                    ts.id, (double)wait_ns / 1e6, (double)queued_ns / 1e6,
+                    (double)(wait_ns - queued_ns) / 1e6,
+                    (double)slice_elapsed_ns / 1e6,
+                    (unsigned long long)ts.entry_pc);
+        }
+    }
     ++ts.slices;
+    /* Which way this slice ended, for /proc/<tid>/status.  A thread that is
+     * parked or sleeping when its slice ends gave the CPU up; anything else
+     * had it taken away at the quantum. */
+    if (thread_has_sync_wait(ts) || ts.sleep_until_ns) ++ts.vol_switches;
+    else                                               ++ts.nonvol_switches;
     /* Only slices long enough to time reliably feed the rate estimate; a slice
      * that returned in microseconds (parked immediately) says nothing about
      * how fast this thread executes. */
@@ -43406,13 +50630,15 @@ static void sched64_run_thread(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, ui
      * thousand instructions stale — while this engine was still overwriting
      * those same registers.  With the old pool, where nothing claimed a thread
      * between passes, the window never opened. */
-    ts.running = false;
     const uint64_t sl_t4 = host_mono_ns();
     g_sched_ticks_total += cb64.ticks_total;
 
     // PC on sentinel page -> thread returned cleanly.  pthread_exit marks the
-    // slot finished inside its SVC, while running is necessarily still true;
-    // finish publishing it here after running has become false.
+    // slot finished inside its SVC, while running is necessarily still true.
+    // Keep ownership through guest cleanup: destructors run callbacks that
+    // can release the execution lock.  Publishing running=false before them
+    // lets another engine claim this same thread, run cleanup again, and
+    // release its TLS while the original destructor is still using it.
     uint64_t final_pc = ts.pc64;
     const bool exited_in_svc = ts.finished;
     if (!ts.finished &&
@@ -43422,6 +50648,7 @@ static void sched64_run_thread(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, ui
         ts.exit_value = ts.regs64[0];   /* the start routine's return value */
         ts.finished = true;
     }
+    ts.running = false;
     /* Pinning follows the binding, not the history.  A thread that used the
      * host context for a single call — a glIsEnabled, an
      * ANativeWindow_setBuffersGeometry — had to run that call where the
@@ -43454,6 +50681,40 @@ static void sched64_run_thread(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, ui
                 finished_tid, exited_in_svc ? " via pthread_exit" : "",
                 (unsigned long long)final_pc,
                 (unsigned long long)finished_value);
+        /* Opt-in, non-mutating exit evidence for short-lived workers.  The
+         * entry filter keeps a busy UE title's output bounded while allowing
+         * a runtime-generated start routine (whose on-disk bytes need not
+         * match) to be followed through its actual Android/SVC interactions. */
+        if (const char *want = lunaria_env("LUNARIA_TRACE_THREAD_EXIT")) {
+            const uint64_t entry = strtoull(want, nullptr, 0);
+            if (entry && (ts.entry_pc == entry ||
+                          (uint32_t)ts.entry_pc == (uint32_t)entry)) {
+                fprintf(stderr, "[thread-exit] tid=%u entry=0x%llx slices=%llu "
+                        "arg=0x%llx final-pc=0x%llx ret=0x%llx\n", finished_tid,
+                        (unsigned long long)ts.entry_pc,
+                        (unsigned long long)ts.slices,
+                        (unsigned long long)ts.start_arg,
+                        (unsigned long long)final_pc,
+                        (unsigned long long)finished_value);
+                if (ts.start_arg) {
+                    const uint8_t *p = ctx.mem.ptr(ts.start_arg);
+                    fprintf(stderr, "[thread-exit] arg[0..63]:");
+                    for (unsigned i = 0; i < 64; ++i)
+                        fprintf(stderr, " %02x", p[i]);
+                    fputc('\n', stderr);
+                }
+                svc_ring_dump_tid(finished_tid);
+                if (ArmThread *creator = arm_thread_by_tid(ts.creator_tid)) {
+                    fprintf(stderr, "[thread-exit] creator tid=%u pc=0x%llx "
+                            "slices=+%llu total=%llu running=%d\n",
+                            creator->id, (unsigned long long)creator->pc64,
+                            (unsigned long long)(creator->slices - ts.creator_slices),
+                            (unsigned long long)creator->slices,
+                            (int)creator->running);
+                    svc_ring_dump_tid(creator->id);
+                }
+            }
+        }
     }
     /* Install a signal before classifying the thread as ready or blocked.
      * Delivery saves and clears an interrupted cond/futex/etc wait, so doing
@@ -43533,6 +50794,7 @@ struct Worker {
     std::thread th;
     Job         job;
     unsigned    index = 0;     /* engine index; matches ArmThread::engine_aff-1 */
+    bool        ready = false; /* owning host thread has constructed its JIT */
     bool        busy = false;  /* guarded by g_mx */
     uint64_t    rescan_ns = 0; /* when this engine may walk the table again */
 };
@@ -43600,7 +50862,9 @@ static bool a64_confirmed_spin(const ArmThread &t) {
  * `sleepers_only` is the barriered mode's whole use of the engines between
  * passes: a thread whose sleep deadline has passed is runnable for a reason
  * nothing else has to agree on, and leaving it for the next frame turns the
- * millisecond it asked for into forty — which the guest measures. */
+ * millisecond it asked for into forty — which the guest measures.  A newly
+ * created task is equally independent of the pass: pthread_create has made
+ * it runnable, so an idle engine may start it even in this mode. */
 static ArmThread *a64_claim(bool sleepers_only, unsigned engine_idx) {
     const size_t n = g_threads.size();
     if (!n) return nullptr;
@@ -43615,6 +50879,20 @@ static ArmThread *a64_claim(bool sleepers_only, unsigned engine_idx) {
             if (due && due < least) least = due;
         }
         g_sleep_next_due_ns.store(least, std::memory_order_relaxed);
+    }
+    while (!g_start_queue.empty()) {
+        const uint8_t tid = g_start_queue.front();
+        g_start_queue.pop_front();
+        start_queue_publish();
+        if (!g_in_ready[tid]) continue;
+        ArmThread *tp = thread_slot_by_tid(tid);
+        if (!tp || tp->finished || tp->running || tp->slices) continue;
+        if (!a64_worker_runnable(*tp)) continue;
+        g_in_ready[tid] = false;
+        ++g_ready_pops[tid];
+        if (!tp->engine_aff) a64_assign_affinity(*tp);
+        tp->running = true;
+        return tp;
     }
     const uint32_t start = g_cursor.fetch_add(1, std::memory_order_relaxed);
     /* Somebody is waiting on a lock this thread holds: run it wherever it is,
@@ -43644,7 +50922,7 @@ static ArmThread *a64_claim(bool sleepers_only, unsigned engine_idx) {
         ArmThread *tp = thread_slot_by_tid(tid);
         if (!tp) continue;
         ArmThread &t = *tp;
-        if (sleepers_only && !t.sleep_until_ns) continue;
+        if (sleepers_only && !t.sleep_until_ns && !t.io_ready) continue;
         if (!a64_worker_runnable(t)) continue;
         if (t.engine_aff && (unsigned)t.engine_aff - 1u != engine_idx) {
             if (!other) other = tp;
@@ -43727,24 +51005,121 @@ static bool self_sched_enabled(void) {
 }
 
 /* Anything that can make a parked guest thread runnable ends here, so an idle
- * engine starts looking again instead of waiting out its poll interval. */
+ * engine starts looking again instead of waiting out its poll interval.
+ *
+ * The notify matters now: an idle engine's wait predicate asks the same
+ * questions its post-wait scan does, so a notification that arrives after one
+ * of them has changed ends the wait immediately.  It used to ask only about
+ * this engine's own job slot, which made every notify_all() from here a wake
+ * with nothing to answer, and left the 100 us timeout as the only thing that
+ * ever started a scan. */
 static void a64_poke(void) {
     g_claim_hint.store(true, std::memory_order_release);
     g_cv_work.notify_all();
 }
 
+/* How long an idle engine may sleep before looking at the thread table on its
+ * own initiative.
+ *
+ * This is insurance against a missed poke, not the mechanism: everything that
+ * makes a thread runnable calls a64_poke(), a parked guest sleep has its own
+ * timer thread, and the earliest deadline in the table is published in
+ * g_sleep_next_due_ns, which the wait below takes as its bound.
+ *
+ * It used to be 100 us, which is not a wait but a poll.  Three idle engines
+ * woke thirty thousand times a second to decide there was nothing to do, and
+ * each of those wakes is an hrtimer, a futex round trip, a run-queue
+ * enqueue/dequeue and -- on a host whose XSAVE area covers AVX -- a full FPU
+ * state reload on the way back to user space.  Measured over Cross Worlds'
+ * post-title load, futex_wait, hrtimer_wakeup, __schedule and
+ * fpregs_restore_userregs together came to about a third of the whole
+ * emulator's CPU time, and the pool's own mutex (taken on every one of those
+ * wakes) is the same mutex the pump needs to hand out a slice. */
+static constexpr uint64_t kIdleRescanNs = 10'000'000ull;
+
+/* After a scan that found nothing, how long before this engine looks again on
+ * its own.  This is the old 100 us poll, kept for exactly the cases that
+ * needed it -- a standing condition an engine cannot settle, such as a sleeper
+ * whose deadline has passed but which the pump owns, or a boosted lock owner
+ * that is already running.  Those leave the condition true, so without a floor
+ * the wait predicate is permanently satisfied and the engine spins at full
+ * speed re-asking a question whose answer it cannot change. */
+static constexpr uint64_t kEmptyScanBackoffNs = 100'000ull;
+
 void sched_poke(void) { a64_poke(); }
 
 static void worker_main(Worker *w) {
     g_a64_is_worker = true;
+    /* Dynarmic binds backend/TLS state to the host thread that constructs the
+     * JIT.  Pay that one-time cost while Android is being brought up, not on
+     * the first pthread this worker happens to claim: otherwise a freshly
+     * created guest thread is runnable immediately but appears to start about
+     * 60 ms late. */
+    (void)a64_cur_engine(*g_ctx);
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        w->ready = true;
+    }
+    g_cv_idle.notify_all();
+    /* In the barriered mode the pump hands out every slice; the only thread an
+     * idle engine may take for itself is one whose sleep is over.  Asking the
+     * thread table that question needs the ARM execution lock, so it is asked
+     * only when one of these cheap published facts says the answer might have
+     * changed -- otherwise an idle engine holds the lock every other engine
+     * needs for its next SVC. */
+    auto self_scan_wanted = [w](uint64_t now_ns) {
+        if (!g_ctx) return false;
+        /* Every reason below is a standing condition, not an edge: a sleeper
+         * whose deadline has passed but which nothing can claim (the pump owns
+         * it, or it is marked for GL) leaves the deadline in the past for as
+         * long as it takes, and a boosted lock owner that is already running
+         * keeps the boost up while it runs.  So a scan that found nothing puts
+         * a floor under the next unprompted one -- without it the wait
+         * predicate is simply true for ever and the engine spins at full speed
+         * re-asking a question whose answer cannot change until somebody else
+         * makes it change.  The floor is the old poll interval, so the worst
+         * case here is exactly what it used to be; what changed is the case
+         * where no condition holds at all, which is now a real wait. */
+        if (now_ns < w->rescan_ns) return false;
+        if (g_lock_boosts.load(std::memory_order_relaxed)) return true;
+        if (g_starts_pending.load(std::memory_order_acquire)) return true;
+        if (now_ns >= g_sleep_next_due_ns.load(std::memory_order_relaxed))
+            return true;
+        if (self_sched_enabled() &&
+            g_claim_hint.load(std::memory_order_acquire))
+            return true;
+        return false;
+    };
     while (!g_stop.load(std::memory_order_relaxed)) {
         Job job;
+        bool scan = false;
         {
             std::unique_lock<std::mutex> lk(g_mx);
-            g_cv_work.wait_for(lk, std::chrono::microseconds(100),
-                               [w] { return g_stop.load(std::memory_order_relaxed) ||
-                                            w->busy; });
+            const uint64_t now_ns = host_mono_ns();
+            /* Sleep until the earliest moment this engine could have
+             * something to do.  A job published to its slot and a poke both
+             * end the wait through the predicate; the next guest deadline in
+             * the table and this engine's own rescan floor bound it; and
+             * kIdleRescanNs is the cap when the table announces neither. */
+            uint64_t wake_ns = now_ns + kIdleRescanNs;
+            const uint64_t due = g_sleep_next_due_ns.load(std::memory_order_relaxed);
+            if (due > now_ns && due < wake_ns) wake_ns = due;
+            if (w->rescan_ns > now_ns && w->rescan_ns < wake_ns)
+                wake_ns = w->rescan_ns;
+            /* The return value is the predicate: false means the wait simply
+             * ran out with nothing to do, and walking the thread table then
+             * is the ARM execution lock taken for an answer already known.
+             * (That mistake showed up as "worker claim" becoming the single
+             * largest holder of the lock, at 19% of the wall clock.) */
+            const bool woke_for_work = g_cv_work.wait_for(
+                lk, std::chrono::nanoseconds(wake_ns - now_ns),
+                [&] {
+                    if (g_stop.load(std::memory_order_relaxed) || w->busy)
+                        return true;
+                    return self_scan_wanted(host_mono_ns());
+                });
             if (w->busy) job = w->job;
+            else         scan = woke_for_work;
         }
         if (job.t) {
             sched64_run_thread(*job.ctx, *job.t, job.slice, job.prev_tid);
@@ -43757,30 +51132,34 @@ static void worker_main(Worker *w) {
             g_cv_idle.notify_all();
             continue;
         }
-        if (!g_ctx) continue;
-        /* In the barriered mode the pump hands out every slice; the only
-         * thread an idle engine may take for itself is one whose sleep is
-         * over.  Asking the thread table that question needs the execution
-         * lock, and asking it ten thousand times a second per engine was
-         * enough on its own to keep the lock held whenever the engines were
-         * idle.  The deadline hint answers it without one. */
+        if (!scan || !g_ctx) continue;
+        /* The predicate above is the only gate: it asks exactly the questions
+         * this scan can answer, so reaching here means one of them said yes. */
         const bool self_sched = self_sched_enabled();
-        const uint64_t now_ns = host_mono_ns();
-        if (!g_lock_boosts.load(std::memory_order_relaxed) &&
-            now_ns < g_sleep_next_due_ns.load(std::memory_order_relaxed) &&
-            (!self_sched ||
-             (!g_claim_hint.load(std::memory_order_acquire) &&
-              now_ns < w->rescan_ns)))
-            continue;
-        /* A scan is about to happen; the next unprompted one is a millisecond
-         * away, which is the floor that keeps a missed poke from stalling. */
-        w->rescan_ns = now_ns + 1000000ull;
         ArmThread *t = nullptr;
         { ArmLockGuard g; arm_lock_tag(ARM_LOCK_TAG_CLAIM);
           t = a64_claim(!self_sched, w->index); }
-        if (!t) continue;
+        if (!t) {
+            /* Nothing to take.  Whatever made the scan look worthwhile is
+             * still true, so pace the next unprompted look (see
+             * self_scan_wanted) instead of walking the table again at once. */
+            w->rescan_ns = host_mono_ns() + kEmptyScanBackoffNs;
+            continue;
+        }
         sched64_run_thread(*g_ctx, *t,
                            env_ticks("LUNARIA_THREAD_TICKS", 200'000'000ULL), 0);
+    }
+
+    /* A Dynarmic JIT's backend exception-handler state belongs to the host
+     * thread that constructed it.  Tear it down here, while that thread and
+     * its thread-local runtime state still exist; destroying all worker JITs
+     * later on the pump thread makes libc++'s backend wait primitive fail
+     * with EINVAL. */
+    if (g_a64_engine_tls) {
+        std::lock_guard<std::mutex> lk(g_a64_engines_mx);
+        g_a64_engine_tls->jit.reset();
+        g_a64_engine_tls->cb.reset();
+        g_a64_engine_tls = nullptr;
     }
 }
 
@@ -43794,6 +51173,17 @@ static void ensure_workers(void) {
         raw->index = i;
         g_workers.push_back(std::move(w));
         raw->th = std::thread(worker_main, raw);
+    }
+    /* Do not expose a nominally idle worker until its thread-local engine is
+     * real.  This wait happens during context initialization in the normal
+     * path; keeping it here also makes later/lazy callers correct. */
+    {
+        std::unique_lock<std::mutex> lk(g_mx);
+        g_cv_idle.wait(lk, [] {
+            for (const auto &w : g_workers)
+                if (!w->ready) return false;
+            return true;
+        });
     }
     fprintf(stderr, "[sched64] %u A64 engines (%zu workers + pump, %s)\n",
             n, g_workers.size(),
@@ -43812,27 +51202,44 @@ static bool have_workers(void) { return !g_workers.empty(); }
  * asks for through ForceQuit after a patch, came out as SIGABRT with
  * "terminate called without an active exception" and no other explanation.
  *
- * Idempotent, and safe to call from the thread that owns the pump: the wait
- * in worker_main times out every 100 us, so a stopped worker leaves promptly
- * whether or not it was holding the lock when the flag was set. */
+ * Idempotent, and safe to call from the thread that owns the pump: g_stop is
+ * part of the wait predicate in worker_main and the notify_all() below is
+ * issued under the same mutex, so a stopped worker leaves at once whether or
+ * not it was waiting when the flag was set. */
 static void shutdown(void) {
-    if (g_workers.empty()) return;
-    g_stop.store(true, std::memory_order_relaxed);
-    {
-        std::lock_guard<std::mutex> lk(g_mx);
-        g_cv_work.notify_all();
-        g_cv_idle.notify_all();
+    if (!g_workers.empty()) {
+        g_stop.store(true, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            g_cv_work.notify_all();
+            g_cv_idle.notify_all();
+        }
+        for (auto &w : g_workers)
+            if (w && w->th.joinable()) w->th.join();
+        g_workers.clear();
     }
-    for (auto &w : g_workers)
-        if (w && w->th.joinable()) w->th.join();
-    g_workers.clear();
+
+    /* Worker JITs were released by their owner threads above.  The remaining
+     * pump JIT was constructed on this thread and is released here. */
+    {
+        std::lock_guard<std::mutex> lk(g_a64_engines_mx);
+        g_a64_engines.clear();
+    }
+    g_a64_engine_tls = nullptr;
 }
 }  // namespace a64par
 static bool a64par_self_sched_enabled(void) { return a64par::self_sched_enabled(); }
 
 /* Called by the loader once the guest has finished, before anything static is
  * destroyed.  See a64par::shutdown() for why the process cannot just exit. */
-extern "C" void arm_exec_shutdown_engines(void) { a64par::shutdown(); }
+extern "C" void arm_exec_shutdown_engines(void) {
+    pump_preempt_shutdown();
+    /* The timer reads scheduler state and takes the execution lock.  It must
+     * finish before either the worker engines or those process-lifetime
+     * synchronization objects are destroyed. */
+    sleep_timer_shutdown();
+    a64par::shutdown();
+}
 namespace a64par {
 
 
@@ -44045,6 +51452,14 @@ static void cb_grant_sanity(uint32_t owner, GuestVA mva, uint32_t word,
 
 static bool cb_lock_wait_try_grant(ArmExecCtx &ctx) {
     if (g_cb_lock_wait.kind == CbLockWait::Idle) return true;
+    /* A sleep owns no word: the only condition is its deadline. */
+    if (g_cb_lock_wait.kind == CbLockWait::Sleep) {
+        if (host_mono_ns() < g_cb_lock_wait.deadline_ns) return false;
+        g_cb_resume_result = 0u;
+        g_cb_resume_result_pending = true;
+        cb_lock_wait_reset();
+        return true;
+    }
     const GuestVA mva = g_cb_lock_wait.mva;
     if (g_cb_lock_wait.kind == CbLockWait::Cond) {
         const bool woke = host_cond_is_woken(g_cb_cond_wait);
@@ -44113,7 +51528,9 @@ static void cb_lock_wait_progress(ArmExecCtx &ctx, int depth) {
         schedule_threads(env_ticks("LUNARIA_CB_MUTEX_TICKS", 2'000'000ULL));
         return;
     }
-    if (g_cb_lock_wait.kind == CbLockWait::Cond) {
+    if (g_cb_lock_wait.kind == CbLockWait::Sleep) {
+        if (host_mono_ns() < g_cb_lock_wait.deadline_ns) a64_yield_to_engines();
+    } else if (g_cb_lock_wait.kind == CbLockWait::Cond) {
         if (host_cond_is_woken(g_cb_cond_wait) ||
             (g_cb_lock_wait.timed &&
              host_mono_ns() >= g_cb_lock_wait.deadline_ns))
@@ -44202,7 +51619,8 @@ static void call_guest_abi64(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *arg
          * TPIDR_EL0 points at, which is not necessarily g_current_tid: a
          * callback keeps whatever TLS this host thread last ran with. */
         uint32_t tls_owner = 0;
-        if (ctx.is_arm64 && g_tpidr_el0_val && g_fast64_mutex_lock_va)
+        if (ctx.is_arm64 && a64_has_private_tls(g_tpidr_el0_val) &&
+            g_fast64_mutex_lock_va)
             tls_owner = ctx.mem.read32((GuestVA)(g_tpidr_el0_val +
                                                  TLS64_OWNER_OFF)) & 0xffu;
         const uint32_t tls_tid = tls_owner ? tls_owner - 1u : 0u;
@@ -44300,6 +51718,8 @@ static void call_guest_abi64(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *arg
          * guest runs past the SVC — same as schedule_threads granting a
          * parked ArmThread — then ClearHalt and resume. */
         bool lock_abandon = false;
+        const bool waiting = g_cb_lock_wait.kind != CbLockWait::Idle;
+        if (waiting) __atomic_add_fetch(&g_callback_waiters, 1u, __ATOMIC_RELEASE);
         while (g_cb_lock_wait.kind != CbLockWait::Idle) {
             if (cb_lock_wait_try_grant(ctx)) break;
             const double cb_elapsed = emu_uptime_s() - cb_t0;
@@ -44317,6 +51737,7 @@ static void call_guest_abi64(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *arg
             }
             cb_lock_wait_progress(ctx, depth);
         }
+        if (waiting) __atomic_sub_fetch(&g_callback_waiters, 1u, __ATOMIC_RELEASE);
         if (lock_abandon) break;
         if (g_cb_resume_result_pending) {
             j.SetRegister(0, g_cb_resume_result);
@@ -44333,7 +51754,9 @@ static void call_guest_abi64(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *arg
          * the lock itself, so there is nothing here the lock was protecting. */
         j.ClearHalt();
         Dynarmic::HaltReason hr;
-        {
+        if (g_cb64_keep_ael) {
+            hr = j.Run();
+        } else {
             const unsigned d_ = arm_lock_unlock_all();
             hr = j.Run();
             arm_lock_relock(d_);
@@ -44359,7 +51782,7 @@ static void call_guest_abi64(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *arg
              * somebody.  Run the other guest threads, then hand it another
              * slice.  Nested callbacks stay out of the scheduler — it is
              * already running one. */
-            if (depth == 0 && !g_scheduling)
+            if (!g_cb64_keep_ael && depth == 0 && !g_scheduling)
                 schedule_threads(env_ticks("LUNARIA_THREAD_TICKS", 200'000'000ULL));
             cb.ticks_remaining = cb_slice;
         }
@@ -44586,6 +52009,32 @@ static void build_fast_rwlock_stubs64(ArmExecCtx &ctx) {
                 ctx.mem.write32(FAST_SYNC64_PAGE + b.off + (uint32_t)(i * 4), b.code[i]);
             *b.va = FAST_SYNC64_PAGE + b.off;
         }
+
+        /* strtoul("0", NULL, 0) is common in parsed UE asset tables.  Base
+         * autodetection deliberately falls back above for every leading zero
+         * because the following byte may select octal or hexadecimal.  The
+         * exact one-byte zero is fully determined, however, and needs neither
+         * errno nor an end-pointer store.  Handle that standard-C case in a
+         * small guest wrapper; every other input branches to the complete
+         * implementation above. */
+        static const uint32_t strtoul_zero[] = {
+            0x35000122u, /* cbnz w2, fallback */
+            0xB5000101u, /* cbnz x1, fallback */
+            0x39400003u, /* ldrb w3, [x0] */
+            0x7100C07Fu, /* cmp w3, #'0' */
+            0x540000A1u, /* b.ne fallback */
+            0x39400403u, /* ldrb w3, [x0,#1] */
+            0x35000063u, /* cbnz w3, fallback */
+            0xAA1F03E0u, /* mov x0, xzr */
+            0xD65F03C0u, /* ret */
+            0x58000049u, /* fallback: ldr x9, .+8 */
+            0xD61F0120u, /* br x9 */
+            0x411008B0u, 0x00007000u,
+        };
+        for (size_t i = 0; i < sizeof strtoul_zero / sizeof strtoul_zero[0]; ++i)
+            ctx.mem.write32(FAST_SYNC64_PAGE + 0xE40u + (uint32_t)(i * 4),
+                            strtoul_zero[i]);
+        g_fast64_strtoul_va = FAST_SYNC64_PAGE + 0xE40u;
     }
 
 
@@ -44636,36 +52085,27 @@ static void build_fast_rwlock_stubs64(ArmExecCtx &ctx) {
          *  1 mrs  x9,tpidr_el0      6 b.lo take(10)        11 add  w12,w12,#0x100
          *  2 ldr  w10,[x9,#0xBF8]   7 and  w12,w11,#0xff   12 orr  w12,w12,w10
          *  3 retry: ldaxr w11,[x0]  8 cmp  w12,w10         13 stlxr w13,w12,[x0]
-         *  4 tbnz w11,#30,slow(17)  9 b.ne slow(17)        14 cbnz w13,retry(3)
+         *  4 tbnz w11,#30,slow(17)  9 tbz w11,#29,slow(17) 14 cbnz w13,retry(3)
          * 15 ret0: mov w0,#0  16 ret  17 slow: clrex  18 svc  19 ret
          *
          * The tbnz is what makes the stub type-aware: a mutex whose word
          * carries MUTEX_SLOW_BIT has semantics only the handler knows (today
          * ERRORCHECK's EDEADLK/EPERM), so it never takes the inline path.
          *
-         * A mutex this thread already holds goes to the handler too (step 9 is
-         * an unconditional branch, not the b.ne it used to be).  The stub
-         * cannot tell NORMAL from RECURSIVE — pthread_mutex_init() writes the
-         * same zero word for both and keeps the type beside it — so taking the
-         * inline count++ meant *every* type recursed.  On a device relocking a
-         * NORMAL mutex deadlocks; here the owner walked straight back into a
-         * critical section it believed was exclusive, and nothing said so.
-         * The handler knows the type, so let it decide, and let it say when a
-         * guest does this. */
+         * Bit 29 carries the recursive type into guest memory, so a recursive
+         * self-lock takes the same userspace count increment as bionic while a
+         * NORMAL self-lock still reaches the handler's deadlock diagnostic. */
         const uint32_t ml[] = {                      /* +0x190 */
-            0xB40001E0u, 0xD53BD049u, 0xB94BF92Au, 0x885FFC0Bu,
-            0x37F001ABu,
-            0x7104017Fu, 0x54000083u, 0x12001D6Cu, 0x6B0A019Fu,
-            0x14000008u, 0x12185D6Cu, 0x1104018Cu, 0x2A0A018Cu,
-            0x880DFC0Cu, 0x35FFFEADu, 0x52800000u, 0xD65F03C0u,
+            0xB40002E0u, 0xD53BD049u, 0xB94BF92Au, 0x885FFC0Bu,
+            0x37F002ABu, 0x7100057Fu, 0x54000183u, 0x12001D6Cu,
+            0x6B0A019Fu, 0x54000201u, 0xD342FC0Du, 0x92401DADu,
+            0xD282000Eu, 0xF2A8220Eu, 0xF2CE000Eu, 0xF86D79CDu,
+            0xEB0001BFu, 0x54000101u, 0x12185D6Cu, 0x1104018Cu,
+            0x2A0A018Cu, 0x880DFC0Cu, 0x35FFFDADu, 0x52800000u,
+            0xD65F03C0u,
             0xD5033F5Fu, 0xD4000001u | (SVC_PTHREAD_MUTEX_LOCK << 5),
             0xD65F03C0u,
         };
-        /*  0 cbz x0,ret0(12)   1 retry: ldaxr w2,[x0]   2 tbnz w2,#30,slow(14)
-         *  3 subs w2,w2,#0x100 4 b.mi clear(10)         5 cmp w2,#0x100
-         *  6 b.lo clear(10)    7 stlxr w3,w2,[x0]       8 cbnz w3,retry(1)
-         *  9 b ret0(12)       10 clear: stlxr w3,wzr,[x0] 11 cbnz w3,retry(1)
-         * 12 ret0: mov w0,#0  13 ret  14 slow: clrex  15 svc  16 ret */
         const uint32_t mu[] = {                      /* +0x210 */
             0xB4000180u, 0x885FFC02u, 0x37F00182u, 0x71040042u,
             0x540000C4u, 0x7104005Fu, 0x54000083u, 0x8803FC02u,
@@ -44765,6 +52205,14 @@ static void build_fast_rwlock_stubs64(ArmExecCtx &ctx) {
             }
             *b.va = FAST_SYNC64_PAGE + b.off;
         }
+        /* The strtoul("0", NULL, 0) wrapper at 0xE40 (written above) branches
+         * to this general blob at 0xE40's fallback for every input it does
+         * not special-case, so the general blob still has to be resident —
+         * but the exported symbol must point at the wrapper that checks for
+         * the single-byte-zero case first.  The loop above just rebound
+         * g_fast64_strtoul_va to the general blob at 0x8B0, which skips that
+         * check entirely: rebind it back. */
+        g_fast64_strtoul_va = FAST_SYNC64_PAGE + 0xE40u;
     }
 
     /* gettid(): the thread asks the register the architecture keeps for it.
@@ -44837,19 +52285,101 @@ static void build_fast_rwlock_stubs64(ArmExecCtx &ctx) {
         g_fast64_clock_gettime_va = FAST_SYNC64_PAGE + 0xD00u;
     }
 
-    /* __errno(): the same deal as gettid, one slot along.
-     *   mrs x9,tpidr_el0; cbz x9,slow; ldr w0,[x9,#TLS64_ERRNO_OFF];
-     *   cbz w0,slow; ret; slow: svc #N; ret */
+    /* __errno(): TLS holds the backing offset (32-bit, 4-aligned at 0xBFC).
+     * Architectural loads need A64_GUEST_BASE|off — a bare return left the
+     * guest reading errno from an unmapped low VA and always seeing 0.
+     *   mrs x9,tpidr_el0; cbz x9,slow;
+     *   ldr w0,[x9,#TLS64_ERRNO_OFF]; cbz w0,slow;
+     *   movk x0,#0x7000,lsl#32; ret;
+     * slow: svc #N; ret */
     {
         static_assert(TLS64_ERRNO_OFF == 0xBFCu,
                       "the ldr offset below encodes TLS64_ERRNO_OFF");
+        static_assert((A64_GUEST_BASE >> 32) == 0x7000ull,
+                      "the movk below encodes A64_GUEST_BASE[47:32]");
         const uint32_t er[] = {
-            0xD53BD049u, 0xB4000089u, 0xB94BFD20u, 0x34000040u,
-            0xD65F03C0u, 0xD4000001u | (SVC_ERRNO_ADDR << 5), 0xD65F03C0u,
+            0xD53BD049u, 0xB40000A9u, 0xB94BFD20u, 0x34000060u,
+            0xF2CE0000u, 0xD65F03C0u,
+            0xD4000001u | (SVC_ERRNO_ADDR << 5), 0xD65F03C0u,
         };
         for (size_t i = 0; i < sizeof er / sizeof er[0]; ++i)
             ctx.mem.write32(FAST_SYNC64_PAGE + 0xD60u + (uint32_t)(i * 4), er[i]);
         g_fast64_errno_va = FAST_SYNC64_PAGE + 0xD60u;
+    }
+
+    /* memchr(): a byte scan belongs in the guest libc, not behind an SVC.
+     * This is the portable C operation encoded for the AArch64 guest:
+     * unsigned-byte comparison, first match, and a strict n-byte bound.  A
+     * null pointer with non-zero length retains the diagnostic SVC path;
+     * n == 0 returns NULL without touching the pointer.
+     *
+     * Cross Worlds called the SVC implementation 1.2 million times in a
+     * 292-second post-title run (6.6% of all emulator exits).  Android's
+     * implementation is ordinary userspace libc code and does not trap.
+     */
+    {
+        const uint32_t mc[] = {
+            0xB4000122u, 0xB4000140u, 0x12001C21u, 0x39400003u,
+            0x6B01007Fu, 0x540000A0u, 0x91000400u, 0xF1000442u,
+            0x54FFFF61u, 0xAA1F03E0u, 0xD65F03C0u,
+            0xD4000001u | (SVC_MEMCHR << 5), 0xD65F03C0u,
+        };
+        for (size_t i = 0; i < sizeof mc / sizeof mc[0]; ++i)
+            ctx.mem.write32(FAST_SYNC64_PAGE + 0xD80u + (uint32_t)(i * 4), mc[i]);
+        g_fast64_memchr_va = FAST_SYNC64_PAGE + 0xD80u;
+    }
+
+    /* feof / fgets — Android stdio in guest code.
+     *
+     * A phone never traps on a line-oriented walk of a FILE that already has
+     * its buffer filled.  Here every fgets/feof was an SVC against a host
+     * FILE*, and Cross Worlds' post-title kit parse spent ~18% of JIT exits
+     * on those two alone.  fopen() now preloads readable files into a guest
+     * buffer and stamps the shim (see GFILE_*); these stubs are the C
+     * operations over that buffer.  base == 0 falls through to the SVC for
+     * write streams and anything too large to preload.
+     *
+     * Laid out at 0xF00..0xFC8, after the strtoul wrapper (0xE40) and before
+     * the mutex-type table at 0x1000. */
+    {
+        static const uint32_t fe[] = {
+            0xb4000140u, 0xd360fc09u, 0xb5000049u, 0xf2ce0000u,
+            0xf9400c01u, 0xb40000a1u, 0xb9400c00u, 0x121b0000u,
+            0x53057c00u, 0xd65f03c0u,
+            0xd4000001u /* | svc */, 0xd65f03c0u,
+        };
+        /* fgets promote: bare FILE* offsets get A64_GUEST_BASE before the
+         * body at 0xF40 (same class of bug as __errno). */
+        static const uint32_t fg_prom[] = {
+            0xb4000460u, 0xd360fc09u, 0xb5000049u, 0xf2ce0000u,
+        };
+        static const uint32_t fg[] = {
+            0xb4000440u, 0xb4000422u, 0x7100043fu, 0x540003ebu,
+            0xf9400c43u, 0xb40003e3u, 0xb9400c43u, 0x37280363u,
+            0xb9400843u, 0x7100007fu, 0x540002adu, 0xaa0003e4u,
+            0x51000421u, 0x34000181u, 0xb9400843u, 0x34000183u,
+            0xf9400045u, 0x384014a6u, 0xf9000045u, 0x51000463u,
+            0xb9000843u, 0x38001486u, 0x51000421u, 0x710028dfu,
+            0x54fffea1u, 0x3900009fu, 0xd65f03c0u, 0xeb00009fu,
+            0x54000060u, 0x3900009fu, 0xd65f03c0u, 0xb9400c43u,
+            0x321b0063u, 0xb9000c43u, 0xaa1f03e0u, 0xd65f03c0u,
+            0xd4000001u /* | svc */, 0xd65f03c0u,
+        };
+        for (size_t i = 0; i < sizeof fe / sizeof fe[0]; ++i) {
+            uint32_t w = fe[i];
+            if (w == 0xd4000001u) w |= SVC_FEOF << 5;
+            ctx.mem.write32(FAST_SYNC64_PAGE + 0xF00u + (uint32_t)(i * 4), w);
+        }
+        for (size_t i = 0; i < sizeof fg_prom / sizeof fg_prom[0]; ++i)
+            ctx.mem.write32(FAST_SYNC64_PAGE + 0xF30u + (uint32_t)(i * 4),
+                            fg_prom[i]);
+        for (size_t i = 0; i < sizeof fg / sizeof fg[0]; ++i) {
+            uint32_t w = fg[i];
+            if (w == 0xd4000001u) w |= SVC_FGETS << 5;
+            ctx.mem.write32(FAST_SYNC64_PAGE + 0xF40u + (uint32_t)(i * 4), w);
+        }
+        g_fast64_feof_va  = FAST_SYNC64_PAGE + 0xF00u;
+        g_fast64_fgets_va = FAST_SYNC64_PAGE + 0xF30u;
     }
 
 
@@ -44986,6 +52516,39 @@ static void build_jni_tables64(ArmExecCtx &ctx) {
      * whether the VM waits for the thread at shutdown, which nothing here
      * models — the JNIEnv it must hand back is the same one. */
     set64(JVM_SLOT_ATTACH_DA, SVC_JVM_ATTACH);
+
+    /* JavaVM invocation functions which only publish this VM's JNIEnv need no
+     * emulator transition.  Android exposes them through an ordinary guest
+     * vtable, and UE asks GetEnv on virtually every Java call from a native
+     * worker.  Sending that operation through SVC 229 made a constant pointer
+     * store one of the hottest JIT exits on Cross Worlds' title screen.
+     *
+     *   ldr x8, env_slot_value; str x8,[x1]; mov w0,wzr; ret
+     *   .quad A64_GUEST_BASE + ENV_SLOT64_BASE
+     *
+     * AttachCurrentThread has the same observable contract in this VM: all
+     * guest threads use the shared immutable JNI function table.  Detach and
+     * Destroy return JNI_OK directly.  The words are plain AArch64 code/data
+     * emitted by the runtime, not a replacement for any application body, and
+     * remain expressible as C arrays for the planned C conversion. */
+    static constexpr uint32_t JVM_FAST_ENV = FAST_SYNC64_PAGE + 0xE00u;
+    static constexpr uint32_t JVM_FAST_OK  = FAST_SYNC64_PAGE + 0xE20u;
+    ctx.mem.write32(JVM_FAST_ENV + 0x00u, 0x58000088u); /* ldr x8, .+16 */
+    ctx.mem.write32(JVM_FAST_ENV + 0x04u, 0xF9000028u); /* str x8, [x1] */
+    ctx.mem.write32(JVM_FAST_ENV + 0x08u, 0x2A1F03E0u); /* mov w0, wzr */
+    ctx.mem.write32(JVM_FAST_ENV + 0x0Cu, 0xD65F03C0u); /* ret */
+    ctx.mem.write64(JVM_FAST_ENV + 0x10u, a64_guest_va(ENV_SLOT64_BASE));
+    ctx.mem.write32(JVM_FAST_OK  + 0x00u, 0x2A1F03E0u); /* mov w0, wzr */
+    ctx.mem.write32(JVM_FAST_OK  + 0x04u, 0xD65F03C0u); /* ret */
+    auto set64va = [&](uint32_t slot, uint32_t va) {
+        const GuestVA guest_va = a64_guest_va(va);
+        std::memcpy(ctx.mem.ptr(JVM_TBL64_BASE + slot * 8u), &guest_va, 8);
+    };
+    set64va(JVM_SLOT_DESTROY,   JVM_FAST_OK);
+    set64va(JVM_SLOT_ATTACH,    JVM_FAST_ENV);
+    set64va(JVM_SLOT_DETACH,    JVM_FAST_OK);
+    set64va(JVM_SLOT_GETENV,    JVM_FAST_ENV);
+    set64va(JVM_SLOT_ATTACH_DA, JVM_FAST_ENV);
 
     // ENV_SLOT64: uint64_t -> JNI_TBL64_BASE (the JNIEnv* guest sees)
     ctx.mem.map(ENV_SLOT64_BASE, 32u);
@@ -45131,7 +52694,6 @@ static void decode_relr(const uint64_t *relr, size_t n,
 static bool load_elf64(ArmExecCtx &ctx, const char *path,
                        uint64_t &jni_onload_va, uint64_t base_addr,
                        bool ctors_via_cb) {
-    (void)ctors_via_cb; /* A64 preload is not mid-SVC; always use main JIT */
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("arm64: open"); return false; }
     struct stat st; fstat(fd, &st);
@@ -45149,6 +52711,27 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
 
     const BackingOffset backing_base = (BackingOffset)base_addr;
     const GuestVA guest_base = a64_guest_va(backing_base);
+
+    /* LUNARIA_DUMP_MODULES=<dir>: keep a copy of every image the guest loads.
+     * A library the guest writes, dlopen()s and unlinks in the same breath --
+     * which is how anti-tamper SDKs ship their downloaded code -- is gone from
+     * the filesystem before anyone can look at it, and its addresses are the
+     * ones that turn up in an abort.  This writes the bytes the loader
+     * actually parsed, so the copy and the mapped image agree. */
+    if (const char *dumpdir = getenv("LUNARIA_DUMP_MODULES")) {
+        const char *slash = strrchr(path, '/');
+        char out[PATH_MAX];
+        if ((size_t)snprintf(out, sizeof out, "%s/%s.so", dumpdir,
+                             slash ? slash + 1 : path) < sizeof out) {
+            FILE *f = fopen(out, "wb");
+            if (f) {
+                fwrite(buf.data(), 1, buf.size(), f);
+                fclose(f);
+                fprintf(stderr, "[arm64] module image saved: %s (base=0x%llx)\n",
+                        out, (unsigned long long)base_addr);
+            }
+        }
+    }
 
     // Map PT_LOAD segments.
     const auto *phdrs = reinterpret_cast<const Elf64_Phdr *>(buf.data() + ehdr->e_phoff);
@@ -45186,11 +52769,50 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
         if (va < lib_lo) lib_lo = va;
         if (va + msz > lib_hi) lib_hi = va + msz;
         g_loaded_regions.push_back({va & ~0xfffu, ((va+msz)+0xfffu)&~0xfffu,
-                                    (uint32_t)phdrs[i].p_flags, path});
+                                    (uint32_t)phdrs[i].p_flags,
+                                    (uint64_t)phdrs[i].p_offset & ~0xfffull,
+                                    path, (uint64_t)st.st_ino});
         guest_rx_bounds_refresh();
     }
     register_module_phdr(ctx, path, guest_base, phdrs,
                          (uint16_t)ehdr->e_phnum, true);
+
+    /* Register the mapped image with the C11 Android-linker scope engine.
+     * dynamic_off is a backing offset (not an architectural VA), matching
+     * ArmMemory::try_ptr's narrow-address form. */
+    uint32_t dynamic_off = 0;
+    for (int i = 0; i < ehdr->e_phnum; ++i)
+        if (phdrs[i].p_type == PT_DYNAMIC) {
+            dynamic_off = backing_base + (uint32_t)phdrs[i].p_vaddr;
+            break;
+        }
+    if (!g_ln64_inited) {
+        ln64_init(ln64_guest_ptr, &ctx);
+        g_ln64_inited = true;
+    }
+    /* libc-pure.so is a second mapping of Android's libc code image used only
+     * as an in-guest provider for the audited stateless routines selected by
+     * svc_prefers_guest_export().  It must not become the process libc: doing
+     * so would split allocator, pthread, stdio and errno ownership across two
+     * ABIs.  In particular, do not run bionic's linker bootstrap or ctors. */
+    const char *image_name = std::strrchr(path, '/');
+    image_name = image_name ? image_name + 1 : path;
+    const char *syslib_dir = std::getenv("LUNARIA_SYSLIB_DIR");
+    const size_t syslib_len = syslib_dir ? std::strlen(syslib_dir) : 0u;
+    const bool legacy_syslib_libc = syslib_len != 0u &&
+        !std::strcmp(image_name, "libc.so") &&
+        !std::strncmp(path, syslib_dir, syslib_len) && path[syslib_len] == '/';
+    const bool pure_libc_image = !std::strcmp(image_name, "libc-pure.so") ||
+                                 legacy_syslib_libc;
+    struct ln64_module *lnmod = dynamic_off
+        ? ln64_add(path, backing_base, dynamic_off, g_a64_loading_main,
+                   g_a64_loading_main)
+        : nullptr;
+    if (!pure_libc_image && lnmod &&
+        !strcmp(ln64_module_soname(lnmod), "libc.so")) {
+        g_guest_bionic_loaded = true;
+    }
+    ln64_link_deps();
 
     // Section headers for symbol/reloc processing
     if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0) {
@@ -45209,6 +52831,9 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
     const Elf64_Sym *dynsym = nullptr;
     size_t           dynsym_n = 0;
     const char      *dynstr = nullptr;
+    GuestVA bionic_init_tls_va = 0;
+    GuestVA bionic_init_thread_va = 0;
+    GuestVA bionic_thread_add_va = 0;
 
     // Collect SHT_RELA relocation sections
     struct RelaSec { const Elf64_Rela *relas; size_t n; uint32_t link; };
@@ -45216,6 +52841,17 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
     // Backing storage for relocations we have to unpack ourselves.
     std::vector<std::vector<Elf64_Rela>> unpacked_relas;
     std::vector<uint64_t> relr_offsets;
+    /* Constructors run only after relocation and may not alter linker-owned
+     * GOT entries.  Keep the values we installed so the loader can detect a
+     * broken execution/memory boundary immediately, at the operation that
+     * caused it, instead of letting a later PLT call branch to NULL.  This is
+     * an ELF-loader invariant check, not an application-specific patch. */
+    struct AppliedA64GotReloc {
+        uint32_t addr;
+        uint64_t value;
+        std::string symbol;
+    };
+    std::vector<AppliedA64GotReloc> applied_got_relocs;
 
     for (int i = 0; i < ehdr->e_shnum; ++i) {
         const auto &sh = shdrs[i];
@@ -45245,6 +52881,33 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
                         (size_t)(sh.sh_size / 8), relr_offsets);
         }
     }
+    /* libc's main-thread bootstrap is normally performed by the Android
+     * linker before libc constructors.  Lunaria maps libc as an ordinary
+     * dependency, so recover the same hidden helpers from its full symbol
+     * table rather than fabricating a second pthread ABI. */
+    if (!pure_libc_image && lnmod &&
+        !strcmp(ln64_module_soname(lnmod), "libc.so")) {
+        for (int i = 0; i < ehdr->e_shnum; ++i) {
+            const auto &sh = shdrs[i];
+            if (sh.sh_type != SHT_SYMTAB || !sh.sh_entsize) continue;
+            const auto *syms = reinterpret_cast<const Elf64_Sym *>(
+                buf.data() + sh.sh_offset);
+            const size_t nsyms = (size_t)(sh.sh_size / sh.sh_entsize);
+            const char *names = reinterpret_cast<const char *>(
+                buf.data() + shdrs[sh.sh_link].sh_offset);
+            for (size_t k = 0; k < nsyms; ++k) {
+                if (!syms[k].st_value || !syms[k].st_name) continue;
+                const char *name = names + syms[k].st_name;
+                const GuestVA va = guest_base + syms[k].st_value;
+                if (!strcmp(name, "_Z10__init_tlsP18pthread_internal_t"))
+                    bionic_init_tls_va = va;
+                else if (!strcmp(name, "_Z13__init_threadP18pthread_internal_t"))
+                    bionic_init_thread_va = va;
+                else if (!strcmp(name, "_Z22__pthread_internal_addP18pthread_internal_t"))
+                    bionic_thread_add_va = va;
+            }
+        }
+    }
     // Patch in the unpacked pointers now that the vectors are done growing.
     {
         size_t u = 0;
@@ -45261,6 +52924,12 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
             if (strcmp(n, "JNI_OnLoad") == 0 && dynsym[i].st_value)
                 jni_onload_va = guest_base + dynsym[i].st_value;
             if (dynsym[i].st_shndx != SHN_UNDEF && dynsym[i].st_value) {
+                /* A pure-code image is not a process-global libc.  Keep its
+                 * allocator/stdio/thread/data symbols out of dlsym and the
+                 * legacy global map as well as out of relocation selection. */
+                if (pure_libc_image &&
+                    !svc_prefers_guest_export(n, lookup_symbol_svc(n)))
+                    continue;
                 GuestVA sym_va = guest_base + dynsym[i].st_value;
                 /* The main library heads the global lookup scope even though
                  * its dependencies were mapped first, so its definitions
@@ -45274,16 +52943,30 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
         fprintf(stderr, "[arm64] %s: exported %zu symbols (base=0x%llx)\n",
                 path, g_exported_syms64.size(), (unsigned long long)base_addr);
 
+        /* Resolve the host-implemented functions in what this module just
+         * published.  By name, out of .dynsym, like any other binding. */
+        a64_install_code_hooks(ctx);
+
+        relink_pending_a64_relocs(ctx);
+
         /* The global scope is now complete for everything mapped so far:
          * re-point the dependency slots the main library interposes. */
         if (g_a64_loading_main && !g_a64_main_loaded) {
             size_t fixed = 0;
             for (const auto &s : g_a64_interpose_slots) {
-                auto g = g_exported_syms64.find(s.name);
-                if (g == g_exported_syms64.end() || g->second == s.local_va)
+                struct ln64_sym resolved{};
+                if (!ln64_lookup_global(s.name.c_str(), &resolved))
                     continue;
-                uint64_t val = g->second + s.addend;
+                const uint64_t target = a64_guest_va(resolved.value);
+                if (target == s.local_va) continue;
+                uint64_t val = target + s.addend;
                 std::memcpy(ctx.mem.ptr(s.ro), &val, 8);
+                if (fixed < 16)
+                    fprintf(stderr, "[interpose64] %s: 0x%llx -> 0x%llx "
+                            "(slot=0x%08x owner=%s)\n", s.name.c_str(),
+                            (unsigned long long)s.local_va,
+                            (unsigned long long)target, s.ro,
+                            ln64_module_soname(resolved.owner));
                 ++fixed;
             }
             if (fixed)
@@ -45340,6 +53023,7 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
 
                 const char *sname = str + stab[si].st_name;
                 uint64_t sym_va = 0;
+                struct ln64_sym scoped{};
 
                 if (stab[si].st_shndx != SHN_UNDEF && stab[si].st_value) {
                     // Defined here — but a default-visibility definition is
@@ -45348,11 +53032,25 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
                     sym_va = guest_base + stab[si].st_value;
                     const unsigned vis  = ELF64_ST_VISIBILITY(stab[si].st_other);
                     const unsigned bind = ELF64_ST_BIND(stab[si].st_info);
-                    if (!symbolic && vis == STV_DEFAULT && bind != STB_LOCAL &&
+                    /* A later dlopen object starts a new Android local group.
+                     * The already-loaded RTLD_LOCAL main library is not in
+                     * that object's global group and must not preempt the
+                     * object's own weak libc++ definitions.  Treating every
+                     * loaded DSO as process-global mixed the module's
+                     * malloc-backed std::string storage with UE's
+                     * FMallocBinned2 append/delete implementation. */
+                    if (!g_a64_main_loaded && !symbolic &&
+                        vis == STV_DEFAULT && bind != STB_LOCAL &&
                         (rt == R_AARCH64_JUMP_SLOT || rt == R_AARCH64_GLOB_DAT)) {
-                        auto g = g_exported_syms64.find(sname);
-                        if (g != g_exported_syms64.end() && g->second != sym_va)
-                            sym_va = g->second;
+                        if (lnmod && ln64_lookup(lnmod, sname, si, &scoped)) {
+                            const GuestVA scoped_va = a64_guest_va(scoped.value);
+                            if (scoped_va != sym_va)
+                                sym_va = scoped_va;
+                            else if (!g_a64_main_loaded)
+                                g_a64_interpose_slots.push_back(
+                                    {ro, (uint64_t)(int64_t)rela.r_addend,
+                                     sym_va, sname});
+                        }
                         else if (!g_a64_main_loaded)
                             g_a64_interpose_slots.push_back(
                                 {ro, (uint64_t)(int64_t)rela.r_addend, sym_va, sname});
@@ -45371,7 +53069,20 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
                     const uint32_t abi_svc = lookup_symbol_svc(sname);
                     // CRITICAL: lookup_symbol_svc returns UINT32_MAX on miss.
                     auto exp_it = g_exported_syms64.find(sname);
-                    if (direct_va) {
+                    const bool scoped_found =
+                        lnmod && ln64_lookup(lnmod, sname, si, &scoped);
+                    if (scoped_found &&
+                        svc_prefers_guest_export(sname, abi_svc)) {
+                        /* Android's own libm is already mapped into the guest.
+                         * Run pure libc/libm operations there just as a device
+                         * does.  This test must precede direct_va: the direct
+                         * memcpy/memset/string helpers deliberately fall back
+                         * to an SVC for their general case, so choosing them
+                         * first silently defeated this SVC-free path.  The
+                         * broader ABI boundary below remains intact for
+                         * stateful libc and pthread entry points. */
+                        sym_va = a64_guest_va(scoped.value);
+                    } else if (direct_va) {
                         sym_va = a64_guest_va(direct_va);
                     } else if (abi_svc != UINT32_MAX) {
                         uint32_t svc = abi_svc;
@@ -45385,8 +53096,8 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
                                 if (named) sym_va = a64_guest_va(named);
                             }
                             if (!sym_va) sym_va = tramp64(svc);
-                    } else if (exp_it != g_exported_syms64.end()) {
-                        sym_va = exp_it->second;
+                    } else if (scoped_found) {
+                        sym_va = a64_guest_va(scoped.value);
                     } else if (ELF64_ST_BIND(stab[si].st_info) == STB_WEAK) {
                             /* An undefined *weak* symbol resolves to 0 — that is
                              * the ELF rule, and callers rely on it: the whole
@@ -45432,7 +53143,32 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
                             }
                             if (slot != UINT32_MAX)
                                 sym_va = tramp64(SVC_TRAMP_TOTAL + slot);
+                            if (rt == R_AARCH64_JUMP_SLOT ||
+                                rt == R_AARCH64_GLOB_DAT)
+                                g_pending_a64_relocs.push_back(
+                                    {ro, (int64_t)rela.r_addend, sname});
                     }
+                    const char *trace_symbol = lunaria_env("LUNARIA_TRACE_BIND_SYMBOL");
+                    if (trace_symbol && !strcmp(sname, trace_symbol)) {
+                        fprintf(stderr,
+                                "[elf-bind] %s: %s -> 0x%llx "
+                                "(scoped=%d owner=%s svc=%u direct=0x%x)\n",
+                                path, sname, (unsigned long long)sym_va,
+                                scoped_found,
+                                scoped_found ? ln64_module_soname(scoped.owner) : "-",
+                                abi_svc, direct_va);
+                    }
+                }
+
+                if (lunaria_env("LUNARIA_TRACE_PTHREAD_BIND") &&
+                    sname && !strncmp(sname, "pthread_", 8)) {
+                    const auto traced_exp = g_exported_syms64.find(sname);
+                    fprintf(stderr,
+                            "[elf-bind] %s: %s -> 0x%llx (guest=0x%llx svc=%u direct=0x%x)\n",
+                            path, sname, (unsigned long long)sym_va,
+                            (unsigned long long)(traced_exp != g_exported_syms64.end()
+                                ? traced_exp->second : 0),
+                            lookup_symbol_svc(sname), lookup_symbol_direct_va(sname));
                 }
 
                 switch (rt) {
@@ -45440,6 +53176,10 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
                 case R_AARCH64_JUMP_SLOT: {
                     uint64_t val = sym_va + (uint64_t)(int64_t)rela.r_addend;
                     std::memcpy(ctx.mem.ptr(ro), &val, 8);
+                    applied_got_relocs.push_back({ro, val, sname ? sname : ""});
+                    if (!strcmp(sname, "__libc_init"))
+                        fprintf(stderr, "[elf-bind] %s: __libc_init slot=0x%x -> 0x%llx\n",
+                                path, ro, (unsigned long long)val);
                     break;
                 }
                 case R_AARCH64_ABS64: {
@@ -45474,6 +53214,39 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
                 path, relr_offsets.size());
     }
 
+    if (bionic_init_tls_va && bionic_init_thread_va && bionic_thread_add_va) {
+        /* Android 8's pthread_internal_t embeds its TLS vector at +0x98; this
+         * is the ABI implemented by the mapped libc (its __init_tls writes
+         * {tls,self} there and stores bionic_tls at +0xb00).  Keep the main
+         * descriptor for process lifetime, just as bionic's static
+         * main_thread does. */
+        const uint32_t thread = arm_malloc(ctx, 0x1000u);
+        if (!thread) return false;
+        memset(ctx.mem.ptr(thread), 0, 0x1000u);
+        (void)run_arm64(ctx, bionic_init_tls_va, a64_guest_va(thread), 0, 0, 0,
+                        20'000'000ULL);
+        const GuestVA tls = a64_guest_va(thread + 0x98u);
+        g_tpidr_el0_val = tls;
+        g_tpidrro_el0_val = tls;
+        ctx.mem.write32(thread + 0x10u, guest_pid()); /* tid */
+        ctx.mem.write32(thread + 0x14u, guest_pid()); /* cached_pid_ */
+        auto attr_init = g_exported_syms64.find("pthread_attr_init");
+        if (attr_init != g_exported_syms64.end())
+            (void)run_arm64(ctx, attr_init->second, a64_guest_va(thread + 0x18u),
+                            0, 0, 0, 20'000'000ULL);
+        (void)run_arm64(ctx, bionic_init_thread_va, a64_guest_va(thread), 0, 0, 0,
+                        20'000'000ULL);
+        (void)run_arm64(ctx, bionic_thread_add_va, a64_guest_va(thread), 0, 0, 0,
+                        20'000'000ULL);
+        arm64_tls_release(ctx, 0);
+        ctx.tpidr_by_tid[1u] = tls;
+        g_tpidr_el0_val = tls;
+        g_tpidrro_el0_val = tls;
+        fprintf(stderr, "[arm64] bionic main pthread initialized: thread=0x%08x "
+                        "tls=0x%llx tid=%u\n", thread,
+                (unsigned long long)tls, guest_pid());
+    }
+
     // Diagnostic detours: LUNARIA_DETOUR=hexva[:label][,hexva[:label].
     if (const char *dl = lunaria_env("LUNARIA_DETOUR")) {
         std::string list(dl);
@@ -45487,439 +53260,8 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
         }
     }
 
-    /* Replace FAES::DecryptData with host AES-256-ECB (pak index decrypt).
-     * Keyed on the symbol, not the library name: UE4 ships libUE4.so and UE5
-     * libUnreal.so, and a name test silently disarmed the hook for UE5.
-     * Opt out with LUNARIA_HOST_FAES=0. */
-    {
-        const char *host_faes = lunaria_env("LUNARIA_HOST_FAES");
-        if (!host_faes || strcmp(host_faes, "0") != 0) {
-        static const char *kFaesSyms[] = {
-            // Real body; FAESKey overload is a 4-byte `b` into this.
-            "_ZN4FAES11DecryptDataEPhjPKhj",
-            nullptr,
-        };
-        for (const char **ps = kFaesSyms; *ps; ++ps) {
-            auto it = g_exported_syms64.find(*ps);
-            if (it == g_exported_syms64.end()) continue;
-            GuestVA va = it->second;
-            uint32_t c = a64_canon_va(va);
-            if (c < lib_lo || c >= lib_hi) continue;
-            // svc #SVC_FAES_DECRYPT ; ret
-            ctx.mem.write32(c, 0xd4000001u | (SVC_FAES_DECRYPT << 5));
-            ctx.mem.write32(c + 4, 0xd65f03c0u);
-            a64_invalidate_main_jit(ctx, a64_guest_va(c), 8);
-            a64_invalidate_engines(a64_guest_va(c), 8);
-            fprintf(stderr, "[aes] host FAES::DecryptData hook @0x%llx (%s)\n",
-                    (unsigned long long)va, *ps);
-        }
-        }
-    }
-
-    /* Replace FSHA1::HashBuffer with host OpenSSL SHA-1.
-     * The static method signature: void FSHA1::HashBuffer(const void*, uint64, uint8*).
-     * A64: x0=data, x1=dataSize, x2=hash.  Opt out with LUNARIA_HOST_SHA1=0. */
-    {
-        const char *opt = lunaria_env("LUNARIA_HOST_SHA1");
-        if (!opt || strcmp(opt, "0") != 0) {
-        static const char *kSha1Syms[] = {
-            "_ZN5FSHA110HashBufferEPKvyPh",  /* FSHA1::HashBuffer(void const*, ulong, uchar*) */
-            nullptr,
-        };
-        for (const char **ps = kSha1Syms; *ps; ++ps) {
-            auto it = g_exported_syms64.find(*ps);
-            if (it == g_exported_syms64.end()) continue;
-            GuestVA va = it->second;
-            uint32_t c = a64_canon_va(va);
-            if (c < lib_lo || c >= lib_hi) continue;
-            ctx.mem.write32(c, 0xd4000001u | (SVC_FSHA1_HASHBUFFER << 5));
-            ctx.mem.write32(c + 4, 0xd65f03c0u);
-            a64_invalidate_main_jit(ctx, a64_guest_va(c), 8);
-            a64_invalidate_engines(a64_guest_va(c), 8);
-            fprintf(stderr, "[sha1] host FSHA1::HashBuffer hook @0x%llx (%s)\n",
-                    (unsigned long long)va, *ps);
-        }
-        }
-    }
-
-    /* Replace CityHash64 with host implementation (identical algorithm: v1.1).
-     * Symbol: _Z10CityHash64PKcj — CityHash64(char const*, unsigned int).
-     * A64: x0=buf, x1=len (uint32), returns uint64 in x0.
-     * Opt out with LUNARIA_HOST_CITYHASH=0. */
-    {
-        const char *opt = lunaria_env("LUNARIA_HOST_CITYHASH");
-        if (!opt || strcmp(opt, "0") != 0) {
-        static const char *kCHSyms[] = {
-            "_Z10CityHash64PKcj",   /* CityHash64(char const*, unsigned int) */
-            nullptr,
-        };
-        for (const char **ps = kCHSyms; *ps; ++ps) {
-            auto it = g_exported_syms64.find(*ps);
-            if (it == g_exported_syms64.end()) continue;
-            GuestVA va = it->second;
-            uint32_t c = a64_canon_va(va);
-            if (c < lib_lo || c >= lib_hi) continue;
-            ctx.mem.write32(c, 0xd4000001u | (SVC_CITYHASH64 << 5));
-            ctx.mem.write32(c + 4, 0xd65f03c0u);
-            a64_invalidate_main_jit(ctx, a64_guest_va(c), 8);
-            a64_invalidate_engines(a64_guest_va(c), 8);
-            fprintf(stderr, "[hash] host CityHash64 hook @0x%llx (%s)\n",
-                    (unsigned long long)va, *ps);
-        }
-        }
-    }
-
-    /* Replace CityHash32 with host implementation (identical algorithm: v1.1).
-     * Symbol: _Z10CityHash32PKcj — CityHash32(char const*, unsigned int).
-     * A64: x0=buf, x1=len (uint32), returns uint32 in w0.
-     * Same reasoning and opt-out as CityHash64 just above — LUNARIA_HOST_CITYHASH=0
-     * disables both, since a guest that calls one calls the other. */
-    {
-        const char *opt = lunaria_env("LUNARIA_HOST_CITYHASH");
-        if (!opt || strcmp(opt, "0") != 0) {
-        static const char *kCH32Syms[] = {
-            "_Z10CityHash32PKcj",   /* CityHash32(char const*, unsigned int) */
-            nullptr,
-        };
-        for (const char **ps = kCH32Syms; *ps; ++ps) {
-            auto it = g_exported_syms64.find(*ps);
-            if (it == g_exported_syms64.end()) continue;
-            GuestVA va = it->second;
-            uint32_t c = a64_canon_va(va);
-            if (c < lib_lo || c >= lib_hi) continue;
-            ctx.mem.write32(c, 0xd4000001u | (SVC_CITYHASH32 << 5));
-            ctx.mem.write32(c + 4, 0xd65f03c0u);
-            a64_invalidate_main_jit(ctx, a64_guest_va(c), 8);
-            a64_invalidate_engines(a64_guest_va(c), 8);
-            fprintf(stderr, "[hash] host CityHash32 hook @0x%llx (%s)\n",
-                    (unsigned long long)va, *ps);
-        }
-        }
-    }
-
-    /* Host Ogg Vorbis decode (stb_vorbis) for FVorbisAudioInfo — see
-     * SVC_STB_VORBIS_INFO / SVC_STB_VORBIS_READ in arm.h for the design.
-     * ReadCompressedInfo is an *observe* hook (install_inline_detour resumes
-     * the original code after); ReadCompressedData/StreamCompressedData are
-     * replaced outright, the same svc+ret patch as CityHash above.
-     * Opt out with LUNARIA_HOST_VORBIS=0. */
-    {
-        const char *opt = lunaria_env("LUNARIA_HOST_VORBIS");
-        if (!opt || strcmp(opt, "0") != 0) {
-        auto it_info = g_exported_syms64.find(
-            "_ZN16FVorbisAudioInfo18ReadCompressedInfoEPKhjP17FSoundQualityInfo");
-        if (it_info != g_exported_syms64.end()) {
-            uint32_t c = a64_canon_va(it_info->second);
-            if (c >= lib_lo && c < lib_hi)
-                install_inline_detour(ctx, c, "stb_vorbis_open_info");
-        }
-        static const char *kVorbisReadSyms[] = {
-            "_ZN16FVorbisAudioInfo18ReadCompressedDataEPhbj",
-            "_ZN16FVorbisAudioInfo20StreamCompressedDataEPhbj",
-            nullptr,
-        };
-        for (const char **ps = kVorbisReadSyms; *ps; ++ps) {
-            auto it = g_exported_syms64.find(*ps);
-            if (it == g_exported_syms64.end()) continue;
-            GuestVA va = it->second;
-            uint32_t c = a64_canon_va(va);
-            if (c < lib_lo || c >= lib_hi) continue;
-            ctx.mem.write32(c, 0xd4000001u | (SVC_STB_VORBIS_READ << 5));
-            ctx.mem.write32(c + 4, 0xd65f03c0u);
-            a64_invalidate_main_jit(ctx, a64_guest_va(c), 8);
-            a64_invalidate_engines(a64_guest_va(c), 8);
-            fprintf(stderr, "[vorbis] host decode hook @0x%llx (%s)\n",
-                    (unsigned long long)va, *ps);
-        }
-        }
-    }
-
-    /* FGenericPlatformStricmp::Stricmp / ::Strnicmp.
-     *
-     * Opt in with LUNARIA_HOST_STRICMP=1.  Default is off: the guest's own
-     * fold-table loop is a few dozen instructions, and replacing the entry
-     * with an SVC makes every short compare leave the JIT (~600 ns).  After
-     * the title screen this title does millions of those in shop/CSV parse;
-     * the SVC form showed up as the dominant slice-exit PC and the wall clock
-     * crawled.  The guest loop is what a phone runs. */
-    {
-        /* Keep short ANSI comparisons entirely inside the JIT, but hand a
-         * long equal prefix to the existing native handler.  The old all-SVC
-         * hook lost badly on the millions of short CSV-key comparisons this
-         * title makes; the unmodified guest loop, on the other hand, retires
-         * ten instructions for every equal byte and dominates long keys.
-         *
-         * This leaf is the guest function's exact loop plus an eight-byte
-         * counter.  A mismatch, a terminator, or any non-ASCII byte takes the
-         * guest fold table path and returns without leaving translated code.
-         * Only after eight equal non-NUL bytes does it issue SVC_UE_STRICMP,
-         * with x0/x1 already advanced to the suffix.  Comparing that suffix
-         * is semantically identical and makes the common short path lock-free.
-         * Opt out for comparison with LUNARIA_GUEST_STRICMP_HYBRID=0. */
-        const char *all_host = lunaria_env("LUNARIA_HOST_STRICMP");
-        const char *opt = lunaria_env("LUNARIA_GUEST_STRICMP_HYBRID");
-        if ((!all_host || strcmp(all_host, "1") != 0) &&
-            (!opt || strcmp(opt, "0") != 0)) {
-            constexpr const char *sym =
-                "_ZN23FGenericPlatformStricmp7StricmpEPKcS1_";
-            auto it = g_exported_syms64.find(sym);
-            if (it != g_exported_syms64.end()) {
-                const GuestVA va = it->second;
-                const uint32_t c = a64_canon_va(va);
-                uint32_t a0 = ctx.mem.read32(c), a1 = ctx.mem.read32(c + 4u);
-                const uint32_t rd0 = a0 & 31u, rd1 = a1 & 31u;
-                const uint32_t rn1 = (a1 >> 5) & 31u;
-                if (c >= lib_lo && c < lib_hi &&
-                    (a0 & 0x9f000000u) == 0x90000000u &&
-                    (a1 & 0xffc00000u) == 0x91000000u &&
-                    rd0 == rd1 && rd0 == rn1) {
-                    const int64_t immhi = (int64_t)((a0 >> 5) & 0x7ffffu);
-                    const int64_t immlo = (int64_t)((a0 >> 29) & 3u);
-                    int64_t page = (immhi << 2) | immlo;
-                    if (page & (1ll << 20)) page -= 1ll << 21;
-                    const uint64_t base = (va & ~0xfffull) +
-                                          (uint64_t)(page * 4096ll);
-                    const uint64_t off = (uint64_t)((a1 >> 10) & 0xfffu) <<
-                                         (((a1 >> 22) & 1u) ? 12 : 0);
-                    const GuestVA table = base + off;
-                    StricmpSite st{};
-                    st.w1 = st.w2 = 1;
-                    memcpy(st.fold, ctx.mem.ptr(table), sizeof st.fold);
-
-                    /* Assembled from the leaf described above.  The literal
-                     * at +0x58 is filled with this build's fold-table VA. */
-                    static const uint32_t code[] = {
-                        0x580002c9u, 0x5280010du, 0x3840140au, 0x3840142bu,
-                        0x6b0b0148u, 0x540000c1u, 0x340001aau, 0x710005adu,
-                        0x54ffff41u, 0xd400b5e1u, 0xd65f03c0u, 0x2a0a016cu,
-                        0x373800acu, 0x386a4928u, 0x386b492au, 0x6b0a0108u,
-                        0x54fffec0u, 0x2a0803e0u, 0xd65f03c0u, 0x2a1f03e0u,
-                        0xd65f03c0u, 0xd503201fu, 0, 0,
-                    };
-                    static_assert(sizeof code == 0x60u);
-                    const uint32_t stub = g_ue_stub_next;
-                    if (stub + sizeof code <= UE_STUB_BASE + 0x1000u) {
-                        g_ue_stub_next += sizeof code;
-                        ctx.mem.map(stub, sizeof code);
-                        for (size_t i = 0; i < sizeof code / sizeof code[0]; ++i)
-                            ctx.mem.write32(stub + (uint32_t)i * 4u, code[i]);
-                        memcpy(ctx.mem.ptr(stub + 0x58u), &table, sizeof table);
-                        g_stricmp_sites[stub + 0x24u] = st;
-                        /* UE_STUB_BASE is deliberately below the libraries,
-                         * but this UE build is more than B's 128 MiB reach
-                         * away.  Use the standard x16 literal veneer. */
-                        const GuestVA stub_va = a64_guest_va(stub);
-                        ctx.mem.write32(c,      0x58000050u); /* ldr x16,#8 */
-                        ctx.mem.write32(c + 4u, 0xd61f0200u); /* br x16     */
-                        memcpy(ctx.mem.ptr(c + 8u), &stub_va, sizeof stub_va);
-                        a64_invalidate_main_jit(ctx, va, 16);
-                        a64_invalidate_engines(va, 16);
-                        cb_invalidate_all(va, 16);
-                        fprintf(stderr, "[stricmp] hybrid guest/native %s "
-                                "@0x%llx -> 0x%08x (fold table 0x%llx)\n",
-                                sym, (unsigned long long)va, stub,
-                                (unsigned long long)table);
-                    }
-                }
-            }
-        }
-    }
-    {
-        const char *opt = lunaria_env("LUNARIA_HOST_STRICMP");
-        if (opt && strcmp(opt, "1") == 0) {
-        static const struct { const char *sym; uint8_t w1, w2; } kStricmp[] = {
-            { "_ZN23FGenericPlatformStricmp7StricmpEPKDsS1_",  2, 2 },
-            { "_ZN23FGenericPlatformStricmp7StricmpEPKcS1_",   1, 1 },
-            { "_ZN23FGenericPlatformStricmp7StricmpEPKDsPKc",  2, 1 },
-            { "_ZN23FGenericPlatformStricmp7StricmpEPKcPKDs",  1, 2 },
-            { "_ZN23FGenericPlatformStricmp7StricmpEPKtS1_",   2, 2 },
-            { "_ZN23FGenericPlatformStricmp7StricmpEPKhS1_",   1, 1 },
-            { "_ZN23FGenericPlatformStricmp7StricmpEPKtPKc",   2, 1 },
-            { "_ZN23FGenericPlatformStricmp7StricmpEPKcPKt",   1, 2 },
-            { "_ZN23FGenericPlatformStricmp7StricmpEPKhPKc",   1, 1 },
-            { "_ZN23FGenericPlatformStricmp7StricmpEPKcPKh",   1, 1 },
-            /* Same function with a count in x2; the handler reads it.  The
-             * fold table is formed one instruction later (the count's zero
-             * check comes first), which the prologue scan below allows for. */
-            { "_ZN23FGenericPlatformStricmp8StrnicmpEPKDsS1_y",  2, 2 },
-            { "_ZN23FGenericPlatformStricmp8StrnicmpEPKcS1_y",   1, 1 },
-            { "_ZN23FGenericPlatformStricmp8StrnicmpEPKDsPKcy",  2, 1 },
-            { "_ZN23FGenericPlatformStricmp8StrnicmpEPKcPKDsy",  1, 2 },
-            { "_ZN23FGenericPlatformStricmp8StrnicmpEPKtS1_y",   2, 2 },
-            { "_ZN23FGenericPlatformStricmp8StrnicmpEPKhS1_y",   1, 1 },
-            { "_ZN23FGenericPlatformStricmp8StrnicmpEPKtPKcy",   2, 1 },
-            { "_ZN23FGenericPlatformStricmp8StrnicmpEPKcPKty",   1, 2 },
-            { nullptr, 0, 0 },
-        };
-        for (const auto *ps = kStricmp; ps->sym; ++ps) {
-            const bool with_count = strstr(ps->sym, "8Strnicmp") != nullptr;
-            auto it = g_exported_syms64.find(ps->sym);
-            if (it == g_exported_syms64.end()) continue;
-            const GuestVA va = it->second;
-            const uint32_t c = a64_canon_va(va);
-            if (c < lib_lo || c >= lib_hi) continue;
-            /* The fold table is formed by an adjacent pair near the top:
-             *   adrp xN, page ; add xN, xN, #imm
-             * Stricmp starts with it; Strnicmp checks its count first.  Look
-             * at the first few instructions and take the first such pair.
-             * Anything else and this is not the shape the handler implements,
-             * so leave the guest's own code in place. */
-            uint32_t i0 = 0, i1 = 0;
-            uint64_t pair_va = 0;
-            for (uint32_t k = 0; k < 3; ++k) {
-                const uint32_t a0 = ctx.mem.read32(c + k * 4u);
-                const uint32_t a1 = ctx.mem.read32(c + k * 4u + 4u);
-                const uint32_t rd0 = a0 & 31u, rd1 = a1 & 31u, rn1 = (a1 >> 5) & 31u;
-                if ((a0 & 0x9f000000u) == 0x90000000u &&
-                    (a1 & 0xffc00000u) == 0x91000000u &&
-                    rd0 == rd1 && rd0 == rn1) {
-                    i0 = a0; i1 = a1; pair_va = va + k * 4u;
-                    break;
-                }
-            }
-            if (!pair_va) {
-                fprintf(stderr, "[stricmp] %s @0x%llx: prologue is %08x %08x, "
-                        "no adrp/add for the fold table — left alone\n",
-                        ps->sym, (unsigned long long)va,
-                        ctx.mem.read32(c), ctx.mem.read32(c + 4));
-                continue;
-            }
-            const int64_t immhi = (int64_t)((i0 >> 5) & 0x7ffffu);
-            const int64_t immlo = (int64_t)((i0 >> 29) & 3u);
-            int64_t page = (immhi << 2) | immlo;
-            if (page & (1ll << 20)) page -= (1ll << 21);   /* sign-extend 21 bits */
-            const uint64_t base = (pair_va & ~0xfffull) + (uint64_t)(page << 12);
-            const uint64_t off  = (uint64_t)((i1 >> 10) & 0xfffu) <<
-                                  (((i1 >> 22) & 1u) ? 12 : 0);
-            const uint64_t tbl  = base + off;
-            StricmpSite st{};
-            st.w1 = ps->w1;
-            st.w2 = ps->w2;
-            const uint8_t *src = ctx.mem.ptr((GuestVA)tbl);
-            if (!src) continue;
-            memcpy(st.fold, src, sizeof st.fold);
-            g_stricmp_sites[c] = st;
-            ctx.mem.write32(c, 0xd4000001u |
-                            ((with_count ? SVC_UE_STRNICMP : SVC_UE_STRICMP) << 5));
-            ctx.mem.write32(c + 4, 0xd65f03c0u);
-            a64_invalidate_main_jit(ctx, a64_guest_va(c), 8);
-            a64_invalidate_engines(a64_guest_va(c), 8);
-            fprintf(stderr, "[stricmp] host %s hook @0x%llx (fold table 0x%llx, "
-                    "'A'->%02x 'a'->%02x)\n", ps->sym, (unsigned long long)va,
-                    (unsigned long long)tbl, st.fold['A'], st.fold['a']);
-        }
-        }
-    }
-
-    /* Replace FString::ReplaceInline with the host's in-place version, and
-     * leave a stub to resume the guest's own code with for every other shape.
-     * See SVC_UE_REPLACE_INLINE.  Opt out with LUNARIA_HOST_REPLACEINLINE=0. */
-    {
-        const char *opt = lunaria_env("LUNARIA_HOST_REPLACEINLINE");
-        if (!opt || strcmp(opt, "0") != 0) {
-        static const char *kReplaceSyms[] = {
-            "_ZN7FString13ReplaceInlineEPKDsS1_N11ESearchCase4TypeE",
-            nullptr,
-        };
-        for (const char **ps = kReplaceSyms; *ps; ++ps) {
-            auto it = g_exported_syms64.find(*ps);
-            if (it == g_exported_syms64.end()) continue;
-            const GuestVA va = it->second;
-            const uint32_t c = a64_canon_va(va);
-            if (c < lib_lo || c >= lib_hi) continue;
-            const uint32_t o0 = ctx.mem.read32(c), o1 = ctx.mem.read32(c + 4);
-            /* The stub replays these two, so they must mean the same thing
-             * somewhere else.  A PC-relative one would not. */
-            if (a64_insn_is_pc_relative(o0) || a64_insn_is_pc_relative(o1)) {
-                fprintf(stderr, "[ue] %s @0x%llx: prologue %08x %08x is "
-                        "PC-relative — left alone\n", *ps,
-                        (unsigned long long)va, o0, o1);
-                continue;
-            }
-            const uint32_t stub = g_ue_stub_next;
-            g_ue_stub_next += 0x20u;
-            ctx.mem.map(stub, 0x20u);
-            /* x16 is the scratch register a linker veneer may clobber, so no
-             * caller can require it across a call boundary — which is what
-             * the function's first instruction still is. */
-            ctx.mem.write32(stub + 0x00u, o0);
-            ctx.mem.write32(stub + 0x04u, o1);
-            ctx.mem.write32(stub + 0x08u, 0x58000050u);   /* ldr x16, #8   */
-            ctx.mem.write32(stub + 0x0cu, 0xd61f0200u);   /* br  x16       */
-            const uint64_t resume = a64_guest_va(c + 8u);
-            std::memcpy(ctx.mem.ptr(stub + 0x10u), &resume, sizeof resume);
-            g_ue_replace_resume[c] = stub;
-            ctx.mem.write32(c, 0xd4000001u | (SVC_UE_REPLACE_INLINE << 5));
-            ctx.mem.write32(c + 4, 0xd65f03c0u);          /* ret           */
-            a64_invalidate_main_jit(ctx, a64_guest_va(c), 8);
-            a64_invalidate_engines(a64_guest_va(c), 8);
-            cb_invalidate_all(a64_guest_va(c), 8);
-            fprintf(stderr, "[ue] host %s hook @0x%llx (resume stub 0x%08x, "
-                    "displaced %08x %08x)\n", *ps, (unsigned long long)va,
-                    stub, o0, o1);
-        }
-        }
-    }
-
-    /* Replace TStringViewImpl<T>::FindChar with the host's.  The whole
-     * function is answered, so no resume stub is needed.  See SVC_UE_FINDCHAR.
-     * Opt out with LUNARIA_HOST_FINDCHAR=0. */
-    {
-        const char *opt = lunaria_env("LUNARIA_HOST_FINDCHAR");
-        if (!opt || strcmp(opt, "0") != 0) {
-        static const struct { const char *sym; uint8_t w; } kFindChar[] = {
-            { "_ZNK15TStringViewImplIDsE8FindCharEDsRi", 2 },
-            { "_ZNK15TStringViewImplIcE8FindCharEcRi",   1 },
-            { nullptr, 0 },
-        };
-        for (const auto *ps = kFindChar; ps->sym; ++ps) {
-            auto it = g_exported_syms64.find(ps->sym);
-            if (it == g_exported_syms64.end()) continue;
-            const GuestVA va = it->second;
-            const uint32_t c = a64_canon_va(va);
-            if (c < lib_lo || c >= lib_hi) continue;
-            g_ue_findchar_sites[c] = ps->w;
-            ctx.mem.write32(c, 0xd4000001u | (SVC_UE_FINDCHAR << 5));
-            ctx.mem.write32(c + 4, 0xd65f03c0u);
-            a64_invalidate_main_jit(ctx, a64_guest_va(c), 8);
-            a64_invalidate_engines(a64_guest_va(c), 8);
-            cb_invalidate_all(a64_guest_va(c), 8);
-            fprintf(stderr, "[ue] host %s hook @0x%llx (%u-byte chars)\n",
-                    ps->sym, (unsigned long long)va, ps->w);
-        }
-        }
-    }
-
-    /* Replace OpenSSL's DES-CBC with the host's.  See SVC_DES_NCBC: the
-     * guest's own DES was 78% of all guest execution for this title.  These
-     * are the stock OpenSSL entry points, statically linked into libUE4.so and
-     * still exported, so they are keyed on the symbol like the hooks above.
-     * Opt out with LUNARIA_HOST_DES=0. */
-    {
-        const char *opt = lunaria_env("LUNARIA_HOST_DES");
-        if (!opt || strcmp(opt, "0") != 0) {
-        static const struct { const char *sym; uint32_t svc; } kDesSyms[] = {
-            { "DES_ncbc_encrypt",     SVC_DES_NCBC },
-            { "DES_cbc_encrypt",      SVC_DES_NCBC },   /* same prototype */
-            { "DES_ede3_cbc_encrypt", SVC_DES_EDE3_CBC },
-            { nullptr, 0 },
-        };
-        for (const auto *ps = kDesSyms; ps->sym; ++ps) {
-            auto it = g_exported_syms64.find(ps->sym);
-            if (it == g_exported_syms64.end()) continue;
-            GuestVA va = it->second;
-            uint32_t c = a64_canon_va(va);
-            if (c < lib_lo || c >= lib_hi) continue;
-            ctx.mem.write32(c, 0xd4000001u | (ps->svc << 5));
-            ctx.mem.write32(c + 4, 0xd65f03c0u);
-            a64_invalidate_main_jit(ctx, a64_guest_va(c), 8);
-            a64_invalidate_engines(a64_guest_va(c), 8);
-            fprintf(stderr, "[des] host %s hook @0x%llx\n",
-                    ps->sym, (unsigned long long)va);
-        }
-        }
-    }
-
+    /* Execute application code as loaded.  Android APIs are provided by the
+     * runtime/linker; application function bodies must not become SVC hooks. */
     // Execute DT_INIT / DT_INIT_ARRAY (C++ static constructors).
     {
         uint64_t init_fn = 0, init_array_va = 0, init_array_sz = 0;
@@ -45943,6 +53285,20 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
             if ((idx % 64) == 0)
                 fprintf(stderr, "[arm64] INIT_ARRAY %s %u/%u fn=0x%llx\n",
                         kind, idx, n, (unsigned long long)fn);
+            /* A dlopen/exec load can occur inside a guest SVC while the frame
+             * pump owns the shared main JIT.  Running this constructor through
+             * run_arm64() from the worker concurrently overwrites that JIT's
+             * PC/register file; the extracted nmss helper then intermittently
+             * reached its correctly relocated __libc_init PLT with x17=0.
+             * A32 has always honoured ctors_via_cb for this reason.  Give A64
+             * the same per-host-thread callback JIT and stack. */
+            if (ctors_via_cb) {
+                const bool saved_keep_ael = g_cb64_keep_ael;
+                g_cb64_keep_ael = true;
+                (void)call_guest_cb64(ctx, fn, 0, 0, 0, 0, nullptr, 0);
+                g_cb64_keep_ael = saved_keep_ael;
+                return true;
+            }
             (void)run_arm64(ctx, fn, 0, 0, 0, 0, 200'000'000ULL);
             if (ctx.jit64 && !pc_in_sentinel((GuestVA)ctx.jit64->GetPC())) {
                 fprintf(stderr, "[arm64] INIT_ARRAY %s %u/%u did not return: "
@@ -45960,10 +53316,13 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
             return true;
         };
         // libc++ global constructors are required.
-        const bool skip_init = (std::strstr(path, "libc++_shared.so") != nullptr &&
-                                lunaria_env("LUNARIA_SKIP_LIBCXX_INIT") != nullptr);
+        const bool skip_init = pure_libc_image ||
+            (std::strstr(path, "libc++_shared.so") != nullptr &&
+             lunaria_env("LUNARIA_SKIP_LIBCXX_INIT") != nullptr);
         if (skip_init)
-            fprintf(stderr, "[arm64] skipping INIT_ARRAY for %s (iostream hang workaround)\n", path);
+            fprintf(stderr, "[arm64] skipping INIT_ARRAY for %s%s\n", path,
+                    pure_libc_image ? " (pure-code provider)" :
+                    " (requested libc++ diagnostic mode)");
         if (!skip_init && init_fn && !run_ctor(init_fn, "DT_INIT", 0, 1))
             return false;
         if (!skip_init && init_array_va && init_array_sz >= 8) {
@@ -45977,6 +53336,29 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
                     return false;
             }
         }
+    }
+
+    /* PT_GNU_RELRO makes these words read-only on Android before application
+     * code runs.  A changed word here proves that Lunaria's constructor path
+     * has violated the loader/memory contract; report every early mismatch
+     * and reject the image rather than converting it into an endless NULL
+     * call/retry loop. */
+    unsigned corrupt_got = 0;
+    for (const auto &rel : applied_got_relocs) {
+        uint64_t actual = 0;
+        std::memcpy(&actual, ctx.mem.ptr(rel.addr), sizeof actual);
+        if (actual == rel.value) continue;
+        if (corrupt_got++ < 16)
+            fprintf(stderr, "[arm64] relocation corrupted during constructors: "
+                    "%s slot=0x%08x expected=0x%llx actual=0x%llx (%s)\n",
+                    path, rel.addr, (unsigned long long)rel.value,
+                    (unsigned long long)actual, rel.symbol.c_str());
+    }
+    if (corrupt_got) {
+        fprintf(stderr, "[arm64] %s: rejecting image: %u linker-owned GOT "
+                "slot(s) changed during constructor execution\n", path,
+                corrupt_got);
+        return false;
     }
 
     fprintf(stderr, "[arm64] %s loaded: base=0x%llx lo=0x%08x hi=0x%08x\n",
@@ -46210,8 +53592,61 @@ static bool dvm_call_guest_native(const char *klass, const char *method,
     fprintf(stderr, "[dvm] native %s.%s%s -> 0x%llx (%d args)\n",
             klass, method, sig, (unsigned long long)fn, ng - 2);
 
+    /* A Runnable delivered by the host pump is a Java/ART thread too, but it
+     * does not pass through bytecode_thread_main().  Give that top-level
+     * Java -> native transition its own Linux identity.  A native -> Java ->
+     * native recursion already runs inside a guest slice/callback and must
+     * retain that original Android thread identity. */
+    const bool temporary_dvm_identity =
+        !g_dvm_guest_tid && g_ctx_depth == 0;
+    if (temporary_dvm_identity) arm_exec_dvm_thread_attach();
+    /* nmssNativeRun reports a synchronous decision through DetectCallBack.
+     * Start that thread's diagnostic window at the JNI boundary so the dump
+     * contains only Android/libc observations used by this invocation, not
+     * hundreds of unrelated UE calls made earlier on the same DVM worker. */
+    if (!strcmp(klass, "nmss/app/NmssSa") && !strcmp(method, "nmssNativeRun") &&
+        g_current_tid < THREAD_TID_MAX) {
+        memset(g_svc_ring_by_tid[g_current_tid], 0,
+               sizeof g_svc_ring_by_tid[g_current_tid]);
+        g_svc_ring_by_tid_pos[g_current_tid] = 0;
+        fprintf(stderr, "[detect] syscall window begins at nmssNativeRun tid=%u\n",
+                g_current_tid);
+        if (nargs > 0 && args[0].l) {
+            struct jvm *jvm = g_ctx->jvm;
+            JNIEnv *env = jvm ? &jvm->env : nullptr;
+            const jstring str = (jstring)args[0].l;
+            const char *config = env
+                ? jvm->native.GetStringUTFChars(env, str, nullptr) : nullptr;
+            fprintf(stderr, "[detect] nmssNativeRun config=%s\n",
+                    config ? config : "<invalid jstring>");
+            if (config)
+                jvm->native.ReleaseStringUTFChars(env, str, config);
+        }
+    }
+    if (!strcmp(klass, "nmss/app/NmssSa") &&
+        !strcmp(method, "nmssNativeInit") && nargs >= 8) {
+        /* Keep this at the Java/native boundary.  The later shell command is
+         * assembled entirely inside the guest, so logging getenv() there
+         * only proves what Lunaria knows, not what Java actually supplied to
+         * the security module. */
+        struct jvm *jvm = g_ctx->jvm;
+        JNIEnv *env = jvm ? &jvm->env : nullptr;
+        const unsigned string_args[] = {3u, 5u, 6u};
+        fprintf(stderr, "[detect] nmssNativeInit strings=");
+        for (unsigned k = 0; k < sizeof string_args / sizeof string_args[0]; ++k) {
+            const unsigned i = string_args[k];
+            const jstring str = (jstring)args[i].l;
+            const char *s = (env && str)
+                ? jvm->native.GetStringUTFChars(env, str, nullptr) : nullptr;
+            fprintf(stderr, "%sarg%u=\"%s\"", k ? " " : "", i,
+                    s ? s : (str ? "<invalid>" : "<null>"));
+            if (s) jvm->native.ReleaseStringUTFChars(env, str, s);
+        }
+        fprintf(stderr, " ints=arg4:%d,arg7:%d\n", args[4].i, args[7].i);
+    }
     GuestRet rv{};
     call_guest_abi(*g_ctx, (GuestVA)fn, gargs, ng, ret, &rv);
+    if (temporary_dvm_identity) arm_exec_dvm_thread_detach();
 
     if (out) {
         memset(out, 0, sizeof *out);
@@ -46268,12 +53703,21 @@ extern "C" int arm64_exec_context_init(struct jvm *jvm) {
     g_thread_stack_next = THREAD_STACK_BASE;
     g_thread_stack_free.clear();
     g_ready_queue.clear();
+    g_start_queue.clear();
+    start_queue_publish();
     g_wait_poll.clear();
     g_in_ready.fill(false);
     g_in_wait_poll.fill(false);
     g_sleep_heap.clear();
     g_in_sleep_heap.fill(false);
     g_sleep_next_due_ns.store(UINT64_MAX, std::memory_order_relaxed);
+    memset(g_guest_ptrace_traceme_pids, 0,
+           sizeof g_guest_ptrace_traceme_pids);
+    g_guest_ptrace_traceme_count = 0;
+    g_guest_no_new_privs = false;
+    /* The device's zone, installed before any guest or Java conversion can
+     * observe the host's.  See arm_exec_timezone_lock(). */
+    arm_exec_timezone_install();
     g_fd_next_deadline_ms.store(INT64_MAX, std::memory_order_relaxed);
     g_futex_waiters.clear();
     g_sem_waiters.clear();
@@ -46309,6 +53753,383 @@ extern "C" int arm64_exec_context_init(struct jvm *jvm) {
     jit_progress_hook_install();
     return 0;
 }
+
+
+/* ------------------------------------------------------------------------ *
+ * Starting a second guest program image
+ * ------------------------------------------------------------------------ *
+ *
+ * An Android application may run a program of its own — a helper it wrote
+ * into its data directory and started with fork()+execve() or system().
+ * Cross Worlds' security module does exactly that: it drops a 62 KB AArch64
+ * PIE in files/ and starts it, and that child is what binds the AF_UNIX
+ * endpoint (files/nmssv) the module then talks to.  Without it the module
+ * reports "Need Security License" and later aborts the process.
+ *
+ * An executable and a shared object differ in two things only, both handled
+ * here: the kernel hands the program an initial stack (argc, argv, envp and
+ * the auxiliary vector) instead of arguments in registers, and its entry is
+ * the crt's _start rather than a named function.  Everything else — mapping
+ * the segments, relocating, resolving imports against this emulator's ABI
+ * bridge, running the init array — is what the loader already does for every
+ * library the guest opens.
+ *
+ * The image shares this address space, which a real second process would not.
+ * That is the same compromise fork() already makes here, and for the same
+ * reason: there is one address space to give.  It is honest for what these
+ * helpers do (open a socket, answer requests) and it is not a substitute for
+ * a second process where one is genuinely required. */
+
+// Linux auxiliary-vector entries the crt and libc actually read.
+enum {
+    GUEST_AT_NULL = 0, GUEST_AT_PHDR = 3, GUEST_AT_PHENT = 4,
+    GUEST_AT_PHNUM = 5, GUEST_AT_PAGESZ = 6, GUEST_AT_BASE = 7,
+    GUEST_AT_FLAGS = 8, GUEST_AT_ENTRY = 9, GUEST_AT_UID = 11,
+    GUEST_AT_EUID = 12, GUEST_AT_GID = 13, GUEST_AT_EGID = 14,
+    GUEST_AT_HWCAP = 16, GUEST_AT_CLKTCK = 17, GUEST_AT_SECURE = 23,
+    GUEST_AT_RANDOM = 25, GUEST_AT_EXECFN = 31,
+};
+
+struct GuestProgramImage {
+    uint64_t base = 0;
+    uint64_t entry = 0;
+    uint64_t phdr = 0;
+    uint16_t phent = 0;
+    uint16_t phnum = 0;
+    size_t first_region = 0;
+    size_t region_count = 0;
+    size_t first_module = 0;
+    size_t module_count = 0;
+};
+
+/* Read the ELF header facts the auxiliary vector needs, and refuse anything
+ * that is not an AArch64 program image.  Reading the file rather than trusting
+ * the loader keeps the two independent: a header this rejects never reaches
+ * load_elf64 at all. */
+static bool guest_program_header(const char *host_path, uint64_t &entry,
+                                 uint64_t &phoff, uint16_t &phent,
+                                 uint16_t &phnum)
+{
+    FILE *f = fopen(host_path, "rb");
+    if (!f) return false;
+    unsigned char eh[64] = {};
+    const size_t got = fread(eh, 1, sizeof eh, f);
+    fclose(f);
+    if (got != sizeof eh) return false;
+    if (eh[0] != 0x7f || eh[1] != 'E' || eh[2] != 'L' || eh[3] != 'F') return false;
+    if (eh[4] != 2 /* ELFCLASS64 */ || eh[5] != 1 /* ELFDATA2LSB */) return false;
+    uint16_t etype = 0, emach = 0;
+    memcpy(&etype, eh + 16, 2);
+    memcpy(&emach, eh + 18, 2);
+    if (emach != 183 /* EM_AARCH64 */) return false;
+    if (etype != 2 /* ET_EXEC */ && etype != 3 /* ET_DYN */) return false;
+    memcpy(&entry, eh + 24, 8);
+    memcpy(&phoff, eh + 32, 8);
+    memcpy(&phent, eh + 54, 2);
+    memcpy(&phnum, eh + 56, 2);
+    return entry != 0;
+}
+
+// Copy a NUL-terminated string into guest memory; returns its guest address.
+static GuestVA guest_program_string(ArmExecCtx &ctx, const std::string &text)
+{
+    const uint32_t backing = arm_malloc(ctx, (uint32_t)text.size() + 1u);
+    if (!backing) return 0;
+    const GuestVA va = a64_guest_va(backing);
+    memcpy(ctx.mem.ptr(va), text.c_str(), text.size() + 1u);
+    return va;
+}
+
+/* Write the initial process stack the crt expects, ending 16-byte aligned at
+ * the returned stack pointer.  Layout is the Linux one: argc, the argv
+ * pointers and their terminator, the envp pointers and theirs, then the
+ * auxiliary vector. */
+static GuestVA guest_program_stack(ArmExecCtx &ctx, GuestVA stack_top,
+                                   const std::vector<std::string> &words,
+                                   const GuestProgramImage &img)
+{
+    /* The environment a device gives a program started from an app: enough to
+     * find the platform's own directories, and nothing of this host's. */
+    static const char *const env[] = {
+        "PATH=/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin",
+        "ANDROID_ROOT=/system",
+        "ANDROID_DATA=/data",
+        nullptr,
+    };
+    size_t envc = 0;
+    while (env[envc]) ++envc;
+
+    std::vector<GuestVA> argv;
+    for (const std::string &w : words) {
+        const GuestVA va = guest_program_string(ctx, w);
+        if (!va) return 0;
+        argv.push_back(va);
+    }
+    std::vector<GuestVA> envp;
+    for (size_t i = 0; i < envc; ++i) {
+        const GuestVA va = guest_program_string(ctx, env[i]);
+        if (!va) return 0;
+        envp.push_back(va);
+    }
+    /* AT_RANDOM points at sixteen bytes the program may use as a seed and the
+     * crt uses for its stack guard.  They have to be real bytes in guest
+     * memory, not a null pointer. */
+    const uint32_t rnd_backing = arm_malloc(ctx, 16u);
+    if (!rnd_backing) return 0;
+    const GuestVA rnd = a64_guest_va(rnd_backing);
+    if (uint8_t *seed = ctx.mem.ptr(rnd))
+        for (int i = 0; i < 16; ++i) seed[i] = (uint8_t)(rand() & 0xff);
+    const GuestVA execfn = argv.empty() ? 0 : argv[0];
+
+    const std::pair<uint64_t, uint64_t> aux[] = {
+        { GUEST_AT_PHDR,   img.phdr },
+        { GUEST_AT_PHENT,  img.phent },
+        { GUEST_AT_PHNUM,  img.phnum },
+        { GUEST_AT_PAGESZ, 4096u },
+        { GUEST_AT_BASE,   0u },      /* no separate interpreter is mapped */
+        { GUEST_AT_FLAGS,  0u },
+        { GUEST_AT_ENTRY,  img.entry },
+        { GUEST_AT_UID,    10000u },
+        { GUEST_AT_EUID,   10000u },
+        { GUEST_AT_GID,    10000u },
+        { GUEST_AT_EGID,   10000u },
+        { GUEST_AT_SECURE, 0u },
+        { GUEST_AT_CLKTCK, 100u },
+        { GUEST_AT_HWCAP,  0xffu },
+        { GUEST_AT_RANDOM, rnd },
+        { GUEST_AT_EXECFN, execfn },
+        { GUEST_AT_NULL,   0u },
+    };
+    const size_t naux = sizeof aux / sizeof *aux;
+    const size_t words_total = 1u                 /* argc */
+                             + argv.size() + 1u   /* argv + NULL */
+                             + envp.size() + 1u   /* envp + NULL */
+                             + naux * 2u;
+    const uint64_t bytes = (uint64_t)words_total * 8u;
+    GuestVA sp = (GuestVA)((stack_top - bytes) & ~(GuestVA)15u);
+
+    GuestVA at = sp;
+    ctx.mem.write64(at, (uint64_t)argv.size()); at += 8u;
+    for (GuestVA v : argv) { ctx.mem.write64(at, v); at += 8u; }
+    ctx.mem.write64(at, 0u); at += 8u;
+    for (GuestVA v : envp) { ctx.mem.write64(at, v); at += 8u; }
+    ctx.mem.write64(at, 0u); at += 8u;
+    for (const auto &pair : aux) {
+        ctx.mem.write64(at, pair.first);  at += 8u;
+        ctx.mem.write64(at, pair.second); at += 8u;
+    }
+    return sp;
+}
+
+/* Map the image and report where its pieces landed.  `words[0]` is the path
+ * as the guest spelled it. */
+static bool guest_program_load(ArmExecCtx &ctx,
+                               const std::vector<std::string> &words,
+                               GuestProgramImage &img)
+{
+    if (words.empty()) return false;
+    char hostbuf[PATH_MAX];
+    const char *host = map_guest_path(words[0].c_str(), hostbuf, sizeof hostbuf);
+    if (!host) return false;
+    uint64_t entry = 0, phoff = 0;
+    uint16_t phent = 0, phnum = 0;
+    if (!guest_program_header(host, entry, phoff, phent, phnum)) {
+        fprintf(stderr, "[exec] %s: not an AArch64 program image\n",
+                words[0].c_str());
+        return false;
+    }
+    /* The guest usually unlinks the image right after starting it, so this is
+     * the only moment it can be kept for analysis. */
+    if (const char *dump = lunaria_env("LUNARIA_DUMP_DIR")) {
+        char save[PATH_MAX];
+        const char *leaf = strrchr(host, '/');
+        snprintf(save, sizeof save, "%s/lunaria-exec-%s", dump,
+                 leaf ? leaf + 1 : "image");
+        FILE *in = fopen(host, "rb");
+        FILE *out = in ? fopen(save, "wb") : nullptr;
+        if (in && out) {
+            char chunk[65536];
+            size_t n;
+            while ((n = fread(chunk, 1, sizeof chunk, in)) > 0)
+                if (fwrite(chunk, 1, n, out) != n) break;
+            fprintf(stderr, "[exec] %s: image saved to %s\n",
+                    words[0].c_str(), save);
+        }
+        if (in) fclose(in);
+        if (out) fclose(out);
+    }
+    /* Android system()/exec starts an extracted guest executable.  ELF loads
+     * are serialized below, and blocking socket I/O now preserves the helper
+     * lifetime, so this is normal process behaviour rather than an opt-in.
+     * LUNARIA_GUEST_EXEC=0 remains available for diagnosis. */
+    const char *guest_exec = lunaria_env("LUNARIA_GUEST_EXEC");
+    if (guest_exec && (guest_exec[0] == '0' || guest_exec[0] == 'n' ||
+                       guest_exec[0] == 'N')) {
+        fprintf(stderr, "[exec] %s: an AArch64 program image "
+                "(entry 0x%llx, %u phdrs) — disabled by "
+                "LUNARIA_GUEST_EXEC=0\n",
+                words[0].c_str(), (unsigned long long)entry, phnum);
+        return false;
+    }
+    uint64_t onload_va = 0;
+    uint64_t base = 0;
+    {
+        /* Loading an ELF image is one atomic linker operation.  load_elf64()
+         * mutates the process-wide module list, global symbol scope, pending
+         * relocation list and image-base cursor.  Ordinary dlopen reaches it
+         * while holding AEL, but system()/exec are deliberately lock-free so
+         * their caller can wait for the child.  Calling the loader directly
+         * from that path let unrelated guest JNI/network threads run between
+         * exporting this image and applying its PLT relocations.  The visible
+         * result was intermittent: __libc_init's JUMP_SLOT remained zero and
+         * the crt branched to address 0.  Android's linker serializes this
+         * operation; take the emulator's execution lock for the same scope. */
+        ArmLockGuard linker_lock;
+        base = a64_next_image_base();
+        img.first_region = g_loaded_regions.size();
+        img.first_module = g_module_phdrs.size();
+        if (!load_elf64(ctx, host, onload_va, base, /*ctors_via_cb=*/true)) {
+            fprintf(stderr, "[exec] %s: could not be mapped\n", words[0].c_str());
+            return false;
+        }
+        img.region_count = g_loaded_regions.size() - img.first_region;
+        img.module_count = g_module_phdrs.size() - img.first_module;
+    }
+    /* load_elf64() accepts a backing offset, but an AArch64 process executes
+     * and addresses data through the architectural VA alias.  Starting a PIE
+     * at the bare offset happened to fetch instructions because
+     * MemoryReadCode canonicalises it; PC-relative ADRP then quite correctly
+     * produced bare data addresses, which identity fastmem does *not* alias.
+     * The first PLT load consequently read zero even though the relocated GOT
+     * at A64_GUEST_BASE+offset was valid.  Android's kernel/linker place AT_*
+     * and the initial PC in one VA domain, so publish all three that way. */
+    img.base  = a64_guest_va((BackingOffset)base);
+    img.entry = a64_guest_va((BackingOffset)(base + entry));
+    img.phdr  = a64_guest_va((BackingOffset)(base + phoff));
+    img.phent = phent;
+    img.phnum = phnum;
+    fprintf(stderr, "[exec] %s: mapped at 0x%llx, entry 0x%llx, %u phdrs\n",
+            words[0].c_str(), (unsigned long long)img.base,
+            (unsigned long long)img.entry, phnum);
+    return true;
+}
+
+/* execve() from a thread that is already a process of its own: this thread
+ * *becomes* the program.  Its registers, stack pointer and program counter are
+ * replaced in place, which is what execve does — the tid does not change, so
+ * the parent's waitpid() still names the same child. */
+static bool guest_program_become(const std::vector<std::string> &words)
+{
+    if (!g_ctx || !g_svc_jit64) return false;
+    ArmExecCtx &ctx = *g_ctx;
+    GuestProgramImage img;
+    if (!guest_program_load(ctx, words, img)) return false;
+    ArmThread *self = thread_slot_by_tid(g_current_tid);
+    if (!self || !self->stack_size) return false;
+    signal_handlers_exec_reset(self->process_pid);
+    for (size_t i = 0; i < img.region_count; ++i)
+        g_loaded_regions[img.first_region + i].process_pid = self->process_pid;
+    for (size_t i = 0; i < img.module_count; ++i)
+        g_module_phdrs[img.first_module + i].process_pid = self->process_pid;
+    set_process_comm(*self, words.empty() ? nullptr : words[0].c_str());
+    const GuestVA top = self->stack_base + (GuestVA)self->stack_size - 16u;
+    const GuestVA sp = guest_program_stack(ctx, top, words, img);
+    if (!sp) return false;
+    for (size_t i = 0; i < 31; ++i) g_svc_jit64->SetRegister(i, 0);
+    g_svc_jit64->SetRegister(30, a64_guest_va(SENTINEL_ADDR));
+    g_svc_jit64->SetSP(sp);
+    g_svc_jit64->SetPC(img.entry);
+    return true;
+}
+
+/* system() and a shell pipeline start the program as a child and wait for it,
+ * so it runs as a thread of its own from the program's entry. */
+static int guest_program_spawn(const std::vector<std::string> &words,
+                               uint32_t parent_tid, uint32_t *child_tid)
+{
+    if (!g_ctx) return -1;
+    ArmExecCtx &ctx = *g_ctx;
+    GuestProgramImage img;
+    if (!guest_program_load(ctx, words, img)) return -1;
+
+    /* system() deliberately called us with AEL dropped so the parent can
+     * wait without stopping the process.  Publishing the child is a separate
+     * atomic scheduler operation, however: its stack allocator, thread table,
+     * tid index and ready queue are all shared with worker engines.  Without
+     * the lock a worker could begin at the freshly mapped crt entry while the
+     * spawning host thread was still publishing that state; the intermittent
+     * symptom was the crt's already-relocated __libc_init PLT call observing
+     * zero. */
+    ArmLockGuard publish_lock;
+
+    constexpr uint32_t kStackSize = 1u << 20;
+    uint32_t stack_lo = 0;
+    {
+        auto &pool = g_thread_stack_free[kStackSize];
+        if (!pool.empty()) { stack_lo = pool.back(); pool.pop_back(); }
+    }
+    if (!stack_lo && (uint64_t)g_thread_stack_next + kStackSize <= HEAP_BASE) {
+        stack_lo = g_thread_stack_next;
+        g_thread_stack_next += kStackSize;
+    }
+    if (!stack_lo) return -1;
+    const uint32_t nid = alloc_guest_tid();
+    if (!nid) { g_thread_stack_free[kStackSize].push_back(stack_lo); return -1; }
+
+    const GuestVA top = a64_guest_va(stack_lo + kStackSize - 16u);
+    const GuestVA sp = guest_program_stack(ctx, top, words, img);
+    if (!sp) { g_thread_stack_free[kStackSize].push_back(stack_lo); return -1; }
+
+    ArmThread t;
+    t.id = nid;
+    t.process_ppid = guest_pid();
+    t.process_pid = guest_tid_of(nid);
+    signal_handlers_exec_reset(t.process_pid);
+    for (size_t i = 0; i < img.region_count; ++i)
+        g_loaded_regions[img.first_region + i].process_pid = t.process_pid;
+    for (size_t i = 0; i < img.module_count; ++i)
+        g_module_phdrs[img.first_module + i].process_pid = t.process_pid;
+    set_process_comm(t, words.empty() ? nullptr : words[0].c_str());
+    signal_mask_store(t.id, signal_mask_load(parent_tid));
+    t.is_arm64 = true;
+    t.stack_base = a64_guest_va((BackingOffset)stack_lo);
+    t.stack_size = kStackSize;
+    t.regs64.fill(0);
+    t.sp64 = sp;
+    t.lr64 = a64_guest_va(SENTINEL_ADDR);
+    t.regs64[30] = t.lr64;
+    t.pc64 = img.entry;
+    t.entry_pc = t.pc64;
+    t.cpsr = 0x10u;
+    t.detached = false;
+    guest_net::g_fd_waits.erase(t.id);
+    {
+        ArmThread *slot;
+        if (!g_free_thread_slots.empty()) {
+            slot = g_free_thread_slots.back();
+            g_free_thread_slots.pop_back();
+            *slot = t;
+        } else {
+            g_threads.push_back(t);
+            slot = &g_threads.back();
+        }
+        g_thread_by_tid[slot->id] = slot;
+    }
+    fork_child_add(parent_tid, nid);
+    thread_mark_ready(nid);
+    if (child_tid) *child_tid = nid;
+    fprintf(stderr, "[exec] started %s as pid=%u tid=%u "
+                    "(parent pid=%u tid=%u)\n",
+            words[0].c_str(), t.process_pid, guest_tid_of(nid),
+            t.process_ppid, guest_tid_of(parent_tid));
+    return 0;
+}
+
+/* See arm_exec.h: the bytecode VM answers Process.myPid()/myUid(),
+ * RunningAppProcessInfo and ApplicationInfo.uid from here, so that one
+ * process cannot disagree with itself about who it is. */
+extern "C" int arm_exec_guest_pid(void) { return (int)guest_pid(); }
+extern "C" int arm_exec_guest_uid(void) { return 10000; /* FIRST_APPLICATION_UID */ }
 
 extern "C" int arm64_exec_load_library(const char *path, uint64_t base_addr) {
     if (!g_ctx) return -1;
@@ -46354,6 +54175,13 @@ extern "C" int arm64_exec_jni_onload(const char *path, struct jvm *jvm) {
         fprintf(stderr, "[arm64] JNI_OnLoad not found in %s\n", path);
         return -1;
     }
+    /* The main image and its dependencies are mapped now, but no guest code
+     * has run.  This is the useful prewarm point: constructing the workers in
+     * context_init made every loader write queue a cache invalidation on each
+     * new JIT, while constructing them lazily made the first pthread pay the
+     * whole JIT startup cost.  A JIT must still be created by its owning host
+     * thread, which ensure_workers() arranges and waits for. */
+    a64par::ensure_workers();
     fprintf(stderr, "[arm64] executing JNI_OnLoad @ 0x%llx\n",
             (unsigned long long)jni_onload_va);
     int64_t ver = run_arm64(*g_ctx, jni_onload_va,
@@ -46558,6 +54386,29 @@ extern "C" void arm64_exec_run_pending_threads(void) {
  * faults it printed, in the middle of its own output, and the addresses it
  * blamed were stack garbage.  Three of them per dump, every dump, for as long
  * as this has existed.  Read through try_ptr(): unmapped means stop. */
+/* Load bias of the image a guest address falls in, or 0.  Module bases are
+ * assigned per run, so the only stable way to name a routine inside an image
+ * the app wrote at runtime is by its offset within that image. */
+static uint64_t a64_module_base_for(uint64_t va) {
+    if (!g_ctx || !va) return 0;
+    for (const auto &m : g_module_phdrs) {
+        if (!m.is_64) continue;
+        const uint8_t *ph = g_ctx->mem.try_ptr(m.phdr_va,
+                                (size_t)m.phnum * sizeof(Elf64_Phdr));
+        if (!ph) continue;
+        GuestVA lo = m.load_bias, hi = m.load_bias;
+        for (uint16_t i = 0; i < m.phnum; ++i) {
+            const Elf64_Phdr *p = (const Elf64_Phdr *)ph + i;
+            if (p->p_type != PT_LOAD) continue;
+            lo = std::min(lo, m.load_bias + (GuestVA)p->p_vaddr);
+            hi = std::max(hi, m.load_bias + (GuestVA)p->p_vaddr +
+                              (GuestVA)p->p_memsz);
+        }
+        if (va >= lo && va < hi) return m.load_bias;
+    }
+    return 0;
+}
+
 static void a64_dump_guest_backtrace(const char *what, uint32_t tid, uint64_t fp) {
     fprintf(stderr, "[arm64] %s tid=%u guest backtrace (x29 chain):\n", what, tid);
     for (int depth = 0; depth < 32 && fp; ++depth) {
@@ -46568,15 +54419,41 @@ static void a64_dump_guest_backtrace(const char *what, uint32_t tid, uint64_t fp
         std::memcpy(&next, frame, 8);
         std::memcpy(&ret, frame + 8, 8);
         if (!ret) break;
-        fprintf(stderr, "  #%-2d fp=0x%llx ret=0x%llx\n", depth,
-                (unsigned long long)fp, (unsigned long long)ret);
+        const ModulePhdr *owner = nullptr;
+        for (const auto &m : g_module_phdrs) {
+            if (!m.is_64) continue;
+            GuestVA lo = m.load_bias, hi = m.load_bias;
+            const uint8_t *ph = g_ctx->mem.try_ptr(m.phdr_va,
+                                      (size_t)m.phnum * sizeof(Elf64_Phdr));
+            if (!ph) continue;
+            for (uint16_t i = 0; i < m.phnum; ++i) {
+                const Elf64_Phdr *p = (const Elf64_Phdr *)ph + i;
+                if (p->p_type != PT_LOAD) continue;
+                lo = std::min(lo, m.load_bias + (GuestVA)p->p_vaddr);
+                hi = std::max(hi, m.load_bias + (GuestVA)p->p_vaddr +
+                                  (GuestVA)p->p_memsz);
+            }
+            if (ret >= lo && ret < hi) { owner = &m; break; }
+        }
+        if (owner)
+            fprintf(stderr, "  #%-2d fp=0x%llx ret=0x%llx  %s+0x%llx\n",
+                    depth, (unsigned long long)fp, (unsigned long long)ret,
+                    g_ctx->mem.cstr(owner->name_va),
+                    (unsigned long long)(ret - owner->load_bias));
+        else
+            fprintf(stderr, "  #%-2d fp=0x%llx ret=0x%llx\n", depth,
+                    (unsigned long long)fp, (unsigned long long)ret);
         if (next <= fp) break; /* stacks grow down: a non-increasing fp is garbage */
         fp = next;
     }
 }
 
 extern "C" void arm64_exec_svc_ring_dump(void) {
-    svc_ring_dump();
+    /* Thread-only dumps are useful when the global ring is dominated by a
+     * hot allocator call site.  This changes diagnostics only; scheduling
+     * and guest state are untouched. */
+    if (!lunaria_env("LUNARIA_DUMP_THREADS_ONLY"))
+        svc_ring_dump();
     /* The queue itself, not just per-thread flags: "queued" and "in the queue"
      * are separate facts and a hang lives in the gap between them. */
     {
@@ -46627,8 +54504,10 @@ extern "C" void arm64_exec_svc_ring_dump(void) {
     }
     /* Every parked guest thread too — a stall is almost always one thread
      * waiting on another, and only the whole set says which. */
+    const long dump_tid = lunaria_env_long("LUNARIA_DUMP_TID", -1);
     for (const ArmThread &t : g_threads) {
         if (t.finished) continue;
+        if (dump_tid >= 0 && t.id != (uint32_t)dump_tid) continue;
         fprintf(stderr, "[arm64] thread tid=%u (%s) pc=0x%llx lr=0x%llx sp=0x%llx\n",
                 t.id, thread_name_of(t.id),
                 (unsigned long long)t.pc64, (unsigned long long)t.lr64,
@@ -46660,6 +54539,27 @@ extern "C" void arm64_exec_svc_ring_dump(void) {
                     (unsigned long long)t.total_ticks);
             fprintf(stderr, "[arm64]   picked out of the ready queue %llu "
                     "times\n", (unsigned long long)g_ready_pops[t.id]);
+        }
+        /* The register file the thread was descheduled with.
+         *
+         * A stall dump names a PC, and a PC alone cannot distinguish "this
+         * thread is waiting for work" from "this thread is in a loop whose
+         * trip count came out wrong".  Both look like one address.  What
+         * separates them is the operands: a frame pacer advancing a
+         * timestamp to the present does it in a loop whose length is
+         * (now - timestamp) / period, so the three values say immediately
+         * whether the emulator handed it a period or a clock it cannot use.
+         *
+         * This is the thread's saved context, not a live read, so printing it
+         * costs nothing and cannot disturb what it is describing. */
+        if (lunaria_env("LUNARIA_SCHED_REGS")) {
+            for (unsigned i = 0; i < 31u; i += 4u) {
+                fprintf(stderr, "[arm64]  ");
+                for (unsigned j = i; j < i + 4u && j < 31u; ++j)
+                    fprintf(stderr, " x%-2u=%016llx", j,
+                            (unsigned long long)t.regs64[j]);
+                fprintf(stderr, "\n");
+            }
         }
         if (t.sleep_until_ns) {
             const uint64_t now = host_mono_ns();
@@ -46738,10 +54638,35 @@ extern "C" void arm64_exec_svc_ring_dump(void) {
              * instead of leaving a bare address that says nothing. */
             if (t.waiting_mutex && g_ctx && g_ctx->mem.ptr(t.waiting_mutex)) {
                 uint32_t w = g_ctx->mem.read32(t.waiting_mutex);
+                /* MUTEX_SLOW_BIT rides in the same word; interpreting the
+                 * raw value made every ERRORCHECK mutex read as held and
+                 * printed a nonsense recursion count (0x400001 for a word
+                 * held exactly once). */
+                const uint32_t ws = mutex_state(w);
                 fprintf(stderr, "[arm64]   mutex 0x%llx word=0x%08x "
                         "held-by-tid=%d depth=%u\n",
                         (unsigned long long)t.waiting_mutex, w,
-                        w >= 0x100u ? (int)(w & 0xffu) - 1 : -1, w >> 8);
+                        ws >= 0x100u ? (int)(ws & 0xffu) - 1 : -1, ws >> 8);
+            }
+            if (t.waiting_futex && g_ctx && g_ctx->mem.ptr(t.waiting_futex)) {
+                const auto wi = g_futex_waiters.find(t.waiting_futex);
+                unsigned listed = 0, total = 0;
+                if (wi != g_futex_waiters.end()) {
+                    total = (unsigned)wi->second.size();
+                    for (uint8_t id : wi->second)
+                        if (id == (uint8_t)t.id) ++listed;
+                }
+                const auto ai = g_futex_wait_addrs.find(t.waiting_futex);
+                fprintf(stderr, "[arm64]   futex 0x%llx word=0x%08x aux+4=0x%08x "
+                        "expected=0x%08x waiter-map=%u/%u active=%u "
+                        "tokens=%u%s\n",
+                        (unsigned long long)t.waiting_futex,
+                        g_ctx->mem.read32(t.waiting_futex),
+                        g_ctx->mem.read32(t.waiting_futex + 4), t.futex_val,
+                        listed, total,
+                        ai == g_futex_wait_addrs.end() ? 0u : ai->second,
+                        futex_token_count(t.waiting_futex),
+                        t.futex_timed ? " timed" : "");
             }
         }
         a64_dump_guest_backtrace("thread", t.id, t.regs64[29]);

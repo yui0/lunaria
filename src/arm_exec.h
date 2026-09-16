@@ -242,7 +242,9 @@ unsigned char *arm_exec_zip_read(const char *archive, const char *name,
  * Returns 1 on success.  Also: F12 in the window, or `touch /tmp/lunaria-shot`. */
 int arm_exec_screenshot(const char *path);
 
-/* Framebuffer / window size (LUNARIA_WIDTH / LUNARIA_HEIGHT, default 1280×720). */
+/* Framebuffer / window size (LUNARIA_WIDTH / LUNARIA_HEIGHT, default 1024x768,
+ * or the device panel scaled by LUNARIA_SCALE if that or LUNARIA_DEVICE_SCREEN_*
+ * is set — see lunaria_screen() in src/jvm/jni_stubs.c). */
 int arm_exec_fb_width(void);
 /* Resolves an absolute guest path into the host path it names, applying the
  * guest's filesystem namespace (Android roots, external storage, app data).
@@ -250,6 +252,19 @@ int arm_exec_fb_width(void);
  * that touch the host filesystem on the guest's behalf must go through this:
  * without it an Android path such as "/etc" aliases the host's. */
 const char *arm_exec_map_guest_path(const char *path, char *buf, size_t bufsz);
+/* The locale the emulated device is configured in, as two-letter language and
+ * country (plus NUL).  One answer for the whole process: the VM's
+ * java.util.Locale default and AConfiguration must not disagree, or an app
+ * that reads both concludes the device is lying.  See arm_exec.cpp. */
+void arm_exec_device_locale(char *lang2, char *country2);
+const char *arm_exec_device_timezone(void);
+void arm_exec_timezone_lock(void);
+void arm_exec_timezone_unlock(void);
+
+/* Give a host thread interpreting java.lang.Thread its own Android pthread
+ * identity while it calls back through JNI into guest native code. */
+void arm_exec_dvm_thread_attach(void);
+void arm_exec_dvm_thread_detach(void);
 
 /* Reports a guest operation that destroys something under a directory lunaria
  * staged — the extracted expansion, or the app's data.  Those are the two
@@ -271,6 +286,16 @@ void arm_exec_audio_output_params(int32_t *frames_per_buffer, int32_t *rate);
 /* The package version from the <manifest> element (PackageInfo.versionCode /
  * versionName).  Never yields 0 or NULL — see the definition. */
 void arm_exec_apk_version(int32_t *code, const char **name);
+/* Who this process is, as Android would answer it.
+ *
+ * One process has one pid and one uid, and every API that reports them has to
+ * agree: native getpid(), /proc/<pid>/status, Process.myPid(),
+ * ActivityManager.RunningAppProcessInfo.pid and ApplicationInfo.uid are all
+ * the same two numbers on a device.  They were not here -- the bytecode side
+ * was handing out the *host* process's pid and uid, so the app appeared to be
+ * running as root under a pid the guest's own getpid() had never heard of. */
+int arm_exec_guest_pid(void);
+int arm_exec_guest_uid(void);
 /* resources.arsc name/value lookup used by android.content.res.Resources. */
 uint32_t arm_exec_apk_resource_id(const char *type, const char *name);
 int arm_exec_apk_resource_value(uint32_t id, int32_t *iv, const char **sv);

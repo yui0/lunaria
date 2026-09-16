@@ -252,6 +252,13 @@ using BackingOffset = uint32_t;
 // A64 guest ptrs: 48-bit lower-half VA; backing store is still 4 GiB.
 constexpr GuestVA A64_GUEST_BASE = 0x0000700000000000ull;
 constexpr GuestVA A64_GUEST_SIZE = 0x0000000100000000ull;
+/* The kernel's own two mappings at the top of the user address space.  Every
+ * Linux process has them; a process whose /proc/<pid>/maps has no [vdso] was
+ * not built by a kernel.  Nothing executes here -- the guest reaches the
+ * clock through its libc, which this emulator answers -- so the addresses
+ * only have to be where a 48-bit-VA arm64 kernel puts them. */
+constexpr GuestVA A64_VVAR_BASE = 0x00007fffffff9000ull;
+constexpr GuestVA A64_VDSO_BASE = 0x00007fffffffd000ull;
 // A64: request image window at its guest VA before ArmMemory::init().
 inline bool g_a64_identity_arena = false;
 inline bool g_a64_arena_identity = false;
@@ -308,6 +315,17 @@ inline bool a64_mapped(GuestVA va) {
     t_a64_cache_hi  = m->hi;
     t_a64_cache_gen = gen;
     return true;
+}
+
+/* Instruction fetch permission is distinct from address validity.  The old
+ * high-VA path used a64_mapped() and consequently executed ordinary RW heap
+ * pages.  Linux raises an instruction abort for those pages; feeding their
+ * bytes to the decoder turns zero-filled data into an endless undefined-
+ * instruction fallback instead. */
+inline bool a64_executable(GuestVA va) {
+    std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
+    const A64Mapping *m = a64_find_locked(va);
+    return m && (m->prot & 4u /* PROT_EXEC */) != 0;
 }
 
 // Bytes mapped contiguously from `va`, or 0 when `va` itself is unmapped.
@@ -572,7 +590,23 @@ inline size_t a64_buf_len(uint64_t x) {
 }
 
 // Guest library regions, recorded by load_elf.
-struct LoadedRegion { uint32_t lo, hi; uint32_t flags; std::string path; };
+/* One PT_LOAD of a mapped image, as /proc/<pid>/maps has to describe it.
+ * `file_off` is the page-aligned file offset the region maps: a device's maps
+ * names it per line, and every segment of a library claiming offset 0 is not
+ * a state the kernel can produce. */
+struct LoadedRegion {
+   uint32_t lo, hi;
+   uint32_t flags;
+   uint64_t file_off;
+   std::string path;
+   /* Captured while the loader still owns the fd.  A mapped ELF may be
+    * unlinked later; Linux keeps its inode in maps and suffixes the name with
+    * " (deleted)" rather than turning it into a named 00:00/inode-0 map. */
+   uint64_t backing_inode = 0;
+   /* Linux mappings belong to an mm/process.  The emulator has one backing
+    * arena, but procfs must never expose an exec child image in its parent. */
+   uint32_t process_pid = 1000u; /* initial Android app process */
+};
 inline std::vector<LoadedRegion> g_loaded_regions;
 // Process-wide ABI selector used by synthetic /proc files.
 
@@ -583,6 +617,7 @@ struct ModulePhdr {
     GuestVA phdr_va;
     uint16_t phnum;
     bool is_64;
+    uint32_t process_pid = 1000u;
 };
 inline std::vector<ModulePhdr> g_module_phdrs;
 
@@ -849,6 +884,9 @@ inline uint32_t misc_sl_iid_end(void) { return MISC_DATA + 0x100u; }
 inline uint32_t misc_tzname(void)     { return MISC_DATA + 0x100u; }
 inline uint32_t misc_tzvars(void)     { return MISC_DATA + 0x180u; }
 inline uint32_t misc_stdio(void)      { return MISC_DATA + 0x200u; }
+inline uint32_t misc_environ(void)    { return MISC_DATA + 0x300u; }
+inline uint32_t misc_env_array(void)  { return MISC_DATA + 0x320u; }
+inline uint32_t misc_env_strings(void){ return MISC_DATA + 0x380u; }
 /* __stack_chk_guard is a *variable* the compiled guest reads directly (the
  * prologue copies it onto the stack, the epilogue compares).  Binding it to a
  * code trampoline handed out the address of an instruction as the guard
@@ -1553,7 +1591,7 @@ constexpr uint32_t SVC_MONO_ADD_ICALL     = SVC_DETOUR_BASE + NUM_DETOURS + 109u
  * mbrlen ran AES-256 over its own string buffer and got the pointer back as
  * the answer.  Give them a range of their own, above everything else, and
  * keep SVC_TRAMP_TOTAL derived from its end. */
-constexpr uint32_t SVC_UE_HOOK_BASE = 1450u;
+constexpr uint32_t SVC_UE_HOOK_BASE = 1470u;
 constexpr uint32_t SVC_FAES_DECRYPT = SVC_UE_HOOK_BASE + 0u;
 // Host SHA-1 for FSHA1::HashBuffer — startup profiler showed 27% of load time.
 constexpr uint32_t SVC_FSHA1_HASHBUFFER = SVC_UE_HOOK_BASE + 1u;
@@ -1622,7 +1660,16 @@ constexpr uint32_t SVC_CITYHASH32 = SVC_UE_HOOK_BASE + 9u;
  * with no struct to get wrong. */
 constexpr uint32_t SVC_STB_VORBIS_INFO = SVC_UE_HOOK_BASE + 10u;
 constexpr uint32_t SVC_STB_VORBIS_READ = SVC_UE_HOOK_BASE + 11u;
-constexpr uint32_t SVC_UE_HOOK_LAST = SVC_STB_VORBIS_READ;
+/* Host UxCsv::FetchRow over UxBufferReader.  Must not share a number with
+ * Vorbis above: CallSVC dispatches by handler id, and a collision sent
+ * ReadCompressedInfo through the CSV path (and starved the host decoder). */
+constexpr uint32_t SVC_UXCSV_FETCHROW = SVC_UE_HOOK_BASE + 12u;
+/* Host TStringConversion<FUTF8ToTCHAR_Convert,128>::Init for the inline
+ * buffer case (output fits in 128 TCHAR).  ReloadInfoAll's stall PC sat in
+ * this Init while FNk*InfoManager::Load turned every CSV field into an
+ * FString. */
+constexpr uint32_t SVC_UE_UTF8_TO_TCHAR = SVC_UE_HOOK_BASE + 13u;
+constexpr uint32_t SVC_UE_HOOK_LAST = SVC_UE_UTF8_TO_TCHAR;
 
 
 constexpr uint32_t SVC_HONEST_BASE          = 1354u; /* first free id */
@@ -1700,13 +1747,26 @@ constexpr uint32_t SVC_ACFG_SETCOUNTRY            = SVC_HONEST_BASE + 71u;
 constexpr uint32_t SVC_ACFG_SET_SDKVER            = SVC_HONEST_BASE + 72u;
 constexpr uint32_t SVC_UNWIND_FAIL                = SVC_HONEST_BASE + 73u;
 constexpr uint32_t SVC_WAITPID                    = SVC_HONEST_BASE + 74u;
+constexpr uint32_t SVC_PTRACE                     = SVC_HONEST_BASE + 75u;
+constexpr uint32_t SVC_GETPPID                    = SVC_HONEST_BASE + 76u;
+/* popen/pclose: an app that runs one of the device's own utilities and reads
+ * its output does it through these as often as through fork()+execve().  They
+ * were bound to the "returns -1" template, which says the process could not be
+ * started at all — a state a device is never in for /system/bin/sh. */
+constexpr uint32_t SVC_POPEN                      = SVC_HONEST_BASE + 77u;
+constexpr uint32_t SVC_PCLOSE                     = SVC_HONEST_BASE + 78u;
+/* bionic's crt entry point.  Only a program image (an executable) calls it —
+ * a shared object never does — so it appeared only once this emulator could
+ * start one.  Left unbound it resolves to the "returns 0" template, and the
+ * program returns from _start without ever entering main. */
+constexpr uint32_t SVC_LIBC_INIT                  = SVC_HONEST_BASE + 79u;
 /* The last number in the block above.  SVC_TRAMP_TOTAL is derived from this
  * rather than from whichever SVC happened to be written last: a number past
  * that bound gets no trampoline built, and the unknown-symbol pool — which
  * starts at the bound — hands its address out to a dlsym'd name instead, so
  * two unrelated symbols end up sharing one stub.  Adding to the block above
  * means moving this line down with it. */
-constexpr uint32_t SVC_HONEST_LAST             = SVC_WAITPID;
+constexpr uint32_t SVC_HONEST_LAST             = SVC_LIBC_INIT;
 static_assert(SVC_HONEST_LAST < SVC_UE_HOOK_BASE,
               "the honest block has grown into the UE hook block");
 constexpr uint32_t NUM_ICALL_PROBES        = 16u;
@@ -2478,7 +2538,16 @@ constexpr uint32_t SVC_SLEEP                      = SVC_COMPAT_BASE + 14u;
  * SVC_PTHREAD_COND_WAIT wants for the cond, and *(r1) already *is* the one
  * it wants for the mutex. */
 constexpr uint32_t SVC_CXX_CONDVAR_WAIT           = SVC_COMPAT_BASE + 15u;
-constexpr uint32_t SVC_COMPAT_LAST                = SVC_CXX_CONDVAR_WAIT;
+/* android_get_application_target_sdk_version(3) and
+ * android_get_device_api_level(3).  Both are bionic entry points, and both
+ * are how native code asks which behaviour changes apply to it.  Unresolved
+ * they bound to the return-0 template, and 0 is not "unknown": it is a
+ * target older than API 1, which is what a repackaged or patched app looks
+ * like.  The answers already exist — the manifest's target SDK and the
+ * device profile's SDK_INT, the same two numbers Java sees. */
+constexpr uint32_t SVC_ANDROID_TARGET_SDK         = SVC_COMPAT_BASE + 16u;
+constexpr uint32_t SVC_ANDROID_DEVICE_API_LEVEL   = SVC_COMPAT_BASE + 17u;
+constexpr uint32_t SVC_COMPAT_LAST                = SVC_ANDROID_DEVICE_API_LEVEL;
 static_assert(SVC_COMPAT_LAST < SVC_UE_HOOK_BASE,
               "the compat block has grown into the UE hook block");
 
