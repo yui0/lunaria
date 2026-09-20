@@ -12,6 +12,7 @@
 #include "lunaria_os.h"
 
 #include <dlfcn.h>
+#include <pthread.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -178,9 +179,13 @@ static bool openh264_ready(void)
 
 /* AVFrame (libavutil 52): data[8], linesize[8], extended_data, w, h, … */
 #define AVFRAME_DATA_OFF        0
+#define AVFRAME_LINESIZE_OFF    64
+#define AVFRAME_WIDTH_OFF       104
+#define AVFRAME_HEIGHT_OFF      108
 #define AVFRAME_NB_SAMPLES_OFF  112
 #define AVFRAME_FORMAT_OFF      116
 
+enum { AV_PIX_FMT_YUV420P = 0, AV_PIX_FMT_YUVJ420P = 12 };
 enum { AV_SAMPLE_FMT_S16 = 1, AV_SAMPLE_FMT_FLT = 3,
        AV_SAMPLE_FMT_S16P = 6, AV_SAMPLE_FMT_FLTP = 8 };
 
@@ -196,6 +201,10 @@ static struct {
    void (*frame_free)(void **);
    int (*frame_channels)(const void *);
    int (*frame_sample_rate)(const void *);
+   /* video: optional — a libavcodec without them still decodes AAC */
+   int (*decode_video2)(void *, void *, int *, const void *);
+   int64_t (*frame_best_effort_ts)(const void *);
+   void (*flush_buffers)(void *);
 } av;
 
 static void *dlopen_any(const char *const *names, size_t n)
@@ -244,7 +253,8 @@ static bool avcodec_ready(void)
    void *u = dlopen_any(util_names, 2);
    if (!c || !u) {
       fprintf(stderr, "[media] no libavcodec/libavutil: %s\n"
-              "[media] AAC decoding is unavailable\n", dlerror());
+              "[media] AAC and libavcodec H.264 decoding are unavailable\n",
+              dlerror());
       return false;
    }
 #define AV_SYM(dst, lib, name) \
@@ -262,6 +272,9 @@ static bool avcodec_ready(void)
    AV_SYM(frame_channels, u, "av_frame_get_channels");
    AV_SYM(frame_sample_rate, u, "av_frame_get_sample_rate");
 #undef AV_SYM
+   *(void **)&av.decode_video2 = dlsym(c, "avcodec_decode_video2");
+   *(void **)&av.frame_best_effort_ts = dlsym(u, "av_frame_get_best_effort_timestamp");
+   *(void **)&av.flush_buffers = dlsym(c, "avcodec_flush_buffers");
 
    if (!avcodec_probe_layout()) {
       fprintf(stderr, "[media] libavcodec AVPacket layout is not the one this "
@@ -269,36 +282,66 @@ static bool avcodec_ready(void)
       return false;
    }
    av.register_all();
-   if (!av.find_decoder_by_name("aac")) {
-      fprintf(stderr, "[media] libavcodec has no \"aac\" decoder\n");
-      return false;
-   }
-   fprintf(stderr, "[media] libavcodec AAC ready\n");
+   fprintf(stderr, "[media] libavcodec ready (aac %s, h264 %s)\n",
+           av.find_decoder_by_name("aac") ? "yes" : "no",
+           av.decode_video2 && av.frame_best_effort_ts &&
+           av.find_decoder_by_name("h264") ? "yes" : "no");
    state = 1;
    return true;
+}
+
+static bool avcodec_aac_ready(void)
+{
+   return avcodec_ready() && av.find_decoder_by_name("aac");
+}
+
+/* A device's MediaCodec decodes every H.264 profile a movie is mastered in —
+ * Main and High with CABAC and B-frames included.  openh264 only reads
+ * Constrained Baseline, so it is the decoder of last resort: libavcodec's
+ * h264 is used whenever it is present. */
+static bool avcodec_h264_ready(void)
+{
+   return avcodec_ready() && av.decode_video2 && av.frame_best_effort_ts &&
+          av.flush_buffers && av.find_decoder_by_name("h264");
 }
 
 /* ------------------------------------------------------------------------ *
  * Frame sink
  * ------------------------------------------------------------------------ */
 
-struct lm_sink {
+/* A producer (the codec thread) and a consumer (updateTexImage on the render
+ * thread) that run concurrently, like a BufferQueue.  Three buffers: the
+ * producer draws into `back`, commit swaps it with `mid` under the lock, and
+ * take swaps `mid` into `front`, which only the consumer reads.  Neither side
+ * ever touches a buffer the other one is using, and no pixel is copied twice. */
+struct lm_sinkbuf {
    uint8_t *rgba;
    size_t cap;
    int w, h;
    int64_t ts_ns;
-   bool pending;
+};
+
+struct lm_sink {
+   pthread_mutex_t mu;
+   struct lm_sinkbuf front, mid, back;
+   bool pending;            /* mid holds a frame front has not taken */
+   int64_t ts_ns;           /* of the newest committed frame */
 };
 
 struct lm_sink *lm_sink_new(void)
 {
-   return calloc(1, sizeof(struct lm_sink));
+   struct lm_sink *s = calloc(1, sizeof(struct lm_sink));
+   if (s) pthread_mutex_init(&s->mu, NULL);
+   return s;
 }
 
 void lm_sink_free(struct lm_sink *s)
 {
    if (!s) return;
-   free(s->rgba);
+   free(s->front.rgba);
+   free(s->mid.rgba);
+   free(s->back.rgba);
+   pthread_mutex_destroy(&s->mu);
    free(s);
 }
 
@@ -306,22 +349,29 @@ uint8_t *lm_sink_begin(struct lm_sink *s, int w, int h)
 {
    if (!s || w <= 0 || h <= 0) return NULL;
    size_t need = (size_t)w * (size_t)h * 4u;
-   if (need > s->cap) {
-      uint8_t *p = realloc(s->rgba, need);
+   struct lm_sinkbuf *b = &s->back;
+   if (need > b->cap) {
+      uint8_t *p = realloc(b->rgba, need);
       if (!p) return NULL;
-      s->rgba = p;
-      s->cap = need;
+      b->rgba = p;
+      b->cap = need;
    }
-   return s->rgba;
+   return b->rgba;
 }
 
 void lm_sink_commit(struct lm_sink *s, int w, int h, int64_t timestamp_ns)
 {
-   if (!s || !s->rgba || w <= 0 || h <= 0) return;
-   s->w = w;
-   s->h = h;
-   s->ts_ns = timestamp_ns;
+   if (!s || !s->back.rgba || w <= 0 || h <= 0) return;
+   s->back.w = w;
+   s->back.h = h;
+   s->back.ts_ns = timestamp_ns;
+   pthread_mutex_lock(&s->mu);
+   struct lm_sinkbuf t = s->mid;
+   s->mid = s->back;
+   s->back = t;
    s->pending = true;
+   s->ts_ns = timestamp_ns;
+   pthread_mutex_unlock(&s->mu);
 }
 
 void lm_sink_push(struct lm_sink *s, const uint8_t *rgba, int w, int h,
@@ -337,26 +387,40 @@ void lm_sink_push(struct lm_sink *s, const uint8_t *rgba, int w, int h,
 
 bool lm_sink_take(struct lm_sink *s, const uint8_t **rgba, int *w, int *h)
 {
-   if (!s || !s->pending || !s->rgba) return false;
-   s->pending = false;
-   if (rgba) *rgba = s->rgba;
-   if (w) *w = s->w;
-   if (h) *h = s->h;
+   if (!s) return false;
+   pthread_mutex_lock(&s->mu);
+   const bool have = s->pending;
+   if (have) {
+      struct lm_sinkbuf t = s->front;
+      s->front = s->mid;
+      s->mid = t;
+      s->pending = false;
+   }
+   pthread_mutex_unlock(&s->mu);
+   if (!have || !s->front.rgba) return false;
+   if (rgba) *rgba = s->front.rgba;
+   if (w) *w = s->front.w;
+   if (h) *h = s->front.h;
    return true;
 }
 
 bool lm_sink_peek(const struct lm_sink *s, const uint8_t **rgba, int *w, int *h)
 {
-   if (!s || !s->rgba || s->w <= 0 || s->h <= 0) return false;
-   if (rgba) *rgba = s->rgba;
-   if (w) *w = s->w;
-   if (h) *h = s->h;
+   /* The consumer's own buffer: what the last take() handed out. */
+   if (!s || !s->front.rgba || s->front.w <= 0 || s->front.h <= 0) return false;
+   if (rgba) *rgba = s->front.rgba;
+   if (w) *w = s->front.w;
+   if (h) *h = s->front.h;
    return true;
 }
 
 int64_t lm_sink_timestamp(const struct lm_sink *s)
 {
-   return s ? s->ts_ns : 0;
+   if (!s) return 0;
+   pthread_mutex_lock((pthread_mutex_t *)&s->mu);
+   const int64_t ts = s->ts_ns;
+   pthread_mutex_unlock((pthread_mutex_t *)&s->mu);
+   return ts;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -372,6 +436,7 @@ struct lm_inbuf {
    uint8_t *p;
    size_t cap;
    bool queued;
+   bool decoding;           /* the codec thread is reading it */
 };
 
 struct lm_outbuf {
@@ -382,12 +447,35 @@ struct lm_outbuf {
    int flags;
    bool busy;               /* handed to the caller, not yet released */
    bool ready;              /* holds a decoded picture */
+   bool rendering;          /* the codec thread is converting it */
 };
 
 struct lm_codec {
    bool video;
    bool started;
-   ISVCDecoder *dec;
+   ISVCDecoder *dec;        /* openh264, when libavcodec has no h264 */
+   void *vctx, *vframe;     /* libavcodec h264 */
+   uint8_t *vpad;           /* input copy with the padding libavcodec reads */
+   size_t vpad_cap;
+   bool vcsd_pending;       /* csd-0/1 still to go in front of the next AU */
+
+   /* The codec thread (libavcodec only).  MediaCodec decodes on a thread of
+    * its own; doing it inside queueInputBuffer / releaseOutputBuffer put the
+    * whole H.264 decode and colour conversion of a background movie on
+    * whichever guest thread drove the player -- the frame pump, which is also
+    * where UE's game thread runs.  Everything below `mu` is shared with it;
+    * vctx/vframe/vpad are the thread's alone. */
+   pthread_t th;
+   bool th_on, th_stop;
+   pthread_mutex_t mu;
+   pthread_cond_t cv;
+   struct lm_job { int kind, idx, off, size, flags; int64_t pts;
+                   struct lm_sink *sink; unsigned epoch; } jobs[16];
+   int job_head, job_n;
+   unsigned epoch;          /* bumped by flush(): older work is discarded */
+   bool flush_decoder;      /* the thread owes avcodec_flush_buffers() */
+   bool draining, drained;  /* past END_OF_STREAM: pulling held-back pictures */
+   int pending_decodes;     /* queued or running, each may yield a picture */
 
    /* audio */
    void *actx, *aframe;
@@ -439,8 +527,9 @@ static bool is_aac_mime(const char *mime)
 bool lm_codec_supported(const char *mime)
 {
    if (!mime) return false;
-   if (!strcasecmp(mime, "video/avc")) return openh264_ready();
-   if (is_aac_mime(mime)) return avcodec_ready();
+   if (!strcasecmp(mime, "video/avc"))
+      return avcodec_h264_ready() || openh264_ready();
+   if (is_aac_mime(mime)) return avcodec_aac_ready();
    return false;
 }
 
@@ -469,6 +558,21 @@ struct lm_codec *lm_codec_new(const char *mime)
    if (!c) return NULL;
    c->video = true;
 
+   if (avcodec_h264_ready()) {
+      void *codec = av.find_decoder_by_name("h264");
+      c->vctx = av.alloc_context3(codec);
+      c->vframe = c->vctx ? av.frame_alloc() : NULL;
+      if (c->vframe && av.open2(c->vctx, codec, NULL) >= 0) {
+         pthread_mutex_init(&c->mu, NULL);
+         pthread_cond_init(&c->cv, NULL);
+         return c;
+      }
+      fprintf(stderr, "[media] libavcodec could not open the H.264 decoder\n");
+      if (c->vframe) av.frame_free(&c->vframe);
+      free(c);
+      return NULL;
+   }
+
    if (lm_WelsCreateDecoder(&c->dec) != 0 || !c->dec) {
       fprintf(stderr, "[media] WelsCreateDecoder failed\n");
       free(c);
@@ -490,12 +594,24 @@ struct lm_codec *lm_codec_new(const char *mime)
 void lm_codec_free(struct lm_codec *c)
 {
    if (!c) return;
+   if (c->vctx) {
+      pthread_mutex_lock(&c->mu);
+      c->th_stop = true;
+      pthread_cond_broadcast(&c->cv);
+      pthread_mutex_unlock(&c->mu);
+      if (c->th_on) pthread_join(c->th, NULL);
+      pthread_cond_destroy(&c->cv);
+      pthread_mutex_destroy(&c->mu);
+   }
    if (c->dec) {
       (*c->dec)->Uninitialize(c->dec);
       lm_WelsDestroyDecoder(c->dec);
    }
    if (c->actx) av.close(c->actx);
    if (c->aframe) av.frame_free(&c->aframe);
+   if (c->vctx) av.close(c->vctx);
+   if (c->vframe) av.frame_free(&c->vframe);
+   free(c->vpad);
    for (int i = 0; i < LM_IN_BUFS; ++i) free(c->in[i].p);
    for (int i = 0; i < LM_OUT_BUFS; ++i) free(c->out[i].yuv);
    for (int i = 0; i < c->ncsd; ++i) free(c->csd[i].p);
@@ -523,6 +639,225 @@ bool lm_media_trace(void)
    return on == 1;
 }
 #define trace_media lm_media_trace
+
+static void i420_to_rgba(const uint8_t *yuv, int w, int h, uint8_t *rgba);
+
+static struct lm_outbuf *free_outbuf(struct lm_codec *c)
+{
+   for (int i = 0; i < LM_OUT_BUFS; ++i)
+      if (!c->out[i].busy && !c->out[i].ready) return &c->out[i];
+   return NULL;
+}
+
+/* Copies one decoded I420 picture into a free output slot. */
+static bool keep_picture(struct lm_codec *c, uint8_t *const planes[3],
+                         const int stride[3], int w, int h, int64_t pts_us)
+{
+   struct lm_outbuf *o = free_outbuf(c);
+   if (!o) {
+      /* dequeue_input() keeps this from happening; if it ever does, dropping
+       * the newest frame is what a full BufferQueue does. */
+      fprintf(stderr, "[media] output buffers full — dropping a frame\n");
+      return true;
+   }
+   int cw = (w + 1) / 2, ch = (h + 1) / 2;
+   size_t need = (size_t)w * (size_t)h + 2u * (size_t)cw * (size_t)ch;
+   if (need > o->cap) {
+      uint8_t *p = realloc(o->yuv, need);
+      if (!p) return false;
+      o->yuv = p;
+      o->cap = need;
+   }
+   for (int y = 0; y < h; ++y)
+      memcpy(o->yuv + (size_t)y * w, planes[0] + (size_t)y * stride[0], (size_t)w);
+   uint8_t *u = o->yuv + (size_t)w * h;
+   uint8_t *v = u + (size_t)cw * ch;
+   for (int y = 0; y < ch; ++y) {
+      memcpy(u + (size_t)y * cw, planes[1] + (size_t)y * stride[1], (size_t)cw);
+      memcpy(v + (size_t)y * cw, planes[2] + (size_t)y * stride[2], (size_t)cw);
+   }
+   if (c->width != w || c->height != h)
+      fprintf(stderr, "[media] H.264 picture %dx%d\n", w, h);
+   o->len = need;
+   o->w = w;
+   o->h = h;
+   o->pts_us = pts_us;
+   o->flags = 0;
+   o->ready = true;
+   c->width = w;
+   c->height = h;
+   return true;
+}
+
+/* libavcodec h264, on the codec thread.  `data == NULL` drains a picture held
+ * back for reordering (B-frames): that is how the end of stream gets its last
+ * frames out.  Returns whether a picture came out into c->vframe. */
+static bool avcodec_decode_packet(struct lm_codec *c, const uint8_t *data,
+                                  size_t len, int64_t pts_us, bool with_csd)
+{
+   enum { PAD = 64 };   /* FF_INPUT_BUFFER_PADDING_SIZE is 16 in lavc 55 */
+   unsigned char pkt[AVPKT_BYTES];
+   memset(pkt, 0, sizeof pkt);
+   av.init_packet(pkt);
+   uint8_t *pdata = NULL;
+   int32_t psize = 0;
+   if (data && len) {
+      /* The parameter sets travel with the first access unit: on their own
+       * they are a packet with no picture, which libavcodec rejects. */
+      size_t pre = 0;
+      if (with_csd)
+         for (int i = 0; i < c->ncsd; ++i) pre += c->csd[i].len;
+      if (pre + len + PAD > c->vpad_cap) {
+         uint8_t *p = realloc(c->vpad, pre + len + PAD);
+         if (!p) return false;
+         c->vpad = p;
+         c->vpad_cap = pre + len + PAD;
+      }
+      size_t at = 0;
+      if (with_csd)
+         for (int i = 0; i < c->ncsd; ++i) {
+            memcpy(c->vpad + at, c->csd[i].p, c->csd[i].len);
+            at += c->csd[i].len;
+         }
+      memcpy(c->vpad + at, data, len);
+      memset(c->vpad + at + len, 0, PAD);
+      pdata = c->vpad;
+      psize = (int32_t)(at + len);
+   }
+   memcpy(pkt + AVPKT_DATA_OFF, &pdata, sizeof pdata);
+   memcpy(pkt + AVPKT_SIZE_OFF, &psize, 4);
+   memcpy(pkt + AVPKT_PTS_OFF, &pts_us, 8);
+   memcpy(pkt + AVPKT_DTS_OFF, &pts_us, 8);
+
+   int got = 0;
+   int used = av.decode_video2(c->vctx, c->vframe, &got, pkt);
+   if (used < 0) {
+      static int warned;
+      if (warned++ < 8)
+         fprintf(stderr, "[media] libavcodec h264 decode failed (%d) on %zu bytes\n",
+                 used, len);
+      return false;
+   }
+   return got != 0;
+}
+
+/* Moves the picture in c->vframe into a free output slot.  Caller holds mu. */
+static bool avcodec_keep_frame(struct lm_codec *c)
+{
+   const uint8_t *f = (const uint8_t *)c->vframe;
+   uint8_t *planes[3];
+   int32_t ls[3], w, h, fmt;
+   memcpy(planes, f + AVFRAME_DATA_OFF, sizeof planes);
+   memcpy(ls, f + AVFRAME_LINESIZE_OFF, sizeof ls);
+   memcpy(&w, f + AVFRAME_WIDTH_OFF, 4);
+   memcpy(&h, f + AVFRAME_HEIGHT_OFF, 4);
+   memcpy(&fmt, f + AVFRAME_FORMAT_OFF, 4);
+   if (fmt != AV_PIX_FMT_YUV420P && fmt != AV_PIX_FMT_YUVJ420P) {
+      static int warned;
+      if (warned++ < 4)
+         fprintf(stderr, "[media] H.264 pixel format %d is not 4:2:0 — "
+                 "this build converts only I420\n", fmt);
+      return false;
+   }
+   if (w <= 0 || h <= 0 || w > 8192 || h > 8192 || ls[0] < w ||
+       ls[1] < (w + 1) / 2 || ls[2] < (w + 1) / 2 ||
+       !planes[0] || !planes[1] || !planes[2]) {
+      fprintf(stderr, "[media] libavcodec AVFrame does not match the layout this "
+              "build assumes (%dx%d linesize %d/%d/%d) — refusing it\n",
+              w, h, ls[0], ls[1], ls[2]);
+      return false;
+   }
+   c->produced_picture = true;
+   int stride[3] = { ls[0], ls[1], ls[2] };
+   return keep_picture(c, planes, stride, w, h, av.frame_best_effort_ts(c->vframe));
+}
+
+
+enum { LM_JOB_DECODE = 1, LM_JOB_RENDER = 2 };
+
+static bool codec_job_push(struct lm_codec *c, const struct lm_job *j)
+{
+   if (c->job_n >= (int)(sizeof c->jobs / sizeof c->jobs[0])) return false;
+   c->jobs[(c->job_head + c->job_n) % (int)(sizeof c->jobs / sizeof c->jobs[0])] = *j;
+   ++c->job_n;
+   pthread_cond_broadcast(&c->cv);
+   return true;
+}
+
+static void *codec_thread_main(void *arg)
+{
+   struct lm_codec *c = arg;
+   pthread_mutex_lock(&c->mu);
+   for (;;) {
+      while (!c->th_stop && !c->job_n &&
+             !(c->draining && !c->drained && free_outbuf(c)))
+         pthread_cond_wait(&c->cv, &c->mu);
+      if (c->th_stop) break;
+      if (c->flush_decoder) {
+         c->flush_decoder = false;
+         pthread_mutex_unlock(&c->mu);
+         av.flush_buffers(c->vctx);
+         pthread_mutex_lock(&c->mu);
+         continue;
+      }
+      if (!c->job_n) {
+         /* Past END_OF_STREAM with a slot free: pull a held-back picture. */
+         const unsigned epoch = c->epoch;
+         pthread_mutex_unlock(&c->mu);
+         const bool got = avcodec_decode_packet(c, NULL, 0, 0, false);
+         pthread_mutex_lock(&c->mu);
+         if (epoch != c->epoch) continue;
+         if (!got || !avcodec_keep_frame(c)) c->drained = true;
+         pthread_cond_broadcast(&c->cv);
+         continue;
+      }
+      struct lm_job j = c->jobs[c->job_head];
+      c->job_head = (c->job_head + 1) % (int)(sizeof c->jobs / sizeof c->jobs[0]);
+      --c->job_n;
+      if (j.kind == LM_JOB_DECODE) {
+         const bool with_csd = c->vcsd_pending && j.epoch == c->epoch;
+         if (with_csd) c->vcsd_pending = false;
+         c->in[j.idx].decoding = true;
+         pthread_mutex_unlock(&c->mu);
+         const bool got = j.epoch == c->epoch &&
+            avcodec_decode_packet(c, c->in[j.idx].p + j.off, (size_t)j.size,
+                                  j.pts, with_csd);
+         pthread_mutex_lock(&c->mu);
+         c->in[j.idx].decoding = false;
+         c->in[j.idx].queued = false;
+         if (c->pending_decodes > 0) --c->pending_decodes;
+         if (got && j.epoch == c->epoch) (void)avcodec_keep_frame(c);
+         if ((j.flags & LM_BUFFER_FLAG_END_OF_STREAM) && j.epoch == c->epoch)
+            c->draining = true;
+      } else if (j.kind == LM_JOB_RENDER) {
+         struct lm_outbuf *o = &c->out[j.idx];
+         if (j.epoch == c->epoch && j.sink && o->len && o->w > 0 && o->h > 0) {
+            o->rendering = true;
+            pthread_mutex_unlock(&c->mu);
+            uint8_t *rgba = lm_sink_begin(j.sink, o->w, o->h);
+            if (rgba) {
+               i420_to_rgba(o->yuv, o->w, o->h, rgba);
+               lm_sink_commit(j.sink, o->w, o->h, o->pts_us * 1000);
+            }
+            pthread_mutex_lock(&c->mu);
+            o->rendering = false;
+         }
+         o->busy = false;
+         o->ready = false;
+      }
+      pthread_cond_broadcast(&c->cv);
+   }
+   pthread_mutex_unlock(&c->mu);
+   return NULL;
+}
+
+static bool codec_thread_ensure(struct lm_codec *c)
+{
+   if (c->th_on) return true;
+   if (pthread_create(&c->th, NULL, codec_thread_main, c) != 0) return false;
+   c->th_on = true;
+   return true;
+}
 
 /* Feeds one access unit and keeps whatever picture comes out.  Returns false
  * only when the decoder itself refused the data. */
@@ -570,44 +905,8 @@ static bool decode_au(struct lm_codec *c, const uint8_t *data, size_t len,
       return false;
    }
 
-   struct lm_outbuf *o = NULL;
-   for (int i = 0; i < LM_OUT_BUFS; ++i)
-      if (!c->out[i].busy && !c->out[i].ready) { o = &c->out[i]; break; }
-   if (!o) {
-      /* dequeue_input() keeps this from happening; if it ever does, dropping
-       * the newest frame is what a full BufferQueue does. */
-      fprintf(stderr, "[media] output buffers full — dropping a frame\n");
-      return true;
-   }
-
-   int cw = (w + 1) / 2, ch = (h + 1) / 2;
-   size_t need = (size_t)w * (size_t)h + 2u * (size_t)cw * (size_t)ch;
-   if (need > o->cap) {
-      uint8_t *p = realloc(o->yuv, need);
-      if (!p) return false;
-      o->yuv = p;
-      o->cap = need;
-   }
-   for (int y = 0; y < h; ++y)
-      memcpy(o->yuv + (size_t)y * w, planes[0] + (size_t)y * b->iStride[0], (size_t)w);
-   uint8_t *u = o->yuv + (size_t)w * h;
-   uint8_t *v = u + (size_t)cw * ch;
-   for (int y = 0; y < ch; ++y) {
-      memcpy(u + (size_t)y * cw, planes[1] + (size_t)y * b->iStride[1], (size_t)cw);
-      memcpy(v + (size_t)y * cw, planes[2] + (size_t)y * b->iStride[1], (size_t)cw);
-   }
-   if (c->width != w || c->height != h)
-      fprintf(stderr, "[media] H.264 picture %dx%d\n", w, h);
-   o->len = need;
-   o->w = w;
-   o->h = h;
-   o->pts_us = (int64_t)info.uiOutYuvTimeStamp;
-   o->flags = 0;
-   o->ready = true;
-
-   c->width = w;
-   c->height = h;
-   return true;
+   int stride[3] = { b->iStride[0], b->iStride[1], b->iStride[1] };
+   return keep_picture(c, planes, stride, w, h, (int64_t)info.uiOutYuvTimeStamp);
 }
 
 /* AAC frames arrive raw, with the configuration in csd-0 (an
@@ -777,7 +1076,12 @@ bool lm_codec_start(struct lm_codec *c)
    /* configure() collected csd-0 / csd-1; the platform feeds them at start(),
     * before any sample.  Doing it here means a caller that never queues its
     * own codec-config buffer still gets a configured decoder. */
-   for (int i = 0; i < c->ncsd; ++i) {
+   if (c->vctx) {
+      pthread_mutex_lock(&c->mu);
+      c->vcsd_pending = c->ncsd > 0;
+      pthread_mutex_unlock(&c->mu);
+   }
+   else for (int i = 0; i < c->ncsd; ++i) {
       if (c->video) (void)decode_au(c, c->csd[i].p, c->csd[i].len, 0);
       else if (i == 0) aac_take_config(c, c->csd[i].p, c->csd[i].len);
    }
@@ -791,20 +1095,69 @@ void lm_codec_stop(struct lm_codec *c)
    lm_codec_flush(c);
 }
 
+static void codec_flush_locked(struct lm_codec *c);
+
 void lm_codec_flush(struct lm_codec *c)
 {
    if (!c) return;
-   for (int i = 0; i < LM_IN_BUFS; ++i) c->in[i].queued = false;
+   if (c->vctx) pthread_mutex_lock(&c->mu);
+   codec_flush_locked(c);
+   if (c->vctx) pthread_mutex_unlock(&c->mu);
+}
+
+static void codec_flush_locked(struct lm_codec *c)
+{
+   /* With a codec thread, an input buffer it is decoding and an output it
+    * is converting stay its own until it hands them back; everything else is
+    * returned now.  Queued-but-unstarted decodes are dropped below. */
+   int inflight = 0;
+   for (int i = 0; i < LM_IN_BUFS; ++i) {
+      if (c->in[i].decoding) { ++inflight; continue; }
+      c->in[i].queued = false;
+   }
+   if (c->vctx) c->pending_decodes = inflight;
    for (int i = 0; i < LM_OUT_BUFS; ++i) {
+      if (c->out[i].rendering) continue;
       c->out[i].busy = false;
       c->out[i].ready = false;
    }
    c->got_eos = c->sent_eos = false;
+   /* MediaCodec.flush() discards every reference picture too: the next
+    * sample after a seek or a loop starts from its own keyframe.  The codec
+    * thread owns the context, so it does the flushing; everything it had
+    * queued or in hand belongs to the old epoch and is dropped. */
+   if (c->vctx) {
+      ++c->epoch;
+      c->job_n = 0;
+      c->flush_decoder = true;
+      c->draining = c->drained = false;
+      pthread_cond_broadcast(&c->cv);
+   }
 }
 
 int lm_codec_dequeue_input(struct lm_codec *c)
 {
    if (!c || !c->started) return -1;
+   if (c->vctx) {
+      pthread_mutex_lock(&c->mu);
+      int free_out = -c->pending_decodes;
+      for (int i = 0; i < LM_OUT_BUFS; ++i)
+         if (!c->out[i].busy && !c->out[i].ready) free_out++;
+      int got = -1;
+      if (free_out > 0)
+         for (int i = 0; i < LM_IN_BUFS && got < 0; ++i) {
+            if (c->in[i].queued) continue;
+            if (!c->in[i].p) {
+               c->in[i].p = malloc(LM_IN_CAP);
+               if (!c->in[i].p) break;
+               c->in[i].cap = LM_IN_CAP;
+            }
+            c->in[i].queued = true;
+            got = i;
+         }
+      pthread_mutex_unlock(&c->mu);
+      return got;
+   }
    /* Back-pressure: with every output slot spoken for there is nowhere to put
     * the next picture, so the input side has to wait. */
    int free_out = 0;
@@ -839,6 +1192,24 @@ bool lm_codec_queue_input(struct lm_codec *c, int idx, int offset, int size,
    if (offset < 0 || size < 0 ||
        (size_t)offset + (size_t)size > c->in[idx].cap) return false;
 
+   if (c->vctx) {
+      pthread_mutex_lock(&c->mu);
+      if (flags & LM_BUFFER_FLAG_END_OF_STREAM) c->got_eos = true;
+      bool ok = false;
+      if ((size > 0 || (flags & LM_BUFFER_FLAG_END_OF_STREAM)) &&
+          codec_thread_ensure(c)) {
+         struct lm_job j = { LM_JOB_DECODE, idx, offset, size, flags, pts_us,
+                             NULL, c->epoch };
+         ok = codec_job_push(c, &j);
+         if (ok) ++c->pending_decodes;
+      }
+      if (!ok) c->in[idx].queued = false;   /* nothing to decode: hand it back */
+      pthread_mutex_unlock(&c->mu);
+      if (trace_media())
+         fprintf(stderr, "[media] queueInput idx=%d size=%d pts=%lld flags=0x%x\n",
+                 idx, size, (long long)pts_us, flags);
+      return true;
+   }
    c->in[idx].queued = false;
    if (flags & LM_BUFFER_FLAG_END_OF_STREAM) c->got_eos = true;
    if (trace_media())
@@ -855,8 +1226,23 @@ bool lm_codec_queue_input(struct lm_codec *c, int idx, int offset, int size,
    return true;
 }
 
+static int codec_dequeue_output_locked(struct lm_codec *c, int64_t *pts_us,
+                                       int *size, int *flags);
+
 int lm_codec_dequeue_output(struct lm_codec *c, int64_t *pts_us, int *size,
                             int *flags)
+{
+   if (c && c->vctx) {
+      pthread_mutex_lock(&c->mu);
+      int r = codec_dequeue_output_locked(c, pts_us, size, flags);
+      pthread_mutex_unlock(&c->mu);
+      return r;
+   }
+   return codec_dequeue_output_locked(c, pts_us, size, flags);
+}
+
+static int codec_dequeue_output_locked(struct lm_codec *c, int64_t *pts_us,
+                                       int *size, int *flags)
 {
    if (pts_us) *pts_us = 0;
    if (size) *size = 0;
@@ -885,6 +1271,12 @@ int lm_codec_dequeue_output(struct lm_codec *c, int64_t *pts_us, int *size,
                  i, (int)c->out[i].len, (long long)c->out[i].pts_us);
       return i;
    }
+
+   /* Pictures libavcodec holds back for B-frame reordering are pulled by the
+    * codec thread once it has seen END_OF_STREAM; the stream ends only when
+    * it has run out of them and nothing is still being decoded. */
+   if (c->vctx && c->got_eos && (c->pending_decodes || !c->drained))
+      return LM_INFO_TRY_AGAIN_LATER;
 
    /* Everything queued has come out; only then does the stream end. */
    if (c->got_eos && !c->sent_eos) {
@@ -971,7 +1363,24 @@ static void i420_to_rgba(const uint8_t *yuv, int w, int h, uint8_t *rgba)
 void lm_codec_release_output(struct lm_codec *c, int idx, bool render,
                              struct lm_sink *sink)
 {
-   if (!c || idx < 0 || idx >= LM_OUT_BUFS || !c->out[idx].busy) return;
+   if (!c || idx < 0 || idx >= LM_OUT_BUFS) return;
+   if (c->vctx) {
+      pthread_mutex_lock(&c->mu);
+      if (c->out[idx].busy) {
+         struct lm_job j = { LM_JOB_RENDER, idx, 0, 0, 0, 0, sink, c->epoch };
+         if (!(render && sink && codec_thread_ensure(c) && codec_job_push(c, &j))) {
+            c->out[idx].busy = false;
+            c->out[idx].ready = false;
+            pthread_cond_broadcast(&c->cv);
+         }
+      }
+      pthread_mutex_unlock(&c->mu);
+      if (trace_media())
+         fprintf(stderr, "[media] releaseOutput idx=%d render=%d sink=%p\n",
+                 idx, (int)render, (void *)sink);
+      return;
+   }
+   if (!c->out[idx].busy) return;
    struct lm_outbuf *o = &c->out[idx];
 
    if (render && sink && o->len && o->w > 0 && o->h > 0) {
@@ -1506,7 +1915,10 @@ const uint8_t *lm_mp4_sample(struct lm_mp4 *m, int t, int i, size_t *len,
       m->buf = grown;
       m->buf_cap = need;
    }
-   if (!lm_read_at(m->fd, s->offset, m->buf, need)) return NULL;
+   /* stco/co64 count from the start of the MP4, not of the file holding it:
+    * a movie inside an OBB zip is handed over as (fd, offset, length), the
+    * same DataSource window stagefright reads through. */
+   if (!lm_read_at(m->fd, m->base + s->offset, m->buf, need)) return NULL;
 
    /* AVC in MP4 prefixes each NAL with its length; a decoder wants Annex-B
     * start codes.  The 4-byte case is a rewrite in place; narrower prefixes

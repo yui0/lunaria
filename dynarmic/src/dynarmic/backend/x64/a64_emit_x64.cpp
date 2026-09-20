@@ -512,6 +512,27 @@ void A64EmitX64::EmitA64InstructionCacheOperationRaised(A64EmitContext& ctx, IR:
     Devirtualize<&A64::UserCallbacks::InstructionCacheOperationRaised>(conf.callbacks).EmitCall(code);
 }
 
+/* A host implementation, called like any other function from inside the block.
+ *
+ * The contrast with EmitA64CallSupervisor above is the whole point: that one
+ * hands control to UserCallbacks and the block ends on a halt check, which is
+ * more work than a short guest function costs to run.  Here the register
+ * allocator puts the three guest arguments straight into the host's argument
+ * registers and binds the return register to this instruction, so the only
+ * cost is the call.  Nothing about the guest's state is written out for it. */
+void A64EmitX64::EmitA64CallHostHook(A64EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    ASSERT(args[0].IsImmediate());
+    ASSERT(conf.host_hook_fn != nullptr);
+    const u32 id = args[0].GetImmediateU32();
+    /* The first parameter is left free for the id; the three guest values go
+     * in the ones after it, matching host_hook_fn's signature. */
+    ctx.reg_alloc.HostCall(inst, {}, args[1], args[2], args[3]);
+    code.mov(code.ABI_PARAM1.cvt32(), id);
+    code.mov(rax, reinterpret_cast<u64>(conf.host_hook_fn));
+    code.call(rax);
+}
+
 void A64EmitX64::EmitA64DataSynchronizationBarrier(A64EmitContext&, IR::Inst*) {
     code.mfence();
     code.lfence();

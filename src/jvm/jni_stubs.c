@@ -819,10 +819,46 @@ static const struct lunaria_device k_devices[] = {
       "lunaria", "lunaria", "lunaria", NULL, "1", "2026-09-05",
       "Lunaria", "Lunaria Accelerometer", "Lunaria Gyroscope", 31,
       720, 1280, 320 },
+   /* Moto G6 Play: a 720x1440 phone that shipped in volume and is squarely
+    * inside every mobile title's supported set.  Kept as the real-device
+    * low-resolution answer for a run that has to look like a phone. */
+   {  "motog6play", "motorola", "motorola", "moto g(6) play", "aljeter",
+      "aljeter", "msm8937", "msm8937", "qcom", "OPP28.85-13", "13",
+      "2018-08-01", "STMicroelectronics", "LSM6DSM Accelerometer",
+      "LSM6DSM Gyroscope", 27,
+      720, 1440, 320 },
+   /* The default.  A Pixel 6 in every respect an engine can match on --
+    * make, brand, model, device, board, platform, hardware -- with a
+    * 1024x576 landscape panel, which is the surface this emulator actually
+    * presents on a desktop.
+    *
+    * The identity has to be a real device, and it has to be *this* one.
+    * Android engines pick their per-device settings by matching those
+    * fields: UE4's [AndroidDeviceProfileMatchingRules] compares DeviceMake,
+    * DeviceModel and GpuFamily, and a name no rule mentions falls through to
+    * the bare [Android DeviceProfile], where sg.ResolutionQuality is unset.
+    * Cross Worlds then clamps to UE's 10% floor and draws its world into a
+    * 103x58 buffer stretched over the window -- measured with
+    * LUNARIA_DRAW_CENSUS on 2026-09-19 against efed3fe, which reported a
+    * Pixel 6 and got a full-size 1024x576 scene.  Pixel 6 specifically
+    * because guest_gl_identity_string() already answers ARM / Mali-G78, and
+    * that is the Pixel 6's GPU: a process may not be one device to
+    * glGetString and another to Build.
+    *
+    * The panel is the one field that is *not* the Pixel 6's, and that is the
+    * honest way round.  lunaria_screen() hands the guest this panel at 1:1,
+    * so DisplayMetrics, Display.getRealSize() and AConfiguration all report
+    * the surface the app is really given -- which is what an app is entitled
+    * to assume, and what a scaled-down window used to break. */
+   {  "desktop", "Google", "google", "Pixel 6", "oriole", "oriole", "oriole",
+      "gs101", "oriole", "SQ3A.220705.003.A1", "8672226", "2022-07-05",
+      "Bosch", "LSM6DSO Accelerometer", "LSM6DSO Gyroscope", 31,
+      576, 1024, 320 },
 };
 
 static const struct lunaria_device *const k_device_list[] = {
-   &k_devices[0], &k_devices[1], &k_devices[2], &k_devices[3], NULL
+   &k_devices[0], &k_devices[1], &k_devices[2], &k_devices[3], &k_devices[4],
+   &k_devices[5], NULL
 };
 
 const struct lunaria_device *const *
@@ -848,7 +884,8 @@ lunaria_device(void)
    if (resolved) return &active;
    resolved = 1;
 
-   const struct lunaria_device *base = &k_devices[0];   /* a real device */
+   /* The "desktop" profile, for the reason given at its table entry. */
+   const struct lunaria_device *base = &k_devices[5];
    const char *want = getenv("LUNARIA_DEVICE");
    if (want && *want) {
       const struct lunaria_device *hit = NULL;
@@ -974,18 +1011,29 @@ lunaria_screen(void)
    s.height  = ((int)(h * scale + 0.5) + 1) & ~1;
    s.density = (int)(dpi * scale + 0.5);
 
-   /* With no operator opinion on the panel or the scale, land on a size an
-    * operator can actually use on a desktop instead of the scaled-down
-    * device panel (720x324 @ 126dpi from the Pixel 6 default at 0.3).  This
-    * keeps dp layout correct: 1024x768 @ 320dpi is 512x384 dp, which stays
-    * in the "normal" screen-size bucket the device profile already reports
-    * (see acfg_int_value's ACFG_I_SCREENSIZE/SCREENLONG), so nothing about
-    * which resource bucket the app picks changes because of this default. */
+   /* The panel, at 1:1.  The surface the emulator presents, DisplayMetrics,
+    * Display.getRealSize() and AConfiguration all have to describe one
+    * display, and the app is entitled to assume the pixels it is given are
+    * the pixels it was told about.  A scaled-down desktop-friendly window
+    * broke that: UE was told one height and handed another, and
+    * UGameUserSettings::UpdateResolutionQuality() -- which computes
+    *     MinResolutionScale = max(MinYFor3DView / ScreenHeight * 100, 10)
+    * and then raises its saved ResolutionQuality (0) to it -- landed on the
+    * 10% floor, so Cross Worlds drew its world into a 103x58 buffer and
+    * stretched it over the window (measured with LUNARIA_DRAW_CENSUS,
+    * 2026-09-18: exactly 10% of the surface at both 1024x576 and 1280x720).
+    *
+    * Which panel that is, is the device profile's business, not this
+    * function's: the default profile is a real low-resolution phone for
+    * exactly the reason a smaller frame is wanted (see k_devices).
+    * LUNARIA_SCALE, LUNARIA_WIDTH/HEIGHT and LUNARIA_DEVICE_SCREEN_* still
+    * name something else for an operator who wants it -- and an operator who
+    * does gets the mismatch back, knowingly. */
    if (!operator_chose_panel) {
       const int landscape = screen_is_landscape();
-      s.width   = landscape ? 1024 : 768;
-      s.height  = landscape ? 768  : 1024;
-      s.density = 320;
+      s.width   = landscape ? (d->screen_h) : (d->screen_w);
+      s.height  = landscape ? (d->screen_w) : (d->screen_h);
+      s.density = d->density;
    }
 
    /* Exact sizes, for an operator who wants one particular surface rather

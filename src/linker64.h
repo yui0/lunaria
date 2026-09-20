@@ -71,6 +71,8 @@ struct ln64_module *ln64_add(const char *path, uint32_t load_bias,
  * registered so far, building the dependency graph the local groups are
  * walked over.  Cheap and idempotent; call it after each load. */
 void ln64_link_deps(void);
+/* Roll back an image whose relocation validation failed. */
+void ln64_remove(struct ln64_module *module);
 
 /* The result of a lookup. */
 struct ln64_sym {
@@ -106,6 +108,9 @@ const char *ln64_module_path(const struct ln64_module *m);
 const char *ln64_module_soname(const struct ln64_module *m);
 uint32_t    ln64_module_bias(const struct ln64_module *m);
 struct ln64_module *ln64_module_by_path(const char *path);
+struct ln64_module *ln64_module_by_address(uint32_t address);
+bool ln64_lookup_next(struct ln64_module *caller, const char *name, struct ln64_sym *out);
+bool ln64_depends_on(struct ln64_module *module, const char *soname);
 
 /* Diagnostics: one line per image with what was found in it. */
 void ln64_dump(void);

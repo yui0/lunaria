@@ -343,7 +343,19 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
     }
 
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
-    constexpr bool ordered = true;
+    /* x86-64 is TSO: every load is already an acquire load, and what makes the
+     * LL/SC pair atomic is the `lock cmpxchg` the store-exclusive emits.  An
+     * *ordered* read, on the other hand, goes through EmitReadMemoryMov as
+     * `lock xadd [addr], 0` -- a read-modify-write that takes the cache line
+     * exclusive on every load-exclusive.  A guest refcount (LDXR/ADD/STXR) then
+     * pays two atomic RMWs and two line transfers instead of one, which is
+     * most of what a load-exclusive costs here: on an Ivy Bridge host a
+     * six-instruction refcount loop measured 62 Mips against 2,120 Mips for
+     * the same loop without the exclusive pair (apps/lunaria `make jit-speed`).
+     *
+     * Only the 128-bit form has to stay ordered: reading a pair atomically is
+     * cmpxchg16b, and there is no plain 128-bit atomic load. */
+    constexpr bool ordered = bitsize == 128;
 
     if constexpr (ordered && bitsize == 128) {
         // Required for atomic 128-bit loads/stores

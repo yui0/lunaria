@@ -46,6 +46,11 @@ void IREmitter::CallSupervisor(u32 imm) {
     Inst(Opcode::A64CallSupervisor, Imm32(imm));
 }
 
+IR::U64 IREmitter::CallHostHook(u32 id, const IR::U64& arg0, const IR::U64& arg1,
+                                const IR::U64& arg2) {
+    return Inst<IR::U64>(Opcode::A64CallHostHook, Imm32(id), arg0, arg1, arg2);
+}
+
 void IREmitter::ExceptionRaised(Exception exception) {
     Inst(Opcode::A64ExceptionRaised, Imm64(PC()), Imm64(static_cast<u64>(exception)));
 }

@@ -351,6 +351,27 @@ static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
     * implements itself (AssetManager, File, …) was unreachable through an
     * object that arrived this way. */
    const char *cn = class_name_of(env, o);
+   /* A ProviderInfo allocated by the framework bridge has its fields in the
+    * host JVM.  Read them before registering the DVM wrapper: once registered,
+    * JNI field access correctly resolves to the DVM object instead. */
+   if (cn && (!strcmp(cn, "android/content/pm/ProviderInfo") ||
+              !strcmp(cn, "android.content.pm.ProviderInfo"))) {
+      jclass pc = (*env)->GetObjectClass(env, o);
+      jfieldID grant = (*env)->GetFieldID(env, pc, "grantUriPermissions", "Z");
+      jfieldID authority = (*env)->GetFieldID(env, pc, "authority",
+                                             "Ljava/lang/String;");
+      jboolean grant_value = grant ? (*env)->GetBooleanField(env, o, grant) : JNI_FALSE;
+      jobject authority_value = authority ? (*env)->GetObjectField(env, o, authority) : NULL;
+      if (getenv("LUNARIA_TRACE_FIELDS"))
+         fprintf(stderr, "[dvm] ProviderInfo import host=%p grant=%d authority=%p\n",
+                 (void *)o, (int)grant_value, (void *)authority_value);
+      dvm_ref r = wrapper_for(vm, cn, (uint32_t)(uintptr_t)o);
+      union dvm_value value = { .i = grant_value ? 1 : 0 };
+      (void)dvm_set_field(vm, r, "grantUriPermissions", "Z", value);
+      value.l = authority_value ? from_jobject(vm, env, authority_value) : 0;
+      (void)dvm_set_field(vm, r, "authority", "Ljava/lang/String;", value);
+      return r;
+   }
    return wrapper_for(vm, cn && *cn ? cn : "java/lang/Object",
                       (uint32_t)(uintptr_t)o);
 }
@@ -425,6 +446,35 @@ static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
    if (s) return (jobject)(*env)->NewStringUTF(env, s);
 
    struct dvm_class *c = dvm_object_class(vm, r);
+
+   /* A java.lang.Class must cross as the host jclass for the class it
+    * *represents*, not as an instance of java.lang.Class.
+    *
+    * Without this it fell through to the AllocObject path below, whose
+    * FindClass argument is dvm_object_class() — "java/lang/Class" — so every
+    * Class the VM handed to native code came out as one anonymous, empty
+    * java.lang.Class instance that names nothing.  Native code does not read
+    * fields off a Class; it passes it to FindClass-shaped APIs
+    * (GetObjectClass results, NewObjectArray's element class,
+    * IsInstanceOf/IsAssignableFrom, Class.getName, reflection), and those
+    * cannot work on an opaque that has no class behind it.
+    *
+    * klass->name is already the internal form FindClass wants, including for
+    * array classes ("[I", "[Ljava/lang/String;").  A Class object with no
+    * klass — a primitive class the VM models differently — is left to the
+    * generic path rather than guessed at. */
+   if (c && c->name && !strcmp(c->name, "java/lang/Class")) {
+      struct dvm_object *co = dvm__obj(vm, r);
+      if (co && co->kind == DVM_OBJ_CLASS && co->klass && co->klass->name) {
+         jclass jc = (*env)->FindClass(env, co->klass->name);
+         if (jc) {
+            co->host_handle = (uint32_t)(uintptr_t)jc;
+            remember_wrapper(co->host_handle, r);
+            return (jobject)jc;
+         }
+      }
+   }
+
    /* reflect.Method / Field must become real jmethodID / jfieldID objects.
     * AllocObject left an empty opaque; FromReflectedMethod then handed that
     * opaque to Call*Method, which rejected it (not JVM_OBJECT_METHOD). */

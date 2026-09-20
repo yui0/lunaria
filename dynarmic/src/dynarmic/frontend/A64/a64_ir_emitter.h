@@ -41,6 +41,23 @@ public:
     void SetNZCV(const IR::NZCV& nzcv);
 
     void CallSupervisor(u32 imm);
+    /* A host implementation called straight from translated code.
+     *
+     * Unlike CallSupervisor this is an ordinary value-producing instruction:
+     * the register allocator hands the three arguments over in the host's own
+     * argument registers and takes the result back in the return register, so
+     * no guest register file is written out to JitState and the block is not
+     * terminated on its account.  The caller decides what happens next, which
+     * for a hook that stands in for a whole guest function is the same
+     * PopRSBHint a RET would have used.
+     *
+     * That difference is the point: an SVC costs a full state flush plus the
+     * dispatch through UserCallbacks, which is more than a short guest
+     * function (a case-insensitive string compare, a character scan) costs to
+     * simply run.  Those are exactly the functions worth replacing, and they
+     * were not worth replacing through an SVC. */
+    IR::U64 CallHostHook(u32 id, const IR::U64& arg0, const IR::U64& arg1,
+                         const IR::U64& arg2);
     void ExceptionRaised(Exception exception);
     void DataCacheOperationRaised(DataCacheOperation op, const IR::U64& value);
     void InstructionCacheOperationRaised(InstructionCacheOperation op, const IR::U64& value);

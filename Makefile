@@ -40,7 +40,9 @@ LUNA_OS_SRC = src/lunaria_windows.c
 else
 LUNA_OS_SRC = src/lunaria_linux.c
 endif
-LUNA_OS_OBJ = lunaria_os.o
+# Intermediate objects and scratch space live outside the source tree.
+BUILD_DIR ?= /tmp/lunaria-build
+LUNA_OS_OBJ = $(BUILD_DIR)/lunaria_os.o
 
 # The dynarmic sub-build's driver.  Only the macOS branch below used to set
 # this, so `make dynarmic-build` on a Linux host ran an empty command and
@@ -187,7 +189,7 @@ $(SYSLIB_LIBM):
 	    cp "$$found" $@; \
 	else \
 	    echo "syslib: fetching $(BUILD_TOOLS_URL)"; \
-	    tmp=`mktemp -d`; \
+	    mkdir -p $(BUILD_DIR); tmp=`mktemp -d $(BUILD_DIR)/syslib.XXXXXX`; \
 	    curl -fsSL -o "$$tmp/bt.zip" "$(BUILD_TOOLS_URL)"; \
 	    entry=`unzip -Z1 "$$tmp/bt.zip" '*/renderscript/lib/intermediates/arm64-v8a/libm.so' | head -1`; \
 	    [ -n "$$entry" ] || { echo "syslib: no arm64 libm in the archive" >&2; rm -rf "$$tmp"; exit 1; }; \
@@ -241,6 +243,29 @@ $(SYSLIB_LIBZ):
 	    { echo "syslib: $@ is not AArch64" >&2; rm -f $@; exit 1; }
 	@echo "syslib: $@ ready"
 
+# Guest-side platform code (src/lib/guest.c): Android libc routines that a
+# device runs as in-process code, built for the guest instead of trapped.
+SYSLIB_GUEST := $(SYSLIB_DIR)/liblunaria_guest.so
+guestlib: $(SYSLIB_GUEST)
+$(SYSLIB_GUEST): src/lib/guest.c
+	@mkdir -p $(SYSLIB_DIR)
+	@set -e; \
+	compiler=""; \
+	for root in "$$LUNARIA_ANDROID_NDK" "$$ANDROID_NDK_HOME" "$$ANDROID_NDK_ROOT" \
+	            "$$ANDROID_HOME/ndk" "$$ANDROID_SDK_ROOT/ndk" /root/image/android/ndk; do \
+	    [ -n "$$root" ] || continue; \
+	    cand=`find "$$root" -name aarch64-linux-android21-clang 2>/dev/null | head -1`; \
+	    [ -n "$$cand" ] && [ -x "$$cand" ] && { compiler="$$cand"; break; }; \
+	done; \
+	[ -n "$$compiler" ] || { echo "guestlib: no Android NDK aarch64 clang found" >&2; exit 1; }; \
+	"$$compiler" -std=c11 -O2 -fPIC -shared -fno-builtin-malloc -fno-builtin-free -fno-builtin-calloc -fno-builtin-realloc \
+	    -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
+	    -fno-stack-protector -mno-outline-atomics -Wall -Wextra -Isrc \
+	    -nostdlib -Wl,-soname,liblunaria_guest.so -Wl,--no-undefined \
+	    -Wl,--unresolved-symbols=ignore-in-object-files \
+	    src/lib/guest.c -o $@
+	@echo "guestlib: $@ ready"
+
 syslib-clean:
 	rm -rf $(SYSLIB_DIR)
 
@@ -274,27 +299,24 @@ arm64-v8a:
 	$(MAKE) all \
 	    CPPFLAGS="$(CPPFLAGS) -UANDROID_X86_LINKER -DANDROID_AARCH64_LINKER"
 
-trace.o: src/trace.c src/trace.h
-	$(CC) $(CFLAGS) -fvisibility=hidden -fPIC $(CPPFLAGS) -D_GNU_SOURCE -c src/trace.c -o $@
-
 runtime/libpthread.so: $(PTHREAD_SRC)
 	mkdir -p runtime
 	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE $(LDFLAGS) \
 	    $(HOST_SO_LDFLAGS) -shared $(PTHREAD_SRC) -lpthread $(HOST_RT_LIBS) -o $@
 
-runtime/libdl.so: trace.o src/linker/dlfcn.c src/linker/linker.c src/linker/linker_environ.c src/linker/rt.c src/linker/strlcpy.c
+runtime/libdl.so: src/trace.h src/linker/dlfcn.c src/linker/linker.c src/linker/linker_environ.c src/linker/rt.c src/linker/strlcpy.c
 	mkdir -p runtime
 	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE -DLINKER_DEBUG=1 -DRUNTIMEPATH='"$(PREFIX)$(LIBDIR)$(RUNTIMEDIR)"' \
 	    -Wno-pedantic -Wno-variadic-macros -Wno-pointer-to-int-cast -Wno-int-to-pointer-cast -Wno-incompatible-pointer-types \
-	    $(LDFLAGS) $(HOST_SO_LDFLAGS) -shared trace.o \
+	    $(LDFLAGS) $(HOST_SO_LDFLAGS) -shared \
 	    src/linker/dlfcn.c src/linker/linker.c src/linker/linker_environ.c src/linker/rt.c src/linker/strlcpy.c \
 	    $(HOST_SYSTEM_DL_LIBS) -lpthread -o $@
 
-runtime/libc.so: trace.o src/lib/libc.c src/lib/libc-ctype.h src/lib/libc-sysconf.h src/lib/libc-verbose.h
+runtime/libc.so: src/trace.h src/lib/libc.c src/lib/libc-ctype.h src/lib/libc-sysconf.h src/lib/libc-verbose.h
 	mkdir -p runtime
 	$(CC) $(CFLAGS) -fPIC -Wno-deprecated-declarations $(CPPFLAGS) -D_GNU_SOURCE \
 	    $(HOST_LIBC_LDFLAGS) $(LDFLAGS) $(HOST_SO_LDFLAGS) -shared \
-	    trace.o src/lib/libc.c \
+	    src/lib/libc.c \
 	    $(HOST_LIBC_LIBS) -o $@
 
 # Small Android API stubs: one driver (src/lib/stub.c), one -DLUNARIA_STUB_* per .so
@@ -312,9 +334,9 @@ runtime/libEGL.so:
 	mkdir -p runtime
 	$(STUB_SO) -DLUNARIA_STUB_EGL -D_GNU_SOURCE -o $@ $(HOST_GL_LIBS) $(HOST_WINDOW_LIBS)
 
-runtime/libOpenSLES.so: trace.o
+runtime/libOpenSLES.so: src/trace.h
 	mkdir -p runtime
-	$(CC) $(CFLAGS) -Wno-pedantic -fPIC $(CPPFLAGS) $(LDFLAGS) $(HOST_SO_LDFLAGS) -Isrc/lib -shared trace.o \
+	$(CC) $(CFLAGS) -Wno-pedantic -fPIC $(CPPFLAGS) $(LDFLAGS) $(HOST_SO_LDFLAGS) -Isrc/lib -shared \
 	    src/lib/stub.c -DLUNARIA_STUB_OPENSLES -o $@
 
 DVM_SRC = src/dvm/dex.c src/dvm/dvm.c src/dvm/dvm_runtime.c src/dvm/dvm_jni.c \
@@ -329,10 +351,10 @@ DVM_HDR = src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
 # layer inside the VM publishes the document, and the swap path in arm_exec
 # presents it.  Both sides then resolve to the same single instance of the
 # engine — two copies would each hold half of the state.
-runtime/libjvm.so: trace.o src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c src/jvm/jvm.h src/jvm/jni.h $(DVM_SRC) $(DVM_HDR) luna_overlay.o luna_boot.o luna_ime.o
+runtime/libjvm.so: src/trace.h src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c src/jvm/jvm.h src/jvm/jni.h $(DVM_SRC) $(DVM_HDR) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o
 	mkdir -p runtime
 	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE -Wno-pedantic $(LDFLAGS) $(HOST_SO_LDFLAGS) -shared \
-	    trace.o src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c $(DVM_SRC) luna_overlay.o luna_boot.o luna_ime.o \
+	    src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c $(DVM_SRC) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o \
 	    -lm $(HOST_CRYPTO_LIBS) $(HOST_ICU_LIBS) \
 	    $(HOST_GL_LIBS) $(HOST_Z_LIBS) -o $@
 
@@ -363,7 +385,8 @@ libpthread.so: runtime/libpthread.so
 	ln -sfn runtime/libpthread.so $@
 
 # arm_exec.o: compiled with C++20 and dynarmic headers; linked into lunaria
-arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/arm.h src/jvm/jvm.h src/binary128.h src/linker64.h $(DYNARMIC_LIB)
+$(BUILD_DIR)/arm_exec.o: | $(BUILD_DIR)
+$(BUILD_DIR)/arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/arm.h src/lib/guest.c src/jvm/jvm.h src/binary128.h src/linker64.h src/trace.h $(DYNARMIC_LIB)
 	$(CXX) -std=c++20 -O2 -g -fPIC \
 	    $(SANITIZE) \
 	    $(DYNARMIC_INCS) \
@@ -373,16 +396,19 @@ arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/arm.h src/jvm/jvm.h src/binary12
 # Plain C11, and its own translation unit: the binary128 parser touches
 # nothing else in the emulator.  Not macOS-only despite the reason it exists —
 # AArch64 long double is binary128 on every host (see the file's header).
-binary128.o: src/binary128.c src/binary128.h
+$(BUILD_DIR)/binary128.o: | $(BUILD_DIR)
+$(BUILD_DIR)/binary128.o: src/binary128.c src/binary128.h
 	$(CC) -std=c11 -O2 -g -fPIC $(CPPFLAGS) -c src/binary128.c -o $@
 
-linker64.o: src/linker64.c src/linker64.h
+$(BUILD_DIR)/linker64.o: | $(BUILD_DIR)
+$(BUILD_DIR)/linker64.o: src/linker64.c src/linker64.h
 	$(CC) -std=c11 -O2 -g -fPIC $(CPPFLAGS) -D_GNU_SOURCE -c src/linker64.c -o $@
 
 # arm.o: code common to the ARM32 and ARM64 execution paths, C11.  Currently
 # the ARM execution lock; anything else neither path owns alone belongs here
 # rather than in a file of its own.
-arm.o: src/arm.c src/arm.h
+$(BUILD_DIR)/arm.o: | $(BUILD_DIR)
+$(BUILD_DIR)/arm.o: src/arm.c src/arm.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -c src/arm.c -o $@
 
 # stb_vorbis.c: Sean Barrett's single-file Ogg Vorbis decoder (public domain /
@@ -390,20 +416,23 @@ arm.o: src/arm.c src/arm.h
 # Host decode for FVorbisAudioInfo::ReadCompressedData/StreamCompressedData —
 # see the SVC_STB_VORBIS_* block in arm_exec.cpp for why.  Its own warnings
 # are not this build's to fix (upstream, unmodified).
-stb_vorbis.o: src/lib/stb_vorbis.c
+$(BUILD_DIR)/stb_vorbis.o: | $(BUILD_DIR)
+$(BUILD_DIR)/stb_vorbis.o: src/lib/stb_vorbis.c
 	$(CC) -std=c11 -O2 -g -fPIC $(CPPFLAGS) -D_GNU_SOURCE \
 	    -Wno-unused-function -Wno-unused-variable -Wno-sign-compare \
 	    -c src/lib/stb_vorbis.c -o $@
 
 # loader.o: compiled as C11 (arm_exec.h is C-compatible)
-loader.o: src/loader.c src/arm_exec.h src/arm.h
+$(BUILD_DIR)/loader.o: | $(BUILD_DIR)
+$(BUILD_DIR)/loader.o: src/loader.c src/arm_exec.h src/arm.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -c src/loader.c -o $@
 
 # luna_overlay.o: the emulator's own UI surface, backed by luna-ui.  Built with
 # the project's own warning set relaxed — luna-ui.h is a 680 KB single-header
 # library from another tree, and its diagnostics are not this build's to fix.
 LUNA_UI_DIR ?= ../luna-ui
-luna_overlay.o: src/luna_overlay.c src/luna_overlay.h src/luna_ime.h $(LUNA_UI_DIR)/luna-ui.h
+$(BUILD_DIR)/luna_overlay.o: | $(BUILD_DIR)
+$(BUILD_DIR)/luna_overlay.o: src/luna_overlay.c src/luna_overlay.h src/luna_ime.h $(LUNA_UI_DIR)/luna-ui.h
 	$(CC) -std=c11 -O2 -g -fPIC $(CPPFLAGS) -I$(LUNA_UI_DIR) -D_GNU_SOURCE \
 	    -Wno-unused-function -Wno-unused-variable -Wno-sign-compare \
 	    -c src/luna_overlay.c -o $@
@@ -411,22 +440,25 @@ luna_overlay.o: src/luna_overlay.c src/luna_overlay.h src/luna_ime.h $(LUNA_UI_D
 # The boot card.  It calls luna-ui but does not define its implementation —
 # luna_overlay.o is the one translation unit that does, and both land in
 # libjvm.so, so the engine is linked once.
-luna_ime.o: src/luna_ime.c src/luna_ime.h src/luna_overlay.h $(LUNA_UI_DIR)/luna-ui.h
+$(BUILD_DIR)/luna_ime.o: | $(BUILD_DIR)
+$(BUILD_DIR)/luna_ime.o: src/luna_ime.c src/luna_ime.h src/luna_overlay.h $(LUNA_UI_DIR)/luna-ui.h
 	$(CC) -std=c11 -O2 -g -fPIC $(CPPFLAGS) -I$(LUNA_UI_DIR) -D_GNU_SOURCE \
 	    -Wno-unused-function -Wno-unused-variable -Wno-sign-compare \
 	    -c src/luna_ime.c -o $@
 
-luna_boot.o: src/luna_boot.c src/luna_boot.h src/luna_overlay.h $(LUNA_UI_DIR)/luna-ui.h
+$(BUILD_DIR)/luna_boot.o: | $(BUILD_DIR)
+$(BUILD_DIR)/luna_boot.o: src/luna_boot.c src/luna_boot.h src/luna_overlay.h $(LUNA_UI_DIR)/luna-ui.h
 	$(CC) -std=c11 -O2 -g -fPIC $(CPPFLAGS) -I$(LUNA_UI_DIR) -D_GNU_SOURCE \
 	    -Wno-unused-function -Wno-unused-variable -Wno-sign-compare \
 	    -c src/luna_boot.c -o $@
 
 # lunaria: link with g++ so arm_exec.o (C++) and dynarmic (C++) are handled correctly
-lunaria_os.o: $(LUNA_OS_SRC) src/lunaria_os.h
+$(BUILD_DIR)/lunaria_os.o: | $(BUILD_DIR)
+$(BUILD_DIR)/lunaria_os.o: $(LUNA_OS_SRC) src/lunaria_os.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 	    -c $(LUNA_OS_SRC) -o $@
 
-lunaria: loader.o arm_exec.o binary128.o linker64.o arm.o trace.o stb_vorbis.o $(LUNA_OS_OBJ) libdl.so libpthread.so \
+lunaria: $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(LUNA_OS_OBJ) libdl.so libpthread.so \
        runtime/libpthread.so $(HOST_BIONIC_LIBC) \
        runtime/libandroid.so runtime/liblog.so \
        runtime/libEGL.so runtime/libOpenSLES.so \
@@ -436,7 +468,7 @@ lunaria: runtime/libvulkan.so
 	$(CXX) -std=c++20 -O2 -g $(HOST_EXPORT) \
 	    $(SANITIZE) \
 	    $(LUNARIA_LIBDIRS) $(HOST_RPATH) $(LDFLAGS) \
-	    loader.o arm_exec.o binary128.o linker64.o arm.o trace.o stb_vorbis.o $(LUNA_OS_OBJ) \
+	    $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(LUNA_OS_OBJ) \
 	    $(DYNARMIC_LIBS) \
 	    $(HOST_DL_LIBS) -lpthread -ljvm \
 	    $(HOST_WINDOW_LIBS) $(HOST_GL_LIBS) $(HOST_Z_LIBS) $(HOST_CRYPTO_LIBS) \
@@ -450,9 +482,12 @@ install-lib: $(libs)
 
 install: install-bin install-lib
 
+$(BUILD_DIR):
+	mkdir -p $@
+
 clean:
-	$(RM) $(bins) trace.o arm_exec.o binary128.o arm.o loader.o lunaria_os.o luna_overlay.o luna_boot.o \
-	    stb_vorbis.o libdl.so libpthread.so
+	$(RM) $(bins) $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/lunaria_os.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o \
+	    $(BUILD_DIR)/stb_vorbis.o libdl.so libpthread.so
 	$(RM) -r runtime
 	$(RM) test/test_dynarmic_arm test/test_unity test/test_dvm test/dvm_test.dex test/test_regex
 	$(RM) test/test_boot_card
@@ -474,10 +509,10 @@ test/dvm_test.dex: test/make_dex.py
 # Sanitizers are on by default but need libasan at link time; pass
 # DVM_TEST_SAN= to build without them where that runtime is not installed.
 DVM_TEST_SAN ?= -fsanitize=address,undefined
-test/test_dvm: test/dvm_test.c $(DVM_SRC) $(DVM_HDR) luna_overlay.o luna_boot.o
+test/test_dvm: test/dvm_test.c $(DVM_SRC) $(DVM_HDR) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o
 	$(CC) -std=c11 -g -O1 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -Isrc \
 	    $(DVM_TEST_SAN) \
-	    test/dvm_test.c $(DVM_SRC:src/dvm/dvm_jni.c=) luna_overlay.o luna_boot.o \
+	    test/dvm_test.c $(DVM_SRC:src/dvm/dvm_jni.c=) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o \
 	    -lm $(HOST_CRYPTO_LIBS) $(HOST_Z_LIBS) $(HOST_SYSTEM_DL_LIBS) $(HOST_GL_LIBS) -o $@
 
 # Pass a real classes.dex as DVM_DEX to also run every method in it.
@@ -486,10 +521,10 @@ DVM_DEX ?=
 # through a real title's boot.
 # luna_ime.o comes along because the overlay presents through it: the input
 # method is part of the surface now, not a separate layer.
-test/test_boot_card: test/boot_card_test.c luna_overlay.o luna_boot.o luna_ime.o \
+test/test_boot_card: test/boot_card_test.c $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o \
                      src/luna_overlay.h src/luna_boot.h src/luna_ime.h
 	$(CC) -std=c11 -O2 -g $(CPPFLAGS) -D_GNU_SOURCE $(HOST_TEST_RPATH) \
-	    test/boot_card_test.c luna_overlay.o luna_boot.o luna_ime.o \
+	    test/boot_card_test.c $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o \
 	    $(HOST_GL_LIBS) -lm -o $@
 
 boot-card-test: test/test_boot_card
@@ -518,6 +553,26 @@ test/libnettest.so: test/net_test.c
 
 # The loader exits non-zero after JNI_OnLoad because a bare .so has no game
 # entry point, so the verdict comes from the test's own RESULT line.
+# The CPU-window pixel conversions are ordinary C with no guest side, so they
+# are checked on the host, under ASan/UBSan: a format's stride and the widened
+# bytes are exactly what ANativeWindow_lock promised the guest.
+pixels-test: test/android_pixels_test.c src/trace.h | $(BUILD_DIR)
+	@set -e; \
+	out=$(BUILD_DIR)/android_pixels_test; \
+	flags="-std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O1 -g"; \
+	if $(CC) $$flags -fsanitize=address,undefined test/android_pixels_test.c \
+	       -o $$out 2>/dev/null; then \
+	    echo "pixels-test: built with ASan/UBSan"; \
+	elif command -v clang >/dev/null && \
+	     clang $$flags -fsanitize=address,undefined test/android_pixels_test.c \
+	       -o $$out 2>/dev/null; then \
+	    echo "pixels-test: built with ASan/UBSan (clang)"; \
+	else \
+	    echo "pixels-test: no sanitizer runtime, building without"; \
+	    $(CC) $$flags test/android_pixels_test.c -o $$out; \
+	fi; \
+	$$out; echo "pixels-test: PASS"
+
 net-test: lunaria test/libnettest.so
 	@python3 test/net_test_server.py & echo $$! > .nettest.pid; \
 	sleep 1; \
@@ -539,6 +594,47 @@ posix-test: lunaria test/libposixtest.so
 	@LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" ./lunaria test/libposixtest.so 2>&1 \
 	    | tee .posixtest.out | grep -E 'posixtest|unresolved'; \
 	grep -q 'RESULT PASS' .posixtest.out; rc=$$?; rm -f .posixtest.out; exit $$rc
+
+# What the JIT sustains on this host, by instruction shape — the number the
+# "is the emulator slow or is the guest busy?" question needs.  See
+# test/jit_speed_test.c.
+test/libjitspeed.so: test/jit_speed_test.c
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
+	    -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libjitspeed.so -o $@ $<
+
+jit-speed: lunaria test/libjitspeed.so
+	@LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" ./lunaria test/libjitspeed.so 2>&1 \
+	    | tee .jitspeed.out | grep -E 'jitspeed'; \
+	grep -q 'RESULT PASS' .jitspeed.out; rc=$$?; rm -f .jitspeed.out; exit $$rc
+
+# Guest-side dynamic-linker exercise: dlopen handles and their scopes, the
+# per-thread dlerror, and what an unresolved symbol does.  Three fixtures out
+# of one source: one that resolves, one with a strong undefined symbol (which
+# must fail to load, as bionic's linker does) and one with a weak undefined
+# symbol (which must load and read as NULL).  See test/dlopen_test.c.
+test/libdlfixture.so: test/dlopen_fixture.c
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
+	    -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libdlfixture.so -o $@ $<
+
+test/libdlmissing.so: test/dlopen_fixture.c
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
+	    -DREQUIRE_MISSING \
+	    -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libdlmissing.so -o $@ $<
+
+test/libdlweak.so: test/dlopen_fixture.c
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
+	    -DREQUIRE_WEAK \
+	    -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libdlweak.so -o $@ $<
+
+test/libdltest.so: test/dlopen_test.c
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
+	    -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libdltest.so -o $@ $<
+
+dl-test: lunaria test/libdltest.so test/libdlfixture.so test/libdlmissing.so \
+         test/libdlweak.so
+	@LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" ./lunaria test/libdltest.so 2>&1 \
+	    | tee .dltest.out | grep -E 'dltest|cannot locate'; \
+	grep -q 'RESULT PASS' .dltest.out; rc=$$?; rm -f .dltest.out; exit $$rc
 
 # Guest-side JNI calling-convention exercise.  The dex declares `native`
 # methods taking jlong / jfloat / jdouble — and more of them than either ABI
@@ -566,6 +662,34 @@ test/libabitest32.so: test/abi_test.c test/abi_test_values.h
 test/libschedtest64.so: test/sched_test.c
 	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) \
 	    -Wl,-soname,libschedtest64.so -o $@ $<
+
+test/libgiltest.so: test/gil_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
+	    -Wl,-soname,libgiltest.so -o $@ $<
+
+test/liblocktest.so: test/lock_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
+	    -Wl,-soname,liblocktest.so -o $@ $<
+
+test/libfutextest.so: test/futex_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
+	    -Wl,-soname,libfutextest.so -o $@ $<
+
+test/libsleeptest.so: test/sleep_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
+	    -Wl,-soname,libsleeptest.so -o $@ $<
+
+test/libguestmem.so: test/guestmem_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
+	    -Wl,-soname,libguestmem.so -o $@ $<
+
+test/libheaptest.so: test/heap_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
+	    -Wl,-soname,libheaptest.so -o $@ $<
+
+test/libmutexstress.so: test/mutex_stress_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
+	    -Wl,-soname,libmutexstress.so -o $@ $<
 
 test/libfdcallback.so: test/fd_callback_test.c
 	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
@@ -596,6 +720,116 @@ thread-start-test: lunaria test/libthreadstart.so
 	    ./lunaria test/libthreadstart.so > .threadstart.out 2>&1; \
 	grep 'threadstart' .threadstart.out; \
 	grep -q 'RESULT PASS' .threadstart.out && ! grep -q 'RESULT FAIL' .threadstart.out
+
+# Contended locks, many threads.  sched-test covers one waiter and one holder;
+# this covers the shape that actually stalls titles, and it runs at one engine
+# and at four because the hand-off that goes missing is a concurrency bug.
+# See test/mutex_stress_test.c for what each round proves.
+# The guest allocator: alignment, no overlap, nothing written past a block,
+# calloc zeroed, realloc preserving.  Cross Worlds dies with MallocBinned2's
+# own canary check, which is the same failure one layer up, so this is the
+# layer to be sure of first.  See test/heap_test.c for what each round proves.
+# Every write the emulator performs into guest memory on the guest's behalf:
+# does it stay inside the length it was given, and is the result right?  A
+# host implementation that runs one byte past its destination corrupts the
+# guest heap with nothing to attribute it to -- which is the shape of the
+# MallocBinned2 canary failure Cross Worlds dies with.  See
+# test/guestmem_test.c for the contract each case checks.
+# "Does a wait let anyone else run?"  mutex-test covers hand-over; this covers
+# the failure that actually stopped Cross Worlds -- a wait held the ARM
+# execution lock, so the only thread that could end the wait could never be
+# scheduled.  Every round is "A can only release this by running, B waits for
+# it".  See test/lock_test.c.
+# The DVM interpreter lock from the guest side: nearly every JNI entry point
+# takes it, so it is a process-wide chokepoint for anything that talks to Java
+# -- and it has been the visible cause of a stall (Cross Worlds' background
+# download: "interpreter lock: held 30%, 7653.0 ms summed wait, worst single
+# wait 570.9 ms" while the execution lock sat at 1%).  See test/gil_test.c.
+gil-test: lunaria test/libgiltest.so
+	@rc=0; for n in 1 4; do \
+	    printf '=== %s engine(s)\n' "$$n"; \
+	    timeout -k 2s 180s env LUNARIA_A64_ENGINES=$$n \
+	        LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" \
+	        ./lunaria test/libgiltest.so > .giltest.out 2>&1; \
+	    grep -E 'giltest|\[gil\]' .giltest.out || \
+	        printf 'no verdict: the guest never reached the report\n'; \
+	    grep -q 'RESULT PASS' .giltest.out || rc=1; \
+	    rm -f .giltest.out; \
+	done; exit $$rc
+
+lock-test: lunaria test/liblocktest.so
+	@rc=0; for n in 1 4; do \
+	    printf '=== %s engine(s)\n' "$$n"; \
+	    timeout -k 2s 180s env LUNARIA_A64_ENGINES=$$n \
+	        LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" \
+	        ./lunaria test/liblocktest.so > .locktest.out 2>&1; \
+	    grep 'locktest' .locktest.out || \
+	        printf 'no verdict: the guest never reached the report\n'; \
+	    grep -q 'RESULT PASS' .locktest.out || rc=1; \
+	    rm -f .locktest.out; \
+	done; exit $$rc
+
+# futex(2) itself: bionic builds every mutex, condvar, join and semaphore on
+# it, so a wrong answer here is a deadlock or a busy loop somewhere else.
+futex-test: lunaria test/libfutextest.so
+	@rc=0; for n in 1 4; do \
+	    printf '=== %s engine(s)\n' "$$n"; \
+	    timeout -k 2s 180s env LUNARIA_A64_ENGINES=$$n \
+	        LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" \
+	        ./lunaria test/libfutextest.so > .futextest.out 2>&1; \
+	    grep 'futextest' .futextest.out || \
+	        printf 'no verdict: the guest never reached the report\n'; \
+	    grep -q 'RESULT PASS' .futextest.out || rc=1; \
+	    rm -f .futextest.out; \
+	done; exit $$rc
+
+# Sleeping: the one wait whose right answer is known in advance.  Run with a
+# short callback watchdog on purpose — round 5 sleeps for longer than it, and a
+# watchdog meant for locks that can never be granted must not touch a sleep.
+sleep-test: lunaria test/libsleeptest.so
+	@rc=0; for n in 1 4; do \
+	    printf '=== %s engine(s)\n' "$$n"; \
+	    timeout -k 2s 120s env LUNARIA_A64_ENGINES=$$n LUNARIA_CB_SECONDS=2 \
+	        LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" \
+	        ./lunaria test/libsleeptest.so > .sleeptest.out 2>&1; \
+	    grep -E 'sleeptest|cb64' .sleeptest.out || \
+	        printf 'no verdict: the guest never reached the report\n'; \
+	    grep -q 'RESULT PASS' .sleeptest.out || rc=1; \
+	    rm -f .sleeptest.out; \
+	done; exit $$rc
+
+guestmem-test: lunaria test/libguestmem.so
+	@timeout -k 2s 120s env LUNARIA_A64_ENGINES=4 \
+	    LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" \
+	    ./lunaria test/libguestmem.so > .guestmem.out 2>&1; \
+	grep 'guestmem' .guestmem.out || \
+	    printf 'no verdict: the guest never reached the report\n'; \
+	rc=0; grep -q 'RESULT PASS' .guestmem.out || rc=1; \
+	rm -f .guestmem.out; exit $$rc
+
+heap-test: lunaria test/libheaptest.so
+	@rc=0; for n in 1 4; do \
+	    printf '=== %s engine(s)\n' "$$n"; \
+	    timeout -k 2s 120s env LUNARIA_A64_ENGINES=$$n \
+	        LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" \
+	        ./lunaria test/libheaptest.so > .heaptest.out 2>&1; \
+	    grep 'heaptest' .heaptest.out || \
+	        printf 'no verdict: the guest never reached the report\n'; \
+	    grep -q 'RESULT PASS' .heaptest.out || rc=1; \
+	    rm -f .heaptest.out; \
+	done; exit $$rc
+
+mutex-test: lunaria test/libmutexstress.so
+	@rc=0; for n in 1 4; do \
+	    printf '=== %s engine(s)\n' "$$n"; \
+	    timeout -k 2s 90s env LUNARIA_A64_ENGINES=$$n \
+	        LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" \
+	        ./lunaria test/libmutexstress.so > .mutexstress.out 2>&1; \
+	    grep 'mutexstress' .mutexstress.out || \
+	        printf 'no verdict: the guest never reached the report\n'; \
+	    grep -q 'RESULT PASS' .mutexstress.out || rc=1; \
+	    rm -f .mutexstress.out; \
+	done; exit $$rc
 
 fd-callback-test: lunaria test/libfdcallback.so
 	@timeout -k 2s 12s env LUNARIA_A64_ENGINES=1 \
@@ -656,10 +890,13 @@ DYNARMIC_ZYC_LIB = $(DYNARMIC_BUILD)/externals/zydis/zycore/libZycore.a
 # invoke CMake.  Depending only on an already-existing archive made edits to
 # Dynarmic source silently leave Lunaria linked against yesterday's code.
 # Keep generated build/ files out of this list; only inputs may trigger it.
+# *.inc counts: dynarmic's memory emitters live in emit_x64_memory.cpp.inc, so
+# leaving that extension out is exactly the silent staleness above.
 DYNARMIC_SOURCES := $(shell find $(DYNARMIC_DIR)/src \
 	$(DYNARMIC_DIR)/externals/mcl/include \
 	$(DYNARMIC_DIR)/externals/mcl/src \
-	-type f \( -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \) 2>/dev/null)
+	-type f \( -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \
+	            -o -name '*.inc' \) 2>/dev/null)
 
 DYNARMIC_INCS = \
 	-I$(DYNARMIC_DIR)/src \
@@ -712,8 +949,8 @@ test/test_binary128: test/binary128_test.cpp src/binary128.c src/binary128.h
 binary128-test: test/test_binary128
 	./test/test_binary128
 
-test/test_os_event: test/os_event_test.c lunaria_os.o src/lunaria_os.h
-	$(CC) -std=c11 -O2 $(CPPFLAGS) -Isrc test/os_event_test.c lunaria_os.o \
+test/test_os_event: test/os_event_test.c $(BUILD_DIR)/lunaria_os.o src/lunaria_os.h
+	$(CC) -std=c11 -O2 $(CPPFLAGS) -Isrc test/os_event_test.c $(BUILD_DIR)/lunaria_os.o \
 	    -Wl,-undefined,dynamic_lookup -lpthread -o $@
 
 os-event-test: test/test_os_event
@@ -788,9 +1025,10 @@ $(OPENH264_SO):
 # Aggregate: download all sample APKs used for development / regression.
 fetch: fetch-libunity fetch-btw fetch-blade-soul fetch-openh264
 
-.PHONY: all syslib syslib-clean host-all macos-deps x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
+.PHONY: all pixels-test dl-test jit-speed syslib guestlib syslib-clean host-all macos-deps x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
 	        clean install install-bin install-lib test net-test dvm-test regex-test abi-test \
 	        posix-test boot-card-test binary128-test fd-callback-test \
-	        thread-start-test \
+	        thread-start-test mutex-test heap-test guestmem-test lock-test \
+        gil-test \
         fetch fetch-libunity fetch-btw fetch-blade-soul fetch-openh264 \
         dynarmic-build

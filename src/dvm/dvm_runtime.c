@@ -24080,18 +24080,11 @@ static bool sfxt_setListener(struct dvm *vm, dvm_ref self,
    RETV();
 }
 
-/* Defined with the MediaPlayer, below: decodes up to the wall clock and pushes
- * the frame that is due into this SurfaceTexture's sink. */
-static void dvm_media_player_pump(struct dvm *vm, dvm_ref player);
-
 static bool sfxt_updateTexImage(struct dvm *vm, dvm_ref self,
                               const union dvm_value *args, int nargs,
                               union dvm_value *out)
 {
    (void)args; (void)nargs;
-   union dvm_value mp = { 0 };
-   if (dvm_get_field(vm, self, "player", "Ljava/lang/Object;", &mp) && mp.l)
-      dvm_media_player_pump(vm, mp.l);
    struct lm_sink *s = sfxt_sink(vm, self);
    const uint8_t *rgba = NULL;
    int w = 0, h = 0;
@@ -24153,8 +24146,9 @@ static bool sfxt_release(struct dvm *vm, dvm_ref self,
 static const struct rt_field rt_surfacetexture_fields[] = {
    { "sink", "J" }, { "texName", "I" }, { "listener", "Ljava/lang/Object;" },
    /* The MediaPlayer feeding this texture, set by MediaPlayer.setSurface().
-    * updateTexImage() is the only regular tick the player gets: playback is
-    * pulled by the consumer, so the producer has to run from here. */
+    * Playback is advanced asynchronously by dvm_media_pump_active(), like
+    * Android's codec thread.  updateTexImage only acquires the newest queued
+    * image; decoding synchronously here serialises it with the render thread. */
    { "player", "Ljava/lang/Object;" },
    F_END,
 };
@@ -31877,6 +31871,14 @@ static bool window_get_attributes(struct dvm *vm, dvm_ref self,
       struct dvm_class *c =
          dvm__class_by_desc(vm, "Landroid/view/WindowManager$LayoutParams;");
       v.l = c ? dvm_new_object(vm, c) : 0;
+      if (v.l) {
+         /* PhoneWindow owns a constructed LayoutParams before callers first
+          * ask for it.  dvm_new_object() only allocates, so publish the same
+          * constructor defaults here as well. */
+         union dvm_value match = { .i = -1 };
+         (void)dvm_set_field(vm, v.l, "width", "I", match);
+         (void)dvm_set_field(vm, v.l, "height", "I", match);
+      }
       (void)dvm_set_field(vm, self, "attributes",
                           "Landroid/view/WindowManager$LayoutParams;", v);
    }
@@ -32009,6 +32011,43 @@ static const struct rt_field rt_window_layout_params_fields[] = {
    { "softInputMode", "I" },
    { "flags", "I" },
    F_END,
+};
+
+/* WindowManager.LayoutParams() is not a zero-filled Java object on Android:
+ * its no-argument constructor calls LayoutParams(MATCH_PARENT, MATCH_PARENT).
+ * Leaving the inherited width/height at zero made the compositor guess at
+ * the window size later, which cannot distinguish an uninitialised window
+ * from an application that actually wrote 0.  Establish the platform state
+ * when the object is constructed instead. */
+static bool window_layout_params_init(struct dvm *vm, dvm_ref self,
+                                      const union dvm_value *args, int nargs,
+                                      union dvm_value *out)
+{
+   (void)out;
+   if (nargs == 1 && args[0].l) {
+      static const struct { const char *name; const char *sig; } fields[] = {
+         { "width", "I" }, { "height", "I" }, { "gravity", "I" },
+         { "x", "I" }, { "y", "I" }, { "flags", "I" },
+         { "softInputMode", "I" }, { "layoutInDisplayCutoutMode", "I" },
+      };
+      for (size_t i = 0; i < sizeof fields / sizeof fields[0]; ++i) {
+         union dvm_value v = { 0 };
+         (void)dvm_get_field(vm, args[0].l, fields[i].name, fields[i].sig, &v);
+         (void)dvm_set_field(vm, self, fields[i].name, fields[i].sig, v);
+      }
+   } else {
+      union dvm_value match = { .i = -1 };
+      (void)dvm_set_field(vm, self, "width", "I", match);
+      (void)dvm_set_field(vm, self, "height", "I", match);
+   }
+   RETV();
+}
+
+static const struct rt_method rt_window_layout_params[] = {
+   M("<init>", "()V", window_layout_params_init),
+   M("<init>", "(Landroid/view/WindowManager$LayoutParams;)V",
+     window_layout_params_init),
+   M_END,
 };
 
 static bool window_set_background(struct dvm *vm, dvm_ref self,
@@ -39052,6 +39091,23 @@ static void ui_rebuild(struct dvm *vm)
       luna_overlay_set_document(NULL, NULL);
       return;
    }
+   /* A window this layer has no content view for is not a window it can show:
+    * nothing is drawn for it and nothing in it can be pressed.  Publishing a
+    * document for it anyway is worse than publishing none, because a guest
+    * document makes the overlay *modal* — luna_overlay_pointer() then takes
+    * every touch and the application below never sees one again.  That is how
+    * Cross Worlds' account-link dialog stopped the title being got past:
+    * the dialog on screen was the game's own, drawn by the game, and every
+    * press on it was being eaten by an Android window the emulator could not
+    * materialise ("[overlay] took pointer ... a guest dialog is up and is
+    * modal"). */
+   int drawable = 0;
+   for (int i = 0; i < g_ui_nwindows; ++i)
+      if (ui_window_content(vm, g_ui_windows[i])) ++drawable;
+   if (!drawable) {
+      luna_overlay_set_document(NULL, NULL);
+      return;
+   }
    struct ui_buf b = { 0 }, css = { 0 };
    g_ui_building = true;
    ui_puts(&css, ui_stylesheet());
@@ -39061,9 +39117,21 @@ static void ui_rebuild(struct dvm *vm)
     * a device, and painting one anyway also takes every touch meant for the
     * app underneath — which is how a banner that says "press X to play" ended
     * up making the game unplayable. */
+   /* And it belongs to a window that is actually *there*.  A Dialog whose
+    * content view this layer never got (it was built from something the
+    * inflater does not produce a view tree for) has nothing to draw and
+    * nothing to press, so the loop below emits no window for it — but it
+    * still answered "I dim", and the scrim alone is a full-screen element
+    * with no way past it: every touch lands on the dim, `ui_click_from_
+    * overlay` answers "not cancelable", and the game underneath — which is
+    * drawing its own dialog with its own renderer — never sees a press again.
+    * That is Cross Worlds' account-link screen: the × is the game's, the
+    * scrim was ours, and the title could not be got past. */
    bool dim = false;
    for (int i = 0; i < g_ui_nwindows; ++i)
-      if (ui_window_dims(vm, g_ui_windows[i])) dim = true;
+      if (ui_window_dims(vm, g_ui_windows[i]) &&
+          ui_window_content(vm, g_ui_windows[i]))
+         dim = true;
    if (dim) ui_puts(&b, "<div id=\"scrim\" class=\"scrim\"></div>");
    for (int i = 0; i < g_ui_nwindows; ++i) {
       dvm_ref content = ui_window_content(vm, g_ui_windows[i]);
@@ -39840,36 +39908,18 @@ static bool adb_create(struct dvm *vm, dvm_ref self,
    RETL(dialog);
 }
 
-/* Builder.show() is create() *and* show() on Android, and here it is create()
- * alone — the one deliberate deviation in this file.
- *
- * Making it show is a one-line change and it is *not* being made yet, because
- * showing is not the whole of it: the emulator's dialog is a full-screen
- * modal with a dim scrim over the guest's frame, and every pointer event goes
- * to it until one of its buttons is pressed.  Cross Worlds' security module
- * raises one ("Need Security License") behind the title screen, so honouring
- * show() here darkens the title and takes the player's input with it, with
- * nothing on the emulator side that dismisses it.
- *
- * The missing piece is the emulator's own handling of an unanswerable modal,
- * not this call.  Until that exists, the dialog is built and logged (see
- * dialog_show) but not raised, and this comment is the record of the
- * difference — the alternative was leaving it undocumented in a table entry
- * that reads as if show() worked. */
+static bool dialog_show(struct dvm *vm, dvm_ref self,
+                        const union dvm_value *args, int nargs,
+                        union dvm_value *out);
+
+/* Android's Builder.show() creates the dialog, shows it, and returns it. */
 static bool adb_show(struct dvm *vm, dvm_ref self,
                      const union dvm_value *args, int nargs,
                      union dvm_value *out)
 {
    union dvm_value dialog = { 0 };
    if (!adb_create(vm, self, args, nargs, &dialog)) return false;
-   union dvm_value t = { 0 }, m = { 0 };
-   (void)dvm_get_field(vm, self, "title", "Ljava/lang/CharSequence;", &t);
-   (void)dvm_get_field(vm, self, "message", "Ljava/lang/CharSequence;", &m);
-   const char *ts = t.l ? rt_charseq_utf8(vm, t.l) : NULL;
-   const char *ms = m.l ? rt_charseq_utf8(vm, m.l) : NULL;
-   if (ts || ms)
-      fprintf(stderr, "[dialog] not raised (Builder.show): %s%s%s\n",
-              ts ? ts : "", ts && ms ? " — " : "", ms ? ms : "");
+   if (!dialog.l || !dialog_show(vm, dialog.l, NULL, 0, NULL)) return false;
    RETL(dialog.l);
 }
 
@@ -41920,9 +41970,22 @@ static bool file_output_write(struct dvm *vm, dvm_ref self,
          fprintf(stderr, "[stream] FileOutputStream.write fd=%d len=%zu\n",
                  fd.i, len);
    }
+   /* Keep the interpreter lock only for a write too small to block.
+    *
+    * The bound was a megabyte, on the reasoning that a short write to a
+    * regular file returns immediately and three lock operations would cost
+    * more than they save (UnitySampleGame writes every frame).  That holds
+    * for a few hundred bytes of state; it does not hold for a bulk transfer,
+    * and a bulk transfer is exactly what arrives in chunks well under a
+    * megabyte: Cross Worlds downloads 228 MB through Java, and while it does,
+    * "interpreter lock: held 30% of the last 5.0s, 7653.0 ms summed wait,
+    * worst single wait 570.9 ms" against an execution lock at 1%, with guest
+    * execution down from ~109 Mips to a few hundred instructions per five
+    * seconds.  A write that reaches the page cache, let alone the disk, is not
+    * something to hold a process-wide lock across. */
    int werr = 0;
    bool handoff = true;
-   if (len < (1u << 20)) {
+   if (len < 4096u) {
       struct stat st;
       if (fstat(fd.i, &st) == 0 && S_ISREG(st.st_mode)) handoff = false;
    }
@@ -42040,8 +42103,9 @@ static bool file_input_read(struct dvm *vm, dvm_ref self,
     * end — a pipe, a socket, a tty — still gets the hand-off. */
    ssize_t n;
    {
+      /* Same bound as FileOutputStream.write above, for the same reason. */
       bool handoff = true;
-      if ((size_t)count < (1u << 20)) {
+      if ((size_t)count < 4096u) {
          struct stat st;
          if (fstat(fd.i, &st) == 0 && S_ISREG(st.st_mode)) handoff = false;
       }
@@ -42170,6 +42234,53 @@ static bool raf_range(struct dvm *vm, const union dvm_value *args, int nargs,
    return true;
 }
 
+/* A blocking host read/write, performed without the interpreter lock.
+ *
+ * Nearly every JNI entry point takes that lock, so a Java thread sitting in a
+ * file read holds up everything in the process that talks to Java.  Measured
+ * on Cross Worlds: while the game downloads 228 MB through Java, the slice
+ * report shows "interpreter lock: held 30% of the last 5.0s, 7653.0 ms summed
+ * wait, worst single wait 570.9 ms" against an execution lock at 1%, and guest
+ * execution collapses from ~109 Mips to a few hundred instructions per five
+ * seconds.  A real VM does not hold a global lock across read(2) either.
+ *
+ * The lock cannot simply be dropped around the syscall, because the
+ * destination is a Java array: with the lock released another thread may run
+ * bytecode and the array's backing is no longer this call's to write into.  So
+ * stage through a buffer of the emulator's own — the copy costs nothing beside
+ * a blocking syscall — and touch the Java array only while the lock is held.
+ *
+ * Chunked so that a huge read does not ask for a huge temporary. */
+#define DVM_IO_CHUNK (16u * 1024u)
+
+static ssize_t dvm_io_read_unlocked(struct dvm *vm, int fd, uint8_t *dst,
+                                    size_t count)
+{
+   /* Thread-local, not on the stack: a DVM thread's stack is not sized for a
+    * buffer this large. */
+   static __thread uint8_t stage[DVM_IO_CHUNK];
+   if (count > sizeof stage) count = sizeof stage;
+   unsigned g = dvm_gil_unlock_all(vm);
+   ssize_t n;
+   do n = read(fd, stage, count); while (n < 0 && errno == EINTR);
+   dvm_gil_relock(vm, g);
+   if (n > 0) memcpy(dst, stage, (size_t)n);
+   return n;
+}
+
+static ssize_t dvm_io_write_unlocked(struct dvm *vm, int fd,
+                                     const uint8_t *src, size_t count)
+{
+   static __thread uint8_t stage[DVM_IO_CHUNK];
+   if (count > sizeof stage) count = sizeof stage;
+   memcpy(stage, src, count);
+   unsigned g = dvm_gil_unlock_all(vm);
+   ssize_t n;
+   do n = write(fd, stage, count); while (n < 0 && errno == EINTR);
+   dvm_gil_relock(vm, g);
+   return n;
+}
+
 static bool raf_read(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                      int nargs, union dvm_value *out)
 {
@@ -42184,7 +42295,7 @@ static bool raf_read(struct dvm *vm, dvm_ref self, const union dvm_value *args,
    }
    uint8_t *base; int32_t count;
    if (!raf_range(vm, args, nargs, &base, &count)) return false;
-   do n = read(fd, base, (size_t)count); while (n < 0 && errno == EINTR);
+   n = dvm_io_read_unlocked(vm, fd, base, (size_t)count);
    if (n < 0) { dvm__throw(vm, "java/io/IOException", "%s", strerror(errno)); return false; }
    RETI(n ? (int32_t)n : -1);
 }
@@ -42199,7 +42310,8 @@ static bool raf_readFully(struct dvm *vm, dvm_ref self,
    uint8_t *base; int32_t count;
    if (!raf_range(vm, args, nargs, &base, &count)) return false;
    for (int32_t done = 0; done < count; ) {
-      ssize_t n = read(fd, base + done, (size_t)(count - done));
+      ssize_t n = dvm_io_read_unlocked(vm, fd, base + done,
+                                       (size_t)(count - done));
       if (n < 0 && errno == EINTR) continue;
       if (n < 0) { dvm__throw(vm, "java/io/IOException", "%s", strerror(errno)); return false; }
       if (n == 0) { dvm__throw(vm, "java/io/EOFException", "readFully"); return false; }
@@ -42216,7 +42328,8 @@ static bool raf_write(struct dvm *vm, dvm_ref self, const union dvm_value *args,
    uint8_t *base; int32_t count;
    if (!raf_range(vm, args, nargs, &base, &count)) return false;
    for (int32_t done = 0; done < count; ) {
-      ssize_t n = write(fd, base + done, (size_t)(count - done));
+      ssize_t n = dvm_io_write_unlocked(vm, fd, base + done,
+                                        (size_t)(count - done));
       if (n < 0 && errno == EINTR) continue;
       if (n < 0) { dvm__throw(vm, "java/io/IOException", "%s", strerror(errno)); return false; }
       done += (int32_t)n;
@@ -45392,7 +45505,7 @@ static const struct rt_class rt_classes[] = {
    { "Landroid/view/Window;", "Ljava/lang/Object;", rt_window,
      rt_window_fields, NULL },
    { "Landroid/view/WindowManager$LayoutParams;",
-     "Landroid/view/ViewGroup$LayoutParams;", NULL,
+     "Landroid/view/ViewGroup$LayoutParams;", rt_window_layout_params,
      rt_window_layout_params_fields, NULL },
    { "Landroid/view/View;", "Ljava/lang/Object;", rt_view, rt_view_fields, NULL },
    { "Landroid/view/View$MeasureSpec;", "Ljava/lang/Object;", rt_measure_spec,

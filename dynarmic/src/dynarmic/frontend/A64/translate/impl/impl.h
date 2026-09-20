@@ -109,6 +109,7 @@ struct TranslatorVisitor final {
     bool B_cond(Imm<19> imm19, Cond cond);
 
     // Exception generation
+    bool HOSTHOOK(Imm<16> id);
     bool SVC(Imm<16> imm16);
     bool HVC(Imm<16> imm16);
     bool SMC(Imm<16> imm16);

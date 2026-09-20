@@ -1,3 +1,8 @@
+// Host hook (Lunaria): an unallocated encoding in the reserved space that
+// stands for "the emulator implements this function".  0x0001iiii, so the
+// all-zero word a stray jump into cleared memory would read stays undefined.
+INST(HOSTHOOK,               "HOSTHOOK",                                  "0000000000000001iiiiiiiiiiiiiiii")
+
 // Data processing - Immediate - PC relative addressing
 INST(ADR,                    "ADR",                                       "0ii10000iiiiiiiiiiiiiiiiiiiddddd")
 INST(ADRP,                   "ADRP",                                      "1ii10000iiiiiiiiiiiiiiiiiiiddddd")

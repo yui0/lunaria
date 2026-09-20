@@ -136,6 +136,18 @@ struct UserCallbacks {
 };
 
 struct UserConfig {
+    /// Host implementations reachable from translated code without an SVC.
+    ///
+    /// When the code supplied by MemoryReadCode decodes to the host-hook
+    /// encoding, the translator emits a direct call to this function with the
+    /// hook's 16-bit id and the guest's x0..x2, and writes the result back to
+    /// x0.  It is an ordinary call inside the block: nothing is spilled to
+    /// JitState for it and nothing terminates on its account.
+    ///
+    /// Left null, the encoding stays undefined and raises as it did before.
+    std::uint64_t (*host_hook_fn)(std::uint32_t id, std::uint64_t arg0,
+                                  std::uint64_t arg1, std::uint64_t arg2) = nullptr;
+
     UserCallbacks* callbacks;
 
     size_t processor_id = 0;

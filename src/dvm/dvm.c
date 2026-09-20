@@ -3720,6 +3720,38 @@ static _Atomic unsigned long long g_gil_wait_ns;     /* summed over threads */
 static _Atomic unsigned long long g_gil_held_ns;     /* wall time with an owner */
 static _Atomic unsigned long long g_gil_max_wait_ns; /* worst single wait */
 static struct timespec    g_gil_held_since;
+/* Who holds the interpreter lock, and what for.
+ *
+ * The lock's cost is visible in the slice report ("interpreter lock: held 30%
+ * of the last 5.0s, 7653.0 ms summed wait, worst single wait 570.9 ms" while
+ * the execution lock was at 1% and 0.4 ms) but the report cannot say *who*,
+ * and that is the whole question: a convoy of short JNI calls and one holder
+ * sitting on it across a long host operation look identical in the totals.
+ *
+ * Measured on Cross Worlds: the numbers above appear the moment a 228 MB
+ * background download starts calling BackgroundDownload.onProgressUpdate()
+ * into native, and guest execution falls from ~109 Mips to a few hundred
+ * instructions per five seconds.  A waiter that has been kept out for longer
+ * than a frame deserves to name the thread keeping it out. */
+static unsigned           g_gil_owner_id;
+static const char        *g_gil_owner_what = "?";
+static __thread unsigned  t_gil_id;
+static __thread const char *t_gil_what = "?";
+static _Atomic unsigned   g_gil_next_id;
+
+/* Called from inside gil_tryacquire()/dvm_gil_acquire(), which already hold
+ * g_gil.m — so it must not take it.  An atomic counter needs no lock. */
+static unsigned gil_self_id(void)
+{
+   if (!t_gil_id)
+      t_gil_id = atomic_fetch_add_explicit(&g_gil_next_id, 1u,
+                                           memory_order_relaxed) + 1u;
+   return t_gil_id;
+}
+
+/* Long enough that a healthy JNI call never trips it; short enough that a
+ * holder that is doing host I/O under the lock always does. */
+#define GIL_SLOW_WAIT_NS 50000000ull   /* 50 ms */
 unsigned long long dvm_gil_wait_ns(void)
 {
    return atomic_load_explicit(&g_gil_wait_ns, memory_order_relaxed);
@@ -3838,6 +3870,8 @@ static bool gil_tryacquire(struct dvm *vm)
       atomic_store_explicit(&g_gil.depth, 1, memory_order_relaxed);
       g_gil.owner = pthread_self();
       clock_gettime(CLOCK_MONOTONIC, &g_gil_held_since);
+      g_gil_owner_id = gil_self_id();
+      g_gil_owner_what = t_gil_what;
       got = true;
    }
    pthread_mutex_unlock(&g_gil.m);
@@ -3851,6 +3885,7 @@ static bool gil_tryacquire(struct dvm *vm)
 
 unsigned dvm_gil_enter_from_guest(struct dvm *vm)
 {
+   t_gil_what = "guest JNI";
    /* No VM at all — a title with no classes*.dex runs with bytecode emulation
     * off, and its JNI entry points still come through here. */
    if (!vm) return 0u;
@@ -4010,10 +4045,21 @@ void dvm_gil_acquire(struct dvm *vm)
       while (old < d && !atomic_compare_exchange_weak_explicit(
                &g_gil_max_wait_ns, &old, d,
                memory_order_relaxed, memory_order_relaxed)) {}
+      if (d >= GIL_SLOW_WAIT_NS) {
+         static unsigned said;
+         if (said < 64u || (said % 200u) == 0u)
+            fprintf(stderr, "[gil] thread %u (%s) waited %.1f ms for the "
+                    "interpreter lock; it was held by thread %u (%s)\n",
+                    gil_self_id(), t_gil_what, (double)d / 1e6,
+                    g_gil_owner_id, g_gil_owner_what);
+         ++said;
+      }
       /* g_gil.depth stayed 1: the releaser handed ownership straight over. */
    }
    g_gil.owner = pthread_self();
    clock_gettime(CLOCK_MONOTONIC, &g_gil_held_since);
+   g_gil_owner_id = gil_self_id();
+   g_gil_owner_what = t_gil_what;
    pthread_mutex_unlock(&g_gil.m);
    t_gil_depth = 1;
    /* Nobody else can be interpreting now, so the VM's per-thread fields are

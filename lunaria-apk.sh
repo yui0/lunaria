@@ -831,150 +831,15 @@ if [ -n "$ANDROID_OBB_MAIN" ]; then
         ln -sf "$ANDROID_OBB_PATCH" "$_obbdir/$(basename "$ANDROID_OBB_PATCH")"
         ln -sf "$ANDROID_OBB_PATCH" "$_obbdir/patch.1.$pkgname.obb"
     fi
-    # Main engine library — needed both to pick the staging root below and to
-    # pull the pak AES key later.  UE4 ships libUE4.so, UE5 libUnreal.so.
-    _ue_so=""
-    for _cand in "$tmpdir/lib/$arch/libUE4.so"   "$tmpdir/lib/$arch/libUnreal.so" \
-                 "$tmpdir/lib/arm64-v8a/libUE4.so"   "$tmpdir/lib/arm64-v8a/libUnreal.so" \
-                 "$tmpdir/lib/armeabi-v7a/libUE4.so" "$tmpdir/lib/armeabi-v7a/libUnreal.so"; do
-        [ -f "$_cand" ] && _ue_so="$_cand" && break
-    done
-
-    # Stage OBB under the loose external-files tree.  With obbInAPK or a mounted
-    # expansion, UE still probes
-    #   <files>/<EngineDir>/<Project>/<Project>/Content/Paks/*.pak
-    # <EngineDir> is "UE4Game" up to UE4 and "UnrealGame" from UE5 on
-    # (FAndroidPlatformFile builds GFilePathBase + that literal).  Reading the
-    # literal out of the engine binary keeps this exact instead of guessing
-    # from the library name or a title list.
-    # OBB zip layouts vary — discover the project name from Content/Paks,
-    # never hard-code a title (a fabricated .uproject / fixed Project name
-    # breaks other APKs).
-    #   A) <EngineDir>/<P>/<P>/Content/Paks  — already device-shaped
-    #   B) <P>/<P>/Content/Paks              — missing <EngineDir>/
-    #   C) <P>/Content/Paks                  — missing outer <P>/ (common on Android)
-    _ue_dirname=""
-    # Once installed, the staged package layout records this decision.  Avoid
-    # rescanning a several-hundred-megabyte engine binary on every process
-    # start; that alone costs seconds before the first guest instruction.
-    for _known_ue_dir in UE4Game UnrealGame; do
-        if find "$ANDROID_EXTERNAL_FILES_DIR/$_known_ue_dir" -type d \
-                -path '*/Content/Paks' -print -quit 2>/dev/null | grep -q .; then
-            _ue_dirname="$_known_ue_dir"
-            break
-        fi
-    done
-    if [ -z "$_ue_dirname" ]; then
-        _ue_dirname="UE4Game"
-        if [ -n "$_ue_so" ] && grep -qa -- '/UnrealGame/' "$_ue_so" 2>/dev/null; then
-            _ue_dirname="UnrealGame"
-        fi
-    fi
-    msg "UE external-files root: $_ue_dirname"
-    _ue_game="$ANDROID_EXTERNAL_FILES_DIR/$_ue_dirname"
-    mkdir -p "$_ue_game"
-    if ! find "$_ue_game" -type d -path '*/Content/Paks' 2>/dev/null | grep -q .; then
-        _obb_x="$tmpdir/obb_extract"
-        mkdir -p "$_obb_x"
-        if unzip -q -o "$ANDROID_OBB_MAIN" -d "$_obb_x"; then
-            find "$_obb_x" -type d -path '*/Content/Paks' 2>/dev/null | while read -r _paks; do
-                _content=$(dirname "$_paks")
-                [ "$(basename "$_content")" = Content ] || continue
-                _inner=$(dirname "$_content")
-                _proj=$(basename "$_inner")
-                [ -n "$_proj" ] && [ "$_proj" != Content ] || continue
-                _dest="$_ue_game/$_proj/$_proj"
-                if [ -d "$_dest/Content/Paks" ]; then
-                    continue
-                fi
-                mkdir -p "$_ue_game/$_proj"
-                if [ -d "$_inner" ]; then
-                    # Move project tree into <EngineDir>/<P>/<P>/ (Content + siblings).
-                    mv "$_inner" "$_dest" 2>/dev/null \
-                        || { mkdir -p "$_dest"; cp -a "$_inner/." "$_dest/"; }
-                fi
-                # The staged command line often sits beside the project folder in
-                # the OBB.  UE4 names it UE4CommandLine.txt, UE5 UECommandLine.txt.
-                for _cmdname in UE4CommandLine.txt UECommandLine.txt; do
-                    for _cmd in "$_obb_x/$_cmdname" \
-                                "$_obb_x/$_proj/$_cmdname" \
-                                "$(dirname "$_inner")/$_cmdname"; do
-                        if [ -f "$_cmd" ] && [ ! -f "$_ue_game/$_proj/$_cmdname" ]; then
-                            cp -f "$_cmd" "$_ue_game/$_proj/$_cmdname"
-                        fi
-                    done
-                done
-                # The expansion also carries engine-side staged content next to
-                # the project (Engine/Config/StagedBuild_<P>.ini, ICU data,
-                # Engine/Content/…).  A mounted OBB exposes all of it under the
-                # same root, so move every remaining sibling across instead of
-                # stopping at the project folder — otherwise the engine sees a
-                # staged build with no Engine/ tree.
-                _sib_root="$(dirname "$_inner")"
-                for _sib in "$_sib_root"/*; do
-                    [ -e "$_sib" ] || continue
-                    [ -d "$_sib" ] || continue
-                    _sib_name="$(basename "$_sib")"
-                    [ "$_sib_name" = "$_proj" ] && continue
-                    [ -e "$_ue_game/$_proj/$_sib_name" ] && continue
-                    mv "$_sib" "$_ue_game/$_proj/$_sib_name" 2>/dev/null \
-                        || cp -a "$_sib" "$_ue_game/$_proj/$_sib_name"
-                done
-                msg "obb staged under $_ue_game/$_proj"
-            done
-        else
-            msg "obb extract failed (continuing with zip mount only)"
-        fi
-    fi
-    # Encrypted-index paks: PreInit opens .uproject before FPakFile mounts, and
-    # ShaderArchive/maps need AES-ECB index decrypt.  Stage the real cooked
-    # assets (including the real .uproject from the pak) as loose files —
-    # host staging only, no fabricated project descriptor.
-    _stage_py="$script_dir/scripts/ue4_stage_encrypted_paks.py"
-    # Skip it when the tree it writes into already has its output.  The test
-    # used to be "did we hit the package cache", which stopped being the right
-    # question once the external-files tree moved out of that cache: a cached
-    # package with a freshly created external tree would have skipped the
-    # staging that fills it.  Ask the tree itself instead.
-    if [ -f "$_ue_game/.staged-encrypted-paks" ]; then
-        _stage_py=""
-    fi
-    if [ -f "$_stage_py" ] && [ -n "$_ue_so" ]; then
-        find "$_ue_game" -type d \( -path '*/Content/Paks' -o -path '*/Content/CBPaks' \) \
-            2>/dev/null | while read -r _paks; do
-            # .../<EngineDir>/<P>/<P>/Content/Paks → out = .../<EngineDir>/<P>
-            _out=$(dirname "$(dirname "$(dirname "$_paks")")")
-            python3 "$_stage_py" --so "$_ue_so" --paks "$_paks" --out "$_out" \
-                || msg "encrypted pak stage failed for $_paks (continuing)"
-            : > "$_ue_game/.staged-encrypted-paks"
-            # UE Curl HTTPS probes several CA paths (Certificates/cacert.pem,
-            # CurlCertificates/ca-bundle.pem, Engine ThirdParty).  Cooked paks
-            # often omit them; install the host trust store so CDN config /
-            # DownloadContent can proceed (emulator-side only).
-            _proj_root="$(dirname "$(dirname "$_paks")")"
-            _ue_root="$(dirname "$_proj_root")"
-            _host_ca=""
-            for _ca in /etc/ssl/certs/ca-certificates.crt \
-                       /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
-                       /etc/ssl/cert.pem; do
-                [ -s "$_ca" ] && _host_ca="$_ca" && break
-            done
-            if [ -n "$_host_ca" ]; then
-                for _dest in \
-                    "$_proj_root/Content/Certificates/cacert.pem" \
-                    "$_proj_root/Content/CurlCertificates/ca-bundle.pem" \
-                    "$_ue_root/Engine/Content/Certificates/ThirdParty/cacert.pem" \
-                    "$ANDROID_EXTERNAL_FILES_DIR/ca-bundle.pem"
-                do
-                    mkdir -p "$(dirname "$_dest")"
-                    if [ ! -s "$_dest" ]; then
-                        cp -f "$_host_ca" "$_dest"
-                        msg "staged host CA → $_dest"
-                    fi
-                done
-            fi
-        done
-    fi
+    # Nothing is extracted.  A device never unpacks the expansion: UE's
+    # FAndroidPlatformFile opens main.<ver>.<pkg>.obb (or the APK asset
+    # main.obb.png) as a zip and mounts Content/Paks/*.pak from inside it, and
+    # decrypts the pak indexes itself with the key compiled into the engine.
+    # The external-files tree <EngineDir>/<Project>/ belongs to the game
+    # (Saved/, downloaded patches).  Loose copies staged there once used to
+    # shadow the package forever: after an app update the engine kept mounting
+    # the previous base pak and its Config/DefaultGame.ini AppVersion, and the
+    # server answered "requires an update".
     msg "obb: $ANDROID_OBB_MAIN"
 fi
 
@@ -999,6 +864,37 @@ fi
 # Run the package's real launcher Activity from dex by default.  Set
 # LUNARIA_DEX_START=0 only when comparing against the legacy, engine-specific
 # native startup path.
+# Unreal saves the scalability group it resolved, and one of them decides how
+# big the 3D scene is drawn.  sg.ResolutionQuality is a percentage; 0 is not a
+# percentage, it is "nothing ever set me", and UE does not treat it as 100 --
+# FLegacyScreenPercentageDriver clamps the fraction to its floor of 0.1, so the
+# world is rendered at a tenth of the surface on each axis and stretched back
+# up.  Measured on Cross Worlds: a 1024x576 surface drew its scene into
+# 103x58.
+#
+# It reads 0 because the device profile UE selected does not set it.  The game
+# ships Nk.ResolutionQuality in Android_Low/Mid/High/Ultra (70/80/90/100) and
+# in the per-GPU profiles that inherit them -- Android_Mali_G78 inherits
+# Android_Ultra -- but *not* in the bare [Android DeviceProfile] it falls back
+# to when no rule matches.  So this line means the emulator did not give UE
+# enough to recognise the device, which is an emulator bug and not a setting
+# the operator should have to fix.
+#
+# Say so at launch rather than leaving it to be discovered as "the graphics
+# look soft": the file is read before the run, so the warning costs nothing.
+_gus="$LUNARIA_DATA_ROOT/data/$pkgname/external/files/UE4Game/ProjectN/ProjectN/Saved/Config/Android/GameUserSettings.ini"
+if [ -f "$_gus" ]; then
+    _rq=$(sed -n 's/^sg\.ResolutionQuality=\([0-9.]*\).*/\1/p' "$_gus" | head -n 1)
+    case "$_rq" in
+        ''|0|0.*|[0-9].0*)
+            msg "warning: sg.ResolutionQuality=${_rq:-unset} in $_gus"
+            msg "warning: UE will clamp the scene to its 10% floor and upscale it."
+            msg "warning: the device profile did not match — UE fell back to the bare"
+            msg "warning: [Android DeviceProfile], which sets no Nk.ResolutionQuality."
+            ;;
+    esac
+fi
+
 : "${LUNARIA_DEX_START:=1}"
 export LUNARIA_DEX_START
 

@@ -428,6 +428,23 @@ void ln64_link_deps(void)
    }
 }
 
+void ln64_remove(struct ln64_module *module)
+{
+   if (!module) return;
+   for (size_t i = 0; i < g_mods_n; ++i) {
+      if (g_mods[i] != module) continue;
+      memmove(g_mods + i, g_mods + i + 1,
+              (g_mods_n - i - 1) * sizeof *g_mods);
+      --g_mods_n;
+      free(module->deps);
+      free(module->needed_off);
+      free(module->path);
+      free(module);
+      ln64_link_deps();
+      return;
+   }
+}
+
 /* ----------------------------------------------------------------- lookup */
 
 static bool take(const struct ln64_module *m, const Elf64_Sym *s,
@@ -559,6 +576,50 @@ struct ln64_module *ln64_module_by_path(const char *path)
    for (size_t i = 0; i < g_mods_n; ++i)
       if (strcmp(g_mods[i]->path, path) == 0) return g_mods[i];
    return NULL;
+}
+
+struct ln64_module *ln64_module_by_address(uint32_t address)
+{
+   struct ln64_module *best = NULL;
+   for (size_t i = 0; i < g_mods_n; ++i)
+      if (g_mods[i]->bias <= address && (!best || best->bias < g_mods[i]->bias))
+         best = g_mods[i];
+   return best;
+}
+
+bool ln64_lookup_next(struct ln64_module *caller, const char *name, struct ln64_sym *out)
+{
+   bool after = false;
+   if (!caller || !name || !out) return false;
+   const uint32_t gh = gnu_hash(name), sh = sysv_hash(name);
+   for (size_t i = 0; i < g_mods_n; ++i) {
+      uint32_t index;
+      if (after) {
+         const Elf64_Sym *symbol = mod_find(g_mods[i], name, gh, sh, NULL, &index);
+         if (symbol) return take(g_mods[i], symbol, name, out);
+      }
+      if (g_mods[i] == caller) after = true;
+   }
+   return false;
+}
+
+bool ln64_depends_on(struct ln64_module *module, const char *soname)
+{
+   if (!module || !soname || !bfs_reserve(g_mods_n + 1)) return false;
+   size_t head = 0, tail = 0;
+   g_bfs[tail++] = module;
+   while (head < tail) {
+      struct ln64_module *m = g_bfs[head++];
+      if (!strcmp(m->soname, soname)) return true;
+      for (size_t k = 0; k < m->needed_n; ++k)
+         if (!strcmp(m->strtab + m->needed_off[k], soname)) return true;
+      for (size_t k = 0; k < m->deps_n; ++k) {
+         bool seen = false;
+         for (size_t q = 0; q < tail; ++q) if (g_bfs[q] == m->deps[k]) seen = true;
+         if (!seen && tail < g_mods_n + 1) g_bfs[tail++] = m->deps[k];
+      }
+   }
+   return false;
 }
 
 void ln64_dump(void)

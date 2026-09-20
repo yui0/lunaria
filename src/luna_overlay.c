@@ -104,6 +104,43 @@ static void *overlay_get_proc(const char *name)
 /* Seconds since the overlay came up.  Zero-based rather than raw monotonic: a
  * CSS animation's timeline starts when the document appears, and a float
  * carrying the host's uptime has no precision left to resolve a frame. */
+/* Where a present frame's wall clock goes.
+ *
+ * The emulator UI is composited inside the guest's own swap, on the host
+ * thread that also runs the guest's GL work, so every microsecond spent here
+ * is a microsecond the guest does not run.  "The overlay is expensive" is not
+ * a statement anything can be done with; which of the four stages it is, is.
+ * LUNARIA_OVERLAY_PROF=1 reports them. */
+static uint64_t overlay_ns(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static bool overlay_prof_on(void)
+{
+   static int on = -1;
+   if (on < 0) on = getenv("LUNARIA_OVERLAY_PROF") != NULL;
+   return on != 0;
+}
+
+static struct {
+   uint64_t frames, bind_ns, parse_ns, render_ns, ime_ns, restore_ns, total_ns;
+} g_prof;
+
+static void overlay_prof_report(void)
+{
+   if (!g_prof.frames || (g_prof.frames % 300) != 0) return;
+   const double f = (double)g_prof.frames;
+   fprintf(stderr, "[overlay-prof] %llu presents, %.0f us each: "
+           "bind=%.0f parse=%.0f render=%.0f ime=%.0f restore=%.0f\n",
+           (unsigned long long)g_prof.frames, (double)g_prof.total_ns / f / 1e3,
+           (double)g_prof.bind_ns / f / 1e3, (double)g_prof.parse_ns / f / 1e3,
+           (double)g_prof.render_ns / f / 1e3, (double)g_prof.ime_ns / f / 1e3,
+           (double)g_prof.restore_ns / f / 1e3);
+}
+
 static double overlay_now(void)
 {
    static double epoch;
@@ -173,22 +210,53 @@ static EGLContext g_ov_ctx = EGL_NO_CONTEXT;
 
 /* Finds the EGLConfig a context was created with.  eglCreateContext needs one,
  * and the only handle onto it is the config id the context remembers. */
+static bool overlay_config_by_id(EGLDisplay dpy, EGLint id, EGLConfig *out)
+{
+   const EGLint attrs[] = { EGL_CONFIG_ID, id, EGL_NONE };
+   EGLint n = 0;
+   return eglChooseConfig(dpy, attrs, out, 1, &n) && n == 1;
+}
+
 static bool overlay_config_of(EGLDisplay dpy, EGLContext ctx, EGLConfig *out)
 {
    EGLint id = 0;
    if (!eglQueryContext(dpy, ctx, EGL_CONFIG_ID, &id)) return false;
-   const EGLint attrs[] = { EGL_CONFIG_ID, id, EGL_NONE };
-   EGLint n = 0;
-   return eglChooseConfig(dpy, attrs, out, 1, &n) && n == 1;
+   return overlay_config_by_id(dpy, id, out);
+}
+
+/* The config of the surface this overlay will actually be made current on.
+ *
+ * It used to take the config of whatever context happened to be current when
+ * the overlay context was first created, which is not the same question: the
+ * emulator has several contexts (the guest's, the bootstrap host one, the
+ * per-engine ones) and they are not all built for the config the window
+ * surface was created with.  When they differ, eglMakeCurrent answers
+ * EGL_BAD_MATCH, and the recovery path destroys the context, recreates it and
+ * marks the document dirty — a full reparse, and with it the 0x0502 that
+ * follows a luna-ui render against names the destroyed context owned.
+ *
+ * Ask the surface. */
+static bool overlay_config_of_surface(EGLDisplay dpy, EGLSurface surf,
+                                      EGLConfig *out)
+{
+   EGLint id = 0;
+   if (surf == EGL_NO_SURFACE) return false;
+   if (!eglQuerySurface(dpy, surf, EGL_CONFIG_ID, &id)) return false;
+   return overlay_config_by_id(dpy, id, out);
 }
 
 static bool overlay_context_create(void)
 {
    EGLDisplay dpy = eglGetCurrentDisplay();
    EGLContext current = eglGetCurrentContext();
+   EGLSurface draw = eglGetCurrentSurface(EGL_DRAW);
    if (dpy == EGL_NO_DISPLAY) return false;
    EGLConfig cfg;
-   if (current != EGL_NO_CONTEXT) {
+   /* The surface first: that is what this context gets made current on, and
+    * a context built for a different config cannot be. */
+   if (overlay_config_of_surface(dpy, draw, &cfg)) {
+      /* got it */
+   } else if (current != EGL_NO_CONTEXT) {
       if (!overlay_config_of(dpy, current, &cfg)) return false;
    } else {
       const EGLint cfg_attrs[] = {
@@ -542,9 +610,50 @@ bool luna_overlay_active(void)
    return up && !g_failed;
 }
 
+/* luna-ui keeps its element tree, its layout and its GL objects in plain
+ * globals and has no locking of its own, and this overlay is entered from
+ * more than one host thread:
+ *
+ *   - the pump's arm_exec_egl_swap(),
+ *   - the guest's own eglSwapBuffers(), on the thread guest GL is pinned to,
+ *   - ANativeWindow_unlockAndPost(), from inside that SVC,
+ *   - and, during a cold start, whichever dynarmic engine thread is
+ *     translating, through the JIT progress hook and the boot card.
+ *
+ * The boot card's own pump is re-entrancy-guarded, but that guard is not
+ * shared with the guest's swap, so a translating engine and the guest's
+ * presenting thread could be inside luna_update()/luna_render() at the same
+ * time.  The observed shape is a storm of GL_INVALID_OPERATION out of render
+ * — after which the emulator's UI and the guest's GL state are both wrong and
+ * the guest stops making progress at all (measured: 0.2 Mips, flat).
+ *
+ * So: one thread inside the emulator's UI at a time, and never a wait.  A
+ * frame that arrives while another thread is compositing skips its own
+ * composite instead of blocking — the guest's swap must not queue behind a
+ * JIT translation thread, and the emulator's UI is a frame late at worst. */
+static pthread_mutex_t g_present_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void overlay_present_locked(int w, int h);
+
 void luna_overlay_present(int w, int h)
 {
    if (!luna_overlay_active() || w <= 0 || h <= 0) return;
+   if (pthread_mutex_trylock(&g_present_lock) != 0) {
+      static unsigned long skipped;
+      if ((skipped++ % 256) == 0)
+         fprintf(stderr, "[overlay] another thread is compositing — skipping "
+                 "this one (%lu)\n", skipped);
+      return;
+   }
+   overlay_present_locked(w, h);
+   pthread_mutex_unlock(&g_present_lock);
+}
+
+static void overlay_present_locked(int w, int h)
+{
+   const bool prof = overlay_prof_on();
+   const uint64_t t_enter = prof ? overlay_ns() : 0;
+   uint64_t t_mark = t_enter;
 
    EGLDisplay dpy = eglGetCurrentDisplay();
    EGLContext prev_ctx = eglGetCurrentContext();
@@ -574,6 +683,8 @@ void luna_overlay_present(int w, int h)
    }
    /* Previous binding is gone until we restore below. */
    arm_exec_egl_invalidate_current();
+   if (prof) { const uint64_t n = overlay_ns();
+               g_prof.bind_ns += n - t_mark; t_mark = n; }
 
    if (overlay_start(w, h)) {
       luna_invalidate_gl_state();
@@ -631,27 +742,45 @@ void luna_overlay_present(int w, int h)
          overlay_wire_clicks();
          /* One layout pass so a dump of element boxes is meaningful. */
          luna_update(overlay_now(), 0.0);
+         /* A reparse is not a rare event — the input method's panel, a guest
+          * dialog and the status card all republish through it, and typing
+          * into a field republishes the document it lives in.  Printing
+          * thirteen lines every time turns a keystroke into a stderr flush
+          * storm on the presenting thread, which is the guest's own swap
+          * thread.  The count is cheap and stays; the element dump is a
+          * layout diagnostic and goes behind its own flag. */
          {
-            int n = luna_element_count();
-            fprintf(stderr, "[overlay] parsed guest document: %d elements "
-                    "at %dx%d\n", n, w, h);
-            for (int i = 0; i < n && i < 12; ++i) {
-               LunaElement *e = luna_element_at(i);
-               if (!e) continue;
-               fprintf(stderr, "[overlay]   [%d] id=%s %.0fx%.0f @%.0f,%.0f "
-                       "pe_none=%d\n", i, e->id[0] ? e->id : "-",
-                       (double)e->w, (double)e->h, (double)e->x, (double)e->y,
-                       e->pointer_events_none);
+            static unsigned long parses;
+            const bool dump = getenv("LUNARIA_TRACE_OVERLAY") != NULL;
+            if (dump || parses < 4 || (parses % 256) == 0)
+               fprintf(stderr, "[overlay] parsed guest document: %d elements "
+                       "at %dx%d (#%lu)\n", luna_element_count(), w, h,
+                       parses);
+            if (dump) {
+               int n = luna_element_count();
+               for (int i = 0; i < n && i < 12; ++i) {
+                  LunaElement *e = luna_element_at(i);
+                  if (!e) continue;
+                  fprintf(stderr, "[overlay]   [%d] id=%s %.0fx%.0f @%.0f,%.0f "
+                          "pe_none=%d\n", i, e->id[0] ? e->id : "-",
+                          (double)e->w, (double)e->h, (double)e->x,
+                          (double)e->y, e->pointer_events_none);
+               }
             }
+            ++parses;
          }
       }
       pthread_mutex_unlock(&g_doc_lock);
+      if (prof) { const uint64_t n = overlay_ns();
+                  g_prof.parse_ns += n - t_mark; t_mark = n; }
 
       overlay_drain_pointer();
       /* Keystrokes go in and the field's contents come back out here: the
        * document is parsed and luna-ui is live, which is the only state its
        * element API may be called in. */
       luna_ime_frame(reparsed);
+      if (prof) { const uint64_t n = overlay_ns();
+                  g_prof.ime_ns += n - t_mark; t_mark = n; }
 
       /* The document is parsed and luna-ui's state is live here, which is the
        * only moment a caller may mutate it.  The boot card pushes its stage
@@ -694,6 +823,8 @@ void luna_overlay_present(int w, int h)
       luna_render(w, h);
       overlay_maybe_dump_boot(w, h, status_only);
       overlay_report_gl_errors("render");
+      if (prof) { const uint64_t n = overlay_ns();
+                  g_prof.render_ns += n - t_mark; t_mark = n; }
    }
 
    /* Hand the previous binding back. */
@@ -702,6 +833,14 @@ void luna_overlay_present(int w, int h)
               (unsigned)eglGetError());
    else if (prev_ctx != EGL_NO_CONTEXT)
       arm_exec_egl_note_current(prev_ctx, draw);
+
+   if (prof) {
+      const uint64_t n = overlay_ns();
+      g_prof.restore_ns += n - t_mark;
+      g_prof.total_ns += n - t_enter;
+      ++g_prof.frames;
+      overlay_prof_report();
+   }
 }
 
 /* A shown Android dialog is modal: the window above takes every touch, and
@@ -748,6 +887,9 @@ consume:
 
 void luna_overlay_shutdown(void)
 {
+   /* Blocking, unlike a present: tearing luna-ui down under a thread that is
+    * inside it is the race this lock exists for. */
+   pthread_mutex_lock(&g_present_lock);
    if (g_ready) luna_shutdown();
    g_ready = false;
    free(g_html);
@@ -758,4 +900,5 @@ void luna_overlay_shutdown(void)
    free(g_ime_css);
    g_html = g_css = g_status_html = g_status_css = NULL;
    g_ime_html = g_ime_css = NULL;
+   pthread_mutex_unlock(&g_present_lock);
 }

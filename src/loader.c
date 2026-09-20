@@ -1437,25 +1437,34 @@ run_ue4_game_arm(struct jvm *jvm)
       fprintf(stderr, "[loader] UE4 android_app instance=0x%08x win=0x%08x\n",
               instance, win);
       if (instance) {
-         /* Heuristic: scan android_app for a writable pipe fd pair.
-          * Observed NDK layout (32-bit bionic): msgread @+0x48. */
+         /* Scan android_app for the command pipe's fd pair.  Observed NDK
+          * layout (32-bit bionic): msgread @+0x48.  The two ends of one
+          * pipe(2) share an inode, which identifies the pair exactly; see the
+          * A64 path for why "both descriptors above 2" was both too loose and
+          * too strict. */
          int msgwrite = -1;
          uint32_t pipe_off = 0;
          for (uint32_t off = 64; off < 256; off += 4) {
             int a = (int)arm_exec_read32(instance + off);
             int b = (int)arm_exec_read32(instance + off + 4);
-            if (a > 2 && b > 2 && a < 1024 && b < 1024 && a != b) {
-               struct stat sa, sb;
-               if (fstat(a, &sa) == 0 && fstat(b, &sb) == 0 &&
-                   S_ISFIFO(sa.st_mode) && S_ISFIFO(sb.st_mode)) {
-                  msgwrite = b;
-                  pipe_off = off;
-                  fprintf(stderr, "[loader] UE4 cmd pipe @+0x%x read=%d write=%d\n",
-                          off, a, b);
-                  break;
-               }
-            }
+            struct stat sa, sb;
+            if (a < 0 || b < 0 || a >= 1024 || b >= 1024 || a == b)
+               continue;
+            if (fstat(a, &sa) != 0 || fstat(b, &sb) != 0)
+               continue;
+            if (!S_ISFIFO(sa.st_mode) || !S_ISFIFO(sb.st_mode))
+               continue;
+            if (sa.st_dev != sb.st_dev || sa.st_ino != sb.st_ino)
+               continue;
+            msgwrite = b;
+            pipe_off = off;
+            fprintf(stderr, "[loader] UE4 cmd pipe @+0x%x read=%d write=%d\n",
+                    off, a, b);
+            break;
          }
+         if (msgwrite < 0)
+            fprintf(stderr, "[loader] UE4 android_app has no command pipe — "
+                    "APP_CMD_INIT_WINDOW cannot be delivered\n");
          if (win) {
             /* Public window @36; pendingWindow sits after mutex/cond/pipe/
              * thread/poll_sources/flags — typically msgread+0x38 (=0x80 when
@@ -1919,20 +1928,38 @@ run_ue4_game_arm64(struct jvm *jvm)
          uint32_t pipe_off = 0;
          /* Scan android_app for the command pipe's fd pair.  On LP64 bionic
           * (pthread_mutex_t 40 B, pthread_cond_t 48 B) msgread lands at
-          * +0xC0; the scan keeps this working if the glue struct shifts. */
+          * +0xC0; the scan keeps this working if the glue struct shifts.
+          *
+          * The two ends of one pipe(2) share an inode, so "both FIFOs on the
+          * same device and inode, and not the same descriptor" identifies the
+          * pair exactly.  The previous test — both descriptors above 2 and
+          * both FIFOs — was neither: it accepted any two unrelated FIFOs, and
+          * it rejected the real pair whenever msgread happened to be fd 0,
+          * which is what a guest gets when this process starts with stdin
+          * closed.  The pipe was then never found, no APP_CMD reached
+          * android_main, and the engine waited for a window it had already
+          * been given. */
          for (uint32_t off = 64; off < 512; off += 4) {
             int a = (int)arm64_exec_read32(instance_va + off);
             int b = (int)arm64_exec_read32(instance_va + off + 4);
-            if (a > 2 && b > 2 && a < 1024 && b < 1024 && a != b) {
-               struct stat sa, sb;
-               if (fstat(a, &sa) == 0 && fstat(b, &sb) == 0 &&
-                   S_ISFIFO(sa.st_mode) && S_ISFIFO(sb.st_mode)) {
-                  msgwrite = b; pipe_off = off;
-                  fprintf(stderr, "[loader] UE arm64 cmd pipe @+0x%x write=%d\n", off, b);
-                  break;
-               }
-            }
+            struct stat sa, sb;
+            if (a < 0 || b < 0 || a >= 1024 || b >= 1024 || a == b)
+               continue;
+            if (fstat(a, &sa) != 0 || fstat(b, &sb) != 0)
+               continue;
+            if (!S_ISFIFO(sa.st_mode) || !S_ISFIFO(sb.st_mode))
+               continue;
+            if (sa.st_dev != sb.st_dev || sa.st_ino != sb.st_ino)
+               continue;
+            msgwrite = b; pipe_off = off;
+            fprintf(stderr, "[loader] UE arm64 cmd pipe @+0x%x read=%d write=%d\n",
+                    off, a, b);
+            break;
          }
+         if (msgwrite < 0)
+            fprintf(stderr, "[loader] UE arm64 android_app has no command pipe "
+                    "— APP_CMD_INIT_WINDOW cannot be delivered and the engine "
+                    "will never start rendering\n");
          if (win_va) {
             /* LP64 android_app: window @+0x48 (it precedes the mutex, so its
              * offset does not depend on the pthread type sizes), and
@@ -2902,10 +2929,53 @@ main(int argc, const char *argv[])
     * "loading module" and dependency messages at the end of the file. */
    setvbuf(stdout, NULL, _IOLBF, 0);
 
+   /* Descriptors 0, 1 and 2 are always open in an Android process: zygote
+    * hands every app /dev/null on stdin and the logger on stdout/stderr, and
+    * nothing the app allocates afterwards can land there.  The guest's file
+    * descriptors *are* this process's file descriptors, so a closed stdin here
+    * is a free descriptor there, and the first pipe() the guest makes comes
+    * back as fd 0.
+    *
+    * That is not a theoretical tidiness argument.  android_native_app_glue
+    * keeps its command pipe in android_app, and the loader finds that pipe by
+    * scanning the struct for a pair of descriptors that are both FIFOs; a
+    * guest whose msgread is fd 0 was skipped, so APP_CMD_INIT_WINDOW never
+    * reached android_main, the engine never learned it had a window, and the
+    * title ran its pump loop for ever without presenting a frame.  Anything
+    * the guest writes to its own stderr would also have gone into that pipe.
+    *
+    * So open /dev/null over whatever is missing before any of it exists. */
+   for (int fd = 0; fd <= 2; ++fd) {
+      if (fcntl(fd, F_GETFD) != -1 || errno != EBADF)
+         continue;
+      int nul = open("/dev/null", fd == 0 ? O_RDONLY : O_WRONLY);
+      if (nul < 0)
+         break;
+      if (nul != fd) {
+         dup2(nul, fd);
+         close(nul);
+      }
+      fprintf(stderr, "[loader] fd %d was closed — opened /dev/null on it "
+              "(a guest descriptor must never land on stdin/stdout/stderr)\n",
+              fd);
+   }
+
    if (argc < 2)
       errx(EXIT_FAILURE, "usage: <elf file or jni library>");
 
    printf("loading module: %s\n", argv[1]);
+
+   /* A bare module loaded from the command line — every test under test/ —
+    * runs its work on guest pthreads exactly as a game does, so it must be
+    * scheduled the same way.  Without this the tests measured the flat-slice
+    * path while every real title measured the adaptive one, which made them
+    * quietly unrepresentative: test/heap_test.c reported 20,001 instructions
+    * a slice, a number no game ever sees.  LUNARIA_THREADS_RUN_ENGINE=0 puts
+    * a test back on the flat path to compare the two. */
+   {
+      const char *e = getenv("LUNARIA_THREADS_RUN_ENGINE");
+      arm64_exec_threads_run_engine(!(e && e[0] == '0'));
+   }
 
    /* An ordinary Android application has no native process entry point.
     * ActivityThread starts its Application/Activity bytecode first, and the
@@ -2987,6 +3057,21 @@ main(int argc, const char *argv[])
             }
             if (have_pure) {
                printf("preloading arm64 pure-code library: %s\n", libpath);
+               arm64_exec_load_library(libpath, 0);
+            }
+         }
+
+         /* The emulator's guest-side libc (src/lib/guest.c): malloc and
+          * friends as in-process code instead of traps.  Loaded before every
+          * consumer so all of them bind to it. */
+         {
+            const char *sys = a64_syslib_dir();
+            const char *off = getenv("LUNARIA_GUEST_LIBC");
+            if (sys && !(off && !strcmp(off, "0")) &&
+                (size_t)snprintf(libpath, sizeof libpath,
+                                 "%s/liblunaria_guest.so", sys) < sizeof libpath &&
+                stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
+               printf("preloading arm64 guest libc: %s\n", libpath);
                arm64_exec_load_library(libpath, 0);
             }
          }
