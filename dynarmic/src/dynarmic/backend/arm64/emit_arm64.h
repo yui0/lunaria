@@ -145,6 +145,8 @@ struct EmitConfig {
     // Endianness
     bool always_little_endian;
 
+    u64 (*host_hook_fn)(u32 id, u64 arg0, u64 arg1, u64 arg2);
+
     // Frontend specific callbacks
     FP::FPCR (*descriptor_to_fpcr)(const IR::LocationDescriptor& descriptor);
     oaknut::Label (*emit_cond)(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Cond cond);

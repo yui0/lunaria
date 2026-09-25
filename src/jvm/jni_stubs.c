@@ -244,41 +244,16 @@ java_lang_System_load(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
    if (!args) return;
-   const char *lib = (*env)->GetStringUTFChars(env, va_arg(args, jstring), NULL);
+   jstring jlib = va_arg(args, jstring);
+   const char *lib = (*env)->GetStringUTFChars(env, jlib, NULL);
+   if (!lib) return;
 
-   struct {
-      union {
-         void *ptr;
-         void* (*fun)(const char*, int);
-      } open;
+   /* Absolute path into the guest ELF loader.  Host/apkenv dlopen rejects
+    * aarch64 APS2 objects the arm64 loader already unpacks. */
+   if (arm_exec_system_load(lib) < 0)
+      warnx("java/lang/System/load: failed to load `%s`", lib);
 
-      union {
-         void *ptr;
-         void* (*fun)(void*, const char*);
-      } sym;
-   } dl;
-
-   if (!(dl.open.ptr = dlsym(RTLD_DEFAULT, "bionic_dlopen")) || !(dl.sym.ptr = dlsym(RTLD_DEFAULT, "bionic_dlsym"))) {
-      dl.open.fun = dlopen;
-      dl.sym.fun = dlsym;
-   }
-
-   void *handle;
-   if (!(handle = dl.open.fun(lib, RTLD_NOW | RTLD_GLOBAL))) {
-      warnx("java/lang/System/load: failed to dlopen `%s`", lib);
-      return;
-   }
-
-   union {
-      void *ptr;
-      void* (*fun)(void*, void*);
-   } JNI_OnLoad;
-
-   if ((JNI_OnLoad.ptr = dl.sym.fun(handle, "JNI_OnLoad"))) {
-      JavaVM *vm;
-      (*env)->GetJavaVM(env, &vm);
-      JNI_OnLoad.fun(vm, NULL);
-   }
+   (*env)->ReleaseStringUTFChars(env, jlib, lib);
 }
 
 jobject
@@ -1049,10 +1024,13 @@ lunaria_screen(void)
    if (s.density < 40) s.density = 40;
 
    fprintf(stderr, "[jvm] screen: %dx%d @ %d dpi (%s %s panel %dx%d @ %d dpi, "
-                   "%s, LUNARIA_SCALE=%.2f)\n",
+                   "%s, LUNARIA_SCALE=%s)\n",
            s.width, s.height, s.density, d->manufacturer, d->model,
            d->screen_w, d->screen_h, d->density,
-           screen_is_landscape() ? "landscape" : "portrait", scale);
+           screen_is_landscape() ? "landscape" : "portrait",
+           operator_chose_panel
+              ? (sc && *sc ? sc : "default-on-override")
+              : "unset→panel 1:1");
    return &s;
 }
 
@@ -1248,6 +1226,12 @@ lunaria_android_property(const char *name)
       { "ro.product.board",         dev->board },
       { "ro.board.platform",        dev->platform },
       { "ro.hardware",              dev->hardware },
+      /* ABI — one 64-bit image; abilist32 empty the way a 64-only device is. */
+      { "ro.product.cpu.abi",       "arm64-v8a" },
+      { "ro.product.cpu.abi2",      "" },
+      { "ro.product.cpu.abilist",   "arm64-v8a" },
+      { "ro.product.cpu.abilist64", "arm64-v8a" },
+      { "ro.product.cpu.abilist32", "" },
       /* build */
       { "ro.build.type",            "user" },
       { "ro.build.tags",            "release-keys" },
@@ -1310,6 +1294,8 @@ LUNARIA_BUILD_FIELD(HOST,         "ro.build.host")
 LUNARIA_BUILD_FIELD(BOOTLOADER,   "ro.bootloader")
 LUNARIA_BUILD_FIELD(RADIO,        "gsm.version.baseband")
 LUNARIA_BUILD_FIELD(UNKNOWN,      "ro.serialno")   /* Build.UNKNOWN == "unknown" */
+LUNARIA_BUILD_FIELD(CPU_ABI,      "ro.product.cpu.abi")
+LUNARIA_BUILD_FIELD(CPU_ABI2,     "ro.product.cpu.abi2")
 LUNARIA_BUILD_FIELD(VERSION_SECURITY_PATCH, "ro.build.version.security_patch")
 LUNARIA_BUILD_FIELD(VERSION_CODENAME,       "ro.build.version.codename")
 
@@ -1327,6 +1313,8 @@ LUNARIA_BUILD_FIELD_ALIAS(TAGS)
 LUNARIA_BUILD_FIELD_ALIAS(TYPE)
 LUNARIA_BUILD_FIELD_ALIAS(BOARD)
 LUNARIA_BUILD_FIELD_ALIAS(BOOTLOADER)
+LUNARIA_BUILD_FIELD_ALIAS(CPU_ABI)
+LUNARIA_BUILD_FIELD_ALIAS(CPU_ABI2)
 
 jstring
 android_os_Build_VERSION_RELEASE(JNIEnv *env, jobject object)
@@ -1411,14 +1399,21 @@ android_content_Context_getFilesDir(JNIEnv *env, jobject object, va_list args)
    return sv;
 }
 
+static jobject
+lunaria_application_info(JNIEnv *env)
+{
+   static jobject sv;
+   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "android/content/pm/ApplicationInfo"))));
+}
+
 jobject
 android_content_Context_getApplicationInfo(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
-   /* Return a stub ApplicationInfo so Unity's PlayAssetDelivery path can read
-    * its (empty) split-APK fields instead of dereferencing NULL. */
-   static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "android/content/pm/ApplicationInfo"))));
+   (void)args;
+   /* Context and PackageManager describe the same installed application.
+    * Keep one object identity, as Android's cached LoadedApk normally does. */
+   return lunaria_application_info(env);
 }
 
 /* PackageItemInfo.packageName is inherited by ApplicationInfo.  Android
@@ -1443,13 +1438,96 @@ android_content_pm_PackageItemInfo_packageName(JNIEnv *env, jobject object)
    return android_content_pm_ApplicationInfo_packageName(env, object);
 }
 
-/* ApplicationInfo.splitPublicSourceDirs — accessed as a field (String[]).
- * This is a non-split (mono) APK, so return an empty String array. */
+/* ApplicationInfo split arrays.  ANDROID_SPLIT_APKS is the installed split
+ * table prepared by the package installer/launcher as
+ * "name|path;name|path".  Android exposes parallel, equally-sized arrays;
+ * returning NULL here describes a monolithic install and makes native SDKs
+ * omit split APKs from their package identity and integrity inputs. */
+struct lunaria_split_name {
+   const char *name;
+   size_t length;
+};
+
+static int lunaria_split_name_compare(const void *left, const void *right)
+{
+   const struct lunaria_split_name *a = left, *b = right;
+   size_t common = a->length < b->length ? a->length : b->length;
+   int order = memcmp(a->name, b->name, common);
+   if (order) return order;
+   return a->length < b->length ? -1 : a->length > b->length ? 1 : 0;
+}
+
+static jobjectArray
+lunaria_application_info_splits(JNIEnv *env, int names)
+{
+   const char *table = getenv("ANDROID_SPLIT_APKS");
+   size_t capacity = 0, count = 0;
+   for (const char *p = table; p && *p; ) {
+      const char *end = strchr(p, ';');
+      if (!end) end = p + strlen(p);
+      if (memchr(p, '|', (size_t)(end - p))) ++capacity;
+      p = *end ? end + 1 : end;
+   }
+   struct lunaria_split_name *entries =
+      capacity ? calloc(capacity, sizeof *entries) : NULL;
+   if (capacity && !entries) return NULL;
+   for (const char *p = table; p && *p; ) {
+      const char *end = strchr(p, ';');
+      if (!end) end = p + strlen(p);
+      const char *bar = memchr(p, '|', (size_t)(end - p));
+      if (bar && bar != p) {
+         entries[count].name = p;
+         entries[count].length = (size_t)(bar - p);
+         ++count;
+      }
+      p = *end ? end + 1 : end;
+   }
+   qsort(entries, count, sizeof *entries, lunaria_split_name_compare);
+   jclass string_class = (*env)->FindClass(env, "java/lang/String");
+   jobjectArray out = (*env)->NewObjectArray(env, (jsize)count,
+                                             string_class, NULL);
+   if (!out) { free(entries); return NULL; }
+   for (size_t i = 0; i < count; ++i) {
+      size_t length = entries[i].length;
+      const char *base = lunaria_android_apk_dir();
+      size_t base_len = strlen(base);
+      size_t needed = base_len + sizeof "/split_.apk" + length;
+      char *value = malloc(needed);
+      if (!value) break;
+      if (names) {
+         memcpy(value, entries[i].name, length);
+         value[length] = '\0';
+      } else {
+         snprintf(value, needed, "%s/split_%.*s.apk", base,
+                  (int)length, entries[i].name);
+      }
+      jstring s = (*env)->NewStringUTF(env, value);
+      if (s) (*env)->SetObjectArrayElement(env, out, (jsize)i, s);
+      free(value);
+   }
+   free(entries);
+   return out;
+}
+
+jobjectArray
+android_content_pm_ApplicationInfo_splitNames(JNIEnv *env, jobject object)
+{
+   assert(env && object);
+   return lunaria_application_info_splits(env, 1);
+}
+
+jobjectArray
+android_content_pm_ApplicationInfo_splitSourceDirs(JNIEnv *env, jobject object)
+{
+   assert(env && object);
+   return lunaria_application_info_splits(env, 0);
+}
+
 jobjectArray
 android_content_pm_ApplicationInfo_splitPublicSourceDirs(JNIEnv *env, jobject object)
 {
    assert(env && object);
-   return (*env)->NewObjectArray(env, 0, (*env)->FindClass(env, "java/lang/String"), NULL);
+   return lunaria_application_info_splits(env, 0);
 }
 
 /* ApplicationInfo.sourceDir — the base APK path. */
@@ -2030,18 +2108,56 @@ android_content_Context_getPackageManager(JNIEnv *env, jobject object, va_list a
    return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "android/content/pm/PackageManager"))));
 }
 
-/* PackageManager.getPackageInfo(name, flags) → a PackageInfo stub whose
- * version fields (versionCode / versionName) are read below. */
+/* PackageManager.getPackageInfo(name, flags) → a PackageInfo for the
+ * installed package when the name matches, else null.  Returning a single
+ * empty AllocObject for every call meant native Callers saw null
+ * packageName/signatures while the Java PackageManager path (DVM) filled
+ * them — two views of the same installed app. */
 jobject
 android_content_pm_PackageManager_getPackageInfo(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
-   if (args) {
-      (void)va_arg(args, jstring); /* package name */
-      (void)va_arg(args, jint);    /* flags */
-   }
+   if (!args) return NULL;
+   jstring name = va_arg(args, jstring);
+   (void)va_arg(args, jint); /* flags */
+   if (!name) return NULL;
+   const char *want = (*env)->GetStringUTFChars(env, name, NULL);
+   const char *installed = getenv("ANDROID_PACKAGE_NAME");
+   const int match = want && installed && !strcmp(want, installed);
+   if (want) (*env)->ReleaseStringUTFChars(env, name, want);
+   if (!match) return NULL;
    static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "android/content/pm/PackageInfo"))));
+   if (!sv)
+      sv = (*env)->AllocObject(env, (*env)->FindClass(env, "android/content/pm/PackageInfo"));
+   return sv;
+}
+
+/* PackageManager.getApplicationInfo(name, flags).  Native SDKs commonly ask
+ * Context for the PackageManager and then query their own package again.  A
+ * missing binding returned NULL even for the installed application, unlike
+ * Android where it returns a fully populated ApplicationInfo (or throws
+ * NameNotFoundException for an unknown package).  The host JNI boundary has
+ * no pending-exception bridge here, so NULL is the faithful failure value for
+ * an unknown name; the running package returns the same object as Context. */
+jobject
+android_content_pm_PackageManager_getApplicationInfo(JNIEnv *env,
+                                                       jobject object,
+                                                       va_list args)
+{
+   assert(env && object);
+   if (!args) return NULL;
+   jstring name = va_arg(args, jstring);
+   (void)va_arg(args, jint);
+   if (!name) return NULL;
+   const char *want = (*env)->GetStringUTFChars(env, name, NULL);
+   const char *installed = getenv("ANDROID_PACKAGE_NAME");
+   const int match = want && installed && !strcmp(want, installed);
+   if (getenv("LUNARIA_TRACE_HTTP"))
+      fprintf(stderr, "[apk-meta] PackageManager.getApplicationInfo(\"%s\") "
+                      "installed=\"%s\" match=%d\n",
+              want ? want : "<null>", installed ? installed : "<null>", match);
+   if (want) (*env)->ReleaseStringUTFChars(env, name, want);
+   return match ? lunaria_application_info(env) : NULL;
 }
 
 /* PackageInfo.versionCode — read as an int field. */

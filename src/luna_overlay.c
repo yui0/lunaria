@@ -15,16 +15,22 @@
  */
 
 #define LUNA_UI_NO_PLATFORM
+#include <limits.h>
 #define LUNA_UI_IMPLEMENTATION
 #include "luna-ui.h"
 
 #include "luna_overlay.h"
+#include <sys/stat.h>
+#include <stdarg.h>
+#include "lunaria_os.h"
+#include "dvm/dvm.h"
 #include "luna_ime.h"
 #include "arm_exec.h"
 
 #include <dlfcn.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <stdio.h>
@@ -40,7 +46,14 @@ static char *g_status_html;    /* JIT / boot status card */
 static char *g_status_css;
 static char *g_ime_html;       /* the input method's panel, above both */
 static char *g_ime_css;
+static char *g_toast_html;     /* a Toast: over the app, under the IME */
+static char *g_toast_css;
+static char *g_menu_html;      /* the emulator's menu: over everything */
+static char *g_menu_css;
+static luna_overlay_menu_fn g_menu_fn;
+static bool g_menu_modal;
 static bool  g_doc_dirty;
+static char *g_changed_image_path;
 static bool  g_from_files;   /* LUNARIA_UI_TEST names an HTML file */
 static int   g_w, g_h;
 static double g_last_time;
@@ -51,6 +64,20 @@ static double g_last_time;
  * mutex and every luna_* call stays on the presenting thread. */
 static pthread_mutex_t g_doc_lock = PTHREAD_MUTEX_INITIALIZER;
 
+void luna_overlay_image_changed(const char *path)
+{
+   if (!path || !*path) return;
+   const size_t length = strlen(path) + 1;
+   char *copy = malloc(length);
+   if (!copy) return;
+   memcpy(copy, path, length);
+   pthread_mutex_lock(&g_doc_lock);
+   free(g_changed_image_path);
+   g_changed_image_path = copy;
+   pthread_mutex_unlock(&g_doc_lock);
+   luna_overlay_wake();
+}
+
 /* Pointer events arrive on the host's event thread (GLFW polls there) and
  * cannot touch luna-ui's hit-testing state from outside the presenting
  * thread, so they queue here and are replayed at the top of present(). */
@@ -60,7 +87,38 @@ static int g_ptr_count;
 static pthread_mutex_t g_ptr_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static luna_overlay_click_fn g_click_fn;
+static luna_overlay_web_pointer_fn g_web_pointer_fn;
+static luna_overlay_web_char_fn g_web_char_fn;
+static luna_overlay_web_key_fn g_web_key_fn;
+static char g_web_pointer_capture[32];
+static char g_web_focus[32];
 static luna_overlay_frame_fn g_frame_fn;
+
+/* Hosted: the overlay is drawn by the window's compositor (luna_compositor.c)
+ * into the context current on its own thread.  Nothing is borrowed, so there
+ * is no context to switch to and no guest binding to hand back.  wake() tells
+ * the compositor that something it draws changed. */
+static atomic_bool g_hosted;
+static pthread_t   g_host_thread;
+static atomic_bool g_host_thread_set;
+static void (*g_wake_fn)(void);
+
+/* Hosted mode is declared before the compositor's thread exists, so that no
+ * other thread can meanwhile bring luna-ui up in a context of its own: the
+ * GL objects it would create there are not names in the compositor's
+ * context, and drawing with them there drew one texture in place of another
+ * over half the screen (Cross Worlds' notice dialog). */
+void luna_overlay_set_hosted(bool hosted) { atomic_store(&g_hosted, hosted); }
+
+/* The compositor's thread, from its first frame on: the only thread that may
+ * run the overlay once it is hosted. */
+void luna_overlay_bind_host_thread(void)
+{
+   g_host_thread = pthread_self();
+   atomic_store(&g_host_thread_set, true);
+}
+void luna_overlay_set_wake(void (*fn)(void)) { g_wake_fn = fn; }
+void luna_overlay_wake(void) { if (g_wake_fn) g_wake_fn(); }
 
 /* luna-ui's input path asks the app runner to schedule a repaint.  With
  * LUNA_UI_NO_PLATFORM there is no runner, and the symbol is the embedder's to
@@ -269,14 +327,19 @@ static bool overlay_context_create(void)
       if (!eglChooseConfig(dpy, cfg_attrs, &cfg, 1, &n) || n < 1)
          return false;
    }
-   /* Prefer ES2 so luna-ui does not depend on the guest's ES3 context. */
-   const EGLint es2[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
-   EGLContext ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, es2);
-   if (ctx == EGL_NO_CONTEXT && current != EGL_NO_CONTEXT) {
-      EGLint version = 2;
+   /* Match the guest's GLES version when we can.  Preferring ES2 left the
+    * overlay on a context that cannot run the ES3 entry points luna-ui and
+    * the present path use (separate draw/read framebuffer binds, etc.), and
+    * every rebind then logged GL_INVALID_OPERATION (0x0502) on render. */
+   EGLint version = 3;
+   if (current != EGL_NO_CONTEXT)
       (void)eglQueryContext(dpy, current, EGL_CONTEXT_CLIENT_VERSION, &version);
-      const EGLint attrs[] = { EGL_CONTEXT_CLIENT_VERSION, version, EGL_NONE };
-      ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, attrs);
+   if (version < 2) version = 2;
+   const EGLint attrs[] = { EGL_CONTEXT_CLIENT_VERSION, version, EGL_NONE };
+   EGLContext ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, attrs);
+   if (ctx == EGL_NO_CONTEXT && version != 2) {
+      const EGLint es2[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+      ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, es2);
    }
    if (ctx == EGL_NO_CONTEXT) return false;
    g_ov_dpy = dpy;
@@ -450,9 +513,55 @@ static bool overlay_start(int w, int h)
    return true;
 }
 
+/* Which screen this present is drawing.
+ *
+ * The emulator's boot card and the application's frame are not two layers of
+ * one picture: the card is what is on the display *instead of* the game,
+ * while the game has nothing to show.  Compositing them together is what made
+ * the card flicker against the first frames of the title — each of the two
+ * producers swapped its own idea of the buffer, and the guest's document and
+ * the card's animation were also being parsed into one luna-ui tree, so a
+ * change to either restarted the other.
+ *
+ * So: one screen at a time, chosen here, and each present says which one it
+ * is.  The card's own presenter asks for OV_BOOT; everything that composites
+ * over a guest frame asks for OV_APP and is skipped while the card is up. */
+enum { OV_BOOT, OV_APP };
+static int g_screen = OV_APP;
+
+/* The boot card is published.  Deliberately *not* "and no guest window is
+ * up": if the two were decided by different rules the screen could alternate
+ * between them from frame to frame, and each flip is a reparse.  While the
+ * card is published it is the screen; a guest window that arrives meanwhile
+ * is drawn once the card comes down. */
+static bool overlay_boot_up(void)
+{
+   pthread_mutex_lock(&g_doc_lock);
+   const bool up = g_status_html != NULL;
+   pthread_mutex_unlock(&g_doc_lock);
+   return up && !g_failed;
+}
+
+/* True when the two strings say the same thing, NULL included. */
+static bool overlay_same(const char *a, const char *b)
+{
+   if (a == b) return true;
+   if (!a || !b) return false;
+   return strcmp(a, b) == 0;
+}
+
 void luna_overlay_set_document(const char *html, const char *css)
 {
    pthread_mutex_lock(&g_doc_lock);
+   /* Re-emitting the same document is not a change to it.  The Android view
+    * layer republishes on every invalidate, and a reparse throws away the
+    * live tree: ids, click wiring, @keyframes timelines, the caret and the
+    * focus of whatever the user is typing into.  Compare first — a few KB of
+    * strcmp against a full parse and a re-layout. */
+   if (overlay_same(html, g_html) && (!css || overlay_same(css, g_css))) {
+      pthread_mutex_unlock(&g_doc_lock);
+      return;
+   }
    free(g_html);
    g_html = html ? strdup(html) : NULL;
    if (css) {
@@ -461,6 +570,7 @@ void luna_overlay_set_document(const char *html, const char *css)
    }
    g_doc_dirty = true;
    pthread_mutex_unlock(&g_doc_lock);
+   luna_overlay_wake();
 }
 
 void luna_overlay_set_status(const char *html, const char *css)
@@ -475,11 +585,11 @@ void luna_overlay_set_status(const char *html, const char *css)
       free(g_status_css);
       g_status_css = NULL;
    }
-   /* Only dirty the parsed document when the status card is what we would
-    * show — a guest dialog owns the parsed tree and must not be rebuilt from
-    * a progress-bar rewrite. */
-   if (!g_html) g_doc_dirty = true;
+   /* Only dirty the parsed document when the card is the screen on display;
+    * the application screen does not contain it. */
+   if (g_screen == OV_BOOT) g_doc_dirty = true;
    pthread_mutex_unlock(&g_doc_lock);
+   luna_overlay_wake();
 }
 
 void luna_overlay_set_ime(const char *html, const char *css)
@@ -494,11 +604,47 @@ void luna_overlay_set_ime(const char *html, const char *css)
       free(g_ime_css);
       g_ime_css = NULL;
    }
-   /* The panel is composited into the same parsed document, so raising or
-    * dropping it is a reparse either way. */
-   g_doc_dirty = true;
+   /* Raising or dropping the panel changes the application screen's markup,
+    * so that screen is reparsed; the boot screen never contains it. */
+   if (g_screen == OV_APP) g_doc_dirty = true;
    pthread_mutex_unlock(&g_doc_lock);
+   luna_overlay_wake();
 }
+
+void luna_overlay_set_toast(const char *html, const char *css)
+{
+   pthread_mutex_lock(&g_doc_lock);
+   free(g_toast_html);
+   g_toast_html = html ? strdup(html) : NULL;
+   free(g_toast_css);
+   g_toast_css = html && css ? strdup(css) : NULL;
+   if (g_screen == OV_APP) g_doc_dirty = true;
+   pthread_mutex_unlock(&g_doc_lock);
+   luna_overlay_wake();
+}
+
+void luna_overlay_set_menu(const char *html, const char *css, bool modal)
+{
+   pthread_mutex_lock(&g_doc_lock);
+   g_menu_modal = html && modal;
+   free(g_menu_html);
+   g_menu_html = html ? strdup(html) : NULL;
+   free(g_menu_css);
+   g_menu_css = html && css ? strdup(css) : NULL;
+   g_doc_dirty = true;             /* on both screens: the menu is over each */
+   pthread_mutex_unlock(&g_doc_lock);
+   luna_overlay_wake();
+}
+
+bool luna_overlay_menu_showing(void)
+{
+   pthread_mutex_lock(&g_doc_lock);
+   const bool up = g_menu_html != NULL;
+   pthread_mutex_unlock(&g_doc_lock);
+   return up && !g_failed;
+}
+
+void luna_overlay_set_menu_handler(luna_overlay_menu_fn fn) { g_menu_fn = fn; }
 
 bool luna_overlay_status_showing(void)
 {
@@ -513,6 +659,40 @@ void luna_overlay_set_click_handler(luna_overlay_click_fn fn)
    g_click_fn = fn;
 }
 
+void luna_overlay_set_web_pointer_handler(luna_overlay_web_pointer_fn fn)
+{
+   g_web_pointer_fn = fn;
+}
+
+void luna_overlay_set_web_text_handlers(luna_overlay_web_char_fn char_fn,
+                                        luna_overlay_web_key_fn key_fn)
+{
+   g_web_char_fn = char_fn;
+   g_web_key_fn = key_fn;
+}
+
+bool luna_overlay_web_char(uint32_t codepoint)
+{
+   char id[sizeof g_web_focus];
+   pthread_mutex_lock(&g_ptr_lock);
+   memcpy(id, g_web_focus, sizeof id);
+   pthread_mutex_unlock(&g_ptr_lock);
+   if (!id[0] || !g_web_char_fn) return false;
+   g_web_char_fn(id, codepoint);
+   return true;
+}
+
+bool luna_overlay_web_key(int key, int action)
+{
+   char id[sizeof g_web_focus];
+   pthread_mutex_lock(&g_ptr_lock);
+   memcpy(id, g_web_focus, sizeof id);
+   pthread_mutex_unlock(&g_ptr_lock);
+   if (!id[0] || !g_web_key_fn) return false;
+   g_web_key_fn(id, key, action);
+   return true;
+}
+
 void luna_overlay_set_frame_handler(luna_overlay_frame_fn fn)
 {
    g_frame_fn = fn;
@@ -523,6 +703,10 @@ void luna_overlay_set_frame_handler(luna_overlay_frame_fn fn)
 static void overlay_element_clicked(LunaElement *e)
 {
    if (!e || !e->id[0]) return;
+   if (!strncmp(e->id, "luna-menu", 9)) {
+      if (g_menu_fn) g_menu_fn(e->id);
+      return;
+   }
    if (luna_ime_click(e->id)) return;
    if (g_click_fn) g_click_fn(e->id);
 }
@@ -549,6 +733,39 @@ static void overlay_drain_pointer(void)
    g_ptr_count = 0;
    pthread_mutex_unlock(&g_ptr_lock);
    for (int i = 0; i < n; ++i) {
+      if (g_web_pointer_fn) {
+         int hit = g_web_pointer_capture[0]
+            ? luna_get_element_by_id(g_web_pointer_capture)
+            : luna_element_at_point(batch[i].x, batch[i].y);
+         bool web_hit = false;
+         for (int parent = hit; parent >= 0;
+              parent = luna_element_parent(parent)) {
+            LunaElement *e = luna_element_at(parent);
+            if (e && e->id[0] == 'v' &&
+                strstr(e->class_name, "WebView")) {
+               web_hit = true;
+               if (batch[i].action == 1)
+                  snprintf(g_web_pointer_capture,
+                           sizeof g_web_pointer_capture, "%s", e->id);
+               if (batch[i].action == 1) {
+                  pthread_mutex_lock(&g_ptr_lock);
+                  snprintf(g_web_focus, sizeof g_web_focus, "%s", e->id);
+                  pthread_mutex_unlock(&g_ptr_lock);
+               }
+               if (g_web_pointer_capture[0])
+                  g_web_pointer_fn(e->id,
+                     (int)(batch[i].x - e->x), (int)(batch[i].y - e->y),
+                     batch[i].action);
+               break;
+            }
+         }
+         if (batch[i].action == 1 && !web_hit) {
+            pthread_mutex_lock(&g_ptr_lock);
+            g_web_focus[0] = 0;
+            pthread_mutex_unlock(&g_ptr_lock);
+         }
+         if (batch[i].action == 0) g_web_pointer_capture[0] = 0;
+      }
       if (batch[i].action < 0) {
          luna_mouse_move(batch[i].x, batch[i].y);
       } else {
@@ -605,7 +822,8 @@ bool luna_overlay_active(void)
 {
    overlay_maybe_test_card();
    pthread_mutex_lock(&g_doc_lock);
-   bool up = g_html != NULL || g_status_html != NULL || g_ime_html != NULL;
+   bool up = g_html != NULL || g_status_html != NULL || g_ime_html != NULL ||
+             g_toast_html != NULL || g_menu_html != NULL;
    pthread_mutex_unlock(&g_doc_lock);
    return up && !g_failed;
 }
@@ -635,9 +853,24 @@ static pthread_mutex_t g_present_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void overlay_present_locked(int w, int h);
 
-void luna_overlay_present(int w, int h)
+static void overlay_present_screen(int w, int h, int screen)
 {
    if (!luna_overlay_active() || w <= 0 || h <= 0) return;
+   /* The two screens never share a frame.  While the card is up it is the
+    * only thing drawn; a guest swap that arrives meanwhile is presented as
+    * the guest drew it, with nothing of the emulator's on top. */
+   if (screen == OV_APP && overlay_boot_up()) return;
+   /* The emulator's UI has one owner: with a compositor, its thread. */
+   if (atomic_load(&g_hosted) &&
+       (!atomic_load(&g_host_thread_set) ||
+        !pthread_equal(pthread_self(), g_host_thread)))
+      return;
+   if (screen != g_screen) {
+      pthread_mutex_lock(&g_doc_lock);
+      g_screen = screen;
+      g_doc_dirty = true;   /* a different screen is a different document */
+      pthread_mutex_unlock(&g_doc_lock);
+   }
    if (pthread_mutex_trylock(&g_present_lock) != 0) {
       static unsigned long skipped;
       if ((skipped++ % 256) == 0)
@@ -647,6 +880,16 @@ void luna_overlay_present(int w, int h)
    }
    overlay_present_locked(w, h);
    pthread_mutex_unlock(&g_present_lock);
+}
+
+void luna_overlay_present_boot(int w, int h)
+{
+   overlay_present_screen(w, h, OV_BOOT);
+}
+
+void luna_overlay_present(int w, int h)
+{
+   overlay_present_screen(w, h, OV_APP);
 }
 
 static void overlay_present_locked(int w, int h)
@@ -661,6 +904,7 @@ static void overlay_present_locked(int w, int h)
    EGLSurface read = eglGetCurrentSurface(EGL_READ);
    if (dpy == EGL_NO_DISPLAY || draw == EGL_NO_SURFACE) return;
 
+   if (g_hosted) goto bound;
    if (g_ov_ctx == EGL_NO_CONTEXT && !g_failed && !overlay_context_create()) {
       fprintf(stderr, "[overlay] no context — emulator UI disabled\n");
       g_failed = true;
@@ -683,6 +927,12 @@ static void overlay_present_locked(int w, int h)
    }
    /* Previous binding is gone until we restore below. */
    arm_exec_egl_invalidate_current();
+   /* The guest may have left a GL error pending on this share-group / the
+    * previous context.  Drain it so a later overlay_report_gl_errors does not
+    * blame luna-ui for a guest mistake, and so luna-ui does not start with a
+    * sticky INVALID_OPERATION. */
+bound:
+   while (glGetError() != GL_NO_ERROR) { }
    if (prof) { const uint64_t n = overlay_ns();
                g_prof.bind_ns += n - t_mark; t_mark = n; }
 
@@ -694,12 +944,12 @@ static void overlay_present_locked(int w, int h)
          luna_resize((float)w, (float)h);
       }
       pthread_mutex_lock(&g_doc_lock);
-      /* Guest widgets win.  The status card is only the document when nothing
-       * from the Android View layer is up. */
-      const char *html = g_html ? g_html : g_status_html;
-      const char *css  = g_html ? g_css  : g_status_css;
-      const bool status_only =
-         g_html == NULL && g_status_html != NULL && g_ime_html == NULL;
+      /* The boot screen is the card and nothing else; the application screen
+       * is the guest's own widgets with the input method over them.  Which
+       * one this is was decided in overlay_present_screen(). */
+      const bool status_only = g_screen == OV_BOOT && g_status_html != NULL;
+      const char *html = status_only ? g_status_html : g_html;
+      const char *css  = status_only ? g_status_css  : g_css;
       bool reparsed = g_doc_dirty;
       if (g_doc_dirty) {
          g_doc_dirty = false;
@@ -734,9 +984,20 @@ static void overlay_present_locked(int w, int h)
           * over whatever the application has up — including a dialog.  There
           * is one luna-ui document here, so "over" means last: appended after
           * the layer below it, with its own sheet. */
-         if (g_ime_html) {
+         /* A toast is a window of its own too: over the application and its
+          * dialogs, under the input method, and never touchable. */
+         if (g_toast_html && !status_only) {
+            if (g_toast_css) luna_parse_css(g_toast_css);
+            luna_parse_html(g_toast_html);
+         }
+         if (g_ime_html && !status_only) {
             if (g_ime_css) luna_parse_css(g_ime_css);
             luna_parse_html(g_ime_html);
+         }
+         /* The emulator's menu is above every window, the card included. */
+         if (g_menu_html) {
+            if (g_menu_css) luna_parse_css(g_menu_css);
+            luna_parse_html(g_menu_html);
          }
          luna_resize((float)w, (float)h);
          overlay_wire_clicks();
@@ -770,6 +1031,11 @@ static void overlay_present_locked(int w, int h)
             ++parses;
          }
       }
+      if (g_changed_image_path) {
+         luna_invalidate_texture(g_changed_image_path);
+         free(g_changed_image_path);
+         g_changed_image_path = NULL;
+      }
       pthread_mutex_unlock(&g_doc_lock);
       if (prof) { const uint64_t n = overlay_ns();
                   g_prof.parse_ns += n - t_mark; t_mark = n; }
@@ -792,9 +1058,13 @@ static void overlay_present_locked(int w, int h)
        * document's own background is whatever its CSS paints.  The status
        * card is the whole frame before the guest has drawn anything, so it
        * clears to its own ink first — otherwise the previous swap's undefined
-       * back buffer shows through. */
-      glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-      glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+       * back buffer shows through.
+       *
+       * Bind with GL_FRAMEBUFFER, not the ES3 DRAW/READ split.  The overlay
+       * context is created as ES2 so it does not depend on the guest's ES3
+       * context; GL_DRAW_FRAMEBUFFER is not a legal target there and raised
+       * GL_INVALID_OPERATION (0x0502) on every present after a rebind. */
+      glBindFramebuffer(GL_FRAMEBUFFER, 0);
       glViewport(0, 0, w, h);
       if (status_only) {
          glDisable(GL_SCISSOR_TEST);
@@ -828,7 +1098,9 @@ static void overlay_present_locked(int w, int h)
    }
 
    /* Hand the previous binding back. */
-   if (!eglMakeCurrent(dpy, draw, read, prev_ctx))
+   if (g_hosted) {
+      /* The compositor's own context stays current; nothing to restore. */
+   } else if (!eglMakeCurrent(dpy, draw, read, prev_ctx))
       fprintf(stderr, "[overlay] failed to restore previous context (0x%04x)\n",
               (unsigned)eglGetError());
    else if (prev_ctx != EGL_NO_CONTEXT)
@@ -851,8 +1123,10 @@ bool luna_overlay_pointer(double x, double y, int action)
    pthread_mutex_lock(&g_doc_lock);
    bool guest = g_html != NULL;
    bool ime = g_ime_html != NULL;
+   bool menu = g_menu_html != NULL && g_menu_modal;
    pthread_mutex_unlock(&g_doc_lock);
    if (g_failed) return false;
+   if (menu) goto consume;    /* the emulator's menu is modal */
    if (guest) goto consume;   /* a dialog is modal: it takes every touch */
    if (!ime) return false;
    /* The input method is not modal — the application below it keeps working,
@@ -870,7 +1144,8 @@ consume:
       if (taken == 0 || (taken % 64) == 0)
          fprintf(stderr, "[overlay] took pointer %.0f,%.0f action=%d "
                  "(%s) — the guest does not see this touch\n", x, y, action,
-                 guest ? "a guest dialog is up and is modal"
+                 menu ? "the emulator menu is up"
+                 : guest ? "a guest dialog is up and is modal"
                        : "inside the input method's band");
       ++taken;
    }
@@ -882,6 +1157,7 @@ consume:
       ++g_ptr_count;
    }
    pthread_mutex_unlock(&g_ptr_lock);
+   luna_overlay_wake();
    return true;
 }
 
@@ -898,7 +1174,439 @@ void luna_overlay_shutdown(void)
    free(g_status_css);
    free(g_ime_html);
    free(g_ime_css);
+   free(g_toast_html);
+   free(g_toast_css);
+   free(g_menu_html);
+   free(g_menu_css);
+   pthread_mutex_lock(&g_doc_lock);
+   free(g_changed_image_path);
+   g_changed_image_path = NULL;
+   pthread_mutex_unlock(&g_doc_lock);
+   g_toast_html = g_toast_css = NULL;
+   g_menu_html = g_menu_css = NULL;
    g_html = g_css = g_status_html = g_status_css = NULL;
    g_ime_html = g_ime_css = NULL;
    pthread_mutex_unlock(&g_present_lock);
+}
+
+unsigned char *luna_overlay_image_decode(const void *data, size_t len,
+                                         int *w, int *h)
+{
+   int ch = 0;
+   if (!data || !len || len > (size_t)INT_MAX) return NULL;
+   return stbi_load_from_memory((const stbi_uc *)data, (int)len, w, h, &ch, 4);
+}
+
+void luna_overlay_image_free(unsigned char *pixels)
+{
+   stbi_image_free(pixels);
+}
+
+float luna_overlay_text_width(const char *text, float px, bool bold)
+{
+   if (!text || !*text || px <= 0.f) return 0.f;
+   pthread_mutex_lock(&g_present_lock);
+   const bool ready = g_ready;
+   float w = ready ? luna_measure_text(text, px, bold ? 1 : 0) : 0.f;
+   pthread_mutex_unlock(&g_present_lock);
+   if (ready) return w;
+   /* Before luna-ui has its fonts: Latin at about half an em, the rest a
+    * full em, which is the shape of the bundled faces. */
+   for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
+      if ((*p & 0xc0) == 0x80) continue;
+      w += *p < 0x80 ? px * 0.55f : px;
+   }
+   return w;
+}
+
+float luna_overlay_line_height(float px)
+{
+   return luna_line_height(px > 0.f ? px : 14.f);
+}
+
+/* ======================================================================== *
+ * The emulator's menu (right click)
+ * ======================================================================== */
+
+enum { SUB_NONE, SUB_SOUND, SUB_ZOOM, SUB_ENGINE };
+
+#define MENU_W 248
+#define ROW_H 24
+#define SEP_H 11
+#define PAD 5
+#define MAX_DEVICES 16
+
+static pthread_mutex_t g_menu_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool   g_menu_open;
+static double g_menu_x, g_menu_y;
+static int    g_menu_w, g_menu_h;
+static int    g_menu_sub;
+static char   g_menu_dev_name[MAX_DEVICES][128], g_menu_dev_desc[MAX_DEVICES][128];
+static int    g_menu_ndev;
+static char   g_menu_notice[256];
+static double g_menu_notice_until;
+
+/* macOS context-menu look: a translucent vibrancy panel, 13px system text,
+ * rounded selection in the accent blue, hairline separators. */
+static const char g_menu_style[] =
+   "#luna-menu-backdrop{position:absolute;left:0;top:0;right:0;bottom:0;"
+   "background:transparent;}"
+   ".lm{position:absolute;width:" "248" "px;padding:5px;border-radius:10px;"
+   "background:rgba(242,242,246,0.80);backdrop-filter:blur(24px) saturate(1.8);"
+   "border:1px solid rgba(0,0,0,0.14);box-shadow:0 12px 36px rgba(0,0,0,0.30);"
+   "font-size:13px;color:#1d1d1f;}"
+   ".li{position:relative;height:24px;line-height:24px;padding:0 12px 0 24px;"
+   "border-radius:5px;white-space:nowrap;overflow:hidden;cursor:pointer;}"
+   ".li:hover{background:#0a64d8;color:#ffffff;}"
+   ".li.dis{color:#a1a1a6;cursor:default;}"
+   ".li.dis:hover{background:transparent;color:#a1a1a6;}"
+   /* the checkmark is drawn, not a glyph: every font has a box */
+   ".ck{display:block;position:absolute;left:10px;top:6px;width:4px;height:9px;"
+   "border-right:2px solid #1d1d1f;border-bottom:2px solid #1d1d1f;transform:rotate(45deg);}"
+   ".li:hover .ck{border-right:2px solid #ffffff;border-bottom:2px solid #ffffff;}"
+   ".kb{position:absolute;right:12px;top:0;color:#8e8e93;font-size:12px;}"
+   ".li:hover .kb{color:#ffffff;}"
+   ".sep{height:1px;margin:5px 10px;background:rgba(0,0,0,0.13);}"
+   ".hd{height:22px;line-height:22px;padding:0 12px;font-size:11px;"
+   "font-weight:bold;color:#8e8e93;}"
+   ".hud{position:absolute;left:50%;top:18px;transform:translate(-50%,0);"
+   "padding:8px 16px;border-radius:10px;background:rgba(30,30,32,0.78);"
+   "backdrop-filter:blur(20px);color:#ffffff;font-size:13px;white-space:nowrap;"
+   "pointer-events:none;}";
+
+static double menu_now(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+struct menu_buf { char *p; size_t len, cap; };
+
+static void menu_put(struct menu_buf *b, const char *s)
+{
+   size_t n = strlen(s);
+   if (b->len + n + 1 > b->cap) {
+      size_t cap = b->cap ? b->cap * 2 : 4096;
+      while (cap < b->len + n + 1) cap *= 2;
+      char *g = realloc(b->p, cap);
+      if (!g) return;
+      b->p = g;
+      b->cap = cap;
+   }
+   memcpy(b->p + b->len, s, n + 1);
+   b->len += n;
+}
+
+static void menu_putf(struct menu_buf *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void menu_putf(struct menu_buf *b, const char *fmt, ...)
+{
+   char tmp[1024];
+   va_list ap;
+   va_start(ap, fmt);
+   vsnprintf(tmp, sizeof tmp, fmt, ap);
+   va_end(ap);
+   menu_put(b, tmp);
+}
+
+static void menu_put_text(struct menu_buf *b, const char *s)
+{
+   char one[2] = { 0, 0 };
+   for (; *s; ++s) {
+      if (*s == '<') menu_put(b, "&lt;");
+      else if (*s == '>') menu_put(b, "&gt;");
+      else if (*s == '&') menu_put(b, "&amp;");
+      else if (*s == '"') menu_put(b, "&quot;");
+      else { one[0] = *s; menu_put(b, one); }
+   }
+}
+
+/* One row.  id NULL: disabled.  check: a ✓ in the gutter.  key: the
+ * right-hand hint (a shortcut, a value, or ▸ for a submenu). */
+static int menu_item(struct menu_buf *b, const char *id, const char *label, bool check, const char *key)
+{
+   if (id) menu_putf(b, "<div id=\"luna-menu-%s\" class=\"li\">", id);
+   else menu_put(b, "<div class=\"li dis\">");
+   if (check) menu_put(b, "<span class=\"ck\"></span>");
+   menu_put_text(b, label);
+   if (key && *key) { menu_put(b, "<span class=\"kb\">"); menu_put_text(b, key); menu_put(b, "</span>"); }
+   menu_put(b, "</div>");
+   return ROW_H;
+}
+
+static int menu_sep(struct menu_buf *b) { menu_put(b, "<div class=\"sep\"></div>"); return SEP_H; }
+
+static int menu_header(struct menu_buf *b, const char *label)
+{
+   menu_put(b, "<div class=\"hd\">");
+   menu_put_text(b, label);
+   menu_put(b, "</div>");
+   return 22;
+}
+
+static int menu_clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+/* The main panel's rows; returns its height and the top of each submenu's
+ * parent row. */
+static int menu_main_rows(struct menu_buf *b, int *sound_y, int *zoom_y, int *engine_y)
+{
+   int y = PAD;
+   char v[64];
+   y += menu_item(b, "shot", "Take Screenshot", false, "F12");
+   y += menu_item(b, "paste", "Paste Clipboard as Typing", false, NULL);
+   y += menu_sep(b);
+   y += menu_item(b, "back", "Back", false, "Esc");
+   y += menu_sep(b);
+   const int vol = (int)(luna_os_audio_volume() * 100.0f + 0.5f);
+   snprintf(v, sizeof v, "%d%%", vol);
+   y += menu_item(b, "volup", "Volume Up", false, v);
+   y += menu_item(b, "voldown", "Volume Down", false, NULL);
+   y += menu_item(b, "mute", "Mute", luna_os_audio_muted() != 0, NULL);
+   *sound_y = y;
+   y += menu_item(b, "sub-sound", "Sound Output", false, "\xe2\x80\xba");
+   y += menu_sep(b);
+   const float z = dvm_webview_zoom();
+   snprintf(v, sizeof v, "%d%%  \xe2\x80\xba", (int)(z * 100.0f + 0.5f));
+   *zoom_y = y;
+   y += menu_item(b, "sub-zoom", "WebView Zoom", false, v);
+   *engine_y = y;
+   y += menu_item(b, "sub-engine", "WebView Engine", false, "\xe2\x80\xba");
+   y += menu_item(b, dvm_webview_count() ? "reload" : NULL, "Reload WebView", false, NULL);
+   y += menu_sep(b);
+   y += menu_item(b, "full", arm_exec_is_fullscreen() ? "Exit Full Screen" : "Enter Full Screen",
+             false, NULL);
+   y += menu_item(b, "quit", "Quit Lunaria", false, NULL);
+   return y + PAD;
+}
+
+static int menu_sub_rows(struct menu_buf *b)
+{
+   int y = PAD;
+   char id[32];
+   if (g_menu_sub == SUB_SOUND) {
+      y += menu_header(b, "SOUND OUTPUT");
+      const char *cur = luna_os_audio_device();
+      for (int i = 0; i < g_menu_ndev; ++i) {
+         snprintf(id, sizeof id, "dev-%d", i);
+         y += menu_item(b, id, g_menu_dev_desc[i], cur && !strcmp(cur, g_menu_dev_name[i]), NULL);
+      }
+      if (!g_menu_ndev) y += menu_item(b, NULL, "No output devices", false, NULL);
+   } else if (g_menu_sub == SUB_ZOOM) {
+      static const int pct[] = { 75, 100, 125, 150, 175, 200, 250, 300 };
+      const int cur = (int)(dvm_webview_zoom() * 100.0f + 0.5f);
+      y += menu_header(b, "WEBVIEW ZOOM");
+      y += menu_item(b, "zoom-0", "Device Density", false, NULL);
+      y += menu_sep(b);
+      for (size_t i = 0; i < sizeof pct / sizeof pct[0]; ++i) {
+         char label[16];
+         snprintf(id, sizeof id, "zoom-%d", pct[i] * 10);
+         snprintf(label, sizeof label, "%d%%", pct[i]);
+         y += menu_item(b, id, label, cur == pct[i], NULL);
+      }
+   } else if (g_menu_sub == SUB_ENGINE) {
+      static const char *const names[] = { "auto", "chrome", "luna", "off" };
+      static const char *const labels[] = { "Automatic", "Chrome / Chromium",
+                                            "luna-browser", "Off" };
+      const char *cur = dvm_webview_engine();
+      y += menu_header(b, "WEBVIEW ENGINE");
+      for (int i = 0; i < 4; ++i) {
+         snprintf(id, sizeof id, "eng-%s", names[i]);
+         y += menu_item(b, id, labels[i], cur && !strcmp(cur, names[i]), NULL);
+      }
+   }
+   return y + PAD;
+}
+
+/* Publishes the current state; g_menu_lock held. */
+static void menu_publish_locked(void)
+{
+   if (!g_menu_open) {
+      if (g_menu_notice[0]) {
+         struct menu_buf b = { 0 };
+         menu_put(&b, "<div class=\"hud\">");
+         menu_put_text(&b, g_menu_notice);
+         menu_put(&b, "</div>");
+         luna_overlay_set_menu(b.p, g_menu_style, false);
+         free(b.p);
+      } else luna_overlay_set_menu(NULL, NULL, false);
+      return;
+   }
+   struct menu_buf rows = { 0 }, sub = { 0 }, doc = { 0 };
+   int sound_y = 0, zoom_y = 0, engine_y = 0;
+   const int h = menu_main_rows(&rows, &sound_y, &zoom_y, &engine_y);
+   const int mx = menu_clampi((int)g_menu_x, 4, g_menu_w - MENU_W - 4 > 4 ? g_menu_w - MENU_W - 4 : 4);
+   const int my = menu_clampi((int)g_menu_y, 4, g_menu_h - h - 4 > 4 ? g_menu_h - h - 4 : 4);
+   menu_put(&doc, "<div id=\"luna-menu-backdrop\"></div>");
+   menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;\">", mx, my);
+   menu_put(&doc, rows.p ? rows.p : "");
+   menu_put(&doc, "</div>");
+   if (g_menu_sub != SUB_NONE) {
+      const int parent_y = g_menu_sub == SUB_SOUND ? sound_y : g_menu_sub == SUB_ZOOM ? zoom_y : engine_y;
+      const int sh = menu_sub_rows(&sub);
+      /* To the right of the menu, the parent row at its first item; to the
+       * left when that would leave the surface. */
+      int sx = mx + MENU_W - 4;
+      if (sx + MENU_W > g_menu_w - 4) sx = mx - MENU_W + 4;
+      const int sy = menu_clampi(my + parent_y - PAD - 22, 4, g_menu_h - sh - 4 > 4 ? g_menu_h - sh - 4 : 4);
+      menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;\">", sx, sy);
+      menu_put(&doc, sub.p ? sub.p : "");
+      menu_put(&doc, "</div>");
+   }
+   if (g_menu_notice[0]) {
+      menu_put(&doc, "<div class=\"hud\">");
+      menu_put_text(&doc, g_menu_notice);
+      menu_put(&doc, "</div>");
+   }
+   luna_overlay_set_menu(doc.p, g_menu_style, true);
+   free(rows.p);
+   free(sub.p);
+   free(doc.p);
+}
+
+static void menu_notice_locked(const char *msg)
+{
+   snprintf(g_menu_notice, sizeof g_menu_notice, "%s", msg);
+   g_menu_notice_until = menu_now() + 2.5;
+}
+
+/* The clipboard, typed into whatever has the text focus: the emulator's
+ * input method, or a WebView page. */
+static int menu_paste_clipboard(void)
+{
+   char *text = arm_exec_clipboard_get();
+   if (!text) return -1;
+   const bool ime = luna_ime_active();
+   int typed = 0;
+   for (const unsigned char *p = (const unsigned char *)text; *p; ) {
+      uint32_t cp = *p;
+      int n = cp >= 0xf0 ? 3 : cp >= 0xe0 ? 2 : cp >= 0xc0 ? 1 : 0;
+      cp &= n == 3 ? 7u : n == 2 ? 15u : n == 1 ? 31u : 127u;
+      ++p;
+      while (n-- > 0 && (*p & 0xc0) == 0x80) cp = (cp << 6) | (*p++ & 63u);
+      if (cp == '\r') continue;
+      if (ime) { luna_ime_char(cp); ++typed; }
+      else if (luna_overlay_web_char(cp)) ++typed;
+      else break;
+   }
+   free(text);
+   return typed;
+}
+
+static void menu_screenshot_path(char *out, size_t cap)
+{
+   const char *home = getenv("HOME");
+   char dir[512];
+   struct stat st;
+   snprintf(dir, sizeof dir, "%s/Pictures", home && *home ? home : ".");
+   if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode))
+      snprintf(dir, sizeof dir, "%s", home && *home ? home : ".");
+   time_t t = time(NULL);
+   struct tm tm;
+   localtime_r(&t, &tm);
+   snprintf(out, cap, "%s/Lunaria %04d-%02d-%02d %02d.%02d.%02d.png", dir,
+            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+}
+
+static void menu_clicked(const char *id)
+{
+   if (strncmp(id, "luna-menu", 9)) return;
+   id += 9;
+   if (*id == '-') ++id;
+   pthread_mutex_lock(&g_menu_lock);
+   bool keep_open = false;
+   if (!strcmp(id, "backdrop")) {
+      /* a click outside: close (a submenu first) */
+      if (g_menu_sub != SUB_NONE) { g_menu_sub = SUB_NONE; keep_open = true; }
+   } else if (!strcmp(id, "shot")) {
+      char path[600];
+      menu_screenshot_path(path, sizeof path);
+      arm_exec_request_screenshot(path);
+      const char *base = strrchr(path, '/');
+      char msg[256];
+      snprintf(msg, sizeof msg, "Screenshot saved: %s", base ? base + 1 : path);
+      menu_notice_locked(msg);
+   } else if (!strcmp(id, "paste")) {
+      pthread_mutex_unlock(&g_menu_lock);
+      const int typed = menu_paste_clipboard();
+      pthread_mutex_lock(&g_menu_lock);
+      if (typed <= 0) menu_notice_locked("No text field has the focus");
+   } else if (!strcmp(id, "back")) {
+      arm_exec_android_key(4 /* AKEYCODE_BACK */);
+   } else if (!strcmp(id, "volup") || !strcmp(id, "voldown")) {
+      float v = luna_os_audio_volume() + (id[3] == 'u' ? 0.1f : -0.1f);
+      luna_os_audio_set_volume(v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v);
+      if (luna_os_audio_muted()) luna_os_audio_set_muted(0);
+      keep_open = true;
+   } else if (!strcmp(id, "mute")) {
+      luna_os_audio_set_muted(!luna_os_audio_muted());
+      menu_notice_locked(luna_os_audio_muted() ? "Sound muted" : "Sound on");
+   } else if (!strncmp(id, "sub-", 4)) {
+      const int sub = !strcmp(id + 4, "sound") ? SUB_SOUND : !strcmp(id + 4, "zoom") ? SUB_ZOOM
+                    : SUB_ENGINE;
+      g_menu_sub = g_menu_sub == sub ? SUB_NONE : sub;
+      if (g_menu_sub == SUB_SOUND) g_menu_ndev = luna_os_audio_devices(g_menu_dev_name, g_menu_dev_desc, MAX_DEVICES);
+      keep_open = true;
+   } else if (!strncmp(id, "dev-", 4)) {
+      const int i = atoi(id + 4);
+      if (i >= 0 && i < g_menu_ndev) {
+         char msg[256];
+         if (luna_os_audio_select_device(g_menu_dev_name[i]) == 0)
+            snprintf(msg, sizeof msg, "Sound output: %s", g_menu_dev_desc[i]);
+         else snprintf(msg, sizeof msg, "Cannot use %s", g_menu_dev_desc[i]);
+         menu_notice_locked(msg);
+      }
+   } else if (!strncmp(id, "zoom-", 5)) {
+      dvm_webview_set_zoom((float)atoi(id + 5) / 1000.0f);
+      char msg[64];
+      snprintf(msg, sizeof msg, "WebView zoom %d%%", (int)(dvm_webview_zoom() * 100.0f + 0.5f));
+      menu_notice_locked(msg);
+   } else if (!strncmp(id, "eng-", 4)) {
+      dvm_webview_set_engine(id + 4);
+      char msg[64];
+      snprintf(msg, sizeof msg, "WebView engine: %s", id + 4);
+      menu_notice_locked(msg);
+   } else if (!strcmp(id, "reload")) {
+      dvm_webview_reload();
+   } else if (!strcmp(id, "full")) {
+      arm_exec_toggle_fullscreen();
+   } else if (!strcmp(id, "quit")) {
+      arm_exec_request_quit();
+   } else keep_open = true;
+   g_menu_open = keep_open;
+   if (!g_menu_open) g_menu_sub = SUB_NONE;
+   menu_publish_locked();
+   pthread_mutex_unlock(&g_menu_lock);
+}
+
+void luna_menu_open(double x, double y, int w, int h)
+{
+   luna_overlay_set_menu_handler(menu_clicked);
+   pthread_mutex_lock(&g_menu_lock);
+   g_menu_open = true;
+   g_menu_sub = SUB_NONE;
+   g_menu_x = x;
+   g_menu_y = y;
+   g_menu_w = w > 0 ? w : 1024;
+   g_menu_h = h > 0 ? h : 576;
+   menu_publish_locked();
+   pthread_mutex_unlock(&g_menu_lock);
+}
+
+void luna_menu_close(void)
+{
+   pthread_mutex_lock(&g_menu_lock);
+   g_menu_open = false;
+   g_menu_sub = SUB_NONE;
+   menu_publish_locked();
+   pthread_mutex_unlock(&g_menu_lock);
+}
+
+void luna_menu_tick(void)
+{
+   pthread_mutex_lock(&g_menu_lock);
+   if (g_menu_notice[0] && menu_now() >= g_menu_notice_until) {
+      g_menu_notice[0] = '\0';
+      menu_publish_locked();
+   }
+   pthread_mutex_unlock(&g_menu_lock);
 }

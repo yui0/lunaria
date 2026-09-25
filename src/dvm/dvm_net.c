@@ -14,7 +14,10 @@
 #include "dvm/dvm_net.h"
 
 #include <errno.h>
+#include <arpa/inet.h>
 #include <netdb.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +30,19 @@
 #include <openssl/ssl.h>
 
 #define HTTP_MAX_REDIRECTS 5
+
+/* OpenSSL writes to the host socket without MSG_NOSIGNAL.  A peer closing an
+ * HTTP/2 connection must be reported to Java as an I/O error, not terminate
+ * the emulator with the host's default SIGPIPE action.  Guest signal state is
+ * maintained separately by the ARM runtime. */
+static pthread_once_t host_sigpipe_once = PTHREAD_ONCE_INIT;
+static void ignore_host_sigpipe(void)
+{
+   struct sigaction action = { 0 };
+   action.sa_handler = SIG_IGN;
+   sigemptyset(&action.sa_mask);
+   (void)sigaction(SIGPIPE, &action, NULL);
+}
 
 /* ------------------------------------------------------------------------ *
  * A stream that is either a bare fd or an SSL session over one
@@ -128,7 +144,9 @@ struct url {
    bool tls;
    char host[256];
    char port[8];
-   char path[4096];
+   /* Graph API / Play URLs with application meta-data in the query routinely
+    * exceed 4 KiB; keep room for those legitimate Android request lines. */
+   char path[16384];
 };
 
 static bool url_parse(const char *s, struct url *u)
@@ -195,8 +213,10 @@ static bool url_resolve(const struct url *base, const char *loc, char *out,
       return (size_t)snprintf(out, outsz, "%s://%s%s", scheme, hostport,
                               loc) < outsz;
 
-   /* Relative to the base's directory. */
-   char dir[4096];
+   /* Relative to the base's directory.  Same capacity as url.path: a redirect
+    * whose base path already fills the URL must not be truncated here. */
+   char dir[sizeof base->path];
+   if (strlen(base->path) >= sizeof dir) return false;
    snprintf(dir, sizeof dir, "%s", base->path);
    char *slash = strrchr(dir, '/');
    if (slash) slash[1] = '\0';
@@ -367,46 +387,64 @@ static const char *header_get(const struct dvm_http_response *r,
    return NULL;
 }
 
-/* Decodes a chunked body in place of `src`, appending to `out`. */
-/* Decode the chunked transfer coding.  `stop_at` receives the offset the
- * decoder gave up at, so a caller can say whether the framing was wrong or the
- * body simply arrived short — the two look identical from the outside.
+/* Decode the chunked transfer coding.  stop_at identifies the byte at which
+ * framing is incomplete or invalid.
  *
  * The size line is parsed here rather than with strtoul(): `src` is a length-
  * counted buffer with no NUL, which strtoul() may read past, and its answer
  * for a line that holds no digits at all is 0 — the same answer as the
  * last-chunk marker.  A body whose framing went wrong therefore used to decode
  * as a short but perfectly valid one, with nothing said about it. */
-static bool dechunk(const uint8_t *src, size_t len, struct buf *out,
-                    size_t *stop_at)
+/* 1: complete body; 0: need another read; -1: invalid framing. */
+static int dechunk(const uint8_t *src, size_t len, struct buf *out,
+                   size_t *stop_at)
 {
    size_t p = 0;
    for (;;) {
       /* chunk-size [;ext] CRLF */
       size_t line = p;
-      while (p < len && src[p] != '\n') ++p;
-      if (p >= len) { *stop_at = line; return false; }
+      while (p < len && src[p] != '\r') ++p;
+      if (p >= len) { *stop_at = line; return 0; }
+      if (p + 1 >= len) { *stop_at = line; return 0; }
+      if (src[p + 1] != '\n') { *stop_at = p; return -1; }
       size_t sz = 0;
       int digits = 0;
+      bool extension = false;
       for (size_t q = line; q < p; ++q) {
          unsigned c = src[q], d;
+         if (extension) continue;
          if (c >= '0' && c <= '9')      d = c - '0';
          else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
          else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
-         else if (!digits && (c == ' ' || c == '\t')) continue;
-         else break;   /* ';' extension, CR, or trailing junk */
-         if (sz > (SIZE_MAX - d) / 16) { *stop_at = line; return false; }
+         else if (digits && (c == ';' || c == ' ' || c == '\t')) {
+            extension = true;
+            continue;
+         } else { *stop_at = q; return -1; }
+         if (sz > (SIZE_MAX - d) / 16) { *stop_at = line; return -1; }
          sz = sz * 16 + d;
          ++digits;
       }
-      if (!digits) { *stop_at = line; return false; }
-      ++p;
-      if (!sz) return true;   /* last-chunk; trailers carry nothing we read */
-      if (p + sz > len) { *stop_at = p; return false; }
-      if (!buf_add(out, src + p, sz)) { *stop_at = p; return false; }
+      if (!digits) { *stop_at = line; return -1; }
+      p += 2;
+      if (!sz) {
+         for (;;) {
+            size_t trailer = p;
+            while (p < len && src[p] != '\r') ++p;
+            if (p + 1 >= len) { *stop_at = trailer; return 0; }
+            if (src[p + 1] != '\n') { *stop_at = p; return -1; }
+            p += 2;
+            if (p == trailer + 2) { *stop_at = p; return 1; }
+         }
+      }
+      if (sz > len - p) { *stop_at = p; return 0; }
+      if (!buf_add(out, src + p, sz)) { *stop_at = p; return -1; }
       p += sz;
-      /* trailing CRLF */
-      while (p < len && (src[p] == '\r' || src[p] == '\n')) ++p;
+      if (p + 1 >= len) { *stop_at = p; return 0; }
+      if (src[p] != '\r' || src[p + 1] != '\n') {
+         *stop_at = p;
+         return -1;
+      }
+      p += 2;
    }
 }
 
@@ -717,8 +755,8 @@ bool dvm_http_slurp(struct dvm_http_response *r)
    if (r->body) return true;
 
    struct buf all = { 0 };
-   /* Chunked bodies have to be collected raw and decoded afterwards, so this
-    * path reads the connection directly rather than through dvm_http_read. */
+   /* Chunked framing is collected until its final chunk, independent of when
+    * the server decides to close the HTTP/1.1 connection. */
    if (r->pre_pos < r->pre_len &&
        !buf_add(&all, r->pre + r->pre_pos, r->pre_len - r->pre_pos)) {
       free(all.p);
@@ -726,7 +764,38 @@ bool dvm_http_slurp(struct dvm_http_response *r)
    }
    r->pre_pos = r->pre_len;
    uint8_t chunk[16384];
+   bool complete = false;
+   bool eof = false;
    while (r->stream) {
+      if (r->chunked) {
+         struct buf decoded = { 0 };
+         size_t stop = 0;
+         int state = dechunk(all.p, all.len, &decoded, &stop);
+         if (state == 1) {
+            if (!decoded.p) {
+               decoded.p = malloc(1);
+               if (!decoded.p) {
+                  snprintf(r->error, sizeof r->error, "out of memory");
+                  http_stream_done(r);
+                  free(all.p);
+                  return false;
+               }
+               decoded.p[0] = '\0';
+            }
+            r->body = decoded.p;
+            r->body_len = decoded.len;
+            complete = true;
+            break;
+         }
+         free(decoded.p);
+         if (state < 0) {
+            snprintf(r->error, sizeof r->error,
+                     "malformed chunked body at byte %zu", stop);
+            http_stream_done(r);
+            free(all.p);
+            return false;
+         }
+      }
       if (!r->chunked && r->content_length >= 0 &&
           (long long)all.len >= r->content_length)
          break;
@@ -738,7 +807,7 @@ bool dvm_http_slurp(struct dvm_http_response *r)
          free(all.p);
          return false;
       }
-      if (got == 0) { http_stream_done(r); break; }
+      if (got == 0) { eof = true; http_stream_done(r); break; }
       if (!buf_add(&all, chunk, (size_t)got)) {
          http_stream_done(r);
          free(all.p);
@@ -748,14 +817,12 @@ bool dvm_http_slurp(struct dvm_http_response *r)
    http_stream_done(r);
 
    if (r->chunked) {
-      struct buf dec = { 0 };
-      size_t stop = 0;
-      if (!dechunk(all.p, all.len, &dec, &stop))
-         fprintf(stderr, "[http] malformed chunked body: gave up at byte %zu "
-                 "of %zu received, %zu decoded\n", stop, all.len, dec.len);
       free(all.p);
-      r->body = dec.p;
-      r->body_len = dec.len;
+      if (!complete) {
+         snprintf(r->error, sizeof r->error,
+                  "%s before final HTTP chunk", eof ? "EOF" : "read ended");
+         return false;
+      }
    } else {
       if (r->content_length >= 0 && (long long)all.len > r->content_length)
          all.len = (size_t)r->content_length;
@@ -779,10 +846,11 @@ bool dvm_http_perform(const char *method, const char *url,
                       const uint8_t *body, size_t body_len, int timeout_ms,
                       bool follow_redirects, struct dvm_http_response *out)
 {
+   (void)pthread_once(&host_sigpipe_once, ignore_host_sigpipe);
    memset(out, 0, sizeof *out);
    out->status = -1;
 
-   char cur[4608];
+   char cur[16896];
    if (strlen(url) >= sizeof cur) {
       snprintf(out->error, sizeof out->error, "URL too long");
       return false;
@@ -857,4 +925,435 @@ void dvm_http_response_free(struct dvm_http_response *r)
    r->body_read = 0;
    r->content_length = -1;
    r->chunked = false;
+}
+
+/* ------------------------------------------------------------------------ *
+ * Stream sockets (java.net.Socket / SSLSocket)
+ * ------------------------------------------------------------------------ */
+
+#include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <openssl/x509v3.h>
+
+/* A connect that honours Socket.connect(address, timeout): non-blocking
+ * connect, then poll for writability for at most timeout_ms. */
+static int bind_local(int fd, int family, const char *local_addr,
+                      int local_port)
+{
+   if ((!local_addr || !*local_addr) && local_port <= 0) return 0;
+   struct sockaddr_storage ss;
+   memset(&ss, 0, sizeof ss);
+   socklen_t sl;
+   if (family == AF_INET6) {
+      struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&ss;
+      a6->sin6_family = AF_INET6;
+      a6->sin6_port = htons((uint16_t)local_port);
+      a6->sin6_addr = in6addr_any;
+      if (local_addr && *local_addr &&
+          inet_pton(AF_INET6, local_addr, &a6->sin6_addr) != 1) {
+         errno = EADDRNOTAVAIL;
+         return -1;
+      }
+      sl = sizeof *a6;
+   } else {
+      struct sockaddr_in *a4 = (struct sockaddr_in *)&ss;
+      a4->sin_family = AF_INET;
+      a4->sin_port = htons((uint16_t)local_port);
+      a4->sin_addr.s_addr = htonl(INADDR_ANY);
+      if (local_addr && *local_addr &&
+          inet_pton(AF_INET, local_addr, &a4->sin_addr) != 1) {
+         errno = EADDRNOTAVAIL;
+         return -1;
+      }
+      sl = sizeof *a4;
+   }
+   return bind(fd, (struct sockaddr *)&ss, sl);
+}
+
+static int connect_one(const struct addrinfo *a, const char *local_addr,
+                       int local_port, int timeout_ms)
+{
+   int fd = socket(a->ai_family, a->ai_socktype | SOCK_CLOEXEC, a->ai_protocol);
+   if (fd < 0) return -1;
+   if (bind_local(fd, a->ai_family, local_addr, local_port) < 0) {
+      int e = errno;
+      close(fd);
+      errno = e;
+      return -1;
+   }
+   if (timeout_ms <= 0) {
+      if (!connect(fd, a->ai_addr, a->ai_addrlen)) return fd;
+      int e = errno;
+      close(fd);
+      errno = e;
+      return -1;
+   }
+   int fl = fcntl(fd, F_GETFL, 0);
+   fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+   int rc = connect(fd, a->ai_addr, a->ai_addrlen);
+   if (rc < 0 && errno == EINPROGRESS) {
+      struct pollfd p = { .fd = fd, .events = POLLOUT };
+      int pr;
+      do pr = poll(&p, 1, timeout_ms); while (pr < 0 && errno == EINTR);
+      if (pr == 0) {
+         close(fd);
+         errno = ETIMEDOUT;
+         return -1;
+      }
+      int soerr = 0;
+      socklen_t sl = sizeof soerr;
+      if (pr < 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) < 0 ||
+          soerr) {
+         close(fd);
+         errno = soerr ? soerr : errno;
+         return -1;
+      }
+      rc = 0;
+   }
+   if (rc < 0) {
+      int e = errno;
+      close(fd);
+      errno = e;
+      return -1;
+   }
+   fcntl(fd, F_SETFL, fl);
+   return fd;
+}
+
+int dvm_sock_connect(const char *host, int port, const char *local_addr,
+                     int local_port, int timeout_ms, char *err, size_t errsz)
+{
+   char portstr[8];
+   snprintf(portstr, sizeof portstr, "%d", port);
+   struct addrinfo hints = { 0 }, *res = NULL;
+   hints.ai_family = AF_UNSPEC;
+   hints.ai_socktype = SOCK_STREAM;
+   int rc = getaddrinfo(host, portstr, &hints, &res);
+   if (rc || !res) {
+      snprintf(err, errsz, "Unable to resolve host \"%s\": %s", host,
+               gai_strerror(rc));
+      errno = EHOSTUNREACH;
+      return -1;
+   }
+   int fd = -1, last = ECONNREFUSED;
+   for (int pass = 0; pass < 2 && fd < 0; ++pass)
+      for (struct addrinfo *a = res; a && fd < 0; a = a->ai_next) {
+         const bool v4 = a->ai_family == AF_INET;
+         if (v4 != (pass == 0)) continue;
+         fd = connect_one(a, local_addr, local_port, timeout_ms);
+         if (fd < 0) last = errno;
+      }
+   freeaddrinfo(res);
+   if (fd < 0) {
+      snprintf(err, errsz, "failed to connect to %s (port %d): %s", host, port,
+               strerror(last));
+      errno = last;
+   }
+   return fd;
+}
+
+void dvm_sock_set_timeout(int fd, int timeout_ms)
+{
+   if (fd < 0) return;
+   struct timeval tv = {
+      .tv_sec = timeout_ms > 0 ? timeout_ms / 1000 : 0,
+      .tv_usec = timeout_ms > 0 ? (timeout_ms % 1000) * 1000 : 0,
+   };
+   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+}
+
+/* One TLS session.  HTTP/2 reads a connection on one thread while others
+ * write it, and an SSL object must not be entered by two threads at once, so
+ * every SSL_* call on it takes `mu`.  Waiting for the socket happens outside
+ * the lock, in poll(): after the handshake the fd is non-blocking, and a
+ * reader that would block releases the session before it sleeps. */
+struct dvm_tls {
+   SSL_CTX *ctx;
+   SSL *ssl;
+   int fd;
+   pthread_mutex_t mu;
+};
+
+/* Every suite the library offers, by IANA name.  Built once from a default
+ * client context: that is what SSLSocket.getSupportedCipherSuites() means. */
+static const char **g_tls_ciphers;
+
+const char *const *dvm_tls_supported_ciphers(void)
+{
+   if (g_tls_ciphers) return g_tls_ciphers;
+   SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+   SSL *ssl = ctx ? SSL_new(ctx) : NULL;
+   STACK_OF(SSL_CIPHER) *sk = ssl ? SSL_get1_supported_ciphers(ssl) : NULL;
+   int n = sk ? sk_SSL_CIPHER_num(sk) : 0;
+   const char **list = calloc((size_t)n + 1, sizeof *list);
+   int k = 0;
+   for (int i = 0; list && i < n; ++i) {
+      const char *std = SSL_CIPHER_standard_name(sk_SSL_CIPHER_value(sk, i));
+      if (std) list[k++] = strdup(std);
+   }
+   if (sk) sk_SSL_CIPHER_free(sk);
+   if (ssl) SSL_free(ssl);
+   if (ctx) SSL_CTX_free(ctx);
+   static const char *empty[] = { NULL };
+   g_tls_ciphers = list ? list : empty;
+   return g_tls_ciphers;
+}
+
+/* Maps the caller's IANA names onto what OpenSSL configures: TLS 1.3 suites
+ * go through SSL_set_ciphersuites() by their (identical) names, older ones
+ * through SSL_set_cipher_list() by OpenSSL's own names. */
+static void tls_apply_ciphers(SSL *ssl, const char *const *want, int nwant)
+{
+   STACK_OF(SSL_CIPHER) *sk = SSL_get_ciphers(ssl);
+   if (!sk || !want || nwant <= 0) return;
+   char l12[4096] = "", l13[1024] = "";
+   for (int i = 0; i < sk_SSL_CIPHER_num(sk); ++i) {
+      const SSL_CIPHER *c = sk_SSL_CIPHER_value(sk, i);
+      const char *std = SSL_CIPHER_standard_name(c);
+      if (!std) continue;
+      bool wanted = false;
+      for (int j = 0; j < nwant && !wanted; ++j)
+         wanted = want[j] && !strcmp(want[j], std);
+      if (!wanted) continue;
+      /* TLS 1.3 suites negotiate no key exchange of their own. */
+      const bool v13 = SSL_CIPHER_get_kx_nid(c) == NID_kx_any;
+      char *dst = v13 ? l13 : l12;
+      size_t cap = v13 ? sizeof l13 : sizeof l12;
+      size_t used = strlen(dst);
+      snprintf(dst + used, cap - used, "%s%s", used ? ":" : "",
+               v13 ? std : SSL_CIPHER_get_name(c));
+   }
+   if (l12[0]) SSL_set_cipher_list(ssl, l12);
+   if (l13[0]) SSL_set_ciphersuites(ssl, l13);
+}
+
+struct dvm_tls *dvm_tls_connect(int fd, const char *host, int verify,
+                                const uint8_t *alpn, size_t alpn_len,
+                                int min_version, int max_version,
+                                const char *const *ciphers, int nciphers,
+                                bool *verify_failed, char *err, size_t errsz)
+{
+   (void)pthread_once(&host_sigpipe_once, ignore_host_sigpipe);
+   if (verify_failed) *verify_failed = false;
+   struct dvm_tls *t = calloc(1, sizeof *t);
+   if (!t) { snprintf(err, errsz, "out of memory"); return NULL; }
+   t->fd = fd;
+   pthread_mutex_init(&t->mu, NULL);
+   t->ctx = SSL_CTX_new(TLS_client_method());
+   if (!t->ctx) {
+      snprintf(err, errsz, "SSL_CTX_new failed");
+      free(t);
+      return NULL;
+   }
+   SSL_CTX_set_options(t->ctx, SSL_OP_NO_SSLv3);
+   if (verify & DVM_TLS_VERIFY_CHAIN) {
+      SSL_CTX_set_default_verify_paths(t->ctx);
+      SSL_CTX_set_verify(t->ctx, SSL_VERIFY_PEER, NULL);
+   } else {
+      SSL_CTX_set_verify(t->ctx, SSL_VERIFY_NONE, NULL);
+   }
+   if (min_version) SSL_CTX_set_min_proto_version(t->ctx, min_version);
+   if (max_version) SSL_CTX_set_max_proto_version(t->ctx, max_version);
+   t->ssl = SSL_new(t->ctx);
+   if (!t->ssl) {
+      snprintf(err, errsz, "SSL_new failed");
+      dvm_tls_free(t);
+      return NULL;
+   }
+   tls_apply_ciphers(t->ssl, ciphers, nciphers);
+   if (alpn && alpn_len) SSL_set_alpn_protos(t->ssl, alpn, (unsigned)alpn_len);
+   SSL_set_fd(t->ssl, fd);
+   if (host && *host) {
+      /* SNI is for names only (RFC 6066 §3); an address goes in the IP SAN
+       * check instead. */
+      unsigned char probe[16];
+      const bool is_ip = inet_pton(AF_INET, host, probe) == 1 ||
+                         inet_pton(AF_INET6, host, probe) == 1;
+      if (!is_ip) SSL_set_tlsext_host_name(t->ssl, host);
+      if (verify & DVM_TLS_VERIFY_HOST) {
+         if (!is_ip) SSL_set1_host(t->ssl, host);
+         else X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(t->ssl), host);
+      }
+   }
+   ERR_clear_error();
+   if (SSL_connect(t->ssl) != 1) {
+      unsigned long e = ERR_get_error();
+      char ebuf[160] = "";
+      if (e) ERR_error_string_n(e, ebuf, sizeof ebuf);
+      long v = SSL_get_verify_result(t->ssl);
+      if (verify_failed) *verify_failed = v != X509_V_OK;
+      snprintf(err, errsz, "TLS handshake with %s failed: %s%s%s",
+               host ? host : "?", ebuf[0] ? ebuf : "connection closed",
+               v != X509_V_OK ? " / " : "",
+               v != X509_V_OK ? X509_verify_cert_error_string(v) : "");
+      dvm_tls_free(t);
+      return NULL;
+   }
+   SSL_set_mode(t->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE |
+                        SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+   fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+   return t;
+}
+
+/* Sleeps until the fd can do what the session asked for.  0 = ready,
+ * -2 = timed out, -1 = error. */
+static int tls_wait(int fd, int want, int timeout_ms)
+{
+   struct pollfd p = {
+      .fd = fd,
+      .events = (short)(want == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN),
+   };
+   int r;
+   do r = poll(&p, 1, timeout_ms > 0 ? timeout_ms : -1);
+   while (r < 0 && errno == EINTR);
+   if (r == 0) return -2;
+   if (r < 0) return -1;
+   return 0;   /* POLLHUP/POLLERR: the next SSL call reports it */
+}
+
+long dvm_tls_read(struct dvm_tls *t, void *buf, size_t n, int timeout_ms)
+{
+   if (!t || !t->ssl) return -1;
+   const int want_n = (int)(n > 0x7fffffff ? 0x7fffffff : n);
+   for (;;) {
+      pthread_mutex_lock(&t->mu);
+      ERR_clear_error();
+      errno = 0;
+      int r = SSL_read(t->ssl, buf, want_n);
+      int e = r > 0 ? SSL_ERROR_NONE : SSL_get_error(t->ssl, r);
+      const int err = errno;
+      pthread_mutex_unlock(&t->mu);
+      if (r > 0) return r;
+      if (e == SSL_ERROR_ZERO_RETURN) return 0;
+      if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+         int w = tls_wait(t->fd, e, timeout_ms);
+         if (w) return w;
+         continue;
+      }
+      if (e == SSL_ERROR_SYSCALL && err == EINTR) continue;
+      /* A peer that just went away without close_notify: end of stream, as
+       * the plain socket reports it. */
+      if (e == SSL_ERROR_SYSCALL && err == 0) return 0;
+      return -1;
+   }
+}
+
+long dvm_tls_write(struct dvm_tls *t, const void *buf, size_t n)
+{
+   if (!t || !t->ssl) return -1;
+   size_t done = 0;
+   while (done < n) {
+      pthread_mutex_lock(&t->mu);
+      ERR_clear_error();
+      errno = 0;
+      int w = SSL_write(t->ssl, (const char *)buf + done,
+                        (int)((n - done) > 0x7fffffff ? 0x7fffffff : n - done));
+      int e = w > 0 ? SSL_ERROR_NONE : SSL_get_error(t->ssl, w);
+      const int err = errno;
+      pthread_mutex_unlock(&t->mu);
+      if (w > 0) { done += (size_t)w; continue; }
+      if (e == SSL_ERROR_WANT_WRITE || e == SSL_ERROR_WANT_READ) {
+         if (tls_wait(t->fd, e, 0) < 0) return -1;
+         continue;
+      }
+      if (e == SSL_ERROR_SYSCALL && err == EINTR) continue;
+      return -1;
+   }
+   return (long)done;
+}
+
+size_t dvm_tls_pending(struct dvm_tls *t)
+{
+   if (!t || !t->ssl) return 0;
+   pthread_mutex_lock(&t->mu);
+   size_t n = (size_t)SSL_pending(t->ssl);
+   pthread_mutex_unlock(&t->mu);
+   return n;
+}
+
+void dvm_tls_free(struct dvm_tls *t)
+{
+   if (!t) return;
+   if (t->ssl) {
+      SSL_shutdown(t->ssl);
+      SSL_free(t->ssl);
+   }
+   if (t->ctx) SSL_CTX_free(t->ctx);
+   pthread_mutex_destroy(&t->mu);
+   free(t);
+}
+
+const char *dvm_tls_protocol(const struct dvm_tls *t)
+{
+   return t && t->ssl ? SSL_get_version(t->ssl) : "NONE";
+}
+
+const char *dvm_tls_cipher(const struct dvm_tls *t)
+{
+   const SSL_CIPHER *c = t && t->ssl ? SSL_get_current_cipher(t->ssl) : NULL;
+   const char *std = c ? SSL_CIPHER_standard_name(c) : NULL;
+   return std ? std : "SSL_NULL_WITH_NULL_NULL";
+}
+
+void dvm_tls_alpn(const struct dvm_tls *t, char *out, size_t outsz)
+{
+   const unsigned char *p = NULL;
+   unsigned len = 0;
+   if (t && t->ssl) SSL_get0_alpn_selected(t->ssl, &p, &len);
+   if (!outsz) return;
+   if (len >= outsz) len = (unsigned)outsz - 1;
+   if (p && len) memcpy(out, p, len);
+   out[len] = '\0';
+}
+
+int dvm_tls_peer_chain(const struct dvm_tls *t, uint8_t ***der, int **len)
+{
+   *der = NULL;
+   *len = NULL;
+   STACK_OF(X509) *sk = t && t->ssl ? SSL_get_peer_cert_chain(t->ssl) : NULL;
+   int n = sk ? sk_X509_num(sk) : 0;
+   if (n <= 0) return 0;
+   *der = calloc((size_t)n, sizeof **der);
+   *len = calloc((size_t)n, sizeof **len);
+   if (!*der || !*len) { free(*der); free(*len); *der = NULL; *len = NULL; return 0; }
+   int k = 0;
+   for (int i = 0; i < n; ++i) {
+      X509 *x = sk_X509_value(sk, i);
+      int l = i2d_X509(x, NULL);
+      if (l <= 0) continue;
+      uint8_t *buf = malloc((size_t)l), *p = buf;
+      if (!buf) continue;
+      if (i2d_X509(x, &p) != l) { free(buf); continue; }
+      (*der)[k] = buf;
+      (*len)[k] = l;
+      ++k;
+   }
+   return k;
+}
+
+const char *dvm_tls_auth_type(const struct dvm_tls *t)
+{
+   const SSL_CIPHER *c = t && t->ssl ? SSL_get_current_cipher(t->ssl) : NULL;
+   if (!c) return "UNKNOWN";
+   const int kx = SSL_CIPHER_get_kx_nid(c), au = SSL_CIPHER_get_auth_nid(c);
+   if (kx == NID_kx_any) return "GENERIC";
+   const bool ecdhe = kx == NID_kx_ecdhe, dhe = kx == NID_kx_dhe;
+   if (au == NID_auth_ecdsa) return ecdhe ? "ECDHE_ECDSA" : "ECDSA";
+   if (au == NID_auth_rsa) return ecdhe ? "ECDHE_RSA" : dhe ? "DHE_RSA" : "RSA";
+   if (au == NID_auth_psk) return ecdhe ? "ECDHE_PSK" : "PSK";
+   return "UNKNOWN";
+}
+
+size_t dvm_tls_session_id(const struct dvm_tls *t, uint8_t *out, size_t outsz)
+{
+   SSL_SESSION *s = t && t->ssl ? SSL_get_session(t->ssl) : NULL;
+   unsigned len = 0;
+   const unsigned char *id = s ? SSL_SESSION_get_id(s, &len) : NULL;
+   if (!id) return 0;
+   if (len > outsz) len = (unsigned)outsz;
+   memcpy(out, id, len);
+   return len;
 }

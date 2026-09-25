@@ -579,6 +579,36 @@ bool dex_class_annotation(struct dex_file *d, uint32_t class_def_idx,
                                   annotation_desc, true, encoded_off);
 }
 
+int dex_class_annotations(struct dex_file *d, uint32_t class_def_idx,
+                          uint32_t *encoded_offs, const char **types, int max)
+{
+   struct dex_class_def cd;
+   if (!d || !dex_class_def(d, class_def_idx, &cd) || !cd.annotations_off ||
+       (uint64_t)cd.annotations_off + 16u > d->len)
+      return 0;
+   uint32_t set_off = dex_u32_at(d, cd.annotations_off);
+   if (!set_off || (uint64_t)set_off + 4u > d->len) return 0;
+   uint32_t count = dex_u32_at(d, set_off);
+   if ((uint64_t)set_off + 4u + (uint64_t)count * 4u > d->len) return 0;
+   int n = 0;
+   for (uint32_t i = 0; i < count; ++i) {
+      uint32_t item_off = dex_u32_at(d, set_off + 4u + (size_t)i * 4u);
+      if (!item_off || (uint64_t)item_off + 2u > d->len) continue;
+      if (d->p[item_off] != 1u) continue; /* runtime-visible only */
+      size_t p = (size_t)item_off + 1u;
+      uint32_t type_idx;
+      size_t q = dex_uleb(d, p, &type_idx);
+      const char *type = q > p ? dex_type(d, type_idx) : NULL;
+      if (!type) continue;
+      if (n < max) {
+         if (encoded_offs) encoded_offs[n] = (uint32_t)p;
+         if (types) types[n] = type;
+      }
+      ++n;
+   }
+   return n;
+}
+
 /* Annotations on one of a class's fields.
  *
  * annotations_directory_item is class_annotations_off, then three counts, then
@@ -608,6 +638,141 @@ bool dex_field_annotation(struct dex_file *d, uint32_t class_def_idx,
                                      encoded_off);
    }
    return false;
+}
+
+static bool dex_signature_text(struct dex_file *d, uint32_t signature_off,
+                               char *out, size_t out_sz);
+
+/* ---- method and parameter annotations -----------------------------------
+ *
+ * annotations_directory_item: class_annotations_off, fields_size,
+ * annotated_methods_size, annotated_parameters_size, then the
+ * field_annotation[], method_annotation[] and parameter_annotation[] tables,
+ * each entry {member_idx, annotations_off}.  A method is named by name and
+ * signature ("(Ljava/lang/String;I)V"), which is what a Method carries. */
+
+static bool dex_method_is(struct dex_file *d, uint32_t method_idx,
+                          const char *name, const char *sig)
+{
+   struct dex_method_id mid;
+   if (!dex_method_id(d, method_idx, &mid)) return false;
+   const char *n = dex_string(d, mid.name_idx);
+   if (!n || strcmp(n, name)) return false;
+   if (!sig) return true;
+   char buf[1024];
+   return dex_proto_signature(d, mid.proto_idx, buf, sizeof buf) &&
+          !strcmp(buf, sig);
+}
+
+/* The annotations_off of the method's (table 1) or its parameters' (table 2)
+ * entry, 0 when it has none. */
+static uint32_t dex_method_entry(struct dex_file *d, uint32_t class_def_idx,
+                                 const char *name, const char *sig, int table)
+{
+   struct dex_class_def cd;
+   if (!d || !name || !dex_class_def(d, class_def_idx, &cd) ||
+       !cd.annotations_off || (uint64_t)cd.annotations_off + 16u > d->len)
+      return 0;
+   const uint32_t fields = dex_u32_at(d, cd.annotations_off + 4u);
+   const uint32_t methods = dex_u32_at(d, cd.annotations_off + 8u);
+   const uint32_t params = dex_u32_at(d, cd.annotations_off + 12u);
+   size_t at = (size_t)cd.annotations_off + 16u + (size_t)fields * 8u;
+   uint32_t n = methods;
+   if (table == 2) {
+      at += (size_t)methods * 8u;
+      n = params;
+   }
+   if ((uint64_t)at + (uint64_t)n * 8u > d->len) return 0;
+   for (uint32_t i = 0; i < n; ++i) {
+      const uint32_t idx = dex_u32_at(d, at + (size_t)i * 8u);
+      if (dex_method_is(d, idx, name, sig))
+         return dex_u32_at(d, at + (size_t)i * 8u + 4u);
+   }
+   return 0;
+}
+
+/* Every annotation of one visibility class in the annotation_set_item at
+ * `set_off`.  `runtime_only` keeps RUNTIME ones (visibility 1). */
+static int dex_annotation_set_list(struct dex_file *d, uint32_t set_off,
+                                   uint32_t *encoded_offs, const char **types,
+                                   int max)
+{
+   if (!set_off || (uint64_t)set_off + 4u > d->len) return 0;
+   uint32_t count = dex_u32_at(d, set_off);
+   if ((uint64_t)set_off + 4u + (uint64_t)count * 4u > d->len) return 0;
+   int n = 0;
+   for (uint32_t i = 0; i < count; ++i) {
+      uint32_t item_off = dex_u32_at(d, set_off + 4u + (size_t)i * 4u);
+      if (!item_off || (uint64_t)item_off + 2u > d->len) continue;
+      if (d->p[item_off] != 1u) continue;
+      size_t p = (size_t)item_off + 1u;
+      uint32_t type_idx;
+      size_t q = dex_uleb(d, p, &type_idx);
+      const char *type = q > p ? dex_type(d, type_idx) : NULL;
+      if (!type) continue;
+      if (n < max) {
+         if (encoded_offs) encoded_offs[n] = (uint32_t)p;
+         if (types) types[n] = type;
+      }
+      ++n;
+   }
+   return n;
+}
+
+int dex_method_annotations(struct dex_file *d, uint32_t class_def_idx,
+                           const char *name, const char *sig,
+                           uint32_t *encoded_offs, const char **types, int max)
+{
+   uint32_t set_off = dex_method_entry(d, class_def_idx, name, sig, 1);
+   return set_off ? dex_annotation_set_list(d, set_off, encoded_offs, types, max)
+                  : 0;
+}
+
+bool dex_method_annotation(struct dex_file *d, uint32_t class_def_idx,
+                           const char *name, const char *sig,
+                           const char *annotation_desc, uint32_t *encoded_off)
+{
+   uint32_t set_off = dex_method_entry(d, class_def_idx, name, sig, 1);
+   return set_off && dex_annotation_set_find(d, set_off, annotation_desc, true,
+                                             encoded_off);
+}
+
+int dex_parameter_annotation_lists(struct dex_file *d, uint32_t class_def_idx,
+                                   const char *name, const char *sig)
+{
+   uint32_t list_off = dex_method_entry(d, class_def_idx, name, sig, 2);
+   if (!list_off || (uint64_t)list_off + 4u > d->len) return -1;
+   return (int)dex_u32_at(d, list_off);
+}
+
+int dex_parameter_annotations(struct dex_file *d, uint32_t class_def_idx,
+                              const char *name, const char *sig, int param,
+                              uint32_t *encoded_offs, const char **types,
+                              int max)
+{
+   uint32_t list_off = dex_method_entry(d, class_def_idx, name, sig, 2);
+   if (!list_off || (uint64_t)list_off + 4u > d->len || param < 0) return 0;
+   uint32_t size = dex_u32_at(d, list_off);
+   if ((uint32_t)param >= size ||
+       (uint64_t)list_off + 4u + (uint64_t)size * 4u > d->len)
+      return 0;
+   uint32_t set_off = dex_u32_at(d, list_off + 4u + (size_t)param * 4u);
+   return dex_annotation_set_list(d, set_off, encoded_offs, types, max);
+}
+
+bool dex_method_signature(struct dex_file *d, uint32_t class_def_idx,
+                          const char *name, const char *sig,
+                          char *out, size_t out_sz)
+{
+   if (!out || !out_sz) return false;
+   out[0] = '\0';
+   uint32_t set_off = dex_method_entry(d, class_def_idx, name, sig, 1);
+   uint32_t signature_off = 0;
+   if (!set_off ||
+       !dex_annotation_set_find(d, set_off, "Ldalvik/annotation/Signature;",
+                                false, &signature_off))
+      return false;
+   return dex_signature_text(d, signature_off, out, out_sz);
 }
 
 const char *dex_annotation_type(struct dex_file *d, uint32_t encoded_off)
@@ -733,35 +898,11 @@ bool dex_class_signature(struct dex_file *d, uint32_t class_def_idx,
  * class Signature, but lives in the field's annotation set.  It is a system
  * annotation (visibility 2), so it must stay separate from the public
  * runtime-annotation lookup used by Field.getAnnotation(). */
-bool dex_field_signature(struct dex_file *d, uint32_t class_def_idx,
-                         const char *field_name, char *out, size_t out_sz)
+/* The text of a dalvik.annotation.Signature annotation at `signature_off`:
+ * its "value" array of string fragments, concatenated. */
+static bool dex_signature_text(struct dex_file *d, uint32_t signature_off,
+                               char *out, size_t out_sz)
 {
-   if (!d || !field_name || !out || !out_sz) return false;
-   out[0] = '\0';
-   struct dex_class_def cd;
-   if (!dex_class_def(d, class_def_idx, &cd) || !cd.annotations_off ||
-       (uint64_t)cd.annotations_off + 16u > d->len)
-      return false;
-
-   uint32_t fields = dex_u32_at(d, cd.annotations_off + 4u);
-   size_t table = (size_t)cd.annotations_off + 16u;
-   if ((uint64_t)table + (uint64_t)fields * 8u > d->len) return false;
-   uint32_t signature_off = 0;
-   for (uint32_t i = 0; i < fields; ++i) {
-      uint32_t field_idx = dex_u32_at(d, table + (size_t)i * 8u);
-      struct dex_field_id fid;
-      if (!dex_field_id(d, field_idx, &fid)) continue;
-      const char *name = dex_string(d, fid.name_idx);
-      if (!name || strcmp(name, field_name)) continue;
-      uint32_t set_off = dex_u32_at(d, table + (size_t)i * 8u + 4u);
-      if (!dex_annotation_set_find(d, set_off,
-                                   "Ldalvik/annotation/Signature;", false,
-                                   &signature_off))
-         return false;
-      break;
-   }
-   if (!signature_off) return false;
-
    struct dex_value value;
    if (!dex_annotation_element(d, signature_off, "value", &value) ||
        value.type != DEX_VALUE_ARRAY)
@@ -791,6 +932,37 @@ bool dex_field_signature(struct dex_file *d, uint32_t class_def_idx,
    free(fragments);
    if (!ok || !used) out[0] = '\0';
    return ok && used;
+}
+
+bool dex_field_signature(struct dex_file *d, uint32_t class_def_idx,
+                         const char *field_name, char *out, size_t out_sz)
+{
+   if (!d || !field_name || !out || !out_sz) return false;
+   out[0] = '\0';
+   struct dex_class_def cd;
+   if (!dex_class_def(d, class_def_idx, &cd) || !cd.annotations_off ||
+       (uint64_t)cd.annotations_off + 16u > d->len)
+      return false;
+
+   uint32_t fields = dex_u32_at(d, cd.annotations_off + 4u);
+   size_t table = (size_t)cd.annotations_off + 16u;
+   if ((uint64_t)table + (uint64_t)fields * 8u > d->len) return false;
+   uint32_t signature_off = 0;
+   for (uint32_t i = 0; i < fields; ++i) {
+      uint32_t field_idx = dex_u32_at(d, table + (size_t)i * 8u);
+      struct dex_field_id fid;
+      if (!dex_field_id(d, field_idx, &fid)) continue;
+      const char *name = dex_string(d, fid.name_idx);
+      if (!name || strcmp(name, field_name)) continue;
+      uint32_t set_off = dex_u32_at(d, table + (size_t)i * 8u + 4u);
+      if (!dex_annotation_set_find(d, set_off,
+                                   "Ldalvik/annotation/Signature;", false,
+                                   &signature_off))
+         return false;
+      break;
+   }
+   if (!signature_off) return false;
+   return dex_signature_text(d, signature_off, out, out_sz);
 }
 
 const char *dex_class_enclosing_type(struct dex_file *d,

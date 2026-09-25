@@ -225,16 +225,16 @@ inline void lunaria_env_invalidate(void) {
 
 // Virtual address layout (32-bit guest VA; A64 relocates tramp/stack).
 constexpr uint32_t HEAP_BASE     = 0x50000000u;
-inline uint32_t           g_heap_size   = 0x10000000u; /* guest_layout_init */
+inline uint32_t    g_heap_size   = 0x10000000u; /* guest_layout_init */
 // A64 fallback mmap arena: upper host-service heap, grows downward.
-inline uint32_t           g_small_mmap_top = 0;
+inline uint32_t    g_small_mmap_top = 0;
 /* Carve the small-mmap fallback off the top of the malloc window (arm_exec). */
 uint32_t arm_heap_take_top(uint32_t len, uint32_t align_mask);
 // Mutable: A64 may relocate tramp/stack and grow primary to 1 GiB.
 inline uint32_t THREAD_STACK_BASE = 0x48000000u;
 constexpr uint32_t THREAD_STACK_SIZE = 0x00100000u;
 constexpr uint32_t MMAP_BASE      = 0x10000000u;
-inline uint32_t           MMAP_END       = 0x41000000u;
+inline uint32_t    MMAP_END       = 0x41000000u;
 // Where AArch64 ELF images may live inside the image window.
 inline uint32_t A64_IMAGE_BASE = 0x10000u;
 inline uint32_t A64_IMAGE_END  = 0x04000000u;
@@ -268,6 +268,13 @@ inline bool a64_is_guest_va(GuestVA va) {
 }
 inline GuestVA a64_guest_va(BackingOffset backing) {
     return A64_GUEST_BASE + (GuestVA)backing;
+}
+/* Dynarmic's callbacks may report an image-window access as its 32-bit
+ * backing offset even though the architectural A64 pointer uses the identity
+ * arena VA.  Both spellings name the same guest page; VMA lookups must use
+ * the architectural spelling stored in g_a64_maps. */
+inline GuestVA a64_mapping_va(GuestVA va) {
+    return va < A64_GUEST_SIZE ? a64_guest_va((BackingOffset)va) : va;
 }
 // A64: real 64-bit guest address space; outside image window, guest VA == host VA.
 struct A64Mapping {
@@ -313,6 +320,7 @@ inline const A64Mapping *a64_find_locked(GuestVA va) {
 }
 
 inline bool a64_mapped(GuestVA va) {
+    va = a64_mapping_va(va);
     const uint64_t gen = g_a64_unmap_gen.load(std::memory_order_acquire);
     A64RangeCache &c = t_a64_cache[(va >> 21) & 7u];
     if (gen == c.gen && va >= c.lo && va < c.hi)
@@ -337,6 +345,7 @@ inline bool a64_mapped(GuestVA va) {
  * bytes to the decoder turns zero-filled data into an endless undefined-
  * instruction fallback instead. */
 inline bool a64_executable(GuestVA va) {
+    va = a64_mapping_va(va);
     std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
     const A64Mapping *m = a64_find_locked(va);
     return m && (m->prot & 4u /* PROT_EXEC */) != 0;
@@ -344,9 +353,29 @@ inline bool a64_executable(GuestVA va) {
 
 // Bytes mapped contiguously from `va`, or 0 when `va` itself is unmapped.
 inline size_t a64_mapped_span(GuestVA va) {
+    va = a64_mapping_va(va);
     std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
     const A64Mapping *m = a64_find_locked(va);
     return m ? (size_t)(m->hi - va) : 0u;
+}
+
+/* True when every byte in [va, va+len) has the requested guest permission.
+ * The host reserves the whole A64 arena, so host pointer validity is not a
+ * substitute for the guest's mmap table.  Walk adjacent entries as Linux
+ * does for an access spanning a page/mapping boundary. */
+inline bool a64_accessible(GuestVA va, size_t len, bool write) {
+    if (!len || va + len < va) return false;
+    va = a64_mapping_va(va);
+    const GuestVA end = va + len;
+    std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
+    while (va < end) {
+        const A64Mapping *m = a64_find_locked(va);
+        if (!m || !(m->prot & 1u /* PROT_READ */) ||
+            (write && !(m->prot & 2u /* PROT_WRITE */)))
+            return false;
+        va = m->hi < end ? m->hi : end;
+    }
+    return true;
 }
 
 inline void a64_map_insert(GuestVA lo, GuestVA hi, uint32_t prot, bool owned) {
@@ -354,6 +383,59 @@ inline void a64_map_insert(GuestVA lo, GuestVA hi, uint32_t prot, bool owned) {
     auto it = std::lower_bound(g_a64_maps.begin(), g_a64_maps.end(), lo,
                                [](const A64Mapping &m, GuestVA v) { return m.lo < v; });
     g_a64_maps.insert(it, A64Mapping{lo, hi, prot, owned});
+    a64_maps_bump();
+}
+
+/* Declare pages in the 4 GiB image/backing window as part of the guest
+ * process address space.
+ *
+ * ArmMemory::map() is the low-VA equivalent of mmap/brk: callers use it for
+ * the libc heap, stacks, TLS, linker images and runtime data.  The host arena
+ * happens to be reserved in one piece, but that reservation is not the guest
+ * page table.  Keep these declarations in the same table as ordinary A64
+ * mmap() ranges so permission checks and signal delivery see one coherent
+ * Android address space.
+ *
+ * Small runtime maps commonly sit inside a range declared during process
+ * setup.  Add only holes and coalesce adjacent declarations; blindly
+ * inserting them would violate g_a64_maps' sorted/disjoint invariant. */
+inline void a64_map_declare_backing(BackingOffset base, uint64_t len,
+                                    uint32_t prot = 3u /* R|W */) {
+    if (!len) return;
+    uint64_t off_lo = (uint64_t)base & ~4095ull;
+    uint64_t off_hi = ((uint64_t)base + len + 4095ull) & ~4095ull;
+    if (off_hi <= off_lo || off_hi > A64_GUEST_SIZE) return;
+    GuestVA lo = a64_guest_va((BackingOffset)off_lo);
+    const GuestVA hi = A64_GUEST_BASE + off_hi;
+
+    std::unique_lock<std::shared_mutex> lk(g_a64_maps_mu);
+    while (lo < hi) {
+        auto it = std::lower_bound(g_a64_maps.begin(), g_a64_maps.end(), lo,
+                                   [](const A64Mapping &m, GuestVA v) {
+                                       return m.lo < v;
+                                   });
+        if (it != g_a64_maps.begin()) {
+            const A64Mapping &prev = *std::prev(it);
+            if (prev.hi > lo) { lo = std::min(prev.hi, hi); continue; }
+        }
+        if (it != g_a64_maps.end() && it->lo <= lo) {
+            lo = std::min(it->hi, hi);
+            continue;
+        }
+        GuestVA gap_hi = it == g_a64_maps.end() ? hi : std::min(hi, it->lo);
+        it = g_a64_maps.insert(it, A64Mapping{lo, gap_hi, prot, false});
+        lo = gap_hi;
+    }
+    for (size_t i = 1; i < g_a64_maps.size();) {
+        A64Mapping &a = g_a64_maps[i - 1];
+        const A64Mapping &b = g_a64_maps[i];
+        if (a.hi == b.lo && a.prot == b.prot && a.owned == b.owned) {
+            a.hi = b.hi;
+            g_a64_maps.erase(g_a64_maps.begin() + (long)i);
+        } else {
+            ++i;
+        }
+    }
     a64_maps_bump();
 }
 
@@ -894,23 +976,59 @@ inline uint32_t MISC_DATA     = 0x41014000u;
 inline uint32_t SL_PAGE_BASE  = 0x41016000u;
 inline uint32_t misc_sl_iid(void)     { return MISC_DATA + 0x000u; }
 inline uint32_t misc_sl_iid_end(void) { return MISC_DATA + 0x100u; }
+/* tzname is `char *tzname[2]`, and the two strings have to live somewhere the
+ * guest can read: the array itself at +0x100, the abbreviations after it.
+ * `timezone` (long) and `daylight` (int) are separate objects in bionic, so
+ * they get separate words -- one address for both meant a write to either
+ * changed the other. */
 inline uint32_t misc_tzname(void)     { return MISC_DATA + 0x100u; }
+inline uint32_t misc_tzname_str(int i){ return MISC_DATA + 0x120u + (uint32_t)i * 0x20u; }
 inline uint32_t misc_tzvars(void)     { return MISC_DATA + 0x180u; }
+inline uint32_t misc_daylight(void)   { return MISC_DATA + 0x190u; }
 inline uint32_t misc_stdio(void)      { return MISC_DATA + 0x200u; }
 inline uint32_t misc_environ(void)    { return MISC_DATA + 0x300u; }
 inline uint32_t misc_env_array(void)  { return MISC_DATA + 0x320u; }
 inline uint32_t misc_env_strings(void){ return MISC_DATA + 0x380u; }
+/* getopt(3) process state.  Between daylight and the stack-guard cookie.
+ * optarg is a pointer; the ints follow.  Defaults match bionic: optind=1,
+ * opterr=1, optopt=0, optarg=NULL. */
+inline uint32_t misc_optarg(void)     { return MISC_DATA + 0x1A0u; }
+inline uint32_t misc_optind(void)     { return MISC_DATA + 0x1A8u; }
+inline uint32_t misc_opterr(void)     { return MISC_DATA + 0x1ACu; }
+inline uint32_t misc_optopt(void)     { return MISC_DATA + 0x1B0u; }
 /* __stack_chk_guard is a *variable* the compiled guest reads directly (the
  * prologue copies it onto the stack, the epilogue compares).  Binding it to a
  * code trampoline handed out the address of an instruction as the guard
  * value; it happened to compare equal, but the whole point of the cookie is
  * that it is unpredictable.  Give it a word of real entropy instead. */
 inline uint32_t misc_stack_guard(void) { return MISC_DATA + 0x1C0u; }
+/* The AThermalManager AThermal_acquireManager() hands out.  The object is
+ * opaque to the guest — the thermal calls only pass the pointer back — but it
+ * has to be an address in guest memory, not an arbitrary token, so a caller
+ * that stores it beside other pointers or compares it with one is not looking
+ * at something that could never be mapped. */
+inline uint32_t misc_athermal(void)    { return MISC_DATA + 0x1E0u; }
 // glGetString/eglQueryString ring (8 × 8 KiB) — see stash_gl_c_string().
 inline uint32_t GL_STR_RING_BASE = 0x41020000u;
 constexpr uint32_t GL_STR_RING_SLOTS = 8u;
 constexpr uint32_t GL_STR_RING_SLOT  = 8192u; /* GL_EXTENSIONS can exceed 4 KiB */
 constexpr uint32_t GL_STR_RING_SIZE  = GL_STR_RING_SLOTS * GL_STR_RING_SLOT;
+/* Storage for a direct java.nio.ByteBuffer the bytecode VM allocated.
+ *
+ * A direct buffer's whole contract is that JNI can take its address:
+ * GetDirectBufferAddress() has to answer with a pointer the guest can
+ * dereference.  The VM's own arrays live in host memory the guest cannot
+ * name, so a buffer it allocates is backed from this guest region instead.
+ * A native that is handed 0 does not fail politely — Unity's UnityWebRequest
+ * upload path takes its "how much is there in total" branch instead of its
+ * "fill this buffer" one and loops for ever. */
+/* 0x41100000..0x41102000 is executable runtime code (FAST_SYNC64_PAGE in
+ * arm_exec.cpp).  Direct-buffer payload is writable data and must never
+ * overlap it: UnityWebRequest writes the response into this pool, and the old
+ * overlap replaced the pthread fast stubs with response bytes.  A worker then
+ * returned through those bytes as A64 instructions. */
+inline uint32_t DIRECT_BB_BASE = 0x41200000u;
+constexpr uint32_t DIRECT_BB_SIZE = 0x00800000u;  /* 8 MiB */
 // Per-thread guest TLS pages (tpidr_el0), one 4 KiB page per guest tid.
 inline uint32_t TLS_WINDOW_BASE = 0x41030000u;
 inline uint32_t TLS_WINDOW_END  = 0x41040000u;
@@ -918,11 +1036,17 @@ inline uint32_t STACK_BASE    = 0x42000000u;
 inline uint32_t STACK_SIZE    = 0x05000000u;  /* 80MB */
 inline uint32_t SENTINEL_ADDR = 0x43000000u;
 inline uint32_t CB_STACK_BASE = 0x47700000u;
-/* 512 KiB is enough for the callbacks this emulator hosts (JNI bridges,
- * NDK choreographer, audio).  Halving the old 1 MiB window doubles the
- * number of concurrent stacks that fit in the same VA range. */
-constexpr uint32_t CB_STACK_SIZE = 0x00080000u;
-constexpr int      CB_MAX_DEPTH  = 2;            /* outer + one nest */
+/* One window per concurrent outermost callback — the stack of the thread the
+ * host borrowed to make the call.  A callback nested inside it (native ->
+ * Java -> native, the ordinary JNI shape) runs on that same stack below the
+ * caller's SP, exactly as it does on a device; it has no window of its own.
+ * So the depth is bounded by stack and by CB_MAX_DEPTH (one callback JIT per
+ * level, since a dynarmic Jit cannot be re-entered), not by address layout.
+ * The old layout gave every level its own 512 KiB window and allowed two, and
+ * the third level of an everyday JNI chain was dropped with its result left
+ * at zero. */
+constexpr uint32_t CB_STACK_SIZE = 0x00100000u;
+constexpr int      CB_MAX_DEPTH  = 16;
 /* A guest callback needs a JIT, an exclusive-monitor id and a guest stack,
  * and none of the three may be shared with a callback running at the same
  * time.  Nest depth alone was enough while one host thread ran all guest code;
@@ -943,9 +1067,8 @@ constexpr int      CB_MAX_SLOTS  = 16;           /* concurrent stack windows */
 /* How many of those slots the guest address space actually has stack windows
  * for; the layout functions below set it from the room they have. */
 inline int         g_cb_slots    = 4;
-inline uint32_t cb_stack_base(int slot, int depth) {
-    return CB_STACK_BASE +
-           (uint32_t)(slot * CB_MAX_DEPTH + depth) * CB_STACK_SIZE;
+inline uint32_t cb_stack_base(int slot) {
+    return CB_STACK_BASE + (uint32_t)slot * CB_STACK_SIZE;
 }
 
 /* Exclusive-monitor processor ids.
@@ -1015,8 +1138,7 @@ inline void guest_va_layout_arm64(void) {
     TLS_WINDOW_END    = 0x0A100000u;
     STACK_BASE        = 0x0A100000u;
     STACK_SIZE        = 0x03000000u; /* 48 MiB */
-    /* CB_MAX_SLOTS concurrent stacks x CB_MAX_DEPTH nest levels x 512 KiB
-     * = 16 MiB, same footprint the old 8×1 MiB layout used. */
+    /* CB_MAX_SLOTS concurrent stacks x 1 MiB = 16 MiB. */
     CB_STACK_BASE     = 0x0D100000u; /* .. 0x0E100000 */
     g_cb_slots        = CB_MAX_SLOTS;
     SENTINEL_ADDR     = 0x0E200000u; /* must not alias CB nest stacks */
@@ -1073,1680 +1195,16 @@ inline bool pc_in_sentinel(GuestVA pc) {
 }
 
 
-/* JNINativeInterface has 233 entries (4 reserved + 229 functions), and the
- * guest indexes it by the offsets in <jni.h>.  Lunaria used to build only 229
- * slots and dispatch slot n to SVC n, which silently dropped the four
- * "critical" accessors (GetPrimitiveArrayCritical, ReleasePrimitiveArrayCritical,
- * GetStringCritical, ReleaseStringCritical) and shifted everything after them
- * by four: a guest calling ExceptionCheck (228) landed on a stub that always
- * answered "no exception", GetPrimitiveArrayCritical returned a jobject where
- * a raw element pointer was due, and NewDirectByteBuffer (229) and its
- * companions fell off the end of the table entirely.
- *
- * libswappy walks exactly that path — loadClass, ExceptionCheck, then
- * InMemoryDexClassLoader over a direct ByteBuffer holding its own dex — so it
- * never saw the failure and ran on with a null SwappyDisplayManager class.
- * See jni_vtable_svc() for the slot→SVC mapping. */
-constexpr uint32_t JNI_VTABLE_COUNT = 233u; /* indices 0–232 */
-constexpr uint32_t SVC_JVM_GETENV   = 229u;
-constexpr uint32_t SVC_JVM_ATTACH   = 230u;
-constexpr uint32_t SVC_JVM_DESTROY  = 231u;
-constexpr uint32_t SVC_LOG_PRINT    = 232u;
-constexpr uint32_t SVC_LOG_WRITE    = 233u;
-constexpr uint32_t SVC_DLOPEN       = 234u;
-constexpr uint32_t SVC_DLSYM        = 235u;
-constexpr uint32_t SVC_DLCLOSE      = 236u;
+#include "svc_ids.h"
 
-constexpr uint32_t SVC_MALLOC       = 237u;
-constexpr uint32_t SVC_FREE         = 238u;
-constexpr uint32_t SVC_CALLOC       = 239u;
-constexpr uint32_t SVC_REALLOC      = 240u;
-constexpr uint32_t SVC_MEMCPY       = 241u;
-constexpr uint32_t SVC_MEMMOVE      = 242u;
-constexpr uint32_t SVC_MEMSET       = 243u;
-constexpr uint32_t SVC_STRLEN       = 244u;
-constexpr uint32_t SVC_STRCPY       = 245u;
-constexpr uint32_t SVC_STRNCPY      = 246u;
-constexpr uint32_t SVC_STRCMP       = 247u;
-constexpr uint32_t SVC_STRNCMP      = 248u;
-constexpr uint32_t SVC_STRDUP       = 249u;
-constexpr uint32_t SVC_STRNDUP      = 250u;
-constexpr uint32_t SVC_STRCAT       = 251u;
-constexpr uint32_t SVC_STRNCAT      = 252u;
-constexpr uint32_t SVC_ABORT          = 253u;
-constexpr uint32_t SVC_PTHREAD_KEY    = 254u; /* pthread_key_create/set/get/once/mutex/cond */
-constexpr uint32_t SVC_PTHREAD_CREATE = 255u; /* pthread_create — queues fn for deferred run */
-
-constexpr uint32_t SVC_ANW_FROM_SURFACE   = 256u;
-constexpr uint32_t SVC_ANW_ACQUIRE        = 257u;
-constexpr uint32_t SVC_ANW_RELEASE        = 258u;
-constexpr uint32_t SVC_ANW_GETWIDTH       = 259u;
-constexpr uint32_t SVC_ANW_GETHEIGHT      = 260u;
-constexpr uint32_t SVC_ANW_SETBUFGEO      = 261u;
-constexpr uint32_t SVC_ANW_TOSURFACE      = 262u;
-
-constexpr uint32_t SVC_EGL_GETDISPLAY     = 263u;
-constexpr uint32_t SVC_EGL_INITIALIZE     = 264u;
-constexpr uint32_t SVC_EGL_CHOOSECONFIG   = 265u;
-constexpr uint32_t SVC_EGL_CREATEWSURF    = 266u;
-constexpr uint32_t SVC_EGL_CREATEPBUF     = 267u;
-constexpr uint32_t SVC_EGL_CREATECTX      = 268u;
-constexpr uint32_t SVC_EGL_MAKECURRENT    = 269u;
-constexpr uint32_t SVC_EGL_SWAPBUF        = 270u;
-constexpr uint32_t SVC_EGL_DESTROYSURF    = 271u;
-constexpr uint32_t SVC_EGL_DESTROYCTX     = 272u;
-constexpr uint32_t SVC_EGL_TERMINATE      = 273u;
-constexpr uint32_t SVC_EGL_GETPROC        = 274u;
-constexpr uint32_t SVC_EGL_QUERYSURF      = 275u;
-constexpr uint32_t SVC_EGL_GETERROR       = 276u;
-constexpr uint32_t SVC_EGL_GETCFGATTRIB   = 277u;
-constexpr uint32_t SVC_EGL_QUERYSTR       = 278u;
-constexpr uint32_t SVC_EGL_SURFACEATTRIB  = 279u;
-constexpr uint32_t SVC_EGL_SWAPINTERVAL   = 280u;
-constexpr uint32_t SVC_EGL_GETCURCTX      = 281u;
-constexpr uint32_t SVC_EGL_GETCURSURF     = 282u;
-constexpr uint32_t SVC_DL_UNWIND_EXIDX   = 283u;
-
-
-constexpr uint32_t SVC_GL_BASE            = 284u;
-constexpr uint32_t SVC_GL_Viewport              = 284u;
-constexpr uint32_t SVC_GL_Clear                 = 285u;
-constexpr uint32_t SVC_GL_ClearColor            = 286u;
-constexpr uint32_t SVC_GL_ClearDepthf           = 287u;
-constexpr uint32_t SVC_GL_ClearStencil          = 288u;
-constexpr uint32_t SVC_GL_Enable                = 289u;
-constexpr uint32_t SVC_GL_Disable               = 290u;
-constexpr uint32_t SVC_GL_DepthFunc             = 291u;
-constexpr uint32_t SVC_GL_DepthMask             = 292u;
-constexpr uint32_t SVC_GL_ColorMask             = 293u;
-constexpr uint32_t SVC_GL_Scissor               = 294u;
-constexpr uint32_t SVC_GL_FrontFace             = 295u;
-constexpr uint32_t SVC_GL_CullFace              = 296u;
-constexpr uint32_t SVC_GL_BlendFuncSeparate     = 297u;
-constexpr uint32_t SVC_GL_BlendEquationSeparate = 298u;
-constexpr uint32_t SVC_GL_GetError              = 299u;
-constexpr uint32_t SVC_GL_GetString             = 300u;
-constexpr uint32_t SVC_GL_GetIntegerv           = 301u;
-constexpr uint32_t SVC_GL_PixelStorei           = 302u;
-constexpr uint32_t SVC_GL_ReadPixels            = 303u;
-constexpr uint32_t SVC_GL_Flush                 = 304u;
-constexpr uint32_t SVC_GL_Finish                = 305u;
-
-constexpr uint32_t SVC_GL_GenBuffers            = 306u;
-constexpr uint32_t SVC_GL_BindBuffer            = 307u;
-constexpr uint32_t SVC_GL_BufferData            = 308u;
-constexpr uint32_t SVC_GL_BufferSubData         = 309u;
-constexpr uint32_t SVC_GL_DeleteBuffers         = 310u;
-
-constexpr uint32_t SVC_GL_GenTextures           = 311u;
-constexpr uint32_t SVC_GL_BindTexture           = 312u;
-constexpr uint32_t SVC_GL_ActiveTexture         = 313u;
-constexpr uint32_t SVC_GL_DeleteTextures        = 314u;
-constexpr uint32_t SVC_GL_TexParameteri         = 315u;
-constexpr uint32_t SVC_GL_TexImage2D            = 316u;
-constexpr uint32_t SVC_GL_TexSubImage2D         = 317u;
-constexpr uint32_t SVC_GL_CopyTexSubImage2D     = 318u;
-constexpr uint32_t SVC_GL_CompressedTexImage2D  = 319u;
-constexpr uint32_t SVC_GL_CompressedTexSubImage2D = 320u;
-constexpr uint32_t SVC_GL_GenerateMipmap        = 321u;
-
-constexpr uint32_t SVC_GL_GenFramebuffers       = 322u;
-constexpr uint32_t SVC_GL_BindFramebuffer       = 323u;
-constexpr uint32_t SVC_GL_DeleteFramebuffers    = 324u;
-constexpr uint32_t SVC_GL_CheckFramebufferStatus = 325u;
-constexpr uint32_t SVC_GL_FramebufferTexture2D  = 326u;
-constexpr uint32_t SVC_GL_FramebufferRenderbuffer = 327u;
-constexpr uint32_t SVC_GL_GetFramebufferAttachmentParameteriv = 328u;
-
-constexpr uint32_t SVC_GL_GenRenderbuffers      = 329u;
-constexpr uint32_t SVC_GL_BindRenderbuffer      = 330u;
-constexpr uint32_t SVC_GL_DeleteRenderbuffers   = 331u;
-constexpr uint32_t SVC_GL_RenderbufferStorage   = 332u;
-
-constexpr uint32_t SVC_GL_CreateShader          = 333u;
-constexpr uint32_t SVC_GL_ShaderSource          = 334u;
-constexpr uint32_t SVC_GL_CompileShader         = 335u;
-constexpr uint32_t SVC_GL_DeleteShader          = 336u;
-constexpr uint32_t SVC_GL_GetShaderiv           = 337u;
-constexpr uint32_t SVC_GL_GetShaderInfoLog      = 338u;
-constexpr uint32_t SVC_GL_GetShaderSource       = 339u;
-
-constexpr uint32_t SVC_GL_CreateProgram         = 340u;
-constexpr uint32_t SVC_GL_AttachShader          = 341u;
-constexpr uint32_t SVC_GL_LinkProgram           = 342u;
-constexpr uint32_t SVC_GL_UseProgram            = 343u;
-constexpr uint32_t SVC_GL_DeleteProgram         = 344u;
-constexpr uint32_t SVC_GL_GetProgramiv          = 345u;
-constexpr uint32_t SVC_GL_GetProgramInfoLog     = 346u;
-constexpr uint32_t SVC_GL_GetAttribLocation     = 347u;
-constexpr uint32_t SVC_GL_GetUniformLocation    = 348u;
-constexpr uint32_t SVC_GL_GetActiveAttrib       = 349u;
-constexpr uint32_t SVC_GL_GetActiveUniform      = 350u;
-constexpr uint32_t SVC_GL_BindAttribLocation    = 351u;
-
-constexpr uint32_t SVC_GL_Uniform1i             = 352u;
-constexpr uint32_t SVC_GL_Uniform1iv            = 353u;
-constexpr uint32_t SVC_GL_Uniform2iv            = 354u;
-constexpr uint32_t SVC_GL_Uniform3iv            = 355u;
-constexpr uint32_t SVC_GL_Uniform4iv            = 356u;
-constexpr uint32_t SVC_GL_Uniform1fv            = 357u;
-constexpr uint32_t SVC_GL_Uniform2fv            = 358u;
-constexpr uint32_t SVC_GL_Uniform3fv            = 359u;
-constexpr uint32_t SVC_GL_Uniform4fv            = 360u;
-constexpr uint32_t SVC_GL_UniformMatrix3fv      = 361u;
-constexpr uint32_t SVC_GL_UniformMatrix4fv      = 362u;
-
-constexpr uint32_t SVC_GL_EnableVertexAttribArray  = 363u;
-constexpr uint32_t SVC_GL_DisableVertexAttribArray = 364u;
-constexpr uint32_t SVC_GL_VertexAttribPointer   = 365u;
-constexpr uint32_t SVC_GL_GetVertexAttribiv     = 366u;
-constexpr uint32_t SVC_GL_GetVertexAttribPointerv = 367u;
-
-constexpr uint32_t SVC_GL_DrawArrays            = 368u;
-constexpr uint32_t SVC_GL_DrawElements          = 369u;
-
-constexpr uint32_t SVC_GL_StencilFunc           = 370u;
-constexpr uint32_t SVC_GL_StencilFuncSeparate   = 371u;
-constexpr uint32_t SVC_GL_StencilMask           = 372u;
-constexpr uint32_t SVC_GL_StencilOp             = 373u;
-constexpr uint32_t SVC_GL_StencilOpSeparate     = 374u;
-
-constexpr uint32_t SVC_GL_BlendFunc             = 375u;
-constexpr uint32_t SVC_GL_TexParameterf         = 376u;
-constexpr uint32_t SVC_GL_DepthRangef           = 377u;
-constexpr uint32_t SVC_GL_PolygonOffset         = 378u;
-constexpr uint32_t SVC_GL_LineWidth             = 379u;
-constexpr uint32_t SVC_GL_SampleCoverage        = 380u;
-
-constexpr uint32_t SVC_GL_Uniform1f             = 381u;
-constexpr uint32_t SVC_GL_Uniform2f             = 382u;
-constexpr uint32_t SVC_GL_Uniform3f             = 383u;
-constexpr uint32_t SVC_GL_Uniform4f             = 384u;
-
-constexpr uint32_t SVC_GL_VertexAttrib1f        = 385u;
-constexpr uint32_t SVC_GL_VertexAttrib2f        = 386u;
-constexpr uint32_t SVC_GL_VertexAttrib3f        = 387u;
-constexpr uint32_t SVC_GL_VertexAttrib4f        = 388u;
-constexpr uint32_t SVC_GL_VertexAttrib4fv       = 389u;
-
-constexpr uint32_t SVC_GL_GetFloatv             = 390u;
-constexpr uint32_t SVC_GL_GetBooleanv           = 391u;
-constexpr uint32_t SVC_GL_IsEnabled             = 392u;
-constexpr uint32_t SVC_GL_IsProgram             = 393u;
-constexpr uint32_t SVC_GL_IsShader              = 394u;
-constexpr uint32_t SVC_GL_IsTexture             = 395u;
-constexpr uint32_t SVC_GL_IsBuffer              = 396u;
-constexpr uint32_t SVC_GL_IsFramebuffer         = 397u;
-constexpr uint32_t SVC_GL_IsRenderbuffer        = 398u;
-
-constexpr uint32_t SVC_GL_BlendEquation         = 399u;
-constexpr uint32_t SVC_GL_BlendColor            = 400u;
-constexpr uint32_t SVC_GL_ReleaseShaderCompiler = 401u;
-constexpr uint32_t SVC_GL_GetShaderPrecisionFormat = 402u;
-constexpr uint32_t SVC_GL_UniformMatrix2fv      = 403u;
-constexpr uint32_t SVC_GL_VertexAttrib1fv       = 404u;
-constexpr uint32_t SVC_GL_VertexAttrib2fv       = 405u;
-constexpr uint32_t SVC_GL_VertexAttrib3fv       = 406u;
-
-constexpr uint32_t SVC_GL_GetTexParameteriv    = 541u;
-
-constexpr uint32_t SVC_AEABI_UIDIV       = 407u;
-constexpr uint32_t SVC_AEABI_UIDIVMOD    = 408u;
-constexpr uint32_t SVC_AEABI_IDIV        = 409u;
-constexpr uint32_t SVC_AEABI_LDIVMOD     = 410u;
-constexpr uint32_t SVC_AEABI_ULDIVMOD    = 411u; /* unsigned 64-bit division */
-constexpr uint32_t SVC_LIBC_OPEN         = 412u;
-constexpr uint32_t SVC_LIBC_CLOSE        = 413u;
-constexpr uint32_t SVC_LIBC_READ         = 414u;
-constexpr uint32_t SVC_LIBC_WRITE        = 415u;
-constexpr uint32_t SVC_LIBC_LSEEK        = 416u;
-constexpr uint32_t SVC_LIBC_FOPEN        = 417u;
-constexpr uint32_t SVC_LIBC_FCLOSE       = 418u;
-constexpr uint32_t SVC_LIBC_FREAD        = 419u;
-constexpr uint32_t SVC_LIBC_FWRITE       = 420u;
-constexpr uint32_t SVC_LIBC_FSEEK        = 421u;
-constexpr uint32_t SVC_LIBC_FTELL        = 422u;
-constexpr uint32_t SVC_LIBC_STAT         = 423u;
-constexpr uint32_t SVC_LIBC_FSTAT        = 424u;
-constexpr uint32_t SVC_LIBC_MMAP         = 425u;
-constexpr uint32_t SVC_LIBC_MUNMAP       = 426u;
-
-
-constexpr uint32_t SVC_CLOCK_GETTIME     = 427u;
-constexpr uint32_t SVC_GETTIMEOFDAY      = 428u;
-constexpr uint32_t SVC_TIME              = 429u;
-constexpr uint32_t SVC_NANOSLEEP         = 430u;
-constexpr uint32_t SVC_USLEEP            = 431u;
-constexpr uint32_t SVC_GETENV            = 432u;
-constexpr uint32_t SVC_GETPID            = 433u;
-constexpr uint32_t SVC_GETTID            = 434u;
-constexpr uint32_t SVC_SCHED_YIELD       = 435u;
-constexpr uint32_t SVC_GETPAGESIZE       = 436u;
-constexpr uint32_t SVC_SYSCONF           = 437u;
-constexpr uint32_t SVC_RET0              = 438u; /* generic success stub */
-constexpr uint32_t SVC_ERRNO_ADDR        = 439u; /* __errno */
-constexpr uint32_t SVC_SYSPROP_GET       = 440u; /* __system_property_get */
-
-constexpr uint32_t SVC_PTHREAD_SELF        = 441u;
-constexpr uint32_t SVC_PTHREAD_KEY_CREATE  = 442u;
-constexpr uint32_t SVC_PTHREAD_KEY_DELETE  = 443u;
-constexpr uint32_t SVC_PTHREAD_SETSPECIFIC = 444u;
-constexpr uint32_t SVC_PTHREAD_GETSPECIFIC = 445u;
-
-constexpr uint32_t SVC_Z_INFLATEINIT2    = 446u;
-constexpr uint32_t SVC_Z_INFLATE         = 447u;
-constexpr uint32_t SVC_Z_INFLATEEND      = 448u;
-constexpr uint32_t SVC_Z_INFLATERESET    = 449u;
-constexpr uint32_t SVC_Z_CRC32           = 450u;
-constexpr uint32_t SVC_Z_ADLER32         = 451u;
-
-constexpr uint32_t SVC_Z_INFLATEINIT     = 452u; /* inflateInit_(z, ver, size) */
-constexpr uint32_t SVC_Z_DEFLATEINIT2    = 453u; /* deflateInit2_(z,lvl,method,wbits,mem,strategy,ver,sz) */
-constexpr uint32_t SVC_Z_DEFLATE         = 454u; /* deflate(z, flush) */
-constexpr uint32_t SVC_Z_DEFLATEEND      = 455u; /* deflateEnd(z) */
-constexpr uint32_t SVC_Z_DEFLATERESET    = 456u; /* deflateReset(z) */
-
-constexpr uint32_t SVC_ATOI              = 457u;
-constexpr uint32_t SVC_ATOL              = 458u;
-constexpr uint32_t SVC_STRTOL            = 459u;
-constexpr uint32_t SVC_STRTOUL           = 460u;
-constexpr uint32_t SVC_STRTOD            = 461u;
-constexpr uint32_t SVC_STRTOF            = 462u;
-
-
-// Math passthrough block.
-constexpr uint32_t SVC_MATH_F1_BASE      = 542u; /* float  fn(float) */
-constexpr uint32_t SVC_MATH_F1_COUNT     = 27u;
-constexpr uint32_t SVC_MATH_F2_BASE      = SVC_MATH_F1_BASE + SVC_MATH_F1_COUNT;       /* float  fn(float,float) */
-constexpr uint32_t SVC_MATH_F2_COUNT     = 9u;
-constexpr uint32_t SVC_MATH_D1_BASE      = SVC_MATH_F2_BASE + SVC_MATH_F2_COUNT;       /* double fn(double) */
-constexpr uint32_t SVC_MATH_D1_COUNT     = 25u;
-constexpr uint32_t SVC_MATH_D2_BASE      = SVC_MATH_D1_BASE + SVC_MATH_D1_COUNT;       /* double fn(double,double) */
-constexpr uint32_t SVC_MATH_D2_COUNT     = 7u;
-
-static_assert(SVC_MATH_F1_BASE > SVC_GL_GetTexParameteriv,
-              "math SVC block overlaps GL (cosf would hit glGetTexParameteriv)");
-
-// Extended libc passthrough.
-
-constexpr uint32_t SVC_EXT_BASE        = SVC_MATH_D2_BASE + SVC_MATH_D2_COUNT;
-constexpr uint32_t SVC_MEMALIGN        = SVC_EXT_BASE + 0u;
-constexpr uint32_t SVC_POSIX_MEMALIGN  = SVC_EXT_BASE + 1u;
-constexpr uint32_t SVC_MEMCMP          = SVC_EXT_BASE + 2u;
-constexpr uint32_t SVC_MEMCHR          = SVC_EXT_BASE + 3u;
-constexpr uint32_t SVC_MEMRCHR         = SVC_EXT_BASE + 4u;
-constexpr uint32_t SVC_MEMMEM          = SVC_EXT_BASE + 5u;
-constexpr uint32_t SVC_STRCHR          = SVC_EXT_BASE + 6u;
-constexpr uint32_t SVC_STRRCHR         = SVC_EXT_BASE + 7u;
-constexpr uint32_t SVC_STRSTR          = SVC_EXT_BASE + 8u;
-constexpr uint32_t SVC_STRNLEN         = SVC_EXT_BASE + 9u;
-constexpr uint32_t SVC_STRCASECMP      = SVC_EXT_BASE + 10u;
-constexpr uint32_t SVC_STRCSPN         = SVC_EXT_BASE + 11u;
-constexpr uint32_t SVC_STRSPN          = SVC_EXT_BASE + 12u;
-constexpr uint32_t SVC_STRTOK_R        = SVC_EXT_BASE + 13u;
-constexpr uint32_t SVC_PTHREAD_EQUAL   = SVC_EXT_BASE + 14u;
-constexpr uint32_t SVC_SNPRINTF        = SVC_EXT_BASE + 15u;
-constexpr uint32_t SVC_SPRINTF         = SVC_EXT_BASE + 16u;
-constexpr uint32_t SVC_VSNPRINTF       = SVC_EXT_BASE + 17u;
-constexpr uint32_t SVC_VASPRINTF       = SVC_EXT_BASE + 18u;
-constexpr uint32_t SVC_PRINTF          = SVC_EXT_BASE + 19u;
-constexpr uint32_t SVC_FPRINTF         = SVC_EXT_BASE + 20u;
-constexpr uint32_t SVC_VPRINTF         = SVC_EXT_BASE + 21u;
-constexpr uint32_t SVC_VFPRINTF        = SVC_EXT_BASE + 22u;
-constexpr uint32_t SVC_PUTS            = SVC_EXT_BASE + 23u;
-constexpr uint32_t SVC_FPUTS           = SVC_EXT_BASE + 24u;
-constexpr uint32_t SVC_FPUTC           = SVC_EXT_BASE + 25u;
-constexpr uint32_t SVC_ASSERT2         = SVC_EXT_BASE + 26u;
-constexpr uint32_t SVC_LOG_VPRINT      = SVC_EXT_BASE + 27u;
-constexpr uint32_t SVC_SINCOS          = SVC_EXT_BASE + 28u;
-constexpr uint32_t SVC_SINCOSF         = SVC_EXT_BASE + 29u;
-constexpr uint32_t SVC_LDEXP           = SVC_EXT_BASE + 30u;
-constexpr uint32_t SVC_LDEXPF          = SVC_EXT_BASE + 31u;
-constexpr uint32_t SVC_MODF            = SVC_EXT_BASE + 32u;
-constexpr uint32_t SVC_MODFF           = SVC_EXT_BASE + 33u;
-constexpr uint32_t SVC_STRTOLL         = SVC_EXT_BASE + 34u;
-constexpr uint32_t SVC_STRTOULL        = SVC_EXT_BASE + 35u;
-constexpr uint32_t SVC_ACCESS          = SVC_EXT_BASE + 36u;
-constexpr uint32_t SVC_REALPATH        = SVC_EXT_BASE + 37u;
-constexpr uint32_t SVC_PREAD           = SVC_EXT_BASE + 38u;
-constexpr uint32_t SVC_PWRITE          = SVC_EXT_BASE + 39u;
-constexpr uint32_t SVC_OPENDIR         = SVC_EXT_BASE + 40u;
-constexpr uint32_t SVC_READDIR         = SVC_EXT_BASE + 41u;
-constexpr uint32_t SVC_CLOSEDIR        = SVC_EXT_BASE + 42u;
-constexpr uint32_t SVC_WCSLEN          = SVC_EXT_BASE + 43u;
-constexpr uint32_t SVC_WMEMCPY         = SVC_EXT_BASE + 44u;
-constexpr uint32_t SVC_WMEMMOVE        = SVC_EXT_BASE + 45u;
-constexpr uint32_t SVC_WMEMSET         = SVC_EXT_BASE + 46u;
-constexpr uint32_t SVC_ISSPACE         = SVC_EXT_BASE + 47u;
-constexpr uint32_t SVC_FGETS           = SVC_EXT_BASE + 48u;
-constexpr uint32_t SVC_FILENO          = SVC_EXT_BASE + 49u;
-constexpr uint32_t SVC_FEOF            = SVC_EXT_BASE + 50u;
-constexpr uint32_t SVC_BASENAME        = SVC_EXT_BASE + 51u;
-constexpr uint32_t SVC_EXIT            = SVC_EXT_BASE + 52u;
-// __aeabi_* / fortify (_chk) / additional libc stubs
-constexpr uint32_t SVC_AEABI_MEMSET    = SVC_EXT_BASE + 53u; /* (dst, n, c) — note argument order */
-constexpr uint32_t SVC_AEABI_MEMCLR    = SVC_EXT_BASE + 54u; /* (dst, n) */
-constexpr uint32_t SVC_STRLCPY         = SVC_EXT_BASE + 55u;
-constexpr uint32_t SVC_STRNCASECMP     = SVC_EXT_BASE + 56u;
-constexpr uint32_t SVC_TOLOWER         = SVC_EXT_BASE + 57u;
-constexpr uint32_t SVC_ISALPHA         = SVC_EXT_BASE + 58u;
-constexpr uint32_t SVC_ISDIGIT         = SVC_EXT_BASE + 59u;
-constexpr uint32_t SVC_ISALNUM         = SVC_EXT_BASE + 60u;
-constexpr uint32_t SVC_ISXDIGIT        = SVC_EXT_BASE + 61u;
-constexpr uint32_t SVC_MKDIR           = SVC_EXT_BASE + 62u;
-constexpr uint32_t SVC_GETCWD          = SVC_EXT_BASE + 63u;
-constexpr uint32_t SVC_UNLINK          = SVC_EXT_BASE + 64u;
-constexpr uint32_t SVC_RENAME          = SVC_EXT_BASE + 65u;
-constexpr uint32_t SVC_FTRUNCATE       = SVC_EXT_BASE + 66u;
-constexpr uint32_t SVC_READLINK        = SVC_EXT_BASE + 67u;
-constexpr uint32_t SVC_CLOCK           = SVC_EXT_BASE + 68u;
-constexpr uint32_t SVC_LOCALTIME_R     = SVC_EXT_BASE + 69u;
-constexpr uint32_t SVC_GMTIME_R        = SVC_EXT_BASE + 70u;
-constexpr uint32_t SVC_LOCALTIME       = SVC_EXT_BASE + 71u;
-constexpr uint32_t SVC_GMTIME          = SVC_EXT_BASE + 72u;
-constexpr uint32_t SVC_MKTIME          = SVC_EXT_BASE + 73u;
-constexpr uint32_t SVC_DIFFTIME        = SVC_EXT_BASE + 74u;
-constexpr uint32_t SVC_STRFTIME        = SVC_EXT_BASE + 75u;
-constexpr uint32_t SVC_UNAME           = SVC_EXT_BASE + 76u;
-constexpr uint32_t SVC_GETRLIMIT       = SVC_EXT_BASE + 77u;
-constexpr uint32_t SVC_MREMAP          = SVC_EXT_BASE + 78u;
-constexpr uint32_t SVC_WRITEV          = SVC_EXT_BASE + 79u;
-constexpr uint32_t SVC_STRERROR        = SVC_EXT_BASE + 80u;
-constexpr uint32_t SVC_SETLOCALE       = SVC_EXT_BASE + 81u;
-constexpr uint32_t SVC_RETM1           = SVC_EXT_BASE + 82u; /* stub returning -1 on failure */
-constexpr uint32_t SVC_PTHREAD_GETATTR_NP      = SVC_EXT_BASE + 83u;
-constexpr uint32_t SVC_PTHREAD_ATTR_GETSTACK   = SVC_EXT_BASE + 84u;
-constexpr uint32_t SVC_PTHREAD_ATTR_GETSTACKSZ = SVC_EXT_BASE + 85u;
-constexpr uint32_t SVC_VSNPRINTF_CHK   = SVC_EXT_BASE + 86u;
-constexpr uint32_t SVC_VSPRINTF_CHK    = SVC_EXT_BASE + 87u;
-constexpr uint32_t SVC_ABS             = SVC_EXT_BASE + 88u;
-constexpr uint32_t SVC_SSCANF          = SVC_EXT_BASE + 89u;
-constexpr uint32_t SVC_VSSCANF         = SVC_EXT_BASE + 90u;
-constexpr uint32_t SVC_ISASCII         = SVC_EXT_BASE + 91u;
-constexpr uint32_t SVC_LIBC_MMAP2      = SVC_EXT_BASE + 92u; /* __mmap2: offset is in pages */
-constexpr uint32_t SVC_WAIT            = SVC_EXT_BASE + 93u; /* cond_wait/join: yield slice each call */
-// Semaphores (real counters) — required for Boehm GC thread registration
-constexpr uint32_t SVC_SEM_INIT        = SVC_EXT_BASE + 94u;
-constexpr uint32_t SVC_SEM_POST        = SVC_EXT_BASE + 95u;
-constexpr uint32_t SVC_SEM_WAIT        = SVC_EXT_BASE + 96u;
-constexpr uint32_t SVC_SEM_TRYWAIT     = SVC_EXT_BASE + 97u;
-constexpr uint32_t SVC_SEM_TIMEDWAIT   = SVC_EXT_BASE + 98u;
-constexpr uint32_t SVC_SEM_DESTROY     = SVC_EXT_BASE + 99u;
-constexpr uint32_t SVC_SEM_GETVALUE    = SVC_EXT_BASE + 100u;
-// setjmp/longjmp: save/restore context in jmp_buf.
-constexpr uint32_t SVC_SETJMP          = SVC_EXT_BASE + 101u;
-constexpr uint32_t SVC_LONGJMP         = SVC_EXT_BASE + 102u;
-// ARM Linux kuser helpers (called via BLX 0xffff0fa0 / 0xffff0fc0 / 0xffff0fe0)
-constexpr uint32_t SVC_KUSER_CMPXCHG   = SVC_EXT_BASE + 103u;
-constexpr uint32_t SVC_KUSER_GET_TLS   = SVC_EXT_BASE + 104u;
-constexpr uint32_t SVC_SYSCALL         = SVC_EXT_BASE + 105u; /* syscall() shim (futex/gettid) */
-constexpr uint32_t SVC_SBRK           = SVC_EXT_BASE + 106u;
-constexpr uint32_t SVC_BRK            = SVC_EXT_BASE + 107u;
-
-constexpr uint32_t SVC_ALOOPER_FORTHREAD = SVC_EXT_BASE + 108u;
-constexpr uint32_t SVC_ALOOPER_PREPARE   = SVC_EXT_BASE + 109u;
-constexpr uint32_t SVC_ALOOPER_POLLONCE  = SVC_EXT_BASE + 110u;
-constexpr uint32_t SVC_ALOOPER_POLLALL   = SVC_EXT_BASE + 111u;
-constexpr uint32_t SVC_ALOOPER_WAKE      = SVC_EXT_BASE + 112u;
-constexpr uint32_t SVC_STATFS            = SVC_EXT_BASE + 113u;
-constexpr uint32_t SVC_STATVFS           = SVC_EXT_BASE + 114u;
-constexpr uint32_t SVC_CHDIR             = SVC_EXT_BASE + 115u;
-// reliable exception-identification logging SVCs.
-constexpr uint32_t SVC_EXC_FROM_NAME     = SVC_EXT_BASE + 116u;
-constexpr uint32_t SVC_EXC_RAISE         = SVC_EXT_BASE + 117u;
-// getdtablesize() — required by mono's io-layer _wapi_handle_init to size _wapi_fd_reserve.
-constexpr uint32_t SVC_GETDTABLESIZE     = SVC_EXT_BASE + 118u;
-// bsearch with a guest comparator callback.  libmono imports.
-constexpr uint32_t SVC_BSEARCH           = SVC_EXT_BASE + 119u;
-// inline-detour logging SVCs (LUNARIA_TRACE_EXC).
-constexpr uint32_t SVC_DETOUR_BASE       = SVC_EXT_BASE + 120u;
-constexpr uint32_t NUM_DETOURS           = 20u;
-
-// Itanium/ARM C++ ABI one-time static-initialisation guards.
-constexpr uint32_t SVC_CXA_GUARD_ACQUIRE = SVC_DETOUR_BASE + NUM_DETOURS + 0u;
-constexpr uint32_t SVC_CXA_GUARD_RELEASE = SVC_DETOUR_BASE + NUM_DETOURS + 1u;
-constexpr uint32_t SVC_CXA_GUARD_ABORT   = SVC_DETOUR_BASE + NUM_DETOURS + 2u;
-constexpr uint32_t SVC_CXA_PURE_VIRTUAL  = SVC_DETOUR_BASE + NUM_DETOURS + 3u;
-constexpr uint32_t SVC_AEABI_ATEXIT      = SVC_DETOUR_BASE + NUM_DETOURS + 4u;
-
-
-constexpr uint32_t SVC_BTOWC             = SVC_DETOUR_BASE + NUM_DETOURS + 5u;
-constexpr uint32_t SVC_WCTOB             = SVC_DETOUR_BASE + NUM_DETOURS + 6u;
-constexpr uint32_t SVC_TOWLOWER          = SVC_DETOUR_BASE + NUM_DETOURS + 7u;
-constexpr uint32_t SVC_TOWUPPER          = SVC_DETOUR_BASE + NUM_DETOURS + 8u;
-constexpr uint32_t SVC_ISWCTYPE          = SVC_DETOUR_BASE + NUM_DETOURS + 9u;
-constexpr uint32_t SVC_WCTYPE            = SVC_DETOUR_BASE + NUM_DETOURS + 10u;
-constexpr uint32_t SVC_MBRTOWC           = SVC_DETOUR_BASE + NUM_DETOURS + 11u;
-constexpr uint32_t SVC_WCRTOMB           = SVC_DETOUR_BASE + NUM_DETOURS + 12u;
-constexpr uint32_t SVC_WMEMCHR           = SVC_DETOUR_BASE + NUM_DETOURS + 13u;
-constexpr uint32_t SVC_STRCOLL           = SVC_DETOUR_BASE + NUM_DETOURS + 14u;
-constexpr uint32_t SVC_STRXFRM           = SVC_DETOUR_BASE + NUM_DETOURS + 15u;
-constexpr uint32_t SVC_STRCASESTR        = SVC_DETOUR_BASE + NUM_DETOURS + 16u;
-constexpr uint32_t SVC_STRSEP            = SVC_DETOUR_BASE + NUM_DETOURS + 17u;
-
-// fp classification, fenv, wide-char classification/conversion
-constexpr uint32_t SVC_ISNAN             = SVC_DETOUR_BASE + NUM_DETOURS + 18u;
-constexpr uint32_t SVC_ISINF             = SVC_DETOUR_BASE + NUM_DETOURS + 19u;
-constexpr uint32_t SVC_ISFINITE          = SVC_DETOUR_BASE + NUM_DETOURS + 20u;
-constexpr uint32_t SVC_SIGNBIT           = SVC_DETOUR_BASE + NUM_DETOURS + 21u;
-constexpr uint32_t SVC_FEGETROUND        = SVC_DETOUR_BASE + NUM_DETOURS + 22u;
-constexpr uint32_t SVC_FESETROUND        = SVC_DETOUR_BASE + NUM_DETOURS + 23u;
-constexpr uint32_t SVC_FECLEAREXCEPT     = SVC_DETOUR_BASE + NUM_DETOURS + 24u;
-constexpr uint32_t SVC_FERAISEEXCEPT     = SVC_DETOUR_BASE + NUM_DETOURS + 25u;
-constexpr uint32_t SVC_FETESTEXCEPT      = SVC_DETOUR_BASE + NUM_DETOURS + 26u;
-constexpr uint32_t SVC_ISWSPACE          = SVC_DETOUR_BASE + NUM_DETOURS + 27u;
-constexpr uint32_t SVC_ISWDIGIT          = SVC_DETOUR_BASE + NUM_DETOURS + 28u;
-constexpr uint32_t SVC_ISWALPHA          = SVC_DETOUR_BASE + NUM_DETOURS + 29u;
-constexpr uint32_t SVC_ISWUPPER          = SVC_DETOUR_BASE + NUM_DETOURS + 30u;
-constexpr uint32_t SVC_ISWLOWER          = SVC_DETOUR_BASE + NUM_DETOURS + 31u;
-constexpr uint32_t SVC_ISWPRINT          = SVC_DETOUR_BASE + NUM_DETOURS + 32u;
-constexpr uint32_t SVC_ISWPUNCT          = SVC_DETOUR_BASE + NUM_DETOURS + 33u;
-constexpr uint32_t SVC_ISWGRAPH          = SVC_DETOUR_BASE + NUM_DETOURS + 34u;
-constexpr uint32_t SVC_ISWALNUM          = SVC_DETOUR_BASE + NUM_DETOURS + 35u;
-constexpr uint32_t SVC_ISWBLANK          = SVC_DETOUR_BASE + NUM_DETOURS + 36u;
-constexpr uint32_t SVC_ISWCNTRL          = SVC_DETOUR_BASE + NUM_DETOURS + 37u;
-constexpr uint32_t SVC_WCTRANS           = SVC_DETOUR_BASE + NUM_DETOURS + 38u;
-constexpr uint32_t SVC_TOWCTRANS         = SVC_DETOUR_BASE + NUM_DETOURS + 39u;
-constexpr uint32_t SVC_STRTOLD           = SVC_DETOUR_BASE + NUM_DETOURS + 40u;
-constexpr uint32_t SVC_WCSTOD            = SVC_DETOUR_BASE + NUM_DETOURS + 41u;
-constexpr uint32_t SVC_WCSTOL            = SVC_DETOUR_BASE + NUM_DETOURS + 42u;
-constexpr uint32_t SVC_WCSTOUL           = SVC_DETOUR_BASE + NUM_DETOURS + 43u;
-constexpr uint32_t SVC_WCSTOLL           = SVC_DETOUR_BASE + NUM_DETOURS + 44u;
-constexpr uint32_t SVC_WCSTOULL          = SVC_DETOUR_BASE + NUM_DETOURS + 45u;
-constexpr uint32_t SVC_STRTOIMAX         = SVC_DETOUR_BASE + NUM_DETOURS + 46u;
-constexpr uint32_t SVC_STRTOUMAX         = SVC_DETOUR_BASE + NUM_DETOURS + 47u;
-// SVC_WCSLEN already defined at SVC_EXT_BASE+43 — skip duplicate
-constexpr uint32_t SVC_WCSNCMP           = SVC_DETOUR_BASE + NUM_DETOURS + 49u;
-constexpr uint32_t SVC_WCSCMP            = SVC_DETOUR_BASE + NUM_DETOURS + 50u;
-constexpr uint32_t SVC_WCSCPY            = SVC_DETOUR_BASE + NUM_DETOURS + 51u;
-constexpr uint32_t SVC_WCSCAT            = SVC_DETOUR_BASE + NUM_DETOURS + 52u;
-constexpr uint32_t SVC_DIV               = SVC_DETOUR_BASE + NUM_DETOURS + 53u;
-constexpr uint32_t SVC_LDIV              = SVC_DETOUR_BASE + NUM_DETOURS + 54u;
-// Unresolved-symbol stubs (instead of tramp(0)) for distinct bind vs runtime logs
-constexpr uint32_t SVC_UNKNOWN_CALL      = SVC_DETOUR_BASE + NUM_DETOURS + 55u;
-
-constexpr uint32_t SVC_FREXP             = SVC_DETOUR_BASE + NUM_DETOURS + 56u;
-constexpr uint32_t SVC_RINT              = SVC_DETOUR_BASE + NUM_DETOURS + 57u;
-constexpr uint32_t SVC_LRAND48           = SVC_DETOUR_BASE + NUM_DETOURS + 58u;
-constexpr uint32_t SVC_SRAND48           = SVC_DETOUR_BASE + NUM_DETOURS + 59u;
-constexpr uint32_t SVC_STRPBRK           = SVC_DETOUR_BASE + NUM_DETOURS + 60u;
-constexpr uint32_t SVC_STRTOK            = SVC_DETOUR_BASE + NUM_DETOURS + 61u;
-constexpr uint32_t SVC_DUP2              = SVC_DETOUR_BASE + NUM_DETOURS + 62u;
-constexpr uint32_t SVC_CLOCK_GETRES      = SVC_DETOUR_BASE + NUM_DETOURS + 63u;
-constexpr uint32_t SVC_GETHOSTNAME       = SVC_DETOUR_BASE + NUM_DETOURS + 64u;
-constexpr uint32_t SVC_GETRUSAGE         = SVC_DETOUR_BASE + NUM_DETOURS + 65u;
-constexpr uint32_t SVC_VSPRINTF2         = SVC_DETOUR_BASE + NUM_DETOURS + 66u;
-constexpr uint32_t SVC_GETC              = SVC_DETOUR_BASE + NUM_DETOURS + 67u;
-constexpr uint32_t SVC_PUTCHAR           = SVC_DETOUR_BASE + NUM_DETOURS + 68u;
-constexpr uint32_t SVC_FPCLASSIFYF       = SVC_DETOUR_BASE + NUM_DETOURS + 69u;
-constexpr uint32_t SVC_INET_ADDR         = SVC_DETOUR_BASE + NUM_DETOURS + 70u;
-constexpr uint32_t SVC_FCNTL2            = SVC_DETOUR_BASE + NUM_DETOURS + 71u;
-constexpr uint32_t SVC_MONO_PATH_NORM    = SVC_DETOUR_BASE + NUM_DETOURS + 72u;
-constexpr uint32_t SVC_G_FILENAME_URI    = SVC_DETOUR_BASE + NUM_DETOURS + 73u;
-constexpr uint32_t SVC_MONO_FILE_MAP_OPEN = SVC_DETOUR_BASE + NUM_DETOURS + 102u;
-constexpr uint32_t SVC_MONO_FILE_MAP_SIZE = SVC_DETOUR_BASE + NUM_DETOURS + 103u;
-constexpr uint32_t SVC_MONO_FILE_MAP_FD   = SVC_DETOUR_BASE + NUM_DETOURS + 104u;
-constexpr uint32_t SVC_MONO_FILE_MAP      = SVC_DETOUR_BASE + NUM_DETOURS + 105u;
-constexpr uint32_t SVC_G_FILENAME_FROM_URI = SVC_DETOUR_BASE + NUM_DETOURS + 106u;
-constexpr uint32_t SVC_MONO_FILE_MAP_CLOSE = SVC_DETOUR_BASE + NUM_DETOURS + 107u;
-constexpr uint32_t SVC_KUSER_DMB           = SVC_DETOUR_BASE + NUM_DETOURS + 108u; /* 0xffff0fa0 */
-// Wrap mono_add_internal_call to probe Time/Transform icalls (LUNARIA_TRACE_ICALL).
-constexpr uint32_t SVC_MONO_ADD_ICALL     = SVC_DETOUR_BASE + NUM_DETOURS + 109u;
-// Host AES-ECB for FAES::DecryptData — UE pak indexes in this title need it.
-/* Host implementations of UE's own functions, reached by an inline detour that
- * overwrites the first instruction with `svc #N` — not by a symbol binding, so
- * these numbers never appear in kSymbolSvcMap and nothing in the build checks
- * them against it.  They used to be carved out of the same run as the SVC29
- * bank and collided with it exactly: FAES::DecryptData shared a number with
- * mbrlen, FSHA1::HashBuffer with mbsrtowcs, CityHash64 with logb,
- * DES_ncbc_encrypt with lrintf, and so on down the block.  The hook is tested
- * with an `if` before dispatch_svc's switch and returns, so a guest calling
- * mbrlen ran AES-256 over its own string buffer and got the pointer back as
- * the answer.  Give them a range of their own, above everything else, and
- * keep SVC_TRAMP_TOTAL derived from its end. */
-constexpr uint32_t SVC_UE_HOOK_BASE = 1470u;
-constexpr uint32_t SVC_FAES_DECRYPT = SVC_UE_HOOK_BASE + 0u;
-// Host SHA-1 for FSHA1::HashBuffer — startup profiler showed 27% of load time.
-constexpr uint32_t SVC_FSHA1_HASHBUFFER = SVC_UE_HOOK_BASE + 1u;
-// Host CityHash64 — FName interning showed 11% of load time.
-constexpr uint32_t SVC_CITYHASH64 = SVC_UE_HOOK_BASE + 2u;
-/* Host OpenSSL DES-CBC.  This title decrypts its content with single DES and
- * the guest's own OpenSSL was 78% of every instruction the emulator executed
- * — 39.7 billion of them in 140 s, one thread, no SVCs, all of it inside
- * DES_ncbc_encrypt.  Same trade as FAES/FSHA1/CityHash above. */
-constexpr uint32_t SVC_DES_NCBC = SVC_UE_HOOK_BASE + 3u;
-constexpr uint32_t SVC_DES_EDE3_CBC = SVC_UE_HOOK_BASE + 4u;
-/* Host FGenericPlatformStricmp::Stricmp.  UE compares FNames and paths with
- * it a character at a time; it was 2.7% of every guest instruction on the load
- * screen.  One SVC for all the width combinations — which one a call is comes
- * from the address the SVC was taken at. */
-constexpr uint32_t SVC_UE_STRICMP = SVC_UE_HOOK_BASE + 5u;
-/* Host FGenericPlatformStricmp::Strnicmp — the same function with a count.
- * UE reaches for it wherever it compares a prefix, and mounting this title's
- * patch paks (570k filenames, each turned into a package name) spends 10% of
- * every guest instruction in it. */
-constexpr uint32_t SVC_UE_STRNICMP = SVC_UE_HOOK_BASE + 6u;
-/* Host FString::ReplaceInline.  Mounting this title's patch paks turns every
- * one of 570k pak entries into a package name, and each conversion normalises
- * the filename — which is a ReplaceInline of "\\" by "/".  That is 12% of
- * every guest instruction on the load screen, and it is the one shape of the
- * function that needs no allocation at all: search and replacement are the
- * same length, so the characters are overwritten in place.  The handler takes
- * only that shape and hands every other call back to the guest's own code
- * through a resume stub, so the growing path keeps its own semantics. */
-constexpr uint32_t SVC_UE_REPLACE_INLINE = SVC_UE_HOOK_BASE + 7u;
-/* Host TStringViewImpl<T>::FindChar.  A one-character scan over a path, 9.5%
- * of the load screen: the loop is four instructions, so the guest pays for
- * fetch and decode rather than for the comparison.  Whole function, no
- * fallback — there is nothing in it to fall back to. */
-constexpr uint32_t SVC_UE_FINDCHAR = SVC_UE_HOOK_BASE + 8u;
-/* Host CityHash32.  Same reasoning as SVC_CITYHASH64 above, and the same
- * emulator: FName's 32-bit hash (FCrc::StrCrc32 aside) and a handful of other
- * UE hash paths call CityHash32 directly, not just its 64-bit sibling —
- * profiling the post-title-load stall showed it alone at up to 40-50% of
- * every guest instruction in some windows, more than CityHash64 ever was.
- * Answered host-side with the same v1.1 algorithm UE bundles (verified
- * against the reference `cityhash` implementation on every code-length class:
- * 0-4, 5-12, 13-24 and >24 bytes, including a >64-byte string that loops the
- * main round more than once). */
-constexpr uint32_t SVC_CITYHASH32 = SVC_UE_HOOK_BASE + 9u;
-/* Host Ogg Vorbis decode via stb_vorbis (src/lib/stb_vorbis.c), for
- * FVorbisAudioInfo::ReadCompressedInfo/ReadCompressedData/StreamCompressedData.
- * Profiling the post-title-load stall (2026-09-04) found libvorbis itself
- * (mdct_backward, floor1_encode, oggpack_look, ...) dominating the guest's
- * instructions once a sound starts playing — Vorbis has no host bridge the
- * way MediaCodec's H.264 (openh264) and AAC (libavcodec) already do.
- *
- * SVC_STB_VORBIS_INFO is an *observe* hook: the displaced instruction runs
- * and the guest's own ReadCompressedInfo executes unmodified, so
- * FSoundQualityInfo — whose field layout this file has no source for — is
- * filled by the game itself, not guessed at here.  This SVC only opens a
- * parallel, independent stb_vorbis decoder from the same compressed bytes,
- * keyed by the `this` pointer, entirely separate from whatever internal
- * state FVorbisAudioInfo keeps (also not this file's business, for the same
- * reason).
- *
- * SVC_STB_VORBIS_READ *replaces* ReadCompressedData/StreamCompressedData
- * outright (same svc+ret patch as CityHash above): both are a closed
- * contract over plain bytes — `(uint8* Destination, bool bLooping,
- * uint32 BufferSize)`, fill Destination and say whether the sound is done —
- * with no struct to get wrong. */
-constexpr uint32_t SVC_STB_VORBIS_INFO = SVC_UE_HOOK_BASE + 10u;
-constexpr uint32_t SVC_STB_VORBIS_READ = SVC_UE_HOOK_BASE + 11u;
-/* Host UxCsv::FetchRow over UxBufferReader.  Must not share a number with
- * Vorbis above: CallSVC dispatches by handler id, and a collision sent
- * ReadCompressedInfo through the CSV path (and starved the host decoder). */
-constexpr uint32_t SVC_UXCSV_FETCHROW = SVC_UE_HOOK_BASE + 12u;
-/* Host TStringConversion<FUTF8ToTCHAR_Convert,128>::Init for the inline
- * buffer case (output fits in 128 TCHAR).  ReloadInfoAll's stall PC sat in
- * this Init while FNk*InfoManager::Load turned every CSV field into an
- * FString. */
-constexpr uint32_t SVC_UE_UTF8_TO_TCHAR = SVC_UE_HOOK_BASE + 13u;
-/* Host Audio::FLateReflectionsFast::GeneraterPlateModulations.  The plate
- * reverb's two modulation LFOs: one closed float loop per output sample, and
- * 8.8% of every guest instruction of Cross Worlds' post-title load (the
- * reverb submix runs for the loading music).  Whole function, with a resume
- * stub for the one shape that would have to allocate. */
-constexpr uint32_t SVC_UE_PLATE_LFO = SVC_UE_HOOK_BASE + 14u;
-constexpr uint32_t SVC_UE_HOOK_LAST = SVC_UE_PLATE_LFO;
-
-/* Android ABI block.
- *
- * Entry points whose *guest-visible shape* depends on which of two bionic
- * declarations the caller compiled against, plus a few that had been sharing
- * a handler with a near neighbour whose contract is not the same.
- *
- * On LP32 bionic keeps two signal ABIs side by side: `sigset_t` is 32 bits
- * and `sigset64_t` is 64, and `struct sigaction` and `struct sigaction64`
- * therefore have different layouts.  One SVC per pair meant every `sigset_t`
- * the guest handed us was read and written eight bytes wide, which runs four
- * bytes past the object the guest actually allocated.  On LP64 the two are
- * the same type, so both numbers land in the same handler there. */
-constexpr uint32_t SVC_ABI_BASE          = SVC_UE_HOOK_LAST + 1u;
-constexpr uint32_t SVC_SIGACTION64       = SVC_ABI_BASE + 0u;
-constexpr uint32_t SVC_SIGEMPTYSET64     = SVC_ABI_BASE + 1u;
-constexpr uint32_t SVC_SIGFILLSET64      = SVC_ABI_BASE + 2u;
-constexpr uint32_t SVC_SIGADDSET64       = SVC_ABI_BASE + 3u;
-constexpr uint32_t SVC_SIGDELSET64       = SVC_ABI_BASE + 4u;
-constexpr uint32_t SVC_SIGISMEMBER64     = SVC_ABI_BASE + 5u;
-constexpr uint32_t SVC_SIGPROCMASK64     = SVC_ABI_BASE + 6u;
-constexpr uint32_t SVC_PTHREAD_SIGMASK64 = SVC_ABI_BASE + 7u;
-constexpr uint32_t SVC_SIGSUSPEND64      = SVC_ABI_BASE + 8u;
-/* SIGRTMIN/SIGRTMAX are function calls in bionic, not constants: the platform
- * reserves the first few realtime signals for itself.  Answering 0 named the
- * "no signal" slot, so SIGRTMIN+n addressed the ordinary signals. */
-constexpr uint32_t SVC_LIBC_SIGRTMIN     = SVC_ABI_BASE + 9u;
-constexpr uint32_t SVC_LIBC_SIGRTMAX     = SVC_ABI_BASE + 10u;
-/* lstat() shared SVC_LIBC_STAT, i.e. it followed symlinks. */
-constexpr uint32_t SVC_LIBC_LSTAT        = SVC_ABI_BASE + 11u;
-/* media_status_t: 0 is AMEDIA_OK, so "unimplemented" cannot be spelled 0. */
-constexpr uint32_t SVC_MEDIA_UNSUPPORTED = SVC_ABI_BASE + 12u;
-constexpr uint32_t SVC_FUTIMENS          = SVC_ABI_BASE + 13u;
-/* A 64-bit -1.  int64_t/ssize_t entry points that mean "nothing here" cannot
- * borrow SVC_RETM1, which only sets the low 32 bits: on AArch64 the caller
- * reads 4294967295 rather than -1. */
-constexpr uint32_t SVC_RETM1_64          = SVC_ABI_BASE + 14u;
-/* lunaria_fortify_fatal(what, want, have) -- the failing half of the
- * _FORTIFY_SOURCE checks, which now run as guest code in
- * liblunaria_guest.so.  Only a violation comes here, so the trap costs
- * nothing on the path that matters. */
-constexpr uint32_t SVC_FORTIFY_FATAL     = SVC_ABI_BASE + 15u;
-/* ALooper_removeFd(looper, fd) takes two arguments; ALooper_addFd takes six.
- * Sharing one SVC meant removeFd's r2/r3 -- whatever the caller happened to
- * leave there -- were read as `ident` and `events`, so a remove could be
- * taken for an add and re-register the descriptor it was asked to drop. */
-constexpr uint32_t SVC_ALOOPER_REMOVEFD  = SVC_ABI_BASE + 16u;
-/* AAssetDir_rewind(3): a documented NDK entry point that puts a directory
- * enumeration back at its first name.  Unbound it fell to the
- * return-a-constant stub, so the cursor never moved and a second walk of the
- * same AAssetDir came back empty. */
-constexpr uint32_t SVC_AASSETDIR_REWIND  = SVC_ABI_BASE + 17u;
-/* ANativeWindow::dequeueBuffer for the private-ABI window the emulator hands
- * out, and its pre-API-18 two-argument form.  A host handler rather than a
- * guest stub: what it has to publish -- an ANativeWindowBuffer and a fence
- * descriptor -- is emulator state, not arithmetic on the window struct. */
-constexpr uint32_t SVC_ANW_DEQUEUE       = SVC_ABI_BASE + 18u;
-constexpr uint32_t SVC_ANW_DEQUEUE_DEP   = SVC_ABI_BASE + 19u;
-constexpr uint32_t SVC_NET_GETADDRINFOFORNET = SVC_ABI_BASE + 20u;
-constexpr uint32_t SVC_PTHREAD_ATTR_SETSTACK = SVC_ABI_BASE + 21u;
-constexpr uint32_t SVC_SETUID = SVC_ABI_BASE + 22u;
-constexpr uint32_t SVC_SETGID = SVC_ABI_BASE + 23u;
-constexpr uint32_t SVC_SETREUID = SVC_ABI_BASE + 24u;
-constexpr uint32_t SVC_SETREGID = SVC_ABI_BASE + 25u;
-constexpr uint32_t SVC_SETRESUID = SVC_ABI_BASE + 26u;
-constexpr uint32_t SVC_SETRESGID = SVC_ABI_BASE + 27u;
-/* epoll_pwait(2) is not epoll_wait(2) with a spare argument: the mask it is
- * given replaces the calling thread's signal mask for exactly the length of
- * the wait, which is the whole reason the call exists -- it is how a thread
- * waits for a descriptor and a signal without the race of unblocking the
- * signal first.  Sharing epoll_wait's number dropped the mask on the floor.
- * epoll_pwait64 is the LP32 spelling that takes a sigset64_t (see
- * sigset_is_wide); on LP64 the two sets are the same type. */
-constexpr uint32_t SVC_NET_EPOLL_PWAIT   = SVC_ABI_BASE + 28u;
-constexpr uint32_t SVC_NET_EPOLL_PWAIT64 = SVC_ABI_BASE + 29u;
-/* AHardwareBuffer, CPU-backed.
- *
- * These were five entries returning a constant, which left the family saying
- * two different things: `fromHardwareBuffer` answered "there is no buffer"
- * while `describe` -- whose whole job is to fill the caller's
- * AHardwareBuffer_Desc -- answered "done" and wrote nothing, and
- * acquire/release claimed to take and drop a reference that never existed.
- * `allocate` was not bound at all, so a library that imports it could not
- * load once unresolved strong symbols became a load failure, exactly as on a
- * device where the symbol is in libnativewindow.so.
- *
- * So the emulator allocates the thing: an ordinary CPU-visible buffer in the
- * guest's own heap, a reference count, a lock that hands out the pixels and a
- * describe() that answers with the description the buffer was made from.
- * Usages that mean "and the GPU will read this" (sampled image, colour
- * output, cube map, data buffer, protected, video encode, sensor data) are
- * *refused* rather than allocated: nothing here can hand such a buffer to
- * EGL or Vulkan, and a buffer that allocates and then fails to bind is a
- * worse answer than one that says up front it cannot be had. */
-constexpr uint32_t SVC_AHB_ALLOCATE      = SVC_ABI_BASE + 30u;
-constexpr uint32_t SVC_AHB_ACQUIRE       = SVC_ABI_BASE + 31u;
-constexpr uint32_t SVC_AHB_RELEASE       = SVC_ABI_BASE + 32u;
-constexpr uint32_t SVC_AHB_DESCRIBE      = SVC_ABI_BASE + 33u;
-constexpr uint32_t SVC_AHB_LOCK          = SVC_ABI_BASE + 34u;
-constexpr uint32_t SVC_AHB_LOCK_INFO     = SVC_ABI_BASE + 35u;
-constexpr uint32_t SVC_AHB_UNLOCK        = SVC_ABI_BASE + 36u;
-constexpr uint32_t SVC_AHB_GETID         = SVC_ABI_BASE + 37u;
-constexpr uint32_t SVC_AHB_IS_SUPPORTED  = SVC_ABI_BASE + 38u;
-constexpr uint32_t SVC_AHB_SOCKET        = SVC_ABI_BASE + 39u;
-constexpr uint32_t SVC_ABI_LAST          = SVC_AHB_SOCKET;
-
-/* Entry points that had to stop sharing another function's SVC.
- *
- * Every block below this one has grown into the one above it — SVC31_BASE+432
- * is already inside the SVC_HONEST block, and SVC_COMPAT ends one id short of
- * SVC_UE_HOOK_BASE — so new numbers go here, above the highest block, where
- * the 0..4095 space is still empty.  SVC_TRAMP_TOTAL is raised to cover them
- * so build_jni_tables() still builds a trampoline for each. */
-constexpr uint32_t SVC_SPLIT_BASE        = SVC_ABI_LAST + 1u;
-/* The float forms of the classification macros and of the wide-string
- * functions that take a maximum length.  They used to share the SVC of their
- * double / unbounded namesake, which is only correct when the two have the
- * same ABI signature — and none of these pairs does.  isnanf() reached a
- * handler that reads a double out of two registers; wcsnlen()'s limit was
- * dropped; and wcsncat(s, t, 0), which must append nothing, took the `n == 0`
- * branch into an unbounded wcscat(). */
-constexpr uint32_t SVC_ISNANF            = SVC_SPLIT_BASE + 0u;
-constexpr uint32_t SVC_ISINFF            = SVC_SPLIT_BASE + 1u;
-constexpr uint32_t SVC_SIGNBITF          = SVC_SPLIT_BASE + 2u;
-constexpr uint32_t SVC_WCSTOF            = SVC_SPLIT_BASE + 3u;
-constexpr uint32_t SVC_WCSNLEN           = SVC_SPLIT_BASE + 4u;
-constexpr uint32_t SVC_WCSNCPY           = SVC_SPLIT_BASE + 5u;
-constexpr uint32_t SVC_WCSNCAT           = SVC_SPLIT_BASE + 6u;
-/* GLES 3.0 sampler objects.  glGenSamplers/glDeleteSamplers/glSamplerParameter*
- * used to share one SVC whose handler did nothing at all, so glGenSamplers()
- * left the caller's array untouched: every id the guest then bound was
- * whatever had been on the stack, and the filter and wrap state a title set
- * through a sampler object was dropped while the same state set through
- * glTexParameteri took effect. */
-constexpr uint32_t SVC_GL3_GenSamplers           = SVC_SPLIT_BASE + 7u;
-constexpr uint32_t SVC_GL3_DeleteSamplers        = SVC_SPLIT_BASE + 8u;
-constexpr uint32_t SVC_GL3_SamplerParameteri     = SVC_SPLIT_BASE + 9u;
-constexpr uint32_t SVC_GL3_SamplerParameterf     = SVC_SPLIT_BASE + 10u;
-constexpr uint32_t SVC_GL3_SamplerParameteriv    = SVC_SPLIT_BASE + 11u;
-constexpr uint32_t SVC_GL3_SamplerParameterfv    = SVC_SPLIT_BASE + 12u;
-constexpr uint32_t SVC_GL3_IsSampler             = SVC_SPLIT_BASE + 13u;
-constexpr uint32_t SVC_GL3_GetSamplerParameteriv = SVC_SPLIT_BASE + 14u;
-constexpr uint32_t SVC_GL3_GetSamplerParameterfv = SVC_SPLIT_BASE + 15u;
-constexpr uint32_t SVC_SPLIT_LAST        = SVC_GL3_GetSamplerParameterfv;
-
-
-constexpr uint32_t SVC_HONEST_BASE          = 1354u; /* first free id */
-/* Entry points that used to be bound to the generic "returns 0" / "returns
- * -1" templates and turned out to be called for real.  A template answer is a
- * guess about what the caller wanted; these are the answers the caller can
- * actually act on. */
-constexpr uint32_t SVC_SCHED_SETAFFINITY       = SVC_HONEST_BASE + 0u;
-constexpr uint32_t SVC_CXA_ATEXIT              = SVC_HONEST_BASE + 1u;
-constexpr uint32_t SVC_CXA_FINALIZE            = SVC_HONEST_BASE + 2u;
-constexpr uint32_t SVC_ATEXIT                  = SVC_HONEST_BASE + 3u;
-constexpr uint32_t SVC_SETRLIMIT               = SVC_HONEST_BASE + 4u;
-constexpr uint32_t SVC_CHMOD                   = SVC_HONEST_BASE + 5u;
-constexpr uint32_t SVC_FCHMOD                  = SVC_HONEST_BASE + 6u;
-constexpr uint32_t SVC_SYSTEM                  = SVC_HONEST_BASE + 7u;
-constexpr uint32_t SVC_FORK                    = SVC_HONEST_BASE + 8u;
-constexpr uint32_t SVC_ANA_SET_WINDOW_FORMAT   = SVC_HONEST_BASE + 9u;
-constexpr uint32_t SVC_TRUNCATE                = SVC_HONEST_BASE + 10u;
-constexpr uint32_t SVC_SYMLINK                 = SVC_HONEST_BASE + 11u;
-constexpr uint32_t SVC_LINK                    = SVC_HONEST_BASE + 12u;
-constexpr uint32_t SVC_FDATASYNC               = SVC_HONEST_BASE + 13u;
-constexpr uint32_t SVC_UTIMENSAT               = SVC_HONEST_BASE + 14u;
-constexpr uint32_t SVC_FCHMODAT                = SVC_HONEST_BASE + 15u;
-constexpr uint32_t SVC_FNMATCH                 = SVC_HONEST_BASE + 16u;
-constexpr uint32_t SVC_LLDIV                   = SVC_HONEST_BASE + 17u;
-constexpr uint32_t SVC_PATHCONF                = SVC_HONEST_BASE + 18u;
-constexpr uint32_t SVC_GETNAMEINFO             = SVC_HONEST_BASE + 19u;
-constexpr uint32_t SVC_SETVBUF                 = SVC_HONEST_BASE + 20u;
-constexpr uint32_t SVC_ANW_GETFORMAT           = SVC_HONEST_BASE + 21u;
-constexpr uint32_t SVC_ALOOPER_ACQUIRE         = SVC_HONEST_BASE + 22u;
-constexpr uint32_t SVC_ALOOPER_RELEASE         = SVC_HONEST_BASE + 23u;
-constexpr uint32_t SVC_PTHREAD_ATFORK          = SVC_HONEST_BASE + 24u;
-constexpr uint32_t SVC_MLOCK                   = SVC_HONEST_BASE + 25u;
-constexpr uint32_t SVC_MUNLOCK                 = SVC_HONEST_BASE + 26u;
-constexpr uint32_t SVC_GETPWUID_R              = SVC_HONEST_BASE + 27u;
-constexpr uint32_t SVC_CXA_THREAD_ATEXIT       = SVC_HONEST_BASE + 28u;
-/* pthread_condattr_setclock/getclock: a condvar may be created on
- * CLOCK_MONOTONIC, and its timedwait deadlines are then on that clock. */
-constexpr uint32_t SVC_PTHREAD_CONDATTR_SETCLOCK = SVC_HONEST_BASE + 29u;
-constexpr uint32_t SVC_PTHREAD_CONDATTR_GETCLOCK = SVC_HONEST_BASE + 30u;
-/* pthread_mutexattr_settype/gettype: NORMAL, RECURSIVE and ERRORCHECK are
- * three different contracts and a mutex has to know which one it was made
- * with. */
-constexpr uint32_t SVC_PTHREAD_MUTEXATTR_SETTYPE = SVC_HONEST_BASE + 31u;
-constexpr uint32_t SVC_PTHREAD_MUTEXATTR_GETTYPE = SVC_HONEST_BASE + 32u;
-/* pthread_attr_t is bionic's plain struct in guest memory, so the setters
- * write the same fields the getters above already read. */
-constexpr uint32_t SVC_PTHREAD_ATTR_INIT         = SVC_HONEST_BASE + 33u;
-constexpr uint32_t SVC_PTHREAD_ATTR_SETSTACKSZ   = SVC_HONEST_BASE + 34u;
-constexpr uint32_t SVC_PTHREAD_ATTR_SETDETACH    = SVC_HONEST_BASE + 35u;
-constexpr uint32_t SVC_PTHREAD_ATTR_GETDETACH    = SVC_HONEST_BASE + 36u;
-/* __pthread_cleanup_push/pop: the handler stack a thread unwinds through when
- * it is cancelled or exits. */
-constexpr uint32_t SVC_PTHREAD_CLEANUP_PUSH      = SVC_HONEST_BASE + 37u;
-constexpr uint32_t SVC_PTHREAD_CLEANUP_POP       = SVC_HONEST_BASE + 38u;
-/* Destroying an attribute has to leave it *invalid*, not untouched. */
-constexpr uint32_t SVC_PTHREAD_MUTEXATTR_DESTROY = SVC_HONEST_BASE + 39u;
-constexpr uint32_t SVC_AASSET_OPENFD64           = SVC_HONEST_BASE + 40u;
-constexpr uint32_t SVC_RAISE                     = SVC_HONEST_BASE + 41u;
-constexpr uint32_t SVC_SIGALTSTACK               = SVC_HONEST_BASE + 42u;
-constexpr uint32_t SVC_SYSPROP_FIND             = SVC_HONEST_BASE + 43u;
-constexpr uint32_t SVC_SYSPROP_READ             = SVC_HONEST_BASE + 44u;
-constexpr uint32_t SVC_SYSPROP_READ_CB           = SVC_HONEST_BASE + 45u;
-constexpr uint32_t SVC_AKEY_ACTION                = SVC_HONEST_BASE + 46u;
-constexpr uint32_t SVC_AKEY_KEYCODE               = SVC_HONEST_BASE + 47u;
-constexpr uint32_t SVC_AKEY_META                  = SVC_HONEST_BASE + 48u;
-constexpr uint32_t SVC_AKEY_FLAGS                 = SVC_HONEST_BASE + 49u;
-constexpr uint32_t SVC_ACFG_DELETE                = SVC_HONEST_BASE + 50u;
-constexpr uint32_t SVC_ACFG_COPY                  = SVC_HONEST_BASE + 51u;
-constexpr uint32_t SVC_ACFG_DIFF                  = SVC_HONEST_BASE + 52u;
-constexpr uint32_t SVC_ACFG_SET_INT_BASE          = SVC_HONEST_BASE + 53u;
-constexpr uint32_t SVC_ACFG_SET_INT_END           = SVC_HONEST_BASE + 69u; /* + ACFG_I_COUNT - 1 */
-constexpr uint32_t SVC_ACFG_SETLANG               = SVC_HONEST_BASE + 70u;
-constexpr uint32_t SVC_ACFG_SETCOUNTRY            = SVC_HONEST_BASE + 71u;
-constexpr uint32_t SVC_ACFG_SET_SDKVER            = SVC_HONEST_BASE + 72u;
-constexpr uint32_t SVC_UNWIND_FAIL                = SVC_HONEST_BASE + 73u;
-constexpr uint32_t SVC_WAITPID                    = SVC_HONEST_BASE + 74u;
-constexpr uint32_t SVC_PTRACE                     = SVC_HONEST_BASE + 75u;
-constexpr uint32_t SVC_GETPPID                    = SVC_HONEST_BASE + 76u;
-/* popen/pclose: an app that runs one of the device's own utilities and reads
- * its output does it through these as often as through fork()+execve().  They
- * were bound to the "returns -1" template, which says the process could not be
- * started at all — a state a device is never in for /system/bin/sh. */
-constexpr uint32_t SVC_POPEN                      = SVC_HONEST_BASE + 77u;
-constexpr uint32_t SVC_PCLOSE                     = SVC_HONEST_BASE + 78u;
-/* bionic's crt entry point.  Only a program image (an executable) calls it —
- * a shared object never does — so it appeared only once this emulator could
- * start one.  Left unbound it resolves to the "returns 0" template, and the
- * program returns from _start without ever entering main. */
-constexpr uint32_t SVC_LIBC_INIT                  = SVC_HONEST_BASE + 79u;
-/* The last number in the block above.  SVC_TRAMP_TOTAL is derived from this
- * rather than from whichever SVC happened to be written last: a number past
- * that bound gets no trampoline built, and the unknown-symbol pool — which
- * starts at the bound — hands its address out to a dlsym'd name instead, so
- * two unrelated symbols end up sharing one stub.  Adding to the block above
- * means moving this line down with it. */
-constexpr uint32_t SVC_HONEST_LAST             = SVC_LIBC_INIT;
-static_assert(SVC_HONEST_LAST < SVC_UE_HOOK_BASE,
-              "the honest block has grown into the UE hook block");
-constexpr uint32_t NUM_ICALL_PROBES        = 16u;
-constexpr uint32_t SVC_ICALL_PROBE_BASE    = SVC_DETOUR_BASE + NUM_DETOURS + 110u;
 constexpr uint32_t ICALL_PROBE_STUB_BASE   = 0x4100e800u;
 inline uint32_t g_icall_probe_next = ICALL_PROBE_STUB_BASE;
 inline uint32_t g_icall_probe_count = 0;
 inline const char *g_icall_probe_names[NUM_ICALL_PROBES] = {};
 inline uint8_t g_icall_probe_kind[NUM_ICALL_PROBES] = {};
 inline uint32_t g_mono_add_icall_real = 0;
-// Real INTERNAL_set_localRotation — optional workaround (LUNARIA_FIX_EULER=1).
-inline uint32_t g_set_local_rotation_fn = 0;
-inline uint32_t g_set_local_euler_fn = 0; /* real INTERNAL_set_localEulerAngles */
-constexpr uint32_t ICALL_QUAT_SCRATCH = 0x4100e7c0u; /* 4 floats */
 
-constexpr uint32_t SVC_LIBC_LSEEK64      = SVC_DETOUR_BASE + NUM_DETOURS + 74u; /* lseek64(fd, r1:r2, whence_r3) */
-
-constexpr uint32_t SVC_PTHREAD_MUTEX_INIT    = SVC_DETOUR_BASE + NUM_DETOURS + 75u;
-constexpr uint32_t SVC_PTHREAD_MUTEX_LOCK    = SVC_DETOUR_BASE + NUM_DETOURS + 76u;
-constexpr uint32_t SVC_PTHREAD_MUTEX_TRYLOCK = SVC_DETOUR_BASE + NUM_DETOURS + 77u;
-constexpr uint32_t SVC_PTHREAD_MUTEX_UNLOCK  = SVC_DETOUR_BASE + NUM_DETOURS + 78u;
-constexpr uint32_t SVC_PTHREAD_MUTEX_DESTROY = SVC_DETOUR_BASE + NUM_DETOURS + 79u;
-constexpr uint32_t SVC_PTHREAD_COND_INIT     = SVC_DETOUR_BASE + NUM_DETOURS + 80u;
-constexpr uint32_t SVC_PTHREAD_COND_DESTROY  = SVC_DETOUR_BASE + NUM_DETOURS + 81u;
-constexpr uint32_t SVC_PTHREAD_COND_SIGNAL   = SVC_DETOUR_BASE + NUM_DETOURS + 82u;
-constexpr uint32_t SVC_PTHREAD_COND_BROADCAST= SVC_DETOUR_BASE + NUM_DETOURS + 83u;
-constexpr uint32_t SVC_PTHREAD_EXIT          = SVC_DETOUR_BASE + NUM_DETOURS + 84u;
-constexpr uint32_t SVC_PTHREAD_ATTR_NOOP     = SVC_DETOUR_BASE + NUM_DETOURS + 85u; /* init/destroy/setstacksize etc */
-constexpr uint32_t SVC_PTHREAD_ATTR_GETGUARD = SVC_DETOUR_BASE + NUM_DETOURS + 48u; /* getguardsize */
-constexpr uint32_t SVC_PTHREAD_MUTEXATTR_NOOP= SVC_DETOUR_BASE + NUM_DETOURS + 86u; /* mutexattr_init/settype/destroy */
-constexpr uint32_t SVC_PTHREAD_CONDATTR_NOOP = SVC_DETOUR_BASE + NUM_DETOURS + 87u; /* condattr_init/setclock/destroy */
-// pthread_rwlock: no real blocking under cooperative scheduling; track state for EBUSY
-constexpr uint32_t SVC_PTHREAD_RWLOCK_INIT     = SVC_DETOUR_BASE + NUM_DETOURS + 88u;
-constexpr uint32_t SVC_PTHREAD_RWLOCK_RDLOCK   = SVC_DETOUR_BASE + NUM_DETOURS + 89u;
-constexpr uint32_t SVC_PTHREAD_RWLOCK_WRLOCK   = SVC_DETOUR_BASE + NUM_DETOURS + 90u;
-constexpr uint32_t SVC_PTHREAD_RWLOCK_UNLOCK   = SVC_DETOUR_BASE + NUM_DETOURS + 91u;
-constexpr uint32_t SVC_PTHREAD_RWLOCK_DESTROY  = SVC_DETOUR_BASE + NUM_DETOURS + 92u;
-constexpr uint32_t SVC_PTHREAD_RWLOCK_TRYRDLOCK= SVC_DETOUR_BASE + NUM_DETOURS + 93u;
-constexpr uint32_t SVC_PTHREAD_RWLOCK_TRYWRLOCK= SVC_DETOUR_BASE + NUM_DETOURS + 94u;
-// pthread_join: wait for target thread finished flag
-constexpr uint32_t SVC_PTHREAD_JOIN            = SVC_DETOUR_BASE + NUM_DETOURS + 95u;
-// pthread_detach: mark thread detached
-constexpr uint32_t SVC_PTHREAD_DETACH          = SVC_DETOUR_BASE + NUM_DETOURS + 96u;
-// pthread_cond_wait/timedwait: check cond and schedule
-constexpr uint32_t SVC_PTHREAD_COND_WAIT       = SVC_DETOUR_BASE + NUM_DETOURS + 97u;
-constexpr uint32_t SVC_PTHREAD_COND_TIMEDWAIT  = SVC_DETOUR_BASE + NUM_DETOURS + 98u;
-// qsort: invoke guest comparator via call_guest_cb
-constexpr uint32_t SVC_QSORT                   = SVC_DETOUR_BASE + NUM_DETOURS + 99u;
-// fdopen: register fd in g_file_tab, return guest shim
-constexpr uint32_t SVC_FDOPEN                  = SVC_DETOUR_BASE + NUM_DETOURS + 100u;
-// strerror_r: write error string into buffer
-constexpr uint32_t SVC_STRERROR_R              = SVC_DETOUR_BASE + NUM_DETOURS + 101u;
-// pread64/pwrite64: LP32 bionic passes the 64-bit offset as an 8-byte-aligned value.
-constexpr uint32_t SVC_PREAD64                = SVC_ICALL_PROBE_BASE + NUM_ICALL_PROBES + 0u;
-constexpr uint32_t SVC_PWRITE64               = SVC_ICALL_PROBE_BASE + NUM_ICALL_PROBES + 1u;
-/* fstatfs/fstatvfs take a descriptor, not a path: they cannot share the SVC
- * with their path-taking siblings once the answer depends on which filesystem
- * was named. */
-constexpr uint32_t SVC_FSTATFS               = SVC_ICALL_PROBE_BASE + NUM_ICALL_PROBES + 2u;
-constexpr uint32_t SVC_FSTATVFS              = SVC_ICALL_PROBE_BASE + NUM_ICALL_PROBES + 3u;
-constexpr uint32_t SVC_TOTAL              = SVC_ICALL_PROBE_BASE + NUM_ICALL_PROBES + 4u;
-
-
-constexpr uint32_t SVC29_BASE             = SVC_TOTAL;
-
-constexpr uint32_t SVC_FMA                = SVC29_BASE + 0u;  /* fma(double,double,double) */
-constexpr uint32_t SVC_FMAF               = SVC29_BASE + 1u;  /* fmaf(float,float,float) */
-constexpr uint32_t SVC_SCALBN             = SVC29_BASE + 2u;  /* scalbn(double,int) */
-constexpr uint32_t SVC_SCALBNF            = SVC29_BASE + 3u;  /* scalbnf(float,int) */
-constexpr uint32_t SVC_ILOGB              = SVC29_BASE + 4u;  /* ilogb(double)->int */
-constexpr uint32_t SVC_ILOGBF             = SVC29_BASE + 5u;  /* ilogbf(float)->int */
-
-constexpr uint32_t SVC_DUP                = SVC29_BASE + 6u;  /* dup(fd) */
-constexpr uint32_t SVC_FERROR             = SVC29_BASE + 7u;  /* ferror(FILE*) */
-constexpr uint32_t SVC_REWINDDIR          = SVC29_BASE + 8u;  /* rewinddir(DIR*) */
-constexpr uint32_t SVC_MBTOWC             = SVC29_BASE + 9u;  /* mbtowc(pwc,s,n) */
-constexpr uint32_t SVC_MBRLEN             = SVC29_BASE + 10u; /* mbrlen(s,n,ps) */
-constexpr uint32_t SVC_MBSRTOWCS          = SVC29_BASE + 11u; /* mbsrtowcs(dst,src,n,ps) */
-
-constexpr uint32_t SVC_LOGB               = SVC29_BASE + 12u; /* logb(double)->double */
-constexpr uint32_t SVC_LRINTF             = SVC29_BASE + 13u; /* lrintf(float)->int */
-constexpr uint32_t SVC_EXPM1F             = SVC29_BASE + 14u; /* expm1f(float)->float */
-constexpr uint32_t SVC_NANF               = SVC29_BASE + 15u; /* nanf(const char*)->float */
-constexpr uint32_t SVC_WMEMCMP            = SVC29_BASE + 16u; /* wmemcmp(s1,s2,n)->int */
-constexpr uint32_t SVC_SWPRINTF           = SVC29_BASE + 17u; /* swprintf(buf,n,fmt,...)->int */
-constexpr uint32_t SVC_LOCALECONV         = SVC29_BASE + 18u; /* localeconv()->struct lconv* */
-constexpr uint32_t SVC_SOCKETPAIR         = SVC29_BASE + 19u; /* socketpair(dom,type,prot,sv) */
-/* iswxdigit accepts a-f/A-F as well as 0-9; iswdigit does not, so the two are
- * not interchangeable — see the symbol table entry for why that mattered. */
-constexpr uint32_t SVC_ACFG_SDKVER        = SVC29_BASE + 20u; /* AConfiguration_getSdkVersion */
-constexpr uint32_t SVC_ACHOREOGRAPHER_GET = SVC29_BASE + 21u; /* AChoreographer_getInstance */
-constexpr uint32_t SVC_AASSETMGR_FROMJAVA = SVC29_BASE + 22u; /* AAssetManager_fromJava */
-constexpr uint32_t SVC_AASSETMGR_OPEN     = SVC29_BASE + 23u; /* AAssetManager_open */
-constexpr uint32_t SVC_AASSET_GETBUFFER   = SVC29_BASE + 24u; /* AAsset_getBuffer */
-constexpr uint32_t SVC_AASSET_GETLENGTH   = SVC29_BASE + 25u; /* AAsset_getLength */
-constexpr uint32_t SVC_ACHOREOGRAPHER_POST      = SVC29_BASE + 26u; /* postFrameCallback */
-constexpr uint32_t SVC_ACHOREOGRAPHER_POST64    = SVC29_BASE + 27u; /* postFrameCallback64 */
-constexpr uint32_t SVC_ACHOREOGRAPHER_POSTDELAY = SVC29_BASE + 28u; /* postFrameCallbackDelayed */
-constexpr uint32_t SVC_MONO_PREP            = SVC29_BASE + 29u; /* mono config before jit init */
-constexpr uint32_t SVC_ANW_LOCK             = SVC29_BASE + 30u;
-constexpr uint32_t SVC_ANW_UNLOCK           = SVC29_BASE + 31u;
-constexpr uint32_t SVC_AEABI_IDIV0          = SVC29_BASE + 32u;
-constexpr uint32_t SVC_AEABI_LDIV0          = SVC29_BASE + 33u;
-constexpr uint32_t SVC_AEABI_LLSL           = SVC29_BASE + 34u;
-constexpr uint32_t SVC_AEABI_LLSR           = SVC29_BASE + 35u;
-constexpr uint32_t SVC_ISFINITEF            = SVC29_BASE + 36u;
-constexpr uint32_t SVC_WPRINTF              = SVC29_BASE + 37u;
-constexpr uint32_t SVC_SWSCANF              = SVC29_BASE + 38u;
-constexpr uint32_t SVC_LRINT                = SVC29_BASE + 39u; /* lrint(double)->long */
-/* iswxdigit accepts a-f/A-F as well as 0-9; iswdigit does not, so the two are
- * not interchangeable — see the symbol table entry for why that mattered. */
-constexpr uint32_t SVC_ISWXDIGIT            = SVC29_BASE + 40u;
-/* clearerr(FILE*): it clears the end-of-file and error indicators, and a
- * no-op leaves a stream that has hit EOF permanently at EOF — the next
- * fread/fgets on it fails although the caller has just said to try again. */
-constexpr uint32_t SVC_CLEARERR             = SVC29_BASE + 41u;
-constexpr uint32_t SVC29_TOTAL            = SVC29_BASE + 42u;
-
-// ---- GC signal / sigaction ----
-constexpr uint32_t SVC31_BASE             = SVC29_TOTAL;
-constexpr uint32_t SVC_SIGACTION          = SVC31_BASE + 0u; /* sigaction(signum,new,old) */
-constexpr uint32_t SVC_PTHREAD_KILL       = SVC31_BASE + 1u; /* pthread_kill/tkill/kill(tid,sig) */
-constexpr uint32_t SVC_BSD_SIGNAL         = SVC31_BASE + 2u; /* bsd_signal(signum,handler) */
-constexpr uint32_t SVC_EGL_SYSTIME_FREQ   = SVC31_BASE + 3u; /* eglGetSystemTimeFrequencyNV() → u64 ticks/s */
-constexpr uint32_t SVC_EGL_SYSTIME        = SVC31_BASE + 4u; /* eglGetSystemTimeNV() → u64 ticks */
-constexpr uint32_t SVC_SIGSUSPEND         = SVC31_BASE + 5u; /* sigsuspend(mask): GC suspend loop */
-
-// pipe/pipe2: host-backed pipes (fds live in the same table as open() fds)
-constexpr uint32_t SVC_PIPE               = SVC31_BASE + 6u;
-constexpr uint32_t SVC_PIPE2              = SVC31_BASE + 7u;
-constexpr uint32_t SVC_ALOOPER_ADDFD      = SVC31_BASE + 8u; /* ALooper_addFd → 1 on success */
-/* SVC_ALOOPER_REMOVEFD is in the SVC_ABI_BASE block: it used to be an alias
- * for addFd, which is why removeFd's absent third and fourth arguments were
- * read as `ident` and `events`. */
-
-// ASensor* — Unity Input.
-constexpr uint32_t SVC_ASENSOR_MGR_INSTANCE = SVC31_BASE + 90u;
-constexpr uint32_t SVC_ASENSOR_MGR_DEFAULT  = SVC31_BASE + 91u;
-constexpr uint32_t SVC_ASENSOR_MGR_LIST     = SVC31_BASE + 92u;
-constexpr uint32_t SVC_ASENSOR_MGR_CREATEQ  = SVC31_BASE + 93u;
-constexpr uint32_t SVC_ASENSOR_MGR_DESTROYQ = SVC31_BASE + 94u;
-constexpr uint32_t SVC_ASENSOR_Q_ENABLE     = SVC31_BASE + 95u;
-constexpr uint32_t SVC_ASENSOR_Q_DISABLE    = SVC31_BASE + 96u;
-constexpr uint32_t SVC_ASENSOR_Q_SETRATE    = SVC31_BASE + 97u;
-constexpr uint32_t SVC_ASENSOR_Q_HASEVENTS  = SVC31_BASE + 98u;
-constexpr uint32_t SVC_ASENSOR_Q_GETEVENTS  = SVC31_BASE + 99u;
-constexpr uint32_t SVC_ASENSOR_GETTYPE      = SVC31_BASE + 100u;
-constexpr uint32_t SVC_ASENSOR_GETNAME      = SVC31_BASE + 101u;
-constexpr uint32_t SVC_ASENSOR_GETVENDOR    = SVC31_BASE + 102u;
-constexpr uint32_t SVC_ASENSOR_GETRES       = SVC31_BASE + 103u;
-constexpr uint32_t SVC_ASENSOR_GETMINDELAY  = SVC31_BASE + 104u;
 inline bool g_asensor_enabled = false;
-
-// Extra libc / EGL / zlib / GLES3 symbols needed by UE arm64 (libUnreal).
-constexpr uint32_t SVC_EGL_BIND_API         = SVC31_BASE + 105u; /* eglBindAPI → EGL_TRUE */
-constexpr uint32_t SVC_MALLOC_USABLE_SIZE   = SVC31_BASE + 106u;
-constexpr uint32_t SVC_ZLIB_VERSION         = SVC31_BASE + 107u;
-constexpr uint32_t SVC_DL_ITERATE_PHDR      = SVC31_BASE + 108u;
-constexpr uint32_t SVC_ANDROID_ABORT_MSG    = SVC31_BASE + 109u;
-constexpr uint32_t SVC_PAUSE                = SVC31_BASE + 110u;
-constexpr uint32_t SVC_MINCORE              = SVC31_BASE + 111u;
-constexpr uint32_t SVC_SCHED_GETSCHEDULER   = SVC31_BASE + 112u;
-constexpr uint32_t SVC_TZSET                = SVC31_BASE + 113u;
-constexpr uint32_t SVC_STRFTIME_L           = SVC31_BASE + 114u;
-constexpr uint32_t SVC_WCSCHR               = SVC31_BASE + 115u;
-constexpr uint32_t SVC_SL_CREATE_ENGINE     = SVC31_BASE + 116u;
-constexpr uint32_t SVC_GL_BLIT_FRAMEBUFFER  = SVC31_BASE + 117u;
-constexpr uint32_t SVC_GL_TEX_IMAGE_3D      = SVC31_BASE + 118u;
-constexpr uint32_t SVC_GL_DRAW_INSTANCED    = SVC31_BASE + 119u; /* Arrays/Elements Instanced */
-constexpr uint32_t SVC_GL_HINT              = SVC31_BASE + 120u;
-constexpr uint32_t SVC_GL_READ_BUFFER       = SVC31_BASE + 121u;
-constexpr uint32_t SVC_GL_GEN_QUERIES       = SVC31_BASE + 122u;
-constexpr uint32_t SVC_GL_QUERY_OPS         = SVC31_BASE + 123u; /* Begin/End/GetQueryObjectuiv */
-constexpr uint32_t SVC_GL_SAMPLER_OPS       = SVC31_BASE + 124u; /* Gen/Delete/Parameteri */
-constexpr uint32_t SVC_GL_MISC3_NOP         = SVC31_BASE + 125u; /* safe no-op GL3 */
-// Kept as the highest real SVC number so SVC_TRAMP_TOTAL (= +1) bounds the whole known-SVC range.
-constexpr uint32_t SVC_MPROTECT            = SVC31_BASE + 129u;
-
-// zlib size helpers.
-constexpr uint32_t SVC_Z_COMPRESSBOUND     = SVC31_BASE + 130u;
-constexpr uint32_t SVC_Z_DEFLATEBOUND      = SVC31_BASE + 131u;
-
-// GLES 3.
-constexpr uint32_t SVC_GLX_TexBuffer          = SVC31_BASE + 132u;
-constexpr uint32_t SVC_GLX_TexBufferRange     = SVC31_BASE + 133u;
-constexpr uint32_t SVC_GLX_CopyImageSubData   = SVC31_BASE + 134u;
-constexpr uint32_t SVC_GLX_Enablei            = SVC31_BASE + 135u;
-constexpr uint32_t SVC_GLX_Disablei           = SVC31_BASE + 136u;
-constexpr uint32_t SVC_GLX_ColorMaski         = SVC31_BASE + 137u;
-constexpr uint32_t SVC_GLX_BlendEquationi     = SVC31_BASE + 138u;
-constexpr uint32_t SVC_GLX_BlendEquationSepi  = SVC31_BASE + 139u;
-constexpr uint32_t SVC_GLX_BlendFunci         = SVC31_BASE + 140u;
-constexpr uint32_t SVC_GLX_BlendFuncSepi      = SVC31_BASE + 141u;
-constexpr uint32_t SVC_GLX_GetPointerv        = SVC31_BASE + 142u;
-
-// OpenSL ES object model.
-constexpr uint32_t SVC_SL_OBJ_REALIZE         = SVC31_BASE + 143u;
-constexpr uint32_t SVC_SL_OBJ_GETSTATE        = SVC31_BASE + 144u;
-constexpr uint32_t SVC_SL_OBJ_GETINTERFACE    = SVC31_BASE + 145u;
-constexpr uint32_t SVC_SL_ENG_CREATE_OUTMIX   = SVC31_BASE + 146u;
-constexpr uint32_t SVC_SL_ENG_CREATE_PLAYER   = SVC31_BASE + 147u;
-constexpr uint32_t SVC_SL_BQ_REGISTER         = SVC31_BASE + 148u;
-constexpr uint32_t SVC_SL_BQ_ENQUEUE          = SVC31_BASE + 149u;
-constexpr uint32_t SVC_SL_BQ_GETSTATE         = SVC31_BASE + 150u;
-// sched_getaffinity(pid, setsize, cpu_set_t*).
-constexpr uint32_t SVC_SCHED_GETAFFINITY      = SVC31_BASE + 151u;
-
-// GLES 3.
-constexpr uint32_t SVC_GL3_ClearBufferfv      = SVC31_BASE + 152u;
-constexpr uint32_t SVC_GL3_ClearBufferiv      = SVC31_BASE + 153u;
-constexpr uint32_t SVC_GL3_ClearBufferuiv     = SVC31_BASE + 154u;
-constexpr uint32_t SVC_GL3_ClearBufferfi      = SVC31_BASE + 155u;
-constexpr uint32_t SVC_GL3_GetUniformBlockIndex   = SVC31_BASE + 156u;
-constexpr uint32_t SVC_GL3_UniformBlockBinding    = SVC31_BASE + 157u;
-constexpr uint32_t SVC_GL3_GetActiveUniformBlockiv= SVC31_BASE + 158u;
-constexpr uint32_t SVC_GL3_GetUniformIndices      = SVC31_BASE + 159u;
-constexpr uint32_t SVC_GL3_GetActiveUniformsiv    = SVC31_BASE + 160u;
-constexpr uint32_t SVC_GL3_FramebufferTextureLayer= SVC31_BASE + 161u;
-constexpr uint32_t SVC_GL3_CopyBufferSubData      = SVC31_BASE + 162u;
-constexpr uint32_t SVC_GL3_RenderbufferStorageMS  = SVC31_BASE + 163u;
-constexpr uint32_t SVC_GL3_BindImageTexture       = SVC31_BASE + 164u;
-constexpr uint32_t SVC_GL3_MemoryBarrier          = SVC31_BASE + 165u;
-constexpr uint32_t SVC_GL3_DispatchCompute        = SVC31_BASE + 166u;
-constexpr uint32_t SVC_GL3_BindVertexBuffer       = SVC31_BASE + 167u;
-constexpr uint32_t SVC_GL3_VertexAttribFormat     = SVC31_BASE + 168u;
-constexpr uint32_t SVC_GL3_VertexAttribIFormat    = SVC31_BASE + 169u;
-constexpr uint32_t SVC_GL3_VertexAttribBinding    = SVC31_BASE + 170u;
-constexpr uint32_t SVC_GL3_VertexBindingDivisor   = SVC31_BASE + 171u;
-constexpr uint32_t SVC_GL3_TexStorage2DMS         = SVC31_BASE + 172u;
-constexpr uint32_t SVC_GL3_Uniform4uiv            = SVC31_BASE + 173u;
-constexpr uint32_t SVC_GL3_GetProgramResourceIndex= SVC31_BASE + 174u;
-constexpr uint32_t SVC_GL3_FramebufferTexture     = SVC31_BASE + 175u;
-constexpr uint32_t SVC_GL3_FramebufferTexture3D   = SVC31_BASE + 176u;
-// GLES2 leftovers + GLES3.
-constexpr uint32_t SVC_GL3_CopyTexImage2D            = SVC31_BASE + 177u;
-constexpr uint32_t SVC_GL3_GetRenderbufferParameteriv= SVC31_BASE + 178u;
-constexpr uint32_t SVC_GL3_ValidateProgram           = SVC31_BASE + 179u;
-constexpr uint32_t SVC_GL3_GetTexLevelParameterfv    = SVC31_BASE + 180u;
-constexpr uint32_t SVC_GL3_GetTexLevelParameteriv    = SVC31_BASE + 181u;
-constexpr uint32_t SVC_GL3_GetUniformiv              = SVC31_BASE + 182u;
-constexpr uint32_t SVC_GL3_TexImage2DMultisample     = SVC31_BASE + 183u;
-constexpr uint32_t SVC_GL3_TexParameteriv            = SVC31_BASE + 184u;
-constexpr uint32_t SVC_GL3_Uniform1uiv               = SVC31_BASE + 185u;
-constexpr uint32_t SVC_GL3_Uniform2uiv               = SVC31_BASE + 186u;
-constexpr uint32_t SVC_GL3_Uniform3uiv               = SVC31_BASE + 187u;
-constexpr uint32_t SVC_GL3_DeleteQueries             = SVC31_BASE + 188u;
-constexpr uint32_t SVC_GL3_GetQueryiv                = SVC31_BASE + 189u;
-constexpr uint32_t SVC_GL3_CompressedTexImage3D      = SVC31_BASE + 190u;
-constexpr uint32_t SVC_GL3_GetActiveUniformBlockName = SVC31_BASE + 191u;
-constexpr uint32_t SVC_GL3_VertexAttribIPointer      = SVC31_BASE + 192u;
-constexpr uint32_t SVC_GL3_ProgramUniform1fv         = SVC31_BASE + 193u;
-constexpr uint32_t SVC_GL3_ProgramUniform1iv         = SVC31_BASE + 194u;
-constexpr uint32_t SVC_GL3_ProgramUniform2fv         = SVC31_BASE + 195u;
-constexpr uint32_t SVC_GL3_ProgramUniform2iv         = SVC31_BASE + 196u;
-constexpr uint32_t SVC_GL3_ProgramUniform3fv         = SVC31_BASE + 197u;
-constexpr uint32_t SVC_GL3_ProgramUniform3iv         = SVC31_BASE + 198u;
-constexpr uint32_t SVC_GL3_ProgramUniform4fv         = SVC31_BASE + 199u;
-constexpr uint32_t SVC_GL3_ProgramUniform4iv         = SVC31_BASE + 200u;
-constexpr uint32_t SVC_GL3_ProgramUniformMatrix2fv   = SVC31_BASE + 201u;
-constexpr uint32_t SVC_GL3_ProgramUniformMatrix3fv   = SVC31_BASE + 202u;
-constexpr uint32_t SVC_GL3_ProgramUniformMatrix4fv   = SVC31_BASE + 203u;
-constexpr uint32_t SVC_GL3_ProgramUniformMatrix2x3fv = SVC31_BASE + 204u;
-constexpr uint32_t SVC_GL3_ProgramUniformMatrix3x2fv = SVC31_BASE + 205u;
-constexpr uint32_t SVC_GL3_ProgramUniformMatrix2x4fv = SVC31_BASE + 206u;
-constexpr uint32_t SVC_GL3_ProgramUniformMatrix4x2fv = SVC31_BASE + 207u;
-constexpr uint32_t SVC_GL3_ProgramUniformMatrix3x4fv = SVC31_BASE + 208u;
-constexpr uint32_t SVC_GL3_ProgramUniformMatrix4x3fv = SVC31_BASE + 209u;
-constexpr uint32_t SVC_GL3_ProgramUniform1uiv        = SVC31_BASE + 210u;
-constexpr uint32_t SVC_GL3_ProgramUniform2uiv        = SVC31_BASE + 211u;
-constexpr uint32_t SVC_GL3_ProgramUniform3uiv        = SVC31_BASE + 212u;
-constexpr uint32_t SVC_GL3_ProgramUniform4uiv        = SVC31_BASE + 213u;
-constexpr uint32_t SVC_GL3_PatchParameteri           = SVC31_BASE + 214u;
-constexpr uint32_t SVC_GL3_TexStorage3DMultisample   = SVC31_BASE + 215u;
-// Android app processes have no controlling terminal.
-constexpr uint32_t SVC_TCGETATTR                     = SVC31_BASE + 216u;
-constexpr uint32_t SVC_TCSETATTR                     = SVC31_BASE + 217u;
-constexpr uint32_t SVC_TCFLUSH                       = SVC31_BASE + 218u;
-constexpr uint32_t SVC_GL3_BeginTransformFeedback    = SVC31_BASE + 219u;
-constexpr uint32_t SVC_GL3_EndTransformFeedback      = SVC31_BASE + 220u;
-constexpr uint32_t SVC_GL3_TransformFeedbackVaryings = SVC31_BASE + 221u;
-constexpr uint32_t SVC_GL3_BindTransformFeedback     = SVC31_BASE + 222u;
-constexpr uint32_t SVC_GL3_DeleteTransformFeedbacks  = SVC31_BASE + 223u;
-constexpr uint32_t SVC_GL3_GenTransformFeedbacks     = SVC31_BASE + 224u;
-
-// AAudio (FMOD output/recorder path; API 26+).
-constexpr uint32_t SVC_AAUDIO_CREATE_BUILDER = SVC31_BASE + 9u;  /* AAudio_createStreamBuilder(**b) */
-constexpr uint32_t SVC_AAUDIO_OPEN_STREAM    = SVC31_BASE + 10u; /* AAudioStreamBuilder_openStream(b,**s) */
-constexpr uint32_t SVC_AAUDIO_GET_FPB        = SVC31_BASE + 11u; /* AAudioStream_getFramesPerBurst */
-constexpr uint32_t SVC_AAUDIO_GET_BUFSIZE    = SVC31_BASE + 12u; /* AAudioStream_getBufferSizeInFrames */
-constexpr uint32_t SVC_AAUDIO_SET_BUFSIZE    = SVC31_BASE + 13u; /* AAudioStream_setBufferSizeInFrames */
-constexpr uint32_t SVC_AAUDIO_GET_BUFCAP     = SVC31_BASE + 14u; /* AAudioStream_getBufferCapacityInFrames */
-constexpr uint32_t SVC_AAUDIO_WAIT_STATE     = SVC31_BASE + 15u; /* AAudioStream_waitForStateChange */
-
-// getauxval(type): FMOD dlopen()s libc.
-constexpr uint32_t SVC_GETAUXVAL             = SVC31_BASE + 16u;
-
-// AAudio builder setters that must record state for callback pumping
-constexpr uint32_t SVC_AAUDIO_SET_DIRECTION  = SVC31_BASE + 17u;
-constexpr uint32_t SVC_AAUDIO_SET_DATA_CB    = SVC31_BASE + 18u;
-constexpr uint32_t SVC_AAUDIO_SET_FORMAT     = SVC31_BASE + 19u;
-constexpr uint32_t SVC_AAUDIO_SET_CHANNELS   = SVC31_BASE + 20u;
-constexpr uint32_t SVC_AAUDIO_SET_RATE       = SVC31_BASE + 21u;
-constexpr uint32_t SVC_AAUDIO_START          = SVC31_BASE + 22u;
-constexpr uint32_t SVC_AAUDIO_STOP           = SVC31_BASE + 23u; /* stop + close */
-
-// Shared SVC behind per-symbol stub trampolines for dlsym'd-but-unimplemented functions.
-constexpr uint32_t SVC_UNKNOWN_SYM           = SVC31_BASE + 24u;
-
-// GLES 3.
-constexpr uint32_t SVC_GL3_GetStringi             = SVC31_BASE + 25u;
-constexpr uint32_t SVC_GL3_GetIntegeri_v          = SVC31_BASE + 26u;
-constexpr uint32_t SVC_GL3_GetInternalformativ    = SVC31_BASE + 27u;
-constexpr uint32_t SVC_GL3_GetProgramInterfaceiv  = SVC31_BASE + 28u;
-constexpr uint32_t SVC_GL3_GetProgramResourceiv   = SVC31_BASE + 29u;
-constexpr uint32_t SVC_GL3_GetProgramResourceName = SVC31_BASE + 30u;
-constexpr uint32_t SVC_GL3_GenVertexArrays        = SVC31_BASE + 31u;
-constexpr uint32_t SVC_GL3_BindVertexArray        = SVC31_BASE + 32u;
-constexpr uint32_t SVC_GL3_DeleteVertexArrays     = SVC31_BASE + 33u;
-constexpr uint32_t SVC_GL3_IsVertexArray          = SVC31_BASE + 34u;
-constexpr uint32_t SVC_GL3_BindSampler            = SVC31_BASE + 35u;
-constexpr uint32_t SVC_GL3_BindBufferBase         = SVC31_BASE + 36u;
-constexpr uint32_t SVC_GL3_BindBufferRange        = SVC31_BASE + 37u;
-constexpr uint32_t SVC_GL3_MapBufferRange         = SVC31_BASE + 38u;
-constexpr uint32_t SVC_GL3_UnmapBuffer            = SVC31_BASE + 39u;
-constexpr uint32_t SVC_GL3_FlushMappedBufferRange = SVC31_BASE + 40u;
-constexpr uint32_t SVC_GL3_TexStorage2D           = SVC31_BASE + 41u;
-constexpr uint32_t SVC_GL3_TexStorage3D           = SVC31_BASE + 42u;
-constexpr uint32_t SVC_GL3_TexSubImage3D          = SVC31_BASE + 43u;
-constexpr uint32_t SVC_GL3_ProgramParameteri      = SVC31_BASE + 44u;
-constexpr uint32_t SVC_GL3_GetProgramBinary       = SVC31_BASE + 45u;
-constexpr uint32_t SVC_GL3_ProgramBinary          = SVC31_BASE + 46u;
-constexpr uint32_t SVC_GL3_FenceSync              = SVC31_BASE + 47u;
-constexpr uint32_t SVC_GL3_ClientWaitSync         = SVC31_BASE + 48u;
-constexpr uint32_t SVC_GL3_DeleteSync             = SVC31_BASE + 49u;
-// Appended after the packed SVC31 block (see SVC_MPROTECT below).
-constexpr uint32_t SVC_GL3_IsSync                 = SVC31_BASE + 127u;
-constexpr uint32_t SVC_GL_TexParameterfv          = SVC31_BASE + 128u;
-constexpr uint32_t SVC_GL3_InvalidateFramebuffer  = SVC31_BASE + 50u;
-constexpr uint32_t SVC_GL3_DetachShader           = SVC31_BASE + 51u;
-constexpr uint32_t SVC_GL3_DrawBuffers            = SVC31_BASE + 52u;
-constexpr uint32_t SVC_GL3_DrawElementsBaseVertex = SVC31_BASE + 53u;
-
-// cxa_throw logging (always on): identifies which managed exception IL2CPP throws.
-constexpr uint32_t SVC_EXC_CXA_THROW              = SVC31_BASE + 54u;
-
-// GL extension entry points the host may or may not back.
-constexpr uint32_t SVC_GLX_DebugMessageControl    = SVC31_BASE + 55u;
-constexpr uint32_t SVC_GLX_DebugMessageCallback   = SVC31_BASE + 56u;
-constexpr uint32_t SVC_GLX_DebugMessageInsert     = SVC31_BASE + 57u;
-constexpr uint32_t SVC_GLX_ObjectLabel            = SVC31_BASE + 58u;
-constexpr uint32_t SVC_GLX_GetObjectLabel         = SVC31_BASE + 59u;
-constexpr uint32_t SVC_GLX_PushDebugGroup         = SVC31_BASE + 60u;
-constexpr uint32_t SVC_GLX_PopDebugGroup          = SVC31_BASE + 61u;
-constexpr uint32_t SVC_GLX_MarkerNop              = SVC31_BASE + 62u; /* EXT_debug_marker/label */
-constexpr uint32_t SVC_GLX_BufferStorage          = SVC31_BASE + 63u;
-constexpr uint32_t SVC_GLX_QueryCounter           = SVC31_BASE + 64u;
-constexpr uint32_t SVC_GLX_GetQueryObjectui64v    = SVC31_BASE + 65u;
-constexpr uint32_t SVC_GLX_DrawElemInstBaseVertex = SVC31_BASE + 66u;
-constexpr uint32_t SVC_GLX_BlendBarrier           = SVC31_BASE + 67u;
-
-// UE4 NativeActivity / AssetManager APIs not covered above
-constexpr uint32_t SVC_AASSETMGR_OPENDIR          = SVC31_BASE + 68u;
-constexpr uint32_t SVC_AASSETDIR_NEXT             = SVC31_BASE + 69u;
-constexpr uint32_t SVC_AASSETDIR_CLOSE            = SVC31_BASE + 70u;
-constexpr uint32_t SVC_AASSET_OPENFD32            = SVC31_BASE + 71u; /* openFileDescriptor(off_t*) */
-constexpr uint32_t SVC_AASSET_OPENFD              = SVC_AASSET_OPENFD32; /* alias */
-constexpr uint32_t SVC_ACFG_NEW                   = SVC31_BASE + 72u; /* AConfiguration_new */
-constexpr uint32_t SVC_ACFG_GETLANG               = SVC31_BASE + 73u; /* getLanguage → write 2 chars */
-constexpr uint32_t SVC_ACFG_GETCOUNTRY            = SVC31_BASE + 74u; /* getCountry → write 2 chars */
-constexpr uint32_t SVC_ACFG_FROM_AM               = SVC31_BASE + 75u; /* fromAssetManager */
-constexpr uint32_t SVC_ATOF                       = SVC31_BASE + 76u;
-constexpr uint32_t SVC_FREXPF                     = SVC31_BASE + 77u;
-constexpr uint32_t SVC_RAND                       = SVC31_BASE + 78u;
-constexpr uint32_t SVC_SRAND                      = SVC31_BASE + 79u;
-constexpr uint32_t SVC_GETENTROPY                 = SVC31_BASE + 80u;
-constexpr uint32_t SVC_SYSINFO                    = SVC31_BASE + 81u;
-constexpr uint32_t SVC_COMPRESS2                  = SVC31_BASE + 82u;
-constexpr uint32_t SVC_ISLOWER                    = SVC31_BASE + 83u;
-constexpr uint32_t SVC_ISUPPER                    = SVC31_BASE + 84u;
-constexpr uint32_t SVC_ISBLANK                    = SVC31_BASE + 85u;
-constexpr uint32_t SVC_TOUPPER                    = SVC31_BASE + 86u;
-
-/* eventfd(2) — host-backed, like pipe(): guest fds are host fds.  UE's
- * FHttpManager and the task-graph use one as a wakeup handle; without it the
- * dlsym stub handed back 0, which is a perfectly usable fd number, so the
- * engine wrote its wakeups into stdin forever and never woke. */
-constexpr uint32_t SVC_EVENTFD                    = SVC31_BASE + 87u;
-constexpr uint32_t SVC_EVENTFD_READ               = SVC31_BASE + 88u;
-constexpr uint32_t SVC_EVENTFD_WRITE              = SVC31_BASE + 89u;
-
-
-
-// AConfiguration_getXxx() integer getters.
-enum : uint32_t {
-    ACFG_I_MCC = 0, ACFG_I_MNC, ACFG_I_ORIENTATION, ACFG_I_TOUCHSCREEN,
-    ACFG_I_DENSITY, ACFG_I_KEYBOARD, ACFG_I_NAVIGATION, ACFG_I_KEYSHIDDEN,
-    ACFG_I_NAVHIDDEN, ACFG_I_SCREENSIZE, ACFG_I_SCREENLONG, ACFG_I_UIMODETYPE,
-    ACFG_I_UIMODENIGHT, ACFG_I_LAYOUTDIR, ACFG_I_SCREENWIDTHDP,
-    ACFG_I_SCREENHEIGHTDP, ACFG_I_SMALLESTSCREENWIDTHDP, ACFG_I_COUNT
-};
-constexpr uint32_t SVC_ACFG_INT_BASE              = SVC31_BASE + 225u;
-constexpr uint32_t SVC_ACFG_INT_END               = SVC_ACFG_INT_BASE + ACFG_I_COUNT - 1u;
-
-// stdio / zlib / math entry points that libgnustl_shared.
-constexpr uint32_t SVC_LIBC_REWIND                = SVC31_BASE + 243u;
-constexpr uint32_t SVC_LIBC_FREOPEN               = SVC31_BASE + 244u;
-constexpr uint32_t SVC_LIBC_TMPFILE               = SVC31_BASE + 245u;
-constexpr uint32_t SVC_LIBC_TMPNAM                = SVC31_BASE + 246u;
-constexpr uint32_t SVC_COMPRESS                   = SVC31_BASE + 247u;
-constexpr uint32_t SVC_FREXPL                     = SVC31_BASE + 248u;
-constexpr uint32_t SVC_ACFG_MATCH                 = SVC31_BASE + 249u;
-// GL_OES_mapbuffer / GL_EXT_discard_framebuffer.
-constexpr uint32_t SVC_GL_MapBufferOES            = SVC31_BASE + 250u;
-constexpr uint32_t SVC_GL_UnmapBufferOES          = SVC31_BASE + 251u;
-constexpr uint32_t SVC_GL_DiscardFramebufferEXT   = SVC31_BASE + 252u;
-
-// BSD sockets.
-constexpr uint32_t SVC_NET_SOCKET                 = SVC31_BASE + 253u;
-constexpr uint32_t SVC_NET_SOCKETPAIR             = SVC31_BASE + 254u;
-constexpr uint32_t SVC_NET_CONNECT                = SVC31_BASE + 255u;
-constexpr uint32_t SVC_NET_BIND                   = SVC31_BASE + 256u;
-constexpr uint32_t SVC_NET_LISTEN                 = SVC31_BASE + 257u;
-constexpr uint32_t SVC_NET_ACCEPT                 = SVC31_BASE + 258u;
-constexpr uint32_t SVC_NET_ACCEPT4                = SVC31_BASE + 259u;
-constexpr uint32_t SVC_NET_SEND                   = SVC31_BASE + 260u;
-constexpr uint32_t SVC_NET_SENDTO                 = SVC31_BASE + 261u;
-constexpr uint32_t SVC_NET_RECV                   = SVC31_BASE + 262u;
-constexpr uint32_t SVC_NET_RECVFROM               = SVC31_BASE + 263u;
-constexpr uint32_t SVC_NET_SENDMSG                = SVC31_BASE + 264u;
-constexpr uint32_t SVC_NET_RECVMSG                = SVC31_BASE + 265u;
-constexpr uint32_t SVC_NET_SHUTDOWN               = SVC31_BASE + 266u;
-constexpr uint32_t SVC_NET_SETSOCKOPT             = SVC31_BASE + 267u;
-constexpr uint32_t SVC_NET_GETSOCKOPT             = SVC31_BASE + 268u;
-constexpr uint32_t SVC_NET_GETSOCKNAME            = SVC31_BASE + 269u;
-constexpr uint32_t SVC_NET_GETPEERNAME            = SVC31_BASE + 270u;
-constexpr uint32_t SVC_NET_SELECT                 = SVC31_BASE + 271u;
-constexpr uint32_t SVC_NET_POLL                   = SVC31_BASE + 272u;
-constexpr uint32_t SVC_NET_GETADDRINFO            = SVC31_BASE + 273u;
-constexpr uint32_t SVC_NET_FREEADDRINFO           = SVC31_BASE + 274u;
-constexpr uint32_t SVC_NET_GAI_STRERROR           = SVC31_BASE + 275u;
-constexpr uint32_t SVC_NET_GETHOSTBYNAME          = SVC31_BASE + 276u;
-constexpr uint32_t SVC_NET_INET_NTOP              = SVC31_BASE + 277u;
-constexpr uint32_t SVC_NET_INET_PTON              = SVC31_BASE + 278u;
-constexpr uint32_t SVC_NET_INET_ATON              = SVC31_BASE + 279u;
-constexpr uint32_t SVC_NET_INET_NTOA              = SVC31_BASE + 280u;
-constexpr uint32_t SVC_NET_EPOLL_CREATE           = SVC31_BASE + 281u;
-constexpr uint32_t SVC_NET_EPOLL_CTL              = SVC31_BASE + 282u;
-constexpr uint32_t SVC_NET_EPOLL_WAIT             = SVC31_BASE + 283u;
-constexpr uint32_t SVC_NET_IOCTL                  = SVC31_BASE + 284u;
-constexpr uint32_t SVC_NET_IF_NAMETOINDEX         = SVC31_BASE + 285u;
-constexpr uint32_t SVC_NET_IF_INDEXTONAME         = SVC31_BASE + 286u;
-// bionic exports htons/htonl/ntohs/ntohl as real functions.
-constexpr uint32_t SVC_NET_BSWAP16               = SVC31_BASE + 287u;
-constexpr uint32_t SVC_NET_BSWAP32               = SVC31_BASE + 288u;
-
-// EGL_KHR_fence_sync / EGL 1.
-constexpr uint32_t SVC_EGL_CREATE_SYNC            = SVC31_BASE + 289u;
-constexpr uint32_t SVC_EGL_DESTROY_SYNC           = SVC31_BASE + 290u;
-constexpr uint32_t SVC_EGL_CLIENT_WAIT_SYNC       = SVC31_BASE + 291u;
-constexpr uint32_t SVC_EGL_GET_SYNC_ATTRIB        = SVC31_BASE + 292u;
-constexpr uint32_t SVC_EGL_WAIT_SYNC              = SVC31_BASE + 293u;
-// glVertexAttribDivisor is ES 3.
-constexpr uint32_t SVC_GL3_VertexAttribDivisor    = SVC31_BASE + 294u;
-constexpr uint32_t SVC_GL3_IsQuery                = SVC31_BASE + 295u;
-// pthread_setname_np was a no-op, so every diagnostic that lists guest threads could only show numbers.
-constexpr uint32_t SVC_PTHREAD_SETNAME            = SVC31_BASE + 296u;
-constexpr uint32_t SVC_ATOLL                       = SVC31_BASE + 297u;
-/* Entry points the loader previously left as "unresolved → stub", i.e. calls
- * that silently returned 0 and left their out-parameters untouched. */
-constexpr uint32_t SVC_EGL_GETCURDPY              = SVC31_BASE + 298u;
-constexpr uint32_t SVC_GL_GETINTEGER64V           = SVC31_BASE + 299u;
-constexpr uint32_t SVC_ARC4RANDOM_BUF             = SVC31_BASE + 300u;
-/* POSIX regex.  libCrashSight matches thread names and library paths with
- * these; stubbed out, every match failed and its filters selected nothing. */
-constexpr uint32_t SVC_REGCOMP                    = SVC31_BASE + 301u;
-constexpr uint32_t SVC_REGEXEC                    = SVC31_BASE + 302u;
-constexpr uint32_t SVC_REGFREE                    = SVC31_BASE + 303u;
-// scandir(dir, &namelist, filter, compar) — enumeration with guest callbacks.
-constexpr uint32_t SVC_SCANDIR                    = SVC31_BASE + 304u;
-/* process_vm_readv: read guest memory without risking a fault, which is the
- * whole reason a crash handler reaches for it. */
-constexpr uint32_t SVC_PROCESS_VM_READV           = SVC31_BASE + 305u;
-/* Scheduling policy.  These were unresolved imports, i.e. stubs returning 0 —
- * "your SCHED_FIFO request was granted" — and sched_get_priority_max/min sat
- * at SVC_RET0, so the whole usable priority band read back as [0,0]. */
-constexpr uint32_t SVC_SCHED_SETSCHEDULER         = SVC31_BASE + 306u;
-constexpr uint32_t SVC_SCHED_SETPARAM             = SVC31_BASE + 307u;
-constexpr uint32_t SVC_SCHED_GETPARAM             = SVC31_BASE + 308u;
-constexpr uint32_t SVC_SCHED_PRIO_MAX             = SVC31_BASE + 309u;
-constexpr uint32_t SVC_SCHED_PRIO_MIN             = SVC31_BASE + 310u;
-/* ASharedMemory_* (libandroid, API 26+).  A stub returned 0, which is a
- * perfectly valid fd number — the guest then mmap()ed and ftruncate()d stdin. */
-constexpr uint32_t SVC_ASHMEM_CREATE              = SVC31_BASE + 311u;
-constexpr uint32_t SVC_ASHMEM_GETSIZE             = SVC31_BASE + 312u;
-constexpr uint32_t SVC_ASHMEM_SETPROT             = SVC31_BASE + 313u;
-/* Wide-char stdio.  putwc/fputwc sat at SVC_RET0: the call reported success
- * (0 is not WEOF) while the character went nowhere. */
-constexpr uint32_t SVC_FPUTWC                     = SVC31_BASE + 314u;
-constexpr uint32_t SVC_FPUTWS                     = SVC31_BASE + 315u;
-// ANativeWindow_setBuffersTransform — dlsym'd out of libnativewindow.so.
-constexpr uint32_t SVC_ANW_SETBUFTRANSFORM        = SVC31_BASE + 316u;
-/* EGLImage / GL_OES_EGL_image.  UE resolves these with eglGetProcAddress and
- * later calls through the saved pointers unconditionally — a NULL entry is a
- * NoExecuteFault, not a skipped optional path.  There is no dma-buf import
- * here, so an EGLImage is the 2D texture it wraps (same contract as mapping
- * GL_TEXTURE_EXTERNAL_OES → GL_TEXTURE_2D). */
-constexpr uint32_t SVC_EGL_CREATE_IMAGE           = SVC31_BASE + 317u;
-constexpr uint32_t SVC_EGL_DESTROY_IMAGE          = SVC31_BASE + 318u;
-constexpr uint32_t SVC_GL_EGLImageTargetTexture2DOES = SVC31_BASE + 319u;
-constexpr uint32_t SVC_GL_EGLImageTargetTexStorageEXT = SVC31_BASE + 320u;
-constexpr uint32_t SVC_EGL_GET_NATIVE_CLIENT_BUFFER = SVC31_BASE + 321u;
-/* EGL extensions the host string advertises but which had no trampoline —
- * UE/Mesa probe them via eglGetProcAddress; NULL means a later crash, not a
- * skipped optional path.  Each handler below matches the extension's contract
- * on this host (no dma-buf plane to export, fences are GL syncs, …). */
-constexpr uint32_t SVC_EGL_SET_BLOB_CACHE         = SVC31_BASE + 322u;
-constexpr uint32_t SVC_EGL_DUP_NATIVE_FENCE       = SVC31_BASE + 323u;
-constexpr uint32_t SVC_EGL_GET_MSC_RATE           = SVC31_BASE + 324u;
-constexpr uint32_t SVC_EGL_QUERY_DMABUF_FORMATS   = SVC31_BASE + 325u;
-constexpr uint32_t SVC_EGL_SWAP_DAMAGE            = SVC31_BASE + 326u;
-constexpr uint32_t SVC_EGL_EXPORT_DMABUF          = SVC31_BASE + 327u;
-constexpr uint32_t SVC_EGL_GET_DRIVER_NAME        = SVC31_BASE + 328u;
-constexpr uint32_t SVC_EGL_PRESENTATION_TIME      = SVC31_BASE + 329u;
-
-/* AChoreographer refresh-rate callbacks (API 30+) — see
- * post_refresh_rate_callback() for why answering these with a stub is not a
- * harmless omission. */
-constexpr uint32_t SVC_ACHOREOGRAPHER_REG_RR      = SVC31_BASE + 330u;
-constexpr uint32_t SVC_ACHOREOGRAPHER_UNREG_RR    = SVC31_BASE + 331u;
-
-/* NDK input queue.  A NativeActivity gets every touch through this path — the
- * native_app_glue that UE links reads it in process_input() — so answering
- * AInputQueue_getEvent with "no events" forever is not a missing extra: it is
- * an emulator with no touchscreen. */
-constexpr uint32_t SVC_AINPUTQ_ATTACH             = SVC31_BASE + 332u;
-constexpr uint32_t SVC_AINPUTQ_DETACH             = SVC31_BASE + 333u;
-constexpr uint32_t SVC_AINPUTQ_HASEVENTS          = SVC31_BASE + 334u;
-constexpr uint32_t SVC_AINPUTQ_GETEVENT           = SVC31_BASE + 335u;
-constexpr uint32_t SVC_AINPUTQ_PREDISPATCH        = SVC31_BASE + 336u;
-constexpr uint32_t SVC_AINPUTQ_FINISH             = SVC31_BASE + 337u;
-constexpr uint32_t SVC_AINPUTEV_TYPE              = SVC31_BASE + 338u;
-constexpr uint32_t SVC_AINPUTEV_SOURCE            = SVC31_BASE + 339u;
-constexpr uint32_t SVC_AINPUTEV_DEVICEID          = SVC31_BASE + 340u;
-constexpr uint32_t SVC_AMOTION_ACTION             = SVC31_BASE + 341u;
-constexpr uint32_t SVC_AMOTION_POINTERCOUNT       = SVC31_BASE + 342u;
-constexpr uint32_t SVC_AMOTION_POINTERID          = SVC31_BASE + 343u;
-constexpr uint32_t SVC_AMOTION_X                  = SVC31_BASE + 344u;
-constexpr uint32_t SVC_AMOTION_Y                  = SVC31_BASE + 345u;
-constexpr uint32_t SVC_AMOTION_EVENTTIME          = SVC31_BASE + 346u;
-constexpr uint32_t SVC_AMOTION_DOWNTIME           = SVC31_BASE + 347u;
-constexpr uint32_t SVC_AMOTION_PRESSURE           = SVC31_BASE + 348u;
-constexpr uint32_t SVC_AMOTION_SIZE               = SVC31_BASE + 349u;
-constexpr uint32_t SVC_AMOTION_TOOLTYPE           = SVC31_BASE + 350u;
-constexpr uint32_t SVC_AMOTION_AXISVALUE          = SVC31_BASE + 351u;
-
-/* AAsset stream reads.  AAssetManager_open already materialises the whole
- * entry, so the stream API is a cursor over that buffer — the NDK contract
- * every non-mmap reader (`AAsset_read` loops until it returns 0) relies on. */
-constexpr uint32_t SVC_AASSET_READ                = SVC31_BASE + 352u;
-constexpr uint32_t SVC_AASSET_SEEK                = SVC31_BASE + 353u;
-constexpr uint32_t SVC_AASSET_SEEK64              = SVC31_BASE + 354u;
-constexpr uint32_t SVC_AASSET_GETLENGTH64         = SVC31_BASE + 355u;
-constexpr uint32_t SVC_AASSET_GETREMAINING        = SVC31_BASE + 356u;
-constexpr uint32_t SVC_AASSET_GETREMAINING64      = SVC31_BASE + 357u;
-constexpr uint32_t SVC_AASSET_ISALLOCATED         = SVC31_BASE + 358u;
-constexpr uint32_t SVC_AASSET_CLOSE               = SVC31_BASE + 359u;
-
-/* JNIEnv slots 222–232.  The layout of the vtable is fixed by <jni.h>; the SVC
- * numbers behind it are Lunaria's own, and the low ones were handed out before
- * these entries were modelled at all.  Rather than renumber every SVC in the
- * file, the tail of the table maps explicitly — see jni_vtable_svc(). */
-constexpr uint32_t SVC_JNI_GET_PRIM_CRITICAL      = SVC31_BASE + 360u;
-constexpr uint32_t SVC_JNI_REL_PRIM_CRITICAL      = SVC31_BASE + 361u;
-constexpr uint32_t SVC_JNI_GET_STR_CRITICAL       = SVC31_BASE + 362u;
-constexpr uint32_t SVC_JNI_REL_STR_CRITICAL       = SVC31_BASE + 363u;
-constexpr uint32_t SVC_JNI_NEW_DIRECT_BB          = SVC31_BASE + 364u;
-constexpr uint32_t SVC_JNI_DIRECT_BB_ADDR         = SVC31_BASE + 365u;
-constexpr uint32_t SVC_JNI_DIRECT_BB_CAP          = SVC31_BASE + 366u;
-constexpr uint32_t SVC_JNI_OBJECT_REF_TYPE        = SVC31_BASE + 367u;
-constexpr uint32_t SVC_OPENAT                     = SVC31_BASE + 368u;
-constexpr uint32_t SVC_FDOPENDIR                  = SVC31_BASE + 369u;
-constexpr uint32_t SVC_UNLINKAT                   = SVC31_BASE + 370u;
-constexpr uint32_t SVC_SIGISMEMBER                = SVC31_BASE + 371u;
-constexpr uint32_t SVC_SIGEMPTYSET                = SVC31_BASE + 372u;
-constexpr uint32_t SVC_SIGFILLSET                 = SVC31_BASE + 373u;
-constexpr uint32_t SVC_SIGADDSET                  = SVC31_BASE + 374u;
-constexpr uint32_t SVC_SIGDELSET                  = SVC31_BASE + 375u;
-constexpr uint32_t SVC_CFI_SLOWPATH               = SVC31_BASE + 376u;
-constexpr uint32_t SVC_SIGPROCMASK                = SVC31_BASE + 377u;
-/* Kept so trampoline numbers after it stay put.  SwappyGL_swap itself is
- * no longer patched: the guest runs it, and the EGL timestamp entry points
- * below are what its swap path actually calls. */
-constexpr uint32_t SVC_SWAPPY_GL_SWAP             = SVC31_BASE + 378u;
-/* alarm(2): arms a one-shot SIGALRM and answers what was left on the previous
- * one.  Stubbed to zero it always claimed "no alarm was pending", so a caller
- * that arms a watchdog and later cancels it reads back a lie. */
-constexpr uint32_t SVC_ALARM                      = SVC31_BASE + 379u;
-/* eglGetSyncValuesCHROMIUM: the counters a frame pacer reads to line its
- * submissions up with the display.  Without an entry point the whole
- * EGL_CHROMIUM_sync_control extension had to be stripped from the string. */
-constexpr uint32_t SVC_EGL_GET_SYNC_VALUES        = SVC31_BASE + 381u;
-/* unshare(2): needs privileges Android apps do not have.  The stub's implicit
- * success told the guest it had its own namespace when nothing had changed;
- * EPERM is what the call really returns to an app. */
-constexpr uint32_t SVC_UNSHARE                    = SVC31_BASE + 380u;
-/* glDrawElementsInstanced.  It used to share SVC_GL_DRAW_INSTANCED with
- * glDrawArraysInstanced, and the handler could not tell them apart: every
- * indexed instanced draw was executed as glDrawArraysInstanced(mode, count,
- * type, indices) — first = the index count, count = the *type enum* (0x1403 =
- * 5123 vertices), instancecount = the index offset.  Whatever that submits, it
- * is not the geometry the guest asked for. */
-constexpr uint32_t SVC_GL_DRAW_ELEM_INSTANCED     = SVC31_BASE + 382u;
-/* JavaVM::DetachCurrentThread.  The slot had no SVC of its own, so it kept the
- * default fill below — trampoline index 0, which on A64 is the raw-syscall
- * entry, not a stub that returns.  Every worker thread that attached, did its
- * JNI work and detached therefore ended its life on ENOSYS from a syscall it
- * never made. */
-constexpr uint32_t SVC_JVM_DETACH                 = SVC31_BASE + 383u;
-/* EGL_ANDROID_get_frame_timestamps.  Frame pacers (Swappy) look these up
- * with eglGetProcAddress and, when they are missing, either disable
- * themselves or wait forever for a present that can never be observed. */
-constexpr uint32_t SVC_EGL_GET_NEXT_FRAME_ID      = SVC31_BASE + 384u;
-constexpr uint32_t SVC_EGL_GET_FRAME_TIMESTAMPS   = SVC31_BASE + 385u;
-constexpr uint32_t SVC_EGL_FRAME_TS_SUPPORTED     = SVC31_BASE + 386u;
-constexpr uint32_t SVC_EGL_GET_COMPOSITOR_TIMING  = SVC31_BASE + 387u;
-constexpr uint32_t SVC_EGL_COMPOSITOR_TIMING_SUP  = SVC31_BASE + 388u;
-/* Previously fell through to the unknown-symbol stub (silent 0 / untouched
- * out-params).  arc4random fills entropy; mallinfo reports heap shape;
- * signalfd is the crash-handler wake path. */
-constexpr uint32_t SVC_ARC4RANDOM                 = SVC31_BASE + 389u;
-constexpr uint32_t SVC_MALLINFO                   = SVC31_BASE + 390u;
-constexpr uint32_t SVC_SIGNALFD                   = SVC31_BASE + 391u;
-
-/* Occlusion queries.  These three used to share SVC_GL_QUERY_OPS, which was a
- * plain no-op — including glGetQueryObjectuiv, whose whole job is to write the
- * out-param.  UE4's RHI thread polls GL_QUERY_RESULT_AVAILABLE in a
- * sched_yield loop, so an untouched out-param that happens to hold 0 is an
- * RHI thread that never presents again.  (The 64-bit sibling
- * SVC_GLX_GetQueryObjectui64v always answered "available", which is why only
- * the 32-bit path hung.) */
-constexpr uint32_t SVC_GL_BEGIN_QUERY             = SVC31_BASE + 392u;
-constexpr uint32_t SVC_GL_END_QUERY               = SVC31_BASE + 393u;
-constexpr uint32_t SVC_GL_GET_QUERY_OBJECT_UIV    = SVC31_BASE + 394u;
-/* clock_nanosleep(clkid, flags, req, rem) — its own entry, not an alias of
- * nanosleep(req, rem): the two put the timespec in different argument slots,
- * and reading the clock id as a pointer made every clock_nanosleep ask to
- * sleep for zero and spin instead. */
-constexpr uint32_t SVC_CLOCK_NANOSLEEP            = SVC31_BASE + 395u;
-/* fflush(3).  It was bound to the generic "returns 0" stub, which is a lie the
- * guest cannot see through: the emulator keeps a real host FILE* per guest
- * stream, so an unflushed write is still sitting in the host's buffer when the
- * guest goes on to read the file back. */
-constexpr uint32_t SVC_LIBC_FFLUSH                = SVC31_BASE + 396u;
-/* ANativeWindow::query for the fake native window.  Keeping the policy in the
- * host avoids baking an incomplete, version-specific switch into guest code. */
-constexpr uint32_t SVC_ANW_QUERY                  = SVC31_BASE + 397u;
-
-/* stdio pushback and the wide-character read side.  Both sat at SVC_RET0.
- * ungetc() returning 0 is indistinguishable from success for a caller that
- * only checks against EOF, so a parser that peeks one byte and pushes it back
- * silently lost it — the byte was never put anywhere, and the next getc()
- * returned the one after.  getwc() answering 0 is worse: 0 is L'\0', a
- * perfectly good wide character, so a read loop that stops at WEOF never
- * stops. */
-constexpr uint32_t SVC_UNGETC                     = SVC31_BASE + 398u;
-constexpr uint32_t SVC_UNGETWC                    = SVC31_BASE + 399u;
-constexpr uint32_t SVC_GETWC                      = SVC31_BASE + 400u;
-/* Per-object locales (POSIX 2008).  newlocale() returning NULL is the "out of
- * memory / unsupported locale" answer, and libc++'s std::locale constructor
- * turns that into a runtime_error; uselocale() returning NULL is not even a
- * legal locale_t.  Android has exactly one locale — C.UTF-8, under several
- * names — so these are cheap to answer truthfully. */
-constexpr uint32_t SVC_NEWLOCALE                  = SVC31_BASE + 401u;
-constexpr uint32_t SVC_USELOCALE                  = SVC31_BASE + 402u;
-constexpr uint32_t SVC_FREELOCALE                 = SVC31_BASE + 403u;
-constexpr uint32_t SVC_DUPLOCALE                  = SVC31_BASE + 404u;
-/* wcstold(): the wide-character long-double parse.  See SVC_STRTOLD for the
- * return width — on A64 a long double is a 128-bit quad in q0, not a double. */
-constexpr uint32_t SVC_WCSTOLD                    = SVC31_BASE + 405u;
-/* Wide-string collation.  Returning 0 from wcscoll means "these two strings
- * are equal", which turns every sort that uses it into a no-op and every
- * lookup keyed on it into a false hit. */
-constexpr uint32_t SVC_WCSCOLL                    = SVC31_BASE + 406u;
-constexpr uint32_t SVC_WCSXFRM                    = SVC31_BASE + 407u;
-/* wcsnrtombs(): the wide->multibyte direction of SVC_MBSRTOWCS. */
-constexpr uint32_t SVC_WCSNRTOMBS                 = SVC31_BASE + 408u;
-constexpr uint32_t SVC_WCSRTOMBS                  = SVC31_BASE + 409u;
-/* mbsnrtowcs() is not mbsrtowcs() with an extra argument: it takes the source
- * limit *before* the destination limit, so sharing one handler read the wrong
- * register as "how many wide characters fit" and wrote past the caller's
- * buffer whenever the two differed. */
-constexpr uint32_t SVC_MBSNRTOWCS                 = SVC31_BASE + 410u;
-/* rmdir(2).  It was bound to the "returns -1" template, so every attempt to
- * remove a directory failed — with no errno set, so the guest could not even
- * tell why.  A game that cleans up its own cache directory tree leaves it
- * behind and, worse, may treat the failure as "the directory is in use". */
-constexpr uint32_t SVC_RMDIR                      = SVC31_BASE + 411u;
-/* pthread_getschedparam / pthread_setschedparam.  The getter returning 0
- * without writing its two out-parameters is the dangerous one: the caller
- * reads an uninitialised policy and priority off its own stack and then hands
- * them straight back to the setter. */
-constexpr uint32_t SVC_PTHREAD_GETSCHEDPARAM      = SVC31_BASE + 412u;
-constexpr uint32_t SVC_PTHREAD_SETSCHEDPARAM      = SVC31_BASE + 413u;
-/* __sched_cpucount() is what CPU_COUNT() expands to.  Answering 0 tells the
- * caller its affinity mask contains no CPUs at all, which is how a worker-pool
- * size computed from "how many cores may I use" comes out as zero. */
-constexpr uint32_t SVC_SCHED_CPUCOUNT             = SVC31_BASE + 414u;
-/* libc calls that were bound to the shared "return 0" template and then showed
- * up as `[stub] CALLED … nothing was done`.  A zero answer is often a lie the
- * guest acts on (getuid()=0 is root; dladdr()=0 means "no module"; setenv()=0
- * looks like success without writing).  Each gets its own trampoline. */
-constexpr uint32_t SVC_GETUID                     = SVC31_BASE + 415u;
-constexpr uint32_t SVC_GETEUID                    = SVC31_BASE + 416u;
-constexpr uint32_t SVC_GETGID                     = SVC31_BASE + 417u;
-constexpr uint32_t SVC_GETEGID                    = SVC31_BASE + 418u;
-constexpr uint32_t SVC_PRCTL                      = SVC31_BASE + 419u;
-constexpr uint32_t SVC_SETPRIORITY                = SVC31_BASE + 420u;
-constexpr uint32_t SVC_GETPRIORITY                = SVC31_BASE + 421u;
-constexpr uint32_t SVC_MADVISE                    = SVC31_BASE + 422u;
-constexpr uint32_t SVC_MSYNC                      = SVC31_BASE + 423u;
-constexpr uint32_t SVC_SETENV                     = SVC31_BASE + 424u;
-constexpr uint32_t SVC_UNSETENV                   = SVC31_BASE + 425u;
-constexpr uint32_t SVC_PTHREAD_SIGMASK            = SVC31_BASE + 426u;
-constexpr uint32_t SVC_DLADDR                     = SVC31_BASE + 427u;
-constexpr uint32_t SVC_DLERROR                    = SVC31_BASE + 428u;
-constexpr uint32_t SVC_FSCANF                     = SVC31_BASE + 429u;
-constexpr uint32_t SVC_FSYNC                      = SVC31_BASE + 430u;
-constexpr uint32_t SVC_FLOCK                      = SVC31_BASE + 431u;
-/* bionic fd_set fortification, getresuid, strxfrm_l, and honest GL stubs.
- * SVC31_BASE+432 would land in the SVC_HONEST block (FLOCK is +431), so these
- * live in the gap before the UE hook block instead. */
-constexpr uint32_t SVC_COMPAT_BASE                = SVC_HONEST_LAST + 1u;
-constexpr uint32_t SVC_FD_SET_CHK                 = SVC_COMPAT_BASE + 0u;
-constexpr uint32_t SVC_FD_ISSET_CHK               = SVC_COMPAT_BASE + 1u;
-constexpr uint32_t SVC_FD_CLR_CHK                 = SVC_COMPAT_BASE + 2u;
-constexpr uint32_t SVC_FD_ZERO_CHK                = SVC_COMPAT_BASE + 3u;
-constexpr uint32_t SVC_GETRESUID                  = SVC_COMPAT_BASE + 4u;
-constexpr uint32_t SVC_STRXFRM_L                  = SVC_COMPAT_BASE + 5u;
-constexpr uint32_t SVC_GL_UNIMPL                  = SVC_COMPAT_BASE + 6u;
-/* ctype classes that used to be answered by a different class entirely:
- * ispunct/isgraph/isprint were bound to isalnum and iscntrl to isspace.
- * '!' is punctuation and graphic but not alphanumeric, ' ' is printable but
- * not alphanumeric, and '\t' is a space but not a control-only answer — the
- * guest acts on the wrong classification wherever it parses text. */
-constexpr uint32_t SVC_ISPUNCT                    = SVC_COMPAT_BASE + 7u;
-constexpr uint32_t SVC_ISPRINT                    = SVC_COMPAT_BASE + 8u;
-constexpr uint32_t SVC_ISCNTRL                    = SVC_COMPAT_BASE + 9u;
-constexpr uint32_t SVC_ISGRAPH                    = SVC_COMPAT_BASE + 10u;
-/* AMotionEvent_getButtonState: the mouse/stylus buttons held during the
- * event.  A template zero is the right answer for a finger, but it is the
- * right answer by accident — the call has to look at the event. */
-constexpr uint32_t SVC_AMOTION_BUTTONSTATE        = SVC_COMPAT_BASE + 11u;
-/* gethostbyaddr(3): the reverse of gethostbyname, which is implemented.
- * Returning NULL from a stub told the caller the address has no name, which
- * is a lookup result it then acts on. */
-constexpr uint32_t SVC_NET_GETHOSTBYADDR          = SVC_COMPAT_BASE + 12u;
-/* getpwuid(3).  Android has no /etc/passwd, but bionic answers for app uids
- * from its own table: an app's name is u<user>_a<appid>, its home is the
- * data directory and its shell is /system/bin/sh.  NULL means "no such user",
- * which is not true of the uid the app is running as. */
-constexpr uint32_t SVC_GETPWUID                   = SVC_COMPAT_BASE + 13u;
-/* sleep(3) takes seconds and returns the unslept seconds.  It cannot share
- * SVC_USLEEP: treating the same register as microseconds made sleep(1) a
- * one-microsecond delay and turned ordinary retry loops into busy loops. */
-constexpr uint32_t SVC_SLEEP                      = SVC_COMPAT_BASE + 14u;
-/* std::__ndk1::condition_variable::wait(unique_lock<mutex>&) — libc++'s own
- * out-of-line instantiation, not a bionic/pthread symbol, so it needs its
- * own binding rather than reusing SVC_PTHREAD_COND_WAIT: r1 here is the
- * address of a stack-local unique_lock<mutex>, not a mutex* directly. Guest
- * ABI (verified by disassembling a real call site and resolving its
- * mutex::lock()/unlock() relocations, not assumed): unique_lock<mutex> is
- * {mutex_type *__m_; bool __owns_;} at offsets 0/8, and both libc++ mutex
- * and condition_variable hold their pthread_mutex_t/pthread_cond_t as the
- * sole member at offset 0 — so `this` (r0) already *is* the guest VA
- * SVC_PTHREAD_COND_WAIT wants for the cond, and *(r1) already *is* the one
- * it wants for the mutex. */
-constexpr uint32_t SVC_CXX_CONDVAR_WAIT           = SVC_COMPAT_BASE + 15u;
-/* android_get_application_target_sdk_version(3) and
- * android_get_device_api_level(3).  Both are bionic entry points, and both
- * are how native code asks which behaviour changes apply to it.  Unresolved
- * they bound to the return-0 template, and 0 is not "unknown": it is a
- * target older than API 1, which is what a repackaged or patched app looks
- * like.  The answers already exist — the manifest's target SDK and the
- * device profile's SDK_INT, the same two numbers Java sees. */
-constexpr uint32_t SVC_ANDROID_TARGET_SDK         = SVC_COMPAT_BASE + 16u;
-constexpr uint32_t SVC_ANDROID_DEVICE_API_LEVEL   = SVC_COMPAT_BASE + 17u;
-/* Android's FORTIFY entry points.  Each takes the destination's size as an
- * extra, compiler-supplied argument and dies if the operation would not fit
- * in it; binding them to the unchecked function of the same name — which is
- * what this used to do — turns every one of those checks off, so an overrun
- * Android catches at the call site runs here instead and lands on whatever
- * the program keeps after the buffer.  See fortify_check in dispatch_svc. */
-constexpr uint32_t SVC_MEMCPY_CHK                 = SVC_COMPAT_BASE + 18u;
-constexpr uint32_t SVC_MEMMOVE_CHK                = SVC_COMPAT_BASE + 19u;
-constexpr uint32_t SVC_MEMSET_CHK                 = SVC_COMPAT_BASE + 20u;
-constexpr uint32_t SVC_STRCPY_CHK                 = SVC_COMPAT_BASE + 21u;
-constexpr uint32_t SVC_STRNCPY_CHK                = SVC_COMPAT_BASE + 22u;
-constexpr uint32_t SVC_STRCAT_CHK                 = SVC_COMPAT_BASE + 23u;
-constexpr uint32_t SVC_STRNCAT_CHK                = SVC_COMPAT_BASE + 24u;
-constexpr uint32_t SVC_STRLEN_CHK                 = SVC_COMPAT_BASE + 25u;
-constexpr uint32_t SVC_STRLCPY_CHK                = SVC_COMPAT_BASE + 26u;
-constexpr uint32_t SVC_READ_CHK                   = SVC_COMPAT_BASE + 27u;
-constexpr uint32_t SVC_WRITE_CHK                  = SVC_COMPAT_BASE + 28u;
-constexpr uint32_t SVC_FGETS_CHK                  = SVC_COMPAT_BASE + 29u;
-constexpr uint32_t SVC_POLL_CHK                   = SVC_COMPAT_BASE + 30u;
-constexpr uint32_t SVC_PREAD64_CHK                = SVC_COMPAT_BASE + 31u;
-constexpr uint32_t SVC_PWRITE64_CHK               = SVC_COMPAT_BASE + 32u;
-/* "Fails, and here is why" — as distinct from SVC_RETM1, which answers -1
- * and leaves errno holding whatever the last failed call put there.  A POSIX
- * caller reads errno to decide what to do next (retry, fall back, report), so
- * an unimplemented entry point has to say ENOSYS, and one that is refused
- * because an app process may not do it has to say EPERM. */
-constexpr uint32_t SVC_RETM1_ENOSYS               = SVC_COMPAT_BASE + 33u;
-constexpr uint32_t SVC_RETM1_EPERM                = SVC_COMPAT_BASE + 34u;
-constexpr uint32_t SVC_COMPAT_LAST                = SVC_RETM1_EPERM;
-static_assert(SVC_COMPAT_LAST < SVC_UE_HOOK_BASE,
-              "the compat block has grown into the UE hook block");
 
 /* Which SVC a JNINativeInterface slot dispatches to.  Identity up to 221;
  * beyond that the historical numbering is four short, so name every slot. */
@@ -2766,44 +1224,6 @@ constexpr uint32_t jni_vtable_svc(uint32_t slot) {
     default:  return slot;
     }
 }
-
-/* Cover ASENSOR + UE extras (must be ≥ highest SVC31_* used as trampoline).
- * Every SVC in the table needs its trampoline built by build_jni_tables(), and
- * that loop stops at SVC_TRAMP_TOTAL; anything past it gets a zero-filled slot
- * that the unknown-symbol pool then hands out to somebody else. */
-static_assert(SVC_PTHREAD_SETNAME > SVC_GL3_GenTransformFeedbacks,
-              "keep SVC_TRAMP_TOTAL above every trampolined SVC");
-/* The bound must sit above the *highest* SVC, not above whichever one happened
- * to be last when the constant was written: SVC_SWAPPY_GL_SWAP and the four
- * numbers after it live past SVC_SIGPROCMASK, so their trampolines were never
- * built and the unknown-symbol pool — which starts here — handed the same
- * addresses out to dlsym'd names it did not implement. */
-constexpr uint32_t SVC_TRAMP_TOTAL        = SVC_SPLIT_LAST + 1u;
-static_assert(SVC_TRAMP_TOTAL > SVC_PROCESS_VM_READV &&
-              SVC_TRAMP_TOTAL > SVC_ACFG_INT_END &&
-              SVC_TRAMP_TOTAL > SVC_GL3_GenTransformFeedbacks &&
-              SVC_TRAMP_TOTAL > SVC_SWAPPY_GL_SWAP &&
-              SVC_TRAMP_TOTAL > SVC_ALARM &&
-              SVC_TRAMP_TOTAL > SVC_UNSHARE &&
-              SVC_TRAMP_TOTAL > SVC_EGL_GET_SYNC_VALUES &&
-              SVC_TRAMP_TOTAL > SVC_GL_DRAW_ELEM_INSTANCED &&
-              SVC_TRAMP_TOTAL > SVC_EGL_GET_NEXT_FRAME_ID &&
-              SVC_TRAMP_TOTAL > SVC_EGL_GET_FRAME_TIMESTAMPS &&
-              SVC_TRAMP_TOTAL > SVC_EGL_GET_COMPOSITOR_TIMING &&
-              SVC_TRAMP_TOTAL > SVC_ARC4RANDOM &&
-              SVC_TRAMP_TOTAL > SVC_MALLINFO &&
-              SVC_TRAMP_TOTAL > SVC_SIGNALFD &&
-              SVC_TRAMP_TOTAL > SVC_SIGPROCMASK &&
-              SVC_TRAMP_TOTAL > SVC_GL_GET_QUERY_OBJECT_UIV &&
-              SVC_TRAMP_TOTAL > SVC_SPLIT_LAST &&
-              SVC_TRAMP_TOTAL > SVC_COMPAT_LAST &&
-              SVC_TRAMP_TOTAL > SVC_UNWIND_FAIL &&
-              SVC_TRAMP_TOTAL > SVC_SYSPROP_READ_CB &&
-              SVC_TRAMP_TOTAL > SVC_GETPWUID_R &&
-              SVC_TRAMP_TOTAL > SVC_HONEST_LAST &&
-              SVC_TRAMP_TOTAL > SVC_UE_HOOK_LAST &&
-              SVC_TRAMP_TOTAL > SVC_ABI_LAST,
-              "SVC_TRAMP_TOTAL must bound every trampolined SVC");
 
 // OpenSL ES fake object page.
 // Everything here is measured in *guest pointer words*, not bytes.
@@ -2833,7 +1253,6 @@ inline std::map<std::string, uint32_t> g_unknown_sym_slot;
  * the run, and only the second explains a wrong answer the guest acted on. */
 inline std::vector<int32_t> g_unknown_sym_ret;
 inline std::vector<uint8_t> g_unknown_sym_is_template;
-
 
 constexpr uint32_t JVM_SLOT_RESERVED0  = 0;
 constexpr uint32_t JVM_SLOT_RESERVED1  = 1;

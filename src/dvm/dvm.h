@@ -124,6 +124,11 @@ int dvm_add_apk_dir(struct dvm *vm, const char *dir);
  * no dex defines it (use dvm_class_is_known() to tell "not defined" from
  * "failed to load"). */
 struct dvm_class *dvm_find_class(struct dvm *vm, const char *name);
+/* Same lookup, but also answers for a class only the host stub layer
+ * implements — the VM's placeholder for it, whose methods route back out.
+ * A jclass arriving from native names a type whether or not this VM defines
+ * it, and the Class object handed to bytecode has to name that type. */
+struct dvm_class *dvm_find_class_or_external(struct dvm *vm, const char *name);
 bool dvm_class_is_known(struct dvm *vm, const char *name);
 
 /* Whether a class by this name would exist on the device at all: defined by
@@ -215,6 +220,16 @@ void dvm_prefs_flush(struct dvm *vm);
  * connected View, and a pending layout pass runs.  Called from the frame pump
  * without the interpreter lock. */
 void dvm_ime_frame(struct dvm *vm);
+
+/* WebView controls for the emulator's menu; any thread.  Applied on the main
+ * looper's next turn.  zoom 0 = the device density; engine is one of auto,
+ * chrome, luna, off. */
+float dvm_webview_zoom(void);
+void dvm_webview_set_zoom(float zoom);
+void dvm_webview_reload(void);
+const char *dvm_webview_engine(void);
+void dvm_webview_set_engine(const char *name);
+int dvm_webview_count(void);
 /* One turn of the main thread's Looper — see dvm.c.  The frame pump calls it
  * so a Handler.postDelayed() callback runs near its due time instead of
  * waiting for the guest to call into Java. */
@@ -325,3 +340,9 @@ bool dvm_package_info_add_signatures(struct dvm *vm, dvm_ref package_info);
 /* True on a host thread started for bytecode, false on the one that drives the
  * frame pump and the guest CPU.  A wait on the latter has to stay short. */
 bool dvm_on_bytecode_thread(void);
+
+/* True on Android's main thread: the host thread that created the VM and
+ * drives the frame pump, whose turn runs the main Looper.  Engine workers that
+ * execute other guest threads' native code, and bytecode threads, are not it —
+ * main-Looper messages run here and nowhere else, as on a device. */
+bool dvm_on_main_thread(void);

@@ -79,3 +79,74 @@ size_t dvm_http_avail(const struct dvm_http_response *r);
  * callers that want it as one array (error bodies, small API replies).
  * Returns false only on a transport error. */
 bool dvm_http_slurp(struct dvm_http_response *r);
+
+/* ------------------------------------------------------------------------ *
+ * Stream sockets for java.net.Socket / javax.net.ssl.SSLSocket
+ *
+ * The HTTP client above owns its connection from open to close.  A library
+ * that speaks HTTP itself (OkHttp, and anything built on Okio) needs the layer
+ * underneath instead: a connected TCP socket it reads and writes, and TLS
+ * layered on that socket after the fact.  These are that layer.  All of them
+ * block; the callers drop the interpreter and execution locks around them.
+ * ------------------------------------------------------------------------ */
+
+/* Connects to host:port (a name or a numeric address), IPv4 first, bound
+ * first to local_addr:local_port when either is given (NULL / 0 = any).
+ * Returns the fd, or -1 with errno set and err filled.  timeout_ms <= 0 waits
+ * for as long as the kernel does. */
+int dvm_sock_connect(const char *host, int port, const char *local_addr,
+                     int local_port, int timeout_ms, char *err, size_t errsz);
+
+/* SO_RCVTIMEO for a Socket's soTimeout; 0 means block forever. */
+void dvm_sock_set_timeout(int fd, int timeout_ms);
+
+struct dvm_tls;
+
+#define DVM_TLS_VERIFY_CHAIN 1   /* against the host trust store */
+#define DVM_TLS_VERIFY_HOST  2   /* the certificate names `host` */
+
+/* TLS client handshake over a connected fd.  `host` is the server name sent
+ * in SNI.  `verify` says what the handshake itself checks: the chain against
+ * the host's trust store (what Android's default TrustManagerImpl does against
+ * its own) and, only when asked, the name — on a device an SSLSocket leaves
+ * the name to the HostnameVerifier unless the endpoint identification
+ * algorithm is set.  `alpn` is the ALPN protocol list in wire format (length-
+ * prefixed), or NULL.  `min_version`/`max_version` are TLS1_x_VERSION values,
+ * 0 for the library default.  `ciphers` are IANA/Java cipher-suite names, or
+ * NULL for the default set.  Returns NULL with err filled on failure;
+ * *verify_failed says whether it was the certificate that was rejected. */
+struct dvm_tls *dvm_tls_connect(int fd, const char *host, int verify,
+                                const uint8_t *alpn, size_t alpn_len,
+                                int min_version, int max_version,
+                                const char *const *ciphers, int nciphers,
+                                bool *verify_failed, char *err, size_t errsz);
+
+/* 0 at end of stream, -1 on error, -2 when timeout_ms (> 0) passed with
+ * nothing to read.  Safe against a concurrent dvm_tls_write(). */
+long dvm_tls_read(struct dvm_tls *t, void *buf, size_t n, int timeout_ms);
+/* Bytes written, or -1. */
+long dvm_tls_write(struct dvm_tls *t, const void *buf, size_t n);
+/* Decrypted bytes available without touching the socket. */
+size_t dvm_tls_pending(struct dvm_tls *t);
+/* Sends close_notify and frees the session.  Does not close the fd.  No other
+ * call may be in progress on it. */
+void dvm_tls_free(struct dvm_tls *t);
+
+/* "TLSv1.3", "TLSv1.2", ... — the names SSLSession.getProtocol() reports. */
+const char *dvm_tls_protocol(const struct dvm_tls *t);
+/* IANA name, e.g. "TLS_AES_128_GCM_SHA256" — SSLSession.getCipherSuite(). */
+const char *dvm_tls_cipher(const struct dvm_tls *t);
+/* Negotiated ALPN protocol, or "" when none was. */
+void dvm_tls_alpn(const struct dvm_tls *t, char *out, size_t outsz);
+/* The peer's chain, leaf first, as DER.  Returns the count; the caller frees
+ * each (*der)[i] and *der, *len. */
+int dvm_tls_peer_chain(const struct dvm_tls *t, uint8_t ***der, int **len);
+/* The key-exchange/authentication name a TrustManager is handed as
+ * authType ("ECDHE_RSA", "RSA", ..., "GENERIC" for TLS 1.3). */
+const char *dvm_tls_auth_type(const struct dvm_tls *t);
+/* Session id bytes (may be empty). */
+size_t dvm_tls_session_id(const struct dvm_tls *t, uint8_t *out, size_t outsz);
+
+/* IANA names of the cipher suites this TLS library can offer, NULL-terminated
+ * and owned by the library. */
+const char *const *dvm_tls_supported_ciphers(void);

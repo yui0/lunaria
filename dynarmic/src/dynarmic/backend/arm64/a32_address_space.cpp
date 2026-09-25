@@ -398,6 +398,7 @@ EmitConfig A32AddressSpace::GetEmitConfig() {
         .enable_cycle_counting = conf.enable_cycle_counting,
 
         .always_little_endian = conf.always_little_endian,
+        .host_hook_fn = nullptr,
 
         .descriptor_to_fpcr = [](const IR::LocationDescriptor& location) { return FP::FPCR{A32::LocationDescriptor{location}.FPSCR().Value()}; },
         .emit_cond = EmitA32Cond,

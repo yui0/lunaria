@@ -12,6 +12,9 @@ libraries from an APK, XAPK or APKS, executes ARM32/ARM64 code through
 [dynarmic](https://github.com/merryhime/dynarmic), and bridges Android APIs,
 JNI, EGL, OpenGL ES and MediaCodec to the Linux host. The APK's own Java runs
 through a built-in Dalvik bytecode emulator — no Android system image required.
+`android.webkit.WebView` is drawn by a host browser over the Chrome DevTools
+pipe: an installed Chrome or Chromium, or the built-in
+[luna-browser](luna-browser/) (luna-ui and QuickJS).
 
 > [!IMPORTANT]
 > Lunaria is a compatibility project under active development, not a complete
@@ -19,7 +22,7 @@ through a built-in Dalvik bytecode emulator — no Android system image required
 
 ![Ni no Kuni: Cross Worlds intro, rendered through Lunaria](screenshot_crossworlds_intro.png)
 
-<p align="center"><sub>Ni no Kuni: Cross Worlds · UE4 · arm64-v8a · 1024×576 · guest framebuffer</sub></p>
+<p align="center"><sub>Ni no Kuni: Cross Worlds (二ノ国) · UE4 · arm64-v8a · 1024×576 · guest framebuffer</sub></p>
 
 ## Why Lunaria
 
@@ -31,6 +34,8 @@ through a built-in Dalvik bytecode emulator — no Android system image required
 | **Engine-aware bridges** | JNI, AssetManager, OBB, pthread, OpenSL ES and Android API stubs |
 | **Dalvik on the host** | APK `classes*.dex` run in `src/dvm/` when no host stub exists |
 | **MediaCodec path** | H.264 via openh264, AAC via libavcodec — intro movies can finish |
+| **WebView on the host** | Chrome/Chromium or luna-browser, same DevTools pipe, composited into the view |
+| **A named device** | `lunaria.conf` reports a real retail profile (Pixel 6 by default) |
 | **Parallel AArch64** | `LUNARIA_A64_ENGINES>1` runs guest workers on host threads |
 | **Headless-capable** | Falls back to a surfaceless EGL pbuffer when no X11 window is available |
 | **Built for diagnosis** | Frame capture, JIT profiling, SVC tracing and guest-memory watchpoints |
@@ -76,6 +81,11 @@ into that temporary view. Unpacked trees are cached under
 `${LUNARIA_CACHE_DIR:-/tmp/lunaria-cache}` keyed on the package identity;
 `LUNARIA_NO_CACHE=1` forces a fresh unpack.
 
+Settings that belong to the installation, not to one launch, live in
+`lunaria.conf` (see `lunaria.conf.sample`): which device to report, where the
+guest's `/data` lives (`LUNARIA_DATA_ROOT`), and which WebView engine to use.
+A variable already set in the environment wins for that run.
+
 Force a guest architecture when a package contains both:
 
 ```bash
@@ -88,14 +98,14 @@ LUNARIA_ARCH=arm64-v8a  ./lunaria-apk.sh game.apk
 A large title spends a long time between the launcher's last message and its
 first frame — Blade & Soul Revolution links a 200 MB library, translates tens
 of thousands of ARM blocks and compiles 28 MB of dex across four files before
-the engine starts. Lunaria draws its own card over that gap, so the wait shows
-what is happening rather than a black rectangle:
+the engine starts. Lunaria draws its own card over that gap: a sky, falling
+snow, a progress ring, and the wordmark, with the current translation and dex
+lines underneath. The card is a luna-ui document, so the wait shows what is
+happening rather than a black rectangle.
 
-![Lunaria's boot card, compiling classes4.dex](screenshot_lunaria_bootcard.png)
+![Lunaria's boot card](screenshot_lunaria_bootcard.png)
 
-<p align="center"><sub>Captured from the headless EGL framebuffer during a real
-Blade &amp; Soul Revolution boot · the moon, its halo and its terminator are CSS
-animations rendered by luna-ui</sub></p>
+<p align="center"><sub>The progress ring and the wordmark, captured from the guest framebuffer</sub></p>
 
 The card comes down the moment the guest takes the surface, and a guest dialog
 always takes priority over it. `LUNARIA_JIT_UI=0` turns it off, and
@@ -105,8 +115,8 @@ Past it, the title can reach its own UI:
 
 ![Blade & Soul Revolution rendering its own UI through Lunaria](screenshot_bladesoul_ui.png)
 
-<p align="center"><sub>The game's own dialog, its own art and fonts, rendered
-through Lunaria · further progress needs a route to Netmarble's CDN</sub></p>
+<p align="center"><sub>The client's own System dialog after the patch server
+refuses the connection · layout, type and buttons are the game's</sub></p>
 
 ## Compatibility
 
@@ -115,16 +125,16 @@ Details and launch recipes live in `PROGRESS.md`.
 
 | Title | Engine / ABI | Current result |
 |---|---|---|
-| **Ni no Kuni: Cross Worlds** | Unreal Engine 4 · AArch64 XAPK | Intro → patch → Guest login → title → village → **story dialogue with 3D world**; SharedPreferences persist; in-game present about 40–57/s after recent scheduler work |
+| **Ni no Kuni: Cross Worlds** | Unreal Engine 4 · AArch64 XAPK | Linux keeps drawing through guest login, the village, story dialogue and in-world play. SharedPreferences persist. On macOS the framebuffer is drawn, but the real window stays black |
 | **Blade & Soul Masia** | Unreal Engine 5 · AArch64 APKS | Opening movie reaches EOS; title screen; additional-patch dialog is readable and Agree advances the download |
-| **Genshin Impact 7.0.0** | Unity IL2CPP · AArch64 XAPK | HoYoverse splash renders (GLES 3.2 + ComputeShader compile); stalls on a Java uncaught exception after the splash |
+| **Genshin Impact 7.0.0** | Unity IL2CPP · AArch64 XAPK | HoYoverse splash, then the login scene. A host WebView can open the account page. Sign-in is not finished: the region query still goes out without its signed parameters |
 | **Between Two Worlds** | Unity 2023 IL2CPP · ARMv7 | Playable; reaches the main story scene |
-| **Between Two Worlds** | Unity 2023 IL2CPP · AArch64 | Reaches language selection / main menu at about 50–70 fps on recorded runs |
+| **Between Two Worlds** | Unity 2023 IL2CPP · AArch64 | Main menu on a recorded run; recent checks reach language selection at about 70 fps |
 | **FPSMobile** | Unreal Engine 4 · ARMv7 | FirstPersonExampleMap renders; 16,000+ swaps observed |
-| **UnitySampleGame** | Unity · ARMv7 | Start screen accepts injected touch; playable 3D scene renders |
+| **UnitySampleGame** | Unity · ARMv7 | An earlier run reached the 3D scene. Current builds abort: `System.loadLibrary` re-enters the ARM32 JIT from inside an SVC |
 | **TIME LOCKER** | Unity · ARMv7 | Reaches the portrait tutorial gameplay scene |
 | **Black Clover: Asta Fight** | Unity IL2CPP · AArch64 XAPK | Base + split load; Unity splash renders headlessly |
-| **Blade & Soul Revolution** | Unreal Engine 4 · AArch64 | Boots through dex / SDK setup into the game's own patch/login UI; without CDN access the client stalls |
+| **Blade & Soul Revolution** | Unreal Engine 4 · AArch64 | Boots through dex / SDK setup into the game's own dialog; without a route to the patch server the client asks to reconnect |
 | **Daggerfall Unity** | Unity Mono · ARMv7 | Mono runtime boots; rendering remains blocked |
 
 <details>
@@ -176,10 +186,11 @@ EGL) — not phone captures or Android emulator windows.
 ### Ni no Kuni: Cross Worlds · title to story
 
 A commercial UE4 title on arm64-v8a: Guest login, server select, character
-select, the starting village, then story dialogue with the 3D world behind it.
+select, the starting village, story dialogue, then in-world play.
 No APK or guest patches — emulator-side fixes only. Programmatic taps use
-`LUNARIA_TOUCH_TEST` (guest FB coordinates; `xdotool` synthetic clicks are
-ignored by GLFW). Framebuffer is **1024×576**.
+`LUNARIA_TOUCH_TEST`. A bare `x,y` is a percentage of the framebuffer
+(`50,84` and `50%,84%` are the same point); `640px,606px` is a guest pixel.
+`xdotool` synthetic clicks are ignored by GLFW. Framebuffer is **1024×576**.
 
 <p align="center">
   <img src="screenshot_crossworlds_title.png" width="48%" alt="Cross Worlds title screen">
@@ -196,7 +207,7 @@ ignored by GLFW). Framebuffer is **1024×576**.
 <p align="center">
   <img src="screenshot_crossworlds_village.png" width="48%" alt="Cross Worlds starting village">
   &nbsp;
-  <img src="screenshot_crossworlds_ingame.png" width="48%" alt="Cross Worlds in-world cutscene">
+  <img src="screenshot_crossworlds_ingame.png" width="48%" alt="Cross Worlds in-world play, quests and HUD">
 </p>
 
 <p align="center">
@@ -205,13 +216,21 @@ ignored by GLFW). Framebuffer is **1024×576**.
   <img src="screenshot_crossworlds_evermore.png" width="48%" alt="Cross Worlds arrival at Evermore">
 </p>
 
-<p align="center"><sub>Title · server · account · character select · village · cutscene · dialogue · Evermore</sub></p>
+<p align="center">
+  <img src="screenshot_crossworlds_power_save.png" width="72%" alt="Cross Worlds power-save screen, resting">
+</p>
 
-### Genshin Impact · HoYoverse splash
+<p align="center"><sub>Title · server · account · character select · village · in-world · dialogue · Evermore · the client's own rest screen</sub></p>
+
+### Genshin Impact · splash, then the login scene
+
+![Genshin Impact login scene rendered through Lunaria](screenshot_genshin_login.png)
+
+<p align="center"><sub>Unity IL2CPP · arm64-v8a · OSREL Android 7.0.0 · the login scene after the splash</sub></p>
 
 ![Genshin Impact HoYoverse splash rendered through Lunaria](screenshot_genshin_splash.png)
 
-<p align="center"><sub>Unity IL2CPP · arm64-v8a · 1280×720 · first guest frame after GLES 3.2 init</sub></p>
+<p align="center"><sub>The HoYoverse splash, the first guest frame after GLES 3.2 init</sub></p>
 
 ### Between Two Worlds · main menu
 
@@ -221,9 +240,10 @@ ignored by GLFW). Framebuffer is **1024×576**.
 
 ### UnitySampleGame · 3D gameplay
 
-The launcher reaches the title screen, injects a touch on **Start**, and enters
-the playable 3D scene with the character, crystal objective, health HUD, and
-touch controls rendered at 1280×720.
+An earlier run reached the title screen, injected a touch on **Start**, and
+entered the playable 3D scene: character, crystal objective, health HUD and
+touch controls at 1280×720. Current builds stop earlier, on a Dynarmic
+re-entry while a class initializer loads a native library.
 
 ![UnitySampleGame 3D gameplay running through Lunaria](screenshot_unitysample_gameplay.png)
 
@@ -249,6 +269,18 @@ rendered at 720×1280.
 
 <p align="center"><sub>UE4 FirstPersonExampleMap · armeabi-v7a · 1280×720 · Mesa llvmpipe</sub></p>
 
+### The host menu
+
+Right-click opens Lunaria's own menu, drawn by luna-ui over the guest and over
+the boot card. From here: a screenshot (also F12), paste-on-type, Back, volume
+and mute, WebView zoom and engine, reload, full screen, quit.
+
+<p align="center">
+  <img src="screenshot_host_menu.png" width="480" alt="Lunaria host menu with the WebView engine submenu open">
+</p>
+
+<p align="center"><sub>WebView engine set to luna-browser · zoom 200% · mute on</sub></p>
+
 ## Capture frames
 
 Capture selected swap indices:
@@ -268,14 +300,10 @@ LUNARIA_SCREENSHOT_EVERY=60 \
 ./lunaria-apk.sh game.xapk
 ```
 
-Frames are written as PPM. Convert one with:
-
-```bash
-ffmpeg -i /tmp/lunaria-shots/lunaria_0001.ppm screenshot.png
-```
-
-F12 (GLFW window) or creating `$LUNARIA_SHOT_TRIGGER` (default
-`/tmp/lunaria-shot`) also dumps a single frame.
+Frames are written as PNG (`lunaria_0000.png` in that directory). Creating
+`$LUNARIA_SHOT_TRIGGER` (default `/tmp/lunaria-shot`) dumps one more frame.
+F12, and **Take Screenshot** in the host menu, write
+`~/Pictures/Lunaria YYYY-MM-DD HH.MM.SS.png` instead.
 
 ## How it works
 
@@ -290,6 +318,7 @@ F12 (GLFW window) or creating `$LUNARIA_SHOT_TRIGGER` (default
      │
      ├── SVC bridge ─── libc · pthread · filesystem · Android APIs · sockets
      ├── JNI / DVM ─── classes · methods · AssetManager · MediaCodec · dex
+     ├── WebView ────── Chrome DevTools pipe · Chrome/Chromium or luna-browser
      └── graphics ───── EGL · OpenGL ES 3 · host Mesa / GPU
 ```
 
@@ -315,6 +344,12 @@ F12 (GLFW window) or creating `$LUNARIA_SHOT_TRIGGER` (default
 - **Media:** `android.media.MediaCodec` decodes H.264 with openh264 and AAC
   with libavcodec when available (`LUNARIA_OPENH264` / `LUNARIA_LIBAVCODEC`
   override the shared-library paths).
+- **WebView:** `android.webkit.WebView` talks to a host browser over the
+  DevTools pipe. `LUNARIA_WEB_ENGINE` is `auto` (Chrome or Chromium if one is
+  installed, otherwise luna-browser), `chrome`, `luna`, or `off`.
+  `LUNARIA_WEB_BROWSER` names a binary directly. The page is shown as an image
+  inside the view; touch and text go back over the same pipe. Build the
+  fallback with `make luna-browser`.
 
 ## Runtime controls
 
@@ -337,7 +372,13 @@ full diagnostic set.
 | `LUNARIA_A64_FASTMEM` | `1` | Set `0` to route memory through callbacks |
 | `LUNARIA_A64_CODE_CACHE_MB` | `128` | Per-JIT translated-code cache |
 | `LUNARIA_GUEST_SLEEP` / `LUNARIA_FD_PARK` | on / off | Park guest sleeps for real wall time / park blocking reads (`LUNARIA_GUEST_SLEEP=0` is diagnostic only) |
-| `LUNARIA_TOUCH_TEST` | off | Inject taps at guest FB `x,y[;x,y…]` (max 8) |
+| `LUNARIA_TOUCH_TEST` | off | Inject taps at `x,y[;x,y…]` (max 8). Bare numbers are framebuffer percentages; `640px` is a guest pixel |
+| `LUNARIA_TOUCH_FIFO` | off | Same taps while running: `echo 'x,y[,hold]' > $LUNARIA_TOUCH_FIFO` |
+| `LUNARIA_DEVICE` | `pixel6` | Device profile: `pixel6`, `pixel7`, `galaxys21`, `lunaria`. Prefer `lunaria.conf` |
+| `LUNARIA_DATA_ROOT` | launcher directory | Guest `/data` and `/storage`. A large title's downloads live here |
+| `LUNARIA_CONF` | `./lunaria.conf`, then the launcher directory, then `~/.config/lunaria/lunaria.conf` | Which settings file to read. Environment variables win |
+| `LUNARIA_WEB_ENGINE` | `auto` | `auto`, `chrome`, `luna`, or `off`. The host menu overrides it for the session |
+| `LUNARIA_SCALE` | off | Scale the selected device's own panel (`0.5` is half). Unset, the surface is `LUNARIA_WIDTH` × `LUNARIA_HEIGHT` |
 | `LUNARIA_TOUCH_FRAME` / `_HOLD` / `_GAP` | `60` / `10` / `60` | First DOWN frame / hold / gap between taps |
 | `LUNARIA_PERF_S` | `10` | `[perf]` interval seconds; `0` disables |
 | `LUNARIA_DUMP_FRAME` | off | Comma-separated swap indices to capture |
@@ -381,9 +422,12 @@ Tick values accept `K`, `M`, and `G` suffixes, for example
 | `src/linker/` | Android ELF linker adapted for the host |
 | `src/jvm/` | lightweight JVM/JNI object model and stubs |
 | `src/lib/` | host implementations exposed to Android native code |
-| `src/luna_overlay.c` | the emulator's own UI surface, drawn with luna-ui and composited over the guest frame |
-| `src/luna_boot.c` | the boot card: an animated CSS document with translation and dex progress |
+| `src/luna_overlay.c` | the emulator's own UI surface: boot card, host menu, and compositing over the guest frame |
+| `src/luna_boot.c` | the boot card: sky, snow, progress ring, wordmark, translation and dex lines |
 | `src/luna_ime.c` | host IME bridge into guest text input |
+| `src/webview_cdp.c` | DevTools pipe client shared by Chrome and luna-browser |
+| `luna-browser/` | the built-in WebView engine (luna-ui + QuickJS); `make luna-browser` |
+| `lunaria.conf.sample` | device profile, data root, screen scale, package ledger, WebView engine |
 | `runtime/` | generated Android-compatible host shared libraries |
 | `lunaria-apk.sh` | APK/XAPK/APKS inspection, extraction and launch pipeline |
 | `PROGRESS.md` | detailed compatibility notes and current engineering work |
@@ -460,17 +504,23 @@ the single-engine path is stable; leave `LUNARIA_SLICE_DETAIL` /
 <summary><strong>Clicks do nothing</strong></summary>
 
 GLFW ignores `xdotool` / `XSendEvent` synthetic clicks. Use
-`LUNARIA_TOUCH_TEST='x,y;…'` with guest framebuffer coordinates, or click
-inside the real GLFW window (mouse events become Android MotionEvents).
+`LUNARIA_TOUCH_TEST='50,84;…'` (percent of the framebuffer; add `px` for
+guest pixels), `LUNARIA_TOUCH_FIFO` once the title is up, or click inside the
+real GLFW window. Right-click opens the host menu and does not go to the guest.
 
 </details>
 
 ## Project status
 
-Lunaria is research software. Expect incomplete Android APIs, title-specific
-issues, heavy diagnostic output, and breaking changes. Contributions are most
-useful when they include the title, ABI, engine version, last successful
-milestone, log, and a captured frame.
+Lunaria is research software. Linux is the host where a window and the
+framebuffer agree. macOS builds (`make dist-mac`) can fill the framebuffer
+while the on-screen window stays black. The Windows OS layer exists; a Windows
+binary does not, because the JIT still calls `mmap` directly.
+`make dist` packs a Linux tree that does not depend on the build directory.
+Expect incomplete Android APIs, title-specific issues, heavy diagnostic
+output, and breaking changes. Contributions are most useful when they include
+the title, ABI, engine version, last successful milestone, log, and a captured
+frame.
 
 Licensed under the [Mozilla Public License 2.0](LICENSE).
 

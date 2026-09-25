@@ -861,6 +861,31 @@ if [ "$(uname -s)" = Darwin ]; then
     export DYLD_LIBRARY_PATH="$script_dir:$script_dir/runtime${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 fi
 
+# A packaged build (`make dist`) carries the host libraries it was built
+# against in lib/ and its fonts in fonts/, because the machine it is unpacked
+# on is not the machine it was built on.  Both directories are absent from a
+# build in the source tree, which then uses the system's own copies exactly as
+# before.
+if [ -d "$script_dir/lib" ]; then
+    export LD_LIBRARY_PATH="$script_dir/lib:$LD_LIBRARY_PATH"
+    [ "$(uname -s)" = Darwin ] &&
+        export DYLD_LIBRARY_PATH="$script_dir/lib:$DYLD_LIBRARY_PATH"
+fi
+# luna-ui looks for its fonts relative to the working directory, and a
+# launcher is started from wherever the user happens to be.  Name them
+# outright; each variable is honoured only if it is not already set.
+if [ -d "$script_dir/fonts" ]; then
+    for _f in REGULAR:Inter-Regular.ttf BOLD:Inter-Bold.ttf \
+              ICONS:LunaSymbols-Solid.otf BRANDS:LunaSymbols-Brands.otf; do
+        _var="LUNA_FONT_${_f%%:*}"
+        _file="$script_dir/fonts/${_f#*:}"
+        eval "_cur=\${$_var-}"
+        [ -n "$_cur" ] && continue
+        [ -f "$_file" ] || continue
+        export "$_var=$_file"
+    done
+fi
+
 # Run the package's real launcher Activity from dex by default.  Set
 # LUNARIA_DEX_START=0 only when comparing against the legacy, engine-specific
 # native startup path.
@@ -963,6 +988,15 @@ PYEOF
 fi
 
 lunaria_bin="${LUNARIA_BIN:-$script_dir/lunaria}"
+
+# ANGLE's Vulkan backend needs an ICD manifest to find MoltenVK.  The macOS
+# dependency step writes one for its local driver; preserve an explicit caller
+# choice when another Vulkan driver is being tested.
+if [ "$(uname -s)" = Darwin ] && [ -z "${VK_ICD_FILENAMES:-}" ] && \
+   [ -f "$script_dir/.deps/lib/moltenvk_icd.json" ]; then
+    VK_ICD_FILENAMES="$script_dir/.deps/lib/moltenvk_icd.json"
+    export VK_ICD_FILENAMES
+fi
 
 # Cold-start JIT can spend a long stretch translating with a blank window.
 # The luna-ui progress card is on by default; LUNARIA_JIT_UI=0 turns it off.

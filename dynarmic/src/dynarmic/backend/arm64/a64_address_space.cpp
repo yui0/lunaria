@@ -574,6 +574,7 @@ EmitConfig A64AddressSpace::GetEmitConfig() {
         .enable_cycle_counting = conf.enable_cycle_counting,
 
         .always_little_endian = true,
+        .host_hook_fn = conf.host_hook_fn,
 
         .descriptor_to_fpcr = [](const IR::LocationDescriptor& location) { return A64::LocationDescriptor{location}.FPCR(); },
         .emit_cond = EmitA64Cond,

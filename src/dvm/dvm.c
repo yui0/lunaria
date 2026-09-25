@@ -575,6 +575,13 @@ struct dvm_class *dvm_find_class(struct dvm *vm, const char *name)
    return (c && !c->external) ? c : NULL;
 }
 
+struct dvm_class *dvm_find_class_or_external(struct dvm *vm, const char *name)
+{
+   char desc[512];
+   name_to_desc(name, desc, sizeof desc);
+   return dvm__class_by_desc(vm, desc);
+}
+
 bool dvm_class_is_known(struct dvm *vm, const char *name)
 {
    char desc[512];
@@ -875,8 +882,19 @@ struct dvm_method *dvm_find_method(struct dvm *vm, struct dvm_class *cls,
    struct dvm_method *hit = mcache_get(cls, h, name, sig);
    if (hit) return hit;
 
-   for (struct dvm_class *c = cls; c; c = c->super) {
-      struct dvm_method *m = class_own_method(c, name, sig);
+   struct dvm_method *m = class_own_method(cls, name, sig);
+   if (m) { mcache_put(cls, h, name, sig, m); return m; }
+
+   /* Constructors and class initialisers are never inherited.  Treating
+    * <init> like an ordinary virtual method made a missing constructor on a
+    * subclass resolve to Object.<init>(); reflective construction then
+    * returned an object without ever running the subclass initialisation.
+    * Apart from violating the VM method-resolution rules, that leaves any
+    * registrations performed by the real constructor silently absent. */
+   if (!strcmp(name, "<init>") || !strcmp(name, "<clinit>")) return NULL;
+
+   for (struct dvm_class *c = cls->super; c; c = c->super) {
+      m = class_own_method(c, name, sig);
       if (m) { mcache_put(cls, h, name, sig, m); return m; }
    }
    /* Default methods live on the interface. */
@@ -1400,6 +1418,13 @@ static bool class_assignable(struct dvm *vm, struct dvm_class *from,
                              struct dvm_class *to)
 {
    if (!from || !to) return true;   /* unknown: do not block the app */
+   if (from == to || !strcmp(from->desc, to->desc)) return true;
+   /* Primitive values have no reference widening conversion.  This check
+    * must precede Object: array covariance recurses on the component type,
+    * and treating byte as an Object made byte[] pass `instanceof Object[]`.
+    * Primitive arrays are Objects, Cloneable and Serializable, but are never
+    * arrays of references; only identical primitive component types match. */
+   if (from->is_primitive || to->is_primitive) return false;
    if (!strcmp(to->desc, "Ljava/lang/Object;")) return true;
    for (struct dvm_class *c = from; c; c = c->super)
       if (c == to || !strcmp(c->desc, to->desc)) return true;
@@ -1983,6 +2008,10 @@ bool dvm__monitor_wait(struct dvm *vm, dvm_ref ref, uint64_t timeout_ms,
                  "wait without monitor ownership");
       return false;
    }
+   if (dvm__thread_take_interrupt(vm)) {
+      dvm__throw(vm, "java/lang/InterruptedException", "wait interrupted");
+      return false;
+   }
    const uint32_t saved_depth = o->monitor_depth;
    const uint64_t seen = o->monitor_seq;
    const uint64_t deadline = timeout_ms ? monitor_now_ms() + timeout_ms : 0;
@@ -1990,24 +2019,33 @@ bool dvm__monitor_wait(struct dvm *vm, dvm_ref ref, uint64_t timeout_ms,
    o->monitor_depth = 0;
    dvm_gil_notify_one_for(monitor_channel(ref, 1));
 
-   bool signalled = false;
+   bool signalled = false, interrupted = false;
    for (;;) {
       uint64_t now = monitor_now_ms();
       if (deadline && now >= deadline) break;
       uint64_t left = deadline ? deadline - now : 60000u;
       if (left > 60000u) left = 60000u;
+      dvm__thread_set_wait(vm, monitor_channel(ref, 2));
       dvm_gil_wait_for(vm, monitor_channel(ref, 2), (unsigned)left);
+      dvm__thread_set_wait(vm, 0);
       o = dvm__obj(vm, ref);
       if (!o) {
          dvm__throw(vm, "java/lang/NullPointerException", "waited object freed");
          return false;
       }
       if (o->monitor_seq != seen) { signalled = true; break; }
+      if (dvm__thread_take_interrupt(vm)) { interrupted = true; break; }
    }
    if (!dvm__monitor_enter(vm, ref)) return false;
    o = dvm__obj(vm, ref);
    o->monitor_depth = saved_depth;
    if (notified) *notified = signalled;
+   /* The monitor is owned again before the interrupt is reported, as
+    * Object.wait() specifies. */
+   if (interrupted) {
+      dvm__throw(vm, "java/lang/InterruptedException", "wait interrupted");
+      return false;
+   }
    return true;
 }
 
@@ -2107,9 +2145,34 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
    const char *trace_class = dvm__env_trace_class();
    bool trace_this = !trace_class ||
       (m->cls && m->cls->name && strstr(m->cls->name, trace_class));
-   if (vm->trace && trace_this)
+   if (vm->trace && trace_this) {
       fprintf(stderr, "[dvm] %*scall %s.%s%s\n", vm->depth * 2, "",
               m->cls ? m->cls->name : "?", m->name, m->sig ? m->sig : "");
+      /* What the reference arguments are: the declared type says little
+       * when the caller passes a subclass (which Throwable reached an error
+       * handler, which listener was registered). */
+      char one[256];
+      for (int i = 0, slot = 0; m->sig && slot < nslots &&
+           dvm__sig_param(m->sig, i, one, sizeof one); ++i) {
+         const bool wide = one[0] == 'J' || one[0] == 'D';
+         if ((one[0] == 'L' || one[0] == '[') && slots[slot]) {
+            struct dvm_object *o = dvm__obj(vm, (dvm_ref)slots[slot]);
+            char desc[384] = "";
+            if (o && o->cls && o->kind != DVM_OBJ_STRING)
+               dvm_describe_exception(vm, (dvm_ref)slots[slot], desc,
+                                      sizeof desc);
+            fprintf(stderr, "[dvm] %*s  arg%d = %s%s%s\n", vm->depth * 2, "", i,
+                    o && o->kind == DVM_OBJ_STRING ? "\""
+                       : o && o->cls && o->cls->name ? o->cls->name : "?",
+                    o && o->kind == DVM_OBJ_STRING
+                       ? (dvm_string_utf8(vm, (dvm_ref)slots[slot]) ?: "") : "",
+                    o && o->kind == DVM_OBJ_STRING ? "\"" : "");
+            if (desc[0] && (strstr(desc, "Exception") || strstr(desc, "Error")))
+               fprintf(stderr, "[dvm] %*s    (%s)\n", vm->depth * 2, "", desc);
+         }
+         slot += wide ? 2 : 1;
+      }
+   }
 
    if (m->builtin) {
       union dvm_value args[64];
@@ -2171,6 +2234,46 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
    if (regs != stackbuf) free(regs);
    if (synchronized && !dvm__monitor_exit(vm, monitor)) ok = false;
    return ok;
+}
+
+
+/* LUNARIA_DVM_TRACE: what a traced method returned, next to the "call" line
+ * that printed its arguments.  A String shows its text, any other object its
+ * class, and a collection its size — enough to tell an empty result from a
+ * missing one without single-stepping the callee. */
+static void trace_return(struct dvm *vm, const struct dvm_method *m, char kind,
+                         const union dvm_value *v)
+{
+   const char *cls = m && m->cls && m->cls->name ? m->cls->name : "?";
+   const char *name = m && m->name ? m->name : "?";
+   if (kind == 'V') {
+      fprintf(stderr, "[dvm] %*sreturn %s.%s\n", vm->depth * 2, "", cls, name);
+      return;
+   }
+   if (kind == 'J') {
+      fprintf(stderr, "[dvm] %*sreturn %s.%s -> %lld (wide)\n", vm->depth * 2,
+              "", cls, name, (long long)v->j);
+      return;
+   }
+   if (kind == 'I') {
+      fprintf(stderr, "[dvm] %*sreturn %s.%s -> %d\n", vm->depth * 2, "", cls,
+              name, v->i);
+      return;
+   }
+   dvm_ref r = (dvm_ref)v->u;
+   struct dvm_object *o = r ? dvm__obj(vm, r) : NULL;
+   if (!o) {
+      fprintf(stderr, "[dvm] %*sreturn %s.%s -> null\n", vm->depth * 2, "",
+              cls, name);
+   } else if (o->kind == DVM_OBJ_STRING) {
+      fprintf(stderr, "[dvm] %*sreturn %s.%s -> \"%.200s\" (%u bytes)\n",
+              vm->depth * 2, "", cls, name, o->utf8 ? o->utf8 : "",
+              (unsigned)o->utf8_len);
+   } else {
+      fprintf(stderr, "[dvm] %*sreturn %s.%s -> @%x %s\n", vm->depth * 2, "",
+              cls, name, (unsigned)r,
+              o->cls && o->cls->name ? o->cls->name : "?");
+   }
 }
 
 static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
@@ -2262,6 +2365,12 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
       if (vm->trace >= 2 && trace_this)
          fprintf(stderr, "[dvm]   %s.%s @%04x op=%02x words=%04x,%04x,%04x\n",
                  m->cls->name, m->name, pc, op, u0, IU(1), IU(2));
+      if (vm->trace >= 3 && trace_this) {
+         fprintf(stderr, "[dvm]     regs");
+         for (uint32_t i = 0; i < nregs; ++i)
+            fprintf(stderr, " v%u=%08x", i, r[i]);
+         fputc('\n', stderr);
+      }
 
       switch (op) {
       case 0x00: /* nop, and the payload pseudo-ops when reached by accident */
@@ -2319,14 +2428,18 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
 
       /* --- returns --- */
       case 0x0e:
+         if (vm->trace && trace_this) trace_return(vm, m, 'V', out);
          return true;
       case 0x0f: case 0x11:
          REQ(AA(u0));
          out->u = r[AA(u0)];
+         if (vm->trace && trace_this)
+            trace_return(vm, m, op == 0x11 ? 'L' : 'I', out);
          return true;
       case 0x10:
          REQ(AA(u0) + 1);
          out->ju = rw(r, AA(u0));
+         if (vm->trace && trace_this) trace_return(vm, m, 'J', out);
          return true;
 
       /* --- constants --- */
@@ -2424,6 +2537,9 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          struct dvm_class *t = dd ? resolve_type(vm, dd, IU(1)) : NULL;
          struct dvm_object *o = dvm__obj(vm, r[AA(u0)]);
          if (o && t && !class_assignable(vm, o->cls, t)) {
+            fprintf(stderr, "[dvm] check-cast at %s.%s%s pc=%u: %s to %s\n",
+                    m->cls->name, m->name, m->sig ? m->sig : "",
+                    fr->pc, o->cls ? o->cls->name : "?", t->name);
             dvm__throw(vm, "java/lang/ClassCastException", "%s to %s",
                        o->cls ? o->cls->name : "?", t->name);
             goto exception;
@@ -2538,6 +2654,18 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
              * failed is lost. */
             vm->exception = r[AA(u0)];
             if (vm->exc_ref != r[AA(u0)]) {
+               /* LUNARIA_DVM_THROWS covers the exceptions app code throws
+                * itself too, not only the VM's own: a library that turns a
+                * platform gap into its own exception (Gson's
+                * JsonSyntaxException, a Kotlin check()) is otherwise
+                * invisible between the gap and the catch that swallows it. */
+               if (dvm__env_throws()) {
+                  char desc[384];
+                  dvm_describe_exception(vm, r[AA(u0)], desc, sizeof desc);
+                  fprintf(stderr, "[dvm] throw %s (in %s.%s @%04x)\n", desc,
+                          m->cls && m->cls->name ? m->cls->name : "?",
+                          m->name, pc * 2);
+               }
                vm->exc_ref = r[AA(u0)];
                vm->nexc_trace = 0;
                vm->exc_trace[vm->nexc_trace++] = m;
@@ -3402,6 +3530,11 @@ static int drain_pending(struct dvm *vm, bool nested)
          /* Background Looper.loop() owns its tagged entries. */
          if (!vm->pending_is_thread[i] && vm->pending_looper[i])
             continue;
+         /* The rest are the main Looper's, and only the main thread runs
+          * them — whatever wait or call boundary brought another thread
+          * here.  (Queued green threads belong to no Looper.) */
+         if (!vm->pending_is_thread[i] && !dvm_on_main_thread())
+            continue;
          if (vm->pending_due_ms[i] <= now) { pick = i; break; }
       }
       if (pick < 0) break;
@@ -3462,7 +3595,16 @@ static int drain_pending(struct dvm *vm, bool nested)
              * couple of Runnables. */
             uint64_t saved_steps = vm->call_steps;
             vm->call_steps = 0;
-            vm->step_limit = DVM_THREAD_SLICE;
+            /* Only a thread that fell back to this queue has a slice: it is the
+             * cooperative scheduler's way of noticing that a green thread is
+             * spinning rather than getting anywhere.  A main-Looper callback
+             * is not a thread — on a device it simply runs on the main thread
+             * until it returns, however long that takes.  Giving it the slice
+             * killed ordinary work: the HoYoverse SDK's language table is a
+             * Gson parse of a large JSON file, took more than two million
+             * instructions, and was aborted with java.lang.Error, so every
+             * SDK string lookup failed ("load resource failed"). */
+            vm->step_limit = is_thread[i] ? DVM_THREAD_SLICE : 0;
             vm->quiet_uncaught = true;
             /* A Runnable handed to Handler.post() runs on the main thread; one
              * started with Thread.start() runs as itself.  App code asserts on
@@ -3565,7 +3707,10 @@ int dvm__drain_for_wait(struct dvm *vm) { return drain_pending(vm, true); }
  * next to the other things a device's main thread does every turn. */
 void dvm_main_looper_tick(struct dvm *vm)
 {
-   if (!vm || !vm->npending) return;
+   /* Not only when a message is pending: input the emulator's own windows
+    * took (a tap on a guest dialog) and their redraws are the main thread's
+    * work too, and they arrive with nothing queued. */
+   if (!vm) return;
    /* Same contract as dvm_media_pump_active(): called from the frame pump,
     * which does not carry the interpreter lock. */
    unsigned cookie = dvm_gil_enter_from_guest(vm);
@@ -3648,6 +3793,11 @@ static _Thread_local bool g_is_bytecode_thread;
 
 bool dvm_on_bytecode_thread(void) { return g_is_bytecode_thread; }
 void dvm__mark_bytecode_thread(void) { g_is_bytecode_thread = true; }
+
+/* Android's main thread.  See dvm_on_main_thread() in dvm.h. */
+static _Thread_local bool g_is_main_thread;
+
+bool dvm_on_main_thread(void) { return g_is_main_thread; }
 
 void dvm__tstate_reset(struct dvm *vm)
 {
@@ -4166,7 +4316,13 @@ bool dvm_call(struct dvm *vm, struct dvm_method *m, dvm_ref self,
                     f->cls ? f->cls->name : "?", f->name, f->sig ? f->sig : "");
       }
    }
-   if (!vm->depth) {
+   /* The main Looper's queue is the main thread's to run.  A JNI call that a
+    * guest's own native thread makes returns to that thread, not to a
+    * Looper: running Handler messages there executed them on whichever
+    * thread happened to call into Java — androidx.sqlite's ProcessLock then
+    * re-entered itself from inside Thread.sleep and deadlocked the process on
+    * its own file lock, and Play services' checkMainThread() failed. */
+   if (!vm->depth && g_is_main_thread) {
       /* vm->parked describes the call that just returned — "this thread is
        * blocked inside the platform", which its caller has to act on.  The
        * drain below runs other Runnables and each clears the flag on its way
@@ -4324,7 +4480,12 @@ struct dvm *dvm_create(const struct dvm_hooks *hooks)
    struct dvm *vm = calloc(1, sizeof *vm);
    if (!vm) return NULL;
    if (hooks) vm->hooks = *hooks;
-   vm->step_limit = 200u * 1000u * 1000u;
+   /* The thread that creates the VM is the process's main thread: it goes on
+    * to launch the Activity and to drive the frame pump. */
+   g_is_main_thread = true;
+   /* No budget: a call on the main thread runs until it returns, as it does
+    * on a device.  dvm_set_step_limit() sets one for diagnosis. */
+   vm->step_limit = 0;
 
    const char *t = getenv("LUNARIA_DVM_TRACE");
    if (t) vm->trace = atoi(t);

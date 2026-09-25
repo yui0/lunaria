@@ -65,12 +65,13 @@ void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Li
         if (ctx.conf.enable_cycle_counting) {
             code.CMP(Xticks, 0);
             code.B(LE, fail);
-            EmitBlockLinkRelocation(code, ctx, terminal.next, BlockRelocationType::Branch);
-        } else {
-            code.LDAR(Wscratch0, Xhalt);
-            code.CBNZ(Wscratch0, fail);
-            EmitBlockLinkRelocation(code, ctx, terminal.next, BlockRelocationType::Branch);
         }
+        /* HaltExecution is asynchronous and remains part of the JIT contract
+         * when cycle counting is enabled.  Checking only Xticks made an
+         * external timer interrupt wait for the whole guest budget. */
+        code.LDAR(Wscratch0, Xhalt);
+        code.CBNZ(Wscratch0, fail);
+        EmitBlockLinkRelocation(code, ctx, terminal.next, BlockRelocationType::Branch);
     }
 
     code.l(fail);
@@ -79,14 +80,13 @@ void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Li
     EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
 }
 
-void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::LinkBlockFast terminal, IR::LocationDescriptor, bool is_single_step) {
-    if (ctx.conf.HasOptimization(OptimizationFlag::BlockLinking) && !is_single_step) {
-        EmitBlockLinkRelocation(code, ctx, terminal.next, BlockRelocationType::Branch);
-    }
-
-    code.MOV(Xscratch0, A64::LocationDescriptor{terminal.next}.PC());
-    code.STR(Xscratch0, Xstate, offsetof(A64JitState, pc));
-    EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
+void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::LinkBlockFast terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+    /* A bare linked branch never observes either the cycle budget or an
+     * asynchronous halt.  A tight guest loop can then occupy this engine
+     * forever and starve runnable Android threads.  The x86-64 backend uses
+     * the guarded LinkBlock path here for the same reason. */
+    EmitA64Terminal(code, ctx, IR::Term::LinkBlock{terminal.next},
+                    initial_location, is_single_step);
 }
 
 void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::PopRSBHint, IR::LocationDescriptor, bool is_single_step) {
@@ -451,6 +451,18 @@ void EmitIR<IR::Opcode::A64InstructionCacheOperationRaised>(oaknut::CodeGenerato
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ctx.reg_alloc.PrepareForCall({}, args[0], args[1]);
     EmitRelocation(code, ctx, LinkTarget::InstructionCacheOperationRaised);
+}
+
+template<>
+void EmitIR<IR::Opcode::A64CallHostHook>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    ASSERT(args[0].IsImmediate());
+    ASSERT(ctx.conf.host_hook_fn != nullptr);
+    ctx.reg_alloc.PrepareForCall({}, args[1], args[2], args[3]);
+    code.MOV(W0, args[0].GetImmediateU32());
+    code.MOV(Xscratch0, reinterpret_cast<u64>(ctx.conf.host_hook_fn));
+    code.BLR(Xscratch0);
+    ctx.reg_alloc.DefineAsRegister(inst, X0);
 }
 
 template<>

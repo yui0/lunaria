@@ -377,3 +377,28 @@ void *luna_os_native_window(void *glfw_window)
    if (!glfw_window) return NULL;
    return (void *)glfwGetWin32Window((GLFWwindow *)glfw_window);
 }
+
+void *luna_os_offscreen_window(void *glfw_window, int w, int h)
+{
+   (void)glfw_window; (void)w; (void)h;
+   return NULL;
+}
+
+/* ---- audio output controls ------------------------------------------------
+ * This platform has no playback stream yet; the menu's settings are kept so
+ * they read back consistently. */
+static float g_win_gain = 1.0f;
+static int   g_win_muted;
+void luna_os_audio_set_volume(float gain) { g_win_gain = gain < 0.0f ? 0.0f : gain > 1.0f ? 1.0f : gain; }
+float luna_os_audio_volume(void) { return g_win_gain; }
+void luna_os_audio_set_muted(int muted) { g_win_muted = muted ? 1 : 0; }
+int luna_os_audio_muted(void) { return g_win_muted; }
+int luna_os_audio_devices(char (*names)[128], char (*descs)[128], int max)
+{
+   if (max < 1) return 0;
+   snprintf(names[0], 128, "default");
+   snprintf(descs[0], 128, "System output");
+   return 1;
+}
+int luna_os_audio_select_device(const char *name) { return (!name || !*name || !strcmp(name, "default")) ? 0 : -1; }
+const char *luna_os_audio_device(void) { return "default"; }

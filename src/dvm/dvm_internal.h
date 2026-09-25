@@ -331,6 +331,12 @@ bool dvm__monitor_try_enter(struct dvm *vm, dvm_ref ref);
 bool dvm__monitor_exit(struct dvm *vm, dvm_ref ref);
 bool dvm__monitor_wait(struct dvm *vm, dvm_ref ref, uint64_t timeout_ms,
                        bool *notified);
+/* Thread interruption.  take_interrupt answers and clears the current
+ * thread's interrupt status; set_wait records the channel it is about to block
+ * on (0 when it stops), which is what Thread.interrupt() signals. */
+dvm_ref dvm__current_thread(struct dvm *vm);
+bool dvm__thread_take_interrupt(struct dvm *vm);
+void dvm__thread_set_wait(struct dvm *vm, uintptr_t channel);
 bool dvm__monitor_notify(struct dvm *vm, dvm_ref ref, bool all);
 bool dvm__monitor_state(struct dvm *vm, dvm_ref ref, bool current,
                         uint32_t *depth);
@@ -473,6 +479,13 @@ const struct dvm_system_service *dvm_runtime_system_services(size_t *count);
 const struct dvm_system_service *dvm_runtime_find_system_service(const char *key);
 /* The per-service singleton instance, created on first use. */
 dvm_ref dvm_runtime_system_service(struct dvm *vm, const char *key);
+/* Context.registerReceiver / unregisterReceiver / send*Broadcast on any
+ * Context.  True when `method` was one of them (the result, or a pending
+ * exception, is then the answer). */
+bool dvm_runtime_context_broadcast(struct dvm *vm, const char *method,
+                                   const char *sig, dvm_ref context,
+                                   const union dvm_value *args, int nargs,
+                                   union dvm_value *out);
 
 /* dvm_runtime.c: installs the built-in classes into a fresh VM. */
 void dvm_runtime_install(struct dvm *vm);

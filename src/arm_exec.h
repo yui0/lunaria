@@ -252,6 +252,10 @@ int arm_exec_fb_width(void);
  * that touch the host filesystem on the guest's behalf must go through this:
  * without it an Android path such as "/etc" aliases the host's. */
 const char *arm_exec_map_guest_path(const char *path, char *buf, size_t bufsz);
+/* Read the emulated process environment.  This deliberately does not expose
+ * the launcher's host environment to Java or guest libc.  The returned
+ * pointer remains owned by the emulator and is copied by callers. */
+const char *arm_exec_guest_getenv(const char *name);
 /* The locale the emulated device is configured in, as two-letter language and
  * country (plus NUL).  One answer for the whole process: the VM's
  * java.util.Locale default and AConfiguration must not disagree, or an app
@@ -265,6 +269,12 @@ void arm_exec_timezone_unlock(void);
  * identity while it calls back through JNI into guest native code. */
 void arm_exec_dvm_thread_attach(void);
 void arm_exec_dvm_thread_detach(void);
+
+/* Java Looper.prepare* and the NDK ALooper for a thread are one looper on a
+ * device.  Call when the bytecode VM binds a Looper to the current thread so
+ * ALooper_forThread() answers the same way. */
+void arm_exec_alooper_mark_prepared(uint32_t tid);
+void arm_exec_alooper_mark_current_prepared(void);
 
 /* Reports a guest operation that destroys something under a directory lunaria
  * staged — the extracted expansion, or the app's data.  Those are the two
@@ -341,6 +351,15 @@ char *arm_exec_clipboard_get(void);
 /* Returns 1 if the GLFW window close button was pressed, 0 otherwise. */
 int arm_exec_glfw_should_close(void);
 void arm_exec_request_quit(void);
+
+/* Host actions for the emulator's menu; callable from any thread, carried out
+ * by the window thread.  The screenshot is the next presented frame, written
+ * as PNG to path. */
+void arm_exec_request_screenshot(const char *path);
+void arm_exec_toggle_fullscreen(void);
+int  arm_exec_is_fullscreen(void);
+/* An Android key press (down then up), as a hardware key would send it. */
+void arm_exec_android_key(int keycode);
 
 /* Stop and join the A64 engine pool.  Call once the guest is finished and
  * before the process returns from main: the workers are host threads owned by
@@ -480,6 +499,22 @@ int arm64_exec_context_init(struct jvm *jvm);
  * `base_addr` == 0 → auto-place after previously loaded libraries. */
 int arm64_exec_load_library(const char *path, uint64_t base_addr);
 
+/* The dynamic linker's DT_NEEDED walk for `path`, before `path` itself is
+ * relocated: each dependency is loaded from beside `path` or, for a platform
+ * library, from LUNARIA_SYSLIB_DIR.  Implemented by the loader (loader.c);
+ * arm64_exec_load_library runs it for every load — the main library,
+ * System.loadLibrary, System.load and dlopen alike. */
+void arm64_loader_load_needed(const char *path);
+
+/* The theme an Activity class starts with (its manifest android:theme, else
+ * the application's), and whether a theme makes a floating window. */
+uint32_t arm_exec_activity_theme(const char *cls);
+int arm_exec_theme_is_floating(uint32_t theme);
+
+/* java.lang.System.load(filename): map the absolute path through the guest
+ * ELF loader (APS2-aware).  Host/apkenv dlopen is a different ABI. */
+int arm_exec_system_load(const char *path);
+
 /* Load an ARM64 ELF and call JNI_OnLoad. Returns JNI version or -1. */
 int arm64_exec_jni_onload(const char *path, struct jvm *jvm);
 
@@ -527,6 +562,11 @@ uint64_t arm64_exec_read64(uint64_t va);
 void     arm64_exec_write32(uint64_t va, uint32_t val);
 void     arm64_exec_write64(uint64_t va, uint64_t val);
 
+/* True when read_fd/write_fd are the two ends of a pipe created for the
+ * guest.  Pipe endpoints do not share an inode on every host (Darwin is one),
+ * so NativeActivity lifecycle delivery must not infer this with fstat(). */
+int arm_exec_guest_pipe_pair(int read_fd, int write_fd);
+
 /* Allocate `size` bytes in the A64 guest heap. Returns guest VA or 0. */
 uint64_t arm64_exec_malloc(uint64_t size);
 
@@ -563,6 +603,58 @@ void arm64_exec_svc_ring_dump(void);
 /* Presents the guest itself drove through the EGL bridge.  The pump loop
  * watches this to notice that the guest has stopped producing frames. */
 uint64_t arm_exec_guest_swap_count(void);
+
+/*
+ * Host calls: a guest-callable entry point for a host function, without an
+ * SVC number of its own.
+ *
+ * Every trampoline runs the one SVC_HOSTCALL and carries, in the word after
+ * its `ret`, the index of a descriptor: a function pointer and a word of data
+ * for it.  Dispatch is that index and one indirect call — no switch, no symbol
+ * table — and a new binding is a registration at run time, so there is no
+ * number to pick and none to collide.  This is what a family of entry points
+ * that is only known once a guest asks for it (Vulkan's hundreds of commands,
+ * found through vkGetInstanceProcAddr) is built on.
+ *
+ * A64 guests only: the arguments are the AAPCS64 registers.
+ */
+
+/* The call as AAPCS64 made it.  Guest and host share an address space for
+ * A64 (identity VA), so a pointer argument is a host pointer as it stands and
+ * stack-passed arguments are 8-byte slots at `sp`. */
+typedef struct HostCallArgs {
+    uint64_t x[8];     /* x0..x7                                            */
+    uint64_t v[8];     /* low 64 bits of v0..v7; filled for HOSTCALL_FLOATS */
+    uint64_t sp;       /* guest SP at the call                              */
+    uint64_t ret;      /* x0 on return                                      */
+} HostCallArgs;
+
+typedef void (*HostCallFn)(struct HostCallArgs *a, uintptr_t data);
+
+enum {
+    /* The function touches no emulator state: it runs without the ARM
+     * execution lock.  Anything that may block (a driver wait, a present)
+     * must have this, or every other engine stops while it waits. */
+    HOSTCALL_LOCKFREE = 1u << 0,
+    /* The function takes float arguments: read v0..v7 before the call. */
+    HOSTCALL_FLOATS   = 1u << 1,
+};
+
+/* A new trampoline for `fn(args, data)`, as a guest VA, or 0 when guest
+ * memory for it cannot be had.  `name` is kept for diagnostics and must stay
+ * valid.  Each call makes a new trampoline; callers that bind a name more
+ * than once keep their own map. */
+uint64_t luna_host_call_tramp(const char *name, HostCallFn fn, uintptr_t data,
+                              unsigned flags);
+
+/* Declares host memory the guest may use directly — a Vulkan mapping, say —
+ * in the guest's address-space table, so the SVCs that validate a guest
+ * pointer accept it.  Only the pages not declared already are added. */
+void arm64_exec_declare_host_range(uint64_t lo, uint64_t len);
+
+/* luna_vulkan.c: the trampoline for a vk* name, as a guest VA, or 0 when
+ * the Vulkan bridge is off (LUNARIA_VULKAN) or the host lacks the name. */
+uint64_t luna_vk_symbol(const char *name);
 
 #ifdef __cplusplus
 }

@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html><head><title>Luna test</title>
+<style>
+body { margin:0; background:#f4f6fb; font-family:sans-serif; }
+.card { margin:24px; padding:16px; background:#ffffff; border-radius:12px; border:1px solid #d0d7e5; }
+.done { background:#d8f5dd; }
+#list li { color:#234; }
+h1 { font-size:28px; color:#1a2b4c; }
+</style></head>
+<body>
+<div class="card" id="main"><h1 id="title">Hello</h1><p id="msg">static</p>
+<ul id="list"><li>one</li></ul>
+<input id="name" placeholder="Name">
+<button id="btn" onclick="window.clicked = (window.clicked||0) + 1">Click</button>
+</div>
+<script>
+var out = [];
+document.getElementById('msg').textContent = 'dynamic: ' + navigator.userAgent.split(' ')[0];
+var li = document.createElement('li'); li.textContent = 'two'; li.className = 'x';
+document.getElementById('list').appendChild(li);
+var li0 = document.createElement('li'); li0.textContent = 'zero';
+document.getElementById('list').insertBefore(li0, document.querySelector('#list li'));
+out.push(Array.from(document.querySelectorAll('#list li')).map(e => e.textContent).join(','));
+document.querySelector('.card').classList.add('done');
+out.push(document.querySelector('.card').className);
+out.push(document.title);
+document.getElementById('main').insertAdjacentHTML('beforeend', '<p class="late">late <b>bold</b></p>');
+out.push(document.querySelectorAll('p').length);
+setTimeout(function(){ document.getElementById('title').textContent = 'Timer ran'; }, 50);
+document.addEventListener('DOMContentLoaded', function(){ out.push('dcl'); });
+window.addEventListener('load', function(){ out.push('load:' + document.readyState); console.log('RESULT ' + JSON.stringify(out)); });
+fetch('data:application/json,{"a":1}').then(r => r.json()).then(j => console.log('FETCH ' + j.a));
+localStorage.setItem('k', 'v'); console.log('LS ' + localStorage.getItem('k'));
+console.log('URL ' + new URL('../x?y=1#z', 'https://a.b/c/d/e').href);
+</script>
+</body></html>

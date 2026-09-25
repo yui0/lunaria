@@ -491,6 +491,12 @@ void *luna_os_native_window(void *glfw_window)
    return (void *)((id (*)(id, SEL))objc_msgSend)(view, layer_sel);
 }
 
+void *luna_os_offscreen_window(void *glfw_window, int w, int h)
+{
+   (void)glfw_window; (void)w; (void)h;
+   return NULL;
+}
+
 /* ---- audio out --------------------------------------------------------- *
  *
  * CoreAudio's AudioQueue, the macOS counterpart of the ALSA path in
@@ -614,9 +620,38 @@ int luna_os_audio_open(unsigned rate, unsigned channels)
    return 0;
 }
 
+static _Atomic int g_aq_gain_q15 = 32768;
+static _Atomic int g_aq_muted;
+
+void luna_os_audio_set_volume(float gain)
+{
+   if (gain < 0.0f) gain = 0.0f;
+   if (gain > 1.0f) gain = 1.0f;
+   atomic_store_explicit(&g_aq_gain_q15, (int)(gain * 32768.0f + 0.5f), memory_order_relaxed);
+}
+float luna_os_audio_volume(void) { return (float)atomic_load(&g_aq_gain_q15) / 32768.0f; }
+void luna_os_audio_set_muted(int muted) { atomic_store(&g_aq_muted, muted ? 1 : 0); }
+int luna_os_audio_muted(void) { return atomic_load(&g_aq_muted); }
+/* AudioQueue plays on the system's current output; choosing one is the
+ * system's Sound settings. */
+int luna_os_audio_devices(char (*names)[128], char (*descs)[128], int max)
+{
+   if (max < 1) return 0;
+   snprintf(names[0], 128, "default");
+   snprintf(descs[0], 128, "System output");
+   return 1;
+}
+int luna_os_audio_select_device(const char *name)
+{
+   return (!name || !*name || !strcmp(name, "default")) ? 0 : -1;
+}
+const char *luna_os_audio_device(void) { return "default"; }
+
 int luna_os_audio_write(const void *pcm16, unsigned frames)
 {
    if (!g_aq_open || !pcm16 || !frames) return 0;
+   const int gain = atomic_load_explicit(&g_aq_muted, memory_order_relaxed)
+      ? 0 : atomic_load_explicit(&g_aq_gain_q15, memory_order_relaxed);
    const int16_t *src = (const int16_t *)pcm16;
    const unsigned h = atomic_load_explicit(&g_aq_head, memory_order_relaxed);
    const unsigned free_frames =
@@ -625,7 +660,7 @@ int luna_os_audio_write(const void *pcm16, unsigned frames)
    for (unsigned i = 0; i < frames; ++i) {
       const unsigned dst = ((h + i) % LUNA_MAC_AUDIO_RING_FRAMES) * g_aq_ch;
       for (unsigned c = 0; c < g_aq_ch; ++c)
-         g_aq_ring[dst + c] = src[i * g_aq_ch + c];
+         g_aq_ring[dst + c] = (int16_t)(((int32_t)src[i * g_aq_ch + c] * gain) >> 15);
    }
    atomic_store_explicit(&g_aq_head, (h + frames) % LUNA_MAC_AUDIO_RING_FRAMES,
                          memory_order_release);

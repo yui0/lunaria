@@ -184,9 +184,35 @@ const char *dex_class_enclosing_type(struct dex_file *d,
 bool dex_class_annotation(struct dex_file *d, uint32_t class_def_idx,
                           const char *annotation_desc,
                           uint32_t *encoded_off);
+/* Fill `encoded_offs`/`types` with every runtime-visible annotation on the
+ * class.  Returns the total count (may exceed `max`; only the first `max`
+ * slots are written).  `types` entries point into the dex string pool. */
+int dex_class_annotations(struct dex_file *d, uint32_t class_def_idx,
+                          uint32_t *encoded_offs, const char **types, int max);
 bool dex_field_annotation(struct dex_file *d, uint32_t class_def_idx,
                           const char *field_name, const char *annotation_desc,
                           uint32_t *encoded_off);
+/* A method's annotations, named by its name and signature
+ * ("(Ljava/lang/String;I)V").  Same conventions as the class forms. */
+int dex_method_annotations(struct dex_file *d, uint32_t class_def_idx,
+                           const char *name, const char *sig,
+                           uint32_t *encoded_offs, const char **types, int max);
+bool dex_method_annotation(struct dex_file *d, uint32_t class_def_idx,
+                           const char *name, const char *sig,
+                           const char *annotation_desc, uint32_t *encoded_off);
+/* How many parameter annotation sets the method has (the dex list's size),
+ * or -1 when it has none recorded. */
+int dex_parameter_annotation_lists(struct dex_file *d, uint32_t class_def_idx,
+                                   const char *name, const char *sig);
+/* The runtime-visible annotations of parameter `param`. */
+int dex_parameter_annotations(struct dex_file *d, uint32_t class_def_idx,
+                              const char *name, const char *sig, int param,
+                              uint32_t *encoded_offs, const char **types,
+                              int max);
+/* The method's generic signature, from its dalvik.annotation.Signature. */
+bool dex_method_signature(struct dex_file *d, uint32_t class_def_idx,
+                          const char *name, const char *sig,
+                          char *out, size_t out_sz);
 const char *dex_annotation_type(struct dex_file *d, uint32_t encoded_off);
 bool dex_annotation_element(struct dex_file *d, uint32_t encoded_off,
                             const char *name, struct dex_value *out);

@@ -222,10 +222,35 @@ void A32EmitX64::GenTerminalHandlers() {
         code.or_(rbx, rcx);
     };
 
+    /* A terminal handler jumps straight to the next block's code.  Like the
+     * LinkBlock terminal, it has to give the run a chance to end first, or a
+     * guest loop whose back edge leaves through here is uninterruptible: the
+     * tick budget is never read again and HaltExecution() from another thread
+     * is never seen.  A `bl`/`ret` pair inside a spin loop leaves through
+     * PopRSBHint every iteration, which is how Genshin's il2cpp wait on a
+     * worker's state held the pump for the life of the process — the
+     * preemption watchdog issued tens of thousands of halts against a Run()
+     * that could not observe any of them.
+     *
+     * The check goes before the handler touches any state (the RSB pointer
+     * below), so a run that ends here resumes at exactly this terminal.
+     * jit_state.pc already holds the destination, which is what the block
+     * lookup on re-entry needs.  Cost is one compare and a predicted branch
+     * per transition, the same price LinkBlock pays. */
+    const auto exit_if_run_is_over = [this] {
+        code.cmp(dword[r15 + offsetof(A32JitState, halt_reason)], 0);
+        code.jne(code.GetForceReturnFromRunCodeAddress());
+        if (conf.enable_cycle_counting) {
+            code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
+            code.jng(code.GetForceReturnFromRunCodeAddress());
+        }
+    };
+
     Xbyak::Label fast_dispatch_cache_miss, rsb_cache_miss;
 
     code.align();
     terminal_handler_pop_rsb_hint = code.getCurr<const void*>();
+    exit_if_run_is_over();
     calculate_location_descriptor();
     code.mov(eax, dword[r15 + offsetof(A32JitState, rsb_ptr)]);
     code.sub(eax, 1);
@@ -244,6 +269,7 @@ void A32EmitX64::GenTerminalHandlers() {
     if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
         code.align();
         terminal_handler_fast_dispatch_hint = code.getCurr<const void*>();
+        exit_if_run_is_over();
         calculate_location_descriptor();
         code.L(rsb_cache_miss);
         code.mov(r12, reinterpret_cast<u64>(fast_dispatch_table.data()));

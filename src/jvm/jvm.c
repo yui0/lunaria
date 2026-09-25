@@ -38,6 +38,34 @@ static pthread_cond_t  g_jni_monitor_cond  = PTHREAD_COND_INITIALIZER;
 static _Atomic uint64_t g_next_jni_monitor_token = 1;
 static _Thread_local uint64_t g_jni_monitor_token;
 
+/* Classes, method/field IDs and the wrapper cache are process-wide VM
+ * metadata.  Android permits JNI lookups concurrently from attached threads;
+ * publishing a half-built table slot is therefore not allowed.  This must be
+ * recursive because adding a method assigns java.lang.reflect.Method, which
+ * may itself intern a class in the same table. */
+static pthread_once_t g_jvm_meta_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t g_jvm_meta_mutex;
+
+static void jvm_meta_mutex_init(void)
+{
+   pthread_mutexattr_t attr;
+   pthread_mutexattr_init(&attr);
+   pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+   pthread_mutex_init(&g_jvm_meta_mutex, &attr);
+   pthread_mutexattr_destroy(&attr);
+}
+
+static void jvm_meta_lock(void)
+{
+   pthread_once(&g_jvm_meta_once, jvm_meta_mutex_init);
+   pthread_mutex_lock(&g_jvm_meta_mutex);
+}
+
+static void jvm_meta_unlock(void)
+{
+   pthread_mutex_unlock(&g_jvm_meta_mutex);
+}
+
 static uint64_t jni_monitor_token(void)
 {
    if (!g_jni_monitor_token)
@@ -264,6 +292,7 @@ static jobject
 jvm_add_object(struct jvm *jvm, const struct jvm_object *o)
 {
    assert(jvm && o);
+   jvm_meta_lock();
 
    /* Resume the scan where the last allocation stopped: restarting at 0 every
     * time made allocation O(n) in a 65536-entry table, which shows up as a
@@ -316,6 +345,7 @@ jvm_add_object(struct jvm *jvm, const struct jvm_object *o)
          }
       }
       assert(0 && "jvm object limit reached!");
+      jvm_meta_unlock();
       return NULL;
    }
    jvm->next_object = i + 1;
@@ -329,7 +359,9 @@ jvm_add_object(struct jvm *jvm, const struct jvm_object *o)
    if (!jvm->objects[i].this_klass)
       jvm_assign_default_class(jvm, &jvm->objects[i]);
 
-   return (jobject)(i + 1);
+   jobject result = (jobject)(i + 1);
+   jvm_meta_unlock();
+   return result;
 }
 
 /* Add a reference to an existing handle (NewGlobalRef / NewLocalRef, or a
@@ -337,9 +369,11 @@ jvm_add_object(struct jvm *jvm, const struct jvm_object *o)
 static jobject
 jvm_ref_object(struct jvm *jvm, jobject object)
 {
+   jvm_meta_lock();
    struct jvm_object *o = jvm_get_object(jvm, object);
    if (o && o->type != JVM_OBJECT_NONE)
       ++o->refs;
+   jvm_meta_unlock();
    return object;
 }
 
@@ -350,36 +384,48 @@ jvm_ref_object(struct jvm *jvm, jobject object)
 static void
 jvm_deref_object(struct jvm *jvm, jobject object)
 {
+   jvm_meta_lock();
    struct jvm_object *o = jvm_get_object(jvm, object);
-   if (!o || o->type == JVM_OBJECT_NONE)
+   if (!o || o->type == JVM_OBJECT_NONE) {
+      jvm_meta_unlock();
       return;
+   }
    if (o->refs > 0)
       --o->refs;
-   if (o->refs > 0)
+   if (o->refs > 0) {
+      jvm_meta_unlock();
       return;
+   }
    if (o->type != JVM_OBJECT_ARRAY && o->type != JVM_OBJECT_STRING &&
        o->type != JVM_OBJECT_MOTION) {
       o->refs = 1; /* pinned for the process lifetime */
+      jvm_meta_unlock();
       return;
    }
    uintptr_t idx = (uintptr_t)object - 1;
    jvm_object_release(o);
    if (idx < jvm->next_object)
       jvm->next_object = idx;
+   jvm_meta_unlock();
 }
 
 static jobject
 jvm_add_object_if_not_there(struct jvm *jvm, struct jvm_object *needle)
 {
    assert(jvm && needle);
+   jvm_meta_lock();
 
    jobject o;
    if ((o = jvm_find_object(jvm, needle))) {
       jvm_object_release(needle);
-      return jvm_ref_object(jvm, o);
+      o = jvm_ref_object(jvm, o);
+      jvm_meta_unlock();
+      return o;
    }
 
-   return jvm_add_object(jvm, needle);
+   o = jvm_add_object(jvm, needle);
+   jvm_meta_unlock();
+   return o;
 }
 
 static struct jvm_object*
@@ -1114,6 +1160,7 @@ static unsigned long long wrap_now_ns(void)
 static void*
 jvm_wrap_method(struct jvm *jvm, jmethodID method_id)
 {
+   jvm_meta_lock();
    const uintptr_t idx = (uintptr_t)method_id;
    /* LUNARIA_JNI_WRAP_CACHE=0 goes back to resolving on every call — the
     * comparison point if a title ever behaves differently with the cache. */
@@ -1131,17 +1178,27 @@ jvm_wrap_method(struct jvm *jvm, jmethodID method_id)
       }
       if (jvm->wrap_cached[idx - 1]) {
          ++g_wrap_hits;
-         return jvm->wrap_cache[idx - 1];
+         void *r = jvm->wrap_cache[idx - 1];
+         jvm_meta_unlock();
+         return r;
       }
    }
+   /* Resolution walks the dex hierarchy and therefore takes the DVM GIL.
+    * Do not hold the metadata lock across it: bytecode threads may already
+    * hold that GIL while entering JNI for another lookup.  Two threads may
+    * resolve the same immutable method concurrently; publication below is
+    * serialized and either identical answer is valid. */
+   jvm_meta_unlock();
    const unsigned long long t0 = wrap_now_ns();
    void *r = jvm_wrap_method_uncached(jvm, method_id);
+   jvm_meta_lock();
    g_wrap_resolve_ns += wrap_now_ns() - t0;
    ++g_wrap_resolves;
    if (cacheable) {
       jvm->wrap_cache[idx - 1] = r;
       jvm->wrap_cached[idx - 1] = true;
    }
+   jvm_meta_unlock();
    return r;
 }
 

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <execinfo.h>
 #include <memory>
 #include <mutex>
 
@@ -566,4 +567,3 @@ void dynarmic_a64_set_progress_hook(void (*fn)(uint64_t, uint64_t)) {
 }
 
 }  // namespace Dynarmic::A64
-

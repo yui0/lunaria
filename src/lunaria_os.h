@@ -160,6 +160,14 @@ int luna_os_disk_info(const char *path, uint64_t *total_bytes,
 void *luna_os_native_display(void);
 void *luna_os_native_window(void *glfw_window);
 
+/* A second native window of the same kind as `glfw_window`'s, `w` x `h`,
+ * that is never shown.  The compositor owns the visible window; the guest's
+ * EGL window surface is created on this one, so the frame it finishes is a
+ * window back buffer the compositor can copy out (a pbuffer is not readable
+ * on every host EGL).  NULL where the platform has no such thing; the caller
+ * then falls back to a pbuffer. */
+void *luna_os_offscreen_window(void *glfw_window, int w, int h);
+
 /* ---- audio out ----------------------------------------------------------
  *
  * One PCM playback stream, which is what the guest's OpenSL ES / AAudio
@@ -181,6 +189,21 @@ int      luna_os_audio_write(const void *pcm16, unsigned frames);
 unsigned luna_os_audio_queued_frames(void);
 uint64_t luna_os_audio_played_frames(void);
 void     luna_os_audio_close(void);
+
+/* Output controls for the emulator's menu.  Volume is a linear gain 0..1
+ * applied as the stream is handed to the device; mute silences it without
+ * stopping it (the guest's buffer queue keeps its clock).  Devices are the
+ * host's playback endpoints: *names* are what select_device takes, *descs*
+ * what a person reads.  Selecting reopens the stream on that device, from the
+ * stream's own thread; NULL or "" is the platform default.  Returns the count
+ * written / 0 on success. */
+void     luna_os_audio_set_volume(float gain);
+float    luna_os_audio_volume(void);
+void     luna_os_audio_set_muted(int muted);
+int      luna_os_audio_muted(void);
+int      luna_os_audio_devices(char (*names)[128], char (*descs)[128], int max);
+int      luna_os_audio_select_device(const char *name);
+const char *luna_os_audio_device(void);
 
 #ifdef __cplusplus
 }

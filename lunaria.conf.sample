@@ -120,3 +120,16 @@
 #LUNARIA_PACKAGES_EXTRA=com.facebook.katana;com.instagram.android
 
 # LUNARIA_TRACE_PM=1 prints the ledger as it was built.
+
+# -- WebView ------------------------------------------------------------------
+# What renders android.webkit.WebView.  Both engines are driven over the same
+# DevTools pipe; the page is shown as a captured image inside the view.
+#
+#   auto    an installed Chrome/Chromium, else luna-browser    <- default
+#   chrome  Chrome/Chromium only
+#   luna    luna-browser (luna-ui + QuickJS; `make luna-browser`)
+#   off     no engine: loads fail (onReceivedError, then onPageFinished)
+#
+#LUNARIA_WEB_ENGINE=auto
+# A browser binary by path (not a shell wrapper); overrides auto/chrome/luna.
+#LUNARIA_WEB_BROWSER=/opt/google/chrome/chrome

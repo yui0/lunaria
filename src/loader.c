@@ -150,6 +150,54 @@ static const char *a64_syslib_dir(void)
    return dir;
 }
 
+/* Platform libraries every Android process sees before any app DSO loads.
+ *
+ * The ELF-on-the-command-line path used to do this; the APK-process path
+ * (`--apk-process-arm64`) did not, so the first System.loadLibrary that
+ * imported a bionic data symbol (optarg, for Crashlytics) failed with
+ * "cannot locate symbol" even though syslib-arm64 held the real image.
+ * A device does not have two linkers — preload once, for every entry. */
+static void a64_preload_platform_libs(void)
+{
+   const char *sys = a64_syslib_dir();
+   char libpath[PATH_MAX];
+   struct stat stbuf;
+
+   if (!sys) return;
+
+   /* libc as a pure-code provider only — see the comment at the ELF-path
+    * call site.  Full ctor/TLS bootstrap is still the emulator's job. */
+   {
+      int have_pure = 0;
+      if ((size_t)snprintf(libpath, sizeof libpath,
+                           "%s/libc-pure.so", sys) < sizeof libpath &&
+          stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath))
+         have_pure = 1;
+      else if ((size_t)snprintf(libpath, sizeof libpath,
+                                "%s/libc.so", sys) < sizeof libpath &&
+               stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath))
+         have_pure = 1; /* legacy syslib layout */
+      if (have_pure) {
+         printf("preloading arm64 pure-code library: %s\n", libpath);
+         if (arm64_exec_load_library(libpath, 0) < 0)
+            warnx("failed to load pure-code library %s", libpath);
+      }
+   }
+
+   /* Guest-side malloc family as in-process code instead of traps. */
+   {
+      const char *off = getenv("LUNARIA_GUEST_LIBC");
+      if (!(off && !strcmp(off, "0")) &&
+          (size_t)snprintf(libpath, sizeof libpath,
+                           "%s/liblunaria_guest.so", sys) < sizeof libpath &&
+          stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
+         printf("preloading arm64 guest libc: %s\n", libpath);
+         if (arm64_exec_load_library(libpath, 0) < 0)
+            warnx("failed to load guest libc %s", libpath);
+      }
+   }
+}
+
 static void a64_preload_needed(const char *path, const char *dir,
                                char seen[][NAME_MAX + 1], size_t *seen_n)
 {
@@ -203,6 +251,19 @@ static void a64_preload_needed(const char *path, const char *dir,
       if (arm64_exec_load_library(dep_path, 0) < 0)
          warnx("failed to preload AArch64 dependency %s", dep_path);
    }
+}
+
+void arm64_loader_load_needed(const char *path)
+{
+   char dir[PATH_MAX];
+   char seen[128][NAME_MAX + 1];
+   size_t seen_n = 0;
+   const char *slash = path ? strrchr(path, '/') : NULL;
+   size_t n = slash ? (size_t)(slash - path) + 1u : 0u;
+   if (!path || n >= sizeof dir) return;
+   memcpy(dir, path, n);
+   dir[n] = '\0';
+   a64_preload_needed(path, dir, seen, &seen_n);
 }
 
 /* LUNARIA_TOUCH_FIFO — taps arriving while the emulator is already running.
@@ -1438,10 +1499,10 @@ run_ue4_game_arm(struct jvm *jvm)
               instance, win);
       if (instance) {
          /* Scan android_app for the command pipe's fd pair.  Observed NDK
-          * layout (32-bit bionic): msgread @+0x48.  The two ends of one
-          * pipe(2) share an inode, which identifies the pair exactly; see the
-          * A64 path for why "both descriptors above 2" was both too loose and
-          * too strict. */
+          * layout (32-bit bionic): msgread @+0x48.  Validate candidates
+          * against the guest-pipe registry: filesystem identity cannot do
+          * this portably because Darwin gives the two pipe ends different
+          * inode numbers. */
          int msgwrite = -1;
          uint32_t pipe_off = 0;
          for (uint32_t off = 64; off < 256; off += 4) {
@@ -1454,7 +1515,7 @@ run_ue4_game_arm(struct jvm *jvm)
                continue;
             if (!S_ISFIFO(sa.st_mode) || !S_ISFIFO(sb.st_mode))
                continue;
-            if (sa.st_dev != sb.st_dev || sa.st_ino != sb.st_ino)
+            if (!arm_exec_guest_pipe_pair(a, b))
                continue;
             msgwrite = b;
             pipe_off = off;
@@ -1930,15 +1991,11 @@ run_ue4_game_arm64(struct jvm *jvm)
           * (pthread_mutex_t 40 B, pthread_cond_t 48 B) msgread lands at
           * +0xC0; the scan keeps this working if the glue struct shifts.
           *
-          * The two ends of one pipe(2) share an inode, so "both FIFOs on the
-          * same device and inode, and not the same descriptor" identifies the
-          * pair exactly.  The previous test — both descriptors above 2 and
-          * both FIFOs — was neither: it accepted any two unrelated FIFOs, and
-          * it rejected the real pair whenever msgread happened to be fd 0,
-          * which is what a guest gets when this process starts with stdin
-          * closed.  The pipe was then never found, no APP_CMD reached
-          * android_main, and the engine waited for a window it had already
-          * been given. */
+          * Validate candidates against the guest-pipe registry.  fstat inode
+          * identity is not portable (Darwin assigns a different inode to
+          * each end), while accepting any two FIFOs can select unrelated
+          * pipes.  The registry records the pair at pipe()/pipe2() time and
+          * forgets it when either descriptor closes. */
          for (uint32_t off = 64; off < 512; off += 4) {
             int a = (int)arm64_exec_read32(instance_va + off);
             int b = (int)arm64_exec_read32(instance_va + off + 4);
@@ -1949,7 +2006,7 @@ run_ue4_game_arm64(struct jvm *jvm)
                continue;
             if (!S_ISFIFO(sa.st_mode) || !S_ISFIFO(sb.st_mode))
                continue;
-            if (sa.st_dev != sb.st_dev || sa.st_ino != sb.st_ino)
+            if (!arm_exec_guest_pipe_pair(a, b))
                continue;
             msgwrite = b; pipe_off = off;
             fprintf(stderr, "[loader] UE arm64 cmd pipe @+0x%x read=%d write=%d\n",
@@ -2999,6 +3056,9 @@ main(int argc, const char *argv[])
       arm_exec_set_main_lib_dir(libdir);
       if (!arm_exec_host_egl_init())
          fprintf(stderr, "[loader] early APK-process host EGL init failed\n");
+      /* Same platform images a device maps before zygote forks the app. */
+      if (is_a64)
+         a64_preload_platform_libs();
 
       int ret = is_a64 ? run_dex_activity_arm64(&jvm)
                        : EXIT_FAILURE;
@@ -3041,40 +3101,8 @@ main(int argc, const char *argv[])
           * half-initialised libc (Cross Worlds reached a NULL JavaVM call in
           * UE's fourth constructor).  arm_exec therefore exposes only the
           * audited stateless routines from this image until that process
-          * bootstrap exists. */
-         {
-            const char *sys = a64_syslib_dir();
-            int have_pure = 0;
-            if (sys) {
-               if ((size_t)snprintf(libpath, sizeof libpath,
-                                    "%s/libc-pure.so", sys) < sizeof libpath &&
-                   stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath))
-                  have_pure = 1;
-               else if ((size_t)snprintf(libpath, sizeof libpath,
-                                         "%s/libc.so", sys) < sizeof libpath &&
-                        stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath))
-                  have_pure = 1; /* legacy syslib layout */
-            }
-            if (have_pure) {
-               printf("preloading arm64 pure-code library: %s\n", libpath);
-               arm64_exec_load_library(libpath, 0);
-            }
-         }
-
-         /* The emulator's guest-side libc (src/lib/guest.c): malloc and
-          * friends as in-process code instead of traps.  Loaded before every
-          * consumer so all of them bind to it. */
-         {
-            const char *sys = a64_syslib_dir();
-            const char *off = getenv("LUNARIA_GUEST_LIBC");
-            if (sys && !(off && !strcmp(off, "0")) &&
-                (size_t)snprintf(libpath, sizeof libpath,
-                                 "%s/liblunaria_guest.so", sys) < sizeof libpath &&
-                stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
-               printf("preloading arm64 guest libc: %s\n", libpath);
-               arm64_exec_load_library(libpath, 0);
-            }
-         }
+          * bootstrap exists.  Shared with the APK-process entry. */
+         a64_preload_platform_libs();
 
          /* Relocate dependencies before their consumer, as the Android
           * dynamic linker does.  Loading libc++ directly used to bind its

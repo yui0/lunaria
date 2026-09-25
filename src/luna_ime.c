@@ -239,6 +239,9 @@ static void ime_enqueue(const struct ime_queued *ev)
    if (g_queue_count < (int)(sizeof g_queue / sizeof g_queue[0]))
       g_queue[g_queue_count++] = *ev;
    pthread_mutex_unlock(&g_queue_lock);
+   /* Drawn by the compositor as soon as it arrives, not on the game's next
+    * frame. */
+   luna_overlay_wake();
 }
 
 void luna_ime_key(int key, int scancode, int action, int mods)

@@ -173,11 +173,26 @@ static void remember_wrapper(uint32_t host, dvm_ref ref)
    slot->ref = ref;
 }
 
-static dvm_ref wrapper_for(struct dvm *vm, const char *class_name, uint32_t host)
+static dvm_ref wrapper_for(struct dvm *vm, JNIEnv *env,
+                           const char *class_name, uint32_t host)
 {
    if (!host) return 0;
    dvm_ref old = find_wrapper(host);
    if (old) return old;
+
+   /* A DVM wrapper is pinned and may outlive the native frame that supplied
+    * `host`.  Keeping only that local-reference number made its lifetime
+    * depend on an unrelated DeleteLocalRef: the JVM slot was released while
+    * SharedPreferences (and ordinary Java fields) still held the DVM object,
+    * and a later round trip returned a non-null jstring whose payload had
+    * already gone.  ART's heap objects do not depend on JNI local-reference
+    * lifetime.  Give the wrapper its own global reference before publishing
+    * it, which is the JNI representation of that ownership. */
+   jobject owned = env
+      ? (*env)->NewGlobalRef(env, (jobject)(uintptr_t)host)
+      : (jobject)(uintptr_t)host;
+   if (!owned) return 0;
+   host = (uint32_t)(uintptr_t)owned;
 
    /* A miss means this host handle was never the far side of a VM object, so
     * whatever instance state the VM holds for it is about to be invisible. */
@@ -305,6 +320,77 @@ static void array_sync_back(struct dvm *vm, JNIEnv *env, jobject o, dvm_ref r)
       ARRAY_REGION(env, Set, kind, o, n, src);
 }
 
+/* --- direct ByteBuffers ---------------------------------------------------
+ *
+ * ByteBuffer.allocateDirect() promises memory JNI can address.  The VM's
+ * array lives in host memory the guest cannot name, so the bridge gives the
+ * buffer a region of guest memory as well and copies the array through it
+ * around a native call.  Without an address, GetDirectBufferAddress() answers
+ * 0 and a native does not fail politely: Unity's UnityWebRequest upload loop
+ * takes its "how many bytes are there in total" branch instead of its "fill
+ * this buffer" one, so the loop's exit condition is never reached and it
+ * calls the native for ever. */
+extern uint32_t arm_exec_new_guest_direct_buffer(uint64_t cap,
+                                                 uint64_t *addr_out);
+extern void *arm_exec_direct_buffer_host(uint32_t handle, uint64_t *cap_out);
+
+static bool dvm_buffer_is_direct(struct dvm *vm, dvm_ref r)
+{
+   if (!r) return false;
+   /* The class check is not belt-and-braces: `direct` is an ordinary field
+    * name and a dex class of the app's own may well have one. */
+   struct dvm_class *c = dvm_object_class(vm, r);
+   if (!c || !c->name || strcmp(c->name, "java/nio/ByteBuffer")) return false;
+   union dvm_value d = { 0 };
+   return dvm_get_field(vm, r, "direct", "Z", &d) && d.i != 0;
+}
+
+/* The buffer's bytes and their length, or NULL. */
+static uint8_t *dvm_buffer_bytes(struct dvm *vm, dvm_ref r, uint32_t *len)
+{
+   union dvm_value bufv = { 0 };
+   *len = 0;
+   if (!dvm_get_field(vm, r, "buf", "[B", &bufv) || !bufv.l) return NULL;
+   *len = dvm_array_length(vm, bufv.l);
+   return dvm_array_data(vm, bufv.l);
+}
+
+/* The guest-backed handle for this buffer, allocated once and remembered on
+ * the object, with the VM's bytes copied into it. */
+static uint32_t dvm_direct_buffer_to_host(struct dvm *vm, dvm_ref r)
+{
+   uint32_t len = 0;
+   uint8_t *src = dvm_buffer_bytes(vm, r, &len);
+   if (!src || !len) return 0;
+
+   uint32_t handle = dvm_external_handle(vm, r);
+   if (!handle) {
+      uint64_t addr = 0;
+      handle = arm_exec_new_guest_direct_buffer(len, &addr);
+      if (!handle) return 0;
+      struct dvm_object *o = dvm__obj(vm, r);
+      if (!o) return 0;
+      o->host_handle = handle;
+      remember_wrapper(handle, r);
+   }
+   uint64_t cap = 0;
+   void *dst = arm_exec_direct_buffer_host(handle, &cap);
+   if (dst && cap) memcpy(dst, src, cap < len ? (size_t)cap : (size_t)len);
+   return handle;
+}
+
+/* The other direction, once the native has written into the region. */
+static void dvm_direct_buffer_from_host(struct dvm *vm, dvm_ref r)
+{
+   uint32_t len = 0;
+   uint8_t *dst = dvm_buffer_bytes(vm, r, &len);
+   const uint32_t handle = dvm_external_handle(vm, r);
+   if (!dst || !len || !handle) return;
+   uint64_t cap = 0;
+   const void *src = arm_exec_direct_buffer_host(handle, &cap);
+   if (src && cap) memcpy(dst, src, cap < len ? (size_t)cap : (size_t)len);
+}
+
 /* jobject → dvm_ref.  A jstring becomes a real VM string so bytecode can call
  * length()/equals() on it; a Class becomes the VM's Class for that type so
  * getDeclaredMethods()/getMethod() see the dex methods of the class the
@@ -323,6 +409,15 @@ static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
       struct jvm *jvm = jnienv_get_jvm(env);
       const char *described = jvm_described_class_name(jvm, o);
       if (described && *described) {
+         /* Only a class the VM defines becomes a VM Class object.  A class
+          * that exists solely in the host stub layer has no methods or fields
+          * here, so a Class object for it would answer an empty
+          * getConstructors()/getDeclaredMethods() — reflection over it would
+          * fail rather than reach the stub that can service it.  Such a
+          * handle stays a wrapper, which is what carries it back out to the
+          * layer that owns it.  (Its getName() is wrong here; fixing that
+          * means giving external classes real reflective members, not
+          * renaming the wrapper — see PROGRESS.md.) */
          struct dvm_class *c = dvm_find_class(vm, described);
          if (c) {
             dvm_ref r = dvm_class_object(vm, c);
@@ -365,14 +460,14 @@ static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
       if (getenv("LUNARIA_TRACE_FIELDS"))
          fprintf(stderr, "[dvm] ProviderInfo import host=%p grant=%d authority=%p\n",
                  (void *)o, (int)grant_value, (void *)authority_value);
-      dvm_ref r = wrapper_for(vm, cn, (uint32_t)(uintptr_t)o);
+      dvm_ref r = wrapper_for(vm, env, cn, (uint32_t)(uintptr_t)o);
       union dvm_value value = { .i = grant_value ? 1 : 0 };
       (void)dvm_set_field(vm, r, "grantUriPermissions", "Z", value);
       value.l = authority_value ? from_jobject(vm, env, authority_value) : 0;
       (void)dvm_set_field(vm, r, "authority", "Ljava/lang/String;", value);
       return r;
    }
-   return wrapper_for(vm, cn && *cn ? cn : "java/lang/Object",
+   return wrapper_for(vm, env, cn && *cn ? cn : "java/lang/Object",
                       (uint32_t)(uintptr_t)o);
 }
 
@@ -436,6 +531,12 @@ static jobject dvm_array_to_host(struct dvm *vm, JNIEnv *env, dvm_ref r)
 static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
 {
    if (!r) return NULL;
+   /* Before the handle shortcut: a direct buffer's bytes have to be in the
+    * guest region on every crossing, not only the first. */
+   if (dvm_buffer_is_direct(vm, r)) {
+      uint32_t bb = dvm_direct_buffer_to_host(vm, r);
+      if (bb) return (jobject)(uintptr_t)bb;
+   }
    uint32_t host = dvm_external_handle(vm, r);
    if (host) return (jobject)(uintptr_t)host;
 
@@ -446,6 +547,24 @@ static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
    if (s) return (jobject)(*env)->NewStringUTF(env, s);
 
    struct dvm_class *c = dvm_object_class(vm, r);
+   if (getenv("LUNARIA_TRACE_JNI")) {
+      struct dvm_object *raw = dvm__obj(vm, r);
+      fprintf(stderr, "[dvm-jni] non-payload object ref=0x%x kind=%d class=%s\n",
+              r, raw ? (int)raw->kind : -1,
+              (c && c->name) ? c->name : "(none)");
+   }
+
+   /* A java.lang.String may never cross JNI as a bare AllocObject(String).
+    * Such an object has no String payload in the host VM: it is non-null, but
+    * GetStringUTFChars returns NULL.  UE's ordinary JNI_String conversion then
+    * quite correctly treats the non-null jstring as a String and calls
+    * strlen() on the promised character pointer.  A few framework-created
+    * optional strings arrive as a typed DVM object with no utf8 payload (the
+    * GameActivity AppType is one); Android represents their usable empty
+    * value as "", never as a payload-less String instance. */
+   if (c && c->name && (!strcmp(c->name, "java/lang/String") ||
+                        !strcmp(c->name, "Ljava/lang/String;")))
+      return (jobject)(*env)->NewStringUTF(env, "");
 
    /* A java.lang.Class must cross as the host jclass for the class it
     * *represents*, not as an instance of java.lang.Class.
@@ -615,55 +734,45 @@ static jvalue va_next(va_list *ap, const char *desc)
 static size_t dvm_build_split_arrays(struct dvm *vm, dvm_ref *out_names,
                                      dvm_ref *out_dirs)
 {
-   /* Off by default, and not because reporting them is wrong — it is the
-    * truthful answer, and the launcher now knows it.  It used to be off
-    * because Cross Worlds stopped at AndroidThunkJava_GooglePAD_Available once
-    * Play Core could see the splits; that is no longer true (the title now
-    * reaches the same render loop either way, and further).  What is still
-    * missing is the other half: Play Core resolves an install-time pack by
-    * walking these arrays and then asking AssetPackStorage for its directory,
-    * which the emulator does not answer — "Pack not found with pack name" is
-    * what the app gets.  LUNARIA_REPORT_SPLITS=1 turns reporting on for work
-    * on that half. */
-   const char *on = getenv("LUNARIA_REPORT_SPLITS");
-   if (!on || !*on || !strcmp(on, "0")) return 0;
    const char *splits = getenv("ANDROID_SPLIT_APKS");
    size_t n = 0;
    for (const char *p = splits; p && *p; ) {
       const char *end = strchr(p, ';');
       if (!end) end = p + strlen(p);
-      if (strchr(p, '|') && strchr(p, '|') < end) ++n;
+      const char *bar = memchr(p, '|', (size_t)(end - p));
+      if (bar && bar != p) ++n;
       p = (*end == ';') ? end + 1 : end;
    }
    /* A package installed from a single APK genuinely has no split arrays;
     * only describe them when the launcher actually installed splits. */
    if (!n) return 0;
-   dvm_ref names = dvm_new_array(vm, 'L', "Ljava/lang/String;", (uint32_t)n);
-   dvm_ref dirs  = dvm_new_array(vm, 'L', "Ljava/lang/String;", (uint32_t)n);
-   dvm_ref *nslot = names ? dvm_array_data(vm, names) : NULL;
-   dvm_ref *dslot = dirs  ? dvm_array_data(vm, dirs)  : NULL;
-   if (!nslot || !dslot) return 0;
    /* Collect first, then sort by name.  The framework keeps splitNames sorted
     * and Play Core depends on it: it locates a pack with
     * Arrays.binarySearch(splitNames, pack) and indexes splitSourceDirs with
     * whatever comes back, so the two arrays must agree index for index and be
     * in the order a binary search expects.  The launcher lists the splits in
     * install order, which is not that order. */
-   struct split_ent { const char *name; size_t nlen; const char *dir; size_t dlen; };
-   struct split_ent e[64];
+   struct split_ent { const char *name; size_t nlen; };
+   struct split_ent *e = calloc(n, sizeof *e);
+   if (!e) return 0;
    size_t i = 0;
-   for (const char *p = splits; *p && i < n && i < 64; ) {
-      const char *bar = strchr(p, '|');
+   for (const char *p = splits; *p && i < n; ) {
       const char *end = strchr(p, ';');
       if (!end) end = p + strlen(p);
-      if (bar && bar < end) {
+      const char *bar = memchr(p, '|', (size_t)(end - p));
+      if (bar && bar != p) {
          e[i].name = p;       e[i].nlen = (size_t)(bar - p);
-         e[i].dir  = bar + 1; e[i].dlen = (size_t)(end - bar - 1);
          ++i;
       }
       p = (*end == ';') ? end + 1 : end;
    }
    n = i;
+   if (n > UINT32_MAX) { free(e); return 0; }
+   dvm_ref names = dvm_new_array(vm, 'L', "Ljava/lang/String;", (uint32_t)n);
+   dvm_ref dirs  = dvm_new_array(vm, 'L', "Ljava/lang/String;", (uint32_t)n);
+   dvm_ref *nslot = names ? dvm_array_data(vm, names) : NULL;
+   dvm_ref *dslot = dirs  ? dvm_array_data(vm, dirs)  : NULL;
+   if (!nslot || !dslot) { free(e); return 0; }
    for (size_t a = 1; a < n; ++a) {           /* insertion sort; n is tiny */
       for (size_t b = a; b > 0; --b) {
          size_t la = e[b - 1].nlen, lb = e[b].nlen, m = la < lb ? la : lb;
@@ -673,10 +782,22 @@ static size_t dvm_build_split_arrays(struct dvm *vm, dvm_ref *out_names,
          struct split_ent t = e[b - 1]; e[b - 1] = e[b]; e[b] = t;
       }
    }
+   /* PackageManager publishes device paths, not the launcher's staging
+    * files.  The filesystem bridge maps split_<name>.apk back to the staged
+    * APK when the guest opens it.  Exposing the host path here also lets an
+    * app derive a bogus native-library directory beside the XAPK container. */
+   const char *install_dir = lunaria_android_apk_dir();
    for (i = 0; i < n; ++i) {
+      char path[PATH_MAX];
+      int written = snprintf(path, sizeof path, "%s/split_%.*s.apk",
+                             install_dir, (int)e[i].nlen, e[i].name);
+      if (written < 0 || (size_t)written >= sizeof path) {
+         free(e); return 0;
+      }
       nslot[i] = dvm_new_string_n(vm, e[i].name, e[i].nlen);
-      dslot[i] = dvm_new_string_n(vm, e[i].dir,  e[i].dlen);
+      dslot[i] = dvm_new_string(vm, path);
    }
+   free(e);
    *out_names = names;
    *out_dirs  = dirs;
    return n;
@@ -765,7 +886,7 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
           * Running it inline was right while the VM had a single thread and
           * every caller already was the main one; with bytecode on host
           * threads it would run the UI work on the caller's thread instead. */
-         if (dvm_on_bytecode_thread()) {
+         if (!dvm_on_main_thread()) {
             (void)dvm__queue_runnable_at(vm, args[0].l, false, 0);
             return true;
          }
@@ -780,6 +901,11 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
        * missing Activity.runOnUiThread stub (note_missing). */
       return true;
    }
+   /* Broadcast receivers registered at run time are the VM's own objects,
+    * and delivery calls back into bytecode; the registry lives with them. */
+   if (dvm_runtime_context_broadcast(vm, method, sig, self, args, nargs, out))
+      return true;
+
    JNIEnv *env = current_env();
    if (!env) return false;
 
@@ -1070,7 +1196,7 @@ static dvm_ref hook_new_external(void *user, struct dvm *vm, const char *class_n
    if (!cls) return 0;
    jobject o = (*env)->AllocObject(env, cls);
    if (!o) return 0;
-   return wrapper_for(vm, class_name, (uint32_t)(uintptr_t)o);
+   return wrapper_for(vm, env, class_name, (uint32_t)(uintptr_t)o);
 }
 
 static bool hook_get_external_static(void *user, struct dvm *vm, const char *class_name,
@@ -1136,6 +1262,13 @@ static bool hook_call_native(void *user, struct dvm *vm, const char *class_name,
    jobject jself = self ? to_jobject(vm, current_env(), self) : NULL;
    if (!g_guest_native(class_name, method, sig, is_static, jself, jargs, nargs, &ret))
       return false;
+   /* The native may have written into a direct buffer's guest region; the
+    * bytes have to be back in the VM's array before bytecode reads them
+    * again (UnityWebRequest's upload loop reads array() on the next line). */
+   for (int i = 0; i < nargs && i < 64; ++i)
+      if (args[i].l && dvm_buffer_is_direct(vm, args[i].l))
+         dvm_direct_buffer_from_host(vm, args[i].l);
+
 
    ++g_native_calls;
    memset(out, 0, sizeof *out);
@@ -1322,7 +1455,14 @@ bool dvm_jni_invoke_locked(JNIEnv *env, const char *class_name, const char *meth
    if (!vm || !class_name || !method) return false;
 
    struct dvm_method *m = find(vm, class_name, method, sig);
-   if (!m || !(m->has_code || m->builtin)) {
+   /* A `native` method the dex declares is still the dex's method: a JNI call
+    * to it initialises its class first (JNI spec, Call<Type>Method* and
+    * GetStaticMethodID) and then runs whatever RegisterNatives or the
+    * Java_… symbol bound.  dvm_call() does both.  Handing it to the stub layer
+    * skipped <clinit> — a class whose initialiser is
+    * `System.loadLibrary(...)` then never loaded its library, and the native
+    * never ran. */
+   if (!m || !(m->has_code || m->builtin || (m->access & DEX_ACC_NATIVE))) {
       /* Not in any dex: the caller falls back to its stub.  Worth seeing when
        * a title is not behaving, because it says exactly which Java the
        * emulator is *not* running. */
@@ -1370,11 +1510,40 @@ bool dvm_jni_invoke_locked(JNIEnv *env, const char *class_name, const char *meth
       }
    }
 
+   /* What a reflective helper was actually handed.  The signature string it
+    * parses comes from native code across the stub layer's handle table, and
+    * a wrong one there produces a failure inside the helper's own parser —
+    * far from the call that supplied it. */
+   if (getenv("LUNARIA_TRACE_CLASS_FLOW") &&
+       strstr(class_name, "ReflectionHelper")) {
+      fprintf(stderr, "[classflow] -> %s.%s%s", class_name, method, msig ? msig : "");
+      for (int i = 0; i < nargs; ++i) {
+         char one[256];
+         if (!dvm__sig_param(msig, i, one, sizeof one)) break;
+         if (!strcmp(one, "Ljava/lang/String;"))
+            fprintf(stderr, " arg%d=\"%s\"", i,
+                    args[i].l ? (dvm_string_utf8(vm, args[i].l) ?: "?") : "(null)");
+         else if (!strcmp(one, "Ljava/lang/Class;")) {
+            jvalue jv = jargs ? jargs[i] : (jvalue){ 0 };
+            const char *described = jv.l
+               ? jvm_described_class_name(jnienv_get_jvm(env), jv.l) : NULL;
+            struct dvm_object *co = args[i].l ? dvm__obj(vm, args[i].l) : NULL;
+            fprintf(stderr, " arg%d=class(%s of %s, host=%s)", i,
+                    co && co->klass && co->klass->name
+                       ? co->klass->name : "(no klass)",
+                    co && co->cls && co->cls->name ? co->cls->name : "?",
+                    described ? described : "(not a host class)");
+         } else
+            fprintf(stderr, " arg%d=%llx", i, (unsigned long long)args[i].j);
+      }
+      fprintf(stderr, "\n");
+   }
+
    dvm_ref dself = 0;
    if (!is_static && self) {
       /* The receiver is a stub-layer handle.  Give the VM a wrapper carrying
        * that handle so a call back out lands on the same object. */
-      dself = wrapper_for(vm, class_name, (uint32_t)(uintptr_t)self);
+      dself = wrapper_for(vm, env, class_name, (uint32_t)(uintptr_t)self);
    } else if (!is_static) {
       dself = dvm_new_object(vm, dvm_find_class(vm, class_name));
    }

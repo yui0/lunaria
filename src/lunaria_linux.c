@@ -365,6 +365,45 @@ void *luna_os_native_window(void *glfw_window)
    return (void *)(uintptr_t)glfwGetX11Window((GLFWwindow *)glfw_window);
 }
 
+/* An unmapped X11 window with the visible window's visual.  Xlib is reached
+ * through the library GLFW already loaded, so the binary gains no link-time
+ * dependency on it.  Wayland has no unmapped-window equivalent here. */
+void *luna_os_offscreen_window(void *glfw_window, int w, int h)
+{
+   if (!glfw_window || w <= 0 || h <= 0 || luna_wayland_backend()) return NULL;
+   Display *dpy = glfwGetX11Display();
+   Window parent = glfwGetX11Window((GLFWwindow *)glfw_window);
+   if (!dpy || !parent) return NULL;
+   void *x11 = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
+   if (!x11) return NULL;
+   Status (*get_attrs)(Display *, Window, XWindowAttributes *);
+   Colormap (*create_cmap)(Display *, Window, Visual *, int);
+   Window (*create_win)(Display *, Window, int, int, unsigned, unsigned,
+                        unsigned, int, unsigned, Visual *, unsigned long,
+                        XSetWindowAttributes *);
+   int (*flush)(Display *);
+   void *sym = dlsym(x11, "XGetWindowAttributes");
+   memcpy(&get_attrs, &sym, sizeof get_attrs);
+   sym = dlsym(x11, "XCreateColormap");
+   memcpy(&create_cmap, &sym, sizeof create_cmap);
+   sym = dlsym(x11, "XCreateWindow");
+   memcpy(&create_win, &sym, sizeof create_win);
+   sym = dlsym(x11, "XFlush");
+   memcpy(&flush, &sym, sizeof flush);
+   if (!get_attrs || !create_cmap || !create_win || !flush) return NULL;
+   XWindowAttributes wa;
+   if (!get_attrs(dpy, parent, &wa)) return NULL;
+   XSetWindowAttributes sa;
+   memset(&sa, 0, sizeof sa);
+   sa.colormap = create_cmap(dpy, wa.root, wa.visual, AllocNone);
+   /* A child of the root, never mapped: it has back buffers of its own and
+    * is never part of what the X server shows. */
+   Window win = create_win(dpy, wa.root, 0, 0, (unsigned)w, (unsigned)h, 0,
+                           wa.depth, InputOutput, wa.visual, CWColormap, &sa);
+   flush(dpy);
+   return (void *)(uintptr_t)win;
+}
+
 /* ---- audio out ----------------------------------------------------------
  *
  * ALSA, through the header-only helper in src/alsa.h.  The device is opened
@@ -394,6 +433,13 @@ static _Atomic unsigned  g_audio_tail;  /* consumer reads here */
 static _Atomic uint64_t  g_audio_played; /* source frames actually consumed */
 static _Atomic int       g_audio_stop;
 static pthread_t         g_audio_thread;
+static _Atomic int       g_audio_gain_q15 = 32768;   /* 1.0 */
+static _Atomic int       g_audio_muted;
+/* A device switch asked for by the menu, carried out by the audio thread. */
+static pthread_mutex_t   g_audio_dev_lock = PTHREAD_MUTEX_INITIALIZER;
+static char              g_audio_dev_want[128];
+static _Atomic int       g_audio_dev_switch;
+static char              g_audio_dev_now[128] = "default";
 
 static unsigned luna_audio_used(void)
 {
@@ -409,7 +455,7 @@ static void *luna_audio_thread(void *arg)
    /* Hand the card whole periods.  Writing whatever happens to be in the ring
     * makes snd_pcm_writei return short and the stream stutter; waiting for a
     * period's worth is what keeps it continuous. */
-   const unsigned period = (unsigned)g_audio.frames ? (unsigned)g_audio.frames : 256u;
+   unsigned period = (unsigned)g_audio.frames ? (unsigned)g_audio.frames : 256u;
    int16_t *chunk = (int16_t *)malloc((size_t)period * g_audio_ch * sizeof *chunk);
    if (!chunk) return NULL;
    unsigned long starved_periods = 0, starved_frames = 0;
@@ -444,6 +490,41 @@ static void *luna_audio_thread(void *arg)
                     starved_frames,
                     1000.0 * (double)starved_frames / (double)g_audio.freq);
       }
+      /* The menu's volume and mute, applied on the way to the card so the
+       * guest's own mix and its clock are untouched. */
+      const int gain = atomic_load_explicit(&g_audio_muted, memory_order_relaxed)
+         ? 0 : atomic_load_explicit(&g_audio_gain_q15, memory_order_relaxed);
+      if (gain != 32768) {
+         const size_t n = (size_t)period * g_audio_ch;
+         for (size_t i = 0; i < n; ++i)
+            chunk[i] = (int16_t)(((int32_t)chunk[i] * gain) >> 15);
+      }
+      if (atomic_exchange_explicit(&g_audio_dev_switch, 0, memory_order_acq_rel)) {
+         char want[128];
+         pthread_mutex_lock(&g_audio_dev_lock);
+         snprintf(want, sizeof want, "%s", g_audio_dev_want[0] ? g_audio_dev_want : "default");
+         pthread_mutex_unlock(&g_audio_dev_lock);
+         AUDIO next;
+         memset(&next, 0, sizeof next);
+         if (AUDIO_init(&next, want, g_audio.freq, (int)g_audio_ch, (int)g_audio.req_frames, 1,
+                        SND_PCM_FORMAT_S16_LE) == 0) {
+            AUDIO_close(&g_audio);
+            g_audio = next;
+            /* This period is already mixed; the next one is the new card's
+               size. */
+            const unsigned np = (unsigned)g_audio.frames ? (unsigned)g_audio.frames : 256u;
+            if (np > period) {
+               int16_t *grown = (int16_t *)realloc(chunk, (size_t)np * g_audio_ch * sizeof *chunk);
+               if (grown) chunk = grown;
+            }
+            snprintf(g_audio_dev_now, sizeof g_audio_dev_now, "%s", want);
+            fprintf(stderr, "[audio] output switched to '%s'\n", want);
+         } else {
+            if (next.handle) AUDIO_close(&next);
+            fprintf(stderr, "[audio] cannot switch output to '%s'; keeping '%s'\n",
+                    want, g_audio_dev_now);
+         }
+      }
       const int wrote = AUDIO_play(&g_audio, (char *)chunk, (int)period);
       /* Frames the card accepted, silence padding included.  This is the
        * device's playback position, and it is what g_audio_played has to
@@ -465,6 +546,7 @@ static void *luna_audio_thread(void *arg)
        * current position), so the time lost to silence is simply lost. */
       unsigned taken = 0u;
       if (wrote >= 0) taken = (unsigned)wrote < period ? (unsigned)wrote : period;
+      const unsigned next_period = (unsigned)g_audio.frames ? (unsigned)g_audio.frames : 256u;
       /* Give back only what the card took.  A short write leaves the tail of
        * the chunk unplayed, and advancing the ring past it would drop those
        * frames on the floor — a gap in the middle of the sound rather than at
@@ -475,6 +557,7 @@ static void *luna_audio_thread(void *arg)
                                (t + consumed) % LUNA_AUDIO_RING_FRAMES,
                                memory_order_release);
       atomic_fetch_add_explicit(&g_audio_played, taken, memory_order_release);
+      period = next_period;
    }
    free(chunk);
    return NULL;
@@ -530,10 +613,83 @@ int luna_os_audio_open(unsigned rate, unsigned channels)
       AUDIO_close(&g_audio);
       return -1;
    }
+   snprintf(g_audio_dev_now, sizeof g_audio_dev_now, "%s", devbuf);
    fprintf(stderr, "[audio] ALSA '%s' %u Hz %u ch, %lu-frame periods\n",
            devbuf, g_audio.freq, channels, (unsigned long)g_audio.frames);
    return 0;
 }
+
+void luna_os_audio_set_volume(float gain)
+{
+   if (gain < 0.0f) gain = 0.0f;
+   if (gain > 1.0f) gain = 1.0f;
+   atomic_store_explicit(&g_audio_gain_q15, (int)(gain * 32768.0f + 0.5f), memory_order_relaxed);
+}
+
+float luna_os_audio_volume(void)
+{
+   return (float)atomic_load_explicit(&g_audio_gain_q15, memory_order_relaxed) / 32768.0f;
+}
+
+void luna_os_audio_set_muted(int muted)
+{
+   atomic_store_explicit(&g_audio_muted, muted ? 1 : 0, memory_order_relaxed);
+}
+
+int luna_os_audio_muted(void)
+{
+   return atomic_load_explicit(&g_audio_muted, memory_order_relaxed);
+}
+
+/* ALSA's playback PCMs, as the system configuration names them: default,
+ * the sound servers, and each card's sysdefault / HDMI outputs.  The
+ * per-channel-layout aliases (front, surround51, iec958…) are the same cards
+ * again and are left out. */
+int luna_os_audio_devices(char (*names)[128], char (*descs)[128], int max)
+{
+   void **hints = NULL;
+   int n = 0;
+   if (snd_device_name_hint(-1, "pcm", &hints) < 0 || !hints) return 0;
+   for (void **h = hints; *h && n < max; ++h) {
+      char *name = snd_device_name_get_hint(*h, "NAME");
+      char *desc = snd_device_name_get_hint(*h, "DESC");
+      char *io = snd_device_name_get_hint(*h, "IOID");
+      const int playback = !io || strcmp(io, "Output") == 0;
+      const int wanted = name && playback &&
+         (!strcmp(name, "default") || !strcmp(name, "pipewire") || !strcmp(name, "pulse") ||
+          !strcmp(name, "jack") || !strncmp(name, "sysdefault:", 11) || !strncmp(name, "hdmi:", 5) ||
+          !strncmp(name, "hw:", 3));
+      if (wanted) {
+         snprintf(names[n], 128, "%s", name);
+         /* The description's first line is the card, the second the port. */
+         char d[256];
+         snprintf(d, sizeof d, "%s", desc ? desc : name);
+         for (char *c = d; *c; ++c) if (*c == '\n') *c = ' ';
+         snprintf(descs[n], 128, "%s", d);
+         ++n;
+      }
+      free(name); free(desc); free(io);
+   }
+   snd_device_name_free_hint(hints);
+   return n;
+}
+
+int luna_os_audio_select_device(const char *name)
+{
+   pthread_mutex_lock(&g_audio_dev_lock);
+   snprintf(g_audio_dev_want, sizeof g_audio_dev_want, "%s", name && *name ? name : "default");
+   pthread_mutex_unlock(&g_audio_dev_lock);
+   /* Not open yet: the choice is where the stream will open. */
+   if (!g_audio_open) {
+      setenv("LUNARIA_ALSA_DEVICE", g_audio_dev_want, 1);
+      snprintf(g_audio_dev_now, sizeof g_audio_dev_now, "%s", g_audio_dev_want);
+      return 0;
+   }
+   atomic_store_explicit(&g_audio_dev_switch, 1, memory_order_release);
+   return 0;
+}
+
+const char *luna_os_audio_device(void) { return g_audio_dev_now; }
 
 int luna_os_audio_write(const void *pcm16, unsigned frames)
 {

@@ -16,8 +16,10 @@ RM = rm -f
 WARNINGS = -Wall -Wextra -Wpedantic -Wformat=2 -Wstrict-aliasing=3 -Wstrict-overflow=3 -Wstack-usage=4096000 \
 	-Wfloat-equal -Wcast-align -Wpointer-arith -Wchar-subscripts -Warray-bounds=2 -Wno-unused-parameter
 
-CFLAGS ?= -g -O2 $(WARNINGS)
+OPTFLAGS ?= -g -O2
+CFLAGS ?= $(OPTFLAGS) $(WARNINGS)
 CFLAGS += -std=c11
+LDFLAGS += $(OPT_LDFLAGS)
 CPPFLAGS ?= -D_FORTIFY_SOURCE=2
 CPPFLAGS += -Isrc -DANDROID_X86_LINKER # -DVERBOSE_FUNCTIONS
 # Optional host instrumentation for reproducing intermittent emulator memory
@@ -39,6 +41,11 @@ else ifneq (,$(findstring CYGWIN,$(LUNA_OS_NAME)))
 LUNA_OS_SRC = src/lunaria_windows.c
 else
 LUNA_OS_SRC = src/lunaria_linux.c
+endif
+ifneq (,$(filter src/lunaria_windows.c,$(LUNA_OS_SRC)))
+WEBVIEW_CDP_HOST_SRC = src/webview_cdp_host_windows.c
+else
+WEBVIEW_CDP_HOST_SRC = src/webview_cdp_host_posix.c
 endif
 # Intermediate objects and scratch space live outside the source tree.
 BUILD_DIR ?= /tmp/lunaria-build
@@ -340,9 +347,11 @@ runtime/libOpenSLES.so: src/trace.h
 	    src/lib/stub.c -DLUNARIA_STUB_OPENSLES -o $@
 
 DVM_SRC = src/dvm/dex.c src/dvm/dvm.c src/dvm/dvm_runtime.c src/dvm/dvm_jni.c \
-          src/dvm/dvm_net.c src/dvm/dvm_media.c src/dvm/regex.c
+          src/dvm/dvm_net.c src/dvm/dvm_media.c src/dvm/regex.c src/dvm/charset.c \
+          src/webview_cdp.c $(WEBVIEW_CDP_HOST_SRC)
 DVM_HDR = src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
-          src/dvm/dvm_net.h src/dvm/dvm_media.h src/dvm/regex.h
+          src/dvm/dvm_net.h src/dvm/dvm_media.h src/dvm/regex.h src/dvm/charset.h \
+          src/webview_cdp.h
 
 # The Dalvik bytecode emulator lives in libjvm.so: it is reached from jvm.c
 # (a JNI call with no host stub) and it calls back out through the same JNI
@@ -351,10 +360,10 @@ DVM_HDR = src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
 # layer inside the VM publishes the document, and the swap path in arm_exec
 # presents it.  Both sides then resolve to the same single instance of the
 # engine — two copies would each hold half of the state.
-runtime/libjvm.so: src/trace.h src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c src/jvm/jvm.h src/jvm/jni.h $(DVM_SRC) $(DVM_HDR) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o
+runtime/libjvm.so: src/trace.h src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c src/jvm/jvm.h src/jvm/jni.h $(DVM_SRC) $(DVM_HDR) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o
 	mkdir -p runtime
-	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE -Wno-pedantic $(LDFLAGS) $(HOST_SO_LDFLAGS) -shared \
-	    src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c $(DVM_SRC) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o \
+	$(CC) $(CFLAGS) $(SANITIZE) -fPIC $(CPPFLAGS) -D_GNU_SOURCE -Wno-pedantic $(LDFLAGS) $(HOST_SO_LDFLAGS) -shared \
+	    src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c $(DVM_SRC) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o \
 	    -lm $(HOST_CRYPTO_LIBS) $(HOST_ICU_LIBS) \
 	    $(HOST_GL_LIBS) $(HOST_Z_LIBS) -o $@
 
@@ -386,8 +395,8 @@ libpthread.so: runtime/libpthread.so
 
 # arm_exec.o: compiled with C++20 and dynarmic headers; linked into lunaria
 $(BUILD_DIR)/arm_exec.o: | $(BUILD_DIR)
-$(BUILD_DIR)/arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/arm.h src/lib/guest.c src/jvm/jvm.h src/binary128.h src/linker64.h src/trace.h $(DYNARMIC_LIB)
-	$(CXX) -std=c++20 -O2 -g -fPIC \
+$(BUILD_DIR)/arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/arm.h src/svc_ids.h src/lib/guest.c src/jvm/jvm.h src/binary128.h src/linker64.h src/trace.h $(DYNARMIC_LIB)
+	$(CXX) -std=c++20 $(OPTFLAGS) -fPIC \
 	    $(SANITIZE) \
 	    $(DYNARMIC_INCS) \
 	    $(CPPFLAGS) -D_GNU_SOURCE \
@@ -398,11 +407,11 @@ $(BUILD_DIR)/arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/arm.h src/lib/guest
 # AArch64 long double is binary128 on every host (see the file's header).
 $(BUILD_DIR)/binary128.o: | $(BUILD_DIR)
 $(BUILD_DIR)/binary128.o: src/binary128.c src/binary128.h
-	$(CC) -std=c11 -O2 -g -fPIC $(CPPFLAGS) -c src/binary128.c -o $@
+	$(CC) -std=c11 $(OPTFLAGS) -fPIC $(CPPFLAGS) -c src/binary128.c -o $@
 
 $(BUILD_DIR)/linker64.o: | $(BUILD_DIR)
 $(BUILD_DIR)/linker64.o: src/linker64.c src/linker64.h
-	$(CC) -std=c11 -O2 -g -fPIC $(CPPFLAGS) -D_GNU_SOURCE -c src/linker64.c -o $@
+	$(CC) -std=c11 $(OPTFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE -c src/linker64.c -o $@
 
 # arm.o: code common to the ARM32 and ARM64 execution paths, C11.  Currently
 # the ARM execution lock; anything else neither path owns alone belongs here
@@ -418,9 +427,16 @@ $(BUILD_DIR)/arm.o: src/arm.c src/arm.h
 # are not this build's to fix (upstream, unmodified).
 $(BUILD_DIR)/stb_vorbis.o: | $(BUILD_DIR)
 $(BUILD_DIR)/stb_vorbis.o: src/lib/stb_vorbis.c
-	$(CC) -std=c11 -O2 -g -fPIC $(CPPFLAGS) -D_GNU_SOURCE \
+	$(CC) -std=c11 $(OPTFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE \
 	    -Wno-unused-function -Wno-unused-variable -Wno-sign-compare \
 	    -c src/lib/stb_vorbis.c -o $@
+
+# The Vulkan bridge (luna_vulkan.c): the host's libvulkan is opened at run
+# time, so nothing links against it.  The command table is generated from
+# vk.xml by scripts/gen_vk_commands.py.
+$(BUILD_DIR)/luna_vulkan.o: | $(BUILD_DIR)
+$(BUILD_DIR)/luna_vulkan.o: src/luna_vulkan.c src/luna_vulkan_cmds.h src/arm_exec.h src/luna_compositor.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -c src/luna_vulkan.c -o $@
 
 # loader.o: compiled as C11 (arm_exec.h is C-compatible)
 $(BUILD_DIR)/loader.o: | $(BUILD_DIR)
@@ -432,8 +448,8 @@ $(BUILD_DIR)/loader.o: src/loader.c src/arm_exec.h src/arm.h
 # library from another tree, and its diagnostics are not this build's to fix.
 LUNA_UI_DIR ?= ../luna-ui
 $(BUILD_DIR)/luna_overlay.o: | $(BUILD_DIR)
-$(BUILD_DIR)/luna_overlay.o: src/luna_overlay.c src/luna_overlay.h src/luna_ime.h $(LUNA_UI_DIR)/luna-ui.h
-	$(CC) -std=c11 -O2 -g -fPIC $(CPPFLAGS) -I$(LUNA_UI_DIR) -D_GNU_SOURCE \
+$(BUILD_DIR)/luna_overlay.o: src/luna_overlay.c src/luna_overlay.h src/luna_ime.h src/lunaria_os.h src/arm_exec.h src/dvm/dvm.h $(LUNA_UI_DIR)/luna-ui.h
+	$(CC) -std=c11 $(OPTFLAGS) -fPIC $(CPPFLAGS) -I$(LUNA_UI_DIR) -D_GNU_SOURCE \
 	    -Wno-unused-function -Wno-unused-variable -Wno-sign-compare \
 	    -c src/luna_overlay.c -o $@
 
@@ -442,13 +458,20 @@ $(BUILD_DIR)/luna_overlay.o: src/luna_overlay.c src/luna_overlay.h src/luna_ime.
 # libjvm.so, so the engine is linked once.
 $(BUILD_DIR)/luna_ime.o: | $(BUILD_DIR)
 $(BUILD_DIR)/luna_ime.o: src/luna_ime.c src/luna_ime.h src/luna_overlay.h $(LUNA_UI_DIR)/luna-ui.h
-	$(CC) -std=c11 -O2 -g -fPIC $(CPPFLAGS) -I$(LUNA_UI_DIR) -D_GNU_SOURCE \
+	$(CC) -std=c11 $(OPTFLAGS) -fPIC $(CPPFLAGS) -I$(LUNA_UI_DIR) -D_GNU_SOURCE \
 	    -Wno-unused-function -Wno-unused-variable -Wno-sign-compare \
 	    -c src/luna_ime.c -o $@
 
+# The window's compositor (luna_compositor.h): in libjvm.so beside the
+# overlay it draws, so both sides reach one instance of it.
+$(BUILD_DIR)/luna_compositor.o: | $(BUILD_DIR)
+$(BUILD_DIR)/luna_compositor.o: src/luna_compositor.c src/luna_compositor.h src/luna_overlay.h src/luna_boot.h src/luna_ime.h
+	$(CC) -std=c11 $(OPTFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE -Wall -Wextra \
+	    -c src/luna_compositor.c -o $@
+
 $(BUILD_DIR)/luna_boot.o: | $(BUILD_DIR)
 $(BUILD_DIR)/luna_boot.o: src/luna_boot.c src/luna_boot.h src/luna_overlay.h $(LUNA_UI_DIR)/luna-ui.h
-	$(CC) -std=c11 -O2 -g -fPIC $(CPPFLAGS) -I$(LUNA_UI_DIR) -D_GNU_SOURCE \
+	$(CC) -std=c11 $(OPTFLAGS) -fPIC $(CPPFLAGS) -I$(LUNA_UI_DIR) -D_GNU_SOURCE \
 	    -Wno-unused-function -Wno-unused-variable -Wno-sign-compare \
 	    -c src/luna_boot.c -o $@
 
@@ -458,17 +481,17 @@ $(BUILD_DIR)/lunaria_os.o: $(LUNA_OS_SRC) src/lunaria_os.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 	    -c $(LUNA_OS_SRC) -o $@
 
-lunaria: $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(LUNA_OS_OBJ) libdl.so libpthread.so \
+lunaria: $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/luna_vulkan.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(LUNA_OS_OBJ) libdl.so libpthread.so \
        runtime/libpthread.so $(HOST_BIONIC_LIBC) \
        runtime/libandroid.so runtime/liblog.so \
        runtime/libEGL.so runtime/libOpenSLES.so \
        runtime/libjvm.so runtime/libm.so runtime/libz.so \
        runtime/libmediandk.so runtime/libGLESv3.so
 lunaria: runtime/libvulkan.so
-	$(CXX) -std=c++20 -O2 -g $(HOST_EXPORT) \
+	$(CXX) -std=c++20 $(OPTFLAGS) $(HOST_EXPORT) \
 	    $(SANITIZE) \
 	    $(LUNARIA_LIBDIRS) $(HOST_RPATH) $(LDFLAGS) \
-	    $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(LUNA_OS_OBJ) \
+	    $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/luna_vulkan.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(LUNA_OS_OBJ) \
 	    $(DYNARMIC_LIBS) \
 	    $(HOST_DL_LIBS) -lpthread -ljvm \
 	    $(HOST_WINDOW_LIBS) $(HOST_GL_LIBS) $(HOST_Z_LIBS) $(HOST_CRYPTO_LIBS) \
@@ -485,11 +508,19 @@ install: install-bin install-lib
 $(BUILD_DIR):
 	mkdir -p $@
 
+# The self-contained WebView engine (LUNARIA_WEB_ENGINE=luna).  An
+# independent project: it builds and runs on its own, see luna-browser/README.
+luna-browser:
+	$(MAKE) -C luna-browser LUNA_UI=$(abspath $(LUNA_UI_DIR))
+
+luna-browser-test: luna-browser test/test_webview_cdp_host
+	./test/test_webview_cdp_host luna-browser/luna-browser $${TMPDIR:-/tmp}/lunaria-luna-browser-test
+
 clean:
 	$(RM) $(bins) $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/lunaria_os.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o \
 	    $(BUILD_DIR)/stb_vorbis.o libdl.so libpthread.so
 	$(RM) -r runtime
-	$(RM) test/test_dynarmic_arm test/test_unity test/test_dvm test/dvm_test.dex test/test_regex
+	$(RM) test/test_dynarmic_arm test/test_unity test/test_dvm test/dvm_test.dex test/test_regex test/test_http_chunked test/test_charset test/test_vulkan_bridge
 	$(RM) test/test_boot_card
 	$(RM) test/libabitest64.so test/libabitest32.so test/abi_test_values.h
 	$(RM) test/abi_pkg/classes.dex
@@ -511,9 +542,10 @@ test/dvm_test.dex: test/make_dex.py
 DVM_TEST_SAN ?= -fsanitize=address,undefined
 test/test_dvm: test/dvm_test.c $(DVM_SRC) $(DVM_HDR) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o
 	$(CC) -std=c11 -g -O1 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -Isrc \
+	    $(CPPFLAGS) \
 	    $(DVM_TEST_SAN) \
 	    test/dvm_test.c $(DVM_SRC:src/dvm/dvm_jni.c=) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o \
-	    -lm $(HOST_CRYPTO_LIBS) $(HOST_Z_LIBS) $(HOST_SYSTEM_DL_LIBS) $(HOST_GL_LIBS) -o $@
+	    -lm $(HOST_CRYPTO_LIBS) $(HOST_ICU_LIBS) $(HOST_Z_LIBS) $(HOST_SYSTEM_DL_LIBS) $(HOST_GL_LIBS) -o $@
 
 # Pass a real classes.dex as DVM_DEX to also run every method in it.
 DVM_DEX ?=
@@ -534,6 +566,23 @@ boot-card-test: test/test_boot_card
 test/test_regex: test/regex_test.c src/dvm/regex.c src/dvm/regex.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc/dvm -o $@ test/regex_test.c src/dvm/regex.c -lpthread
 
+# The Vulkan bridge driven the way a guest drives it, through its host-call
+# handlers (needs a host Vulkan driver; lavapipe is enough).  Exit 77 = skip.
+test/test_vulkan_bridge: test/vulkan_bridge_test.c src/luna_vulkan.c src/luna_vulkan_cmds.h src/arm_exec.h
+	$(CC) -std=c11 $(OPTFLAGS) -D_GNU_SOURCE -Isrc -o $@ test/vulkan_bridge_test.c src/luna_vulkan.c -ldl -lpthread
+
+vulkan-test: test/test_vulkan_bridge
+	./test/test_vulkan_bridge
+
+test/test_charset: test/charset_test.c src/dvm/charset.c src/dvm/charset.h
+	$(CC) -std=c11 -g -Wall -Wextra -D_GNU_SOURCE -Isrc $(CPPFLAGS) -o $@ \
+	    test/charset_test.c src/dvm/charset.c $(HOST_ICU_LIBS)
+
+# java.nio.charset on its own: decoding and encoding with a device's
+# replacement rules, and the streaming decoder InputStreamReader uses.
+charset-test: test/test_charset
+	./test/test_charset
+
 # The java.util.regex engine on its own: it depends on nothing from the VM, so
 # its behaviour can be checked without booting one.
 regex-test: test/test_regex
@@ -541,6 +590,14 @@ regex-test: test/test_regex
 
 dvm-test: test/test_dvm test/dvm_test.dex
 	./test/test_dvm test/dvm_test.dex $(DVM_DEX)
+
+test/test_http_chunked: test/http_chunked_test.c src/dvm/dvm_net.c src/dvm/dvm_net.h
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -D_GNU_SOURCE -Isrc \
+	    test/http_chunked_test.c src/dvm/dvm_net.c \
+	    $(HOST_CRYPTO_LIBS) -lpthread -o $@
+
+http-chunked-test: test/test_http_chunked
+	./test/test_http_chunked
 
 # Guest-side socket exercise: an AArch64 .so with no libc, talking to a local
 # HTTP server through the emulator's socket SVCs (see test/net_test.c).
@@ -683,9 +740,17 @@ test/libguestmem.so: test/guestmem_test.c
 	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
 	    -Wl,-soname,libguestmem.so -o $@ $<
 
+test/libmmaptest.so: test/mmap_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
+	    -Wl,-soname,libmmaptest.so -o $@ $<
+
 test/libheaptest.so: test/heap_test.c
 	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
 	    -Wl,-soname,libheaptest.so -o $@ $<
+
+test/libicachesync.so: test/icache_sync_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
+	    -Wl,-soname,libicachesync.so -o $@ $<
 
 test/libmutexstress.so: test/mutex_stress_test.c
 	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
@@ -807,6 +872,15 @@ guestmem-test: lunaria test/libguestmem.so
 	rc=0; grep -q 'RESULT PASS' .guestmem.out || rc=1; \
 	rm -f .guestmem.out; exit $$rc
 
+mmap-test: lunaria test/libmmaptest.so
+	@timeout -k 2s 120s env LUNARIA_A64_ENGINES=1 LUNARIA_A64_SEGV=1 \
+	    LD_LIBRARY_PATH="$(CURDIR):$(CURDIR)/runtime" \
+	    ./lunaria test/libmmaptest.so > .mmaptest.out 2>&1; \
+	grep 'mmaptest' .mmaptest.out || \
+	    printf 'no verdict: the guest never reached the report\n'; \
+	rc=0; grep -q 'RESULT PASS' .mmaptest.out || rc=1; \
+	rm -f .mmaptest.out; exit $$rc
+
 heap-test: lunaria test/libheaptest.so
 	@rc=0; for n in 1 4; do \
 	    printf '=== %s engine(s)\n' "$$n"; \
@@ -818,6 +892,19 @@ heap-test: lunaria test/libheaptest.so
 	    grep -q 'RESULT PASS' .heaptest.out || rc=1; \
 	    rm -f .heaptest.out; \
 	done; exit $$rc
+
+# A guest mprotect(PROT_EXEC) is an instruction-cache synchronization point.
+# Run only with four engines: this specifically checks that an engine already
+# inside Run() is halted before it can execute a translation another engine
+# has invalidated.
+icache-sync-test: lunaria test/libicachesync.so
+	@timeout -k 2s 30s env LUNARIA_A64_ENGINES=4 \
+	    LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" \
+	    ./lunaria test/libicachesync.so > .icachesync.out 2>&1; \
+	grep 'icachesync' .icachesync.out || \
+	    printf 'no verdict: the guest never reached the report\n'; \
+	rc=0; grep -q 'RESULT PASS' .icachesync.out || rc=1; \
+	rm -f .icachesync.out; exit $$rc
 
 mutex-test: lunaria test/libmutexstress.so
 	@rc=0; for n in 1 4; do \
@@ -880,7 +967,7 @@ test/libunity.so: $(LIBUNITY_APK)
 
 # Build dynarmic A32 JIT library (Release, A32 frontend only)
 DYNARMIC_DIR     = dynarmic
-DYNARMIC_BUILD   = $(DYNARMIC_DIR)/build
+DYNARMIC_BUILD  ?= $(DYNARMIC_DIR)/build
 DYNARMIC_LIB     = $(DYNARMIC_BUILD)/src/dynarmic/libdynarmic.a
 DYNARMIC_FMT_LIB = $(DYNARMIC_BUILD)/externals/fmt/libfmt.a
 DYNARMIC_MCL_LIB = $(DYNARMIC_BUILD)/externals/mcl/src/libmcl.a
@@ -922,6 +1009,7 @@ $(DYNARMIC_LIB): $(DYNARMIC_SOURCES) $(DYNARMIC_DIR)/CMakeLists.txt
 	    -DDYNARMIC_WARNINGS_AS_ERRORS=OFF \
 	    -DDYNARMIC_TESTS=OFF \
 	    -DCMAKE_BUILD_TYPE=Release \
+	    -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=$(DYNARMIC_IPO) \
 	    $(DYNARMIC_CMAKE_FLAGS) \
 	    -DDYNARMIC_FRONTENDS="A32;A64" \
 	    -DCMAKE_POLICY_VERSION_MINIMUM=3.5
@@ -942,6 +1030,28 @@ test/test_dynarmic_arm: test/test_dynarmic_arm.cpp $(DYNARMIC_LIB)
 	    $(DYNARMIC_LIBS) \
 	    -lpthread -o $@
 
+test/test_fp_muladd32: test/test_fp_muladd32.cpp $(DYNARMIC_LIB)
+	$(CXX) -std=c++20 -O2 -g \
+	    $(DYNARMIC_INCS) \
+	    test/test_fp_muladd32.cpp \
+	    $(DYNARMIC_LIB) $(DYNARMIC_MCL_LIB) $(DYNARMIC_FMT_LIB) \
+	    -lpthread -o $@
+
+fp-muladd32-test: test/test_fp_muladd32
+	./test/test_fp_muladd32
+
+test/test_webview_cdp: test/test_webview_cdp.c src/webview_cdp.c src/webview_cdp.h
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -Isrc \
+	    test/test_webview_cdp.c src/webview_cdp.c -o $@
+
+webview-cdp-test: test/test_webview_cdp
+	./test/test_webview_cdp
+
+test/test_webview_cdp_host: test/test_webview_cdp_host.c $(WEBVIEW_CDP_HOST_SRC) src/webview_cdp.c src/webview_cdp.h
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -Isrc \
+	    test/test_webview_cdp_host.c $(WEBVIEW_CDP_HOST_SRC) \
+	    src/webview_cdp.c -o $@
+
 test/test_binary128: test/binary128_test.cpp src/binary128.c src/binary128.h
 	$(CC) -std=c11 -O2 -g -Isrc -c src/binary128.c -o test/binary128_c.o
 	$(CXX) -std=c++20 -O2 -g -Isrc test/binary128_test.cpp test/binary128_c.o -o $@
@@ -955,12 +1065,6 @@ test/test_os_event: test/os_event_test.c $(BUILD_DIR)/lunaria_os.o src/lunaria_o
 
 os-event-test: test/test_os_event
 	./test/test_os_event
-
-test/test_opensl_format: test/opensl_format_test.c src/opensl_format.h
-	$(CC) -std=c11 -O2 -Wall -Wextra -Isrc $< -o $@
-
-opensl-format-test: test/test_opensl_format
-	./test/test_opensl_format
 
 # Relink when dynarmic itself is rebuilt: it is linked in statically, so a
 # fresh libdynarmic.a that nothing depends on leaves the old code in the
@@ -1025,10 +1129,88 @@ $(OPENH264_SO):
 # Aggregate: download all sample APKs used for development / regression.
 fetch: fetch-libunity fetch-btw fetch-blade-soul fetch-openh264
 
-.PHONY: all pixels-test dl-test jit-speed syslib guestlib syslib-clean host-all macos-deps x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
-	        clean install install-bin install-lib test net-test dvm-test regex-test abi-test \
+# --- packaging ------------------------------------------------------------
+#
+# A build in this tree finds its shim libraries, its fonts and its host
+# libraries because they happen to be where it was built.  `make dist` makes a
+# copy that does not depend on any of that: see scripts/make-dist.sh for what
+# travels with it and what deliberately does not.
+#
+# The version is whatever git says, so a tagged build names its tag and an
+# untagged one names the commit it came from -- a downloaded archive should be
+# able to say what it is.
+DIST_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+DIST_ARCH    ?= $(shell uname -m)
+ifeq ($(LUNA_OS_NAME),Darwin)
+DIST_OS      ?= macos
+else
+DIST_OS      ?= linux
+endif
+DIST_NAME     = lunaria-$(DIST_VERSION)-$(DIST_OS)-$(DIST_ARCH)
+DIST_STAGE    = $(BUILD_DIR)/dist/$(DIST_NAME)
+
+# Distribution builds favour execution speed and deliberately carry no debug
+# instrumentation.  They use their own object and Dynarmic directories so a
+# developer build cannot accidentally be reused merely because its timestamps
+# are newer.  Keep the CPU baseline portable; -march=native would make the
+# resulting archive fail on older machines of the same architecture.
+DIST_OPTFLAGS ?= -O3 -DNDEBUG -flto -fomit-frame-pointer
+DIST_LDFLAGS  ?= -flto -Wl,-O2 -Wl,--as-needed
+DIST_BUILD_DIR ?= /tmp/lunaria-dist-build
+DIST_DYNARMIC_BUILD ?= $(DIST_BUILD_DIR)/dynarmic
+
+dist-stage:
+	$(MAKE) -B dist-stage-build \
+	    BUILD_DIR="$(DIST_BUILD_DIR)" \
+	    DYNARMIC_BUILD="$(DIST_DYNARMIC_BUILD)" \
+	    DIST_STAGE="$(DIST_STAGE)" \
+	    OPTFLAGS="$(DIST_OPTFLAGS)" \
+	    OPT_LDFLAGS="$(DIST_LDFLAGS)" \
+	    DYNARMIC_IPO=ON
+
+dist-stage-build: lunaria $(libs)
+	sh scripts/make-dist.sh "$(DIST_STAGE)" "$(DIST_OS)" "$(DIST_ARCH)"
+
+# The archive, next to the sources, ready to upload.
+dist: dist-stage
+	cd "$(dir $(DIST_STAGE))" && tar czf "$(CURDIR)/$(DIST_NAME).tar.gz" "$(DIST_NAME)"
+	@echo "$(DIST_NAME).tar.gz"
+
+# macOS bundle.  A .app is a directory with a fixed shape; the emulator's own
+# entry point is the launcher script, so the bundle's executable is a stub
+# that runs it with the bundle's Resources as the working directory.
+MAC_APP = $(BUILD_DIR)/dist/Lunaria.app
+dist-mac: dist-stage
+	rm -rf "$(MAC_APP)"
+	mkdir -p "$(MAC_APP)/Contents/MacOS" "$(MAC_APP)/Contents/Resources"
+	cp -R "$(DIST_STAGE)/." "$(MAC_APP)/Contents/Resources/"
+	printf '%s\n' '#!/bin/sh' \
+	    'dir=$$(cd -- "$$(dirname -- "$$0")/../Resources" && pwd)' \
+	    'exec "$$dir/lunaria-apk.sh" "$$@"' \
+	    > "$(MAC_APP)/Contents/MacOS/Lunaria"
+	chmod +x "$(MAC_APP)/Contents/MacOS/Lunaria"
+	printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+	    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+	    '<plist version="1.0"><dict>' \
+	    '<key>CFBundleName</key><string>Lunaria</string>' \
+	    '<key>CFBundleIdentifier</key><string>net.berry-lab.lunaria</string>' \
+	    '<key>CFBundleExecutable</key><string>Lunaria</string>' \
+	    '<key>CFBundlePackageType</key><string>APPL</string>' \
+	    '<key>CFBundleShortVersionString</key><string>$(DIST_VERSION)</string>' \
+	    '<key>NSHighResolutionCapable</key><true/>' \
+	    '</dict></plist>' > "$(MAC_APP)/Contents/Info.plist"
+	hdiutil create -volname Lunaria -srcfolder "$(MAC_APP)" -ov -format UDZO \
+	    "$(CURDIR)/$(DIST_NAME).dmg"
+	@echo "$(DIST_NAME).dmg"
+
+dist-clean:
+	$(RM) -r "$(BUILD_DIR)/dist"
+	$(RM) lunaria-*.tar.gz lunaria-*.dmg
+
+.PHONY: luna-browser luna-browser-test vulkan-test dist dist-stage dist-stage-build dist-mac dist-clean all pixels-test dl-test jit-speed syslib guestlib syslib-clean host-all macos-deps x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
+	        clean install install-bin install-lib test net-test dvm-test http-chunked-test regex-test charset-test abi-test \
 	        posix-test boot-card-test binary128-test fd-callback-test \
-	        thread-start-test mutex-test heap-test guestmem-test lock-test \
+	        thread-start-test mutex-test heap-test icache-sync-test guestmem-test lock-test \
         gil-test \
         fetch fetch-libunity fetch-btw fetch-blade-soul fetch-openh264 \
         dynarmic-build
