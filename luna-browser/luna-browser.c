@@ -4,7 +4,7 @@
  *
  * Copyright © 2026 Yuichiro Nakada / Project Vespera — MPL 2.0
  *
- * One process is one page.  It is driven three ways:
+ * One process is one page.  It is driven three ways, plus the window:
  *
  *   luna-browser --remote-debugging-pipe [--user-data-dir=DIR] [URL]
  *       Headless, speaking the Chrome DevTools Protocol subset an embedder
@@ -14,8 +14,11 @@
  *       an embedder that drives Chrome drives this unchanged.
  *   luna-browser --screenshot[=FILE] [--window-size=W,H] URL
  *       Headless: load, let timers settle, write a PNG, exit.
- *   luna-browser [--window-size=W,H] URL          (built with LB_WINDOW=1)
- *       An interactive window through luna-ui's native host.
+ *   luna-browser [--window-size=W,H] [URL]        (built with GLFW)
+ *       A browser window: address bar, back/forward/reload.  The page runs
+ *       in a child in the first mode; this process draws the toolbar and
+ *       the frames the child streams (Page.startScreencast).
+ *       Keys: Ctrl+L / F6 address bar, Ctrl+R / F5 reload, Alt+Left/Right.
  *
  * The document *is* luna-ui's element tree: scripts mutate it through the
  * luna_dom_* API, so there is no second DOM to keep in sync and no reparse.
@@ -55,6 +58,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -763,13 +767,23 @@ static int conn_open(struct conn *c, const struct url *u, char **error)
    hints.ai_socktype = SOCK_STREAM;
    int rc = getaddrinfo(host, port, &hints, &res);
    if (rc != 0) { *error = lb_strdup(gai_strerror(rc)); return -1; }
+   int dead_family = AF_UNSPEC;         /* one timeout per family, not per address */
    for (struct addrinfo *a = res; a; a = a->ai_next) {
+      if (a->ai_family == dead_family) continue;
       c->fd = socket(a->ai_family, a->ai_socktype | SOCK_CLOEXEC, a->ai_protocol);
       if (c->fd < 0) continue;
-      struct timeval tv = { 30, 0 };
+      /* SO_SNDTIMEO also bounds connect(): an unreachable address (a dead
+       * IPv6 route, say) costs seconds, not the whole I/O timeout, before the
+       * next one is tried. */
+      struct timeval tv = { 30, 0 }, ctv = { 4, 0 };
       setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-      setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-      if (connect(c->fd, a->ai_addr, a->ai_addrlen) == 0) break;
+      setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &ctv, sizeof ctv);
+      if (connect(c->fd, a->ai_addr, a->ai_addrlen) == 0) {
+         setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+         break;
+      }
+      if (errno == EINPROGRESS || errno == EAGAIN || errno == ENETUNREACH || errno == EHOSTUNREACH)
+         dead_family = a->ai_family;
       close(c->fd);
       c->fd = -1;
    }
@@ -912,10 +926,33 @@ static const char *mime_of_path(const char *path)
    return "application/octet-stream";
 }
 
+static int lb_fetch_hops(const char *url, const char *method, const char *headers,
+                         const unsigned char *body, size_t body_len, struct response *r,
+                         char **frag);
+
 /* GET or any method; follows redirects.  Always fills r (r->error on
- * failure). */
+ * failure).  r->url keeps the fragment: the request's, or the one a
+ * redirect's Location gave (fragments never go on the wire). */
 static int lb_fetch(const char *url, const char *method, const char *headers,
                     const unsigned char *body, size_t body_len, struct response *r)
+{
+   const char *hash = strchr(url, '#');
+   char *frag = hash ? lb_strdup(hash) : NULL;
+   int rc = lb_fetch_hops(url, method, headers, body, body_len, r, &frag);
+   if (frag && r->url) {
+      struct buf b = { 0 };
+      buf_puts(&b, r->url);
+      buf_puts(&b, frag);
+      free(r->url);
+      r->url = buf_take(&b);
+   }
+   free(frag);
+   return rc;
+}
+
+static int lb_fetch_hops(const char *url, const char *method, const char *headers,
+                         const unsigned char *body, size_t body_len, struct response *r,
+                         char **frag)
 {
    memset(r, 0, sizeof *r);
    char *cur = lb_strdup(url);
@@ -995,6 +1032,8 @@ static int lb_fetch(const char *url, const char *method, const char *headers,
             free(loc);
             free(cur);
             cur = next;
+            char *h = strchr(cur, '#');
+            if (h) { free(*frag); *frag = lb_strdup(h); *h = '\0'; }
             if (r->status != 307 && r->status != 308) { method = "GET"; body = NULL; body_len = 0; }
             free(r->headers); free(r->body);
             r->headers = NULL; r->body = NULL; r->length = 0;
@@ -2601,7 +2640,7 @@ static int scan_scripts(const char *html, struct script_tag **out)
 
 /* The part of the HTML UA stylesheet luna-ui does not build in. */
 static const char lb_ua_css[] =
-   "html,head,script,style,template,[hidden]{display:none}"
+   "head,script,style,template,[hidden]{display:none}"
    "input,textarea,select{border:1px solid #767676;border-radius:2px;padding:1px 2px;"
    "background:#ffffff;color:#000000;font-size:13.33px}"
    "button{border:1px solid #767676;border-radius:3px;padding:1px 6px;background:#efefef;"
@@ -2885,16 +2924,15 @@ static void page_key(const char *key, int vk, int down, const char *text)
 
 /* Runs due timers and animation callbacks and any navigation the page asked
  * for.  Returns milliseconds until the next timer (-1: none). */
+static void cdp_navigate_now(const char *url);
+
 static double page_pump(void)
 {
-   if (g_page.nav_url) {
+   if (g_page.nav_url) {             /* the page's own navigation (a link, location) */
       char *u = g_page.nav_url;
       g_page.nav_url = NULL;
-      page_emit("Page.frameStartedLoading", NULL);
-      page_navigate(u);
+      cdp_navigate_now(u);
       free(u);
-      page_emit("Page.loadEventFired", NULL);
-      page_emit("Page.frameStoppedLoading", NULL);
    }
    http_drain();
    if (!g_page.ctx) return -1;
@@ -2939,8 +2977,19 @@ static void page_render(void)
 
 static void png_sink(void *ctx, void *data, int size) { buf_put(ctx, data, (size_t)size); }
 
-/* The current frame as PNG bytes (owned). */
-static unsigned char *page_capture(size_t *len)
+#define CAST_MS 33          /* ~30 frames a second while things move */
+#define CAST_CARET_MS 500   /* a focused field's caret alone */
+static struct { int on, acked, quality, seq; double last_ms; } g_cast;
+
+/* A screenshot/screencast "quality" (JPEG), 80 when not given. */
+static int cast_quality(const struct jv *params)
+{
+   double q = params ? jnum(params, "quality", 80) : 80;
+   return q < 1 ? 1 : q > 100 ? 100 : (int)q;
+}
+
+/* The current frame as PNG, or JPEG when quality > 0 (owned bytes). */
+static unsigned char *page_capture(size_t *len, int jpeg_quality)
 {
    *len = 0;
    page_render();
@@ -2957,7 +3006,8 @@ static unsigned char *page_capture(size_t *len)
    }
    free(rgba);
    struct buf b = { 0 };
-   stbi_write_png_to_func(png_sink, &b, w, h, 3, rgb, w * 3);
+   if (jpeg_quality > 0) stbi_write_jpg_to_func(png_sink, &b, w, h, 3, rgb, jpeg_quality);
+   else stbi_write_png_to_func(png_sink, &b, w, h, 3, rgb, w * 3);
    free(rgb);
    *len = b.len;
    return (unsigned char *)b.p;
@@ -3266,9 +3316,9 @@ static void cdp_handle(const char *text)
       buf_puts(&r, "}}");
       cdp_reply(id, in_session, r.p);
    } else if (!strcmp(method, "Page.captureScreenshot")) {
-      /* PNG whatever the format asked for: the engine has no JPEG encoder. */
+      const char *fmt = jstr(params, "format");
       size_t len = 0;
-      unsigned char *img = page_capture(&len);
+      unsigned char *img = page_capture(&len, fmt && !strcmp(fmt, "jpeg") ? cast_quality(params) : 0);
       if (!img) cdp_error(id, in_session, -32000, "Unable to capture screenshot");
       else {
          buf_puts(&r, "{\"data\":\"");
@@ -3277,6 +3327,19 @@ static void cdp_handle(const char *text)
          cdp_reply(id, in_session, r.p);
          free(img);
       }
+   } else if (!strcmp(method, "Page.startScreencast")) {
+      const char *fmt = jstr(params, "format");
+      g_cast.quality = fmt && !strcmp(fmt, "png") ? 0 : cast_quality(params);
+      g_cast.on = 1;
+      g_cast.acked = 1;
+      g_page.dirty = 1;               /* the first frame right away */
+      cdp_reply(id, in_session, "{}");
+   } else if (!strcmp(method, "Page.stopScreencast")) {
+      g_cast.on = 0;
+      cdp_reply(id, in_session, "{}");
+   } else if (!strcmp(method, "Page.screencastFrameAck")) {
+      g_cast.acked = 1;
+      cdp_reply(id, in_session, "{}");
    } else if (!strcmp(method, "Page.addScriptToEvaluateOnNewDocument")) {
       const char *src = jstr(params, "source");
       char **g = realloc(g_page.boot_scripts, sizeof *g * (size_t)(g_page.nboot + 1));
@@ -3442,6 +3505,40 @@ static int cdp_read(struct buf *rx)
    return 0;
 }
 
+/* Page.startScreencast: a frame goes out when the page has repainted and the
+ * previous one was acknowledged, at most every CAST_MS -- no polling, and
+ * nothing sent while the page is still. */
+
+/* Milliseconds until the next frame is due (-1: none pending). */
+static int cast_pump(void)
+{
+   if (!g_cast.on || !g_cast.acked) return -1;
+   double now = lb_now_ms();
+   double gap = CAST_MS;
+   if (!g_page.dirty) {
+      int m = luna_needs_redraw(now / 1000.0, 0.0);
+      if (!m) return -1;
+      if (!(m & (LUNA_REDRAW_LAYOUT | LUNA_REDRAW_ANIM))) gap = CAST_CARET_MS;
+   }
+   if (now - g_cast.last_ms < gap) return (int)ceil(gap - (now - g_cast.last_ms));
+   size_t len = 0;
+   unsigned char *img = page_capture(&len, g_cast.quality);
+   if (!img) return -1;
+   struct buf b = { 0 };
+   buf_puts(&b, "{\"data\":\"");
+   buf_base64(&b, img, len);
+   buf_printf(&b, "\",\"metadata\":{\"offsetTop\":0,\"pageScaleFactor\":%g,"
+              "\"deviceWidth\":%d,\"deviceHeight\":%d,\"scrollOffsetX\":0,"
+              "\"scrollOffsetY\":0,\"timestamp\":%.6f},\"sessionId\":%d}",
+              (double)g_page.scale, g_page.w, g_page.h, now / 1000.0, ++g_cast.seq);
+   cdp_emit("Page.screencastFrame", b.p);
+   free(b.p);
+   free(img);
+   g_cast.acked = 0;
+   g_cast.last_ms = now;
+   return -1;
+}
+
 static int cdp_loop(void)
 {
    g_page.emit = cdp_emit;
@@ -3455,6 +3552,8 @@ static int cdp_loop(void)
       if (cdp_read(&rx) < 0) return 0;
       double next = page_pump();
       int timeout = next < 0 ? 1000 : next > 1000 ? 1000 : (int)ceil(next);
+      int cast = cast_pump();
+      if (cast >= 0 && cast < timeout) timeout = cast;
       struct pollfd pfd[2] = { { g_cdp_in, POLLIN, 0 }, { g_wake[0], POLLIN, 0 } };
       int pr = poll(pfd, g_wake[0] >= 0 ? 2 : 1, timeout);
       if (pr < 0 && errno != EINTR) return 1;
@@ -3468,6 +3567,7 @@ static int cdp_loop(void)
 static void usage(void)
 {
    fputs("usage: luna-browser [options] [URL]\n"
+         "  (no mode)                 open a browser window (GLFW builds)\n"
          "  --remote-debugging-pipe   serve CDP on fds 3/4 (headless)\n"
          "  --screenshot[=FILE]       load URL, save a PNG (default screenshot.png), exit\n"
          "  --dump-dom                load URL, print the document, exit\n"
@@ -3529,62 +3629,445 @@ static char *arg_url(const char *a)
 }
 
 #ifdef LB_WINDOW
-static char *g_window_url;
+/* ======================================================================== *
+ * The browser window
+ *
+ * luna-ui keeps one document per process, so, as in Chrome, the window and
+ * the page are two processes: this one draws the toolbar with luna-ui and
+ * shows the frames a child `luna-browser --remote-debugging-pipe` pushes
+ * (Page.startScreencast), and hands it input over the same protocol.
+ * ======================================================================== */
 
-static void win_init(void *user)
+#define UI_BAR 44
+#define UI_FRAME "lb-frame"          /* the page picture, served from memory */
+
+static const char ui_html[] =
+   "<body><div id=\"bar\">"
+   "<button id=\"back\" title=\"Back\">\xe2\x80\xb9</button>"
+   "<button id=\"fwd\" title=\"Forward\">\xe2\x80\xba</button>"
+   "<button id=\"reload\" title=\"Reload\">\xe2\x86\xbb</button>"
+   "<input id=\"url\" type=\"text\" spellcheck=\"false\">"
+   "</div><div id=\"view\"></div><div id=\"status\"></div></body>";
+static const char ui_css[] =
+   "body{margin:0;background:#ffffff;font-family:sans-serif;}"
+   "#bar{position:fixed;left:0;top:0;right:0;height:44px;box-sizing:border-box;display:flex;"
+   "align-items:center;gap:4px;padding:0 8px;background:#f1f3f4;border-bottom:1px solid #dadce0;}"
+   "#bar button{width:32px;height:32px;border:0;border-radius:16px;background:transparent;"
+   "color:#3c4043;font-size:20px;padding:0;flex:0 0 auto;}"
+   "#bar button:hover{background:#e3e5e8;}"
+   "#bar button.off{color:#b8bbbf;}"
+   "#url{flex:1 1 auto;height:30px;box-sizing:border-box;border:1px solid #dadce0;border-radius:15px;"
+   "padding:0 14px;margin-left:4px;font-size:14px;background:#ffffff;color:#202124;}"
+   "#view{position:fixed;left:0;top:44px;right:0;bottom:0;background-size:100% 100%;"
+   "background-repeat:no-repeat;}"
+   "#status{position:fixed;left:0;bottom:0;padding:2px 8px;font-size:12px;color:#5f6368;"
+   "background:#f1f3f4;border-top-right-radius:4px;display:none;}"
+   "#status.on{display:block;}";
+
+static struct {
+   pid_t pid;
+   int to, from;                     /* the child's fds 3 and 4, from here */
+   struct buf rx;
+   unsigned next_id, title_id;
+   unsigned char *frame;             /* the newest picture (JPEG) */
+   size_t frame_len;
+   int shown;
+   char **hist;                      /* back/forward list and where we are */
+   int nhist, cur, going;            /* going: index a back/forward is loading */
+   int sent_w, sent_h;
+   float scale;
+   int pressed;                      /* a button went down over the page */
+   double mx, my;
+   char *start;
+} g_ui = { .pid = -1, .to = -1, .from = -1, .going = -1, .scale = 1.0f };
+
+static int ui_el(const char *id) { return luna_get_element_by_id(id); }
+
+/* A protocol command to the page's session (or the browser, session 0). */
+static unsigned ui_send(const char *method, const char *params, int session)
 {
-   (void)user;
-   g_luna_platform.read_resource = lb_read_resource;
-   luna_set_web_compat(1);
-   luna_set_mouse_press_hook(hook_press);
-   luna_set_mouse_release_hook(hook_release);
-   page_navigate(g_window_url);
-   luna_platform_set_title(luna_doc_title[0] ? luna_doc_title : g_window_url);
+   if (g_ui.to < 0) return 0;
+   unsigned id = ++g_ui.next_id;
+   struct buf b = { 0 };
+   buf_printf(&b, "{\"id\":%u,\"method\":\"%s\",\"params\":%s%s}", id, method,
+              params ? params : "{}", session ? ",\"sessionId\":\"" SESSION_ID "\"" : "");
+   buf_put(&b, "", 1);               /* the NUL that ends a message */
+   const char *p = b.p;
+   size_t n = b.len;
+   while (n > 0) {
+      ssize_t w = write(g_ui.to, p, n);
+      if (w < 0 && errno == EINTR) continue;
+      if (w <= 0) break;
+      p += w; n -= (size_t)w;
+   }
+   free(b.p);
+   return id;
 }
 
-static void win_frame(double dt, void *user)
+static unsigned char *ui_read_resource(const char *path, size_t *out_size)
 {
-   (void)dt; (void)user;
-   double x, y;
-   luna_get_pointer(&x, &y);
-   if (g_page.nev) flush_pointer_events(x, y, 0);
-   page_pump();
-   luna_app_request_redraw();
+   *out_size = 0;
+   if (!path || strcmp(path, UI_FRAME) || !g_ui.frame) return NULL;
+   unsigned char *copy = malloc(g_ui.frame_len);
+   if (!copy) return NULL;
+   memcpy(copy, g_ui.frame, g_ui.frame_len);
+   *out_size = g_ui.frame_len;
+   return copy;
 }
 
-static int win_key(int key, int scancode, int action, int mods, void *user)
+static void ui_status(const char *text)
 {
-   (void)scancode; (void)mods; (void)user;
-   if (action == LUNA_REPEAT) action = LUNA_PRESS;
-   const char *name = NULL;
-   for (int i = 0; g_keys[i].name; ++i) if (g_keys[i].key == key) name = g_keys[i].name;
-   if (!g_page.ctx) return 0;
-   JSValue a[3] = { JS_NewString(g_page.ctx, action == LUNA_PRESS ? "keydown" : "keyup"),
-                    JS_NewString(g_page.ctx, name ? name : ""), JS_NewInt32(g_page.ctx, key) };
-   JSValue r = js_hook("__lb_key", 3, a);
-   int prevented = JS_ToBool(g_page.ctx, r) > 0;
-   JS_FreeValue(g_page.ctx, r);
-   for (int i = 0; i < 3; ++i) JS_FreeValue(g_page.ctx, a[i]);
-   return prevented;
+   int i = ui_el("status");
+   if (i < 0) return;
+   luna_set_text(i, text ? text : "");
+   if (text && *text) luna_add_class(i, "on"); else luna_remove_class(i, "on");
 }
 
-static void win_render(int fbw, int fbh, void *user)
+static void ui_buttons(void)
 {
-   (void)user;
-   luna_render(fbw, fbh);
-   sync_focus_and_value();
+   int b = ui_el("back"), f = ui_el("fwd");
+   if (b >= 0) { if (g_ui.cur > 0) luna_remove_class(b, "off"); else luna_add_class(b, "off"); }
+   if (f >= 0) { if (g_ui.cur + 1 < g_ui.nhist) luna_remove_class(f, "off"); else luna_add_class(f, "off"); }
 }
 
-static void win_resize_check(void)
+/* What was typed: a URL, a file, or else a search. */
+static char *ui_typed_url(const char *t)
+{
+   while (*t == ' ') t++;
+   if (!*t) return NULL;
+   if (strstr(t, "://") || !strncmp(t, "about:", 6) || !strncmp(t, "data:", 5)) return lb_strdup(t);
+   if (t[0] == '/' || t[0] == '.' || t[0] == '~') return arg_url(t);
+   struct buf b = { 0 };
+   if (!strchr(t, ' ') && (strchr(t, '.') || !strncmp(t, "localhost", 9))) {
+      buf_puts(&b, "https://");
+      buf_puts(&b, t);
+   } else {
+      buf_puts(&b, "https://duckduckgo.com/html/?q=");
+      for (const unsigned char *p = (const unsigned char *)t; *p; ++p) {
+         if (isalnum(*p) || strchr("-_.~", *p)) buf_put(&b, (const char *)p, 1);
+         else buf_printf(&b, *p == ' ' ? "+" : "%%%02X", *p);
+      }
+   }
+   return buf_take(&b);
+}
+
+static void ui_navigate(const char *url)
+{
+   if (!url) return;
+   struct buf b = { 0 };
+   buf_puts(&b, "{\"url\":");
+   buf_json_str(&b, url);
+   buf_puts(&b, "}");
+   ui_send("Page.navigate", b.p, 1);
+   free(b.p);
+   ui_status("Loading\xe2\x80\xa6");
+}
+
+static void ui_go(int delta)
+{
+   int to = g_ui.cur + delta;
+   if (to < 0 || to >= g_ui.nhist) return;
+   g_ui.going = to;
+   ui_navigate(g_ui.hist[to]);
+}
+
+static void ui_on_back(LunaElement *e) { (void)e; ui_go(-1); }
+static void ui_on_fwd(LunaElement *e) { (void)e; ui_go(1); }
+static void ui_on_reload(LunaElement *e) { (void)e; ui_send("Page.reload", NULL, 1); ui_status("Loading\xe2\x80\xa6"); }
+
+/* A page committed: the address bar, the history, then its title. */
+static void ui_committed(const char *url)
+{
+   int u = ui_el("url");
+   if (u >= 0 && luna_focused_element() != u) luna_set_value(u, url);
+   if (g_ui.going >= 0) {
+      g_ui.cur = g_ui.going;
+      g_ui.going = -1;
+   } else if (!(g_ui.cur < g_ui.nhist && !strcmp(g_ui.hist[g_ui.cur], url))) {
+      for (int i = g_ui.cur + 1; i < g_ui.nhist; ++i) free(g_ui.hist[i]);
+      g_ui.nhist = g_ui.nhist ? g_ui.cur + 1 : 0;
+      char **h = realloc(g_ui.hist, sizeof *h * (size_t)(g_ui.nhist + 1));
+      if (h) { g_ui.hist = h; h[g_ui.nhist] = lb_strdup(url); g_ui.cur = g_ui.nhist++; }
+   }
+   ui_buttons();
+}
+
+static void ui_message(const char *text)
+{
+   struct jv *m = json_parse(text);
+   if (!m) return;
+   const char *method = jstr(m, "method");
+   const struct jv *params = jget(m, "params");
+   if (method && !strcmp(method, "Page.screencastFrame")) {
+      const char *data = jstr(params, "data");
+      size_t n = 0;
+      unsigned char *img = data ? base64_decode(data, strlen(data), &n) : NULL;
+      if (img) {
+         free(g_ui.frame);
+         g_ui.frame = img;
+         g_ui.frame_len = n;
+         luna_invalidate_texture(UI_FRAME);
+         if (!g_ui.shown && ui_el("view") >= 0) {
+            luna_set_background_image(ui_el("view"), UI_FRAME);
+            g_ui.shown = 1;
+         }
+         luna_app_request_redraw();
+      }
+      char ack[48];
+      snprintf(ack, sizeof ack, "{\"sessionId\":%d}", (int)jnum(params, "sessionId", 0));
+      ui_send("Page.screencastFrameAck", ack, 1);
+   } else if (method && !strcmp(method, "Page.frameNavigated")) {
+      const char *url = jstr(jget(params, "frame"), "url");
+      if (url) ui_committed(url);
+   } else if (method && !strcmp(method, "Page.loadEventFired")) {
+      ui_status(NULL);
+      g_ui.title_id = ui_send("Runtime.evaluate",
+                              "{\"expression\":\"document.title\",\"returnByValue\":true}", 1);
+   } else if (!method && g_ui.title_id && (unsigned)jnum(m, "id", 0) == g_ui.title_id) {
+      const char *t = jstr(jget(jget(m, "result"), "result"), "value");
+      int u = ui_el("url");
+      const char *url = u >= 0 ? luna_get_value(u) : "";
+      char title[512];
+      snprintf(title, sizeof title, "%s", t && *t ? t : url);
+      luna_platform_set_title(title);
+      g_ui.title_id = 0;
+   } else if (method && !strcmp(method, "Target.attachedToTarget")) {
+      ui_send("Page.enable", NULL, 1);
+      ui_send("Runtime.enable", NULL, 1);
+      ui_send("Page.startScreencast", "{\"format\":\"jpeg\",\"quality\":90}", 1);
+      if (g_ui.start) { ui_navigate(g_ui.start); free(g_ui.start); g_ui.start = NULL; }
+   }
+   jv_free(m);
+}
+
+static void ui_pump(void)
+{
+   if (g_ui.from < 0) return;
+   for (;;) {
+      char chunk[65536];
+      ssize_t n = read(g_ui.from, chunk, sizeof chunk);
+      if (n > 0) { buf_put(&g_ui.rx, chunk, (size_t)n); continue; }
+      if (n == 0) { close(g_ui.from); g_ui.from = -1; ui_status("The page process ended."); }
+      break;
+   }
+   size_t start = 0;
+   for (size_t i = 0; i < g_ui.rx.len; ++i) {
+      if (g_ui.rx.p[i]) continue;
+      ui_message(g_ui.rx.p + start);
+      start = i + 1;
+   }
+   if (start) {
+      memmove(g_ui.rx.p, g_ui.rx.p + start, g_ui.rx.len - start);
+      g_ui.rx.len -= start;
+   }
+}
+
+/* The page area's size in CSS pixels, and the device pixels behind them. */
+static void ui_viewport(void)
 {
    int x, y, w, h;
    luna_platform_get_window_rect(&x, &y, &w, &h);
-   if (w > 0 && h > 0) set_viewport(w, h, g_page.scale);
+   h -= UI_BAR;
+   if (w <= 0 || h <= 0 || (w == g_ui.sent_w && h == g_ui.sent_h)) return;
+   char p[160];
+   snprintf(p, sizeof p, "{\"width\":%d,\"height\":%d,\"deviceScaleFactor\":%g,\"mobile\":false}",
+            w, h, (double)g_ui.scale);
+   ui_send("Emulation.setDeviceMetricsOverride", p, 1);
+   g_ui.sent_w = w;
+   g_ui.sent_h = h;
+}
+
+static int ui_spawn(void)
+{
+   int in[2], out[2];
+   if (pipe(in) != 0 || pipe(out) != 0) return -1;
+   char size[64];
+   snprintf(size, sizeof size, "--window-size=%d,%d", g_page.w, g_page.h - UI_BAR);
+   char profile[1024] = "";
+   if (g_page.profile) snprintf(profile, sizeof profile, "--user-data-dir=%s", g_page.profile);
+   else if (getenv("HOME")) {
+      snprintf(profile, sizeof profile, "%s/.config", getenv("HOME"));
+      mkdir(profile, 0700);
+      snprintf(profile, sizeof profile, "--user-data-dir=%s/.config/luna-browser", getenv("HOME"));
+   }
+   char ua[600] = "";
+   if (g_user_agent[0]) snprintf(ua, sizeof ua, "--user-agent=%s", g_user_agent);
+   pid_t pid = fork();
+   if (pid < 0) return -1;
+   if (pid == 0) {
+      dup2(in[0], 3);
+      dup2(out[1], 4);
+      for (int fd = 5; fd < 256; ++fd) close(fd);
+      const char *argv[8] = { "luna-browser", "--remote-debugging-pipe", size };
+      int n = 3;
+      if (profile[0]) argv[n++] = profile;
+      if (ua[0]) argv[n++] = ua;
+      if (g_verbose) argv[n++] = "-v";
+      argv[n] = NULL;
+      execv("/proc/self/exe", (char *const *)argv);
+      _exit(127);
+   }
+   close(in[0]);
+   close(out[1]);
+   g_ui.pid = pid;
+   g_ui.to = in[1];
+   g_ui.from = out[0];
+   fcntl(g_ui.to, F_SETFD, FD_CLOEXEC);
+   fcntl(g_ui.from, F_SETFD, FD_CLOEXEC);
+   fcntl(g_ui.from, F_SETFL, O_NONBLOCK);
+   ui_send("Target.attachToTarget", "{\"targetId\":\"" TARGET_ID "\",\"flatten\":true}", 0);
+   return 0;
+}
+
+static void ui_init(void *user)
+{
+   (void)user;
+   g_luna_platform.read_resource = ui_read_resource;
+   luna_set_on_click(ui_el("back"), ui_on_back);
+   luna_set_on_click(ui_el("fwd"), ui_on_fwd);
+   luna_set_on_click(ui_el("reload"), ui_on_reload);
+   ui_buttons();
+   if (g_ui.start && !strcmp(g_ui.start, "about:blank")) luna_focus_element(ui_el("url"));
+   if (ui_spawn() != 0) ui_status("Could not start the page process.");
+}
+
+static void ui_frame(double dt, void *user)
+{
+   (void)dt; (void)user;
+   ui_pump();
+   ui_viewport();
+}
+
+static void ui_render(int fbw, int fbh, void *user)
+{
+   (void)user;
+   int x, y, w, h;
+   luna_platform_get_window_rect(&x, &y, &w, &h);
+   float s = w > 0 ? (float)fbw / (float)w : 1.0f;
+   (void)fbh;
+   if (s > 0.5f && fabsf(s - g_ui.scale) > 0.01f) { g_ui.scale = s; g_ui.sent_w = 0; }
+}
+
+static int ui_in_view(double y) { return y >= UI_BAR; }
+
+static void ui_mouse(const char *type, double x, double y, int button, int clicks)
+{
+   char p[200];
+   static const char *names[] = { "left", "right", "middle" };
+   snprintf(p, sizeof p, "{\"type\":\"%s\",\"x\":%.1f,\"y\":%.1f,\"button\":\"%s\",\"clickCount\":%d}",
+            type, x, y - UI_BAR, button >= 0 && button < 3 ? names[button] : "none", clicks);
+   ui_send("Input.dispatchMouseEvent", p, 1);
+}
+
+static int ui_mouse_button(int button, int action, int mods, double x, double y, void *user)
+{
+   (void)mods; (void)user;
+   if (action == LUNA_PRESS && ui_in_view(y)) {
+      luna_focus_element(-1);          /* the page has the keyboard now */
+      g_ui.pressed = 1;
+      ui_mouse("mousePressed", x, y, button, 1);
+      return 1;
+   }
+   if (action == LUNA_RELEASE && g_ui.pressed) {
+      g_ui.pressed = 0;
+      ui_mouse("mouseReleased", x, y, button, 1);
+      return 1;
+   }
+   return 0;
+}
+
+static int ui_mouse_move(double x, double y, void *user)
+{
+   (void)user;
+   g_ui.mx = x; g_ui.my = y;
+   if (ui_in_view(y) || g_ui.pressed) ui_mouse("mouseMoved", x, y, g_ui.pressed ? 0 : -1, 0);
+   return 0;
+}
+
+static int ui_scroll(double dx, double dy, void *user)
+{
+   (void)user;
+   if (!ui_in_view(g_ui.my)) return 0;
+   char p[200];
+   snprintf(p, sizeof p, "{\"type\":\"mouseWheel\",\"x\":%.1f,\"y\":%.1f,\"deltaX\":%.1f,\"deltaY\":%.1f}",
+            g_ui.mx, g_ui.my - UI_BAR, -dx * 60.0, -dy * 60.0);
+   ui_send("Input.dispatchMouseEvent", p, 1);
+   return 1;
+}
+
+static int ui_page_has_keys(void)
+{
+   int u = ui_el("url");
+   return luna_focused_element() != u;
+}
+
+static int ui_key(int key, int scancode, int action, int mods, void *user)
+{
+   (void)scancode; (void)user;
+   const int down = action != LUNA_RELEASE;
+   const int ctrl = mods & (LUNA_MOD_CONTROL | LUNA_MOD_SUPER);
+   /* the browser's own keys first */
+   if (down && ((ctrl && key == LUNA_KEY_L) || key == LUNA_KEY_F6)) {
+      int u = ui_el("url");
+      luna_focus_element(u);
+      return 1;
+   }
+   if (down && ((ctrl && key == LUNA_KEY_R) || key == LUNA_KEY_F5)) { ui_on_reload(NULL); return 1; }
+   if (down && (mods & LUNA_MOD_ALT) && key == LUNA_KEY_LEFT) { ui_go(-1); return 1; }
+   if (down && (mods & LUNA_MOD_ALT) && key == LUNA_KEY_RIGHT) { ui_go(1); return 1; }
+   if (!ui_page_has_keys()) {
+      if (down && key == LUNA_KEY_ENTER) {
+         char *url = ui_typed_url(luna_get_value(ui_el("url")));
+         if (url) { ui_navigate(url); free(url); }
+         luna_focus_element(-1);
+         return 1;
+      }
+      if (down && key == LUNA_KEY_ESCAPE) {
+         if (g_ui.cur < g_ui.nhist) luna_set_value(ui_el("url"), g_ui.hist[g_ui.cur]);
+         luna_focus_element(-1);
+         return 1;
+      }
+      return 0;                        /* typing in the address bar */
+   }
+   for (int i = 0; g_keys[i].name; ++i) {
+      if (g_keys[i].key != key) continue;
+      char p[200];
+      snprintf(p, sizeof p, "{\"type\":\"%s\",\"key\":\"%s\",\"windowsVirtualKeyCode\":%d}",
+               down ? "rawKeyDown" : "keyUp", g_keys[i].name, g_keys[i].vk);
+      ui_send("Input.dispatchKeyEvent", p, 1);
+      return 1;
+   }
+   return 0;
+}
+
+static int ui_char(unsigned int cp, void *user)
+{
+   (void)user;
+   if (!ui_page_has_keys() || cp < 0x20) return 0;
+   char utf8[5] = { 0 };
+   if (cp < 0x80) utf8[0] = (char)cp;
+   else if (cp < 0x800) { utf8[0] = (char)(0xc0 | cp >> 6); utf8[1] = (char)(0x80 | (cp & 63)); }
+   else if (cp < 0x10000) { utf8[0] = (char)(0xe0 | cp >> 12); utf8[1] = (char)(0x80 | ((cp >> 6) & 63)); utf8[2] = (char)(0x80 | (cp & 63)); }
+   else { utf8[0] = (char)(0xf0 | cp >> 18); utf8[1] = (char)(0x80 | ((cp >> 12) & 63)); utf8[2] = (char)(0x80 | ((cp >> 6) & 63)); utf8[3] = (char)(0x80 | (cp & 63)); }
+   struct buf b = { 0 };
+   buf_puts(&b, "{\"text\":");
+   buf_json_str(&b, utf8);
+   buf_puts(&b, "}");
+   ui_send("Input.insertText", b.p, 1);
+   free(b.p);
+   return 1;
+}
+
+static void ui_shutdown(void *user)
+{
+   (void)user;
+   if (g_ui.to >= 0) close(g_ui.to);
+   if (g_ui.pid > 0) { kill(g_ui.pid, SIGTERM); waitpid(g_ui.pid, NULL, 0); }
 }
 
 static int window_main(const char *url)
 {
-   g_window_url = lb_strdup(url);
+   g_ui.start = lb_strdup(url);
    LunaAppConfig cfg;
    memset(&cfg, 0, sizeof cfg);
    cfg.title = "Luna Browser";
@@ -3592,14 +4075,18 @@ static int window_main(const char *url)
    cfg.height = g_page.h;
    cfg.resizable = 1;
    cfg.vsync = 1;
-   cfg.html = "<body></body>";
-   cfg.css = "body{background:#ffffff;}";
-   cfg.on_init = win_init;
-   cfg.on_frame = win_frame;
-   cfg.on_key = win_key;
+   cfg.html = ui_html;
+   cfg.css = ui_css;
+   cfg.on_init = ui_init;
+   cfg.on_frame = ui_frame;
+   cfg.on_render = ui_render;
+   cfg.on_shutdown = ui_shutdown;
+   cfg.on_mouse_button = ui_mouse_button;
+   cfg.on_mouse_move = ui_mouse_move;
+   cfg.on_scroll = ui_scroll;
+   cfg.on_key = ui_key;
+   cfg.on_char = ui_char;
    cfg.frame_interval = 1.0 / 60.0;
-   (void)win_render;
-   (void)win_resize_check;
    return luna_app_run(&cfg);
 }
 #endif
@@ -3678,7 +4165,7 @@ int main(int argc, char **argv)
    }
    if (shot) {
       size_t len = 0;
-      unsigned char *png = page_capture(&len);
+      unsigned char *png = page_capture(&len, 0);
       FILE *f = png ? fopen(shot, "wb") : NULL;
       if (f && fwrite(png, 1, len, f) == len) fprintf(stderr, "luna-browser: wrote %s (%dx%d)\n", shot, g_page.w, g_page.h);
       else { fprintf(stderr, "luna-browser: screenshot failed\n"); rc = 1; }

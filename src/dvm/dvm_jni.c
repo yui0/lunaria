@@ -895,6 +895,12 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
          if (run) {
             union dvm_value ignored = { 0 };
             (void)dvm_call(vm, run, args[0].l, NULL, 0, &ignored);
+         } else {
+            union dvm_value ignored = { 0 };
+            struct dvm_class *iface =
+               dvm__class_by_desc(vm, "Ljava/lang/Runnable;");
+            (void)dvm_proxy_try_invoke(vm, args[0].l, iface, "run", "()V",
+                                       NULL, 0, &ignored);
          }
       }
       /* Always consume the call: a failed Runnable must not look like a

@@ -1284,6 +1284,36 @@ pump_now_us(void)
    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
 }
 
+/* The Android side of one turn of the main loop: what the framework does on
+ * the main thread every frame regardless of which engine the app runs.  Every
+ * pump loop calls it once per frame, the engine-specific ones included — the
+ * Unity loops used to skip it, so Handler/Choreographer callbacks ran only
+ * when Unity happened to call into Java, apply()'d preferences never reached
+ * the disk (the account a login stored was gone next launch), and typed text
+ * waited for the guest to call Java before the input method saw it. */
+static void
+pump_java_frame(void)
+{
+   const uint64_t t_media = frame_now_ns();
+   struct dvm *vm = dvm_jni_vm();
+   if (vm) {
+      /* The main thread's Looper.  A device runs it every turn of the main
+       * loop, so a Handler.postDelayed() callback lands near its due time;
+       * without this it only ran when the guest itself called into Java, which
+       * left armed callbacks seconds late (see dvm_main_looper_tick). */
+      dvm_main_looper_tick(vm);
+      dvm_media_pump_active(vm);
+      /* Preferences an apply() left pending: on a device the framework writes
+       * them behind the caller's back, and this is that writer. */
+      dvm_prefs_flush(vm);
+      /* The input method: a game blocked on the text the player is typing
+       * calls no Java of its own, so the keystrokes need a way in that does
+       * not depend on the guest doing anything. */
+      dvm_ime_frame(vm);
+   }
+   frame_stage_add(FRAME_STAGE_MEDIA, t_media);
+}
+
 static void
 pump_run_frame(void (*run_threads)(void))
 {
@@ -1310,25 +1340,7 @@ pump_run_frame(void (*run_threads)(void))
       usleep((deadline - now > 1000ull) ? 1000u : (useconds_t)(deadline - now));
       frame_stage_add(FRAME_STAGE_IDLE, t_idle);
    }
-   const uint64_t t_media = frame_now_ns();
-   {
-      struct dvm *vm = dvm_jni_vm();
-      /* The main thread's Looper.  A device runs it every turn of the main
-       * loop, so a Handler.postDelayed() callback lands near its due time;
-       * without this it only ran when the guest itself called into Java, which
-       * left armed callbacks seconds late (see dvm_main_looper_tick). */
-      if (vm) dvm_main_looper_tick(vm);
-      if (vm) dvm_media_pump_active(vm);
-      /* Preferences an apply() left pending: on a device the framework writes
-       * them behind the caller's back, and this is that writer. */
-      if (vm) dvm_prefs_flush(vm);
-      /* The input method: a game blocked on the text the player is typing
-       * calls no Java of its own, so the keystrokes need a way in that does
-       * not depend on the guest doing anything. */
-      if (vm) dvm_ime_frame(vm);
-
-   }
-   frame_stage_add(FRAME_STAGE_MEDIA, t_media);
+   pump_java_frame();
 }
 
 static int
@@ -2222,6 +2234,16 @@ run_unity_game_arm64(struct jvm *jvm, jobject existing_context,
 
    if (!va_init_jni || !va_render)
       errx(EXIT_FAILURE, "not a unity jni lib (arm64)");
+   const int touch_diag = getenv("LUNARIA_TOUCH_DIAG") != NULL;
+   uint64_t touch_queue_va = 0;
+   const char *lifecycle_diag = getenv("LUNARIA_LIFECYCLE_DIAG_FILE");
+   if (touch_diag) {
+      const char *q = getenv("LUNARIA_TOUCH_QUEUE_VA");
+      if (q && *q) touch_queue_va = strtoull(q, NULL, 0);
+   }
+   if (touch_diag)
+      fprintf(stderr, "[loader] arm64 nativeInjectEvent=%#llx\n",
+              (unsigned long long)va_inject);
 
    uint64_t env = arm64_exec_env_va();
    const jobject context = existing_context ? existing_context
@@ -2298,9 +2320,40 @@ run_unity_game_arm64(struct jvm *jvm, jobject existing_context,
     * permanently stuck on the splash screen. */
 
    for (;;) {
+      if (arm_exec_guest_exit_count() > 0 || arm_exec_guest_abort_count() > 0) {
+         fprintf(stderr, "[loader] guest process terminated — stopping Unity loop "
+                         "(frame %d)\n", frame_count);
+         break;
+      }
       if (max_frames > 0 && frame_count >= max_frames) {
          fprintf(stderr, "[loader] LUNARIA_MAX_FRAMES=%d reached\n", max_frames);
          break;
+      }
+      if (lifecycle_diag && *lifecycle_diag && (frame_count % 50) == 0) {
+         FILE *command = fopen(lifecycle_diag, "r");
+         if (command) {
+            char action[32] = {0};
+            if (!fgets(action, sizeof action, command)) action[0] = '\0';
+            fclose(command);
+            unlink(lifecycle_diag);
+            if (!strncmp(action, "resume", 6) && va_resume) {
+               fprintf(stderr, "[loader] diagnostic nativeResume at frame %d\n", frame_count);
+               arm64_exec_call(va_resume, env, ctx, 0, 0);
+            } else if (!strncmp(action, "focus", 5) && va_focus) {
+               fprintf(stderr, "[loader] diagnostic nativeFocusChanged(1) at frame %d\n", frame_count);
+               arm64_exec_call(va_focus, env, ctx, 1, 0);
+            } else if (!strncmp(action, "recreate", 8) && va_recreate) {
+               jobject surface = jvm->native.AllocObject(&jvm->env,
+                     jvm->native.FindClass(&jvm->env, "android/view/Surface"));
+               fprintf(stderr, "[loader] diagnostic nativeRecreateGfxState at frame %d\n", frame_count);
+               if (recreate_sig[0] == '(' && recreate_sig[1] == 'L')
+                  arm64_exec_call(va_recreate, env, ctx,
+                                  (uint64_t)(uintptr_t)surface, 0);
+               else
+                  arm64_exec_call(va_recreate, env, ctx, 0,
+                                  (uint64_t)(uintptr_t)surface);
+            }
+         }
       }
       ArmExecTouchEvent te;
       if (va_inject && arm_exec_touch_next(&te)) {
@@ -2308,11 +2361,23 @@ run_unity_game_arm64(struct jvm *jvm, jobject existing_context,
             arm64_exec_call(va_fwd_dalv, env, ctx, 0, 0);
          lunaria_touch_event lev = touch_to_lunaria(&te);
          jobject motion_ev = jvm_new_motion_event(jvm, &lev);
-         arm64_exec_call(va_inject, env, ctx, (uint64_t)(uintptr_t)motion_ev, 0);
+         uint64_t queue_before = touch_queue_va ? arm64_exec_read64(touch_queue_va + 8) : 0;
+         int handled = (int)arm64_exec_call(va_inject, env, ctx,
+                                            (uint64_t)(uintptr_t)motion_ev, 0);
+         if (touch_diag)
+            fprintf(stderr, "[loader] arm64 injectEvent action=%d x=%.0f y=%.0f -> %d queue_end=%#llx->%#llx\n",
+                    te.action, te.x, te.y, handled,
+                    (unsigned long long)queue_before,
+                    (unsigned long long)(touch_queue_va ? arm64_exec_read64(touch_queue_va + 8) : 0));
       }
 
       arm_exec_drain_gl_thread_jobs();
       int ok = (int)arm64_exec_call_unlimited(va_render, env, ctx, 0, 0);
+      if (arm_exec_guest_exit_count() > 0 || arm_exec_guest_abort_count() > 0) {
+         fprintf(stderr, "[loader] guest process terminated during nativeRender "
+                         "(frame %d)\n", frame_count);
+         break;
+      }
 
       if (!resized_after_init && frame_count >= 1 && va_resize) {
          int w = arm64_exec_fb_width(), h = arm64_exec_fb_height();
@@ -2322,6 +2387,7 @@ run_unity_game_arm64(struct jvm *jvm, jobject existing_context,
       }
 
       arm64_exec_run_pending_threads();
+      pump_java_frame();
       arm64_exec_egl_swap();
       arm64_exec_glfw_poll();
       ++frame_count;
@@ -2336,7 +2402,8 @@ run_unity_game_arm64(struct jvm *jvm, jobject existing_context,
       if (arm64_exec_glfw_should_close()) break;
    }
 
-   if (va_done)
+   if (va_done && !arm_exec_guest_exit_count() &&
+       !arm_exec_guest_abort_count())
       arm64_exec_call(va_done, env, ctx, 0, 0);
    return EXIT_SUCCESS;
 }
@@ -2933,6 +3000,7 @@ run_jni_game_arm(struct jvm *jvm)
       }
       /* UnityMain などのゲストスレッドにも実行時間を与える */
       arm_exec_run_pending_threads();
+      pump_java_frame();
       /* Unity はeglSwapBuffersをJava側に任せる場合があるのでここで呼ぶ */
       arm_exec_egl_swap();
       ++frame_count;

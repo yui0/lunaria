@@ -2288,8 +2288,15 @@ JNIEnv_GetStringUTFChars(JNIEnv *env, jstring string, jboolean *isCopy)
    if (isCopy)
       *isCopy = JNI_FALSE;
 
-   verbose("%s", (string ? jvm_get_object_of_type(jnienv_get_jvm(env), string, JVM_OBJECT_STRING)->string.data : "(null)"));
-   return (string ? jvm_get_object_of_type(jnienv_get_jvm(env), string, JVM_OBJECT_STRING)->string.data : NULL);
+   if (!string) return NULL;
+   struct jvm_object *o = jvm_get_object_of_type(jnienv_get_jvm(env), string,
+                                                 JVM_OBJECT_STRING);
+   if (!o || o->type != JVM_OBJECT_STRING) return NULL;
+   /* A valid empty Java string has a non-NULL GetStringUTFChars result.
+    * jvm_string_set_cstr_with_length stores no allocation for length zero. */
+   const char *utf = o->string.data ? o->string.data : "";
+   verbose("%s", utf);
+   return utf;
 }
 
 static void

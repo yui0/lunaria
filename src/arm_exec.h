@@ -437,6 +437,7 @@ int arm_exec_boot_present(void);
 
 /* How many times guest abort() has been called (mono g_assert, etc.). */
 uint64_t arm_exec_guest_abort_count(void);
+uint64_t arm_exec_guest_exit_count(void);
 
 /* Consumes a pending SetDesiredViewSize change: returns 1 once per resize and
  * fills the width/height outputs with the new view size, so the pump can deliver the engine's

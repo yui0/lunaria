@@ -1787,7 +1787,24 @@ enum SvcId : uint32_t {
     SVC_GL3_MemoryBarrierByRegion,
     SVC_GL3_GetMultisamplefv,
     SVC_GL3_SampleMaski,
-    SVC_SPLIT_LAST = SVC_GL3_SampleMaski,
+    /* AMotionEvent fields libandroid exports beside getX/getY.  A library
+     * that references one and finds nothing is unloaded whole — Unity's
+     * libmain.so does that — so each of these is the field on the same
+     * NdkInputEvent the other getters already read. */
+    SVC_AMOTION_EDGEFLAGS,
+    SVC_AMOTION_FLAGS,
+    SVC_AMOTION_META,
+    SVC_AMOTION_XPREC,
+    SVC_AMOTION_YPREC,
+    SVC_AMOTION_ORIENT,
+    SVC_AMOTION_TOUCHMAJOR,
+    SVC_AMOTION_TOUCHMINOR,
+    SVC_AMOTION_TOOLMAJOR,
+    SVC_AMOTION_TOOLMINOR,
+    SVC_AMOTION_HISTSIZE,
+    SVC_AMOTION_HISTTIME,
+    SVC_AMOTION_HISTFLOAT,
+    SVC_SPLIT_LAST = SVC_AMOTION_HISTFLOAT,
     /* A host function bound at run time, found through the index its
      * trampoline carries (see HostCallFn in arm_exec.h).  One number for all of them. */
     SVC_HOSTCALL,

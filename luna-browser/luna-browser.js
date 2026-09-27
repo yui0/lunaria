@@ -282,9 +282,21 @@ class Node extends EventTarget {
       if (c.contains(this)) throw new DOMException('The new child element contains the parent.', 'HierarchyRequestError');
       if (ref && ref.parentNode !== this) ref = null;
       detach(c);
+      /* A lone text child lives folded into its element's own text.  Once
+       * anything joins it, it becomes a node of its own again, first, so
+       * document order holds (Vue's fragment anchors land around text). */
+      const folded = this._folded;
+      if (folded && folded._host === this && this._uid && L.text(this._uid) === folded._data) {
+         hide(this, '_folded', null);
+         folded._host = null;
+         L.setText(this._uid, '');
+         folded._materialize();
+         L.insert(this._uid, folded._uid, 0);
+      }
       if (c.nodeType === 3 && this._uid) {         /* text into a rendered element */
          if (!c._uid && !L.children(this._uid).length && !this._vkids && L.text(this._uid) === '' && !ref) {
             hide(c, '_host', this);
+            hide(this, '_folded', c);
             L.setText(this._uid, c._data);
             return c;
          }
@@ -1634,6 +1646,26 @@ class IntersectionObserver {
    observe(el) { setTimeout(() => { const r = el.getBoundingClientRect(); try { this._cb([{ target: el, isIntersecting: true, intersectionRatio: 1, boundingClientRect: r, intersectionRect: r, rootBounds: null, time: performance.now() }], this); } catch (e) { reportError(e); } }, 0); }
    unobserve() {} disconnect() {} takeRecords() { return []; }
 }
+/* Parsed markup lives in a detached element; the returned object answers the
+ * Document calls parsers' callers make (documentElement, body, queries). */
+class DOMParser {
+   parseFromString(str, type) {
+      const box = document.createElement('div');
+      box.innerHTML = String(str).replace(/^\s*<\?xml[^>]*\?>/, '');
+      const root = box.firstElementChild;
+      const html = !/xml/.test(String(type));
+      return {
+         nodeType: 9, contentType: String(type || 'text/html'),
+         documentElement: html ? box : root, body: html ? box : null, head: null,
+         firstElementChild: root, childNodes: box.childNodes, children: box.children,
+         querySelector: q => box.querySelector(q), querySelectorAll: q => box.querySelectorAll(q),
+         getElementById: id => box.querySelector('#' + CSS.escape(id)),
+         getElementsByTagName: t => box.getElementsByTagName(t),
+         getElementsByClassName: c => box.getElementsByClassName(c),
+      };
+   }
+}
+class XMLSerializer { serializeToString(n) { return n.outerHTML !== undefined ? n.outerHTML : n.textContent; } }
 class Image { constructor(w, h) { const i = document.createElement('img'); if (w) i.width = w; if (h) i.height = h; return i; } }
 class Audio { constructor(src) { const a = document.createElement('audio'); if (src) a.setAttribute('src', src); return a; } }
 const CSS = {
@@ -1655,7 +1687,7 @@ Object.assign(g, {
    HTMLSpanElement, HTMLParagraphElement, HTMLUListElement, HTMLLIElement, HTMLTitleElement, SVGElement,
    URL, URLSearchParams, TextEncoder, TextDecoder, Blob, File, FileReader, FormData, Headers, Request, Response,
    AbortController, AbortSignal, XMLHttpRequest, WebSocket, Storage,
-   MutationObserver, ResizeObserver, IntersectionObserver, Image, Audio, Window: Object,
+   MutationObserver, ResizeObserver, IntersectionObserver, Image, Audio, DOMParser, XMLSerializer, Window: Object,
 });
 
 /* -------------------------------------------------------------- input */

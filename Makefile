@@ -66,9 +66,11 @@ MAC_SDK           = $(shell xcrun --show-sdk-path)
 CMAKE             = $(MAC_DEPS)/bin/cmake
 DYNARMIC_CMAKE_FLAGS = -DBOOST_ROOT=$(abspath $(MAC_DEPS)/boost) \
 	-DBoost_NO_SYSTEM_PATHS=ON -DCMAKE_CXX_FLAGS=-DFMT_CONSTEVAL=
-HOST_CPPFLAGS     = -DEGL_NO_PLATFORM_SPECIFIC_TYPES \
+HOST_CPPFLAGS     = -DEGL_NO_PLATFORM_SPECIFIC_TYPES -DU_DISABLE_RENAMING=1 \
 	-I$(MAC_DEPS)/linux-abi -I$(MAC_DEPS)/khronos/include \
+	-I$(MAC_DEPS)/vulkan/include \
 	-I$(MAC_DEPS)/glfw/include -I$(MAC_DEPS)/icu/include \
+	-I$(MAC_DEPS)/moltenvk/include \
 	-I$(MAC_OPENSSL)/include
 HOST_GL_LIBS      = $(MAC_DEPS)/lib/libEGL.dylib $(MAC_DEPS)/lib/libGLESv2.dylib
 HOST_Z_LIBS       = $(MAC_SDK)/usr/lib/libz.tbd
@@ -186,7 +188,8 @@ $(SYSLIB_LIBM):
 	@mkdir -p $(SYSLIB_DIR)
 	@set -e; \
 	found=""; \
-	for root in "$$LUNARIA_ANDROID_SDK" "$$ANDROID_HOME" "$$ANDROID_SDK_ROOT" /root/image/android; do \
+	for root in "$$LUNARIA_ANDROID_SDK" "$$ANDROID_HOME" "$$ANDROID_SDK_ROOT" \
+	            "$$HOME/Library/Android/sdk" "$$HOME/Android/Sdk" /root/image/android; do \
 	    [ -n "$$root" ] || continue; \
 	    cand=`find "$$root" -path '*/renderscript/lib/intermediates/arm64-v8a/libm.so' 2>/dev/null | head -1`; \
 	    if [ -n "$$cand" ]; then found="$$cand"; break; fi; \
@@ -211,7 +214,8 @@ $(SYSLIB_LIBC):
 	@mkdir -p $(SYSLIB_DIR)
 	@set -e; \
 	found=""; \
-	for root in "$$LUNARIA_ANDROID_SDK" "$$ANDROID_HOME" "$$ANDROID_SDK_ROOT" /root/image/android; do \
+	for root in "$$LUNARIA_ANDROID_SDK" "$$ANDROID_HOME" "$$ANDROID_SDK_ROOT" \
+	            "$$HOME/Library/Android/sdk" "$$HOME/Android/Sdk" /root/image/android; do \
 	    [ -n "$$root" ] || continue; \
 	    cand=`find "$$root" -path '*/renderscript/lib/intermediates/arm64-v8a/libc.so' 2>/dev/null | head -1`; \
 	    if [ -n "$$cand" ]; then found="$$cand"; break; fi; \
@@ -233,7 +237,9 @@ $(SYSLIB_LIBZ):
 	@set -e; \
 	archive=""; compiler=""; \
 	for root in "$$LUNARIA_ANDROID_NDK" "$$ANDROID_NDK_HOME" "$$ANDROID_NDK_ROOT" \
-	            "$$ANDROID_HOME/ndk" "$$ANDROID_SDK_ROOT/ndk" /root/image/android/ndk; do \
+	            "$$ANDROID_HOME/ndk" "$$ANDROID_SDK_ROOT/ndk" \
+	            "$$HOME/Library/Android/sdk/ndk" "$$HOME/Android/Sdk/ndk" \
+	            /root/image/android/ndk; do \
 	    [ -n "$$root" ] || continue; \
 	    archive=`find "$$root" -path '*/sysroot/usr/lib/aarch64-linux-android/libz.a' 2>/dev/null | head -1`; \
 	    [ -n "$$archive" ] || continue; \
@@ -259,7 +265,9 @@ $(SYSLIB_GUEST): src/lib/guest.c
 	@set -e; \
 	compiler=""; \
 	for root in "$$LUNARIA_ANDROID_NDK" "$$ANDROID_NDK_HOME" "$$ANDROID_NDK_ROOT" \
-	            "$$ANDROID_HOME/ndk" "$$ANDROID_SDK_ROOT/ndk" /root/image/android/ndk; do \
+	            "$$ANDROID_HOME/ndk" "$$ANDROID_SDK_ROOT/ndk" \
+	            "$$HOME/Library/Android/sdk/ndk" "$$HOME/Android/Sdk/ndk" \
+	            /root/image/android/ndk; do \
 	    [ -n "$$root" ] || continue; \
 	    cand=`find "$$root" -name aarch64-linux-android21-clang 2>/dev/null | head -1`; \
 	    [ -n "$$cand" ] && [ -x "$$cand" ] && { compiler="$$cand"; break; }; \
@@ -350,7 +358,8 @@ DVM_SRC = src/dvm/dex.c src/dvm/dvm.c src/dvm/dvm_runtime.c src/dvm/dvm_jni.c \
           src/dvm/dvm_net.c src/dvm/dvm_media.c src/dvm/regex.c src/dvm/charset.c \
           src/webview_cdp.c $(WEBVIEW_CDP_HOST_SRC)
 DVM_HDR = src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
-          src/dvm/dvm_net.h src/dvm/dvm_media.h src/dvm/regex.h src/dvm/charset.h \
+          src/dvm/dvm_net.h src/dvm/host_socket.h src/dvm/dvm_media.h \
+          src/dvm/regex.h src/dvm/charset.h \
           src/webview_cdp.h
 
 # The Dalvik bytecode emulator lives in libjvm.so: it is reached from jvm.c
@@ -520,7 +529,7 @@ clean:
 	$(RM) $(bins) $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/lunaria_os.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o \
 	    $(BUILD_DIR)/stb_vorbis.o libdl.so libpthread.so
 	$(RM) -r runtime
-	$(RM) test/test_dynarmic_arm test/test_unity test/test_dvm test/dvm_test.dex test/test_regex test/test_http_chunked test/test_charset test/test_vulkan_bridge
+	$(RM) test/test_dynarmic_arm test/test_a64_memory_abort test/test_unity test/test_dvm test/dvm_test.dex test/test_regex test/test_http_chunked test/test_charset test/test_vulkan_bridge
 	$(RM) test/test_boot_card
 	$(RM) test/libabitest64.so test/libabitest32.so test/abi_test_values.h
 	$(RM) test/abi_pkg/classes.dex
@@ -893,6 +902,13 @@ heap-test: lunaria test/libheaptest.so
 	    rm -f .heaptest.out; \
 	done; exit $$rc
 
+# Pure C allocator core, also checked by sanitizers on hosts without an
+# AArch64 linker (where the guest-facing heap-test cannot be built).
+heap-core-test: | $(BUILD_DIR)
+	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined \
+	    -fno-omit-frame-pointer test/heap_core_test.c -o $(BUILD_DIR)/heap_core_test
+	$(BUILD_DIR)/heap_core_test
+
 # A guest mprotect(PROT_EXEC) is an instruction-cache synchronization point.
 # Run only with four engines: this specifically checks that an engine already
 # inside Run() is halted before it can execute a translation another engine
@@ -1030,6 +1046,13 @@ test/test_dynarmic_arm: test/test_dynarmic_arm.cpp $(DYNARMIC_LIB)
 	    $(DYNARMIC_LIBS) \
 	    -lpthread -o $@
 
+test/test_a64_memory_abort: test/test_a64_memory_abort.cpp $(DYNARMIC_LIB)
+	$(CXX) -std=c++20 -O2 -g \
+	    $(DYNARMIC_INCS) \
+	    test/test_a64_memory_abort.cpp \
+	    $(DYNARMIC_LIBS) \
+	    -lpthread -o $@
+
 test/test_fp_muladd32: test/test_fp_muladd32.cpp $(DYNARMIC_LIB)
 	$(CXX) -std=c++20 -O2 -g \
 	    $(DYNARMIC_INCS) \
@@ -1046,6 +1069,12 @@ test/test_webview_cdp: test/test_webview_cdp.c src/webview_cdp.c src/webview_cdp
 
 webview-cdp-test: test/test_webview_cdp
 	./test/test_webview_cdp
+
+test/test_host_socket: test/host_socket_test.c src/dvm/host_socket.h
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -Isrc test/host_socket_test.c -o $@
+
+host-socket-test: test/test_host_socket
+	./test/test_host_socket
 
 test/test_webview_cdp_host: test/test_webview_cdp_host.c $(WEBVIEW_CDP_HOST_SRC) src/webview_cdp.c src/webview_cdp.h
 	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -Isrc \
@@ -1210,7 +1239,7 @@ dist-clean:
 .PHONY: luna-browser luna-browser-test vulkan-test dist dist-stage dist-stage-build dist-mac dist-clean all pixels-test dl-test jit-speed syslib guestlib syslib-clean host-all macos-deps x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
 	        clean install install-bin install-lib test net-test dvm-test http-chunked-test regex-test charset-test abi-test \
 	        posix-test boot-card-test binary128-test fd-callback-test \
-	        thread-start-test mutex-test heap-test icache-sync-test guestmem-test lock-test \
+	        thread-start-test mutex-test heap-test heap-core-test icache-sync-test guestmem-test lock-test \
         gil-test \
         fetch fetch-libunity fetch-btw fetch-blade-soul fetch-openh264 \
         dynarmic-build

@@ -1022,11 +1022,14 @@ constexpr uint32_t GL_STR_RING_SIZE  = GL_STR_RING_SLOTS * GL_STR_RING_SLOT;
  * A native that is handed 0 does not fail politely — Unity's UnityWebRequest
  * upload path takes its "how much is there in total" branch instead of its
  * "fill this buffer" one and loops for ever. */
-/* 0x41100000..0x41102000 is executable runtime code (FAST_SYNC64_PAGE in
- * arm_exec.cpp).  Direct-buffer payload is writable data and must never
- * overlap it: UnityWebRequest writes the response into this pool, and the old
- * overlap replaced the pthread fast stubs with response bytes.  A worker then
- * returned through those bytes as A64 instructions. */
+/* Direct-buffer payload is writable data that natives write through
+ * (UnityWebRequest copies request and response bodies into it), so it must
+ * overlap nothing else.  An old overlap with the pthread fast stubs replaced
+ * them with response bytes.  The A64 layout moves it next to the other
+ * runtime windows: at this A32 address it sat inside the A64 thread-stack
+ * window, and the nineteenth pthread_create got a stack that was the first
+ * direct buffer — Unity zeroed its request buffer over Tencent GME's
+ * AK::BankManager frames and the next stack-guard check aborted. */
 inline uint32_t DIRECT_BB_BASE = 0x41200000u;
 constexpr uint32_t DIRECT_BB_SIZE = 0x00800000u;  /* 8 MiB */
 // Per-thread guest TLS pages (tpidr_el0), one 4 KiB page per guest tid.
@@ -1142,6 +1145,8 @@ inline void guest_va_layout_arm64(void) {
     CB_STACK_BASE     = 0x0D100000u; /* .. 0x0E100000 */
     g_cb_slots        = CB_MAX_SLOTS;
     SENTINEL_ADDR     = 0x0E200000u; /* must not alias CB nest stacks */
+    /* 0x0E300000: FAST_SYNC64_PAGE (arm_exec.cpp), 8 KiB of stubs. */
+    DIRECT_BB_BASE    = 0x0E400000u; /* .. 0x0EC00000, below MMAP_BASE */
     // Guest thread stacks: [0x40000000, HEAP_BASE) — 256 MiB, i.
     THREAD_STACK_BASE = 0x40000000u;
     // ELF images: [0x10000000,0x50000000).

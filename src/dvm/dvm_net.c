@@ -12,6 +12,7 @@
  */
 
 #include "dvm/dvm_net.h"
+#include "dvm/host_socket.h"
 
 #include <errno.h>
 #include <arpa/inet.h>
@@ -976,7 +977,7 @@ static int bind_local(int fd, int family, const char *local_addr,
 static int connect_one(const struct addrinfo *a, const char *local_addr,
                        int local_port, int timeout_ms)
 {
-   int fd = socket(a->ai_family, a->ai_socktype | SOCK_CLOEXEC, a->ai_protocol);
+   int fd = host_socket_cloexec(a->ai_family, a->ai_socktype, a->ai_protocol);
    if (fd < 0) return -1;
    if (bind_local(fd, a->ai_family, local_addr, local_port) < 0) {
       int e = errno;

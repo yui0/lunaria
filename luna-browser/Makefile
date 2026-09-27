@@ -1,7 +1,8 @@
 # luna-browser — luna-ui + QuickJS web engine
 #
-#   make                 headless build (CDP pipe, --screenshot, --dump-dom)
-#   make LB_WINDOW=1     also an interactive window through luna-ui's host
+#   make                 the browser: a window when GLFW is installed, plus the
+#                        headless modes (CDP pipe, --screenshot, --dump-dom)
+#   make LB_WINDOW=0     headless only
 #   make LB_NO_TLS=1     without OpenSSL (no https)
 #   make test            headless self-tests
 
@@ -15,6 +16,7 @@ WARN     := -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare \
             -Wno-missing-field-initializers
 LIBS     := -lEGL -ldl -lm -lpthread
 
+LB_WINDOW ?= $(shell pkg-config --exists glfw3 2>/dev/null && echo 1 || echo 0)
 ifeq ($(LB_WINDOW),1)
 CFLAGS   += -DLB_WINDOW
 LIBS     += $(shell pkg-config --libs glfw3 2>/dev/null || echo -lglfw)

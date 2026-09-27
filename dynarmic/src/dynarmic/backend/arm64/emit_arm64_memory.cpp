@@ -138,6 +138,9 @@ void CallbackOnlyEmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, I
     if (ordered) {
         code.DMB(oaknut::BarrierOp::ISH);
     }
+    oaknut::Label memory_ok;
+    ctx.conf.emit_check_memory_abort(code, ctx, inst, memory_ok);
+    code.l(memory_ok);
 
     if constexpr (bitsize == 128) {
         code.MOV(Q8.B16(), Q0.B16());
@@ -159,6 +162,9 @@ void CallbackOnlyEmitExclusiveReadMemory(oaknut::CodeGenerator& code, EmitContex
     if (ordered) {
         code.DMB(oaknut::BarrierOp::ISH);
     }
+    oaknut::Label memory_ok;
+    ctx.conf.emit_check_memory_abort(code, ctx, inst, memory_ok);
+    code.l(memory_ok);
 
     if constexpr (bitsize == 128) {
         code.MOV(Q8.B16(), Q0.B16());
@@ -181,6 +187,9 @@ void CallbackOnlyEmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, 
     if (ordered) {
         code.DMB(oaknut::BarrierOp::ISH);
     }
+    oaknut::Label memory_ok;
+    ctx.conf.emit_check_memory_abort(code, ctx, inst, memory_ok);
+    code.l(memory_ok);
 }
 
 template<size_t bitsize>
@@ -202,6 +211,7 @@ void CallbackOnlyEmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitConte
     if (ordered) {
         code.DMB(oaknut::BarrierOp::ISH);
     }
+    ctx.conf.emit_check_memory_abort(code, ctx, inst, end);
     code.l(end);
     ctx.reg_alloc.DefineAsRegister(inst, X0);
 }

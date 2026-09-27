@@ -21,8 +21,10 @@
 #include "dvm/dvm_internal.h"
 #include "dvm/dvm_media.h"
 #include "dvm/dvm_net.h"
+#include "dvm/host_socket.h"
 #include "dvm/regex.h"
 #include "dvm/charset.h"
+#include "dvm/host_socket.h"
 #include "arm_exec.h"
 #include "arm.h"
 #include "jvm/jvm.h"
@@ -1544,14 +1546,37 @@ static bool sb_deleteCharAt(struct dvm *vm, dvm_ref self,
 {
    (void)nargs;
    struct dvm_object *o = dvm__obj(vm, self);
-   if (!o || !o->utf8) RETL(self);
-   size_t len = o->utf8_len;
-   size_t b = utf16_to_byte(o->utf8, ARG(0).i < 0 ? 0 : ARG(0).i);
-   if (b >= len) RETL(self);
-   size_t e = utf16_to_byte(o->utf8, (ARG(0).i < 0 ? 0 : ARG(0).i) + 1);
-   if (e > len) e = len;
-   memmove(o->utf8 + b, o->utf8 + e, len - e + 1);
-   o->utf8_len = (uint32_t)(len - (e - b));
+   const int32_t at = ARG(0).i;
+   const size_t len = o && o->utf8 ? o->utf8_len : 0;
+   const char *s = len ? o->utf8 : "";
+   if (at < 0 || at >= s_utf16_len(s, len)) {
+      dvm__throw(vm, "java/lang/StringIndexOutOfBoundsException",
+                 "index %d", at);
+      return false;
+   }
+   uint16_t unit = 0, adjacent = 0;
+   (void)utf16_unit_at(s, len, at, &unit);
+   int32_t first = at, after = at + 1;
+   char replacement[3];
+   size_t replacement_len = 0;
+   /* Deleting one half of a supplementary character leaves the other UTF-16
+    * surrogate in a Java StringBuffer.  Store that lone unit as WTF-8. */
+   if (unit >= 0xd800 && unit <= 0xdbff &&
+       utf16_unit_at(s, len, at + 1, &adjacent) &&
+       adjacent >= 0xdc00 && adjacent <= 0xdfff) {
+      after = at + 2;
+      replacement_len = utf8_put_unit(replacement, adjacent);
+   } else if (unit >= 0xdc00 && unit <= 0xdfff && at > 0 &&
+              utf16_unit_at(s, len, at - 1, &adjacent) &&
+              adjacent >= 0xd800 && adjacent <= 0xdbff) {
+      first = at - 1;
+      replacement_len = utf8_put_unit(replacement, adjacent);
+   }
+   const size_t b = utf16_to_byte_n(s, len, first);
+   const size_t e = utf16_to_byte_n(s, len, after);
+   memmove(o->utf8 + b + replacement_len, o->utf8 + e, len - e + 1);
+   if (replacement_len) memcpy(o->utf8 + b, replacement, replacement_len);
+   o->utf8_len = (uint32_t)(len - (e - b) + replacement_len);
    RETL(self);
 }
 
@@ -1736,7 +1761,10 @@ static bool sb_toString(struct dvm *vm, dvm_ref self, const union dvm_value *arg
 static bool sb_length(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                       int nargs, union dvm_value *out)
 {
-   return s_length(vm, self, args, nargs, out);
+   (void)args; (void)nargs;
+   struct dvm_object *o = dvm__obj(vm, self);
+   const char *s = o && o->utf8 ? o->utf8 : "";
+   RETI(s_utf16_len(s, o && o->utf8 ? o->utf8_len : 0));
 }
 
 static bool sb_setLength(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -4043,13 +4071,15 @@ static bool t_setDaemon(struct dvm *vm, dvm_ref self, const union dvm_value *arg
  * queue the caller has not filled yet — Volley's dispatchers are started
  * before the first request is added — and a Handler.post() is by definition
  * work for later.  Returns false when the queue is full. */
+static bool class_extends_proxy(struct dvm_class *c);
 static bool queue_runnable_for(struct dvm *vm, dvm_ref r, bool as_thread,
                                int64_t delay_ms, dvm_ref looper,
                                dvm_ref owner, dvm_ref token)
 {
    struct dvm_class *c = r ? dvm_object_class(vm, r) : NULL;
    struct dvm_method *run = c ? dvm_find_method(vm, c, "run", "()V") : NULL;
-   if (!run || (!run->has_code && !run->builtin))
+   if ((!run && !class_extends_proxy(c)) ||
+       (run && !run->has_code && !run->builtin))
       return true;   /* nothing to run: done */
    if (vm->npending >= (int)(sizeof vm->pending_threads /
                              sizeof vm->pending_threads[0])) {
@@ -4059,7 +4089,7 @@ static bool queue_runnable_for(struct dvm *vm, dvm_ref r, bool as_thread,
       static int warned;
       if (warned++ < 8)
          fprintf(stderr, "[sched] queue full (%d): dropped %s.run()\n",
-                 vm->npending, run->cls ? run->cls->name : "?");
+                 vm->npending, c && c->name ? c->name : "?");
       return false;
    }
    dvm_pin(vm, r);
@@ -4078,10 +4108,10 @@ static bool queue_runnable_for(struct dvm *vm, dvm_ref r, bool as_thread,
    if (vm->trace)
       fprintf(stderr, "[dvm] queue runnable=@%x thread=%d delay=%lld pending=%d\n",
               r, as_thread ? 1 : 0, (long long)delay_ms, vm->npending);
-   else if (dvm__sched_trace_for(run->cls ? run->cls->name : NULL)) {
-      fprintf(stderr, "[sched] queue %s thread=%d delay=%lld pending=%d\n",
-              run->cls ? run->cls->name : "?", as_thread ? 1 : 0,
-              (long long)delay_ms, vm->npending);
+   else if (dvm__sched_trace_for(c ? c->name : NULL)) {
+      fprintf(stderr, "[sched] queue %s thread=%d delay=%lld pending=%d looper=%u owner=%u\n",
+              c && c->name ? c->name : "?", as_thread ? 1 : 0,
+              (long long)delay_ms, vm->npending, looper, owner);
       for (int i = vm->ncallstack - 1, shown = 0;
            i >= 0 && shown < 6; --i, ++shown) {
          const struct dvm_method *f = vm->callstack[i];
@@ -5826,6 +5856,7 @@ static const struct rt_method rt_sbuf[] = {
    M("<init>", "(Ljava/lang/CharSequence;)V", sb_init_str),
    M("append", "(Ljava/lang/String;)Ljava/lang/StringBuffer;", sb_append_str),
    M("append", "(Ljava/lang/Object;)Ljava/lang/StringBuffer;", sb_append_str),
+   M("append", "(Ljava/lang/CharSequence;)Ljava/lang/StringBuffer;", sb_append_str),
    M("append", "(Ljava/lang/CharSequence;)Ljava/lang/Appendable;", sb_append_str),
    M("append", "(Ljava/lang/CharSequence;II)Ljava/lang/StringBuffer;",
      sb_append_range),
@@ -5840,6 +5871,16 @@ static const struct rt_method rt_sbuf[] = {
    M("toString", "()Ljava/lang/String;", sb_toString),
    M("length", "()I", sb_length),
    M("setLength", "(I)V", sb_setLength),
+   M("charAt", "(I)C", sb_charAt),
+   M("subSequence", "(II)Ljava/lang/CharSequence;", sb_subSequence),
+   M("substring", "(II)Ljava/lang/String;", sb_subSequence),
+   M("substring", "(I)Ljava/lang/String;", sb_subSequence),
+   M("deleteCharAt", "(I)Ljava/lang/StringBuffer;", sb_deleteCharAt),
+   M("delete", "(II)Ljava/lang/StringBuffer;", sb_delete),
+   M("insert", "(ILjava/lang/String;)Ljava/lang/StringBuffer;", sb_insert),
+   M("insert", "(ILjava/lang/Object;)Ljava/lang/StringBuffer;", sb_insert),
+   M("indexOf", "(Ljava/lang/String;)I", sb_indexOf),
+   M("reverse", "()Ljava/lang/StringBuffer;", sb_reverse),
    M_END,
 };
 
@@ -10946,6 +10987,10 @@ bool dvm_proxy_try_invoke(struct dvm *vm, dvm_ref self, struct dvm_class *cls,
    }
 
    struct dvm_class *hc = dvm_object_class(vm, hv.l);
+   if (getenv("LUNARIA_DVM_PROXY"))
+      fprintf(stderr, "[proxy] invoke %s.%s%s handler=%s@%u\n",
+              decl && decl->name ? decl->name : "?", name, sig,
+              hc && hc->name ? hc->name : "?", hv.l);
    struct dvm_method *inv =
       hc ? dvm_find_method(
               vm, hc, "invoke",
@@ -21548,6 +21593,9 @@ static bool h_obtainMessage(struct dvm *vm, dvm_ref self,
 static bool h_sendMessage(struct dvm *vm, dvm_ref self,
                           const union dvm_value *args, int nargs,
                           union dvm_value *out);
+static bool msg_sendToTarget(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out);
 static bool h_sendEmptyMessage(struct dvm *vm, dvm_ref self,
                                const union dvm_value *args, int nargs,
                                union dvm_value *out);
@@ -21898,14 +21946,27 @@ static bool msg_dispatch(struct dvm *vm, dvm_ref self, dvm_ref target,
                        "Landroid/os/Handler$Callback;", &handler_cb);
    if (handler_cb.l) {
       struct dvm_class *cc = dvm_object_class(vm, handler_cb.l);
-      struct dvm_method *hm = cc
-         ? dvm_find_method(vm, cc, "handleMessage", "(Landroid/os/Message;)Z")
-         : NULL;
-      if (hm) {
-         union dvm_value message = { .l = self }, consumed = { 0 };
-         if (!dvm_call(vm, hm, handler_cb.l, &message, 1, &consumed))
-            return false;
+      if (dvm__sched_trace_for("android/os/Message"))
+         fprintf(stderr, "[sched] Message=%u callback=%s@%u target=%u\n",
+                 self, cc && cc->name ? cc->name : "?", handler_cb.l, target);
+      union dvm_value message = { .l = self }, consumed = { 0 };
+      struct dvm_class *callback_interface =
+         dvm__class_by_desc(vm, "Landroid/os/Handler$Callback;");
+      bool proxy_handled = dvm_proxy_try_invoke(
+         vm, handler_cb.l, callback_interface,
+         "handleMessage", "(Landroid/os/Message;)Z", &message, 1, &consumed);
+      if (proxy_handled) {
+         if (vm->exception) return false;
          if (consumed.i) RETV();
+      } else {
+         struct dvm_method *hm = cc
+            ? dvm_find_method(vm, cc, "handleMessage", "(Landroid/os/Message;)Z")
+            : NULL;
+         if (hm) {
+            if (!dvm_call(vm, hm, handler_cb.l, &message, 1, &consumed))
+               return false;
+            if (consumed.i) RETV();
+         }
       }
    }
 
@@ -21968,6 +22029,7 @@ static const struct rt_method rt_message[] = {
    M("getWhen", "()J", msg_getWhen),
    M("getTarget", "()Landroid/os/Handler;", msg_getTarget),
    M("getCallback", "()Ljava/lang/Runnable;", msg_getCallback),
+   M("sendToTarget", "()V", msg_sendToTarget),
    M_END,
 };
 
@@ -22026,6 +22088,27 @@ static bool h_sendMessage(struct dvm *vm, dvm_ref self,
    RETI(1);
 }
 
+/* A Message carries its Handler as target.  Sending queues it on that
+ * Handler's Looper; dispatch occurs when the Looper processes the queue. */
+static bool msg_sendToTarget(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)args; (void)nargs; (void)out;
+   union dvm_value target = { 0 }, message = { .l = self }, sent = { 0 };
+   (void)dvm_get_field(vm, self, "target", "Landroid/os/Handler;", &target);
+   if (!target.l) {
+      dvm__throw(vm, "java/lang/NullPointerException", "Message.target");
+      return false;
+   }
+   if (!h_sendMessage(vm, target.l, &message, 1, &sent)) return false;
+   if (!sent.i) {
+      dvm__throw(vm, "java/lang/IllegalStateException", "Message queue full");
+      return false;
+   }
+   RETV();
+}
+
 static bool h_sendEmptyMessage(struct dvm *vm, dvm_ref self,
                                const union dvm_value *args, int nargs,
                                union dvm_value *out)
@@ -22036,8 +22119,7 @@ static bool h_sendEmptyMessage(struct dvm *vm, dvm_ref self,
    return h_sendMessage(vm, self, &one, 1, out);
 }
 
-/* HandlerThread: cooperative VM has one bytecode thread, so getLooper() is the
- * main looper and start() only marks the thread as live. */
+/* HandlerThread keeps the supplied name and owns its Looper. */
 static bool ht_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                     int nargs, union dvm_value *out)
 {
@@ -28195,7 +28277,17 @@ static bool looper_loop(struct dvm *vm, dvm_ref self,
          struct dvm_method *run =
             c ? dvm_find_method(vm, c, "run", "()V") : NULL;
          union dvm_value ret;
-         if (run) (void)dvm_call(vm, run, r, NULL, 0, &ret);
+         bool ok = true;
+         if (run) ok = dvm_call(vm, run, r, NULL, 0, &ret);
+         else if (class_extends_proxy(c)) {
+            struct dvm_class *iface =
+               dvm__class_by_desc(vm, "Ljava/lang/Runnable;");
+            ok = dvm_proxy_try_invoke(vm, r, iface, "run", "()V",
+                                      NULL, 0, &ret) && !vm->exception;
+         }
+         if (dvm__sched_trace_for(c ? c->name : NULL))
+            fprintf(stderr, "[sched] looper %u ran %s.run() ok=%d pending=%d\n",
+                    me, c ? c->name : "?", ok ? 1 : 0, vm->npending);
          dvm_unpin(vm, r);
          ran = true;
          break;
@@ -32924,6 +33016,13 @@ static const struct rt_method rt_url_util[] = {
    M_END,
 };
 
+/* What android.webkit.WebView reports: "; wv" and "Version/4.0" mark the
+ * embedded engine, and pages choose their mobile layouts from it. */
+#define WEBVIEW_DEFAULT_UA \
+   "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230901.001; wv) " \
+   "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/120.0.0.0 " \
+   "Mobile Safari/537.36"
+
 /* WebSettings.getDefaultUserAgent(Context) — IronSource probes this during
  * init to build its device profile. */
 static bool websettings_getDefaultUserAgent(struct dvm *vm, dvm_ref self,
@@ -32931,9 +33030,7 @@ static bool websettings_getDefaultUserAgent(struct dvm *vm, dvm_ref self,
                                             int nargs, union dvm_value *out)
 {
    (void)self; (void)args; (void)nargs;
-   RETL(dvm_new_string(vm,
-      "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"));
+   RETL(dvm_new_string(vm, WEBVIEW_DEFAULT_UA));
 }
 
 /* --- android.webkit.CookieManager --------------------------------------- */
@@ -32974,7 +33071,9 @@ static void cookie_host(const char *url, char *out, size_t cap)
    if (sep) p += (sep - p) + 3;
    while (*p == '.') ++p;
    size_t n = 0;
-   while (p[n] && p[n] != '/' && p[n] != ':' && p[n] != '?' && n + 1 < cap) ++n;
+   while (p[n] && p[n] != '/' && p[n] != ':' && p[n] != '?' &&
+          p[n] != ';' && p[n] != '#' && p[n] != ' ' && p[n] != '\t' &&
+          n + 1 < cap) ++n;
    memcpy(out, p, n);
    out[n] = '\0';
    for (size_t i = 0; i < n; ++i)
@@ -33034,6 +33133,7 @@ static void cookie_jar_set(struct cookie_jar *jar, const char *url,
    if (!spec) return;
    char host[256];
    cookie_host(url ? url : "", host, sizeof host);
+   if (!host[0]) return;
 
    const char *eq = strchr(spec, '=');
    const char *semi = strchr(spec, ';');
@@ -33050,7 +33150,11 @@ static void cookie_jar_set(struct cookie_jar *jar, const char *url,
       if (strncasecmp(k, "domain=", 7)) continue;
       char dom[256];
       cookie_host(k + 7, dom, sizeof dom);
-      if (dom[0]) memcpy(host, dom, sizeof dom);
+      /* RFC 6265 only permits a parent domain of the response host.  In
+       * particular, do not let a Set-Cookie header for one origin install a
+       * cookie for an unrelated origin. */
+      if (!dom[0] || !cookie_host_matches(dom, host)) return;
+      snprintf(host, sizeof host, "%s", dom);
       break;
    }
 
@@ -33067,6 +33171,10 @@ static size_t cookie_jar_header(struct cookie_jar *jar, const char *url,
 {
    char host[256];
    cookie_host(url ? url : "", host, sizeof host);
+   if (!host[0]) {
+      if (cap) out[0] = '\0';
+      return 0;
+   }
    size_t at = 0;
    if (cap) out[0] = '\0';
    for (size_t i = 0; i < jar->n; ++i) {
@@ -33107,6 +33215,7 @@ static bool cookie_setCookie(struct dvm *vm, dvm_ref self,
 
    char host[256];
    cookie_host(url ? url : "", host, sizeof host);
+   if (!host[0]) return true;
 
    const char *eq = strchr(spec, '=');
    const char *semi = strchr(spec, ';');
@@ -33122,7 +33231,8 @@ static bool cookie_setCookie(struct dvm *vm, dvm_ref self,
       if (strncasecmp(k, "domain=", 7)) continue;
       char dom[256];
       cookie_host(k + 7, dom, sizeof dom);
-      if (dom[0]) { memcpy(host, dom, sizeof dom); }
+      if (!dom[0] || !cookie_host_matches(dom, host)) return true;
+      snprintf(host, sizeof host, "%s", dom);
       break;
    }
 
@@ -38917,9 +39027,7 @@ static bool websettings_init(struct dvm *vm, dvm_ref self,
    (void)args; (void)nargs; (void)out;
    union dvm_value v = { .i = 1 };
    (void)dvm_set_field(vm, self, "javascriptEnabled", "Z", v);
-   v.l = dvm_new_string(vm,
-      "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+   v.l = dvm_new_string(vm, WEBVIEW_DEFAULT_UA);
    (void)dvm_set_field(vm, self, "userAgent", "Ljava/lang/String;", v);
    RETV();
 }
@@ -39011,15 +39119,16 @@ struct webview_host_view {
    struct lunaria_cdp_page page;
    char profile[256];
    char image[256];
-   unsigned capture_id;
-   uint64_t last_capture_ms;
+   bool casting;             /* Page.startScreencast sent: frames arrive on change */
    int width, height, sent_width, sent_height;
    float sent_zoom;
    char *url;                /* what it shows, to reload or re-open with */
+   char sent_ua[512];        /* the user agent the browser has */
    unsigned bridge_sent;     /* g_js_iface_seq the page has the shim for */
    unsigned cookies_sent;    /* g_webview_cookie_seq the browser has */
    unsigned cookie_pull_id;  /* Network.getAllCookies awaiting its reply */
    bool runtime_on;
+   bool fetch_on;            /* Fetch.enable sent: Fetch.requestPaused intercepts navigations */
    struct { unsigned id; dvm_ref cb; } evals[16];     /* awaiting a reply */
    int nevals;
    struct { char *js; dvm_ref cb; } queued[16];       /* before the page is up */
@@ -39248,6 +39357,31 @@ static char *webview_bridge_shim(dvm_ref view)
 }
 
 /* CookieManager's cookies into the page's browser. */
+/* The view's WebSettings user agent, as the page's navigator.userAgent and
+ * request header: pages pick mobile or desktop layouts from it. */
+static void webview_ua_sync(struct dvm *vm, struct webview_host_view *slot)
+{
+   union dvm_value settings = { 0 }, ua = { 0 };
+   (void)dvm_get_field(vm, slot->view, "settings", "Landroid/webkit/WebSettings;", &settings);
+   if (settings.l)
+      (void)dvm_get_field(vm, settings.l, "userAgent", "Ljava/lang/String;", &ua);
+   const char *text = ua.l ? dvm_string_utf8(vm, ua.l) : NULL;
+   if (!text || !*text) text = WEBVIEW_DEFAULT_UA;
+   if (!strcmp(text, slot->sent_ua)) return;
+   char *quoted = lunaria_cdp_json_quote(text);
+   if (!quoted) return;
+   size_t n = strlen(quoted) + 32;
+   char *params = malloc(n);
+   if (params) {
+      snprintf(params, n, "{\"userAgent\":%s}", quoted);
+      if (lunaria_cdp_page_command(&slot->page, "Emulation.setUserAgentOverride",
+                                   params, NULL) == 0)
+         snprintf(slot->sent_ua, sizeof slot->sent_ua, "%s", text);
+      free(params);
+   }
+   free(quoted);
+}
+
 static void webview_cookies_push(struct webview_host_view *slot)
 {
    if (slot->cookies_sent == g_webview_cookie_seq) return;
@@ -39305,6 +39439,10 @@ static void webview_bridge_sync(struct webview_host_view *slot)
       (void)lunaria_cdp_page_command(&slot->page, "Runtime.addBinding",
                                      "{\"name\":\"__lunariaBridge\"}", NULL);
       slot->runtime_on = true;
+   }
+   if (!slot->fetch_on) {
+      (void)lunaria_cdp_page_enable_fetch(&slot->page);
+      slot->fetch_on = true;
    }
    char *shim = webview_bridge_shim(slot->view);
    char *quoted = shim ? lunaria_cdp_json_quote(shim) : NULL;
@@ -39468,7 +39606,8 @@ static bool webview_host_open(struct webview_host_view *slot)
    slot->host_open = true;
    slot->sent_width = slot->sent_height = 0;
    slot->sent_zoom = 0.0f;
-   slot->capture_id = 0;
+   slot->sent_ua[0] = '\0';
+   slot->casting = false;
    return true;
 }
 
@@ -39581,6 +39720,31 @@ static void webview_call_client(struct dvm *vm, dvm_ref wv, const char *name,
    (void)dvm_call(vm, m, client.l, args, nargs, &ignored);
 }
 
+/* Calls shouldOverrideUrlLoading(WebView, String) on the registered client.
+ * Returns true if the client consumed the URL (navigation must be aborted). */
+static bool webview_should_override_url(struct dvm *vm, dvm_ref wv, const char *url_text)
+{
+   union dvm_value client = { 0 };
+   (void)dvm_get_field(vm, wv, "client",
+                       "Landroid/webkit/WebViewClient;", &client);
+   if (!client.l) return false;
+   struct dvm_class *lc = dvm_object_class(vm, client.l);
+   struct dvm_method *m = lc
+      ? dvm_find_method(vm, lc, "shouldOverrideUrlLoading",
+                        "(Landroid/webkit/WebView;Ljava/lang/String;)Z")
+      : NULL;
+   if (!m) return false;
+   dvm_ref url_ref = dvm_new_string(vm, url_text ? url_text : "");
+   union dvm_value args[2] = { { .l = wv }, { .l = url_ref } };
+   union dvm_value ret = { 0 };
+   if (!dvm_call(vm, m, client.l, args, 2, &ret))
+      ui_report_exception(vm, "shouldOverrideUrlLoading");
+   if (getenv("LUNARIA_WEB_TRACE"))
+      fprintf(stderr, "[webview] shouldOverrideUrlLoading(%s) -> %d\n",
+              url_text ? url_text : "", ret.i);
+   return ret.i != 0;
+}
+
 static void webview_start(struct dvm *vm, dvm_ref wv, dvm_ref url)
 {
    if (url) {
@@ -39623,13 +39787,6 @@ static void webview_host_capture_image(struct webview_host_view *slot,
       }
    }
    free(png);
-}
-
-static uint64_t webview_now_ms(void)
-{
-   struct timespec ts;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
 static void webview_send_text(struct lunaria_cdp_page *page,
@@ -39744,9 +39901,18 @@ static void webview_host_tick(struct dvm *vm)
          int eval_hit = -1;
          for (int k = 0; id >= 0 && k < slot->nevals; ++k)
             if ((long)slot->evals[k].id == id) eval_hit = k;
-         if (slot->capture_id && id == (long)slot->capture_id) {
-            slot->capture_id = 0;
+         if (strstr(message, "\"method\":\"Page.screencastFrame\"") &&
+             strstr(message, slot->page.session_id)) {
             webview_host_capture_image(slot, message);
+            /* the frame's own number (params.sessionId), then the next one */
+            for (const char *p = strstr(message, "\"sessionId\":"); p;
+                 p = strstr(p + 12, "\"sessionId\":")) {
+               if (p[12] < '0' || p[12] > '9') continue;
+               char ack[48];
+               snprintf(ack, sizeof ack, "{\"sessionId\":%ld}", strtol(p + 12, NULL, 10));
+               (void)lunaria_cdp_page_command(&slot->page, "Page.screencastFrameAck", ack, NULL);
+               break;
+            }
          } else if (eval_hit >= 0) {
             /* A ValueCallback's answer: the value's JSON ("null" when it
              * threw or was undefined). */
@@ -39773,6 +39939,27 @@ static void webview_host_tick(struct dvm *vm)
             (void)lunaria_cdp_page_command(&slot->page, "Network.getAllCookies", NULL,
                                            &slot->cookie_pull_id);
             webview_finish(vm, slot->view, slot->url_ref);
+         } else if (strstr(message, "\"method\":\"Fetch.requestPaused\"") &&
+                    strstr(message, slot->page.session_id)) {
+            /* Navigation interception for shouldOverrideUrlLoading.
+             * App-initiated navigations (slot->navigating) pass through;
+             * page-initiated navigations call the WebViewClient first. */
+            char request_id[128] = { 0 };
+            lunaria_cdp_json_string(message, "requestId",
+                                    request_id, sizeof request_id);
+            if (slot->navigating || !request_id[0]) {
+               (void)lunaria_cdp_page_fetch_continue(&slot->page, request_id);
+            } else {
+               char *nav_url = lunaria_cdp_json_string_dup(message, "url");
+               bool override = nav_url &&
+                               webview_should_override_url(vm, slot->view, nav_url);
+               if (override) {
+                  (void)lunaria_cdp_page_fetch_fail(&slot->page, request_id);
+               } else {
+                  (void)lunaria_cdp_page_fetch_continue(&slot->page, request_id);
+               }
+               free(nav_url);
+            }
          }
          free(message);
       }
@@ -39789,10 +39976,10 @@ static void webview_host_tick(struct dvm *vm)
          slot->sent_width = slot->width;
          slot->sent_height = slot->height;
          slot->sent_zoom = zoom;
-         slot->last_capture_ms = 0;     /* show the new scale right away */
       }
       /* The interface objects and CookieManager's cookies first, so the page
        * being loaded has them. */
+      webview_ua_sync(vm, slot);
       webview_bridge_sync(slot);
       webview_cookies_push(slot);
       for (int q = 0; q < slot->nqueued; ++q) {
@@ -39804,17 +39991,51 @@ static void webview_host_tick(struct dvm *vm)
          if (lunaria_cdp_page_navigate(&slot->page, slot->pending_url) == 0) {
             slot->navigating = true;
             slot->loaded = false;
-            slot->capture_id = 0;
          }
          free(slot->pending_url);
          slot->pending_url = NULL;
       }
-      const uint64_t now = webview_now_ms();
-      if (slot->loaded && !slot->capture_id &&
-          now - slot->last_capture_ms >= 500 &&
-          lunaria_cdp_page_capture(&slot->page, &slot->capture_id) == 0)
-         slot->last_capture_ms = now;
+      /* The picture: pushed by the browser whenever the page repaints. */
+      if (!slot->casting &&
+          lunaria_cdp_page_command(&slot->page, "Page.startScreencast",
+                                   "{\"format\":\"jpeg\",\"quality\":85}", NULL) == 0)
+         slot->casting = true;
    }
+}
+
+/* Chromium runs outside Android's virtual filesystem.  Resolve the
+ * WebView-only android_asset URL to the installed APK's extracted asset, so
+ * relative scripts and styles load from the same directory.  The Java-side
+ * URL remains the one supplied by the app. */
+static char *webview_host_url(const char *url)
+{
+   static const char prefix[] = "file:///android_asset/";
+   if (strncmp(url, prefix, sizeof prefix - 1) != 0) return strdup(url);
+   const char *relative = url + sizeof prefix - 1;
+   const char *suffix = strpbrk(relative, "?#");
+   size_t length = suffix ? (size_t)(suffix - relative) : strlen(relative);
+   if (!length || relative[0] == '/' ||
+       (length >= 2 && relative[0] == '.' && relative[1] == '.'))
+      return strdup(url);
+   for (size_t i = 0; i + 1 < length; ++i)
+      if (relative[i] == '/' && relative[i + 1] == '.' &&
+          (i + 2 == length || relative[i + 2] == '/' ||
+           (relative[i + 2] == '.' &&
+            (i + 3 == length || relative[i + 3] == '/'))))
+         return strdup(url);
+   char *entry = malloc(sizeof "assets/" + length);
+   if (!entry) return NULL;
+   memcpy(entry, "assets/", sizeof "assets/" - 1);
+   memcpy(entry + sizeof "assets/" - 1, relative, length);
+   entry[sizeof "assets/" - 1 + length] = '\0';
+   const char *path = arm_exec_apk_entry_path(entry);
+   free(entry);
+   if (!path) return strdup(url);
+   size_t need = sizeof "file://" - 1 + strlen(path) +
+                 (suffix ? strlen(suffix) : 0) + 1;
+   char *host = malloc(need);
+   if (host) snprintf(host, need, "file://%s%s", path, suffix ? suffix : "");
+   return host;
 }
 
 static bool webview_load_url(struct dvm *vm, dvm_ref self,
@@ -39847,7 +40068,7 @@ static bool webview_load_url(struct dvm *vm, dvm_ref self,
       webview_finish(vm, self, url);
       RETV();
    }
-   char *copy = strdup(text);
+   char *copy = webview_host_url(text);
    if (!copy) RETV();
    free(slot->pending_url);
    slot->pending_url = copy;
@@ -39856,6 +40077,27 @@ static bool webview_load_url(struct dvm *vm, dvm_ref self,
    slot->url_ref = url;
    webview_start(vm, self, url);
    fprintf(stderr, "[webview] loadUrl scheduled view=%u\n", (unsigned)self);
+   RETV();
+}
+
+static bool webview_reload_page(struct dvm *vm, dvm_ref self,
+                                const union dvm_value *args, int nargs,
+                                union dvm_value *out)
+{
+   (void)args; (void)nargs; (void)out;
+   struct webview_host_view *slot = webview_host_find(self);
+   if (!slot || !slot->host_open || !slot->url) RETV();
+   if (slot->page.stage != 4) {
+      free(slot->pending_url);
+      slot->pending_url = strdup(slot->url);
+      RETV();
+   }
+   if (lunaria_cdp_page_command(&slot->page, "Page.reload",
+                                "{\"ignoreCache\":false}", NULL) == 0) {
+      slot->navigating = true;
+      slot->loaded = false;
+      webview_start(vm, self, slot->url_ref);
+   }
    RETV();
 }
 
@@ -40005,7 +40247,7 @@ static const struct rt_method rt_webview[] = {
      "Ljava/lang/String;Ljava/lang/String;)V",
      webview_load_data),
    M("stopLoading", "()V", nop_void),
-   M("reload", "()V", nop_void),
+   M("reload", "()V", webview_reload_page),
    M("goBack", "()V", nop_void),
    M("goForward", "()V", nop_void),
    M("canGoBack", "()Z", ret_false),
@@ -40343,9 +40585,10 @@ static bool view_animate(struct dvm *vm, dvm_ref self,
 
 #define RT_MAX_PROPERTY_ANIMATIONS 64
 struct rt_property_animation {
-   dvm_ref animator, view;
+   dvm_ref animator, view, driver;
    float from, target;
    int64_t start_ms;
+   bool started;
 };
 static struct rt_property_animation g_property_animations[RT_MAX_PROPERTY_ANIMATIONS];
 static int g_nproperty_animations;
@@ -40365,6 +40608,24 @@ static float vpa_view_alpha(struct dvm *vm, dvm_ref view)
    return alpha.f;
 }
 
+/* ViewPropertyAnimator reports events with its underlying ValueAnimator, not
+ * the ViewPropertyAnimator returned by View.animate().  Keep that object alive
+ * for the span of the animation, including calls into an app's listener. */
+static void vpa_notify(struct dvm *vm, const struct rt_property_animation *anim,
+                       const char *name)
+{
+   union dvm_value listener = { 0 };
+   (void)dvm_get_field(vm, anim->animator, "listener",
+                       "Landroid/animation/Animator$AnimatorListener;", &listener);
+   if (!listener.l || !anim->driver) return;
+   struct dvm_class *cls = dvm_object_class(vm, listener.l);
+   struct dvm_method *method = cls ? dvm_find_method(vm, cls, name,
+                                  "(Landroid/animation/Animator;)V") : NULL;
+   if (!method) return;
+   union dvm_value arg = { .l = anim->driver }, ignored = { 0 };
+   (void)dvm_call(vm, method, listener.l, &arg, 1, &ignored);
+}
+
 static void vpa_begin(struct dvm *vm, dvm_ref animator, dvm_ref view, float target)
 {
    for (int i = 0; i < g_nproperty_animations; ++i) {
@@ -40379,9 +40640,9 @@ static void vpa_begin(struct dvm *vm, dvm_ref animator, dvm_ref view, float targ
    dvm_pin(vm, animator);
    dvm_pin(vm, view);
    g_property_animations[g_nproperty_animations++] =
-      (struct rt_property_animation){ animator, view,
-                                      vpa_view_alpha(vm, view), target,
-                                      vpa_now_ms() };
+      (struct rt_property_animation){ .animator = animator, .view = view,
+                                      .from = vpa_view_alpha(vm, view),
+                                      .target = target, .start_ms = vpa_now_ms() };
 }
 
 static void vpa_tick(struct dvm *vm)
@@ -40389,6 +40650,17 @@ static void vpa_tick(struct dvm *vm)
    const int64_t now = vpa_now_ms();
    for (int i = 0; i < g_nproperty_animations;) {
       struct rt_property_animation *anim = &g_property_animations[i];
+      if (!anim->started) {
+         anim->started = true;
+         struct dvm_class *cls = dvm__class_by_desc(
+            vm, "Landroid/animation/ValueAnimator;");
+         anim->driver = cls ? dvm_new_object(vm, cls) : 0;
+         if (anim->driver) dvm_pin(vm, anim->driver);
+         struct rt_property_animation started = *anim;
+         vpa_notify(vm, &started, "onAnimationStart");
+         /* A listener may cancel or replace the animation. */
+         continue;
+      }
       union dvm_value duration = { .j = 300 }, has_duration = { 0 };
       (void)dvm_get_field(vm, anim->animator, "durationSet", "Z", &has_duration);
       if (has_duration.i)
@@ -40404,10 +40676,13 @@ static void vpa_tick(struct dvm *vm)
       (void)dvm_set_field(vm, anim->view, "alphaSet", "Z", set);
       ui_invalidate();
       if (done) {
-         dvm_unpin(vm, anim->animator);
-         dvm_unpin(vm, anim->view);
+         struct rt_property_animation ended = *anim;
          g_property_animations[i] =
             g_property_animations[--g_nproperty_animations];
+         vpa_notify(vm, &ended, "onAnimationEnd");
+         if (ended.driver) dvm_unpin(vm, ended.driver);
+         dvm_unpin(vm, ended.animator);
+         dvm_unpin(vm, ended.view);
       } else {
          ++i;
       }
@@ -40443,6 +40718,16 @@ static bool vpa_set_duration(struct dvm *vm, dvm_ref self,
    RETL(self);
 }
 
+static bool vpa_set_listener(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   union dvm_value listener = { .l = nargs ? ARG(0).l : 0 };
+   (void)dvm_set_field(vm, self, "listener",
+                       "Landroid/animation/Animator$AnimatorListener;", listener);
+   RETL(self);
+}
+
 static bool vpa_start(struct dvm *vm, dvm_ref self,
                       const union dvm_value *args, int nargs,
                       union dvm_value *out)
@@ -40463,13 +40748,20 @@ static bool vpa_cancel(struct dvm *vm, dvm_ref self,
                        union dvm_value *out)
 {
    (void)args; (void)nargs; (void)out;
-   vpa_tick(vm);
+   /* A pending animation has not begun on the next frame yet.  Cancelling it
+    * must not first synthesize a start event (or an end event for duration 0). */
    for (int i = 0; i < g_nproperty_animations; ++i) {
       if (g_property_animations[i].animator != self) continue;
-      dvm_unpin(vm, self);
-      dvm_unpin(vm, g_property_animations[i].view);
+      struct rt_property_animation cancelled = g_property_animations[i];
       g_property_animations[i] =
          g_property_animations[--g_nproperty_animations];
+      if (cancelled.started) {
+         vpa_notify(vm, &cancelled, "onAnimationCancel");
+         vpa_notify(vm, &cancelled, "onAnimationEnd");
+      }
+      if (cancelled.driver) dvm_unpin(vm, cancelled.driver);
+      dvm_unpin(vm, cancelled.animator);
+      dvm_unpin(vm, cancelled.view);
       break;
    }
    RETV();
@@ -40478,6 +40770,7 @@ static bool vpa_cancel(struct dvm *vm, dvm_ref self,
 static const struct rt_method rt_view_property_animator[] = {
    M("alpha", "(F)Landroid/view/ViewPropertyAnimator;", vpa_alpha),
    M("setDuration", "(J)Landroid/view/ViewPropertyAnimator;", vpa_set_duration),
+   M("setListener", "(Landroid/animation/Animator$AnimatorListener;)Landroid/view/ViewPropertyAnimator;", vpa_set_listener),
    M("start", "()V", vpa_start),
    M("cancel", "()V", vpa_cancel),
 };
@@ -40488,6 +40781,7 @@ static const struct rt_field rt_view_property_animator_fields[] = {
    { "durationSet", "Z" },
    { "targetAlpha", "F" },
    { "targetAlphaSet", "Z" },
+   { "listener", "Landroid/animation/Animator$AnimatorListener;" },
 };
 
 /* clearFocus(): nothing in this view tree holds input focus — the IME is
@@ -40861,6 +41155,7 @@ static const struct rt_field rt_view_fields[] = {
    { "clickListener", "Landroid/view/View$OnClickListener;" },
    { "touchListener", "Landroid/view/View$OnTouchListener;" },
    { "id", "I" }, { "focusable", "Z" }, { "visibility", "I" },
+   { "fitsSystemWindows", "Z" },
    { "paddingLeft", "I" }, { "paddingTop", "I" },
    { "paddingRight", "I" }, { "paddingBottom", "I" },
    { "importantForAccessibility", "I" }, { "importantForAutofill", "I" },
@@ -41255,6 +41550,33 @@ static bool view_request_apply_insets(struct dvm *vm, dvm_ref self,
    RETV();
 }
 
+static bool view_set_fits_system_windows(struct dvm *vm, dvm_ref self,
+                                         const union dvm_value *args, int nargs,
+                                         union dvm_value *out)
+{
+   (void)nargs;
+   int32_t fits = ARG(0).i != 0;
+   union dvm_value old = { 0 };
+   (void)dvm_get_field(vm, self, "fitsSystemWindows", "Z", &old);
+   if ((old.i != 0) != fits) {
+      union dvm_value v = { .i = fits };
+      (void)dvm_set_field(vm, self, "fitsSystemWindows", "Z", v);
+      /* A changed inset policy takes effect on the next ViewRoot traversal. */
+      (void)view_request_apply_insets(vm, self, NULL, 0, out);
+   }
+   RETV();
+}
+
+static bool view_get_fits_system_windows(struct dvm *vm, dvm_ref self,
+                                         const union dvm_value *args, int nargs,
+                                         union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "fitsSystemWindows", "Z", &v);
+   RETI(v.i != 0);
+}
+
 static bool view_on_apply_window_insets(struct dvm *vm, dvm_ref self,
                                         const union dvm_value *args, int nargs,
                                         union dvm_value *out)
@@ -41429,6 +41751,8 @@ static const struct rt_method rt_view[] = {
    M("getTag", "(I)Ljava/lang/Object;", view_get_tag),
    M("setVisibility", "(I)V", view_set_visibility),
    M("getVisibility", "()I", view_get_visibility),
+   M("setFitsSystemWindows", "(Z)V", view_set_fits_system_windows),
+   M("getFitsSystemWindows", "()Z", view_get_fits_system_windows),
    M("setWillNotDraw", "(Z)V", nop_void),
    M("setEnabled", "(Z)V", view_set_enabled),
    M("isEnabled", "()Z", view_is_enabled),
@@ -45596,8 +45920,8 @@ static bool act_on_destroy(struct dvm *vm, dvm_ref self,
 }
 
 static bool act_get_title(struct dvm *vm, dvm_ref self,
-                          const union dvm_value *args, int nargs,
-                          union dvm_value *out)
+                           const union dvm_value *args, int nargs,
+                           union dvm_value *out)
 {
    (void)self; (void)args; (void)nargs;
    const char *package = getenv("ANDROID_PACKAGE_NAME");
@@ -46347,9 +46671,37 @@ static void act_tick(struct dvm *vm)
    }
 }
 
+static bool act_runOnUiThread(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   dvm_ref runnable = nargs ? ARG(0).l : 0;
+   if (!runnable) RETV();
+   if (!dvm_on_main_thread()) {
+      if (!queue_runnable_for(vm, runnable, false, 0, 0, self, 0)) {
+         dvm__throw(vm, "java/lang/IllegalStateException", "main queue full");
+         return false;
+      }
+      RETV();
+   }
+   struct dvm_class *c = dvm_object_class(vm, runnable);
+   struct dvm_method *run = c ? dvm_find_method(vm, c, "run", "()V") : NULL;
+   union dvm_value ignored = { 0 };
+   if (run) {
+      if (!dvm_call(vm, run, runnable, NULL, 0, &ignored)) return false;
+   } else {
+      struct dvm_class *iface = dvm__class_by_desc(vm, "Ljava/lang/Runnable;");
+      if (dvm_proxy_try_invoke(vm, runnable, iface, "run", "()V",
+                               NULL, 0, &ignored) && vm->exception)
+         return false;
+   }
+   RETV();
+}
+
 static const struct rt_method rt_activity[] = {
    /* Activity() is empty on a device; subclasses start with super(). */
    M("<init>", "()V", empty_void),
+   M("runOnUiThread", "(Ljava/lang/Runnable;)V", act_runOnUiThread),
    M("getTitle", "()Ljava/lang/CharSequence;", act_get_title),
    M("getReferrer", "()Landroid/net/Uri;", act_getReferrer),
    M("getApplication", "()Landroid/app/Application;", act_get_application),
@@ -48718,7 +49070,8 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
    if (!clickable) ui_puts(b2, "pointer-events:none;");
    ui_puts(b2, "}");
 
-   ui_printf(b, "<div id=\"v%u\" class=\"w %s\">", (unsigned)view, simple);
+   ui_printf(b, "<div id=\"v%u\" class=\"w %s%s\">", (unsigned)view,
+             simple, is_webview ? " lunaria-webview" : "");
    if (is_compound) {
       const bool checked = ui_int(vm, view, "checked") != 0;
       ui_printf(b, "<div id=\"v%ub\" class=\"cbox%s\"></div>", (unsigned)view,
@@ -51192,25 +51545,87 @@ static bool choreographer_post(struct dvm *vm, dvm_ref self,
                                const union dvm_value *args, int nargs,
                                union dvm_value *out)
 {
-   (void)self;
    dvm_ref callback = nargs ? ARG(0).l : 0;
-   struct dvm_class *c = callback ? dvm_object_class(vm, callback) : NULL;
-   struct dvm_method *method = c ? dvm_find_method(vm, c, "doFrame", "(J)V") : NULL;
-   if (method) {
-      struct timespec now = { 0 };
-      (void)clock_gettime(CLOCK_MONOTONIC, &now);
-      union dvm_value frame = {
-         .j = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec
-      }, ignored = { 0 };
-      if (!dvm_call(vm, method, callback, &frame, 1, &ignored)) return false;
+   if (!callback) {
+      dvm__throw(vm, "java/lang/NullPointerException", "FrameCallback");
+      return false;
+   }
+   struct dvm_class *fc = dvm__class_by_desc(vm, "Llunaria/ChoreographerFrame;");
+   dvm_ref frame = fc ? dvm_new_object(vm, fc) : 0;
+   if (!frame) return false;
+   union dvm_value value = { .l = callback };
+   (void)dvm_set_field(vm, frame, "callback",
+                       "Landroid/view/Choreographer$FrameCallback;", value);
+   /* The queue uses milliseconds; round the emulated 60 Hz period to 17 ms. */
+   if (!queue_runnable_for(vm, frame, false, 17, 0, self, callback)) {
+      dvm__throw(vm, "java/lang/IllegalStateException", "Choreographer queue full");
+      return false;
    }
    RETV();
 }
 
+static bool choreographer_frame_run(struct dvm *vm, dvm_ref self,
+                                    const union dvm_value *args, int nargs,
+                                    union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value callback = { 0 }, ignored = { 0 };
+   (void)dvm_get_field(vm, self, "callback",
+                       "Landroid/view/Choreographer$FrameCallback;", &callback);
+   if (!callback.l) RETV();
+   struct timespec now = { 0 };
+   (void)clock_gettime(CLOCK_MONOTONIC, &now);
+   union dvm_value frame = {
+      .j = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec
+   };
+   struct dvm_class *iface = dvm__class_by_desc(
+      vm, "Landroid/view/Choreographer$FrameCallback;");
+   if (dvm_proxy_try_invoke(vm, callback.l, iface, "doFrame", "(J)V",
+                            &frame, 1, &ignored)) {
+      if (vm->exception) return false;
+      RETV();
+   }
+   struct dvm_class *c = dvm_object_class(vm, callback.l);
+   struct dvm_method *method = c ? dvm_find_method(vm, c, "doFrame", "(J)V") : NULL;
+   if (method && !dvm_call(vm, method, callback.l, &frame, 1, &ignored))
+      return false;
+   RETV();
+}
+
+struct choreographer_cancel_key { dvm_ref owner, callback; };
+static bool choreographer_cancel_match(struct dvm *vm, int i, void *ctx)
+{
+   const struct choreographer_cancel_key *key = ctx;
+   return vm->pending_owner[i] == key->owner &&
+          vm->pending_token[i] == key->callback;
+}
+
+static bool choreographer_remove(struct dvm *vm, dvm_ref self,
+                                 const union dvm_value *args, int nargs,
+                                 union dvm_value *out)
+{
+   (void)out;
+   struct choreographer_cancel_key key = {
+      .owner = self, .callback = nargs ? ARG(0).l : 0
+   };
+   if (key.callback)
+      pending_drop(vm, choreographer_cancel_match, &key);
+   RETV();
+}
+
+static const struct rt_field rt_choreographer_frame_fields[] = {
+   { "callback", "Landroid/view/Choreographer$FrameCallback;" }, F_END
+};
+static const struct rt_method rt_choreographer_frame[] = {
+   M("run", "()V", choreographer_frame_run), M_END
+};
+
 static const struct rt_method rt_choreographer[] = {
    SM("getInstance", "()Landroid/view/Choreographer;", choreographer_instance),
    M("postFrameCallback", "(Landroid/view/Choreographer$FrameCallback;)V",
-     choreographer_post), M_END,
+     choreographer_post),
+   M("removeFrameCallback", "(Landroid/view/Choreographer$FrameCallback;)V",
+     choreographer_remove), M_END,
 };
 
 static bool object_store_first_ref(struct dvm *vm, dvm_ref self,
@@ -53096,22 +53511,30 @@ static const struct rt_method rt_cursor[] = {
    M_END,
 };
 
-static const struct rt_method rt_sqlite_statement[] = {
+static const struct rt_method rt_sqlite_closable[] = {
+   M("close", "()V", nop_void),
+   M_END,
+};
+
+static const struct rt_method rt_sqlite_program[] = {
    M("bindNull", "(I)V", nop_void),
    M("bindLong", "(IJ)V", nop_void),
    M("bindDouble", "(ID)V", nop_void),
    M("bindString", "(ILjava/lang/String;)V", nop_void),
    M("bindBlob", "(I[B)V", nop_void),
    M("clearBindings", "()V", nop_void),
+   M_END,
+};
+
+static const struct rt_method rt_sqlite_statement[] = {
    M("execute", "()V", sqlite_statement_execute),
    M("executeInsert", "()J", ret_one_long),
    M("executeUpdateDelete", "()I", ret_zero),
    M("simpleQueryForLong", "()J", ret_zero),
-   M("close", "()V", nop_void),
    M_END,
 };
 
-static const struct rt_field rt_sqlite_statement_fields[] = {
+static const struct rt_field rt_sqlite_program_fields[] = {
    { "database", "Landroid/database/sqlite/SQLiteDatabase;" },
    { "sql", "Ljava/lang/String;" }, F_END
 };
@@ -56418,7 +56841,7 @@ static bool ss_bind_to(struct dvm *vm, dvm_ref self, const char *addr,
       return false;
    }
    const bool v6 = addr && strchr(addr, ':');
-   int fd = socket(v6 ? AF_INET6 : AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+   int fd = host_socket_cloexec(v6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
    if (fd < 0) {
       dvm__throw(vm, "java/net/SocketException", "%s", strerror(errno));
       return false;
@@ -56541,7 +56964,7 @@ static bool ss_accept(struct dvm *vm, dvm_ref self,
    while (pr < 0 && errno == EINTR);
    if (pr == 0) timed_out = true;
    else if (pr > 0 && (p.revents & POLLIN)) {
-      do fd = accept4(lfd, (struct sockaddr *)&peer, &pl, SOCK_CLOEXEC);
+      do fd = host_accept_cloexec(lfd, (struct sockaddr *)&peer, &pl);
       while (fd < 0 && errno == EINTR);
       if (fd < 0) e = errno;
    } else {
@@ -63058,10 +63481,14 @@ static const struct rt_class rt_classes[] = {
      rt_persistable_bundle, NULL, NULL },
    { "Landroid/database/sqlite/SQLiteOpenHelper;", "Ljava/lang/Object;",
      rt_sqlite_helper, rt_sqlite_helper_fields, NULL },
-   { "Landroid/database/sqlite/SQLiteDatabase;", "Ljava/lang/Object;",
+   { "Landroid/database/sqlite/SQLiteClosable;", "Ljava/lang/Object;",
+     rt_sqlite_closable, NULL, rt_iface_closeable },
+   { "Landroid/database/sqlite/SQLiteDatabase;", "Landroid/database/sqlite/SQLiteClosable;",
      rt_sqlite_database, rt_sqlite_database_fields, NULL },
-   { "Landroid/database/sqlite/SQLiteStatement;", "Ljava/lang/Object;",
-     rt_sqlite_statement, rt_sqlite_statement_fields, NULL },
+   { "Landroid/database/sqlite/SQLiteProgram;", "Landroid/database/sqlite/SQLiteClosable;",
+     rt_sqlite_program, rt_sqlite_program_fields, NULL },
+   { "Landroid/database/sqlite/SQLiteStatement;", "Landroid/database/sqlite/SQLiteProgram;",
+     rt_sqlite_statement, NULL, NULL },
    { "Landroid/database/Cursor;", "Ljava/lang/Object;", rt_cursor,
      rt_cursor_fields, rt_iface_closeable },
    { "Ljava/io/FileOutputStream;", "Ljava/io/OutputStream;", rt_file_output,
@@ -63409,6 +63836,11 @@ static const struct rt_class rt_classes[] = {
    { "Landroid/view/View;", "Ljava/lang/Object;", rt_view, rt_view_fields, NULL },
    { "Landroid/view/ViewPropertyAnimator;", "Ljava/lang/Object;",
      rt_view_property_animator, rt_view_property_animator_fields, NULL },
+   { "Landroid/animation/Animator;", "Ljava/lang/Object;", NULL, NULL, NULL },
+   { "Landroid/animation/ValueAnimator;", "Landroid/animation/Animator;",
+     NULL, NULL, NULL },
+   { "Landroid/animation/Animator$AnimatorListener;", "Ljava/lang/Object;",
+     NULL, NULL, NULL },
    { "Landroid/view/View$MeasureSpec;", "Ljava/lang/Object;", rt_measure_spec,
      NULL, NULL },
    { "Landroid/view/WindowInsets;", "Ljava/lang/Object;", rt_window_insets,
@@ -63616,6 +64048,8 @@ static const struct rt_class rt_classes[] = {
      rt_pending_intent_fields, rt_iface_parcelable },
    { "Landroid/view/Choreographer;", "Ljava/lang/Object;", rt_choreographer,
      NULL, NULL },
+   { "Llunaria/ChoreographerFrame;", "Ljava/lang/Object;",
+     rt_choreographer_frame, rt_choreographer_frame_fields, NULL },
    { "Landroid/app/Fragment;", "Ljava/lang/Object;", rt_empty_ctor, NULL,
      NULL },
    { "Landroid/app/FragmentManager;", "Ljava/lang/Object;", rt_fragment_manager,

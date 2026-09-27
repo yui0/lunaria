@@ -1044,7 +1044,7 @@ static size_t dex_read_value(const struct dex_file *d, size_t p, struct dex_valu
          uint32_t n;
          size_t q = dex_uleb(d, p, &n);
          struct dex_value tmp;
-         for (uint32_t i = 0; i < n; ++i)
+         for (uint32_t i = 0; i < n && q < d->len; ++i)
             q = dex_read_value(d, q, &tmp);
          return q;
       }
@@ -1055,7 +1055,7 @@ static size_t dex_read_value(const struct dex_file *d, size_t p, struct dex_valu
          size_t q = dex_uleb(d, p, &ti);
          q = dex_uleb(d, q, &n);
          struct dex_value tmp;
-         for (uint32_t i = 0; i < n; ++i) {
+         for (uint32_t i = 0; i < n && q < d->len; ++i) {
             uint32_t ni;
             q = dex_uleb(d, q, &ni);
             q = dex_read_value(d, q, &tmp);

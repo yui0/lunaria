@@ -1815,7 +1815,11 @@ android_view_MotionEvent_obtain(JNIEnv *env, jclass clazz, va_list args)
    struct jvm *jvm = jnienv_get_jvm(env);
    jobject src = va_arg(args, jobject);
    lunaria_touch_event ev = {0};
-   if (!jvm || !jvm_motion_event_read(jvm, src, &ev))
+   bool valid = jvm && jvm_motion_event_read(jvm, src, &ev);
+   if (getenv("LUNARIA_TOUCH_DIAG"))
+      fprintf(stderr, "[motion] obtain source=%p valid=%d action=%d x=%.0f y=%.0f\n",
+              src, valid, ev.action, ev.x, ev.y);
+   if (!valid)
       return NULL;
    return jvm_new_motion_event(jvm, &ev);
 }
@@ -2210,21 +2214,6 @@ android_app_ApplicationErrorReport_getErrorReportReceiver(JNIEnv *env, jobject o
 {
    (void)env; (void)object;
    return NULL;
-}
-
-/* bitter.jnibridge.JNIBridge.newInterfaceProxy(long ptr, Class[] interfaces).
- * Creates a Java proxy that forwards interface calls to IL2CPP managed code via
- * JNIBridge.invoke().  In headless emulation there are no real Java callers, so
- * a stub object suffices — IL2CPP will hold it as a reference but Java will never
- * actually call back through it. */
-jobject
-bitter_jnibridge_JNIBridge_newInterfaceProxy(JNIEnv *env, jclass cls, va_list args)
-{
-   (void)cls; (void)args;
-   static jobject sv;
-   if (!sv)
-      sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/lang/Object"));
-   return sv;
 }
 
 /* Activity.executeMainThreadJobs() — Unity calls this from its render thread to
@@ -3325,9 +3314,6 @@ void java_lang_Class_triggerResizeCall(JNIEnv *e, jobject o, va_list a)
 DEF_VOID3(hideSoftInput)
 DEF_VOID3(startActivityIndicator)
 DEF_VOID3(stopActivityIndicator)
-/* runOnUiThread(Runnable): no-op at the stub layer.  When dvm is active the
- * bytecode emulator's hook_call_external runs the Runnable inline instead. */
-DEF_VOID3(runOnUiThread)
 #undef DEF_VOID3
 
 /* ---- android.view.Display ---- */

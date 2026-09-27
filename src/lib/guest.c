@@ -429,6 +429,18 @@ static inline uint32_t lh_memalign(struct lh_heap *h, uint32_t align, uint32_t s
    return payload;
 }
 
+/* bionic memalign accepts arbitrary alignments and rounds up to a power of
+ * two.  A value above 2^31 cannot be rounded within the 32-bit guest heap. */
+static inline bool lh_memalign_alignment(uint32_t align, uint32_t *rounded)
+{
+   if (align <= 1u) { *rounded = 1u; return true; }
+   if (align > 0x80000000u) return false;
+   uint32_t value = 1u;
+   while (value < align) value <<= 1;
+   *rounded = value;
+   return true;
+}
+
 static inline uint32_t lh_usable_size(const struct lh_heap *h, uint32_t va)
 {
    return lh_owns(h, va) ? lh_r32(h, va - LH_HDR) : 0u;
@@ -596,12 +608,7 @@ void *memalign(size_t align, size_t n)
       set_errno(ENOMEM);
       return 0;
    }
-   /* bionic rounds a non-power-of-two alignment up to one. */
-   if (a & (a - 1u)) {
-      uint32_t p2 = 1;
-      while (p2 < a && p2) p2 <<= 1;
-      a = p2;
-   }
+   if (!lh_memalign_alignment(a, &a)) { set_errno(ENOMEM); return 0; }
    heap_lock(h.ctl);
    const uint32_t off = lh_memalign(&h, a, size);
    heap_unlock(h.ctl);

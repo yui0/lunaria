@@ -1914,13 +1914,20 @@ static bool annotation_element_builtin(struct dvm *vm, dvm_ref self,
                  "annotation element has no encoded value");
       return false;
    }
+   /* An encoded value is offsets into the dex it was read from.  An element
+    * the use site left out takes the default declared on the annotation
+    * type, which may live in another dex of a multidex APK; decoding it
+    * against the use site's dex read unrelated bytes as nested arrays. */
+   struct dex_file *value_dex = obj->annotation_dex;
    bool found = dex_annotation_element(obj->annotation_dex,
                                        obj->annotation_off,
                                        method->name, &value);
-   if (!found && method->cls && method->cls->dex)
+   if (!found && method->cls && method->cls->dex) {
       found = dex_annotation_default(method->cls->dex,
                                      method->cls->class_def_idx,
                                      method->name, &value);
+      value_dex = method->cls->dex;
+   }
    if (!found) {
       dvm__throw(vm, "java/lang/annotation/IncompleteAnnotationException",
                  "%s.%s", method->cls && method->cls->name
@@ -1928,7 +1935,7 @@ static bool annotation_element_builtin(struct dvm *vm, dvm_ref self,
       return false;
    }
    const char *returns = strchr(method->sig, ')');
-   if (!returns || !annotation_value_to_dvm(vm, obj->annotation_dex, &value,
+   if (!returns || !annotation_value_to_dvm(vm, value_dex, &value,
                                             returns + 1, out)) {
       dvm__throw(vm, "java/lang/AnnotationFormatError", "%s.%s",
                  method->cls && method->cls->name ? method->cls->name : "?",
@@ -3559,6 +3566,8 @@ static int drain_pending(struct dvm *vm, bool nested)
          const int i = 0;
          struct dvm_class *c = dvm_object_class(vm, list[i]);
          struct dvm_method *run = c ? dvm_find_method(vm, c, "run", "()V") : NULL;
+         bool proxy_run = !run && c && c->super && c->super->name &&
+                          !strcmp(c->super->name, "java/lang/reflect/Proxy");
          /* How late this looper is.
           *
           * A Handler.postDelayed() callback is a deadline the app may be
@@ -3581,7 +3590,7 @@ static int drain_pending(struct dvm *vm, bool nested)
                        run && run->cls ? run->cls->name : "?",
                        (unsigned long long)(now - entry_due));
          }
-         if (run && (run->has_code || run->builtin)) {
+         if ((run && (run->has_code || run->builtin)) || proxy_run) {
             union dvm_value ret;
             uint64_t before = vm->steps;
             /* The Runnable gets a slice of its own, so it starts from zero.
@@ -3611,7 +3620,15 @@ static int drain_pending(struct dvm *vm, bool nested)
              * the difference, so Thread.currentThread() has to follow it. */
             dvm_ref saved_thread = vm->cur_thread;
             vm->cur_thread = is_thread[i] ? list[i] : 0;
-            bool ok = dvm_call(vm, run, list[i], NULL, 0, &ret);
+            bool ok;
+            if (proxy_run) {
+               struct dvm_class *iface =
+                  dvm__class_by_desc(vm, "Ljava/lang/Runnable;");
+               ok = dvm_proxy_try_invoke(vm, list[i], iface, "run", "()V",
+                                         NULL, 0, &ret) && !vm->exception;
+            } else {
+               ok = dvm_call(vm, run, list[i], NULL, 0, &ret);
+            }
             vm->cur_thread = saved_thread;
             vm->quiet_uncaught = saved_quiet;
             vm->step_limit = saved_limit;
@@ -3633,13 +3650,13 @@ static int drain_pending(struct dvm *vm, bool nested)
             if (parked_here) {
                bool requeued = dvm__queue_runnable_at(vm, list[i], is_thread[i],
                                                       DVM_PARK_RETRY_MS);
-               if (dvm__sched_trace_for(run->cls ? run->cls->name : NULL))
+               if (dvm__sched_trace_for(c ? c->name : NULL))
                   fprintf(stderr, "[sched] parked %s.run() depth=%d %s\n",
-                          run->cls ? run->cls->name : "?", vm->drain_depth,
+                          c && c->name ? c->name : "?", vm->drain_depth,
                           requeued ? "requeued" : "DROPPED (queue full)");
-            } else if (dvm__sched_trace_for(run->cls ? run->cls->name : NULL)) {
+            } else if (dvm__sched_trace_for(c ? c->name : NULL)) {
                fprintf(stderr, "[sched] ran %s.run() depth=%d steps=%llu\n",
-                       run->cls ? run->cls->name : "?", vm->drain_depth,
+                       c && c->name ? c->name : "?", vm->drain_depth,
                        (unsigned long long)(vm->steps - before));
             }
             static int log_n = 0;
@@ -3648,7 +3665,7 @@ static int drain_pending(struct dvm *vm, bool nested)
             const bool report = (log_n++ < 24 || vm->trace);
             if (report)
                fprintf(stderr, "[dvm] thread %s.run() ran %llu steps%s%s\n",
-                       run->cls ? run->cls->name : "?",
+                       c && c->name ? c->name : "?",
                        (unsigned long long)(vm->steps - before),
                        how[0] ? " — " : "", how[0] ? how : "");
             /* A Runnable that died of an exception is the interesting case, and

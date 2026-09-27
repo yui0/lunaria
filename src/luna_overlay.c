@@ -742,7 +742,7 @@ static void overlay_drain_pointer(void)
               parent = luna_element_parent(parent)) {
             LunaElement *e = luna_element_at(parent);
             if (e && e->id[0] == 'v' &&
-                strstr(e->class_name, "WebView")) {
+                strstr(e->class_name, "lunaria-webview")) {
                web_hit = true;
                if (batch[i].action == 1)
                   snprintf(g_web_pointer_capture,

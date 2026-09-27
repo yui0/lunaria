@@ -462,6 +462,58 @@ int lunaria_cdp_page_navigate(struct lunaria_cdp_page *page, const char *url)
    return status;
 }
 
+int lunaria_cdp_page_enable_fetch(struct lunaria_cdp_page *page)
+{
+   if (!page || !page->transport || !page->session_id[0]) return -1;
+   char command[320];
+   snprintf(command, sizeof command,
+      "{\"id\":%u,\"sessionId\":\"%s\","
+      "\"method\":\"Fetch.enable\","
+      "\"params\":{\"patterns\":[{\"resourceType\":\"Document\"}]}}",
+      page->next_id++, page->session_id);
+   return lunaria_cdp_send(page->transport, command);
+}
+
+int lunaria_cdp_page_fetch_continue(struct lunaria_cdp_page *page,
+                                    const char *request_id)
+{
+   if (!page || !page->transport || !page->session_id[0] || !request_id) return -1;
+   char *quoted = lunaria_cdp_json_quote(request_id);
+   if (!quoted) return -1;
+   size_t n = strlen(quoted) + strlen(page->session_id) + 128;
+   char *command = malloc(n);
+   if (!command) { free(quoted); return -1; }
+   snprintf(command, n,
+      "{\"id\":%u,\"sessionId\":\"%s\","
+      "\"method\":\"Fetch.continueRequest\","
+      "\"params\":{\"requestId\":%s}}",
+      page->next_id++, page->session_id, quoted);
+   int status = lunaria_cdp_send(page->transport, command);
+   free(command);
+   free(quoted);
+   return status;
+}
+
+int lunaria_cdp_page_fetch_fail(struct lunaria_cdp_page *page,
+                                const char *request_id)
+{
+   if (!page || !page->transport || !page->session_id[0] || !request_id) return -1;
+   char *quoted = lunaria_cdp_json_quote(request_id);
+   if (!quoted) return -1;
+   size_t n = strlen(quoted) + strlen(page->session_id) + 128;
+   char *command = malloc(n);
+   if (!command) { free(quoted); return -1; }
+   snprintf(command, n,
+      "{\"id\":%u,\"sessionId\":\"%s\","
+      "\"method\":\"Fetch.failRequest\","
+      "\"params\":{\"requestId\":%s,\"errorReason\":\"Aborted\"}}",
+      page->next_id++, page->session_id, quoted);
+   int status = lunaria_cdp_send(page->transport, command);
+   free(command);
+   free(quoted);
+   return status;
+}
+
 int lunaria_cdp_page_capture(struct lunaria_cdp_page *page,
                              unsigned *request_id)
 {

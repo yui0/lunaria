@@ -85,6 +85,13 @@ char *lunaria_cdp_json_raw(const char *json, const char *key);
 char *lunaria_cdp_json_string_dup(const char *json, const char *key);
 /* The same for a JSON string literal starting at p. */
 char *lunaria_cdp_json_string_at(const char *p);
+/* Enables Fetch domain with Document-type navigation interception. */
+int lunaria_cdp_page_enable_fetch(struct lunaria_cdp_page *page);
+/* Respond to a paused Fetch.requestPaused: let it proceed or abort it. */
+int lunaria_cdp_page_fetch_continue(struct lunaria_cdp_page *page,
+                                    const char *request_id);
+int lunaria_cdp_page_fetch_fail(struct lunaria_cdp_page *page,
+                                const char *request_id);
 /* Any method on the page's session; params_json is an object (or NULL). */
 int lunaria_cdp_page_command(struct lunaria_cdp_page *page, const char *method,
                              const char *params_json, unsigned *request_id);
