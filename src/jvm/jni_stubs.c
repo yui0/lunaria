@@ -1802,7 +1802,7 @@ android_view_MotionEvent_getSource(JNIEnv *env, jobject object, va_list args)
 static const lunaria_touch_event *
 motion_payload(JNIEnv *env, jobject object)
 {
-   static lunaria_touch_event scratch;
+   static _Thread_local lunaria_touch_event scratch;
    struct jvm *jvm = jnienv_get_jvm(env);
    return jvm && jvm_motion_event_read(jvm, object, &scratch) ? &scratch : NULL;
 }
@@ -1856,7 +1856,8 @@ android_view_MotionEvent_getActionIndex(JNIEnv *env, jobject object, va_list arg
 {
    assert(env && object);
    motion_trace("getActionIndex");
-   return 0;
+   const lunaria_touch_event *ev = motion_payload(env, object);
+   return ev ? ((ev->action >> 8) & 0xff) : 0;
 }
 
 jfloat
@@ -1900,7 +1901,7 @@ android_view_MotionEvent_getPointerCount(JNIEnv *env, jobject object, va_list ar
 {
    assert(env && object);
    motion_trace("getPointerCount");
-   return 1;
+   return luna_event_count(motion_payload(env, object));
 }
 
 jint
@@ -1908,7 +1909,7 @@ android_view_MotionEvent_getPointerId(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
    motion_trace("getPointerId");
-   return 0;
+   return luna_event_id(motion_payload(env, object), va_arg(args, int));
 }
 
 jlong
@@ -3628,4 +3629,22 @@ jstring
 com_blizzard_wtcg_hearthstone_DeviceSettings_GetModelNumber(JNIEnv *env, jobject object)
 {
    return (*env)->NewStringUTF(env, "0");
+}
+
+/* Indexed and non-indexed MotionEvent getters have distinct JNI signatures. */
+jfloat android_view_MotionEvent_getX__I(JNIEnv *e, jobject o, va_list a)
+{ return luna_event_x(motion_payload(e, o), va_arg(a, int)); }
+jfloat android_view_MotionEvent_getY__I(JNIEnv *e, jobject o, va_list a)
+{ return luna_event_y(motion_payload(e, o), va_arg(a, int)); }
+jfloat android_view_MotionEvent_getRawX__I(JNIEnv *e, jobject o, va_list a)
+{ return luna_event_x(motion_payload(e, o), va_arg(a, int)); }
+jfloat android_view_MotionEvent_getRawY__I(JNIEnv *e, jobject o, va_list a)
+{ return luna_event_y(motion_payload(e, o), va_arg(a, int)); }
+jint android_view_MotionEvent_findPointerIndex(JNIEnv *e, jobject o, va_list a)
+{
+   const lunaria_touch_event *ev = motion_payload(e, o);
+   int id = va_arg(a, int);
+   for (int i = 0; i < luna_event_count(ev); ++i)
+      if (luna_event_id(ev, i) == id) return i;
+   return -1;
 }

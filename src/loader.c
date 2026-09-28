@@ -32,14 +32,7 @@
 static lunaria_touch_event
 touch_to_lunaria(const ArmExecTouchEvent *te)
 {
-   lunaria_touch_event ev = {
-      .action = te->action,
-      .x = te->x,
-      .y = te->y,
-      .event_ms = te->event_ms,
-      .down_ms = te->down_ms,
-   };
-   return ev;
+   return *te;
 }
 #include "dvm/dvm_media.h"
 
@@ -639,8 +632,13 @@ static void thread_dump_request_tick(void)
    static int every;
    if (++every < 30) return;   /* ~twice a second at 60 fps */
    every = 0;
-   if (access("/tmp/lunaria-threads", F_OK) != 0) return;
-   unlink("/tmp/lunaria-threads");
+   /* /tmp/lunaria-threads.<pid> names one process when several run; the
+    * bare name is whichever process polls it first. */
+   char own[64];
+   snprintf(own, sizeof own, "/tmp/lunaria-threads.%d", (int)getpid());
+   if (access(own, F_OK) == 0) unlink(own);
+   else if (access("/tmp/lunaria-threads", F_OK) == 0) unlink("/tmp/lunaria-threads");
+   else return;
    fprintf(stderr, "[threads] dump requested\n");
    arm64_exec_svc_ring_dump();
 }
@@ -1294,6 +1292,7 @@ pump_now_us(void)
 static void
 pump_java_frame(void)
 {
+   thread_dump_request_tick();
    const uint64_t t_media = frame_now_ns();
    struct dvm *vm = dvm_jni_vm();
    if (vm) {
@@ -1618,8 +1617,8 @@ run_ue4_game_arm(struct jvm *jvm)
 
    fprintf(stderr, "[loader] UE4 entering pump loop (max_frames=%d)\n", max_frames);
    for (int frame = 0; max_frames <= 0 || frame < max_frames; ++frame) {
-      if (arm_exec_guest_abort_count() > 0) {
-         fprintf(stderr, "[loader] guest abort — stopping UE4 loop (frame %d)\n", frame);
+      if (arm_exec_guest_exit_count() > 0 || arm_exec_guest_abort_count() > 0) {
+         fprintf(stderr, "[loader] guest process terminated — stopping UE4 loop (frame %d)\n", frame);
          break;
       }
       pump_run_frame(arm_exec_run_pending_threads);
@@ -2127,8 +2126,8 @@ run_ue4_game_arm64(struct jvm *jvm)
 
    fprintf(stderr, "[loader] UE arm64 entering pump loop (max_frames=%d)\n", max_frames);
    for (int frame = 0; max_frames <= 0 || frame < max_frames; ++frame) {
-      if (arm_exec_guest_abort_count() > 0) {
-         fprintf(stderr, "[loader] guest abort — stopping UE arm64 loop (frame %d)\n", frame);
+      if (arm_exec_guest_exit_count() > 0 || arm_exec_guest_abort_count() > 0) {
+         fprintf(stderr, "[loader] guest process terminated — stopping UE arm64 loop (frame %d)\n", frame);
          break;
       }
       touch_test_tick(frame);
@@ -2166,7 +2165,6 @@ run_ue4_game_arm64(struct jvm *jvm)
       dvm_gil_yield(dvm_current());
       stall_watch_tick();
       perf_tick();
-      thread_dump_request_tick();
       if (frame < 5 || frame % 50 == 0)
          fprintf(stderr, "[loader] UE arm64 pump frame %d\n", frame);
       if (arm64_exec_glfw_should_close()) break;

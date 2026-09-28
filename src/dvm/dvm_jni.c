@@ -173,6 +173,97 @@ static void remember_wrapper(uint32_t host, dvm_ref ref)
    slot->ref = ref;
 }
 
+/* Remove an entry without breaking the probe chain following it. */
+static void forget_wrapper(uint32_t host, dvm_ref ref)
+{
+   struct dvm_wrapper *slot = wrapper_slot(g_wrappers, g_wrapper_cap, host);
+   if (!slot || slot->host != host || slot->ref != ref) return;
+   size_t i = (size_t)(slot - g_wrappers);
+   memset(slot, 0, sizeof *slot);
+   --g_nwrappers;
+   for (size_t j = (i + 1) & (g_wrapper_cap - 1); g_wrappers[j].host;
+        j = (j + 1) & (g_wrapper_cap - 1)) {
+      struct dvm_wrapper moved = g_wrappers[j];
+      memset(&g_wrappers[j], 0, sizeof g_wrappers[j]);
+      *wrapper_slot(g_wrappers, g_wrapper_cap, moved.host) = moved;
+   }
+}
+
+/* JNI locals made while converting bytecode arguments belong to the native
+ * call, not to the DVM heap object they came from.  Track only fresh handles;
+ * already bound objects keep their established identity. */
+extern bool arm_exec_release_guest_direct_buffer(uint32_t handle);
+struct bridge_local { jobject handle; dvm_ref source; bool direct; };
+struct bridge_frame {
+   struct bridge_frame *prev;
+   struct bridge_local *locals;
+   size_t count, capacity;
+};
+static _Thread_local struct bridge_frame *g_bridge_frame;
+
+static void bridge_record(jobject handle, dvm_ref source, bool direct)
+{
+   struct bridge_frame *f = g_bridge_frame;
+   if (!f || !handle) return;
+   if (f->count == f->capacity) {
+      size_t cap = f->capacity ? f->capacity * 2 : 16;
+      struct bridge_local *p = realloc(f->locals, cap * sizeof *p);
+      if (!p) return;
+      f->locals = p;
+      f->capacity = cap;
+   }
+   f->locals[f->count++] = (struct bridge_local){ handle, source, direct };
+}
+
+static bool bridge_release_one(struct dvm *vm, JNIEnv *env, struct jvm *jvm,
+                               const struct bridge_local *local)
+{
+   const int refs = jvm_bridge_ref_count(jvm, local->handle);
+   if (refs > 1) {
+      (*env)->DeleteLocalRef(env, local->handle);
+      return false;  /* a global reference still owns this handle */
+   }
+   struct dvm_object *o = local->source ? dvm__obj(vm, local->source) : NULL;
+   if (o && o->host_handle == (uint32_t)(uintptr_t)local->handle) {
+      o->host_handle = 0;
+      forget_wrapper((uint32_t)(uintptr_t)local->handle, local->source);
+   }
+   const bool released = jvm_release_bridge_local(jvm, local->handle);
+   if (local->direct && released)
+      arm_exec_release_guest_direct_buffer((uint32_t)(uintptr_t)local->handle);
+   return released;
+}
+
+static void bridge_end(struct dvm *vm, JNIEnv *env, struct bridge_frame *f)
+{
+   struct jvm *jvm = jnienv_get_jvm(env);
+   /* A retained array may still point to any of its converted elements.
+    * Keep the entire group when native code made a global reference. */
+   bool retained = false;
+   for (size_t i = 0; i < f->count; ++i)
+      if (!f->locals[i].direct &&
+          jvm_bridge_ref_count(jvm, f->locals[i].handle) > 1)
+         retained = true;
+   size_t released = 0;
+   for (size_t i = f->count; i > 0; --i) {
+      const struct bridge_local *local = &f->locals[i - 1];
+      /* A global object array can retain any converted element.  Direct
+       * buffers are independent and can always release their own local. */
+      if (retained && !local->direct &&
+          jvm_bridge_ref_count(jvm, local->handle) <= 1) continue;
+      if (bridge_release_one(vm, env, jvm, local)) ++released;
+   }
+   if (released) {
+      static unsigned long long total;
+      unsigned long long before = total;
+      total += released;
+      if (before / 10000 != total / 10000)
+         fprintf(stderr, "[dvm-jni] released %llu bridge locals\n", total);
+   }
+   g_bridge_frame = f->prev;
+   free(f->locals);
+}
+
 static dvm_ref wrapper_for(struct dvm *vm, JNIEnv *env,
                            const char *class_name, uint32_t host)
 {
@@ -372,6 +463,7 @@ static uint32_t dvm_direct_buffer_to_host(struct dvm *vm, dvm_ref r)
       if (!o) return 0;
       o->host_handle = handle;
       remember_wrapper(handle, r);
+      bridge_record((jobject)(uintptr_t)handle, r, true);
    }
    uint64_t cap = 0;
    void *dst = arm_exec_direct_buffer_host(handle, &cap);
@@ -515,6 +607,7 @@ static jobject dvm_array_to_host(struct dvm *vm, JNIEnv *env, dvm_ref r)
           * refers back to this array then finds it instead of building a
           * second one. */
          o->host_handle = (uint32_t)(uintptr_t)h;
+         bridge_record(h, r, false);
          const dvm_ref *items = (const dvm_ref *)o->data;
          for (jsize i = 0; items && i < n; ++i)
             (*env)->SetObjectArrayElement(env, (jobjectArray)h, i,
@@ -525,6 +618,7 @@ static jobject dvm_array_to_host(struct dvm *vm, JNIEnv *env, dvm_ref r)
    if (!h) return NULL;
    if (n > 0 && o->data) ARRAY_REGION(env, Set, kind, h, n, o->data);
    o->host_handle = (uint32_t)(uintptr_t)h;
+   bridge_record(h, r, false);
    return h;
 }
 
@@ -544,7 +638,11 @@ static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
    if (arr) return arr;
 
    const char *s = dvm_string_utf8(vm, r);
-   if (s) return (jobject)(*env)->NewStringUTF(env, s);
+   if (s) {
+      jobject h = (jobject)(*env)->NewStringUTF(env, s);
+      bridge_record(h, 0, false);
+      return h;
+   }
 
    struct dvm_class *c = dvm_object_class(vm, r);
    if (getenv("LUNARIA_TRACE_JNI")) {
@@ -654,6 +752,7 @@ static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
        * Record the reverse edge now; otherwise from_jobject() wraps the host
        * handle as a fresh VM object and loses every instance field. */
       remember_wrapper(obj->host_handle, r);
+      bridge_record(o, r, false);
    }
    return o;
 }
@@ -943,8 +1042,9 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
          dvm_find_class(vm, "android/content/pm/ApplicationInfo");
       dvm_ref ai = ac ? dvm_new_object(vm, ac) : 0;
       if (!ai) return false;
-      struct dvm_class *bc = dvm_find_class(vm, "android/os/Bundle");
-      union dvm_value v = { .l = bc ? dvm_new_object(vm, bc) : 0 };
+      const char *meta_pkg = getenv("ANDROID_PACKAGE_NAME");
+      union dvm_value v = { .l = meta_pkg && !strcmp(meta_pkg, record.name)
+                               ? dvm_runtime_manifest_bundle(vm) : 0 };
       (void)dvm_set_field(vm, ai, "metaData", "Landroid/os/Bundle;", v);
       dvm_fill_registered_application_info(vm, ai, &record);
       const char *pkg = getenv("ANDROID_PACKAGE_NAME");
@@ -977,8 +1077,8 @@ static bool hook_call_external(void *user, struct dvm *vm, const char *class_nam
       /* Same ApplicationInfo the getApplicationInfo path builds: manifest
        * meta-data is read straight off pi.applicationInfo.metaData. */
       {
-         struct dvm_class *bc = dvm_find_class(vm, "android/os/Bundle");
-         union dvm_value bv = { .l = bc ? dvm_new_object(vm, bc) : 0 };
+         union dvm_value bv = { .l = self_pkg && !strcmp(self_pkg, record.name)
+                                   ? dvm_runtime_manifest_bundle(vm) : 0 };
          if (bv.l) (void)dvm_set_field(vm, ai, "metaData", "Landroid/os/Bundle;", bv);
       }
       /* Play Core's SplitInstallInfoProvider reads the installed split set off
@@ -1255,19 +1355,25 @@ static bool hook_call_native(void *user, struct dvm *vm, const char *class_name,
    (void)user;
    if (!g_guest_native || !current_env()) return false;
 
+   JNIEnv *env = current_env();
+   struct bridge_frame frame = { .prev = g_bridge_frame };
+   g_bridge_frame = &frame;
+
    jvalue jargs[64];
    memset(jargs, 0, sizeof jargs);
    for (int i = 0; i < nargs && i < 64; ++i) {
       char one[256];
       if (!dvm__sig_param(sig, i, one, sizeof one)) break;
-      jargs[i] = dvm_to_jvalue(vm, current_env(), dvm__kind_of(one), args[i]);
+      jargs[i] = dvm_to_jvalue(vm, env, dvm__kind_of(one), args[i]);
    }
 
    jvalue ret;
    memset(&ret, 0, sizeof ret);
-   jobject jself = self ? to_jobject(vm, current_env(), self) : NULL;
-   if (!g_guest_native(class_name, method, sig, is_static, jself, jargs, nargs, &ret))
+   jobject jself = self ? to_jobject(vm, env, self) : NULL;
+   if (!g_guest_native(class_name, method, sig, is_static, jself, jargs, nargs, &ret)) {
+      bridge_end(vm, env, &frame);
       return false;
+   }
    /* The native may have written into a direct buffer's guest region; the
     * bytes have to be back in the VM's array before bytecode reads them
     * again (UnityWebRequest's upload loop reads array() on the next line). */
@@ -1288,8 +1394,9 @@ static bool hook_call_native(void *user, struct dvm *vm, const char *class_name,
       case 'J': out->j = ret.j; break;
       case 'F': out->f = ret.f; break;
       case 'D': out->d = ret.d; break;
-      default:  out->l = from_jobject(vm, current_env(), ret.l); break;
+      default:  out->l = from_jobject(vm, env, ret.l); break;
    }
+   bridge_end(vm, env, &frame);
    return true;
 }
 

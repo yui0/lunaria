@@ -4537,6 +4537,13 @@ void dvm_destroy(struct dvm *vm)
    /* A pending apply() must reach the disk before the process goes away. */
    dvm_prefs_flush(vm);
 
+   free(vm->pending_threads);
+   free(vm->pending_is_thread);
+   free(vm->pending_due_ms);
+   free(vm->pending_looper);
+   free(vm->pending_owner);
+   free(vm->pending_token);
+
    for (uint32_t i = 0; i < vm->heap_size; ++i) {
       struct dvm_object *o = heap_slot(vm, i + 1u);
       free(o->utf8);

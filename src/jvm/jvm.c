@@ -158,7 +158,7 @@ jvm_object_release(struct jvm_object *o)
    if (!o || o->type == JVM_OBJECT_NONE)
       return;
 
-   void (*destructor[])(struct jvm_object *o) = {
+   void (*destructor[JVM_OBJECT_LAST])(struct jvm_object *o) = {
       NULL,
       NULL,
       release_array,
@@ -218,10 +218,15 @@ static bool
 compare_motion(const struct jvm_object *a, const struct jvm_object *b)
 {
    assert(a && b);
-   return a->motion.action == b->motion.action &&
-          a->motion.x == b->motion.x && a->motion.y == b->motion.y &&
-          a->motion.event_ms == b->motion.event_ms &&
-          a->motion.down_ms == b->motion.down_ms;
+   if (a->motion.action != b->motion.action ||
+       a->motion.event_ms != b->motion.event_ms ||
+       a->motion.down_ms != b->motion.down_ms ||
+       luna_event_count(&a->motion) != luna_event_count(&b->motion)) return false;
+   for (int i = 0; i < luna_event_count(&a->motion); ++i)
+      if (luna_event_id(&a->motion, i) != luna_event_id(&b->motion, i) ||
+          luna_event_x(&a->motion, i) != luna_event_x(&b->motion, i) ||
+          luna_event_y(&a->motion, i) != luna_event_y(&b->motion, i)) return false;
+   return true;
 }
 
 static jobject
@@ -407,6 +412,38 @@ jvm_deref_object(struct jvm *jvm, jobject object)
    if (idx < jvm->next_object)
       jvm->next_object = idx;
    jvm_meta_unlock();
+}
+
+int
+jvm_bridge_ref_count(struct jvm *jvm, jobject object)
+{
+   if (!jvm || !object || (uintptr_t)object > ARRAY_SIZE(jvm->objects))
+      return 0;
+   jvm_meta_lock();
+   struct jvm_object *o = jvm_get_object(jvm, object);
+   int refs = o->type == JVM_OBJECT_NONE ? 0 : o->refs;
+   jvm_meta_unlock();
+   return refs;
+}
+
+bool
+jvm_release_bridge_local(struct jvm *jvm, jobject object)
+{
+   if (!jvm || !object || (uintptr_t)object > ARRAY_SIZE(jvm->objects))
+      return false;
+   jvm_meta_lock();
+   struct jvm_object *o = jvm_get_object(jvm, object);
+   if (o->type == JVM_OBJECT_NONE || o->refs != 1) {
+      jvm_meta_unlock();
+      return false;
+   }
+   uintptr_t idx = (uintptr_t)object - 1;
+   jvm_object_release(o);
+   jvm->wrap_cached[idx] = false;
+   jvm->wrap_cache[idx] = NULL;
+   if (idx < jvm->next_object) jvm->next_object = idx;
+   jvm_meta_unlock();
+   return true;
 }
 
 static jobject
@@ -1102,6 +1139,12 @@ jvm_wrap_method_uncached(struct jvm *jvm, jmethodID method_id)
    jvm_form_symbol(jvm, &method, symbol, sizeof(symbol));
 
    void *sym;
+   if (!strcmp(method.signature.data, "(I)F")) {
+      char indexed[260];
+      snprintf(indexed, sizeof indexed, "%s__I", symbol);
+      if ((sym = wrapper_create(indexed, dlsym(RTLD_DEFAULT, indexed))))
+         return sym;
+   }
    if ((sym = wrapper_create(symbol, dlsym(RTLD_DEFAULT, symbol))))
       return sym;
 
@@ -2656,13 +2699,7 @@ jvm_new_motion_event(struct jvm *jvm, const lunaria_touch_event *ev)
    struct jvm_object o = {
       .this_klass = jvm_make_class(jvm, "android/view/MotionEvent"),
       .type = JVM_OBJECT_MOTION,
-      .motion = {
-         .action = ev->action,
-         .x = ev->x,
-         .y = ev->y,
-         .event_ms = ev->event_ms,
-         .down_ms = ev->down_ms,
-      },
+      .motion = *ev,
    };
    return jvm_add_object(jvm, &o);
 }
@@ -2673,11 +2710,7 @@ jvm_motion_event_read(struct jvm *jvm, jobject object, lunaria_touch_event *out)
    struct jvm_object *o = jvm_get_object(jvm, object);
    if (!o || o->type != JVM_OBJECT_MOTION || !out)
       return false;
-   out->action = o->motion.action;
-   out->x = o->motion.x;
-   out->y = o->motion.y;
-   out->event_ms = o->motion.event_ms;
-   out->down_ms = o->motion.down_ms;
+   *out = o->motion;
    return true;
 }
 

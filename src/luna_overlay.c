@@ -21,6 +21,8 @@
 
 #include "luna_overlay.h"
 #include <sys/stat.h>
+#include <dirent.h>
+#include "luna_keymap.h"
 #include <stdarg.h>
 #include "lunaria_os.h"
 #include "dvm/dvm.h"
@@ -639,7 +641,7 @@ void luna_overlay_set_menu(const char *html, const char *css, bool modal)
 bool luna_overlay_menu_showing(void)
 {
    pthread_mutex_lock(&g_doc_lock);
-   const bool up = g_menu_html != NULL;
+   const bool up = g_menu_html != NULL && g_menu_modal;
    pthread_mutex_unlock(&g_doc_lock);
    return up && !g_failed;
 }
@@ -1228,7 +1230,7 @@ float luna_overlay_line_height(float px)
  * The emulator's menu (right click)
  * ======================================================================== */
 
-enum { SUB_NONE, SUB_SOUND, SUB_ZOOM, SUB_ENGINE };
+enum { SUB_NONE, SUB_SOUND, SUB_ZOOM, SUB_ENGINE, SUB_KEYMAP };
 
 #define MENU_W 248
 #define ROW_H 24
@@ -1245,6 +1247,64 @@ static char   g_menu_dev_name[MAX_DEVICES][128], g_menu_dev_desc[MAX_DEVICES][12
 static int    g_menu_ndev;
 static char   g_menu_notice[256];
 static double g_menu_notice_until;
+#define KEYMAP_PAGE 10
+struct keymap_file { char name[256]; int directory; };
+static struct keymap_file *g_keyfiles;
+static int g_keyfiles_cap;
+static char g_keydir[4096];
+static int g_nkeyfiles, g_keypage;
+static bool g_keydir_error;
+static int keyfile_compare(const void *a, const void *b)
+{
+   const struct keymap_file *x = a, *y = b;
+   return x->directory != y->directory ? y->directory - x->directory : strcmp(x->name, y->name);
+}
+static bool keyfile_path(char *out, size_t cap, const char *name)
+{
+   return snprintf(out, cap, "%s%s%s", g_keydir, !strcmp(g_keydir, "/") ? "" : "/", name) < (int)cap;
+}
+static void keyfiles_read(void)
+{
+   g_nkeyfiles = 0; g_keypage = 0;
+   if (!g_keydir[0]) {
+      char path[4096]; luna_keymap_current(path, sizeof path);
+      if (strcmp(path, "off")) snprintf(g_keydir, sizeof g_keydir, "%s", path);
+      else if (luna_os_executable_path(g_keydir, sizeof g_keydir) < 0) strcpy(g_keydir, ".");
+      char *slash = strrchr(g_keydir, '/');
+      if (slash) {
+         *slash = 0;
+         if (!strcmp(path, "off")) {
+            size_t n = strlen(g_keydir);
+            if (n + 9 < sizeof g_keydir) strcpy(g_keydir + n, "/keymaps");
+         }
+      } else strcpy(g_keydir, ".");
+      if (!g_keydir[0]) strcpy(g_keydir, "/");
+   }
+   char resolved[4096];
+   if (realpath(g_keydir, resolved)) snprintf(g_keydir, sizeof g_keydir, "%s", resolved);
+   DIR *dir = opendir(g_keydir);
+   g_keydir_error = !dir;
+   if (!dir) return;
+   struct dirent *entry;
+   while ((entry = readdir(dir))) {
+      if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+      char path[4096]; struct stat st;
+      if (!keyfile_path(path, sizeof path, entry->d_name) || stat(path, &st) ||
+          (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))) continue;
+      if (g_nkeyfiles == g_keyfiles_cap) {
+         int cap = g_keyfiles_cap ? g_keyfiles_cap * 2 : 32;
+         void *files = realloc(g_keyfiles, (size_t)cap * sizeof g_keyfiles[0]);
+         if (!files) { g_keydir_error = true; break; }
+         g_keyfiles = files; g_keyfiles_cap = cap;
+      }
+      struct keymap_file *f = &g_keyfiles[g_nkeyfiles++];
+      snprintf(f->name, sizeof f->name, "%s", entry->d_name);
+      f->directory = S_ISDIR(st.st_mode);
+   }
+   closedir(dir);
+   qsort(g_keyfiles, g_nkeyfiles, sizeof g_keyfiles[0], keyfile_compare);
+}
+
 
 /* macOS context-menu look: a translucent vibrancy panel, 13px system text,
  * rounded selection in the accent blue, hairline separators. */
@@ -1348,7 +1408,7 @@ static int menu_clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi
 
 /* The main panel's rows; returns its height and the top of each submenu's
  * parent row. */
-static int menu_main_rows(struct menu_buf *b, int *sound_y, int *zoom_y, int *engine_y)
+static int menu_main_rows(struct menu_buf *b, int *sound_y, int *zoom_y, int *engine_y, int *keymap_y)
 {
    int y = PAD;
    char v[64];
@@ -1373,6 +1433,9 @@ static int menu_main_rows(struct menu_buf *b, int *sound_y, int *zoom_y, int *en
    y += menu_item(b, "sub-engine", "WebView Engine", false, "\xe2\x80\xba");
    y += menu_item(b, dvm_webview_count() ? "reload" : NULL, "Reload WebView", false, NULL);
    y += menu_sep(b);
+   *keymap_y = y;
+   y += menu_item(b, "sub-keymap", "Keyboard Controls", false, "\xe2\x80\xba");
+   y += menu_sep(b);
    y += menu_item(b, "full", arm_exec_is_fullscreen() ? "Exit Full Screen" : "Enter Full Screen",
              false, NULL);
    y += menu_item(b, "quit", "Quit Lunaria", false, NULL);
@@ -1383,7 +1446,27 @@ static int menu_sub_rows(struct menu_buf *b)
 {
    int y = PAD;
    char id[32];
-   if (g_menu_sub == SUB_SOUND) {
+   if (g_menu_sub == SUB_KEYMAP) {
+      char current[4096]; luna_keymap_current(current, sizeof current);
+      y += menu_header(b, "KEYMAP FILE");
+      y += menu_item(b, "km-off", "Off", !strcmp(current, "off"), NULL);
+      y += menu_item(b, strcmp(current, "off") ? "km-reload" : NULL, "Reload Current File", false, NULL);
+      y += menu_sep(b);
+      y += menu_item(b, "km-up", "Parent Folder", false, "..");
+      const char *base = strrchr(g_keydir, '/');
+      y += menu_header(b, base && base[1] ? base + 1 : g_keydir);
+      for (int i = g_keypage * KEYMAP_PAGE; i < g_nkeyfiles && i < (g_keypage + 1) * KEYMAP_PAGE; ++i) {
+         char path[4096]; keyfile_path(path, sizeof path, g_keyfiles[i].name);
+         snprintf(id, sizeof id, "km-file-%d", i);
+         y += menu_item(b, id, g_keyfiles[i].name, !strcmp(current, path), g_keyfiles[i].directory ? "\xe2\x80\xba" : NULL);
+      }
+      if (!g_nkeyfiles) y += menu_item(b, NULL, g_keydir_error ? "Cannot read folder" : "No files", false, NULL);
+      if (g_nkeyfiles > KEYMAP_PAGE) {
+         y += menu_sep(b);
+         y += menu_item(b, g_keypage ? "km-prev" : NULL, "Previous Page", false, NULL);
+         y += menu_item(b, (g_keypage + 1) * KEYMAP_PAGE < g_nkeyfiles ? "km-next" : NULL, "Next Page", false, NULL);
+      }
+   } else if (g_menu_sub == SUB_SOUND) {
       y += menu_header(b, "SOUND OUTPUT");
       const char *cur = luna_os_audio_device();
       for (int i = 0; i < g_menu_ndev; ++i) {
@@ -1432,8 +1515,8 @@ static void menu_publish_locked(void)
       return;
    }
    struct menu_buf rows = { 0 }, sub = { 0 }, doc = { 0 };
-   int sound_y = 0, zoom_y = 0, engine_y = 0;
-   const int h = menu_main_rows(&rows, &sound_y, &zoom_y, &engine_y);
+   int sound_y = 0, zoom_y = 0, engine_y = 0, keymap_y = 0;
+   const int h = menu_main_rows(&rows, &sound_y, &zoom_y, &engine_y, &keymap_y);
    const int mx = menu_clampi((int)g_menu_x, 4, g_menu_w - MENU_W - 4 > 4 ? g_menu_w - MENU_W - 4 : 4);
    const int my = menu_clampi((int)g_menu_y, 4, g_menu_h - h - 4 > 4 ? g_menu_h - h - 4 : 4);
    menu_put(&doc, "<div id=\"luna-menu-backdrop\"></div>");
@@ -1441,7 +1524,7 @@ static void menu_publish_locked(void)
    menu_put(&doc, rows.p ? rows.p : "");
    menu_put(&doc, "</div>");
    if (g_menu_sub != SUB_NONE) {
-      const int parent_y = g_menu_sub == SUB_SOUND ? sound_y : g_menu_sub == SUB_ZOOM ? zoom_y : engine_y;
+      const int parent_y = g_menu_sub == SUB_SOUND ? sound_y : g_menu_sub == SUB_ZOOM ? zoom_y : g_menu_sub == SUB_ENGINE ? engine_y : keymap_y;
       const int sh = menu_sub_rows(&sub);
       /* To the right of the menu, the parent row at its first item; to the
        * left when that would leave the surface. */
@@ -1542,16 +1625,39 @@ static void menu_clicked(const char *id)
       menu_notice_locked(luna_os_audio_muted() ? "Sound muted" : "Sound on");
    } else if (!strncmp(id, "sub-", 4)) {
       const int sub = !strcmp(id + 4, "sound") ? SUB_SOUND : !strcmp(id + 4, "zoom") ? SUB_ZOOM
-                    : SUB_ENGINE;
+                    : !strcmp(id + 4, "keymap") ? SUB_KEYMAP : SUB_ENGINE;
       g_menu_sub = g_menu_sub == sub ? SUB_NONE : sub;
+      if (g_menu_sub == SUB_KEYMAP) keyfiles_read();
       if (g_menu_sub == SUB_SOUND) g_menu_ndev = luna_os_audio_devices(g_menu_dev_name, g_menu_dev_desc, MAX_DEVICES);
       keep_open = true;
+   } else if (!strcmp(id, "km-up")) {
+      char *slash = strrchr(g_keydir, '/');
+      if (slash) { if (slash == g_keydir) slash[1] = 0; else *slash = 0; }
+      else snprintf(g_keydir, sizeof g_keydir, "..");
+      keyfiles_read(); keep_open = true;
+   } else if (!strcmp(id, "km-next") || !strcmp(id, "km-prev")) {
+      if (id[3] == 'n' && (g_keypage + 1) * KEYMAP_PAGE < g_nkeyfiles) ++g_keypage;
+      else if (id[3] == 'p' && g_keypage) --g_keypage;
+      keep_open = true;
+   } else if (!strncmp(id, "km-file-", 8)) {
+      int i = atoi(id + 8); char path[4096];
+      if (i >= 0 && i < g_nkeyfiles && keyfile_path(path, sizeof path, g_keyfiles[i].name)) {
+         if (g_keyfiles[i].directory) {
+            snprintf(g_keydir, sizeof g_keydir, "%s", path); keyfiles_read(); keep_open = true;
+         } else if (luna_keymap_select(path)) menu_notice_locked("Keyboard controls loaded");
+         else { menu_notice_locked("Cannot load keymap file"); keep_open = true; }
+      } else keep_open = true;
+   } else if (!strcmp(id, "km-off") || !strcmp(id, "km-reload")) {
+      char path[4096]; luna_keymap_current(path, sizeof path);
+      if (!strcmp(id, "km-off")) strcpy(path, "off");
+      if (luna_keymap_select(path)) menu_notice_locked(!strcmp(path, "off") ? "Keyboard controls off" : "Keyboard controls reloaded");
+      else { menu_notice_locked("Cannot load keymap file"); keep_open = true; }
    } else if (!strncmp(id, "dev-", 4)) {
       const int i = atoi(id + 4);
       if (i >= 0 && i < g_menu_ndev) {
          char msg[256];
          if (luna_os_audio_select_device(g_menu_dev_name[i]) == 0)
-            snprintf(msg, sizeof msg, "Sound output: %s", g_menu_dev_desc[i]);
+            snprintf(msg, sizeof msg, "Switching sound output: %s", g_menu_dev_desc[i]);
          else snprintf(msg, sizeof msg, "Cannot use %s", g_menu_dev_desc[i]);
          menu_notice_locked(msg);
       }

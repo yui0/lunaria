@@ -55,6 +55,15 @@ lunaria_load_conf() {
     done < "$_conf"
 }
 lunaria_load_conf
+# A keymap may be a bundled layout name or a user-created profile file.
+case "${LUNARIA_KEYMAP-}" in
+    genshin|crossworlds) export LUNARIA_KEYMAP="$script_dir/keymaps/$LUNARIA_KEYMAP.conf" ;;
+esac
+if [ -n "${LUNARIA_KEYMAP-}" ] && [ "$LUNARIA_KEYMAP" != off ]; then
+    [ -r "$LUNARIA_KEYMAP" ] || err "cannot read keymap: $LUNARIA_KEYMAP"
+    LUNARIA_KEYMAP=$(realpath "$LUNARIA_KEYMAP")
+    export LUNARIA_KEYMAP
+fi
 
 [ -z "$1" ] && err 'usage: <apk-or-xapk>'
 inputfile="$(realpath "$1")"
@@ -1002,6 +1011,13 @@ fi
 # The luna-ui progress card is on by default; LUNARIA_JIT_UI=0 turns it off.
 : "${LUNARIA_JIT_UI:=1}"
 export LUNARIA_JIT_UI
+
+# Let the guest CPU engines schedule runnable threads continuously.  Waiting
+# for the frame pump between slices throttles network callbacks and asset
+# decoding even when the host has idle cores.  The environment or lunaria.conf
+# can still select the barrier scheduler with LUNARIA_A64_SELF_SCHED=0.
+: "${LUNARIA_A64_SELF_SCHED:=1}"
+export LUNARIA_A64_SELF_SCHED
 
 # Real AArch64 platform libraries for the guest, if `make syslib` fetched them.
 # Every symbol answered from one of these runs as guest code instead of leaving

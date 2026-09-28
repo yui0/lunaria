@@ -9,6 +9,7 @@
 #pragma once
 
 #include "jni.h"
+#include "../luna_input.h"
 #include <stdbool.h>
 #include <stdlib.h>
 
@@ -200,12 +201,7 @@ struct jvm_object {
       struct jvm_method method;
       struct jvm_class klass;
       struct jvm_string string;
-      struct {
-         int action;       /* AMOTION_EVENT_ACTION_* */
-         float x, y;
-         int64_t event_ms; /* CLOCK_MONOTONIC ms when this sample happened */
-         int64_t down_ms;  /* down time of the active pointer gesture */
-      } motion;
+      luna_touch_event motion;
    };
 
    enum jvm_object_type {
@@ -226,7 +222,9 @@ struct jvm_object {
     * this reaches zero (see jvm_deref_object()).  Classes and methods are
     * interned and must keep their identity for the process lifetime, and
     * opaque objects back the singleton stubs in jni_stubs.c, which cache the
-    * jobject in a `static` and would dangle if the slot were recycled. */
+    * jobject in a `static` and would dangle if the slot were recycled.  The
+    * DVM-to-native bridge explicitly releases the opaque locals it created
+    * once that native call returns (jvm_release_bridge_local). */
    int refs;
 
    /* JNI MonitorEnter/Exit state.  Access is serialized by the bridge's
@@ -333,18 +331,19 @@ jvm_get_native_method(struct jvm *jvm, const char *klass, const char *method);
 void
 jvm_release(struct jvm *jvm);
 
+/* Drop a JNI local created solely for a Java-to-native bridge call.  The
+ * bridge clears its DVM mapping first.  A global reference keeps the handle
+ * alive; otherwise even an opaque instance can be reclaimed. */
+bool jvm_release_bridge_local(struct jvm *jvm, jobject object);
+int jvm_bridge_ref_count(struct jvm *jvm, jobject object);
+
 void
 jvm_init(struct jvm *jvm);
 
 /* Immutable Android MotionEvent payload.  Each injected touch gets its own
  * JVM_OBJECT_MOTION instance; getters read only that object, never global
  * state — Unity keeps the jobject and reads it again during PlayerLoop. */
-typedef struct lunaria_touch_event {
-   int action;
-   float x, y;
-   long long event_ms;
-   long long down_ms;
-} lunaria_touch_event;
+typedef luna_touch_event lunaria_touch_event;
 
 jobject
 jvm_new_motion_event(struct jvm *jvm, const lunaria_touch_event *ev);

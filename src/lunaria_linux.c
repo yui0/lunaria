@@ -506,20 +506,42 @@ static void *luna_audio_thread(void *arg)
          pthread_mutex_unlock(&g_audio_dev_lock);
          AUDIO next;
          memset(&next, 0, sizeof next);
-         if (AUDIO_init(&next, want, g_audio.freq, (int)g_audio_ch, (int)g_audio.req_frames, 1,
-                        SND_PCM_FORMAT_S16_LE) == 0) {
-            AUDIO_close(&g_audio);
-            g_audio = next;
-            /* This period is already mixed; the next one is the new card's
-               size. */
-            const unsigned np = (unsigned)g_audio.frames ? (unsigned)g_audio.frames : 256u;
+         int opened = !strcmp(want, g_audio_dev_now) ? 2 :
+            AUDIO_init(&next, want, g_audio.freq, (int)g_audio_ch,
+                       (int)g_audio.req_frames, 1, SND_PCM_FORMAT_S16_LE);
+         if (opened == 1) {
+            /* Two ALSA names may address one exclusive card.  Release the
+             * old PCM, retry, then restore it if the requested PCM fails. */
+            AUDIO_release(&g_audio);
+            opened = AUDIO_init(&next, want, g_audio.freq, (int)g_audio_ch,
+                                (int)g_audio.req_frames, 1, SND_PCM_FORMAT_S16_LE);
+            if (opened != 0 && AUDIO_reopen(&g_audio) != 0)
+               fprintf(stderr, "[audio] cannot reopen previous output '%s'\n",
+                       g_audio_dev_now);
+         }
+         if (opened == 0) {
+            const unsigned np = (unsigned)next.frames ? (unsigned)next.frames : 256u;
+            /* Keep the old output usable if the new period cannot be buffered.
+             * The current chunk still has the old period's samples; its write
+             * below uses that size, and the following iteration uses np. */
             if (np > period) {
                int16_t *grown = (int16_t *)realloc(chunk, (size_t)np * g_audio_ch * sizeof *chunk);
-               if (grown) chunk = grown;
+               if (!grown) {
+                  AUDIO_close(&next);
+                  if (!g_audio.handle) (void)AUDIO_reopen(&g_audio);
+                  fprintf(stderr, "[audio] cannot buffer ALSA '%s'; keeping '%s'\n",
+                          want, g_audio_dev_now);
+                  continue;
+               }
+               chunk = grown;
             }
+            AUDIO_close(&g_audio);
+            g_audio = next;
+            pthread_mutex_lock(&g_audio_dev_lock);
             snprintf(g_audio_dev_now, sizeof g_audio_dev_now, "%s", want);
+            pthread_mutex_unlock(&g_audio_dev_lock);
             fprintf(stderr, "[audio] output switched to '%s'\n", want);
-         } else {
+         } else if (opened == 1) {
             if (next.handle) AUDIO_close(&next);
             fprintf(stderr, "[audio] cannot switch output to '%s'; keeping '%s'\n",
                     want, g_audio_dev_now);
@@ -658,7 +680,7 @@ int luna_os_audio_devices(char (*names)[128], char (*descs)[128], int max)
       const int wanted = name && playback &&
          (!strcmp(name, "default") || !strcmp(name, "pipewire") || !strcmp(name, "pulse") ||
           !strcmp(name, "jack") || !strncmp(name, "sysdefault:", 11) || !strncmp(name, "hdmi:", 5) ||
-          !strncmp(name, "hw:", 3));
+          !strncmp(name, "hw:", 3) || !strncmp(name, "plughw:", 7));
       if (wanted) {
          snprintf(names[n], 128, "%s", name);
          /* The description's first line is the card, the second the port. */
@@ -682,14 +704,23 @@ int luna_os_audio_select_device(const char *name)
    /* Not open yet: the choice is where the stream will open. */
    if (!g_audio_open) {
       setenv("LUNARIA_ALSA_DEVICE", g_audio_dev_want, 1);
+      pthread_mutex_lock(&g_audio_dev_lock);
       snprintf(g_audio_dev_now, sizeof g_audio_dev_now, "%s", g_audio_dev_want);
+      pthread_mutex_unlock(&g_audio_dev_lock);
       return 0;
    }
    atomic_store_explicit(&g_audio_dev_switch, 1, memory_order_release);
    return 0;
 }
 
-const char *luna_os_audio_device(void) { return g_audio_dev_now; }
+const char *luna_os_audio_device(void)
+{
+   static _Thread_local char name[128];
+   pthread_mutex_lock(&g_audio_dev_lock);
+   snprintf(name, sizeof name, "%s", g_audio_dev_now);
+   pthread_mutex_unlock(&g_audio_dev_lock);
+   return name;
+}
 
 int luna_os_audio_write(const void *pcm16, unsigned frames)
 {

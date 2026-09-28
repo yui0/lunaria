@@ -285,7 +285,7 @@ void arm_exec_note_destructive(const char *what, const char *host_path,
 
 /* AndroidManifest meta-data for the bytecode VM's ApplicationInfo.metaData
  * Bundle.  Returns 0 when absent, else the value kind ('Z','I','F' in *iv or
- * 'L' in *sv). */
+ * 'L' in *sv).  'F' supplies the IEEE-754 float bits in *iv. */
 int arm_exec_apk_meta(const char *key, int32_t *iv, const char **sv);
 const char *arm_exec_apk_meta_keys(void);
 /* The audio output the emulator actually presents, as AudioManager reports it
@@ -320,12 +320,7 @@ int arm_exec_fb_height(void);
  * Returns 0 when the queue is empty.  arm_exec_touch_* accessors reflect the
  * last popped sample for diagnostics only — MotionEvent JNI getters must use
  * jvm_motion_event_view(), not these. */
-typedef struct ArmExecTouchEvent {
-   int action;          /* 0=DOWN 1=UP 2=MOVE */
-   float x, y;
-   long long event_ms;
-   long long down_ms;
-} ArmExecTouchEvent;
+typedef luna_touch_event ArmExecTouchEvent;
 
 int       arm_exec_touch_next(ArmExecTouchEvent *out);
 int       arm_exec_touch_action(void);

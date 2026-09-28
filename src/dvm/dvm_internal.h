@@ -208,30 +208,29 @@ struct dvm {
    /* Handler / Looper posts, and Thread.start fallback when a host thread
     * cannot be created (LUNARIA_DVM_THREADS=0 or pthread_create failure).
     * Executor workers go through Thread.start → host threads; they must not
-    * live here — that filled a 32-slot queue at Cross Worlds title and made
-    * growing it to 256 look like a fix for what was a mis-routed Executor. */
-#define DVM_PENDING_MAX 256
-   dvm_ref pending_threads[DVM_PENDING_MAX];
+    * live here.  Android's MessageQueue has no fixed 256-message limit;
+    * legitimate delayed posts can exceed that during a long download. */
+   dvm_ref *pending_threads;
    /* Whether each entry came from Thread.start() rather than Handler.post():
     * a posted Runnable runs on the main thread, and app code asserts on that. */
-   bool pending_is_thread[DVM_PENDING_MAX];
+   bool *pending_is_thread;
    /* Monotonic millisecond stamp before which the entry must not run.  A
     * postDelayed() whose delay is dropped turns every "do this unless the fast
     * path beats me to it" timeout into an unconditional one. */
-   uint64_t pending_due_ms[DVM_PENDING_MAX];
+   uint64_t *pending_due_ms;
    /* Handler.post target Looper.  0 = main drain (also Thread.start).  A
     * background Looper.loop() only takes entries tagged with its own ref —
     * otherwise SwappyDisplayManager$LooperThread greedily runs every posted
     * Runnable on the wrong thread and holds the interpreter lock for them. */
-   dvm_ref pending_looper[DVM_PENDING_MAX];
+   dvm_ref *pending_looper;
    /* The Handler an entry was posted through, and the token it carried.
     * Handler.removeCallbacksAndMessages(token) is defined in terms of both —
     * "this handler's pending posts and messages, keeping only those whose
     * token differs" — so with neither recorded the call had nothing to key on
     * and did nothing.  A Thread.start() entry has no handler and no token. */
-   dvm_ref pending_owner[DVM_PENDING_MAX];
-   dvm_ref pending_token[DVM_PENDING_MAX];
-   int npending;
+   dvm_ref *pending_owner;
+   dvm_ref *pending_token;
+   int npending, pending_cap;
    /* The Thread the interpreter is currently inside, or 0 for the main one. */
    dvm_ref cur_thread;
    /* How many drains of the pending queue are on the stack.  This used to be a
@@ -492,3 +491,6 @@ void dvm_runtime_install(struct dvm *vm);
 /* Called by dvm.c when a class has no dex definition, before falling back to
  * the host stubs.  Returns NULL when the runtime has no built-in for it. */
 struct dvm_class *dvm_runtime_define(struct dvm *vm, const char *desc);
+
+/* A fresh Bundle containing only the installed application metadata. */
+dvm_ref dvm_runtime_manifest_bundle(struct dvm *vm);

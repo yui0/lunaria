@@ -4072,6 +4072,27 @@ static bool t_setDaemon(struct dvm *vm, dvm_ref self, const union dvm_value *arg
  * before the first request is added — and a Handler.post() is by definition
  * work for later.  Returns false when the queue is full. */
 static bool class_extends_proxy(struct dvm_class *c);
+static bool pending_reserve(struct dvm *vm)
+{
+   if (vm->npending < vm->pending_cap) return true;
+   if (vm->pending_cap > INT_MAX / 2) return false;
+   const int cap = vm->pending_cap ? vm->pending_cap * 2 : 64;
+#define GROW_PENDING(member) do { \
+      void *p = realloc(vm->member, (size_t)cap * sizeof *vm->member); \
+      if (!p) return false; \
+      vm->member = p; \
+   } while (0)
+   GROW_PENDING(pending_threads);
+   GROW_PENDING(pending_is_thread);
+   GROW_PENDING(pending_due_ms);
+   GROW_PENDING(pending_looper);
+   GROW_PENDING(pending_owner);
+   GROW_PENDING(pending_token);
+#undef GROW_PENDING
+   vm->pending_cap = cap;
+   return true;
+}
+
 static bool queue_runnable_for(struct dvm *vm, dvm_ref r, bool as_thread,
                                int64_t delay_ms, dvm_ref looper,
                                dvm_ref owner, dvm_ref token)
@@ -4081,14 +4102,11 @@ static bool queue_runnable_for(struct dvm *vm, dvm_ref r, bool as_thread,
    if ((!run && !class_extends_proxy(c)) ||
        (run && !run->has_code && !run->builtin))
       return true;   /* nothing to run: done */
-   if (vm->npending >= (int)(sizeof vm->pending_threads /
-                             sizeof vm->pending_threads[0])) {
-      /* Dropping a post() silently is indistinguishable from a callback that
-       * simply never fires, and that is exactly how it is noticed: a boot flow
-       * waiting on a Handler message that was thrown away. */
+   if (!pending_reserve(vm)) {
+      /* Only actual allocation failure can reject a post. */
       static int warned;
       if (warned++ < 8)
-         fprintf(stderr, "[sched] queue full (%d): dropped %s.run()\n",
+         fprintf(stderr, "[sched] queue allocation failed (%d): %s.run()\n",
                  vm->npending, c && c->name ? c->name : "?");
       return false;
    }
@@ -15094,151 +15112,77 @@ static const struct rt_method rt_uuid[] = {
    M_END,
 };
 
-/* android.os.Bundle backed by the APK manifest's meta-data.
- *
- * Play services reads its configuration from
- * getPackageManager().getApplicationInfo(pkg, GET_META_DATA).metaData, not
- * through UE's thunks.  With ApplicationInfo.metaData null it concluded the
- * manifest was missing com.google.android.gms.version — which this APK does
- * declare — and threw GooglePlayServicesMissingManifestValueException out of
- * Netmarble's session init.  The values come from the manifest parser the
- * emulator already runs for UE. */
+/* Each Bundle owns its entries.  Manifest data is copied only into the
+ * ApplicationInfo Bundle; ordinary Bundles and provider data stay independent. */
 static bool bundle_getString(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
                              union dvm_value *out)
 {
-   /* Mutable puts live in the same map storage HashMap uses; APK meta-data is
-    * the fallback for ApplicationInfo.metaData Bundles that were never written. */
-   if (self) {
-      union dvm_value got = { 0 };
-      (void)map_get(vm, self, args, 1, &got);
-      if (got.l) RETL(got.l);
-   }
-   const char *key = dvm_string_utf8(vm, ARG(0).l);
-   const char *sv = NULL;
-   int32_t iv = 0;
-   int kind = key ? arm_exec_apk_meta(key, &iv, &sv) : 0;
-   if (kind == 'L' && sv) RETL(dvm_new_string(vm, sv));
-   /* A default may be supplied as the second argument. */
+   union dvm_value got = { 0 };
+   (void)map_get(vm, self, args, 1, &got);
+   struct dvm_object *o = got.l ? dvm__obj(vm, got.l) : NULL;
+   if (o && o->cls && !strcmp(o->cls->name, "java/lang/String")) RETL(got.l);
    RETL(nargs > 1 ? ARG(1).l : 0);
 }
 
-/* A Bundle entry is either a box written by a typed putter or a string — the
- * manifest meta-data path stores strings.  Android's typed getters read both,
- * so the readers must unbox rather than assume one representation. */
-static bool bundle_number(struct dvm *vm, dvm_ref value, int64_t *as_int,
-                          double *as_real)
-{
-   struct dvm_object *o = value ? dvm__obj(vm, value) : NULL;
-   if (!o || !o->cls || !o->cls->name) return false;
-   const char *name = o->cls->name;
-   if (!strcmp(name, "java/lang/String")) {
-      const char *s = dvm_string_utf8(vm, value);
-      if (!s) return false;
-      *as_int = strtoll(s, NULL, 10);
-      *as_real = strtod(s, NULL);
-      return true;
-   }
-   if (!o->slots) return false;
-   if (!strcmp(name, "java/lang/Long")) {
-      *as_int = o->slots[0].j; *as_real = (double)o->slots[0].j;
-   } else if (!strcmp(name, "java/lang/Float")) {
-      *as_real = o->slots[0].f; *as_int = (int64_t)o->slots[0].f;
-   } else if (!strcmp(name, "java/lang/Double")) {
-      *as_real = o->slots[0].d; *as_int = (int64_t)o->slots[0].d;
-   } else if (!strcmp(name, "java/lang/Integer") ||
-              !strcmp(name, "java/lang/Short") ||
-              !strcmp(name, "java/lang/Byte") ||
-              !strcmp(name, "java/lang/Character") ||
-              !strcmp(name, "java/lang/Boolean")) {
-      *as_int = o->slots[0].i; *as_real = o->slots[0].i;
-   } else {
-      return false;
-   }
-   return true;
+/* BaseBundle getters accept the corresponding boxed type, returning their
+ * default for a missing, null or differently typed value. */
+#define BUNDLE_GET(fn, type, member, ret, zero)                               \
+static bool fn(struct dvm *vm, dvm_ref self,                                  \
+               const union dvm_value *args, int nargs,                       \
+               union dvm_value *out)                                        \
+{                                                                           \
+   union dvm_value got = { 0 };                                              \
+   (void)map_get(vm, self, args, 1, &got);                                     \
+   struct dvm_object *o = got.l ? dvm__obj(vm, got.l) : NULL;                  \
+   if (o && o->cls && o->slots && !strcmp(o->cls->name, type))                \
+      ret(o->slots[0].member);                                               \
+   ret(nargs > 1 ? ARG(1).member : zero);                                     \
 }
+BUNDLE_GET(bundle_getInt, "java/lang/Integer", i, RETI, 0)
+BUNDLE_GET(bundle_getShort, "java/lang/Short", i, RETI, 0)
+BUNDLE_GET(bundle_getByte, "java/lang/Byte", i, RETI, 0)
+BUNDLE_GET(bundle_getChar, "java/lang/Character", i, RETI, 0)
+BUNDLE_GET(bundle_getBoolean, "java/lang/Boolean", i, RETI, 0)
+BUNDLE_GET(bundle_getLong, "java/lang/Long", j, RETJ, 0)
+BUNDLE_GET(bundle_getFloat, "java/lang/Float", f, RETF, 0.0f)
+BUNDLE_GET(bundle_getDouble, "java/lang/Double", d, RETD, 0.0)
+#undef BUNDLE_GET
 
-static bool bundle_getInt(struct dvm *vm, dvm_ref self,
-                          const union dvm_value *args, int nargs,
-                          union dvm_value *out)
+/* PackageManager supplies this data for the installed application. */
+dvm_ref dvm_runtime_manifest_bundle(struct dvm *vm)
 {
-   if (self) {
-      union dvm_value got = { 0 };
-      (void)map_get(vm, self, args, 1, &got);
-      int64_t i = 0; double d = 0;
-      if (got.l && bundle_number(vm, got.l, &i, &d)) RETI((int32_t)i);
-   }
-   const char *key = dvm_string_utf8(vm, ARG(0).l);
-   const char *sv = NULL;
-   int32_t iv = 0;
-   int kind = key ? arm_exec_apk_meta(key, &iv, &sv) : 0;
-   if (kind == 'I' || kind == 'Z' || kind == 'F') RETI(iv);
-   RETI(nargs > 1 ? ARG(1).i : 0);
-}
-
-static bool bundle_getBoolean(struct dvm *vm, dvm_ref self,
-                              const union dvm_value *args, int nargs,
-                              union dvm_value *out)
-{
-   if (self) {
-      union dvm_value got = { 0 };
-      (void)map_get(vm, self, args, 1, &got);
-      int64_t i = 0; double d = 0;
-      /* A present entry is not automatically true — putBoolean(key,false)
-       * stores a Boolean whose value is 0, and "false" arrives as a string. */
-      if (got.l) {
-         const char *s = dvm_string_utf8(vm, got.l);
-         if (s && (!strcasecmp(s, "true") || !strcasecmp(s, "false")))
-            RETI(!strcasecmp(s, "true"));
-         if (bundle_number(vm, got.l, &i, &d)) RETI(i ? 1 : 0);
+   struct dvm_class *bc = dvm__class_by_desc(vm, "Landroid/os/Bundle;");
+   dvm_ref bundle = bc ? dvm_new_object(vm, bc) : 0;
+   if (!bundle) return 0;
+   union dvm_value ignored = { 0 };
+   (void)map_init(vm, bundle, NULL, 0, &ignored);
+   const char *encoded = arm_exec_apk_meta_keys();
+   char *copy = encoded && *encoded ? strdup(encoded) : NULL;
+   char *save = NULL;
+   for (char *key = copy ? strtok_r(copy, ";", &save) : NULL;
+        key; key = strtok_r(NULL, ";", &save)) {
+      int32_t iv = 0;
+      const char *sv = NULL;
+      int kind = arm_exec_apk_meta(key, &iv, &sv);
+      union dvm_value v = { .i = iv };
+      dvm_ref value = 0;
+      if (kind == 'L' && sv) value = dvm_new_string(vm, sv);
+      else if (kind == 'Z') value = box_make(vm, "Ljava/lang/Boolean;", v);
+      else if (kind == 'I') value = box_make(vm, "Ljava/lang/Integer;", v);
+      else if (kind == 'F') {
+         memcpy(&v.f, &iv, sizeof v.f);
+         value = box_make(vm, "Ljava/lang/Float;", v);
+      }
+      if (kind) {
+         union dvm_value kv[2] = {
+            { .l = dvm_new_string(vm, key) }, { .l = value }
+         };
+         (void)map_put(vm, bundle, kv, 2, &ignored);
       }
    }
-   const char *key = dvm_string_utf8(vm, ARG(0).l);
-   const char *sv = NULL;
-   int32_t iv = 0;
-   int kind = key ? arm_exec_apk_meta(key, &iv, &sv) : 0;
-   if (kind == 'Z' || kind == 'I') RETI(iv ? 1 : 0);
-   RETI(nargs > 1 ? (ARG(1).i ? 1 : 0) : 0);
-}
-
-static bool bundle_containsKey(struct dvm *vm, dvm_ref self,
-                               const union dvm_value *args, int nargs,
-                               union dvm_value *out)
-{
-   (void)nargs;
-   if (self) {
-      union dvm_value got = { 0 };
-      (void)map_containsKey(vm, self, args, 1, &got);
-      if (got.i) RETI(1);
-   }
-   const char *key = dvm_string_utf8(vm, ARG(0).l);
-   const char *sv = NULL;
-   int32_t iv = 0;
-   RETI(key && arm_exec_apk_meta(key, &iv, &sv) ? 1 : 0);
-}
-
-static bool bundle_get(struct dvm *vm, dvm_ref self,
-                       const union dvm_value *args, int nargs,
-                       union dvm_value *out)
-{
-   if (self) {
-      union dvm_value got = { 0 };
-      (void)map_get(vm, self, args, 1, &got);
-      if (got.l) RETL(got.l);
-   }
-   const char *key = nargs > 0 ? dvm_string_utf8(vm, ARG(0).l) : NULL;
-   const char *sv = NULL;
-   int32_t iv = 0;
-   int kind = key ? arm_exec_apk_meta(key, &iv, &sv) : 0;
-   if (kind == 'L' && sv) RETL(dvm_new_string(vm, sv));
-   union dvm_value v = { .i = iv };
-   if (kind == 'Z') RETL(box_make(vm, "Ljava/lang/Boolean;", v));
-   if (kind == 'I') RETL(box_make(vm, "Ljava/lang/Integer;", v));
-   if (kind == 'F') {
-      v.f = (float)iv;
-      RETL(box_make(vm, "Ljava/lang/Float;", v));
-   }
-   RETL(0);
+   free(copy);
+   return bundle;
 }
 
 static bool bundle_putString(struct dvm *vm, dvm_ref self,
@@ -15302,77 +15246,23 @@ static bool bundle_putObject(struct dvm *vm, dvm_ref self,
    RETV();
 }
 
-static bool bundle_getLong(struct dvm *vm, dvm_ref self,
-                           const union dvm_value *args, int nargs,
-                           union dvm_value *out)
-{
-   union dvm_value got = { 0 };
-   if (self) (void)map_get(vm, self, args, 1, &got);
-   int64_t i = 0; double d = 0;
-   if (got.l && bundle_number(vm, got.l, &i, &d)) RETJ(i);
-   RETJ(nargs > 1 ? ARG(1).j : 0);
-}
-
-static bool bundle_getFloat(struct dvm *vm, dvm_ref self,
-                            const union dvm_value *args, int nargs,
-                            union dvm_value *out)
-{
-   union dvm_value got = { 0 };
-   if (self) (void)map_get(vm, self, args, 1, &got);
-   int64_t i = 0; double d = 0;
-   if (got.l && bundle_number(vm, got.l, &i, &d)) RETF((float)d);
-   RETF(nargs > 1 ? ARG(1).f : 0.0f);
-}
-
-static bool bundle_getDouble(struct dvm *vm, dvm_ref self,
-                             const union dvm_value *args, int nargs,
-                             union dvm_value *out)
-{
-   union dvm_value got = { 0 };
-   if (self) (void)map_get(vm, self, args, 1, &got);
-   int64_t i = 0; double d = 0;
-   if (got.l && bundle_number(vm, got.l, &i, &d)) RETD(d);
-   RETD(nargs > 1 ? ARG(1).d : 0.0);
-}
-
-static bool bundle_keySet(struct dvm *vm, dvm_ref self,
-                          const union dvm_value *args, int nargs,
-                          union dvm_value *out)
-{
-   union dvm_value set = { 0 };
-   (void)map_keySet(vm, self, args, nargs, &set);
-   const char *encoded = arm_exec_apk_meta_keys();
-   char *copy = encoded && *encoded ? strdup(encoded) : NULL;
-   if (copy && set.l) {
-      char *save = NULL;
-      for (char *key = strtok_r(copy, ";", &save); key;
-           key = strtok_r(NULL, ";", &save)) {
-         union dvm_value value = { .l = dvm_new_string(vm, key) };
-         union dvm_value ignored = { 0 };
-         (void)list_add(vm, set.l, &value, 1, &ignored);
-      }
-   }
-   free(copy);
-   RETL(set.l);
-}
-
 static const struct rt_method rt_bundle[] = {
    M("<init>", "()V", map_init),
    M("<init>", "(I)V", map_init),
    M("<init>", "(Landroid/os/Bundle;)V", map_init_map),
-   M("get", "(Ljava/lang/String;)Ljava/lang/Object;", bundle_get),
-   M("getParcelable", "(Ljava/lang/String;)Landroid/os/Parcelable;", bundle_get),
+   M("get", "(Ljava/lang/String;)Ljava/lang/Object;", map_get),
+   M("getParcelable", "(Ljava/lang/String;)Landroid/os/Parcelable;", map_get),
    M("getString", "(Ljava/lang/String;)Ljava/lang/String;", bundle_getString),
    M("getString", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
      bundle_getString),
    M("getInt", "(Ljava/lang/String;)I", bundle_getInt),
    M("getInt", "(Ljava/lang/String;I)I", bundle_getInt),
-   M("getShort", "(Ljava/lang/String;)S", bundle_getInt),
-   M("getShort", "(Ljava/lang/String;S)S", bundle_getInt),
-   M("getByte", "(Ljava/lang/String;)B", bundle_getInt),
-   M("getByte", "(Ljava/lang/String;B)B", bundle_getInt),
-   M("getChar", "(Ljava/lang/String;)C", bundle_getInt),
-   M("getChar", "(Ljava/lang/String;C)C", bundle_getInt),
+   M("getShort", "(Ljava/lang/String;)S", bundle_getShort),
+   M("getShort", "(Ljava/lang/String;S)S", bundle_getShort),
+   M("getByte", "(Ljava/lang/String;)B", bundle_getByte),
+   M("getByte", "(Ljava/lang/String;B)B", bundle_getByte),
+   M("getChar", "(Ljava/lang/String;)C", bundle_getChar),
+   M("getChar", "(Ljava/lang/String;C)C", bundle_getChar),
    M("getLong", "(Ljava/lang/String;)J", bundle_getLong),
    M("getLong", "(Ljava/lang/String;J)J", bundle_getLong),
    M("getFloat", "(Ljava/lang/String;)F", bundle_getFloat),
@@ -15383,10 +15273,10 @@ static const struct rt_method rt_bundle[] = {
    M("getBoolean", "(Ljava/lang/String;Z)Z", bundle_getBoolean),
    M("getCharSequence", "(Ljava/lang/String;)Ljava/lang/CharSequence;",
      bundle_getString),
-   M("getSerializable", "(Ljava/lang/String;)Ljava/io/Serializable;", bundle_get),
-   M("getBundle", "(Ljava/lang/String;)Landroid/os/Bundle;", bundle_get),
-   M("containsKey", "(Ljava/lang/String;)Z", bundle_containsKey),
-   M("keySet", "()Ljava/util/Set;", bundle_keySet),
+   M("getSerializable", "(Ljava/lang/String;)Ljava/io/Serializable;", map_get),
+   M("getBundle", "(Ljava/lang/String;)Landroid/os/Bundle;", map_get),
+   M("containsKey", "(Ljava/lang/String;)Z", map_containsKey),
+   M("keySet", "()Ljava/util/Set;", map_keySet),
    M("putString", "(Ljava/lang/String;Ljava/lang/String;)V", bundle_putString),
    M("putBoolean", "(Ljava/lang/String;Z)V", bundle_putBoolean),
    M("putInt", "(Ljava/lang/String;I)V", bundle_putInt),
@@ -15404,6 +15294,10 @@ static const struct rt_method rt_bundle[] = {
      bundle_putObject),
    M("putBundle", "(Ljava/lang/String;Landroid/os/Bundle;)V", bundle_putObject),
    M("putAll", "(Landroid/os/Bundle;)V", map_putAll),
+   M("remove", "(Ljava/lang/String;)V", map_remove),
+   M("clear", "()V", map_clear),
+   M("size", "()I", map_size),
+   M("isEmpty", "()Z", map_isEmpty),
    M_END,
 };
 
@@ -15420,10 +15314,10 @@ static const struct rt_method rt_content_values[] = {
    M("put", "(Ljava/lang/String;Ljava/lang/Boolean;)V", bundle_putObject),
    M("put", "(Ljava/lang/String;Ljava/lang/Byte;)V", bundle_putObject),
    M("put", "(Ljava/lang/String;[B)V", bundle_putObject),
-   M("get", "(Ljava/lang/String;)Ljava/lang/Object;", bundle_get),
+   M("get", "(Ljava/lang/String;)Ljava/lang/Object;", map_get),
    M("getAsString", "(Ljava/lang/String;)Ljava/lang/String;", bundle_getString),
-   M("containsKey", "(Ljava/lang/String;)Z", bundle_containsKey),
-   M("keySet", "()Ljava/util/Set;", bundle_keySet),
+   M("containsKey", "(Ljava/lang/String;)Z", map_containsKey),
+   M("keySet", "()Ljava/util/Set;", map_keySet),
    M("clear", "()V", map_clear),
    M_END,
 };
@@ -17719,11 +17613,21 @@ static struct dvm_object *stream_reserve(struct dvm *vm, dvm_ref self,
 {
    struct dvm_object *a = stream_buf(vm, self);
    if (a && a->length >= need) return a;
+   /* Java arrays use signed int lengths.  Doubling a uint32_t capacity past
+    * 2 GiB used to wrap to zero and loop forever while holding the VM lock. */
+   if (need > (uint32_t)INT32_MAX - 8u) {
+      dvm__throw(vm, "java/lang/OutOfMemoryError", "stream capacity %u", need);
+      return NULL;
+   }
    uint32_t cap = a && a->length ? a->length : 32;
-   while (cap < need) cap *= 2;
+   while (cap < need)
+      cap = cap > ((uint32_t)INT32_MAX - 8u) / 2u ? need : cap * 2u;
    dvm_ref nb = dvm_new_array(vm, 'B', "B", cap);
    struct dvm_object *n = nb ? dvm__obj(vm, nb) : NULL;
-   if (!n || !n->data) return a;
+   if (!n || !n->data) {
+      dvm__throw(vm, "java/lang/OutOfMemoryError", "stream capacity %u", cap);
+      return NULL;
+   }
    int32_t count = 0;
    (void)stream_field(vm, self, "count", &count);
    if (a && a->data && count > 0) {
@@ -18581,15 +18485,24 @@ static bool st_write(struct dvm *vm, dvm_ref self, const union dvm_value *args,
       if (!a->data) RETV();
       int32_t off = nargs >= 3 ? args[1].i : 0;
       int32_t n = nargs >= 3 ? args[2].i : (int32_t)a->length;
-      if (off < 0 || (uint32_t)off > a->length) RETV();
-      if (n < 0 || (uint32_t)(off + n) > a->length) n = (int32_t)a->length - off;
+      if (off < 0 || n < 0 || (uint64_t)(uint32_t)off + (uint32_t)n > a->length) {
+         dvm__throw(vm, "java/lang/IndexOutOfBoundsException",
+                    "write off=%d len=%d size=%u", off, n, a->length);
+         return false;
+      }
       src = (const uint8_t *)a->data + off;
       len = (uint32_t)n;
    }
    if (!len) RETV();
 
-   struct dvm_object *b = stream_reserve(vm, dst, (uint32_t)count + len);
-   if (!b || !b->data) RETV();
+   const uint64_t need = (uint64_t)(uint32_t)count + len;
+   if (need > (uint32_t)INT32_MAX - 8u) {
+      dvm__throw(vm, "java/lang/OutOfMemoryError", "stream capacity %llu",
+                  (unsigned long long)need);
+      return false;
+   }
+   struct dvm_object *b = stream_reserve(vm, dst, (uint32_t)need);
+   if (!b || !b->data) return false;
    memcpy((uint8_t *)b->data + count, src, len);
    stream_set_field(vm, dst, "count", count + (int32_t)len);
    RETV();
@@ -33597,7 +33510,10 @@ static const char *file_path(struct dvm *vm, dvm_ref self)
  * two of them live at once. */
 static const char *file_host_path(struct dvm *vm, dvm_ref self)
 {
-   const char *p = file_path(vm, self);
+   /* java.io constructors accept either File or String.  Both name the
+    * guest filesystem and must pass through the same namespace mapping. */
+   const char *p = object_is_a(vm, self, "Ljava/lang/String;")
+      ? dvm_string_utf8(vm, self) : file_path(vm, self);
    if (!p || !*p) return p;
    static char bank[4][PATH_MAX];
    static int next;
@@ -38314,8 +38230,11 @@ static dvm_ref pm_package_info(struct dvm *vm,
    (void)dvm_set_field(vm, ai, "nativeLibraryDir", "Ljava/lang/String;", path);
    int32_t version_code = 1;
    const char *version_name = NULL;
-   if (self && !strcmp(self, record->name))
+   if (self && !strcmp(self, record->name)) {
+      union dvm_value meta = { .l = dvm_runtime_manifest_bundle(vm) };
+      (void)dvm_set_field(vm, ai, "metaData", "Landroid/os/Bundle;", meta);
       arm_exec_apk_version(&version_code, &version_name);
+   }
    union dvm_value version = { .i = version_code };
    (void)dvm_set_field(vm, pi, "versionCode", "I", version);
    version.l = dvm_new_string(vm, version_name ? version_name : "");
@@ -52054,8 +51973,8 @@ static const struct rt_method rt_persistable_bundle[] = {
    M("getString", "(Ljava/lang/String;)Ljava/lang/String;", bundle_getString),
    M("getString", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
      bundle_getString),
-   M("containsKey", "(Ljava/lang/String;)Z", bundle_containsKey),
-   M("keySet", "()Ljava/util/Set;", bundle_keySet),
+   M("containsKey", "(Ljava/lang/String;)Z", map_containsKey),
+   M("keySet", "()Ljava/util/Set;", map_keySet),
    M_END,
 };
 
@@ -52522,7 +52441,6 @@ static bool file_output_init(struct dvm *vm, dvm_ref self,
 {
    (void)out;
    const char *path = ARG(0).l ? file_host_path(vm, ARG(0).l) : NULL;
-   if (!path && ARG(0).l) path = dvm_string_utf8(vm, ARG(0).l);
    bool append = nargs > 1 && ARG(1).i != 0;
    int fd = path && *path
       ? open(path, O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC), 0666)
@@ -52696,7 +52614,6 @@ static bool file_input_init(struct dvm *vm, dvm_ref self,
 {
    (void)nargs;
    const char *path = ARG(0).l ? file_host_path(vm, ARG(0).l) : NULL;
-   if (!path && ARG(0).l) path = dvm_string_utf8(vm, ARG(0).l);
    int fd = path ? open(path, O_RDONLY) : -1;
    if (fd < 0) {
       dvm__throw(vm, "java/io/FileNotFoundException", "%s: %s",
@@ -52771,7 +52688,6 @@ static bool raf_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                      int nargs, union dvm_value *out)
 {
    const char *path = ARG(0).l ? file_host_path(vm, ARG(0).l) : NULL;
-   if (!path && ARG(0).l) path = dvm_string_utf8(vm, ARG(0).l);
    const char *mode = (nargs > 1 && ARG(1).l) ? dvm_string_utf8(vm, ARG(1).l) : "r";
    /* "r" opens read-only and must not create; every "rw" variant ("rws"/"rwd"
     * only add sync-on-write) opens read/write and creates. */

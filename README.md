@@ -63,7 +63,9 @@ make x86_64 -j"$(nproc)"   # host is x86_64; plain `make` builds the 32-bit x86 
 
 `make` / `make x86_64` already pulls Cisco's openh264 shared library into
 `runtime/` (required for MediaCodec H.264). Re-run explicitly with
-`make fetch-openh264` if you need to refresh it.
+`make fetch-openh264` if you need to refresh it. `make syslib` fetches a
+real AArch64 libm into `syslib-arm64/`; the launcher uses it when that
+directory is present.
 
 ### 3. Launch a package
 
@@ -125,9 +127,9 @@ Details and launch recipes live in `PROGRESS.md`.
 
 | Title | Engine / ABI | Current result |
 |---|---|---|
-| **Ni no Kuni: Cross Worlds** | Unreal Engine 4 · AArch64 XAPK | Linux keeps drawing through guest login, the village, story dialogue and in-world play. SharedPreferences persist. On macOS the framebuffer is drawn, but the real window stays black |
+| **Ni no Kuni: Cross Worlds** | Unreal Engine 4 · AArch64 XAPK | Drawn on Linux through guest login, the village, story dialogue and in-world play. SharedPreferences persist. A current-build check still draws the 3D intro; a full playable pass on that build is still open. On macOS the framebuffer is drawn, but the real window stays black |
 | **Blade & Soul Masia** | Unreal Engine 5 · AArch64 APKS | Opening movie reaches EOS; title screen; additional-patch dialog is readable and Agree advances the download |
-| **Genshin Impact 7.0.0** | Unity IL2CPP · AArch64 XAPK | HoYoverse splash, then the login scene. A host WebView can open the account page. Sign-in is not finished: the region query still goes out without its signed parameters |
+| **Genshin Impact 7.1.0** | Unity IL2CPP · AArch64 XAPK | Past the HoYoverse splash and the login scene: server select, shader compile, the resource download, then the open world (the shore outside Mondstadt, including swimming) and in-game UI (mail, language). A host WebView can open the account page. Walking input and long sessions are still being checked |
 | **Between Two Worlds** | Unity 2023 IL2CPP · ARMv7 | Playable; reaches the main story scene |
 | **Between Two Worlds** | Unity 2023 IL2CPP · AArch64 | Main menu on a recorded run; recent checks reach language selection at about 70 fps |
 | **FPSMobile** | Unreal Engine 4 · ARMv7 | FirstPersonExampleMap renders; 16,000+ swaps observed |
@@ -222,15 +224,38 @@ No APK or guest patches — emulator-side fixes only. Programmatic taps use
 
 <p align="center"><sub>Title · server · account · character select · village · in-world · dialogue · Evermore · the client's own rest screen</sub></p>
 
-### Genshin Impact · splash, then the login scene
+### Genshin Impact · login, then the open world
 
-![Genshin Impact login scene rendered through Lunaria](screenshot_genshin_login.png)
+Unity IL2CPP on arm64-v8a. 7.0.0 reached the login scene. 7.1.0 goes on
+through server select, shader compilation and the resource download, then
+past **TAP TO BEGIN** into the world: the shore outside Mondstadt, swimming,
+the gift mailbox and the language screen. Frames are the guest framebuffer
+at **1024×576**. The world frames still carry a strong blue cast on the
+character. Walking input and long sessions are still being checked.
 
-<p align="center"><sub>Unity IL2CPP · arm64-v8a · OSREL Android 7.0.0 · the login scene after the splash</sub></p>
+<p align="center">
+  <img src="screenshot_genshin_swim.png" width="48%" alt="Genshin Impact, swimming off the Mondstadt shore">
+  &nbsp;
+  <img src="screenshot_genshin_field.png" width="48%" alt="Genshin Impact, the Traveler on the shore outside Mondstadt">
+</p>
 
-![Genshin Impact HoYoverse splash rendered through Lunaria](screenshot_genshin_splash.png)
+<p align="center">
+  <img src="screenshot_genshin_login.png" width="48%" alt="Genshin Impact login scene, night sky over the cloud bridge">
+  &nbsp;
+  <img src="screenshot_genshin_server.png" width="48%" alt="Genshin Impact server select, Asia checked">
+</p>
 
-<p align="center"><sub>The HoYoverse splash, the first guest frame after GLES 3.2 init</sub></p>
+<p align="center">
+  <img src="screenshot_genshin_mail.png" width="48%" alt="Genshin Impact gift mailbox, a letter open">
+  &nbsp;
+  <img src="screenshot_genshin_language.png" width="48%" alt="Genshin Impact language settings in Japanese">
+</p>
+
+<p align="center">
+  <img src="screenshot_genshin_splash.png" width="42%" alt="Genshin Impact HoYoverse splash">
+</p>
+
+<p align="center"><sub>7.1.0 open world and in-game UI · 7.0.0 login scene · the HoYoverse splash, the first guest frame after GLES init</sub></p>
 
 ### Between Two Worlds · main menu
 
@@ -273,7 +298,7 @@ rendered at 720×1280.
 
 Right-click opens Lunaria's own menu, drawn by luna-ui over the guest and over
 the boot card. From here: a screenshot (also F12), paste-on-type, Back, volume
-and mute, WebView zoom and engine, reload, full screen, quit.
+and mute, ALSA sound output, WebView zoom and engine, reload, full screen, quit.
 
 <p align="center">
   <img src="screenshot_host_menu.png" width="480" alt="Lunaria host menu with the WebView engine submenu open">
@@ -326,17 +351,22 @@ F12, and **Take Screenshot** in the host menu, write
 - **ARM64:** guest virtual addresses map one-to-one to host addresses; a
   high-address image window holds loaded ELFs, trampolines, JNI tables and
   stacks, enabling dynarmic fastmem. `LUNARIA_A64_ENGINES` (1–8; defaults from
-  host core count) can run multiple JIT engines on host threads. By default
-  the frame pump barriers engines at pass boundaries; `LUNARIA_A64_SELF_SCHED=1`
-  lets engines pull runnable guests freely (breaks some anti-cheat / timing
-  checks — off by default).
+  host core count) can run multiple JIT engines on host threads.
+  `lunaria-apk.sh` sets `LUNARIA_A64_SELF_SCHED=1`, so those engines pull
+  runnable guests continuously. `LUNARIA_A64_SELF_SCHED=0` puts a barrier
+  back at each frame-pump pass. Free-running engines match a device and
+  raise throughput a lot. Cross Worlds' security module has aborted about
+  twenty-five seconds in under that mode.
 - **Native calls:** guest libc, EGL, GLES and JNI calls cross generated
   `SVC #n` trampolines into host implementations.
+- **libm:** `make syslib` fills `syslib-arm64/` with an AArch64 libm that
+  runs as guest code (`pow`, `sincosf`, and the rest). The launcher points
+  `LUNARIA_SYSLIB_DIR` at that directory when it exists.
 - **Threads:** guest pthreads use cooperative round-robin scheduling with a
   separate JIT context per worker; mutex unlock can hand off directly to a
-  waiter. Optional parking (`LUNARIA_GUEST_SLEEP`, `LUNARIA_FD_PARK`) is
-  implemented but off by default — enabling it changes wake timing that some
-  titles measure.
+  waiter. Guest sleeps park for real wall time (`LUNARIA_GUEST_SLEEP`, on
+  unless set to `0`). Blocking reads stay on the scheduler unless
+  `LUNARIA_FD_PARK` is set.
 - **Java:** when a JNI call has no host stub, `src/dvm/` executes the method
   from the APK's `classes*.dex` (`LUNARIA_DVM=1` by default).
 - **Assets:** `AssetManager` reads DEFLATE/STORE entries from APKs and OBB
@@ -368,10 +398,11 @@ full diagnostic set.
 | `LUNARIA_THREAD_TICKS` | `200M` | ARM32 worker scheduling slice |
 | `LUNARIA_A64_THREAD_TICKS` | `20K` | AArch64 worker scheduling slice |
 | `LUNARIA_A64_ENGINES` | auto | Host threads for AArch64 JIT engines (1–8; defaults to 4 / 2 / 1 from host core count) |
-| `LUNARIA_A64_SELF_SCHED` | off | Engines pull runnable guests freely instead of barrier-pooled passes |
+| `LUNARIA_A64_SELF_SCHED` | `1` | Launcher default. Engines pull runnable guests freely. Set `0` for barrier-pooled passes. The binary itself stays off until the variable is set |
 | `LUNARIA_A64_FASTMEM` | `1` | Set `0` to route memory through callbacks |
 | `LUNARIA_A64_CODE_CACHE_MB` | `128` | Per-JIT translated-code cache |
 | `LUNARIA_GUEST_SLEEP` / `LUNARIA_FD_PARK` | on / off | Park guest sleeps for real wall time / park blocking reads (`LUNARIA_GUEST_SLEEP=0` is diagnostic only) |
+| `LUNARIA_SYSLIB_DIR` | `syslib-arm64/` if that directory exists | AArch64 platform libraries that run as guest code. `make syslib` fetches libm |
 | `LUNARIA_TOUCH_TEST` | off | Inject taps at `x,y[;x,y…]` (max 8). Bare numbers are framebuffer percentages; `640px` is a guest pixel |
 | `LUNARIA_TOUCH_FIFO` | off | Same taps while running: `echo 'x,y[,hold]' > $LUNARIA_TOUCH_FIFO` |
 | `LUNARIA_DEVICE` | `pixel6` | Device profile: `pixel6`, `pixel7`, `galaxys21`, `lunaria`. Prefer `lunaria.conf` |
@@ -525,3 +556,36 @@ frame.
 Licensed under the [Mozilla Public License 2.0](LICENSE).
 
 Project Lunaria © 2026 Yuichiro Nakada.
+
+### キーボード操作
+
+タッチ操作のゲームは、キーを画面上のタッチ位置へ割り当てて操作できます。
+右クリックメニューの **Keyboard Controls** からkeymapファイルを選ぶと、
+実行中に切り替わります。フォルダを移動して自作ファイルも選択でき、
+**Off**で無効化、**Reload Current File**で編集したファイルを再読み込みできます。
+読み込みに失敗した場合は元の設定を維持します。起動時の指定もできます。
+
+```sh
+LUNARIA_KEYMAP=genshin ./lunaria-apk.sh /path/to/Genshin.xapk
+LUNARIA_KEYMAP=crossworlds ./lunaria-apk.sh /path/to/CrossWorlds.apks
+```
+
+WASDで移動、Fで通常攻撃、E/Q/1/2/3でスキルやキャラ選択、Spaceでジャンプ、
+Shiftでダッシュです。Cross WorldsではSpace/Shiftは回避に割り当てています。
+マウスの左ドラッグでカメラを操作できます。移動とボタン、マウス操作は同時に使えます。
+入力欄では文字入力を優先し、フォーカスを失うと押していたキーを解除します。
+
+他のゲームやHUD配置には、`keymaps/*.conf`をコピーして座標を変更し、
+`LUNARIA_KEYMAP=/path/to/my.conf`で読み込みます。`lunaria.conf`にも設定を保存できます。
+`LUNARIA_KEYMAP=off`で無効になります。
+
+```text
+stick 0.15625 0.764 0.09
+button SPACE 0.922 0.665
+button F 0.826 0.769
+```
+
+`stick`はWASDで操作するスティック中心のX/Yと半径、`button`はキーとタッチ位置のX/Yです。
+X/Yは画面幅・高さに対する0〜1の割合、半径は短辺に対する割合です。
+ボタンは8個まで、キーは英大文字・数字・SPACE・SHIFTを指定できます。
+同梱レイアウトは横画面のHUDに合わせてあります。HUDのサイズや配置を変更した場合は調整してください。

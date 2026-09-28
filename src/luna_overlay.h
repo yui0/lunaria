@@ -87,6 +87,7 @@ void luna_overlay_set_toast(const char *html, const char *css);
  * elements' ids start with "luna-menu"; a click on one is handed to the menu
  * handler instead of the guest's click handler.  NULL html takes it down. */
 void luna_overlay_set_menu(const char *html, const char *css, bool modal);
+/* True for the modal context menu; a transient notice does not take input. */
 bool luna_overlay_menu_showing(void);
 typedef void (*luna_overlay_menu_fn)(const char *id);
 void luna_overlay_set_menu_handler(luna_overlay_menu_fn fn);

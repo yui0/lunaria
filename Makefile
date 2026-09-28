@@ -369,10 +369,10 @@ DVM_HDR = src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
 # layer inside the VM publishes the document, and the swap path in arm_exec
 # presents it.  Both sides then resolve to the same single instance of the
 # engine — two copies would each hold half of the state.
-runtime/libjvm.so: src/trace.h src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c src/jvm/jvm.h src/jvm/jni.h $(DVM_SRC) $(DVM_HDR) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o
+runtime/libjvm.so: src/trace.h src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c src/jvm/jvm.h src/jvm/jni.h $(DVM_SRC) $(DVM_HDR) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_keymap.o $(BUILD_DIR)/luna_gl_inspect.o
 	mkdir -p runtime
 	$(CC) $(CFLAGS) $(SANITIZE) -fPIC $(CPPFLAGS) -D_GNU_SOURCE -Wno-pedantic $(LDFLAGS) $(HOST_SO_LDFLAGS) -shared \
-	    src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c $(DVM_SRC) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o \
+	    src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c $(DVM_SRC) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_keymap.o $(BUILD_DIR)/luna_gl_inspect.o \
 	    -lm $(HOST_CRYPTO_LIBS) $(HOST_ICU_LIBS) \
 	    $(HOST_GL_LIBS) $(HOST_Z_LIBS) -o $@
 
@@ -404,7 +404,7 @@ libpthread.so: runtime/libpthread.so
 
 # arm_exec.o: compiled with C++20 and dynarmic headers; linked into lunaria
 $(BUILD_DIR)/arm_exec.o: | $(BUILD_DIR)
-$(BUILD_DIR)/arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/arm.h src/svc_ids.h src/lib/guest.c src/jvm/jvm.h src/binary128.h src/linker64.h src/trace.h $(DYNARMIC_LIB)
+$(BUILD_DIR)/arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/luna_input.h src/luna_keymap.h src/arm.h src/svc_ids.h src/lib/guest.c src/jvm/jvm.h src/binary128.h src/linker64.h src/trace.h $(DYNARMIC_LIB)
 	$(CXX) -std=c++20 $(OPTFLAGS) -fPIC \
 	    $(SANITIZE) \
 	    $(DYNARMIC_INCS) \
@@ -530,7 +530,7 @@ clean:
 	    $(BUILD_DIR)/stb_vorbis.o libdl.so libpthread.so
 	$(RM) -r runtime
 	$(RM) test/test_dynarmic_arm test/test_a64_memory_abort test/test_unity test/test_dvm test/dvm_test.dex test/test_regex test/test_http_chunked test/test_charset test/test_vulkan_bridge
-	$(RM) test/test_boot_card
+	$(RM) test/test_boot_card test/test_keymap test/test_motion_event test/libkeymapguest.so test/libkeymapndk.so
 	$(RM) test/libabitest64.so test/libabitest32.so test/abi_test_values.h
 	$(RM) test/abi_pkg/classes.dex
 
@@ -549,12 +549,12 @@ test/dvm_test.dex: test/make_dex.py
 # Sanitizers are on by default but need libasan at link time; pass
 # DVM_TEST_SAN= to build without them where that runtime is not installed.
 DVM_TEST_SAN ?= -fsanitize=address,undefined
-test/test_dvm: test/dvm_test.c $(DVM_SRC) $(DVM_HDR) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o
+test/test_dvm: test/dvm_test.c test/dvm_host_fixture.c src/jvm/packages.c $(DVM_SRC) $(DVM_HDR) $(LUNA_OS_OBJ) $(BUILD_DIR)/luna_keymap.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o
 	$(CC) -std=c11 -g -O1 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -Isrc \
 	    $(CPPFLAGS) \
 	    $(DVM_TEST_SAN) \
-	    test/dvm_test.c $(DVM_SRC:src/dvm/dvm_jni.c=) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o \
-	    -lm $(HOST_CRYPTO_LIBS) $(HOST_ICU_LIBS) $(HOST_Z_LIBS) $(HOST_SYSTEM_DL_LIBS) $(HOST_GL_LIBS) -o $@
+	    test/dvm_test.c test/dvm_host_fixture.c src/jvm/packages.c $(DVM_SRC:src/dvm/dvm_jni.c=) $(LUNA_OS_OBJ) $(BUILD_DIR)/luna_keymap.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o \
+	    -lm $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_CRYPTO_LIBS) $(HOST_ICU_LIBS) $(HOST_Z_LIBS) $(HOST_SYSTEM_DL_LIBS) $(HOST_GL_LIBS) -o $@
 
 # Pass a real classes.dex as DVM_DEX to also run every method in it.
 DVM_DEX ?=
@@ -562,10 +562,10 @@ DVM_DEX ?=
 # through a real title's boot.
 # luna_ime.o comes along because the overlay presents through it: the input
 # method is part of the surface now, not a separate layer.
-test/test_boot_card: test/boot_card_test.c $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o \
+test/test_boot_card: test/boot_card_test.c $(BUILD_DIR)/luna_keymap.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o \
                      src/luna_overlay.h src/luna_boot.h src/luna_ime.h
 	$(CC) -std=c11 -O2 -g $(CPPFLAGS) -D_GNU_SOURCE $(HOST_TEST_RPATH) \
-	    test/boot_card_test.c $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o \
+	    test/boot_card_test.c $(BUILD_DIR)/luna_keymap.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o \
 	    $(HOST_GL_LIBS) -lm -o $@
 
 boot-card-test: test/test_boot_card
@@ -612,6 +612,17 @@ http-chunked-test: test/test_http_chunked
 # HTTP server through the emulator's socket SVCs (see test/net_test.c).
 # Needs clang with the aarch64 target and lld; both come with the clang
 # package listed in the prerequisites.
+test/libglmaptest.so: test/gl_buffer_mapping_test.c
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
+	    -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libglmaptest.so \
+	    -o $@ $<
+
+gl-map-test: lunaria test/libglmaptest.so
+	@LD_LIBRARY_PATH="$(CURDIR):$(CURDIR)/runtime" ./lunaria test/libglmaptest.so \
+	    > .glmaptest.out 2>&1; \
+	grep 'glmaptest' .glmaptest.out; \
+	grep -q 'RESULT PASS' .glmaptest.out && ! grep -q 'RESULT FAIL' .glmaptest.out
+
 test/libnettest.so: test/net_test.c
 	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
 	    -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libnettest.so \
@@ -736,6 +747,20 @@ test/libgiltest.so: test/gil_test.c
 test/liblocktest.so: test/lock_test.c
 	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
 	    -Wl,-soname,liblocktest.so -o $@ $<
+
+test/libprimarymutex.so: test/primary_mutex_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
+	    -Wl,-soname,libprimarymutex.so -o $@ $<
+
+primary-mutex-test: lunaria test/libprimarymutex.so
+	@rc=0; for mode in 0 1; do \
+	    timeout 20s env LUNARIA_A64_SELF_SCHED=$$mode \
+	        LD_LIBRARY_PATH="$(CURDIR):$(CURDIR)/runtime" \
+	        ./lunaria test/libprimarymutex.so > .primarymutex.out 2>&1; \
+	    grep 'primarymutex.*RESULT' .primarymutex.out; \
+	    grep -q 'RESULT PASS' .primarymutex.out || rc=1; \
+	    grep -q 'RESULT FAIL' .primarymutex.out && rc=1; \
+	done; exit $$rc
 
 test/libfutextest.so: test/futex_test.c
 	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
@@ -883,7 +908,7 @@ guestmem-test: lunaria test/libguestmem.so
 
 mmap-test: lunaria test/libmmaptest.so
 	@timeout -k 2s 120s env LUNARIA_A64_ENGINES=1 LUNARIA_A64_SEGV=1 \
-	    LD_LIBRARY_PATH="$(CURDIR):$(CURDIR)/runtime" \
+	    LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" \
 	    ./lunaria test/libmmaptest.so > .mmaptest.out 2>&1; \
 	grep 'mmaptest' .mmaptest.out || \
 	    printf 'no verdict: the guest never reached the report\n'; \
@@ -1236,10 +1261,48 @@ dist-clean:
 	$(RM) -r "$(BUILD_DIR)/dist"
 	$(RM) lunaria-*.tar.gz lunaria-*.dmg
 
-.PHONY: luna-browser luna-browser-test vulkan-test dist dist-stage dist-stage-build dist-mac dist-clean all pixels-test dl-test jit-speed syslib guestlib syslib-clean host-all macos-deps x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
+.PHONY: primary-mutex-test gl-map-test luna-browser luna-browser-test vulkan-test dist dist-stage dist-stage-build dist-mac dist-clean all pixels-test dl-test jit-speed syslib guestlib syslib-clean host-all macos-deps x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
 	        clean install install-bin install-lib test net-test dvm-test http-chunked-test regex-test charset-test abi-test \
 	        posix-test boot-card-test binary128-test fd-callback-test \
 	        thread-start-test mutex-test heap-test heap-core-test icache-sync-test guestmem-test lock-test \
         gil-test \
         fetch fetch-libunity fetch-btw fetch-blade-soul fetch-openh264 \
         dynarmic-build
+
+$(BUILD_DIR)/luna_input.o: src/luna_input.c src/luna_input.h | $(BUILD_DIR)
+	$(CC) -std=c11 $(OPTFLAGS) -fPIC $(CPPFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/luna_keymap.o: src/luna_keymap.c src/luna_keymap.h | $(BUILD_DIR)
+	$(CC) -std=c11 $(OPTFLAGS) -fPIC $(CPPFLAGS) -c $< -o $@
+
+.PHONY: keymap-test
+test/test_keymap: test/keymap_test.c src/luna_input.c src/luna_keymap.c src/luna_input.h src/luna_keymap.h
+	$(CC) -std=c11 -g -Wall -Wextra -Werror -Isrc test/keymap_test.c src/luna_input.c src/luna_keymap.c -pthread -lm -o $@
+keymap-test: test/test_keymap
+	./test/test_keymap
+
+$(BUILD_DIR)/loader.o $(BUILD_DIR)/luna_overlay.o runtime/libjvm.so: src/luna_input.h
+
+.PHONY: motion-event-test
+test/test_motion_event: test/motion_event_test.c test/dvm_host_fixture.c runtime/libjvm.so $(LUNA_OS_OBJ)
+	$(CC) -std=c11 -g -O1 -D_GNU_SOURCE $(CPPFLAGS) -Isrc $(HOST_EXPORT) \
+	    test/motion_event_test.c test/dvm_host_fixture.c runtime/libjvm.so $(LUNA_OS_OBJ) \
+	    -Wl,-rpath,'$$ORIGIN/../runtime' $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_SYSTEM_DL_LIBS) -o $@
+motion-event-test: test/test_motion_event
+	./test/test_motion_event
+
+test/libkeymapguest.so: test/keymap_guest_test.c src/jvm/jni.h
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) $< -o $@
+
+test/libkeymapndk.so: test/keymap_guest_test.c src/jvm/jni.h
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -DNDK_INPUT_TEST $< -o $@
+
+.PHONY: keymap-smoke-test
+keymap-smoke-test: lunaria test/libkeymapguest.so test/libkeymapndk.so
+	python3 test/keymap_smoke.py
+
+$(BUILD_DIR)/luna_overlay.o: src/luna_keymap.h
+
+$(BUILD_DIR)/luna_gl_inspect.o: src/luna_gl_inspect.c src/luna_gl_inspect.h | $(BUILD_DIR)
+	$(CC) -std=c11 $(OPTFLAGS) -fPIC $(CPPFLAGS) -c $< -o $@
+$(BUILD_DIR)/arm_exec.o: src/luna_gl_inspect.h

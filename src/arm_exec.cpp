@@ -182,6 +182,8 @@ extern "C" void dynarmic_a64_set_progress_hook(void (*fn)(uint64_t compiles,
 
 extern "C" {
 #include "arm_exec.h"
+#include "luna_gl_inspect.h"
+#include "luna_keymap.h"
 #include "linker64.h"
 #include "jvm/jvm.h"
 #include "jvm/jni.h"
@@ -5467,6 +5469,7 @@ struct ArmSignalWaitState {
     bool futex_timed = false;
     uint64_t futex_until_ns = 0;
     bool futex_raw_result = false;
+    bool futex_is_cond = false;
     GuestVA waiting_cond = 0;
     uint32_t waiting_join = 0;
     GuestVA join_retval_ptr = 0;
@@ -5502,6 +5505,7 @@ struct ArmSignalFrameState {
      * relative to it; see a64_deliver_pending_signal. */
     GuestVA handler_sp = 0;
     uint64_t old_mask = 0;
+    bool restart_wait = false;
     ArmSignalWaitState wait{};
 };
 
@@ -5795,6 +5799,21 @@ static std::deque<ArmThread> g_threads;
  * that runs that JIT; neither the scheduler nor another guest thread owns them. */
 static thread_local ArmSignalFrameState g_main_signal_frames[A64_SIGNAL_DEPTH_MAX];
 static thread_local uint8_t g_main_signal_depth;
+static thread_local uint64_t g_main_signal_returns;
+/* Signals directed at that thread (pthread_kill(1, …), tgkill(pid, pid, …)).
+ * It has no ArmThread to carry the pending set, so the set lives here and the
+ * thread itself takes it at its next SVC return or slice boundary, on its own
+ * JIT and stack -- which is what the kernel does.  Running the handler at the
+ * sender instead ran a stop-the-world collector's suspend handler on the
+ * collector itself: the main thread was never stopped, never acknowledged, and
+ * every collection sat out its full timeout.  Written by any engine under the
+ * execution lock; the atomic lets the owner test it without taking the lock. */
+static std::atomic<uint64_t> g_main_pending_signals{0};
+static std::atomic<bool> g_guest_quit{false};
+/* sigsuspend() on that thread: the mask it replaced, restored by rt_sigreturn
+ * of the handler that ends the wait. */
+static bool     g_main_waiting_signal = false;
+static uint64_t g_main_sigsuspend_old_mask = 0;
 
 static uint32_t guest_pid(void)
 {
@@ -5869,6 +5888,12 @@ static void sem_wake_parked(GuestVA sva, uint32_t max_wake);
 static void futex_waiter_add(uint32_t tid, GuestVA uaddr);
 static void futex_waiter_remove(uint32_t tid, GuestVA uaddr);
 static void futex_waiter_remove_tid(uint32_t tid);
+static void arm_signal_suspend_futex(ArmThread &t);
+static void arm_signal_resume_futex(ArmExecCtx &ctx, ArmThread &t,
+                                    const ArmSignalFrameState &frame);
+static void arm_signal_suspend_sem(ArmThread &t);
+static void arm_signal_resume_sem(ArmExecCtx &ctx, ArmThread &t,
+                                  const ArmSignalFrameState &frame);
 static void sem_waiter_add(uint32_t tid, GuestVA sva);
 static void sem_waiter_remove(uint32_t tid, GuestVA sva);
 static void sem_waiter_remove_tid(uint32_t tid);
@@ -8058,6 +8083,7 @@ static void arm_signal_save_wait(ArmThread &t, ArmSignalWaitState &w) {
     w.futex_timed = t.futex_timed;
     w.futex_until_ns = t.futex_until_ns;
     w.futex_raw_result = t.futex_raw_result;
+    w.futex_is_cond = t.futex_is_cond;
     w.waiting_cond = t.waiting_cond;
     w.waiting_join = t.waiting_join;
     w.join_retval_ptr = t.join_retval_ptr;
@@ -8091,6 +8117,7 @@ static void arm_signal_clear_wait(ArmThread &t) {
     t.futex_timed = false;
     t.futex_until_ns = 0;
     t.futex_raw_result = false;
+    t.futex_is_cond = false;
     t.waiting_cond = 0;
     t.waiting_join = 0;
     t.join_retval_ptr = 0;
@@ -8124,6 +8151,7 @@ static void arm_signal_restore_wait(ArmThread &t, const ArmSignalWaitState &w) {
     t.futex_timed = w.futex_timed;
     t.futex_until_ns = w.futex_until_ns;
     t.futex_raw_result = w.futex_raw_result;
+    t.futex_is_cond = w.futex_is_cond;
     t.waiting_cond = w.waiting_cond;
     t.waiting_join = w.waiting_join;
     t.join_retval_ptr = w.join_retval_ptr;
@@ -8266,6 +8294,9 @@ static bool a64_deliver_pending_signal(ArmExecCtx &ctx, ArmThread &t) {
     }
     frame.old_mask = resume_mask;
     arm_signal_save_wait(t, frame.wait);
+    frame.restart_wait = (sa.flags & GUEST_SA_RESTART) != 0;
+    arm_signal_suspend_futex(t);
+    arm_signal_suspend_sem(t);
     arm_signal_clear_wait(t);
 
     GuestVA si_va = 0, uc_va = 0;
@@ -8317,10 +8348,10 @@ static bool a64_deliver_pending_signal(ArmExecCtx &ctx, ArmThread &t) {
         signal_action_erase(t.process_pid, sig);
     }
     /* Which wait the signal interrupted decides what the interrupted call
-     * has to report.  A device answers EINTR for a sleep, a poll/read and a
-     * semaphore; a condition variable and a mutex are restarted underneath
-     * the caller.  Naming it here is the only way to see which one a guest
-     * was actually in. */
+     * has to report.  A device answers EINTR for a sleep and a poll/read;
+     * sem_wait restarts when SA_RESTART is set, while a condition variable
+     * and a mutex are restarted underneath the caller.  Naming it here is
+     * the only way to see which one a guest was actually in. */
     fprintf(stderr, "[signal] interrupted tid=%u wait: sleep=%d fds=%d sem=%d "
             "futex=%d cond=%d mutex=%d rwlock=%d join=%d egl=%d\n", t.id,
             frame.wait.sleep_until_ns != 0, (int)frame.wait.waiting_fds,
@@ -8354,6 +8385,8 @@ static bool a64_rt_sigreturn(ArmExecCtx &ctx, uint32_t tid) {
     if (t) {
         arm_signal_clear_wait(*t);
         arm_signal_restore_wait(*t, frame.wait);
+        arm_signal_resume_futex(ctx, *t, frame);
+        arm_signal_resume_sem(ctx, *t, frame);
     }
     /* The handler ran, so a sleep it interrupted is over.  Report what a
      * device reports: EINTR, and the time that was left through `rem`. */
@@ -8386,6 +8419,7 @@ static bool a64_rt_sigreturn(ArmExecCtx &ctx, uint32_t tid) {
     }
     signal_mask_store(tid, frame.old_mask);
     --*depth;
+    if (tid == 0) ++g_main_signal_returns;
     g_svc_context_restored = true;
     fprintf(stderr, "[signal] return tid=%u depth=%u\n",
             tid, (unsigned)*depth);
@@ -8720,6 +8754,102 @@ static uint32_t futex_wake_parked(GuestVA uaddr, uint32_t max_wake)
         futex_wait_addr_remove(uaddr, woke);
     }
     return woke;
+}
+
+/* A kernel futex waiter is dequeued before entering a signal handler.
+ * WAKE during the handler must not count that waiter.  SA_RESTART queues a
+ * fresh wait after sigreturn, including the value check.  A timed raw wait
+ * instead returns EINTR.
+ * Merely restoring waiting_futex lost the wake-list entry permanently. */
+static void arm_signal_suspend_futex(ArmThread &t)
+{
+    if (!t.waiting_futex) return;
+    futex_waiter_remove(t.id, t.waiting_futex);
+    futex_wait_addr_remove(t.waiting_futex);
+}
+
+/* A signal removes a blocked sem_wait from the kernel's wait queue.  The
+ * signal handler may run across a sem_post; that post must leave a token for
+ * sigreturn to consume, rather than spending it on the suspended waiter. */
+static void arm_signal_suspend_sem(ArmThread &t)
+{
+    if (t.waiting_sem) sem_waiter_remove(t.id, t.waiting_sem);
+}
+
+static void arm_signal_resume_sem(ArmExecCtx &ctx, ArmThread &t,
+                                  const ArmSignalFrameState &frame)
+{
+    if (!t.waiting_sem) return;
+    const GuestVA sva = t.waiting_sem;
+    int error = 0;
+    if (!frame.restart_wait) error = EINTR;
+    else {
+        auto it = g_sems.find(sva);
+        if (it != g_sems.end() && it->second > 0) {
+            --it->second;
+            t.waiting_sem = 0;
+            t.sem_skip_passes = 0;
+            t.sem_timed = false;
+            t.sem_until_ns = 0;
+            g_svc_jit64->SetRegister(0, 0);
+            t.regs64[0] = 0;
+            t.regs[0] = 0;
+            return;
+        }
+        if (t.sem_timed && host_mono_ns() >= t.sem_until_ns)
+            error = ETIMEDOUT;
+        else {
+            sem_waiter_add(t.id, sva);
+            return;
+        }
+    }
+    t.waiting_sem = 0;
+    t.sem_skip_passes = 0;
+    t.sem_timed = false;
+    t.sem_until_ns = 0;
+    if (uint32_t eva = errno_va(ctx, t.id))
+        ctx.mem.write32(eva, (uint32_t)error);
+    g_svc_jit64->SetRegister(0, UINT64_MAX);
+    t.regs64[0] = UINT64_MAX;
+    t.regs[0] = ~0u;
+}
+
+static void arm_signal_resume_futex(ArmExecCtx &ctx, ArmThread &t,
+                                    const ArmSignalFrameState &frame)
+{
+    if (!t.waiting_futex) return;
+    const GuestVA uaddr = t.waiting_futex;
+    const bool cond = t.futex_is_cond;
+    int error = 0;
+    if (!cond && (!frame.restart_wait || t.futex_timed)) error = EINTR;
+    else if (guest_word_load(ctx.mem, uaddr) != t.futex_val) error = EAGAIN;
+    else if (t.futex_timed && host_mono_ns() >= t.futex_until_ns)
+        error = ETIMEDOUT;
+    if (!error) {
+        ++g_futex_wait_addrs[uaddr];
+        futex_waiter_add(t.id, uaddr);
+        return;
+    }
+    const bool raw = t.futex_raw_result;
+    t.waiting_futex = 0;
+    t.futex_timed = false;
+    t.futex_until_ns = 0;
+    t.futex_raw_result = false;
+    t.futex_is_cond = false;
+    if (cond) {
+        /* The condition SVC resumes its mutex acquisition itself. */
+        t.waiting_cond = 0;
+        t.wait_result = error == ETIMEDOUT ? ETIMEDOUT : 0;
+        return;
+    }
+    const uint64_t result = raw ? (uint64_t)-(int64_t)error : UINT64_MAX;
+    if (!raw) {
+        const uint32_t eva = errno_va(ctx, t.id);
+        if (eva) ctx.mem.write32(eva, (uint32_t)error);
+    }
+    g_svc_jit64->SetRegister(0, result);
+    t.regs64[0] = result;
+    t.regs[0] = (uint32_t)result;
 }
 
 static uint32_t futex_publish_wake(GuestVA uaddr, uint32_t max_wake)
@@ -9703,7 +9833,13 @@ static void alarm_check(ArmExecCtx &ctx) {
 static void guest_raise_signal(ArmExecCtx &ctx, uint32_t tid, int sig) {
     if (sig <= 0 || sig > 64) return;
     ArmThread *target = arm_thread_by_tid(tid);
-    if (!target) return;
+    if (!target) {
+        /* The main thread: 0 internally, 1 as its pthread_t. */
+        if (ctx.is_arm64 && (tid == 0 || tid == 1))
+            g_main_pending_signals.fetch_or(1ull << (unsigned)(sig - 1),
+                                            std::memory_order_release);
+        return;
+    }
     target->pending_signals |= 1ull << (unsigned)(sig - 1);
     if (!target->running && a64_deliver_pending_signal(ctx, *target))
         thread_mark_ready(target->id);
@@ -11812,7 +11948,7 @@ static std::map<uint32_t, SlBufferQueue> g_sl_queues;  /* key: owner instance */
  * the silent metronome (useful when a machine has no card, and for comparing
  * timing with and without the device in the loop). */
 static bool audio_sink_ready(uint32_t rate, uint32_t channels) {
-    static int state = 0;   /* 0 unknown, 1 open, -1 off for good */
+    static int state = 0;   /* 0 unopened, 1 open, -1 explicitly disabled */
     static uint64_t retry_ns = 0;
     if (state > 0) return true;
     if (state < 0) return false;
@@ -11821,7 +11957,6 @@ static bool audio_sink_ready(uint32_t rate, uint32_t channels) {
     /* A card that is busy now may be free in a minute — the desktop's music
      * player exits, the other app releases it — so keep trying, slowly.  Only
      * an explicit LUNARIA_AUDIO=0 turns playback off for the whole run. */
-    static int tries = 0;
     const uint64_t now = host_mono_ns();
     if (now < retry_ns) return false;
     retry_ns = now + 3'000'000'000ull;
@@ -11852,10 +11987,9 @@ static bool audio_sink_ready(uint32_t rate, uint32_t channels) {
     { ArmLockDropped unlock_for_coreaudio;
       opened = luna_os_audio_open(rate, channels); }
     if (opened == 0) { state = 1; return true; }
-    /* A card that is busy now may be free in a moment, so try a few times —
-     * but a machine without one is a fact, not a fault: stop asking and let
-     * the guest run silent. */
-    if (++tries >= 5) state = -1;
+    /* Keep the sink recoverable: a user can select another output from the
+     * host menu while this application is running.  The retry timer bounds
+     * work when the machine has no usable card. */
     return false;
 }
 // What we told the guest through GetMetaDataInt("audiomanager.
@@ -12239,6 +12373,31 @@ static void drive_ndk_choreographer(ArmExecCtx &ctx) {
 struct GlMappedBuf { void *host; uint32_t gva, len, access; };
 static std::map<uint32_t, GlMappedBuf> g_gl_mapped;    /* keyed by buffer name */
 static std::map<uint32_t, uint32_t> g_gl_bound_bufs;   /* target -> buffer name */
+/* With a pixel-unpack buffer bound, GL interprets the pointer argument as a
+ * byte offset into that buffer.  Translating it as guest memory corrupts or
+ * rejects texture uploads (and can leave scene materials black). */
+static const void *gl_unpack_ptr(ArmExecCtx &ctx, GuestVA value) {
+    auto it = g_gl_bound_bufs.find(0x88ECu /* GL_PIXEL_UNPACK_BUFFER */);
+    if (it != g_gl_bound_bufs.end() && it->second) {
+        static unsigned reported = 0;
+        if (reported++ < 8)
+            fprintf(stderr, "[gl] pixel-unpack buffer %u offset=0x%llx\n",
+                    it->second, (unsigned long long)value);
+        return (const void *)(uintptr_t)value;
+    }
+    return value ? (const void *)ctx.mem.ptr(value) : nullptr;
+}
+static void *gl_pack_ptr(ArmExecCtx &ctx, GuestVA value) {
+    auto it = g_gl_bound_bufs.find(0x88EBu /* GL_PIXEL_PACK_BUFFER */);
+    if (it != g_gl_bound_bufs.end() && it->second) {
+        static unsigned reported = 0;
+        if (reported++ < 8)
+            fprintf(stderr, "[gl] pixel-pack buffer %u offset=0x%llx\n",
+                    it->second, (unsigned long long)value);
+        return (void *)(uintptr_t)value;
+    }
+    return value ? (void *)ctx.mem.ptr(value) : nullptr;
+}
 // GLsync handles: guest sees index+1 into this table (host GLsync is 64-bit).
 // Deleted slots are recycled: engines create fences per frame, so an
 // append-only table was both an allocation hot path and an unbounded leak.
@@ -13579,10 +13738,11 @@ static void gl_trace_upload(const char *what, uint32_t tgt, uint32_t lvl,
     const uint32_t pbo = g_gl_bound_bufs[0x88ECu];
     if (bytes > 4096) bytes = 4096;
     void *mapped = nullptr;
-    if (!px && pbo && bytes && pfn_glMapBufferRange && pfn_glUnmapBuffer)
-        mapped = pfn_glMapBufferRange(0x88ECu, 0, (intptr_t)bytes, 0x0001u);
-    const unsigned char *src = px ? (const unsigned char *)px
-                                  : (const unsigned char *)mapped;
+    if (pbo && bytes && pfn_glMapBufferRange && pfn_glUnmapBuffer)
+        mapped = pfn_glMapBufferRange(0x88ECu, (intptr_t)(uintptr_t)px,
+                                      (intptr_t)bytes, 0x0001u);
+    const unsigned char *src = pbo ? (const unsigned char *)mapped
+                                   : (const unsigned char *)px;
     unsigned lo = 255, hi = 0, n = 0;
     unsigned long sum = 0;
     for (size_t k = 0; src && k < bytes; ++k) {
@@ -13595,7 +13755,7 @@ static void gl_trace_upload(const char *what, uint32_t tgt, uint32_t lvl,
     fprintf(stderr, "[tex] %s tex=%u tgt=0x%x lvl=%u %dx%d at %d,%d fmt=0x%x "
             "type=0x%x src=%s pbo=%u byte[min=%u max=%u avg=%lu]\n",
             what, bound_tex, tgt, lvl, w, h, x, y, fmt, typ,
-            px ? "client" : (src ? "pbo" : "none"), pbo,
+            pbo ? (src ? "pbo" : "none") : (px ? "client" : "none"), pbo,
             n ? lo : 0, hi, n ? sum / n : 0ul);
 }
 
@@ -13909,6 +14069,7 @@ static int gl_trace_draw_cap(void) {
  * which nine and where they go is the whole shape of the problem.  Deliberately
  * cheap — no readbacks, no uniform queries — so it can cover whole frames. */
 static void gl_draw_census(const char *what, GLenum mode, GLsizei count) {
+    luna_gl_inspect_draw(g_guest_egl_swap_count);
     static uint64_t lo = 1, hi = 0;
     static bool init = false;
     if (!init) {
@@ -14281,6 +14442,32 @@ static void gl_dump_fb0_ui_draw(GLsizei count) {
         while (pfn_glGetError() != 0) {}
 }
 
+/* Mapping follows the current context's generic binding.  BindBufferBase /
+ * BindBufferRange also change it, and element bindings belong to the VAO;
+ * a shadow updated only by BindBuffer cannot identify the mapped object.
+ * Query on map/flush/unmap, rather than adding driver queries to every bind. */
+static GLuint gl_mapping_buffer(GLenum target) {
+    GLenum pname;
+    switch (target) {
+    case 0x8892u: pname = 0x8894u; break; /* ARRAY_BUFFER */
+    case 0x8893u: pname = 0x8895u; break; /* ELEMENT_ARRAY_BUFFER */
+    case 0x88EBu: pname = 0x88EDu; break; /* PIXEL_PACK_BUFFER */
+    case 0x88ECu: pname = 0x88EFu; break; /* PIXEL_UNPACK_BUFFER */
+    case 0x8A11u: pname = 0x8A28u; break; /* UNIFORM_BUFFER */
+    case 0x8C8Eu: pname = 0x8C8Fu; break; /* TRANSFORM_FEEDBACK_BUFFER */
+    case 0x8F36u: pname = 0x8F36u; break; /* COPY_READ_BUFFER */
+    case 0x8F37u: pname = 0x8F37u; break; /* COPY_WRITE_BUFFER */
+    case 0x90D2u: pname = 0x90D3u; break; /* SHADER_STORAGE_BUFFER */
+    case 0x92C0u: pname = 0x92C1u; break; /* ATOMIC_COUNTER_BUFFER */
+    case 0x8F3Fu: pname = 0x8F43u; break; /* DRAW_INDIRECT_BUFFER */
+    case 0x90EEu: pname = 0x90EFu; break; /* DISPATCH_INDIRECT_BUFFER */
+    default: return 0;
+    }
+    GLint buffer = 0;
+    if (pfn_glGetIntegerv) pfn_glGetIntegerv(pname, &buffer);
+    return (GLuint)buffer;
+}
+
 static void gl_restore_texture_units() {
     /* Disabled for UE: our shadow map often holds BindTexture(...,0) from
      * FBO-attach unbinds, and restoring it right before Draw* clears the
@@ -14298,28 +14485,16 @@ static void gl_restore_texture_units() {
 }
 
 // Touch input: GLFW mouse -> Android MotionEvent bridge.
-struct TouchEvent {
-    int action;
-    float x, y;
-    int64_t event_ms;
-    int64_t down_ms;
-};
+typedef luna_touch_event TouchEvent;
+static luna_touch_state g_touch_state = {};
 static std::deque<TouchEvent> g_touch_queue;
 static TouchEvent g_touch_cur = {1, 0.f, 0.f, 0, 0}; /* current (last-popped) */
 static bool g_touch_down = false;
-static int64_t g_touch_down_ms = 0;
 
 static int64_t touch_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000ll + ts.tv_nsec / 1000000ll;
-}
-
-static TouchEvent touch_make(int action, float x, float y) {
-    const int64_t now = touch_now_ms();
-    if (action == 0 /* DOWN */)
-        g_touch_down_ms = now;
-    return {action, x, y, now, g_touch_down_ms ? g_touch_down_ms : now};
 }
 
 /* ---- NDK input queue (AInputQueue / AMotionEvent) ----------------------
@@ -14331,7 +14506,7 @@ static TouchEvent touch_make(int action, float x, float y) {
  * its ALooper, so the queue needs a pollable fd of its own: the looper is what
  * tells the glue there is anything to read.
  *
- * Everything here describes one finger, because a mouse is one finger. */
+ * Events retain an immutable snapshot of all mouse and mapped-key contacts. */
 static constexpr int32_t NDK_INPUT_TYPE_MOTION = 2;
 static constexpr int32_t NDK_INPUT_TYPE_KEY    = 1;
 
@@ -14358,12 +14533,12 @@ struct NdkInputEvent {
     float    x_precision = 1.f;
     float    y_precision = 1.f;
     int32_t  edge_flags = 0;
+    luna_touch_event touch = {};
 };
 static std::deque<NdkInputEvent> g_ndk_input_q;
 static NdkInputEvent g_ndk_input_cur = {};
 static int  g_ndk_input_pipe[2] = { -1, -1 };
 static bool g_ndk_input_attached = false;
-static int64_t g_ndk_touch_down_ns = 0;
 
 /* "The guest has stopped reading its input queue."
  *
@@ -14382,19 +14557,26 @@ static void ndk_input_queue_full(void) {
     ++dropped;
 }
 
-static void ndk_input_push(int action, float x, float y) {
-    if (g_ndk_input_pipe[0] < 0) return;      /* no queue handed out yet */
+static void ndk_input_push(const TouchEvent &ev) {
+    if (g_ndk_input_pipe[0] < 0) return;
     if (g_ndk_input_q.size() >= 256) { ndk_input_queue_full(); return; }
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    const int64_t now = (int64_t)ts.tv_sec * 1'000'000'000ll + ts.tv_nsec;
-    if (action == 0 /* DOWN */) g_ndk_touch_down_ns = now;
-    g_ndk_input_q.push_back({NDK_INPUT_TYPE_MOTION, action, x, y, 0, 0, 0, now,
-                             g_ndk_touch_down_ns ? g_ndk_touch_down_ns : now});
-    /* One byte per event: the reader pops exactly one byte per getEvent, so
-     * the looper stays readable while events remain. */
+    NdkInputEvent n = {};
+    n.action = ev.action; n.x = ev.x; n.y = ev.y;
+    n.event_ns = ev.event_ms * 1000000ll;
+    n.down_ns = ev.down_ms * 1000000ll;
+    n.touch = ev;
+    g_ndk_input_q.push_back(n);
     const char b = 1;
-    if (write(g_ndk_input_pipe[1], &b, 1) != 1) { /* pipe full: poll still fires */ }
+    if (write(g_ndk_input_pipe[1], &b, 1) != 1) { }
+}
+
+static void touch_contact(int id, int action, float x, float y) {
+    TouchEvent ev;
+    if (!luna_touch_update(&g_touch_state, id, action, x, y, touch_now_ms(), &ev)) return;
+    if (!g_touch_queue.empty() && ev.action == 2 && g_touch_queue.back().action == 2)
+        g_touch_queue.back() = ev;
+    else g_touch_queue.push_back(ev);
+    ndk_input_push(ev);
 }
 
 static void ndk_input_push_key(int action, int keycode, int metastate) {
@@ -14503,6 +14685,8 @@ static void glfw_fb_size_cb(GLFWwindow *window, int w, int h) {
     }
 }
 
+static void keymap_release(void);
+
 static void glfw_mouse_button_cb(GLFWwindow *w, int button, int action, int) {
     double cx = 0, cy = 0;
     glfwGetCursorPos(w, &cx, &cy);
@@ -14510,7 +14694,10 @@ static void glfw_mouse_button_cb(GLFWwindow *w, int button, int action, int) {
     /* Right click is the emulator's, never the guest's: a touchscreen has no
      * second button, so no app is waiting for one. */
     if (button == GLFW_MOUSE_BUTTON_RIGHT) {
-        if (action == GLFW_PRESS) luna_menu_open(cx, cy, g_fb_w, g_fb_h);
+        if (action == GLFW_PRESS) {
+            keymap_release();
+            luna_menu_open(cx, cy, g_fb_w, g_fb_h);
+        }
         return;
     }
     if (button != GLFW_MOUSE_BUTTON_LEFT) return;
@@ -14520,34 +14707,21 @@ static void glfw_mouse_button_cb(GLFWwindow *w, int button, int action, int) {
      * gets nothing.  Feeding the guest a touch it should never have seen makes
      * it act on a tap the player aimed at the dialog. */
     if (luna_overlay_pointer(cx, cy, g_touch_down ? 1 : 0)) return;
-    if (g_touch_queue.size() < 64)
-        g_touch_queue.push_back(touch_make(g_touch_down ? 0 : 1, (float)cx, (float)cy));
-    ndk_input_push(g_touch_down ? 0 : 1, (float)cx, (float)cy);
+    touch_contact(0, g_touch_down ? 0 : 1, (float)cx, (float)cy);
 }
 
 static void glfw_cursor_pos_cb(GLFWwindow *, double cx, double cy) {
     window_to_surface(&cx, &cy);
     if (luna_overlay_pointer(cx, cy, -1)) return;
     if (!g_touch_down) return;   /* touchscreen semantics: no hover events */
-    // Coalesce: replace a pending MOVE instead of queueing thousands
-    if (!g_touch_queue.empty() && g_touch_queue.back().action == 2)
-        g_touch_queue.back() = touch_make(2, (float)cx, (float)cy);
-    else if (g_touch_queue.size() < 64)
-        g_touch_queue.push_back(touch_make(2, (float)cx, (float)cy));
-    ndk_input_push(2, (float)cx, (float)cy);
+    touch_contact(0, 2, (float)cx, (float)cy);
 }
 
 extern "C" int arm_exec_touch_next(ArmExecTouchEvent *out) {
     if (g_touch_queue.empty()) return 0;
     g_touch_cur = g_touch_queue.front();
     g_touch_queue.pop_front();
-    if (out) {
-        out->action = g_touch_cur.action;
-        out->x = g_touch_cur.x;
-        out->y = g_touch_cur.y;
-        out->event_ms = g_touch_cur.event_ms;
-        out->down_ms = g_touch_cur.down_ms;
-    }
+    if (out) *out = g_touch_cur;
     return 1;
 }
 
@@ -14561,9 +14735,7 @@ extern "C" int arm_exec_touch_next(ArmExecTouchEvent *out) {
 extern "C" void arm_exec_touch_push(int action, float x, float y) {
     const int overlay_action = action == 2 ? -1 : (action == 0 ? 1 : 0);
     if (luna_overlay_pointer(x, y, overlay_action)) return;
-    if (g_touch_queue.size() < 64)
-        g_touch_queue.push_back(touch_make(action, x, y));
-    ndk_input_push(action, x, y);
+    touch_contact(0, action, x, y);
 }
 extern "C" int   arm_exec_touch_action(void) { return g_touch_cur.action; }
 extern "C" float arm_exec_touch_x(void)      { return g_touch_cur.x; }
@@ -14571,17 +14743,8 @@ extern "C" float arm_exec_touch_y(void)      { return g_touch_cur.y; }
 extern "C" long long arm_exec_touch_time(void) { return g_touch_cur.event_ms; }
 extern "C" long long arm_exec_touch_down_time(void) { return g_touch_cur.down_ms; }
 
-/* Host keyboard -> the emulator's input method.
- *
- * A device has no keyboard attached; text reaches an app from whatever input
- * method the system has up, and Lunaria's is luna_ime.c.  So these two do not
- * decide anything: they hand the keystroke to the input method when one is
- * showing, and drop it otherwise, which is what a device does with a key
- * pressed at a screen that is not asking for text.  GLFW's key, action and
- * modifier numbering is luna-ui's, so the arguments pass straight through.
- *
- * (Hardware-key delivery to the guest's own AInputQueue is a separate path and
- * does not exist yet; nothing here pretends to be it.) */
+/* Text input is routed to the IME first. An optional keymap turns gameplay
+ * keys into touchscreen contacts; remaining keys go to the NDK key queue. */
 static int glfw_to_android_key(int key) {
     switch (key) {
     case GLFW_KEY_ESCAPE:     return 4;   /* BACK — common game mapping */
@@ -14611,13 +14774,45 @@ static int glfw_to_android_meta(int mods) {
     return m;
 }
 
+static luna_keymap g_keymap = {};
+static void keymap_emit(void *, int id, int action, float x, float y) {
+    touch_contact(id, action, x, y);
+}
+static void keymap_size(float &w, float &h) {
+    int dw, dh; view_size_load(dw, dh);
+    w = dw > 0 ? dw : g_fb_w; h = dh > 0 ? dh : g_fb_h;
+}
+static void keymap_release(void) {
+    float w, h; keymap_size(w, h);
+    luna_keymap_release(&g_keymap, w, h, keymap_emit, nullptr);
+}
+static void keymap_apply_pending(void) {
+    luna_keymap next;
+    if (!luna_keymap_take(&next)) return;
+    keymap_release();
+    g_keymap = next;
+    char path[4096]; luna_keymap_current(path, sizeof path);
+    fprintf(stderr, "[input] keymap: %s\n", path);
+}
+static void glfw_focus_cb(GLFWwindow *, int focused) {
+    if (focused) return;
+    keymap_release();
+    if (g_touch_state.count) touch_contact(0, 3, 0, 0);
+    g_touch_down = false;
+}
+
 static void glfw_key_cb(GLFWwindow *, int key, int scancode, int action, int mods) {
-    if (luna_overlay_web_key(key, action)) return;
+    if (luna_overlay_web_key(key, action)) { keymap_release(); return; }
     if (luna_ime_active()) {
+        keymap_release();
         luna_ime_key(key, scancode, action, mods);
         return;
     }
+    if (luna_overlay_guest_window_up() || luna_overlay_menu_showing()) { keymap_release(); return; }
     if (action != GLFW_PRESS && action != GLFW_RELEASE) return;
+    keymap_apply_pending();
+    float width, height; keymap_size(width, height);
+    if (luna_keymap_key(&g_keymap, key, action == GLFW_PRESS, width, height, keymap_emit, nullptr)) return;
     const int kc = glfw_to_android_key(key);
     if (!kc) return;
     ndk_input_push_key(action == GLFW_PRESS ? 0 : 1, kc, glfw_to_android_meta(mods));
@@ -14751,6 +14946,7 @@ static bool ensure_glfw_window() {
         glfwSetMouseButtonCallback(g_glfw, glfw_mouse_button_cb);
         glfwSetCursorPosCallback(g_glfw, glfw_cursor_pos_cb);
         glfwSetKeyCallback(g_glfw, glfw_key_cb);
+        glfwSetWindowFocusCallback(g_glfw, glfw_focus_cb);
         glfwSetCharCallback(g_glfw, glfw_char_cb);
     }
     return g_glfw != nullptr;
@@ -17228,7 +17424,7 @@ extern "C" int arm_exec_apk_meta(const char *key, int32_t *iv, const char **sv) 
     switch (e->kind) {
     case ApkMetaEntry::KindBool:  if (iv) *iv = e->b ? 1 : 0; return 'Z';
     case ApkMetaEntry::KindInt:   if (iv) *iv = e->i;         return 'I';
-    case ApkMetaEntry::KindFloat: if (iv) *iv = (int32_t)e->f; return 'F';
+    case ApkMetaEntry::KindFloat: if (iv) memcpy(iv, &e->f, sizeof *iv); return 'F';
     default:                      if (sv) *sv = e->str.c_str(); return 'L';
     }
 }
@@ -19942,12 +20138,30 @@ static jobject jni_new_direct_buffer(ArmExecCtx &ctx, struct jvm *jvm,
  * platform's do.  The VM copies its array through the region around a native
  * call (see dvm_jni.c) — the two halves then read and write the same bytes.
  *
- * Bump allocation, no free: a title keeps a handful of these for the life of
- * a connection, and handing the same region to a second buffer while the
- * first is still live would be worse than running out. */
+ * JNI locals return their guest span after the native call; global references
+ * retain it.  A bump allocator exhausted this 8 MiB region after sixty-four
+ * 128 KiB UnityWebRequest calls, leaving later callbacks without an address. */
 static std::mutex g_direct_bb_mx;
-static uint64_t g_direct_bb_next = 0;
 static bool g_direct_bb_mapped = false;
+static std::map<uint32_t, uint32_t> g_direct_bb_free;
+static std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> g_direct_bb_owned;
+
+static void direct_bb_free_span(uint32_t off, uint32_t len) {
+    auto next = g_direct_bb_free.lower_bound(off);
+    if (next != g_direct_bb_free.begin()) {
+        auto prev = std::prev(next);
+        if (prev->first + prev->second == off) {
+            off = prev->first;
+            len += prev->second;
+            g_direct_bb_free.erase(prev);
+        }
+    }
+    if (next != g_direct_bb_free.end() && off + len == next->first) {
+        len += next->second;
+        g_direct_bb_free.erase(next);
+    }
+    g_direct_bb_free.emplace(off, len);
+}
 
 extern "C" uint32_t arm_exec_new_guest_direct_buffer(uint64_t cap,
                                                      uint64_t *addr_out) {
@@ -19960,9 +20174,12 @@ extern "C" uint32_t arm_exec_new_guest_direct_buffer(uint64_t cap,
         g_ctx->mem.map(DIRECT_BB_BASE, DIRECT_BB_SIZE);
         if (g_ctx->is_arm64)
             a64_map_declare_backing(DIRECT_BB_BASE, DIRECT_BB_SIZE, 3u);
+        g_direct_bb_free.emplace(0, DIRECT_BB_SIZE);
         g_direct_bb_mapped = true;
     }
-    if (g_direct_bb_next + cap > (uint64_t)DIRECT_BB_SIZE) {
+    auto span = g_direct_bb_free.begin();
+    while (span != g_direct_bb_free.end() && span->second < cap) ++span;
+    if (span == g_direct_bb_free.end()) {
         static bool said;
         if (!said) {
             said = true;
@@ -19972,16 +20189,33 @@ extern "C" uint32_t arm_exec_new_guest_direct_buffer(uint64_t cap,
         }
         return 0;
     }
-    const uint32_t off = DIRECT_BB_BASE + (uint32_t)g_direct_bb_next;
-    g_direct_bb_next += cap;
+    const uint32_t start = span->first;
+    const uint32_t left = span->second - (uint32_t)cap;
+    g_direct_bb_free.erase(span);
+    if (left) g_direct_bb_free.emplace(start + (uint32_t)cap, left);
+    const uint32_t off = DIRECT_BB_BASE + start;
     const GuestVA va = g_ctx->is_arm64 ? a64_guest_va(off) : (GuestVA)off;
 
     struct jvm *jvm = g_ctx->jvm;
     JNIEnv *env = &jvm->env;
     jobject bb = jni_new_direct_buffer(*g_ctx, jvm, env, va, cap);
-    if (!bb) return 0;
+    if (!bb) {
+        direct_bb_free_span(start, (uint32_t)cap);
+        return 0;
+    }
+    g_direct_bb_owned[(uint32_t)(uintptr_t)bb] = { start, (uint32_t)cap };
     if (addr_out) *addr_out = (uint64_t)va;
     return (uint32_t)(uintptr_t)bb;
+}
+
+extern "C" bool arm_exec_release_guest_direct_buffer(uint32_t handle) {
+    std::lock_guard<std::mutex> lk(g_direct_bb_mx);
+    auto it = g_direct_bb_owned.find(handle);
+    if (it == g_direct_bb_owned.end()) return false;
+    direct_bb_free_span(it->second.first, it->second.second);
+    g_direct_buffers.erase(handle);
+    g_direct_bb_owned.erase(it);
+    return true;
 }
 
 /* The host side of that region, so the VM can copy its array in and out. */
@@ -31462,6 +31696,11 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_EGL_CREATEWSURF: {
         // eglCreateWindowSurface(dpy, cfg, window, attribs)
+        const auto surface_attrs = read_egl_attribs(ctx, argp(3));
+        for (size_t i = 0; i + 1 < surface_attrs.size(); i += 2)
+            if (surface_attrs[i] == 0x309D /* EGL_GL_COLORSPACE */)
+                fprintf(stderr, "[egl] guest window colorspace=0x%x\n",
+                        (unsigned)surface_attrs[i + 1]);
         if (g_egl_dpy == EGL_NO_DISPLAY || !g_egl_cfg) {
             ensure_glfw_window();
             init_host_egl();
@@ -31520,7 +31759,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             EGLNativeWindowType native_win =
                 (EGLNativeWindowType)luna_os_native_window(g_glfw);
             g_egl_surf = eglCreateWindowSurface(
-                g_egl_dpy, cfg, native_win, nullptr);
+                g_egl_dpy, cfg, native_win, surface_attrs.data());
             window_surface = g_egl_surf != EGL_NO_SURFACE;
             if (!window_surface) {
                 const EGLint error = eglGetError();
@@ -31540,7 +31779,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (g_egl_surf == EGL_NO_SURFACE && luna_comp_active() &&
             g_egl_offscreen_win) {
             g_egl_surf = eglCreateWindowSurface(g_egl_dpy, cfg,
-                                                g_egl_offscreen_win, nullptr);
+                                                g_egl_offscreen_win,
+                                                surface_attrs.data());
             if (g_egl_surf == EGL_NO_SURFACE) {
                 const EGLint error = eglGetError();
                 fprintf(stderr, "[arm_exec] guest eglCreateWindowSurface on "
@@ -31553,10 +31793,17 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             }
         }
         if (g_egl_surf == EGL_NO_SURFACE) { /* explicit headless mode */
-            const EGLint pb_attribs[] = {
-                EGL_WIDTH, arm_exec_fb_width(), EGL_HEIGHT, arm_exec_fb_height(), EGL_NONE
+            std::vector<EGLint> pb_attribs = {
+                EGL_WIDTH, arm_exec_fb_width(), EGL_HEIGHT, arm_exec_fb_height()
             };
-            g_egl_surf = eglCreatePbufferSurface(g_egl_dpy, cfg, pb_attribs);
+            for (size_t i = 0; i + 1 < surface_attrs.size(); i += 2)
+                if (surface_attrs[i] == 0x309D /* EGL_GL_COLORSPACE */) {
+                    pb_attribs.push_back(surface_attrs[i]);
+                    pb_attribs.push_back(surface_attrs[i + 1]);
+                }
+            pb_attribs.push_back(EGL_NONE);
+            g_egl_surf = eglCreatePbufferSurface(g_egl_dpy, cfg,
+                                                  pb_attribs.data());
         }
         fprintf(stderr, "[arm_exec] eglCreateWindowSurface -> %p "
                 "(glfw=%d, backing=%s)\n", g_egl_surf, g_glfw != nullptr,
@@ -31967,6 +32214,39 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                             t->id, (unsigned long long)mask);
                 break;
             }
+            /* The main thread has no slot to park.  Wait here, driving the
+             * other threads the way its sleeps do, until a signal the
+             * temporary mask lets through is pending; the SVC return then
+             * enters its handler (Arm64Callbacks::take_main_signal). */
+            if (g_current_tid == 0 && !g_a64_is_worker) {
+                uint64_t mask = guest_sigset_load(ctx, argp(0),
+                                                  sigset_is_wide(ctx, svc_no));
+                mask &= ~(1ull << (9 - 1));
+                mask &= ~(1ull << (19 - 1));
+                const uint64_t old_mask = signal_mask_load(0);
+                signal_mask_store(0, mask);
+                bool got = false;
+                while (!g_guest_quit.load(std::memory_order_relaxed)) {
+                    if (g_main_pending_signals.load(std::memory_order_acquire) & ~mask)
+                        { got = true; break; }
+                    /* Inside a scheduler pass there is a driver above this
+                     * frame; nothing here could run a sender. */
+                    if (g_scheduling || g_threads.empty()) break;
+                    maybe_schedule_on_wait();
+                    if (g_main_pending_signals.load(std::memory_order_acquire) & ~mask)
+                        { got = true; break; }
+                    sched_idle_wait();
+                }
+                if (got) {
+                    g_main_waiting_signal = true;
+                    g_main_sigsuspend_old_mask = old_mask;
+                } else {
+                    signal_mask_store(0, old_mask);
+                }
+                if (uint32_t eva = errno_va(ctx, 0)) ctx.mem.write32(eva, EINTR);
+                ret32(~0u);
+                break;
+            }
         }
         if (ss_log++ < 5)
             fprintf(stderr, "[sigsuspend] r0=0x%08lx tid=%u -> -1/EINTR\n", r0, g_current_tid);
@@ -32201,7 +32481,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 type = ctx.mem.read32(regs[13]+4);
                 pva  = ctx.mem.read32(regs[13]+8);
             }
-            pfn_glReadPixels((GLint)r0,(GLint)r1,(GLsizei)r2,(GLsizei)r3,(GLenum)fmt,(GLenum)type,ARM_PTR(pva));
+            pfn_glReadPixels((GLint)r0,(GLint)r1,(GLsizei)r2,(GLsizei)r3,
+                             (GLenum)fmt,(GLenum)type,gl_pack_ptr(ctx, pva));
         }
         break;
 /* A draw, a flush and a finish are the three GL entry points that can block in
@@ -32285,14 +32566,21 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (guest_tgt != host_tgt)
             ctx_units[g_gl_active_texture][host_tgt] = (GLuint)r1;
         {
-            if (pfn_glGetError)
+            /* State queries and glGetError are debugging work.  Polling them
+             * on every bind is costly in a title that binds thousands of
+             * textures per frame, and it consumes errors before the guest can
+             * observe them. */
+            const bool diagnose = g_guest_egl_swap_count <= 2 &&
+                                  g_current_tid >= 40;
+            if (diagnose && pfn_glGetError)
                 while (pfn_glGetError() != 0) {}
             if (pfn_glBindTexture) pfn_glBindTexture(host_tgt, host_tex);
             // If the loaded pointer left the binding at 0, retry via dlsym.
             GLint bound = -1;
-            if (pfn_glGetIntegerv)
+            if (diagnose && pfn_glGetIntegerv)
                 pfn_glGetIntegerv(0x8069 /* GL_TEXTURE_BINDING_2D */, &bound);
-            if (host_tgt == 0x0DE1u && host_tex != 0 && bound != (GLint)host_tex &&
+            if (diagnose && host_tgt == 0x0DE1u && host_tex != 0 &&
+                bound != (GLint)host_tex &&
                 g_libgles2) {
                 using Fn = void (*)(GLenum, GLuint);
                 static Fn dl_bt = nullptr;
@@ -32308,8 +32596,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                                 bound, g_current_tid);
                 }
             }
-            GLenum err = pfn_glGetError ? pfn_glGetError() : 0;
-            if (g_guest_egl_swap_count <= 2 && g_current_tid >= 40 &&
+            GLenum err = diagnose && pfn_glGetError ? pfn_glGetError() : 0;
+            if (diagnose &&
                 (r1 != 0u || err != 0 || bound != (GLint)host_tex)) {
                 static int n = 0;
                 if (n++ < 40) {
@@ -32411,9 +32699,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 if (bound_tex)
                     g_gl_tex_size[bound_tex] = {(GLsizei)r3, h};
             }
+            const void *data = gl_unpack_ptr(ctx, pva);
             gl_trace_upload("Image", r0, r1, (int)r3, (int)h, 0, 0, fmt, typ,
-                            ARM_CPTR(pva), (size_t)r3 * (size_t)h);
-            pfn_glTexImage2D((GLenum)r0,(GLint)r1,(GLint)r2,(GLsizei)r3,h,brd,fmt,typ,ARM_CPTR(pva));
+                            data, (size_t)r3 * (size_t)h);
+            pfn_glTexImage2D((GLenum)r0,(GLint)r1,(GLint)r2,(GLsizei)r3,h,brd,fmt,typ,data);
         }
         break;
     }
@@ -32432,9 +32721,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 typ = (GLenum) ctx.mem.read32(regs[13]+12);
                 pva = ctx.mem.read32(regs[13]+16);
             }
+            const void *data = gl_unpack_ptr(ctx, pva);
             gl_trace_upload("SubImage", r0, r1, (int)w, (int)h, (int)r2, (int)r3,
-                            fmt, typ, ARM_CPTR(pva), (size_t)w * (size_t)h);
-            pfn_glTexSubImage2D((GLenum)r0,(GLint)r1,(GLint)r2,(GLint)r3,w,h,fmt,typ,ARM_CPTR(pva));
+                            fmt, typ, data, (size_t)w * (size_t)h);
+            pfn_glTexSubImage2D((GLenum)r0,(GLint)r1,(GLint)r2,(GLint)r3,w,h,fmt,typ,data);
         }
         break;
     }
@@ -32466,13 +32756,14 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 sz = (GLsizei)ctx.mem.read32(regs[13]+8);
                 pva = ctx.mem.read32(regs[13]+12);
             }
+            const void *data = gl_unpack_ptr(ctx, pva);
             gl_trace_upload("CompressedImage", r0, r1, (int)r3, (int)h, 0, 0, r2,
-                            0, ARM_CPTR(pva), (size_t)(sz > 0 ? sz : 0));
+                            0, data, (size_t)(sz > 0 ? sz : 0));
             if (sz >= GL_UPLOAD_UNLOCK_BYTES) {
                 ArmLockDropped unlocked; (void)unlocked;   /* see the sub-image case */
-                pfn_glCompressedTexImage2D((GLenum)r0,(GLint)r1,(GLenum)r2,(GLsizei)r3,h,brd,sz,ARM_CPTR(pva));
+                pfn_glCompressedTexImage2D((GLenum)r0,(GLint)r1,(GLenum)r2,(GLsizei)r3,h,brd,sz,data);
             } else {
-                pfn_glCompressedTexImage2D((GLenum)r0,(GLint)r1,(GLenum)r2,(GLsizei)r3,h,brd,sz,ARM_CPTR(pva));
+                pfn_glCompressedTexImage2D((GLenum)r0,(GLint)r1,(GLenum)r2,(GLsizei)r3,h,brd,sz,data);
             }
         }
         break;
@@ -32492,8 +32783,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 sz = (GLsizei)ctx.mem.read32(regs[13]+12);
                 pva = ctx.mem.read32(regs[13]+16);
             }
+            const void *data = gl_unpack_ptr(ctx, pva);
             gl_trace_upload("CompressedSubImage", r0, r1, (int)w, (int)h, (int)r2,
-                            (int)r3, fmt, 0, ARM_CPTR(pva),
+                            (int)r3, fmt, 0, data,
                             (size_t)(sz > 0 ? sz : 0));
             /* A megabyte of texture is milliseconds of driver work, and it
              * needs nothing the ARM execution lock protects: the guest thread
@@ -32506,9 +32798,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
              * lock wait.  Those are the same milliseconds. */
             if (sz >= GL_UPLOAD_UNLOCK_BYTES) {
                 ArmLockDropped unlocked; (void)unlocked;
-                pfn_glCompressedTexSubImage2D((GLenum)r0,(GLint)r1,(GLint)r2,(GLint)r3,w,h,fmt,sz,ARM_CPTR(pva));
+                pfn_glCompressedTexSubImage2D((GLenum)r0,(GLint)r1,(GLint)r2,(GLint)r3,w,h,fmt,sz,data);
             } else {
-                pfn_glCompressedTexSubImage2D((GLenum)r0,(GLint)r1,(GLint)r2,(GLint)r3,w,h,fmt,sz,ARM_CPTR(pva));
+                pfn_glCompressedTexSubImage2D((GLenum)r0,(GLint)r1,(GLint)r2,(GLint)r3,w,h,fmt,sz,data);
             }
         }
         break;
@@ -33181,7 +33473,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             gl_draw_census("DrawElements", (GLenum)r0, (GLsizei)r1);
             gl_trace_fb0_draw("DrawElements", (GLenum)r0, (GLsizei)r1);
             gl_dump_fb0_ui_draw((GLsizei)r1);
-            {
+            if (g_guest_egl_swap_count <= 3) {
                 GLenum sticky = 0;
                 if (pfn_glGetError)
                     while ((sticky = pfn_glGetError()) != 0) {
@@ -33208,9 +33500,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                                            idx);
                     }
             }
-            {
+            if (g_guest_egl_swap_count <= 3) {
                 GLenum e = pfn_glGetError ? pfn_glGetError() : 0;
-                if (e && g_guest_egl_swap_count <= 3) {
+                if (e) {
                     static int ne = 0;
                     if (ne++ < 16)
                         fprintf(stderr, "[gl] DrawElements GL error 0x%x "
@@ -38353,12 +38645,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             GLsizei height, depth;
             GLint border;
             GLenum format, type;
-            uint32_t data;
+            GuestVA data;
             if (ctx.is_arm64) {
                 height = (GLsizei)regs[4]; depth = (GLsizei)regs[5];
                 border = (GLint)regs[6]; format = (GLenum)regs[7];
                 type = ctx.mem.read32(regs[13]);
-                data = ctx.mem.read32(regs[13] + 8);
+                data = ctx.mem.read64(regs[13] + 8);
             } else {
                 height = (GLsizei)ctx.mem.read32(regs[13]);
                 depth = (GLsizei)ctx.mem.read32(regs[13]+4);
@@ -38369,7 +38661,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             }
             fn((GLenum)r0,(GLint)r1,(GLint)r2,(GLsizei)r3,
                height, depth, border, format, type,
-               data ? (const void *)ctx.mem.ptr(data) : nullptr);
+               gl_unpack_ptr(ctx, data));
         }
         break;
     }
@@ -38826,12 +39118,17 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_GL3_MapBufferRange: {
         // Host pointers can't be handed to the guest; shadow the mapping in a guest buffer and copy back on flush/unmap.
         uint32_t off = r1, len = r2, access = r3;
-        uint32_t buf = g_gl_bound_bufs[r0];
+        uint32_t buf = gl_mapping_buffer((GLenum)r0);
         void *host = pfn_glMapBufferRange
             ? pfn_glMapBufferRange((GLenum)r0,(intptr_t)off,(intptr_t)len,
                                    (GLbitfield)access) : nullptr;
+        if (!host) { retptr(0u); break; }
         uint32_t gva = arm_malloc(ctx, len ? len : 4u);
-        if (!gva) { ret32(0u); break; }
+        if (!gva) {
+            if (pfn_glUnmapBuffer) pfn_glUnmapBuffer((GLenum)r0);
+            guest_gl_set_error(0x0505u /* GL_OUT_OF_MEMORY */);
+            retptr(0u); break;
+        }
         if (host && (access & 0x0001u) /* GL_MAP_READ_BIT */)
             memcpy(ctx.mem.ptr(gva), host, len);
         g_gl_mapped[buf] = { host, gva, len, access };
@@ -38856,12 +39153,17 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         uint32_t access = 0x0002u | 0x0008u; /* WRITE | INVALIDATE_BUFFER */
         if (r1 == 0x88B8u) access = 0x0001u;                 /* READ_ONLY  */
         else if (r1 == 0x88BAu) access = 0x0001u | 0x0002u;  /* READ_WRITE */
-        uint32_t buf = g_gl_bound_bufs[r0];
+        uint32_t buf = gl_mapping_buffer((GLenum)r0);
         void *host = pfn_glMapBufferRange
             ? pfn_glMapBufferRange((GLenum)r0, 0, (intptr_t)len,
                                    (GLbitfield)access) : nullptr;
+        if (!host) { retptr(0u); break; }
         uint32_t gva = arm_malloc(ctx, len ? len : 4u);
-        if (!gva) { if (ctx.is_arm64) retptr(0u); else ret32(0u); break; }
+        if (!gva) {
+            if (pfn_glUnmapBuffer) pfn_glUnmapBuffer((GLenum)r0);
+            guest_gl_set_error(0x0505u /* GL_OUT_OF_MEMORY */);
+            retptr(0u); break;
+        }
         if (host && (access & 0x0001u)) memcpy(ctx.mem.ptr(gva), host, len);
         g_gl_mapped[buf] = { host, gva, len, access };
         {
@@ -38909,7 +39211,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     case SVC_GL_UnmapBufferOES:
     case SVC_GL3_UnmapBuffer: {
-        auto it = g_gl_mapped.find(g_gl_bound_bufs[r0]);
+        auto it = g_gl_mapped.find(gl_mapping_buffer((GLenum)r0));
         if (it != g_gl_mapped.end()) {
             auto &m = it->second;
             // GL_MAP_WRITE_BIT without GL_MAP_FLUSH_EXPLICIT_BIT
@@ -38927,7 +39229,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_GL3_FlushMappedBufferRange: {
-        auto it = g_gl_mapped.find(g_gl_bound_bufs[r0]);
+        auto it = g_gl_mapped.find(gl_mapping_buffer((GLenum)r0));
         if (it != g_gl_mapped.end()) {
             auto &m = it->second;
             uint32_t off = r1, len = r2;
@@ -38991,7 +39293,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 (GLint)arg32(4),   (GLsizei)arg32(5),
                 (GLsizei)arg32(6), (GLsizei)arg32(7),
                 (GLenum)arg32(8),  (GLenum)arg32(9),
-                pixels ? (const void*)ctx.mem.ptr(pixels) : nullptr);
+                gl_unpack_ptr(ctx, pixels));
         break;
     }
     case SVC_GL3_ProgramParameteri:
@@ -39527,9 +39829,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             pva  = (GuestVA)ctx.mem.read32(regs[13] + 24u);
         }
         if (f) {
-            const void *data = g_gl_bound_bufs[0x88ECu /* PIXEL_UNPACK_BUFFER */]
-                                   ? (const void *)(uintptr_t)pva
-                                   : ARM_CPTR(pva);
+            const void *data = gl_unpack_ptr(ctx, pva);
             f((GLenum)r0, (GLint)r1, (GLint)r2, (GLint)r3, zoff, w, h, d,
               fmt, sz, data);
         }
@@ -39992,7 +40292,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             pva = ctx.mem.read32(regs[13] + 16u);
         }
         if (f) f((GLenum)r0, (GLint)r1, (GLenum)r2, (GLsizei)r3,
-                 h, d, brd, isz, ARM_CPTR(pva));
+                 h, d, brd, isz, gl_unpack_ptr(ctx, pva));
         break;
     }
     case SVC_GL3_GetActiveUniformBlockName: {
@@ -40565,19 +40865,34 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
          * context.  Calling its handler here, on the sender's SVC stack, is a
          * deadlock for stop-the-world collectors: the handler parks the target
          * and the sender must keep running to release it. */
-        if (ctx.is_arm64 && sig > 0 && sig <= 64) {
-            ArmThread *target = arm_thread_by_tid(target_tid);
+        if (ctx.is_arm64) {
+            if (sig < 0 || sig > 64) { ret32(EINVAL); break; }
+            ArmThread *target = thread_slot_by_tid(target_tid);
             if (target) {
-                target->pending_signals |= 1ull << (unsigned)(sig - 1);
-                if (!target->running && a64_deliver_pending_signal(ctx, *target))
-                    /* Delivery saved and cleared the interrupted wait.  The
-                     * handler is now the target's runnable continuation; do
-                     * not leave it registered as an event-only blocked thread
-                     * waiting for a poll pass that will never come. */
-                    thread_mark_ready(target->id);
+                /* A terminated but unjoined pthread still has a handle;
+                 * it receives no signal.  Never invoke at the sender. */
+                if (sig && !target->finished) {
+                    target->pending_signals |= 1ull << (unsigned)(sig - 1);
+                    if (!target->running && a64_deliver_pending_signal(ctx, *target))
+                        thread_mark_ready(target->id);
+                }
                 ret32(0);
                 break;
             }
+            if (target_tid == 0 || target_tid == 1) {
+                if (sig) guest_raise_signal(ctx, 0, sig);
+                ret32(0);
+                break;
+            }
+            /* The legacy callback path changes the sender's identity and
+             * executes another thread's handler on its JIT and stack.  A
+             * stale handle must fail instead, including signal-zero probes. */
+            static unsigned missing_log;
+            if (missing_log++ < 16u)
+                fprintf(stderr, "[pthread_kill] absent target=%u sig=%d sender=%u -> ESRCH\n",
+                        target_tid, sig, g_current_tid);
+            ret32(ESRCH);
+            break;
         }
 
         if (handler_va > 1u) {
@@ -46109,11 +46424,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         ret32((uint32_t)g_ndk_input_cur.flags);
         break;
     case SVC_AMOTION_POINTERCOUNT:
-        ret32(g_ndk_input_cur.type == NDK_INPUT_TYPE_MOTION ? 1u : 0u);
+        ret32(g_ndk_input_cur.type == NDK_INPUT_TYPE_MOTION ? luna_event_count(&g_ndk_input_cur.touch) : 0u);
         break;
     case SVC_AMOTION_POINTERID:
-        if (g_ndk_input_cur.type != NDK_INPUT_TYPE_MOTION) { ret32(0u); break; }
-        ret32(0u);
+        ret32((uint32_t)luna_event_id(&g_ndk_input_cur.touch, (int)arg32(1)));
         break;
     case SVC_AMOTION_X:
     case SVC_AMOTION_Y: {
@@ -46122,8 +46436,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             ret32(0u);
             break;
         }
-        const float v = (svc_no == SVC_AMOTION_X) ? g_ndk_input_cur.x
-                                                  : g_ndk_input_cur.y;
+        const float v = (svc_no == SVC_AMOTION_X) ? luna_event_x(&g_ndk_input_cur.touch, (int)arg32(1))
+                                                  : luna_event_y(&g_ndk_input_cur.touch, (int)arg32(1));
         uint32_t bits;
         std::memcpy(&bits, &v, 4);
         g_svc_ret_fp = 4;
@@ -46148,7 +46462,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_AMOTION_TOOLTYPE:
-        ret32(g_ndk_input_cur.type == NDK_INPUT_TYPE_MOTION ? 1u : 0u);
+        ret32(g_ndk_input_cur.type == NDK_INPUT_TYPE_MOTION ? luna_event_count(&g_ndk_input_cur.touch) : 0u);
         break;
     /* int32_t AMotionEvent_getButtonState(event).
      *
@@ -46179,9 +46493,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         const int32_t axis = (int32_t)arg32(1);
         const size_t pointer = (size_t)arg32(2);
         float v = 0.0f;
-        if (pointer == 0) {
-            if (axis == 0 /* AXIS_X */)      v = g_ndk_input_cur.x;
-            else if (axis == 1 /* AXIS_Y */) v = g_ndk_input_cur.y;
+        if (pointer < (size_t)luna_event_count(&g_ndk_input_cur.touch)) {
+            if (axis == 0 /* AXIS_X */)      v = luna_event_x(&g_ndk_input_cur.touch, (int)pointer);
+            else if (axis == 1 /* AXIS_Y */) v = luna_event_y(&g_ndk_input_cur.touch, (int)pointer);
             else if (axis == 2 /* AXIS_PRESSURE */)
                 v = g_ndk_input_cur.action != 1 ? 1.0f : 0.0f;
             else if (axis == 3 /* AXIS_SIZE */)        v = g_ndk_input_cur.size;
@@ -48763,14 +49077,15 @@ static void schedule_threads(uint64_t slice) {
         g_pass_refused_worker.fetch_add(1, std::memory_order_relaxed);
         (void)slice; arm_lock_yield(); return;
     }
-    /* Re-entered from inside an SVC handler.  Every one of those call sites is
-     * a *wait* — "let the other threads run until my condition holds" — and the
-     * caller is holding the ARM execution lock, which is exactly what the
-     * threads that could satisfy it need.  Handing the lock over is the whole
-     * of what this thread can usefully do here. */
+    /* Re-entered from inside an SVC handler.  These calls wait for another
+     * guest thread or a deadline.  A lock hand-off alone returns immediately
+     * when nobody is queued for the lock; the caller then spins through this
+     * branch millions of times while the other engines are parked.  Wait for
+     * the scheduler notification or the next deadline, releasing the ARM lock
+     * while asleep. */
     if (g_scheduling) {
         g_pass_refused_nested.fetch_add(1, std::memory_order_relaxed);
-        arm_lock_yield(); return;
+        sched_idle_wait(); return;
     }
     if (!g_ctx || g_threads.empty()) return;
     /* Somebody else is already walking the table; the useful thing this thread
@@ -48796,6 +49111,11 @@ static void schedule_threads(uint64_t slice) {
      * itself around Run(). */
     g_pass_ran.fetch_add(1, std::memory_order_relaxed);
     ArmLockGuard sched_lock;
+    /* A pass may have no queued work while an engine is already running the
+     * lock owner.  Yield before inspecting the queues: yielding only inside
+     * their drain loops leaves a blocking primary SVC spinning with the ARM
+     * lock held, preventing that owner from entering its next SVC to unlock. */
+    arm_lock_yield();
     /* Restore the caller's label on the way out: the scheduler is re-entered
      * from inside SVC handlers, whose hold continues after the pass. */
     struct SchedTag {
@@ -49891,7 +50211,15 @@ static void drive_opensles_callbacks(ArmExecCtx &ctx) {
  * ldrex/strex against the shared exclusive monitor, the uncontended and
  * already-owned cases taken inline, and a genuinely contended lock handed to
  * SVC_PTHREAD_MUTEX_LOCK so the caller is parked and granted in turn.  trylock
- * never blocks, so it answers EBUSY itself rather than entering the SVC. */
+ * never blocks, so it answers EBUSY itself rather than entering the SVC.
+ *
+ * MUTEX_RECURSIVE_BIT (0x20000000) is the type, not a holder.  pthread_mutex_init
+ * writes it into a free recursive mutex, and mutex_state() masks it out of the
+ * count.  Comparing the raw word with 0x100 treated that free mutex as locked
+ * (owner byte 0, value >= 0x100) and trylock returned EBUSY.  Unity's PhysX
+ * then skipped createScene ("WriteLock is still acquired") and called through
+ * the null scene.  Every inline read masks the bit; every inline write keeps
+ * it, including the word left behind when the last hold is released. */
 static void build_fast_mutex_stubs(ArmExecCtx &ctx) {
     if (g_fastmutex_lock_va) return;
     auto movw = [](uint32_t rd, uint32_t imm){
@@ -49902,49 +50230,41 @@ static void build_fast_mutex_stubs(ArmExecCtx &ctx) {
     ctx.mem.write32(CUR_TID_VA, 1u);            /* main thread = tid 0 -> 1 */
     uint32_t p = FAST_MUTEX_PAGE + 0x10;
 
-    /*  0 movw r2,#lo(CUR_TID_VA)      6 retry: ldrex r3,[r0]   12 take: bic r12,r3,#0xff
-     *  1 movt r2,#hi(CUR_TID_VA)      7 cmp   r3,#0x100        13 add  r12,r12,#0x100
-     *  2 ldr  r2,[r2]   (tid+1)       8 blo   take             14 orr  r12,r12,r2
-     *  3 and  r2,r2,#0xff             9 and   r1,r3,#0xff      15 strex r1,r12,[r0]
-     *  4 cmp  r0,#0                  10 cmp   r1,r2            16 cmp  r1,#0
-     *  5 beq  ret0                   11 bne   slow             17 bne  retry
-     * 18 ret0: mov r0,#0   19 bx lr   20 slow: clrex   21 svc   22 bx lr          */
+    /* State is the word with the recursive-type bit cleared (bic #0x20000000),
+     * the same mask as MUTEX_RECURSIVE_BIT / mutex_state().  The slow bit still
+     * leaves the stub; a free word (state < 0x100) is taken, an already-owned
+     * word is incremented, anything else goes to the handler.
+     *  6 retry: ldrex r3          9 bic r1,r3,#rec   15 take: bic r12,r3,#0xff
+     *  7 tst r3,#slow            10 cmp r1,#0x100   21 ret0: mov r0,#0
+     *  8 bne slow(23)            11 blo take(15)    23 slow: clrex / svc      */
     g_fastmutex_lock_va = p;
-    /*  0 movw r2,#lo(CUR_TID_VA)   6 retry: ldrex r3,[r0]  14 take: bic r12,r3,#0xff
-     *  1 movt r2,#hi(CUR_TID_VA)   7 tst  r3,#0x40000000   15 add  r12,r12,#0x100
-     *  2 ldr  r2,[r2]  (tid+1)     8 bne  slow(22)         16 orr  r12,r12,r2
-     *  3 and  r2,r2,#0xff          9 cmp  r3,#0x100        17 strex r1,r12,[r0]
-     *  4 cmp  r0,#0               10 blo  take(14)         18 cmp  r1,#0
-     *  5 beq  ret0(20)            11 and  r1,r3,#0xff      19 bne  retry(6)
-     * 20 ret0: mov r0,#0          12 cmp  r1,r2            21 bx lr
-     * 22 slow: clrex              13 bne  slow(22)         23 svc   24 bx lr   */
     const uint32_t lock_code[] = {
         movw(2, CUR_TID_VA & 0xffffu), movt(2, CUR_TID_VA >> 16),
-        0xE5922000u, 0xE20220FFu, 0xE3500000u, 0x0A00000Du,
-        0xE1903F9Fu, 0xE3130101u, 0x1A00000Cu,
-        0xE3530C01u, 0x3A000002u, 0xE20310FFu, 0xE1510002u, 0x1A000007u,
+        0xE5922000u, 0xE20220FFu, 0xE3500000u, 0x0A00000Eu, /* beq ret0(21) */
+        0xE1903F9Fu, 0xE3130101u, 0x1A00000Du,             /* bne slow(23) */
+        0xE3C31420u, 0xE3510C01u, 0x3A000002u,             /* bic rec; blo take */
+        0xE20310FFu, 0xE1510002u, 0x1A000007u,             /* bne slow(23) */
         0xE3C3C0FFu, 0xE28CCC01u, 0xE18CC002u, 0xE1801F9Cu,
-        0xE3510000u, 0x1AFFFFF1u,
+        0xE3510000u, 0x1AFFFFF0u,                          /* bne retry(6) */
         0xE3A00000u, 0xE12FFF1Eu,
         0xF57FF01Fu, 0xEF000000u | SVC_PTHREAD_MUTEX_LOCK, 0xE12FFF1Eu,
     };
     for (uint32_t w : lock_code) { ctx.mem.write32(p, w); p += 4; }
 
-    /*  0 cmp r0,#0        6 bmi clear(14)   12 ret0: mov r0,#0   18 b ret0(12)
-     *  1 beq ret0(12)     7 cmp r3,#0x100   13 bx lr             19 slow: clrex
-     *  2 retry: ldrex     8 blo clear(14)   14 clear: mov r3,#0  20 svc
-     *  3 tst #slow-bit    9 strex r1,r3     15 strex r1,r3       21 bx lr
-     *  4 bne slow(19)    10 cmp r1,#0       16 cmp r1,#0
-     *  5 subs #0x100     11 bne retry(2)    17 bne retry(2)                   */
+    /* Unlock counts the masked state, then stores state|recursive-bit.  The
+     * last release keeps the type bit and drops the owner; storing zero here
+     * used to turn a recursive mutex into a normal one.  A null mutex returns
+     * 0, as bionic does. */
     p = (p + 15) & ~15u;
     g_fastmutex_unlock_va = p;
     const uint32_t unlock_code[] = {
-        0xE3500000u, 0x0A000009u,
-        0xE1903F9Fu, 0xE3130101u, 0x1A00000Du,
-        0xE2533C01u, 0x4A000006u, 0xE3530C01u, 0x3A000004u,
-        0xE1801F93u, 0xE3510000u, 0x1AFFFFF5u,
+        0xE3500000u, 0x0A00000Cu,                         /* beq ret0(15) */
+        0xE1903F9Fu, 0xE3130101u, 0x1A000010u,            /* bne slow(22) */
+        0xE3C31420u, 0xE2511C01u, 0x4A000008u,            /* bic; subs; bmi clear */
+        0xE3510C01u, 0x3A000006u,                         /* blo clear(17) */
+        0xE203C420u, 0xE181100Cu, 0xE1802F91u, 0xE3520000u, 0x1AFFFFF2u,
         0xE3A00000u, 0xE12FFF1Eu,
-        0xE3A03000u, 0xE1801F93u, 0xE3510000u, 0x1AFFFFEFu, 0xEAFFFFF8u,
+        0xE2033420u, 0xE1802F93u, 0xE3520000u, 0x1AFFFFECu, 0xEAFFFFF8u,
         0xF57FF01Fu, 0xEF000000u | SVC_PTHREAD_MUTEX_UNLOCK, 0xE12FFF1Eu,
     };
     for (uint32_t w : unlock_code) { ctx.mem.write32(p, w); p += 4; }
@@ -49952,18 +50272,20 @@ static void build_fast_mutex_stubs(ArmExecCtx &ctx) {
     /* trylock is lock with "someone else has it" answering EBUSY instead of
      * blocking — it is defined never to block.  A mutex carrying the slow bit
      * still goes to the handler: it may be free, and only the handler knows
-     * what its type allows. */
+     * what its type allows.  The free test is the masked state, so an unlocked
+     * recursive mutex (word == MUTEX_RECURSIVE_BIT) is free. */
     p = (p + 15) & ~15u;
     g_fastmutex_trylock_va = p;
     const uint32_t trylock_code[] = {
         movw(2, CUR_TID_VA & 0xffffu), movt(2, CUR_TID_VA >> 16),
-        0xE5922000u, 0xE20220FFu, 0xE3500000u, 0x0A00000Du,
-        0xE1903F9Fu, 0xE3130101u, 0x1A00000Fu,          /* bne slow(25) */
-        0xE3530C01u, 0x3A000002u, 0xE20310FFu, 0xE1510002u, 0x1A000007u,
+        0xE5922000u, 0xE20220FFu, 0xE3500000u, 0x0A00000Eu, /* beq ret0(21) */
+        0xE1903F9Fu, 0xE3130101u, 0x1A000010u,             /* bne slow(26) */
+        0xE3C31420u, 0xE3510C01u, 0x3A000002u,             /* bic rec; blo take */
+        0xE20310FFu, 0xE1510002u, 0x1A000007u,             /* bne busy(23) */
         0xE3C3C0FFu, 0xE28CCC01u, 0xE18CC002u, 0xE1801F9Cu,
-        0xE3510000u, 0x1AFFFFF1u,
-        0xE3A00000u, 0xE12FFF1Eu,                        /* 20 ret0, 21 bx lr */
-        0xF57FF01Fu, 0xE3A00010u, 0xE12FFF1Eu,           /* 22 busy: EBUSY */
+        0xE3510000u, 0x1AFFFFF0u,                          /* bne retry(6) */
+        0xE3A00000u, 0xE12FFF1Eu,                         /* ret0, bx lr */
+        0xF57FF01Fu, 0xE3A00010u, 0xE12FFF1Eu,            /* busy: EBUSY */
         0xF57FF01Fu, 0xEF000000u | SVC_PTHREAD_MUTEX_TRYLOCK, 0xE12FFF1Eu,
     };
     for (uint32_t w : trylock_code) { ctx.mem.write32(p, w); p += 4; }
@@ -51895,7 +52217,10 @@ extern "C" void arm_exec_android_key(int keycode) {
 }
 
 extern "C" void arm_exec_glfw_poll(void) {
+    keymap_apply_pending();
     if (g_glfw) glfwPollEvents();
+    if (luna_ime_active() || luna_overlay_guest_window_up() || luna_overlay_menu_showing())
+        keymap_release();
     clipboard_flush_pending();
     if (g_glfw && g_fullscreen_toggle.exchange(false)) {
         GLFWmonitor *mon = glfwGetWindowMonitor(g_glfw);
@@ -51926,7 +52251,6 @@ extern "C" int arm_exec_screenshot(const char *path) {
 /* The guest asked to be shut down (AndroidThunkJava_ForceQuit).  Honoured the
  * same way a closed window is: the pump loop notices and returns, so the exit
  * runs the ordinary teardown rather than a bare _exit(). */
-static std::atomic<bool> g_guest_quit{false};
 extern "C" void arm_exec_request_quit(void) { g_guest_quit.store(true); }
 
 
@@ -54010,13 +54334,22 @@ public:
             frame.si = si;
             frame.uc = uc;
             frame.handler_sp = frame_sp;
-            frame.old_mask = signal_mask_load(g_current_tid);
+            const uint64_t cur_mask = signal_mask_load(g_current_tid);
+            frame.old_mask = cur_mask;
             if (t) {
                 arm_signal_save_wait(*t, frame.wait);
+                arm_signal_suspend_sem(*t);
                 arm_signal_clear_wait(*t);
+            } else if (g_main_waiting_signal) {
+                /* The signal ends the main thread's sigsuspend: the handler
+                 * runs under the temporary mask and its return restores the
+                 * one sigsuspend replaced, exactly as the kernel's
+                 * saved_sigmask does. */
+                g_main_waiting_signal = false;
+                frame.old_mask = g_main_sigsuspend_old_mask;
             }
             ++*depth;
-            uint64_t blocked = frame.old_mask | sa.mask;
+            uint64_t blocked = cur_mask | sa.mask;
             if (!(sa.flags & GUEST_SA_NODEFER))
                 blocked |= 1ull << (unsigned)(sig - 1);
             blocked &= ~(1ull << (9 - 1));    /* SIGKILL */
@@ -54035,6 +54368,46 @@ public:
         jit64->SetSP(frame_sp);
         jit64->SetPC(handler);
         return true;
+    }
+
+    /* Take one signal pending for the main guest thread (see
+     * g_main_pending_signals) when this engine is that thread: the JIT is
+     * stopped at an SVC return or a slice boundary, so its registers are the
+     * interrupted context.  SIG_DFL and SIG_IGN are resolved here as
+     * a64_deliver_pending_signal resolves them for the other threads.
+     * Returns true when a handler was entered. */
+    bool take_main_signal(void) {
+        if (g_current_tid != 0 || g_a64_is_worker || !jit64 || !ctx) return false;
+        const uint64_t pend = g_main_pending_signals.load(std::memory_order_acquire);
+        if (!pend) return false;
+        GuestVA handler = 0;
+        int sig = 0;
+        {
+            ArmLockGuard g;
+            const uint64_t bits = g_main_pending_signals.load(std::memory_order_acquire) &
+                                  ~signal_mask_load(0);
+            if (!bits) return false;
+            if (g_main_signal_depth >= A64_SIGNAL_DEPTH_MAX) return false;
+            sig = (int)__builtin_ctzll(bits) + 1;
+            g_main_pending_signals.fetch_and(~(1ull << (unsigned)(sig - 1)),
+                                             std::memory_order_acq_rel);
+            handler = signal_handler_load(guest_pid(), sig);
+            if (handler == 0u) {            /* SIG_DFL */
+                if (guest_signal_default(sig) == SIGDEF_TERM ||
+                    guest_signal_default(sig) == SIGDEF_CORE) {
+                    fprintf(stderr, "Fatal signal %d (%s), code 0 (SI_USER) in "
+                            "tid 0 — default action is to terminate\n",
+                            sig, guest_signal_name(sig));
+                    arm_exec_request_quit();
+                }
+                return false;
+            }
+            if (handler == 1u) return false; /* SIG_IGN */
+        }
+        if (handler < 0x100000000ull && !a64_is_guest_va(handler))
+            handler = a64_guest_va((BackingOffset)(uint32_t)handler);
+        /* SI_TKILL: what pthread_kill/tgkill report in si_code. */
+        return enter_guest_signal(handler, sig, -6, 0);
     }
 
     /* Hand a synchronous breakpoint to the guest's SIGTRAP handler.
@@ -54107,6 +54480,7 @@ public:
                 frame.old_mask = signal_mask_load(g_current_tid);
                 if (t) {
                     arm_signal_save_wait(*t, frame.wait);
+                    arm_signal_suspend_sem(*t);
                     arm_signal_clear_wait(*t);
                 }
                 ++*depth;
@@ -55676,6 +56050,7 @@ public:
             /* rt_sigreturn replaced the whole file; do not put the pre-SVC
              * snapshot back on top of it. */
             g_svc_context_restored = false;
+            (void)take_main_signal();
             if (g_yield_requested) {
                 g_yield_requested = false;
                 jit64->HaltExecution();
@@ -55754,6 +56129,11 @@ public:
         }
         /* The second half of a two-register result (div_t/ldiv_t). */
         if (g_svc_ret_x1) jit64->SetRegister(1, regs32[1]);
+
+        /* A signal sent to the main thread is taken on the way out of the
+         * syscall, after the result is in x0: the handler's return resumes
+         * the caller with it. */
+        (void)take_main_signal();
 
         /* A syscall preserves x18 just like x19-x30.  svc_pres.restore()
          * already did that; replacing it with TPIDR_EL0 here corrupts old
@@ -57476,9 +57856,10 @@ static unsigned a64_assign_affinity(ArmThread &t) {
 static bool a64_worker_runnable(const ArmThread &t, bool lock_owner = false) {
     if (t.finished || t.running || !t.is_arm64) return false;
     if (a64_pending_signal(t)) return true;
-    if (t.waiting_cond || t.waiting_mutex || t.waiting_rwlock ||
-        t.waiting_join || t.waiting_sem || t.waiting_futex ||
-        t.waiting_fds || t.waiting_signal) return false;
+    /* All parked waits belong to the scheduler, including EGL fences.
+     * Resuming a fence waiter here exposes its provisional timeout result
+     * before the scheduler has polled completion. */
+    if (thread_has_sync_wait(t)) return false;
     /* A sleep is the one wait an engine can settle by itself: the condition is
      * the clock.  Leaving it to the frame pump meant a guest thread that asked
      * for one millisecond woke at the next frame instead — thirty times too
@@ -60477,6 +60858,7 @@ static int64_t run_arm64(ArmExecCtx &ctx, uint64_t entry_va,
          * handler finishing its own work, and it is short by construction.
          * The JIT and the guest stack under it belong to this host thread
          * alone (CbSlot32 / CbSlot64), so nothing else can be inside them. */
+        const uint64_t main_signal_returns_before = g_main_signal_returns;
         Dynarmic::HaltReason hr = j.Run();
         if (lunaria_env("LUNARIA_TRACE_A64_HALT") &&
             Dynarmic::Has(hr, Dynarmic::HaltReason::UserDefined1))
@@ -60493,6 +60875,10 @@ static int64_t run_arm64(ArmExecCtx &ctx, uint64_t entry_va,
             j.ClearHalt(Dynarmic::HaltReason::UserDefined3);
         }
         const bool entered_fault_handler = ctx.cb64->take_pending_fault();
+        /* A main thread spinning in guest code makes no SVC; its signals
+         * are taken at the slice boundary instead. */
+        const bool entered_main_handler = !entered_fault_handler &&
+            !pc_in_sentinel((GuestVA)j.GetPC()) && ctx.cb64->take_main_signal();
         /* Fault diagnostics inspect the JIT that just stopped.  Keep it
          * selected until the pending fault has printed its register file;
          * clearing running first silently suppressed both the dump and the
@@ -60517,6 +60903,16 @@ static int64_t run_arm64(ArmExecCtx &ctx, uint64_t entry_va,
             break;
         if (pc < 0x1000u)
             break; /* NULL / bogus return */
+        /* Signal entry replaces the continuation.  The halt reason belongs
+         * to the code that was interrupted, including a yielding SVC which
+         * took its signal on return.  Abandoning the call here left a live
+         * main-thread signal frame behind and returned the signal number as
+         * the native method's result. */
+        if (entered_main_handler || (g_current_tid == 0 &&
+            (g_main_signal_depth || g_main_signal_returns != main_signal_returns_before))) {
+            j.ClearHalt();
+            continue;
+        }
         // UserDefined / MemoryAbort etc. — stop; caller inspects regs
         if (Dynarmic::Has(hr, Dynarmic::HaltReason::MemoryAbort) ||
             Dynarmic::Has(hr, Dynarmic::HaltReason::UserDefined1) ||
