@@ -3648,6 +3648,9 @@ static int drain_pending(struct dvm *vm, bool nested)
             const bool parked_here = vm->parked;
             dvm_clear_exception(vm);
             if (parked_here) {
+               /* The exception only exists to unwind the wait. It is not a
+                * failure, and reporting it would print one line per park. */
+               how[0] = '\0';
                bool requeued = dvm__queue_runnable_at(vm, list[i], is_thread[i],
                                                       DVM_PARK_RETRY_MS);
                if (dvm__sched_trace_for(c ? c->name : NULL))
@@ -3661,8 +3664,14 @@ static int drain_pending(struct dvm *vm, bool nested)
             }
             static int log_n = 0;
             /* The cap keeps startup readable; a trace run wants every one of
-               them, because a runnable that keeps re-queueing is the symptom. */
-            const bool report = (log_n++ < 24 || vm->trace);
+               them, because a runnable that keeps re-queueing is the symptom.
+               An exception is not startup noise: it is dropped together with
+               the rest of the Runnable (Volley's Request.finish never runs),
+               and once the first two dozen callbacks have passed it used to
+               vanish entirely. Cross Worlds' sign-in delivery is one of those. */
+            const bool failed = how[0] != '\0';
+            const bool report = failed || log_n < 24 || vm->trace;
+            if (!failed) ++log_n;
             if (report)
                fprintf(stderr, "[dvm] thread %s.run() ran %llu steps%s%s\n",
                        c && c->name ? c->name : "?",

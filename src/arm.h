@@ -9,6 +9,48 @@
 #define ARM_H
 
 #include <stdbool.h>
+#include <stdint.h>
+
+/* One bit per 4 KiB page in the 32-bit image window. Readers run inside
+ * parallel JIT translation; writers hold the ARM execution lock. Build the
+ * replacement privately, then publish complete words, never an empty table.
+ * Compiler atomics keep this representation usable from both C and C++. */
+#define GUEST_RX_WORDS (UINT32_C(1) << 14)
+struct guest_rx_table { uint64_t words[GUEST_RX_WORDS]; };
+
+static inline void guest_rx_add(struct guest_rx_table *table,
+                                uint32_t lo, uint32_t hi)
+{
+    if (hi <= lo) return;
+    uint32_t first = lo >> 12, last = (hi - 1) >> 12;
+    for (uint32_t page = first; page <= last; ++page)
+        table->words[page >> 6] |= UINT64_C(1) << (page & 63);
+}
+
+static inline void guest_rx_publish(struct guest_rx_table *shared,
+                                    const struct guest_rx_table *next)
+{
+    for (uint32_t i = 0; i < GUEST_RX_WORDS; ++i)
+        __atomic_store_n(&shared->words[i], next->words[i], __ATOMIC_RELEASE);
+}
+
+static inline int guest_rx_hits(const struct guest_rx_table *shared,
+                                uint32_t va, uint32_t length)
+{
+    if (!length) return 0;
+    uint64_t end = (uint64_t)va + length;
+    if (end > (UINT64_C(1) << 32)) end = UINT64_C(1) << 32;
+    uint32_t first = va >> 12, last = (uint32_t)((end - 1) >> 12);
+    uint32_t word = first >> 6, final_word = last >> 6;
+    for (; word <= final_word; ++word) {
+        uint64_t mask = UINT64_MAX;
+        if (word == (first >> 6)) mask &= UINT64_MAX << (first & 63);
+        if (word == final_word) mask &= UINT64_MAX >> (63 - (last & 63));
+        if (__atomic_load_n(&shared->words[word], __ATOMIC_ACQUIRE) & mask)
+            return 1;
+    }
+    return 0;
+}
 
 #ifdef __cplusplus
 extern "C" {
@@ -906,29 +948,19 @@ inline uint32_t mmap_bump_exact(uint32_t raw_len, uint32_t *out_len = nullptr,
     return ~0u;
 }
 
-// Union bounds of the RX segments, maintained by guest_rx_bounds_refresh().
-inline uint32_t g_rx_lo = ~0u, g_rx_hi = 0u;
+inline struct guest_rx_table g_rx_pages = {};
 inline void guest_rx_bounds_refresh(void) {
-    g_rx_lo = ~0u; g_rx_hi = 0u;
+    struct guest_rx_table next = {};
     for (const auto &r : g_loaded_regions) {
         if (!(r.flags & 1u) || (r.flags & 2u)) continue; /* need X, not W */
-        if (r.lo < g_rx_lo) g_rx_lo = r.lo;
-        if (r.hi > g_rx_hi) g_rx_hi = r.hi;
+        guest_rx_add(&next, r.lo, r.hi);
     }
+    guest_rx_publish(&g_rx_pages, &next);
 }
 
 // True if [va, va+n) overlaps any loaded RX (PF_X and not PF_W) segment.
 inline bool guest_range_hits_rx(uint32_t va, uint32_t n) {
-    if (!n) return false;
-    uint64_t end = (uint64_t)va + n;
-    // Fast reject.
-    if (va >= g_rx_hi || end <= (uint64_t)g_rx_lo) return false;
-    if (end > 0x100000000ull) end = 0x100000000ull;
-    for (const auto &r : g_loaded_regions) {
-        if (!(r.flags & 1u) || (r.flags & 2u)) continue; /* need X, not W */
-        if (va < r.hi && end > r.lo) return true;
-    }
-    return false;
+    return guest_rx_hits(&g_rx_pages, va, n) != 0;
 }
 
 // True if [va, va+n) overlaps any recorded PT_LOAD (code or data).

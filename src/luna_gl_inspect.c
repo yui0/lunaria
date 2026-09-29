@@ -30,6 +30,11 @@ static void inspect_attributes(GLuint program)
         glGetVertexAttribPointerv(loc, GL_VERTEX_ATTRIB_ARRAY_POINTER, &offset);
         fprintf(stderr, "[gl-attrib] p=%u %s loc=%d enabled=%d buffer=%d stride=%d components=%d type=%x norm=%d offset=%llu",
             program,name,loc,enabled,buffer,stride,components,storage,normalized,(unsigned long long)(uintptr_t)offset);
+        if (!enabled) {
+            GLfloat current[4] = {0};
+            glGetVertexAttribfv(loc, GL_CURRENT_VERTEX_ATTRIB, current);
+            fprintf(stderr, " current=%g,%g,%g,%g", current[0],current[1],current[2],current[3]);
+        }
         if (enabled && buffer) {
             GLint64 length = 0; GLint mapped = 0;
             glBindBuffer(GL_ARRAY_BUFFER, buffer);
@@ -190,6 +195,27 @@ void luna_gl_inspect_draw(uint64_t frame)
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
     fprintf(stderr, "[gl-inspect] frame=%llu program=%d fbo=%d uniforms=%d blocks=%d\n",
             (unsigned long long)frame, program, fbo, n, nb);
+    const char *extensions = (const char *)glGetString(GL_EXTENSIONS);
+    if (extensions && strstr(extensions, "GL_EXT_sRGB_write_control"))
+        fprintf(stderr, "[gl-inspect] framebuffer-srgb=%d\n", glIsEnabled(0x8db9));
+    if (fbo) {
+        GLint count = 0;
+        glGetIntegerv(GL_MAX_DRAW_BUFFERS, &count);
+        for (int i = 0; i < count && i < 8; ++i) {
+            GLint attachment = 0, type = 0, object = 0, encoding = 0;
+            glGetIntegerv(GL_DRAW_BUFFER0 + i, &attachment);
+            if (attachment == GL_NONE) continue;
+            glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, attachment,
+                GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+            if (type == GL_NONE) continue;
+            glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, attachment,
+                GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &object);
+            glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, attachment,
+                GL_FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING, &encoding);
+            fprintf(stderr, "[gl-inspect] draw-buffer=%d attachment=%x type=%x object=%d encoding=%x\n",
+                i, attachment, type, object, encoding);
+        }
+    }
     inspect_attributes(program);
     if (nb > 32) nb = 32;
     struct block_sample blocks[32] = {{0}};

@@ -429,6 +429,12 @@ $(BUILD_DIR)/arm.o: | $(BUILD_DIR)
 $(BUILD_DIR)/arm.o: src/arm.c src/arm.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -c src/arm.c -o $@
 
+# Standalone C11 check of the table read by concurrent JIT translators.
+.PHONY: guest-rx-test
+guest-rx-test: test/guest_rx_test.c src/arm.h | $(BUILD_DIR)
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -pthread $< -o $(BUILD_DIR)/guest_rx_test
+	$(BUILD_DIR)/guest_rx_test
+
 # stb_vorbis.c: Sean Barrett's single-file Ogg Vorbis decoder (public domain /
 # MIT, vendored verbatim — see the file's own header for the license text).
 # Host decode for FVorbisAudioInfo::ReadCompressedData/StreamCompressedData —
@@ -612,6 +618,30 @@ http-chunked-test: test/test_http_chunked
 # HTTP server through the emulator's socket SVCs (see test/net_test.c).
 # Needs clang with the aarch64 target and lld; both come with the clang
 # package listed in the prerequisites.
+test/libglversiontest.so: test/gl_version_test.c
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
+	    -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libglversiontest.so \
+	    -o $@ $<
+
+.PHONY: gl-version-test
+gl-version-test: lunaria test/libglversiontest.so
+	@LD_LIBRARY_PATH="$(CURDIR):$(CURDIR)/runtime" ./lunaria test/libglversiontest.so \
+	    > .glversiontest.out 2>&1; \
+	grep 'glversiontest' .glversiontest.out; \
+	grep -q 'RESULT PASS' .glversiontest.out && ! grep -q 'RESULT FAIL' .glversiontest.out
+
+test/libglsrgbtest.so: test/gl_srgb_test.c
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
+	    -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libglsrgbtest.so \
+	    -o $@ $<
+
+.PHONY: gl-srgb-test
+gl-srgb-test: lunaria test/libglsrgbtest.so
+	@LD_LIBRARY_PATH="$(CURDIR):$(CURDIR)/runtime" ./lunaria test/libglsrgbtest.so \
+	    > .glsrgbtest.out 2>&1; \
+	grep 'glsrgbtest' .glsrgbtest.out; \
+	grep -q 'RESULT PASS' .glsrgbtest.out && ! grep -q 'RESULT FAIL' .glsrgbtest.out
+
 test/libglmaptest.so: test/gl_buffer_mapping_test.c
 	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
 	    -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libglmaptest.so \

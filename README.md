@@ -20,9 +20,19 @@ pipe: an installed Chrome or Chromium, or the built-in
 > Lunaria is a compatibility project under active development, not a complete
 > Android emulator. Support varies by title and engine version.
 
-![Ni no Kuni: Cross Worlds intro, rendered through Lunaria](screenshot_crossworlds_intro.png)
+<p align="center">
+  <img src="screenshot_genshin_shore.png" width="49%" alt="Genshin Impact: the Traveler standing in the water outside Mondstadt, full HUD">
+  &nbsp;
+  <img src="screenshot_crossworlds_cutscene.png" width="49%" alt="Ni no Kuni: Cross Worlds in-engine cutscene, a white-haired boy against the sky">
+</p>
 
-<p align="center"><sub>Ni no Kuni: Cross Worlds (二ノ国) · UE4 · arm64-v8a · 1024×576 · guest framebuffer</sub></p>
+<p align="center">
+  <img src="screenshot_genshin_dialog.png" width="49%" alt="Genshin Impact prologue: Lumine, Paimon and a floating companion around a glowing red stone">
+  &nbsp;
+  <img src="screenshot_genshin_cutscene.png" width="49%" alt="Genshin Impact prologue cutscene: Paimon pointing, Lumine watching">
+</p>
+
+<p align="center"><sub>Genshin Impact 7.1.0 · Unity IL2CPP · arm64-v8a &nbsp;·&nbsp; Ni no Kuni: Cross Worlds · Unreal Engine 4 · arm64-v8a<br>Guest framebuffer on Linux. No APK patches.</sub></p>
 
 ## Why Lunaria
 
@@ -30,15 +40,141 @@ pipe: an installed Chrome or Chromium, or the built-in
 |---|---|
 | **Two guest architectures** | ARMv7 and AArch64 execution through dynarmic JIT |
 | **No Android system image** | Launch an `.apk`, `.xapk` or `.apks` directly from Linux |
-| **Real graphics path** | EGL and OpenGL ES 3 calls pass through to the host |
+| **Real graphics path** | EGL and OpenGL ES 3 calls pass through to the host GPU. Vulkan is optional (`LUNARIA_VULKAN=1`) and still secondary to GLES |
 | **Engine-aware bridges** | JNI, AssetManager, OBB, pthread, OpenSL ES and Android API stubs |
 | **Dalvik on the host** | APK `classes*.dex` run in `src/dvm/` when no host stub exists |
 | **MediaCodec path** | H.264 via openh264, AAC via libavcodec — intro movies can finish |
 | **WebView on the host** | Chrome/Chromium or luna-browser, same DevTools pipe, composited into the view |
 | **A named device** | `lunaria.conf` reports a real retail profile (Pixel 6 by default) |
 | **Parallel AArch64** | `LUNARIA_A64_ENGINES>1` runs guest workers on host threads |
+| **Keyboard on a touch HUD** | Bundled maps for Genshin and Cross Worlds; WASD, skills, mouse-look together |
 | **Headless-capable** | Falls back to a surfaceless EGL pbuffer when no X11 window is available |
 | **Built for diagnosis** | Frame capture, JIT profiling, SVC tracing and guest-memory watchpoints |
+
+## Gallery
+
+These frames are read from Lunaria's guest framebuffer (GLFW window or headless
+EGL) — not phone captures or Android emulator windows.
+
+### Genshin Impact 7.1.0
+
+Unity IL2CPP on arm64-v8a, framebuffer **1024×576**. The current run goes
+past the HoYoverse splash, login and server select, through shader compile
+and the resource download, then past **TAP TO BEGIN** into the world and the
+prologue: the shore outside Mondstadt, and the cutscene with Paimon.
+Characters and scenery in these frames are drawn in color.
+
+Earlier shore captures (`screenshot_genshin_field.png`,
+`screenshot_genshin_swim.png`, `screenshot_genshin_chat.png`) still show the
+Traveler as a blue silhouette. Login-scene column materials are still being
+checked. Walking input and long sessions are still open.
+
+<p align="center">
+  <img src="screenshot_genshin_shaders.png" width="48%" alt="Genshin Impact shader-compile cinematic, column bridge under a blue sky">
+  &nbsp;
+  <img src="screenshot_genshin_login.png" width="48%" alt="Genshin Impact login scene, night sky over the cloud bridge">
+</p>
+
+<p align="center">
+  <img src="screenshot_genshin_server.png" width="48%" alt="Genshin Impact server select, Asia checked">
+  &nbsp;
+  <img src="screenshot_genshin_mail.png" width="48%" alt="Genshin Impact gift mailbox, a letter open">
+</p>
+
+<p align="center">
+  <img src="screenshot_genshin_language.png" width="72%" alt="Genshin Impact language settings in Japanese">
+</p>
+
+<p align="center"><sub>Shader compile · login · server · mailbox · language</sub></p>
+
+The same boot also left the in-between frames: shader progress
+(`screenshot_genshin_compile.png`, `screenshot_genshin_compile_early.png`),
+data load (`screenshot_genshin_loading.png`), **TAP TO BEGIN**
+(`screenshot_genshin_begin.png`), the element splash
+(`screenshot_genshin_elements.png`) and the HoYoverse card
+(`screenshot_genshin_splash.png`).
+
+### Ni no Kuni: Cross Worlds
+
+A commercial UE4 title on arm64-v8a. Guest login, server select, character
+select, the starting village, story dialogue, a voiced cutscene, then
+in-world play. No APK or guest patches — emulator-side fixes only.
+Programmatic taps use `LUNARIA_TOUCH_TEST`. A bare `x,y` is a percentage of
+the framebuffer (`50,84` and `50%,84%` are the same point); `640px,606px` is
+a guest pixel. `xdotool` synthetic clicks are ignored by GLFW. Framebuffer
+is **1024×576**.
+
+<p align="center">
+  <img src="screenshot_crossworlds_title.png" width="48%" alt="Cross Worlds title screen">
+  &nbsp;
+  <img src="screenshot_crossworlds_servers.png" width="48%" alt="Cross Worlds server select (Luxelion)">
+</p>
+
+<p align="center">
+  <img src="screenshot_crossworlds_account.png" width="48%" alt="Cross Worlds account-link dialog">
+  &nbsp;
+  <img src="screenshot_crossworlds_character_select.png" width="48%" alt="Cross Worlds character select">
+</p>
+
+<p align="center">
+  <img src="screenshot_crossworlds_village.png" width="48%" alt="Cross Worlds starting village">
+  &nbsp;
+  <img src="screenshot_crossworlds_ingame.png" width="48%" alt="Cross Worlds in-world play, quests and HUD">
+</p>
+
+<p align="center">
+  <img src="screenshot_crossworlds_dialog.png" width="48%" alt="Cross Worlds story dialogue, Chloe">
+  &nbsp;
+  <img src="screenshot_crossworlds_evermore.png" width="48%" alt="Cross Worlds arrival at Evermore">
+</p>
+
+<p align="center">
+  <img src="screenshot_crossworlds_intro.png" width="48%" alt="Cross Worlds 3D intro">
+  &nbsp;
+  <img src="screenshot_crossworlds_power_save.png" width="48%" alt="Cross Worlds power-save screen, resting">
+</p>
+
+<p align="center"><sub>Title · server · account · character select · village · in-world · Chloe · Evermore · intro · the client's own rest screen</sub></p>
+
+### Open-source and smaller titles
+
+<p align="center">
+  <img src="screenshot_btw_menu.png" width="48%" alt="Between Two Worlds main menu">
+  &nbsp;
+  <img src="screenshot_fpsmobile_map.png" width="48%" alt="Unreal Engine 4 FirstPersonExampleMap">
+</p>
+
+<p align="center"><sub>Between Two Worlds · Unity 2023 IL2CPP · 1280×720 &nbsp;·&nbsp; FPSMobile · UE4 · armeabi-v7a · Mesa llvmpipe</sub></p>
+
+<p align="center">
+  <img src="screenshot_unitysample_gameplay.png" width="48%" alt="UnitySampleGame 3D gameplay">
+  &nbsp;
+  <img src="screenshot_timelocker_gameplay.png" width="28%" alt="TIME LOCKER portrait tutorial">
+</p>
+
+<p align="center"><sub>UnitySampleGame, an earlier 1280×720 run that reached the playable scene &nbsp;·&nbsp; TIME LOCKER tutorial, 720×1280</sub></p>
+
+<p align="center">
+  <img src="screenshot_blackclover_splash.png" width="360" alt="Black Clover Unity splash">
+</p>
+
+<p align="center"><sub>Black Clover: Asta Fight · Unity splash, headless</sub></p>
+
+### Lunaria itself
+
+A large title spends a long time linking, translating and compiling dex
+before the first guest frame. The boot card is Lunaria's own surface for
+that wait. Once the guest draws, right-click opens the host menu over the
+frame: screenshot (also F12), paste-on-type, Back, volume and mute, ALSA
+output, keyboard map, WebView zoom and engine, reload, full screen, quit.
+
+<p align="center">
+  <img src="screenshot_lunaria_bootcard.png" width="48%" alt="Lunaria boot card, progress ring at 95 percent over a blue sky">
+  &nbsp;
+  <img src="screenshot_host_menu.png" width="42%" alt="Lunaria host menu with the WebView engine submenu open">
+</p>
+
+<p align="center"><sub>Boot card · host menu, WebView engine set to luna-browser, zoom 200%, mute on</sub></p>
 
 ## Quick start
 
@@ -51,8 +187,12 @@ sudo apt install \
   build-essential cmake pkg-config \
   libboost-dev libbsd-dev libunwind-dev \
   libglfw3-dev libegl1-mesa-dev libgles2-mesa-dev \
-  libssl-dev libicu-dev zlib1g-dev
+  libssl-dev libicu-dev zlib1g-dev \
+  libasound2-dev libvulkan-dev
 ```
+
+`libvulkan-dev` supplies the headers for the bridge. The bridge stays off
+until `LUNARIA_VULKAN=1`, and then it `dlopen`s the host's `libvulkan.so.1`.
 
 ### 2. Build
 
@@ -63,9 +203,13 @@ make x86_64 -j"$(nproc)"   # host is x86_64; plain `make` builds the 32-bit x86 
 
 `make` / `make x86_64` already pulls Cisco's openh264 shared library into
 `runtime/` (required for MediaCodec H.264). Re-run explicitly with
-`make fetch-openh264` if you need to refresh it. `make syslib` fetches a
-real AArch64 libm into `syslib-arm64/`; the launcher uses it when that
-directory is present.
+`make fetch-openh264` if you need to refresh it.
+
+`make syslib` fills `syslib-arm64/` with an AArch64 libm, a bionic libc, and
+libz. The launcher points `LUNARIA_SYSLIB_DIR` at that directory when it
+exists, so pure arithmetic (`pow`, `sincosf`) and inflate stay inside the
+guest. `make guestlib` builds `liblunaria_guest.so` from `src/lib/guest.c`
+(a zero-duration `nanosleep` returns without leaving the JIT).
 
 ### 3. Launch a package
 
@@ -95,31 +239,6 @@ LUNARIA_ARCH=armeabi-v7a ./lunaria-apk.sh game.apk
 LUNARIA_ARCH=arm64-v8a  ./lunaria-apk.sh game.apk
 ```
 
-## While it loads
-
-A large title spends a long time between the launcher's last message and its
-first frame — Blade & Soul Revolution links a 200 MB library, translates tens
-of thousands of ARM blocks and compiles 28 MB of dex across four files before
-the engine starts. Lunaria draws its own card over that gap: a sky, falling
-snow, a progress ring, and the wordmark, with the current translation and dex
-lines underneath. The card is a luna-ui document, so the wait shows what is
-happening rather than a black rectangle.
-
-![Lunaria's boot card](screenshot_lunaria_bootcard.png)
-
-<p align="center"><sub>The progress ring and the wordmark, captured from the guest framebuffer</sub></p>
-
-The card comes down the moment the guest takes the surface, and a guest dialog
-always takes priority over it. `LUNARIA_JIT_UI=0` turns it off, and
-`make boot-card-test` renders it on its own, without booting a title.
-
-Past it, the title can reach its own UI:
-
-![Blade & Soul Revolution rendering its own UI through Lunaria](screenshot_bladesoul_ui.png)
-
-<p align="center"><sub>The client's own System dialog after the patch server
-refuses the connection · layout, type and buttons are the game's</sub></p>
-
 ## Compatibility
 
 These are observed milestones, not a general compatibility guarantee.
@@ -127,9 +246,9 @@ Details and launch recipes live in `PROGRESS.md`.
 
 | Title | Engine / ABI | Current result |
 |---|---|---|
-| **Ni no Kuni: Cross Worlds** | Unreal Engine 4 · AArch64 XAPK | Drawn on Linux through guest login, the village, story dialogue and in-world play. SharedPreferences persist. A current-build check still draws the 3D intro; a full playable pass on that build is still open. On macOS the framebuffer is drawn, but the real window stays black |
+| **Ni no Kuni: Cross Worlds** | Unreal Engine 4 · AArch64 XAPK | Drawn on Linux through guest login, the village, story dialogue, an in-engine cutscene and in-world play. SharedPreferences persist. A current-build check still draws the 3D intro; a full playable pass on that build is still open. On macOS the framebuffer is drawn, but the real window stays black |
 | **Blade & Soul Masia** | Unreal Engine 5 · AArch64 APKS | Opening movie reaches EOS; title screen; additional-patch dialog is readable and Agree advances the download |
-| **Genshin Impact 7.1.0** | Unity IL2CPP · AArch64 XAPK | Past the HoYoverse splash and the login scene: server select, shader compile, the resource download, then the open world (the shore outside Mondstadt, including swimming) and in-game UI (mail, language). A host WebView can open the account page. Walking input and long sessions are still being checked |
+| **Genshin Impact 7.1.0** | Unity IL2CPP · AArch64 XAPK | Past the HoYoverse splash, login and server select: shader compile, the resource download, **TAP TO BEGIN**, the shore outside Mondstadt, and the prologue cutscene (Paimon, Japanese dialogue). Recent frames draw the character in color. A host WebView can open the account page. Walking input and long sessions are still being checked |
 | **Between Two Worlds** | Unity 2023 IL2CPP · ARMv7 | Playable; reaches the main story scene |
 | **Between Two Worlds** | Unity 2023 IL2CPP · AArch64 | Main menu on a recorded run; recent checks reach language selection at about 70 fps |
 | **FPSMobile** | Unreal Engine 4 · ARMv7 | FirstPersonExampleMap renders; 16,000+ swaps observed |
@@ -180,131 +299,49 @@ make fetch-libunity
 
 </details>
 
-## Gallery — captured from Lunaria
+## Keyboard controls
 
-These frames are read from Lunaria's guest framebuffer (GLFW window or headless
-EGL) — not phone captures or Android emulator windows.
+Touch-driven games can be controlled from the keyboard by mapping keys to touch
+positions on the screen. Open **Keyboard Controls** from the right-click menu and
+select a keymap file to switch layouts while the game is running. You can also
+browse to another folder and load your own keymap. Choose **Off** to disable
+keyboard mapping, or **Reload Current File** to reload a keymap after editing it.
+If a keymap fails to load, Lunaria keeps the current settings unchanged. A keymap
+can also be selected at startup.
 
-### Ni no Kuni: Cross Worlds · title to story
+```sh
+LUNARIA_KEYMAP=genshin ./lunaria-apk.sh /path/to/Genshin.xapk
+LUNARIA_KEYMAP=crossworlds ./lunaria-apk.sh /path/to/CrossWorlds.apks
+```
 
-A commercial UE4 title on arm64-v8a: Guest login, server select, character
-select, the starting village, story dialogue, then in-world play.
-No APK or guest patches — emulator-side fixes only. Programmatic taps use
-`LUNARIA_TOUCH_TEST`. A bare `x,y` is a percentage of the framebuffer
-(`50,84` and `50%,84%` are the same point); `640px,606px` is a guest pixel.
-`xdotool` synthetic clicks are ignored by GLFW. Framebuffer is **1024×576**.
+The bundled layouts use **WASD** for movement, **F** for the normal attack,
+**E/Q/1/2/3** for skills or character selection, **Space** for jump, and
+**Shift** for dash. In Cross Worlds, **Space** and **Shift** are mapped to dodge
+actions instead. Drag with the left mouse button to control the camera. Movement,
+mapped buttons, and mouse input can all be used at the same time.
 
-<p align="center">
-  <img src="screenshot_crossworlds_title.png" width="48%" alt="Cross Worlds title screen">
-  &nbsp;
-  <img src="screenshot_crossworlds_servers.png" width="48%" alt="Cross Worlds server select (Luxelion)">
-</p>
+When a text field has focus, text input takes priority over game controls. If the
+window loses focus, any keys currently held down are released automatically.
 
-<p align="center">
-  <img src="screenshot_crossworlds_account.png" width="48%" alt="Cross Worlds account-link dialog">
-  &nbsp;
-  <img src="screenshot_crossworlds_character_select.png" width="48%" alt="Cross Worlds character select">
-</p>
+To adapt the controls for another game or a different HUD layout, copy one of the
+files in `keymaps/*.conf`, adjust the coordinates, and load it with
+`LUNARIA_KEYMAP=/path/to/my.conf`. The setting can also be saved in
+`lunaria.conf`. Set `LUNARIA_KEYMAP=off` to disable keyboard mapping.
 
-<p align="center">
-  <img src="screenshot_crossworlds_village.png" width="48%" alt="Cross Worlds starting village">
-  &nbsp;
-  <img src="screenshot_crossworlds_ingame.png" width="48%" alt="Cross Worlds in-world play, quests and HUD">
-</p>
+```text
+stick 0.15625 0.764 0.09
+button SPACE 0.922 0.665
+button F 0.826 0.769
+```
 
-<p align="center">
-  <img src="screenshot_crossworlds_dialog.png" width="48%" alt="Cross Worlds story dialogue (Chloe)">
-  &nbsp;
-  <img src="screenshot_crossworlds_evermore.png" width="48%" alt="Cross Worlds arrival at Evermore">
-</p>
+`stick` defines the center X/Y position and radius of the virtual stick controlled
+by WASD. `button` maps a key to an X/Y touch position. X and Y are normalized
+coordinates from 0 to 1 relative to the screen width and height; the stick radius
+is relative to the shorter screen dimension.
 
-<p align="center">
-  <img src="screenshot_crossworlds_power_save.png" width="72%" alt="Cross Worlds power-save screen, resting">
-</p>
-
-<p align="center"><sub>Title · server · account · character select · village · in-world · dialogue · Evermore · the client's own rest screen</sub></p>
-
-### Genshin Impact · login, then the open world
-
-Unity IL2CPP on arm64-v8a. 7.0.0 reached the login scene. 7.1.0 goes on
-through server select, shader compilation and the resource download, then
-past **TAP TO BEGIN** into the world: the shore outside Mondstadt, swimming,
-the gift mailbox and the language screen. Frames are the guest framebuffer
-at **1024×576**. The world frames still carry a strong blue cast on the
-character. Walking input and long sessions are still being checked.
-
-<p align="center">
-  <img src="screenshot_genshin_swim.png" width="48%" alt="Genshin Impact, swimming off the Mondstadt shore">
-  &nbsp;
-  <img src="screenshot_genshin_field.png" width="48%" alt="Genshin Impact, the Traveler on the shore outside Mondstadt">
-</p>
-
-<p align="center">
-  <img src="screenshot_genshin_login.png" width="48%" alt="Genshin Impact login scene, night sky over the cloud bridge">
-  &nbsp;
-  <img src="screenshot_genshin_server.png" width="48%" alt="Genshin Impact server select, Asia checked">
-</p>
-
-<p align="center">
-  <img src="screenshot_genshin_mail.png" width="48%" alt="Genshin Impact gift mailbox, a letter open">
-  &nbsp;
-  <img src="screenshot_genshin_language.png" width="48%" alt="Genshin Impact language settings in Japanese">
-</p>
-
-<p align="center">
-  <img src="screenshot_genshin_splash.png" width="42%" alt="Genshin Impact HoYoverse splash">
-</p>
-
-<p align="center"><sub>7.1.0 open world and in-game UI · 7.0.0 login scene · the HoYoverse splash, the first guest frame after GLES init</sub></p>
-
-### Between Two Worlds · main menu
-
-![Between Two Worlds main menu running through Lunaria](screenshot_btw_menu.png)
-
-<p align="center"><sub>Unity 2023 IL2CPP · 1280×720</sub></p>
-
-### UnitySampleGame · 3D gameplay
-
-An earlier run reached the title screen, injected a touch on **Start**, and
-entered the playable 3D scene: character, crystal objective, health HUD and
-touch controls at 1280×720. Current builds stop earlier, on a Dynarmic
-re-entry while a class initializer loads a native library.
-
-![UnitySampleGame 3D gameplay running through Lunaria](screenshot_unitysample_gameplay.png)
-
-### TIME LOCKER · tutorial gameplay
-
-The portrait build advances beyond the Unity logo into the first interactive
-scene. The player character, score HUD, playfield, and touch tutorial are
-rendered at 720×1280.
-
-<p align="center">
-  <img src="screenshot_timelocker_gameplay.png" width="420" alt="TIME LOCKER tutorial gameplay running through Lunaria">
-</p>
-
-### Black Clover: Asta Fight · splash
-
-<p align="center">
-  <img src="screenshot_blackclover_splash.png" width="480" alt="Black Clover Unity splash through Lunaria">
-</p>
-
-### FPSMobile · Unreal sample
-
-![Unreal Engine 4 FirstPersonExampleMap running through Lunaria](screenshot_fpsmobile_map.png)
-
-<p align="center"><sub>UE4 FirstPersonExampleMap · armeabi-v7a · 1280×720 · Mesa llvmpipe</sub></p>
-
-### The host menu
-
-Right-click opens Lunaria's own menu, drawn by luna-ui over the guest and over
-the boot card. From here: a screenshot (also F12), paste-on-type, Back, volume
-and mute, ALSA sound output, WebView zoom and engine, reload, full screen, quit.
-
-<p align="center">
-  <img src="screenshot_host_menu.png" width="480" alt="Lunaria host menu with the WebView engine submenu open">
-</p>
-
-<p align="center"><sub>WebView engine set to luna-browser · zoom 200% · mute on</sub></p>
+Up to eight buttons can be mapped. Supported keys are uppercase letters, digits,
+`SPACE`, and `SHIFT`. The bundled layouts are tuned for landscape HUDs, so adjust
+the coordinates if you change the HUD size or placement.
 
 ## Capture frames
 
@@ -344,7 +381,7 @@ F12, and **Take Screenshot** in the host menu, write
      ├── SVC bridge ─── libc · pthread · filesystem · Android APIs · sockets
      ├── JNI / DVM ─── classes · methods · AssetManager · MediaCodec · dex
      ├── WebView ────── Chrome DevTools pipe · Chrome/Chromium or luna-browser
-     └── graphics ───── EGL · OpenGL ES 3 · host Mesa / GPU
+     └── graphics ───── EGL · OpenGL ES 3 · optional Vulkan · host GPU
 ```
 
 - **ARM32:** a flat 4 GiB guest memory window with fastmem.
@@ -359,8 +396,10 @@ F12, and **Take Screenshot** in the host menu, write
   twenty-five seconds in under that mode.
 - **Native calls:** guest libc, EGL, GLES and JNI calls cross generated
   `SVC #n` trampolines into host implementations.
-- **libm:** `make syslib` fills `syslib-arm64/` with an AArch64 libm that
-  runs as guest code (`pow`, `sincosf`, and the rest). The launcher points
+- **Guest libraries:** `make syslib` fills `syslib-arm64/` with AArch64 libm,
+  libc and libz that run as guest code. `make guestlib` adds
+  `liblunaria_guest.so` for routines that should not trap on every call
+  (a zero-time `nanosleep` is the current one). The launcher points
   `LUNARIA_SYSLIB_DIR` at that directory when it exists.
 - **Threads:** guest pthreads use cooperative round-robin scheduling with a
   separate JIT context per worker; mutex unlock can hand off directly to a
@@ -380,6 +419,10 @@ F12, and **Take Screenshot** in the host menu, write
   `LUNARIA_WEB_BROWSER` names a binary directly. The page is shown as an image
   inside the view; touch and text go back over the same pipe. Build the
   fallback with `make luna-browser`.
+- **Vulkan:** off unless `LUNARIA_VULKAN=1`. Guest `vk*` calls go to the
+  host loader; Android surfaces and swapchains are emulated and the presented
+  image is handed to the compositor. A title that does not see Vulkan stays
+  on GLES, which is the path the titles above actually use.
 
 ## Runtime controls
 
@@ -402,9 +445,11 @@ full diagnostic set.
 | `LUNARIA_A64_FASTMEM` | `1` | Set `0` to route memory through callbacks |
 | `LUNARIA_A64_CODE_CACHE_MB` | `128` | Per-JIT translated-code cache |
 | `LUNARIA_GUEST_SLEEP` / `LUNARIA_FD_PARK` | on / off | Park guest sleeps for real wall time / park blocking reads (`LUNARIA_GUEST_SLEEP=0` is diagnostic only) |
-| `LUNARIA_SYSLIB_DIR` | `syslib-arm64/` if that directory exists | AArch64 platform libraries that run as guest code. `make syslib` fetches libm |
+| `LUNARIA_SYSLIB_DIR` | `syslib-arm64/` if that directory exists | AArch64 platform libraries that run as guest code. `make syslib` fetches libm, libc and libz; `make guestlib` builds `liblunaria_guest.so` |
+| `LUNARIA_VULKAN` | off | Set `1` to advertise Vulkan and bridge `vk*` to the host. GLES stays the default |
 | `LUNARIA_TOUCH_TEST` | off | Inject taps at `x,y[;x,y…]` (max 8). Bare numbers are framebuffer percentages; `640px` is a guest pixel |
 | `LUNARIA_TOUCH_FIFO` | off | Same taps while running: `echo 'x,y[,hold]' > $LUNARIA_TOUCH_FIFO` |
+| `LUNARIA_KEYMAP` | off | `genshin`, `crossworlds`, `off`, or a path to a keymap file. The host menu can change it live |
 | `LUNARIA_DEVICE` | `pixel6` | Device profile: `pixel6`, `pixel7`, `galaxys21`, `lunaria`. Prefer `lunaria.conf` |
 | `LUNARIA_DATA_ROOT` | launcher directory | Guest `/data` and `/storage`. A large title's downloads live here |
 | `LUNARIA_CONF` | `./lunaria.conf`, then the launcher directory, then `~/.config/lunaria/lunaria.conf` | Which settings file to read. Environment variables win |
@@ -452,12 +497,14 @@ Tick values accept `K`, `M`, and `G` suffixes, for example
 | `src/loader.c` | runtime entry point and Unity render-loop orchestration |
 | `src/linker/` | Android ELF linker adapted for the host |
 | `src/jvm/` | lightweight JVM/JNI object model and stubs |
-| `src/lib/` | host implementations exposed to Android native code |
+| `src/lib/` | host implementations exposed to Android native code; `guest.c` is the in-guest libc |
+| `src/luna_vulkan.c` | optional Vulkan bridge (`LUNARIA_VULKAN=1`) |
 | `src/luna_overlay.c` | the emulator's own UI surface: boot card, host menu, and compositing over the guest frame |
 | `src/luna_boot.c` | the boot card: sky, snow, progress ring, wordmark, translation and dex lines |
 | `src/luna_ime.c` | host IME bridge into guest text input |
 | `src/webview_cdp.c` | DevTools pipe client shared by Chrome and luna-browser |
 | `luna-browser/` | the built-in WebView engine (luna-ui + QuickJS); `make luna-browser` |
+| `keymaps/` | bundled touch maps (`genshin.conf`, `crossworlds.conf`) |
 | `lunaria.conf.sample` | device profile, data root, screen scale, package ledger, WebView engine |
 | `runtime/` | generated Android-compatible host shared libraries |
 | `lunaria-apk.sh` | APK/XAPK/APKS inspection, extraction and launch pipeline |
@@ -556,36 +603,3 @@ frame.
 Licensed under the [Mozilla Public License 2.0](LICENSE).
 
 Project Lunaria © 2026 Yuichiro Nakada.
-
-### キーボード操作
-
-タッチ操作のゲームは、キーを画面上のタッチ位置へ割り当てて操作できます。
-右クリックメニューの **Keyboard Controls** からkeymapファイルを選ぶと、
-実行中に切り替わります。フォルダを移動して自作ファイルも選択でき、
-**Off**で無効化、**Reload Current File**で編集したファイルを再読み込みできます。
-読み込みに失敗した場合は元の設定を維持します。起動時の指定もできます。
-
-```sh
-LUNARIA_KEYMAP=genshin ./lunaria-apk.sh /path/to/Genshin.xapk
-LUNARIA_KEYMAP=crossworlds ./lunaria-apk.sh /path/to/CrossWorlds.apks
-```
-
-WASDで移動、Fで通常攻撃、E/Q/1/2/3でスキルやキャラ選択、Spaceでジャンプ、
-Shiftでダッシュです。Cross WorldsではSpace/Shiftは回避に割り当てています。
-マウスの左ドラッグでカメラを操作できます。移動とボタン、マウス操作は同時に使えます。
-入力欄では文字入力を優先し、フォーカスを失うと押していたキーを解除します。
-
-他のゲームやHUD配置には、`keymaps/*.conf`をコピーして座標を変更し、
-`LUNARIA_KEYMAP=/path/to/my.conf`で読み込みます。`lunaria.conf`にも設定を保存できます。
-`LUNARIA_KEYMAP=off`で無効になります。
-
-```text
-stick 0.15625 0.764 0.09
-button SPACE 0.922 0.665
-button F 0.826 0.769
-```
-
-`stick`はWASDで操作するスティック中心のX/Yと半径、`button`はキーとタッチ位置のX/Yです。
-X/Yは画面幅・高さに対する0〜1の割合、半径は短辺に対する割合です。
-ボタンは8個まで、キーは英大文字・数字・SPACE・SHIFTを指定できます。
-同梱レイアウトは横画面のHUDに合わせてあります。HUDのサイズや配置を変更した場合は調整してください。

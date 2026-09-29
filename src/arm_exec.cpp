@@ -12822,10 +12822,6 @@ GL_DECL(void,    glGetTexParameteriv,    GLenum,GLenum,GLint*)
 GL_DECL(void,    glTexImage2D,           GLenum,GLint,GLint,GLsizei,GLsizei,GLint,GLenum,GLenum,const void*)
 GL_DECL(void,    glTexSubImage2D,        GLenum,GLint,GLint,GLint,GLsizei,GLsizei,GLenum,GLenum,const void*)
 GL_DECL(void,    glCopyTexSubImage2D,    GLenum,GLint,GLint,GLint,GLint,GLint,GLsizei,GLsizei)
-/* Uploads at least this big run with the ARM execution lock dropped; smaller
- * ones keep the plain path, where the lock costs less than handing it over. */
-static constexpr GLsizei GL_UPLOAD_UNLOCK_BYTES = 65536;
-
 GL_DECL(void,    glCompressedTexImage2D, GLenum,GLint,GLenum,GLsizei,GLsizei,GLint,GLsizei,const void*)
 GL_DECL(void,    glCompressedTexSubImage2D, GLenum,GLint,GLint,GLint,GLsizei,GLsizei,GLenum,GLsizei,const void*)
 GL_DECL(void,    glGenerateMipmap,       GLenum)
@@ -13006,9 +13002,8 @@ static bool egl_strict(void)
 static constexpr int GL_ES_ADVERTISED_MAX_MINOR = 1;
 static int g_gl_ctx_major = 0, g_gl_ctx_minor = 0;
 
-/* Ask the live context what it is.  GL_MAJOR_VERSION/GL_MINOR_VERSION exist
- * from ES 3.0; on an ES 2.0 context they set GL_INVALID_ENUM and leave the
- * value alone, which is the answer 2.0. */
+/* Read the live context without changing its pending GL error.  The version
+ * string exists on ES 2 as well, unlike the integer version queries. */
 static void gl_probe_context_version(void)
 {
     /* Not cached: a title creates several contexts at different levels (UE4
@@ -13016,12 +13011,9 @@ static void gl_probe_context_version(void)
      * the answer belongs to whichever is current now.  One cached probe told
      * every later context what the first one happened to be. */
     int major = 0, minor = 0;
-    if (pfn_glGetIntegerv) {
-        if (pfn_glGetError) while (pfn_glGetError() != 0) { }
-        pfn_glGetIntegerv(0x821B /* GL_MAJOR_VERSION */, &major);
-        pfn_glGetIntegerv(0x821C /* GL_MINOR_VERSION */, &minor);
-        if (pfn_glGetError && pfn_glGetError() != 0) { major = 0; minor = 0; }
-    }
+    const char *version = pfn_glGetString
+        ? (const char *)pfn_glGetString(0x1F02 /* GL_VERSION */) : nullptr;
+    if (version) sscanf(version, "OpenGL ES %d.%d", &major, &minor);
     if (major < 2) { major = 2; minor = 0; }      /* ES 2.0 context */
     if (major > 3) { major = 3; minor = 2; }
     if (major == 3 && minor > GL_ES_ADVERTISED_MAX_MINOR)
@@ -13036,6 +13028,17 @@ static void gl_probe_context_version(void)
     }
     g_gl_ctx_major = major;
     g_gl_ctx_minor = minor;
+}
+
+static bool guest_gl_version_integer(GLenum name, GLint *value)
+{
+    if (name != 0x821B /* GL_MAJOR_VERSION */ &&
+        name != 0x821C /* GL_MINOR_VERSION */) return false;
+    gl_probe_context_version();
+    /* Let the host report INVALID_ENUM when these queries do not exist. */
+    if (g_gl_ctx_major < 3) return false;
+    *value = name == 0x821B ? g_gl_ctx_major : g_gl_ctx_minor;
+    return true;
 }
 
 static const char *guest_gl_identity_string(GLenum name) {
@@ -15403,14 +15406,9 @@ static bool init_host_egl() {
         egl_note_bound(ARM_EGL_CONTEXT, g_egl_surf);
     if (ok) {
         load_gl_procs();
-        EGLint context_major = 0, context_minor = 0;
-        eglQueryContext(g_egl_dpy, g_egl_ctx, EGL_CONTEXT_MAJOR_VERSION,
-                        &context_major);
-        eglQueryContext(g_egl_dpy, g_egl_ctx, EGL_CONTEXT_MINOR_VERSION,
-                        &context_minor);
-        fprintf(stderr, "[arm_exec] init_host_egl: context ES %d.%d, GL_VERSION=%s\n",
-                context_major, context_minor,
-                glGetString(GL_VERSION) ? (const char *)glGetString(GL_VERSION) : "(null)");
+        const GLubyte *host_version = glGetString(GL_VERSION);
+        fprintf(stderr, "[arm_exec] init_host_egl: GL_VERSION=%s\n",
+                host_version ? (const char *)host_version : "(null)");
         // Sync logical FB size to the real drawable.
         EGLint sw = 0, sh = 0;
         eglQuerySurface(g_egl_dpy, g_egl_surf, EGL_WIDTH, &sw);
@@ -15874,30 +15872,17 @@ static uint32_t egl_host_create_context(uint32_t config_handle,
         egl_set_guest_error(EGL_BAD_MATCH);
         return 0u;
     }
-    /* What the guest gets is not always what it asked for, and the downgrade
-     * is the emulator's: say it out loud rather than leave the version string
-     * to contradict it later. */
-    if (has_minor && !exact_request) {
-        EGLint got_major = 0, got_minor = 0;
-        eglQueryContext(g_egl_dpy, nctx, EGL_CONTEXT_MAJOR_VERSION, &got_major);
-        eglQueryContext(g_egl_dpy, nctx, EGL_CONTEXT_MINOR_VERSION, &got_minor);
-        static int said = 0;
-        if (said++ < 8 && got_major)
-            fprintf(stderr, "[egl] context request not met exactly: guest asked "
-                    "for ES%d.x, got ES%d.%d (LUNARIA_STRICT_EGL=1 refuses "
-                    "instead)\n", (int)requested_major, (int)got_major,
-                    (int)got_minor);
-    }
+    /* eglQueryContext does not accept EGL_CONTEXT_MINOR_VERSION, even
+     * when EGL_KHR_create_context accepts it in eglCreateContext.  A log
+     * query here left EGL_BAD_ATTRIBUTE pending after a successful create,
+     * causing capability probes to reject valid ES 3.1 contexts.  The actual
+     * GL version is available only after making the context current. */
     g_egl_ctx_tab.push_back(nctx);
     uint32_t handle = ARM_EGL_CTXTAB_BASE + (uint32_t)(g_egl_ctx_tab.size() - 1);
-    EGLint client_major = 0, client_minor = 0;
-    eglQueryContext(g_egl_dpy, nctx, EGL_CONTEXT_MAJOR_VERSION, &client_major);
-    eglQueryContext(g_egl_dpy, nctx, EGL_CONTEXT_MINOR_VERSION, &client_minor);
     fprintf(stderr, "[arm_exec] eglCreateContext -> %p (handle 0x%x, cfg=0x%x, share=%p, "
-            "requested ES%d%s, actual ES%d.%d)\n", nctx, handle, config_handle,
+            "requested ES%d%s)\n", nctx, handle, config_handle,
             share, (int)requested_major,
-            has_minor ? ".minor-explicit" : "", (int)client_major,
-            (int)client_minor);
+            has_minor ? ".minor-explicit" : "");
     return handle;
 }
 
@@ -16500,6 +16485,11 @@ struct ApkMetaEntry {
     float f = 0.f;
 };
 static std::map<std::string, ApkMetaEntry> g_apk_meta;
+/* The same entries, scoped to the component that declares them.  A flat map
+ * is what ApplicationInfo.metaData is; PackageManager.getServiceInfo() is
+ * the service's own <meta-data>, which is how Firebase finds
+ * FirebaseMessagingRegistrar. */
+static std::map<std::string, std::map<std::string, ApkMetaEntry>> g_apk_component_meta;
 static bool g_apk_meta_tried = false;
 /* The <manifest> element's own attributes.  PackageInfo.versionName is one of
  * the few fields Android guarantees is never null (aapt refuses to build a
@@ -17059,6 +17049,36 @@ extern "C" int arm_exec_apk_style_value(uint32_t style_id, uint32_t attr_id,
     return kind;
 }
 
+/* android:name on a component, package-qualified the way PackageManager
+ * stores it.  ".Foo" and "Foo" are relative to the APK's package. */
+static std::string apk_component_class(const std::vector<uint8_t> &buf,
+                                        const std::vector<std::string> &strings,
+                                        size_t elem, uint16_t attr_start,
+                                        uint16_t attr_size, uint16_t attr_count)
+{
+    std::string name;
+    if (attr_size < 20) return name;
+    size_t base = elem + 16 + attr_start;
+    for (uint16_t a = 0; a < attr_count; ++a) {
+        size_t ao = base + (size_t)a * attr_size;
+        if (ao + 20 > buf.size()) break;
+        int32_t an_idx = *(const int32_t *)(buf.data() + ao + 4);
+        uint8_t typ = buf[ao + 15];
+        uint32_t dval = *(const uint32_t *)(buf.data() + ao + 16);
+        const char *an = (an_idx >= 0 && (size_t)an_idx < strings.size())
+            ? strings[(size_t)an_idx].c_str() : "";
+        if (!strcmp(an, "name") && typ == 0x03 && dval < strings.size())
+            name = strings[dval];
+    }
+    if (name.empty()) return name;
+    const char *pkg = lunaria_env("ANDROID_PACKAGE_NAME");
+    if (name[0] == '.')
+        return std::string(pkg ? pkg : "") + name;
+    if (name.find('.') == std::string::npos && pkg && *pkg)
+        return std::string(pkg) + "." + name;
+    return name;
+}
+
 static void apk_meta_ensure_loaded() {
     if (g_apk_meta_tried) return;
     g_apk_meta_tried = true;
@@ -17164,17 +17184,29 @@ static void apk_meta_ensure_loaded() {
         return;
     }
     size_t i = 8;
+    /* Start element pushes, end element pops.  A <meta-data> belongs to the
+     * nearest component above it, not to every later sibling. */
+    std::vector<std::string> meta_owner;
     while (i + 8 <= buf.size()) {
         uint16_t ct = *(const uint16_t *)(buf.data() + i);
         uint32_t cs = *(const uint32_t *)(buf.data() + i + 4);
         if (cs < 8 || i + cs > buf.size()) break;
-        if (ct == 0x0102u && i + 30 <= buf.size()) {
+        if (ct == 0x0103u) {
+            if (!meta_owner.empty()) meta_owner.pop_back();
+        } else if (ct == 0x0102u && i + 30 <= buf.size()) {
             int32_t name_idx = *(const int32_t *)(buf.data() + i + 20);
             uint16_t attr_start = *(const uint16_t *)(buf.data() + i + 24);
             uint16_t attr_size = *(const uint16_t *)(buf.data() + i + 26);
             uint16_t attr_count = *(const uint16_t *)(buf.data() + i + 28);
             const char *ename = (name_idx >= 0 && (size_t)name_idx < strings.size())
                 ? strings[(size_t)name_idx].c_str() : "";
+            std::string owner;
+            if (!strcmp(ename, "service") || !strcmp(ename, "activity") ||
+                !strcmp(ename, "activity-alias") || !strcmp(ename, "receiver") ||
+                !strcmp(ename, "provider"))
+                owner = apk_component_class(buf, strings, i, attr_start,
+                                             attr_size, attr_count);
+            meta_owner.push_back(std::move(owner));
             if (!strcmp(ename, "manifest") && attr_size >= 20) {
                 size_t base = i + 16 + attr_start;
                 for (uint16_t a = 0; a < attr_count; ++a) {
@@ -17318,13 +17350,19 @@ static void apk_meta_ensure_loaded() {
                         ent.str.clear();
                     }
                     g_apk_meta[key] = ent;
+                    for (auto it = meta_owner.rbegin(); it != meta_owner.rend(); ++it) {
+                        if (it->empty()) continue;
+                        g_apk_component_meta[*it][key] = ent;
+                        break;
+                    }
                 }
             }
         }
         i += cs;
     }
     fprintf(stderr, "[apk-meta] loaded %zu meta-data entries from AndroidManifest"
-            " (version %s code %d)\n", g_apk_meta.size(),
+            " across %zu components (version %s code %d)\n", g_apk_meta.size(),
+            g_apk_component_meta.size(),
             g_apk_version_name.empty() ? "?" : g_apk_version_name.c_str(),
             g_apk_version_code);
 }
@@ -17465,6 +17503,24 @@ extern "C" const char *arm_exec_apk_meta_keys(void) {
         }
     }
     return keys.c_str();
+}
+
+extern "C" const char *arm_exec_apk_component_meta_keys(const char *component) {
+    static std::map<std::string, std::string> cached;
+    apk_meta_ensure_loaded();
+    if (!component || !*component) return "";
+    auto found = cached.find(component);
+    if (found != cached.end()) return found->second.c_str();
+    std::string keys;
+    auto owned = g_apk_component_meta.find(component);
+    if (owned != g_apk_component_meta.end()) {
+        for (const auto &entry : owned->second) {
+            if (!keys.empty()) keys.push_back(';');
+            keys += entry.first;
+        }
+    }
+    auto placed = cached.emplace(component, std::move(keys));
+    return placed.first->second.c_str();
 }
 
 // JNI AssetManager bridge.
@@ -23339,100 +23395,6 @@ static int run_arm(ArmExecCtx &ctx, uint32_t entry_va,
                    uint32_t r2_arg, uint32_t r3_arg,
                    uint64_t max_ticks);
 extern "C" void arm_exec_prepare_mono_config(void);
-
-/* ------------------------------------------------------------------------ *
- * GLSL dialect translation
- * ------------------------------------------------------------------------ */
-
-/* Device GLES drivers (Adreno, Mali) expose GLSL extensions that Mesa's ES
- * front end does not — GL_EXT_control_flow_attributes is desktop-GL-only there.
- * A cooked shader archive has the `#extension … : require` line baked in, so
- * nothing on the guest side can avoid asking for it, and Mesa rejects the whole
- * shader.  Translating the shader to the dialect the host does accept is the
- * emulator's job, the same way it translates GLES enums and entry points.
- *
- * Only used after the host has actually rejected the shader, and only for the
- * extensions its own log names — an extension the host supports is passed
- * through untouched. */
-
-// Collect the names Mesa reports as  extension `NAME' unsupported …
-static std::vector<std::string> glsl_unsupported_extensions(const char *log)
-{
-    std::vector<std::string> names;
-    if (!log) return names;
-    for (const char *p = strstr(log, "extension `"); p;
-         p = strstr(p, "extension `")) {
-        p += 11;
-        const char *end = strchr(p, '\'');
-        if (!end) break;
-        std::string name(p, (size_t)(end - p));
-        /* Only act on the "unsupported" diagnostic; a syntax error that merely
-         * quotes an extension name must not make us rewrite anything. */
-        const char *tail = strstr(end, "unsupported");
-        if (tail && (size_t)(tail - end) < 32 &&
-            std::find(names.begin(), names.end(), name) == names.end())
-            names.push_back(name);
-        p = end;
-    }
-    return names;
-}
-
-/* GL_EXT_control_flow_attributes(2) adds [[unroll]] / [[loop]] / [[branch]] /
- * [[dependency_length(n)]] … — statement attributes that are pure optimisation
- * hints with no effect on the result.  Dropping them leaves the shader
- * semantically identical, which is exactly what a driver without the extension
- * would compute. */
-static void glsl_strip_attribute_spans(std::string &src)
-{
-    for (size_t at = src.find("[["); at != std::string::npos;
-         at = src.find("[[", at)) {
-        size_t end = src.find("]]", at + 2);
-        if (end == std::string::npos) break;
-        src.erase(at, end + 2 - at);
-    }
-}
-
-/* Rewrite `src` so it no longer asks for any of `names`.  Returns false when
- * there was nothing to remove, so the caller can keep the original error. */
-static bool glsl_drop_extensions(std::string &src,
-                                 const std::vector<std::string> &names)
-{
-    if (names.empty()) return false;
-    bool changed = false, strip_attrs = false;
-
-    std::string out;
-    out.reserve(src.size());
-    for (size_t pos = 0; pos < src.size();) {
-        size_t eol = src.find('\n', pos);
-        size_t next = (eol == std::string::npos) ? src.size() : eol + 1;
-        std::string line = src.substr(pos, next - pos);
-        pos = next;
-
-        size_t ws = line.find_first_not_of(" \t");
-        bool drop = false;
-        if (ws != std::string::npos && line.compare(ws, 10, "#extension") == 0) {
-            for (const std::string &n : names) {
-                if (line.find(n, ws) == std::string::npos) continue;
-                drop = true;
-                if (n.find("control_flow_attributes") != std::string::npos)
-                    strip_attrs = true;
-                break;
-            }
-        }
-        if (drop) {
-            changed = true;
-            /* Keep the line count so the driver's error positions still line up
-             * with the guest's own view of the shader. */
-            out += '\n';
-        } else {
-            out += line;
-        }
-    }
-    if (!changed) return false;
-    if (strip_attrs) glsl_strip_attribute_spans(out);
-    src.swap(out);
-    return true;
-}
 
 /* ssize_t results: AAPCS64 returns them in the full 64-bit x0, so -1 has to
  * sign-extend.  ret32() zero-extends, which turned every failed read/write into
@@ -32340,17 +32302,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (pfn_glClearStencil) pfn_glClearStencil((GLint)r0); break;
     case SVC_GL_Enable:
         if (pfn_glEnable) {
-            /* Desktop GL_FRAMEBUFFER_SRGB (0x8DB9) is not a GLES enable cap —
-             * forwarding it yields sticky INVALID_ENUM (0x500) that then taints
-             * the next draw.  GLES sRGB is via EXT_sRGB / framebuffer formats. */
-            if (r0 == 0x8DB9u /* GL_FRAMEBUFFER_SRGB */) {
-                if (lunaria_env("LUNARIA_TRACE_GL")) {
-                    static int n = 0;
-                    if (n++ < 8)
-                        fprintf(stderr, "[gl] glEnable(GL_FRAMEBUFFER_SRGB) ignored on GLES\n");
-                }
-                break;
-            }
+            /* EXT_sRGB_write_control accepts 0x8DB9 in GLES. Forward it like
+             * any other capability: supporting contexts change conversion
+             * state, unsupported contexts preserve the driver's INVALID_ENUM.
+             * https://registry.khronos.org/OpenGL/extensions/EXT/EXT_sRGB_write_control.txt */
             if (r0 == 0x0BE2u /* GL_BLEND */ &&
                 lunaria_env("LUNARIA_TRACE_BLEND")) {
                 static int n = 0;
@@ -32374,7 +32329,6 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         break;
     case SVC_GL_Disable:
-        if (r0 == 0x8DB9u /* GL_FRAMEBUFFER_SRGB */) break;
         if (r0 == 0x0BE2u /* GL_BLEND */ && lunaria_env("LUNARIA_TRACE_BLEND")) {
             static int n = 0;
             if (n++ < 20000)
@@ -32445,6 +32399,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_GL_GetIntegerv:
+        if (r1) {
+            GLint version;
+            if (guest_gl_version_integer((GLenum)r0, &version)) {
+                ctx.mem.write32(r1, (uint32_t)version);
+                break;
+            }
+        }
         /* GL_NUM_EXTENSIONS has to count the list the guest can actually
          * enumerate, not the host's -- a loop from 0 to the host's count
          * walked off the end of the filtered list. */
@@ -32759,12 +32720,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             const void *data = gl_unpack_ptr(ctx, pva);
             gl_trace_upload("CompressedImage", r0, r1, (int)r3, (int)h, 0, 0, r2,
                             0, data, (size_t)(sz > 0 ? sz : 0));
-            if (sz >= GL_UPLOAD_UNLOCK_BYTES) {
-                ArmLockDropped unlocked; (void)unlocked;   /* see the sub-image case */
-                pfn_glCompressedTexImage2D((GLenum)r0,(GLint)r1,(GLenum)r2,(GLsizei)r3,h,brd,sz,data);
-            } else {
-                pfn_glCompressedTexImage2D((GLenum)r0,(GLint)r1,(GLenum)r2,(GLsizei)r3,h,brd,sz,data);
-            }
+            ArmLockDropped unlocked; /* see the sub-image case */
+            pfn_glCompressedTexImage2D((GLenum)r0,(GLint)r1,(GLenum)r2,(GLsizei)r3,h,brd,sz,data);
         }
         break;
     }
@@ -32787,8 +32744,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             gl_trace_upload("CompressedSubImage", r0, r1, (int)w, (int)h, (int)r2,
                             (int)r3, fmt, 0, data,
                             (size_t)(sz > 0 ? sz : 0));
-            /* A megabyte of texture is milliseconds of driver work, and it
-             * needs nothing the ARM execution lock protects: the guest thread
+            /* A compressed upload can stall in the driver at any byte count.
+             * The call needs nothing the ARM execution lock protects: the guest thread
              * that asked is stopped inside this SVC, its data is where it left
              * it, and GL is pinned to the pump so no other guest thread can be
              * in the driver at the same time.  Held, it was the emulator's
@@ -32796,12 +32753,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
              * sleep timer waits on the same lock to wake a sleeper, so guest
              * sleeps overshot by as much as 38 ms against a 37.9 ms worst-case
              * lock wait.  Those are the same milliseconds. */
-            if (sz >= GL_UPLOAD_UNLOCK_BYTES) {
-                ArmLockDropped unlocked; (void)unlocked;
-                pfn_glCompressedTexSubImage2D((GLenum)r0,(GLint)r1,(GLint)r2,(GLint)r3,w,h,fmt,sz,data);
-            } else {
-                pfn_glCompressedTexSubImage2D((GLenum)r0,(GLint)r1,(GLint)r2,(GLint)r3,w,h,fmt,sz,data);
-            }
+            ArmLockDropped unlocked;
+            pfn_glCompressedTexSubImage2D((GLenum)r0,(GLint)r1,(GLint)r2,(GLint)r3,w,h,fmt,sz,data);
         }
         break;
     }
@@ -33027,57 +32980,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_GL_CompileShader:
-        if (pfn_glCompileShader) pfn_glCompileShader((GLuint)r0);
-        if (pfn_glGetShaderiv) {
-            GLint ok_c = 0;
-            pfn_glGetShaderiv((GLuint)r0, 0x8B81 /* GL_COMPILE_STATUS */, &ok_c);
-            char info[1024] = {};
-            if (!ok_c && pfn_glGetShaderInfoLog) {
-                GLsizei len = 0;
-                pfn_glGetShaderInfoLog((GLuint)r0, sizeof info - 1, &len, info);
-            }
-            /* Host GLSL rejected an extension the device driver would have
-             * accepted: translate the shader into the host's dialect and
-             * compile that instead of handing the guest a dead shader (UE
-             * treats a failed compile as fatal and abort()s). */
-            if (!ok_c && pfn_glGetShaderSource && pfn_glShaderSource &&
-                pfn_glCompileShader) {
-                std::vector<std::string> gone = glsl_unsupported_extensions(info);
-                GLint srclen = 0;
-                pfn_glGetShaderiv((GLuint)r0, 0x8B88 /* SHADER_SOURCE_LENGTH */,
-                                  &srclen);
-                if (!gone.empty() && srclen > 0) {
-                    std::vector<char> buf((size_t)srclen + 1, '\0');
-                    GLsizei got = 0;
-                    pfn_glGetShaderSource((GLuint)r0, srclen + 1, &got, buf.data());
-                    std::string src(buf.data(), (size_t)(got > 0 ? got : 0));
-                    if (glsl_drop_extensions(src, gone)) {
-                        const char *one = src.c_str();
-                        GLint onelen = (GLint)src.size();
-                        pfn_glShaderSource((GLuint)r0, 1, &one, &onelen);
-                        pfn_glCompileShader((GLuint)r0);
-                        pfn_glGetShaderiv((GLuint)r0, 0x8B81, &ok_c);
-                        static int xlog = 0;
-                        if (xlog++ < 8) {
-                            std::string list;
-                            for (const std::string &n : gone)
-                                list += (list.empty() ? "" : ", ") + n;
-                            fprintf(stderr,
-                                    "[gl] shader %lu: host GLSL lacks %s — "
-                                    "recompiled without it: %s\n",
-                                    r0, list.c_str(), ok_c ? "ok" : "still failing");
-                        }
-                        if (!ok_c && pfn_glGetShaderInfoLog) {
-                            GLsizei len = 0;
-                            pfn_glGetShaderInfoLog((GLuint)r0, sizeof info - 1,
-                                                   &len, info);
-                        }
-                    }
-                }
-            }
-            static int shlog = 0;
-            if (!ok_c && shlog++ < 8)
-                fprintf(stderr, "[gl] shader %lu compile FAILED: %s\n", r0, info);
+        /* The driver may spend milliseconds compiling.  GL is pinned to the
+         * pump thread, so no other guest thread can enter this context while
+         * it runs; the other engines must be allowed to continue. */
+        if (pfn_glCompileShader) {
+            ArmLockDropped gl_unlocked; /* see SVC_GL_Flush */
+            pfn_glCompileShader((GLuint)r0);
         }
         break;
     case SVC_GL_DeleteShader:
@@ -33085,7 +32993,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             fprintf(stderr, "[glsh] DeleteShader(%lu)\n", r0);
         if (pfn_glDeleteShader) pfn_glDeleteShader((GLuint)r0); break;
     case SVC_GL_GetShaderiv:
-        if (pfn_glGetShaderiv && r2) pfn_glGetShaderiv((GLuint)r0,(GLenum)r1,(GLint*)ctx.mem.ptr(r2)); break;
+        if (pfn_glGetShaderiv && r2) {
+            /* Status queries may wait for a driver compiler worker. */
+            GLint *value = (GLint*)ctx.mem.ptr(r2);
+            ArmLockDropped gl_unlocked;
+            pfn_glGetShaderiv((GLuint)r0, (GLenum)r1, value);
+        }
+        break;
     case SVC_GL_GetShaderInfoLog: {
         // r0=shader r1=bufSize r2=length_va r3=infoLog_va
         if (pfn_glGetShaderInfoLog && r3) {
@@ -33121,37 +33035,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             fprintf(stderr, "[glsh] AttachShader(prog=%lu, shader=%lu)\n", r0, r1);
         if (pfn_glAttachShader) pfn_glAttachShader((GLuint)r0,(GLuint)r1); break;
     case SVC_GL_LinkProgram:
-        if (pfn_glLinkProgram) pfn_glLinkProgram((GLuint)r0);
-        if (pfn_glGetProgramiv) {
-            GLint ok_l = 0;
-            pfn_glGetProgramiv((GLuint)r0, 0x8B82 /* GL_LINK_STATUS */, &ok_l);
-            static int lnlog = 0;
-            if (!ok_l && lnlog++ < 8) {
-                char info[512] = {};
-                if (pfn_glGetProgramInfoLog) {
-                    GLsizei len = 0;
-                    pfn_glGetProgramInfoLog((GLuint)r0, sizeof info - 1, &len, info);
-                }
-                // Which stages actually made it to the host?
-                GLint nsh = 0;
-                pfn_glGetProgramiv((GLuint)r0, 0x8B85 /* GL_ATTACHED_SHADERS */, &nsh);
-                fprintf(stderr, "[gl] program %lu link FAILED (%d attached", r0, nsh);
-                if (nsh > 0 && nsh <= 8) {
-                    GLuint sh[8] = {};
-                    if (auto getatt = (void(*)(GLuint,GLsizei,GLsizei*,GLuint*))
-                            host_gl_proc({"glGetAttachedShaders"})) {
-                        GLsizei got = 0;
-                        getatt((GLuint)r0, nsh, &got, sh);
-                        for (GLsizei k = 0; k < got; ++k) {
-                            GLint ty = 0;
-                            if (pfn_glGetShaderiv)
-                                pfn_glGetShaderiv(sh[k], 0x8B4F /* GL_SHADER_TYPE */, &ty);
-                            fprintf(stderr, " %u:type=0x%x", sh[k], (unsigned)ty);
-                        }
-                    }
-                }
-                fprintf(stderr, "): %s\n", info);
-            }
+        if (pfn_glLinkProgram) {
+            ArmLockDropped gl_unlocked; /* see SVC_GL_CompileShader */
+            pfn_glLinkProgram((GLuint)r0);
         }
         break;
     case SVC_GL_UseProgram:
@@ -33200,7 +33086,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_GL_DeleteProgram:
         if (pfn_glDeleteProgram) pfn_glDeleteProgram((GLuint)r0); break;
     case SVC_GL_GetProgramiv:
-        if (pfn_glGetProgramiv && r2) pfn_glGetProgramiv((GLuint)r0,(GLenum)r1,(GLint*)ctx.mem.ptr(r2)); break;
+        if (pfn_glGetProgramiv && r2) {
+            GLint *value = (GLint*)ctx.mem.ptr(r2);
+            ArmLockDropped gl_unlocked;
+            pfn_glGetProgramiv((GLuint)r0, (GLenum)r1, value);
+        }
+        break;
     case SVC_GL_GetProgramInfoLog: {
         if (pfn_glGetProgramInfoLog && r3) {
             GLsizei len = 0;
@@ -33726,10 +33617,24 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_GL_VertexAttrib3fv:
         if (pfn_glVertexAttrib3fv && r1) pfn_glVertexAttrib3fv((GLuint)r0,(const GLfloat*)ctx.mem.ptr(r1)); break;
     
-    case SVC_GL_GetFloatv:
+    case SVC_GL_GetFloatv: {
+        GLint version;
+        if (r1 && guest_gl_version_integer((GLenum)r0, &version)) {
+            GLfloat value = (GLfloat)version;
+            std::memcpy(ctx.mem.ptr(r1), &value, sizeof value);
+            break;
+        }
         if (pfn_glGetFloatv && r1) pfn_glGetFloatv((GLenum)r0,(GLfloat*)ctx.mem.ptr(r1)); break;
-    case SVC_GL_GetBooleanv:
+    }
+    case SVC_GL_GetBooleanv: {
+        GLint version;
+        if (r1 && guest_gl_version_integer((GLenum)r0, &version)) {
+            GLboolean value = (GLboolean)(version != 0);
+            std::memcpy(ctx.mem.ptr(r1), &value, sizeof value);
+            break;
+        }
         if (pfn_glGetBooleanv && r1) pfn_glGetBooleanv((GLenum)r0,(GLboolean*)ctx.mem.ptr(r1)); break;
+    }
     case SVC_GL_IsEnabled:
         ret32(pfn_glIsEnabled ? (uint32_t)pfn_glIsEnabled((GLenum)r0) : 0u); break;
     case SVC_GL_IsProgram:
@@ -39301,24 +39206,27 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             pfn_glProgramParameteri((GLuint)r0,(GLenum)r1,(GLint)r2);
         break;
     case SVC_GL3_GetProgramBinary: {
-        // glGetProgramBinary(program, bufSize, GLsizei *length,.
         GuestVA len_p = argp(2), fmt_p = argp(3), bin_p = argp_n(4);
-        const uint32_t zero = 0u;
-        if (len_p) std::memcpy(ctx.mem.ptr(len_p), &zero, 4);
-        if (fmt_p) std::memcpy(ctx.mem.ptr(fmt_p), &zero, 4);
-        if (pfn_glGetProgramBinary)
-            pfn_glGetProgramBinary((GLuint)r0,(GLsizei)r1,
-                                   (GLsizei*)(len_p ? ctx.mem.ptr(len_p) : nullptr),
-                                   (GLenum*)(fmt_p ? ctx.mem.ptr(fmt_p) : nullptr),
-                                   bin_p ? (void*)ctx.mem.ptr(bin_p) : nullptr);
+        if (pfn_glGetProgramBinary) {
+            GLsizei *length = len_p ? (GLsizei*)ctx.mem.ptr(len_p) : nullptr;
+            GLenum *format = fmt_p ? (GLenum*)ctx.mem.ptr(fmt_p) : nullptr;
+            void *binary = bin_p ? (void*)ctx.mem.ptr(bin_p) : nullptr;
+            /* Binary retrieval can wait for the compiler just like linking.
+             * Resolve guest arguments before dropping the execution lock. */
+            ArmLockDropped gl_unlocked;
+            pfn_glGetProgramBinary((GLuint)r0, (GLsizei)r1,
+                                   length, format, binary);
+        }
         break;
     }
     case SVC_GL3_ProgramBinary: {
         GuestVA bin_p = argp(2);
-        if (pfn_glProgramBinary)
-            pfn_glProgramBinary((GLuint)r0,(GLenum)r1,
-                                bin_p ? (const void*)ctx.mem.ptr(bin_p) : nullptr,
-                                (GLsizei)arg32(3));
+        if (pfn_glProgramBinary) {
+            const void *binary = bin_p ? (const void*)ctx.mem.ptr(bin_p) : nullptr;
+            GLsizei length = (GLsizei)arg32(3);
+            ArmLockDropped gl_unlocked;
+            pfn_glProgramBinary((GLuint)r0, (GLenum)r1, binary, length);
+        }
         break;
     }
     case SVC_GL3_FenceSync: {
@@ -47978,6 +47886,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_GL_GETINTEGER64V: {
         GuestVA out = argp(1);
         if (!out) break;
+        GLint version;
+        if (guest_gl_version_integer((GLenum)r0, &version)) {
+            GLint64 value = version;
+            std::memcpy(ctx.mem.ptr(out), &value, sizeof value);
+            break;
+        }
         auto f = (void(*)(GLenum, GLint64 *))dlsym(
             g_libgles2 ? g_libgles2 : RTLD_DEFAULT, "glGetInteger64v");
         GLint64 v[16] = {};

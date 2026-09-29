@@ -4216,8 +4216,26 @@ static void *bytecode_thread_main(void *p)
       /* A park is not an ending: the thread is blocked inside the platform on
        * something another thread has to produce, and the unwind that reports
        * it has already dropped the frames.  Re-enter run() the way the queue
-       * re-ran it, on the same retry interval, until it finishes for real. */
+       * re-ran it, on the same retry interval, until it finishes for real.
+       * Anything else that unwound is an exception the thread's own catch did
+       * not handle. quiet_uncaught keeps it from being printed at the call,
+       * and clearing it here used to end a NetworkDispatcher with no trace at
+       * all — the response had already been read and then was never posted. */
       const bool parked = vm->parked;
+      if (!parked && vm->exception) {
+         char buf[512];
+         dvm_describe_exception(vm, vm->exception, buf, sizeof buf);
+         struct dvm_class *tc = dvm_object_class(vm, self);
+         fprintf(stderr, "[dvm] bytecode thread %s died: %s\n",
+                 tc && tc->name ? tc->name : "?", buf);
+         for (int i = 0; i < vm->nexc_trace; ++i) {
+            struct dvm_method *f = vm->exc_trace[i];
+            if (!f) continue;
+            fprintf(stderr, "[dvm]   at %s.%s%s\n",
+                    f->cls ? f->cls->name : "?", f->name,
+                    f->sig ? f->sig : "");
+         }
+      }
       dvm_clear_exception(vm);
       if (!parked) break;
       dvm_gil_release(vm);
@@ -15149,17 +15167,15 @@ BUNDLE_GET(bundle_getFloat, "java/lang/Float", f, RETF, 0.0f)
 BUNDLE_GET(bundle_getDouble, "java/lang/Double", d, RETD, 0.0)
 #undef BUNDLE_GET
 
-/* PackageManager supplies this data for the installed application. */
-dvm_ref dvm_runtime_manifest_bundle(struct dvm *vm)
+/* `encoded` is the ';' list arm_exec_apk_meta_keys() returns.  Values are
+ * looked up by key, so a key shared by two components answers whichever
+ * landed last in the flat map — component keys in this manifest are unique. */
+static void manifest_bundle_fill(struct dvm *vm, dvm_ref bundle, const char *encoded)
 {
-   struct dvm_class *bc = dvm__class_by_desc(vm, "Landroid/os/Bundle;");
-   dvm_ref bundle = bc ? dvm_new_object(vm, bc) : 0;
-   if (!bundle) return 0;
-   union dvm_value ignored = { 0 };
-   (void)map_init(vm, bundle, NULL, 0, &ignored);
-   const char *encoded = arm_exec_apk_meta_keys();
-   char *copy = encoded && *encoded ? strdup(encoded) : NULL;
+   if (!bundle || !encoded || !*encoded) return;
+   char *copy = strdup(encoded);
    char *save = NULL;
+   union dvm_value ignored = { 0 };
    for (char *key = copy ? strtok_r(copy, ";", &save) : NULL;
         key; key = strtok_r(NULL, ";", &save)) {
       int32_t iv = 0;
@@ -15182,6 +15198,17 @@ dvm_ref dvm_runtime_manifest_bundle(struct dvm *vm)
       }
    }
    free(copy);
+}
+
+/* PackageManager supplies this data for the installed application. */
+dvm_ref dvm_runtime_manifest_bundle(struct dvm *vm)
+{
+   struct dvm_class *bc = dvm__class_by_desc(vm, "Landroid/os/Bundle;");
+   dvm_ref bundle = bc ? dvm_new_object(vm, bc) : 0;
+   if (!bundle) return 0;
+   union dvm_value ignored = { 0 };
+   (void)map_init(vm, bundle, NULL, 0, &ignored);
+   manifest_bundle_fill(vm, bundle, arm_exec_apk_meta_keys());
    return bundle;
 }
 
@@ -21187,11 +21214,14 @@ static bool http_body_available(struct dvm *vm, dvm_ref self,
    (void)dvm_get_field(vm, self, "conn", "Ljava/net/HttpURLConnection;", &cv);
    struct rt_conn *c = cv.l ? conn_of(vm, cv.l) : NULL;
    if (!c) RETI(0);
-   long long left = c->resp.content_length >= 0
-                        ? c->resp.content_length - c->resp.body_read : 0;
-   if (left < 0) left = 0;
-   if (left > 0x7fffffffLL) left = 0x7fffffffLL;
-   RETI((int32_t)left);
+   /* Close-terminated and chunked bodies are already in `resp.body`. Their
+    * Content-Length is negative, so a remainder computed from that header is
+    * always zero — and a caller that waits for available() to become positive
+    * before it reads never does. The bytes already taken off the socket are
+    * the amount that can be read without blocking. */
+   size_t n = dvm_http_avail(&c->resp);
+   if (n > 0x7fffffffu) n = 0x7fffffffu;
+   RETI((int32_t)n);
 }
 
 static bool http_body_close(struct dvm *vm, dvm_ref self,
@@ -37712,14 +37742,23 @@ static bool cn_init_context_class(struct dvm *vm, dvm_ref self,
                                   const union dvm_value *args, int nargs,
                                   union dvm_value *out)
 {
-   (void)args; (void)nargs; (void)out;
+   (void)out;
    const char *pkg = getenv("ANDROID_PACKAGE_NAME");
-   const char *cls = getenv("ANDROID_LAUNCH_ACTIVITY");
+   /* ComponentName(Context, Class) names that class.  Firebase looks up
+    * ComponentDiscoveryService this way; substituting the launch activity
+    * made getServiceInfo answer a different component. */
+   char dotted[512];
+   dotted[0] = '\0';
+   struct dvm_object *co = nargs > 1 ? dvm__obj(vm, ARG(1).l) : NULL;
+   if (co && co->kind == DVM_OBJ_CLASS && co->klass && co->klass->name) {
+      snprintf(dotted, sizeof dotted, "%s", co->klass->name);
+      for (char *q = dotted; *q; ++q) if (*q == '/') *q = '.';
+   }
    union dvm_value v = {
       .l = dvm_new_string(vm, pkg && *pkg ? pkg : "com.lunaria.app")
    };
    (void)dvm_set_field(vm, self, "pkg", "Ljava/lang/String;", v);
-   v.l = dvm_new_string(vm, cls && *cls ? cls : "android.app.Activity");
+   v.l = dvm_new_string(vm, dotted[0] ? dotted : "android.app.Activity");
    (void)dvm_set_field(vm, self, "cls", "Ljava/lang/String;", v);
    RETV();
 }
@@ -38014,28 +38053,61 @@ static bool pm_resolveProvider(struct dvm *vm, dvm_ref self,
    RETL(result);
 }
 
+/* GET_META_DATA.  Without it, ServiceInfo.metaData stays the empty bundle
+ * pm_component_info() already installed — the same as a device. */
+enum { PM_GET_META_DATA = 0x00000080 };
+
+/* The component named by args[0], with its own manifest <meta-data> when
+ * the caller asked for it.  Firebase ComponentDiscovery reads
+ * ComponentDiscoveryService this way and will not register
+ * FirebaseMessagingRegistrar from any other bundle. */
+static dvm_ref pm_info_for_component(struct dvm *vm, const char *desc,
+                                     const union dvm_value *args, int nargs)
+{
+   dvm_ref info = pm_component_info(vm, desc);
+   if (!info || nargs < 1 || !ARG(0).l) return info;
+   union dvm_value cls = { 0 };
+   (void)dvm_get_field(vm, ARG(0).l, "cls", "Ljava/lang/String;", &cls);
+   const char *name = dvm_string_utf8(vm, cls.l);
+   if (!name || !*name) return info;
+   union dvm_value v = { .l = dvm_new_string(vm, name) };
+   (void)dvm_set_field(vm, info, "name", "Ljava/lang/String;", v);
+   const char *pkg = getenv("ANDROID_PACKAGE_NAME");
+   v.l = dvm_new_string(vm, pkg ? pkg : "");
+   (void)dvm_set_field(vm, info, "packageName", "Ljava/lang/String;", v);
+   if (nargs > 1 && (ARG(1).i & PM_GET_META_DATA)) {
+      union dvm_value bundle = { 0 };
+      (void)dvm_get_field(vm, info, "metaData", "Landroid/os/Bundle;", &bundle);
+      manifest_bundle_fill(vm, bundle.l, arm_exec_apk_component_meta_keys(name));
+   }
+   return info;
+}
+
 static bool pm_getServiceInfo(struct dvm *vm, dvm_ref self,
                               const union dvm_value *args, int nargs,
                               union dvm_value *out)
 {
-   (void)self; (void)args; (void)nargs;
-   RETL(pm_component_info(vm, "Landroid/content/pm/ServiceInfo;"));
+   (void)self;
+   RETL(pm_info_for_component(vm, "Landroid/content/pm/ServiceInfo;",
+                              args, nargs));
 }
 
 static bool pm_getActivityInfo(struct dvm *vm, dvm_ref self,
                                const union dvm_value *args, int nargs,
                                union dvm_value *out)
 {
-   (void)self; (void)args; (void)nargs;
-   RETL(pm_component_info(vm, "Landroid/content/pm/ActivityInfo;"));
+   (void)self;
+   RETL(pm_info_for_component(vm, "Landroid/content/pm/ActivityInfo;",
+                              args, nargs));
 }
 
 static bool pm_getProviderInfo(struct dvm *vm, dvm_ref self,
                                const union dvm_value *args, int nargs,
                                union dvm_value *out)
 {
-   (void)self; (void)args; (void)nargs;
-   RETL(pm_component_info(vm, "Landroid/content/pm/ProviderInfo;"));
+   (void)self;
+   RETL(pm_info_for_component(vm, "Landroid/content/pm/ProviderInfo;",
+                              args, nargs));
 }
 
 static bool pm_getInstallerPackageName(struct dvm *vm, dvm_ref self,

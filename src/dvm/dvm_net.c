@@ -626,8 +626,10 @@ static void http_stream_done(struct dvm_http_response *r)
 size_t dvm_http_avail(const struct dvm_http_response *r)
 {
    if (!r) return 0;
-   if (r->chunked)
-      return r->body && r->body_len > (size_t)r->body_read
+   /* Slurping also stores close-terminated responses in body.  Once the
+    * socket is closed, the prebuffer has been consumed into that allocation. */
+   if (r->body)
+      return r->body_len > (size_t)r->body_read
                 ? r->body_len - (size_t)r->body_read : 0;
    size_t n = 0;
    if (r->pre_pos < r->pre_len) n += r->pre_len - r->pre_pos;
@@ -639,10 +641,10 @@ long dvm_http_read(struct dvm_http_response *r, void *buf, size_t n)
 {
    if (!r || !buf || !n) return 0;
 
-   /* Chunked framing is only used here by the small JSON APIs, and decoding it
-    * incrementally would buy nothing: decode it once and serve from there. */
-   if (r->chunked) {
-      if (!r->body && !dvm_http_slurp(r)) return -1;
+   /* Both decoded chunked bodies and close-terminated bodies are served from
+    * the allocation made by dvm_http_slurp(). */
+   if (r->chunked && !r->body && !dvm_http_slurp(r)) return -1;
+   if (r->body) {
       size_t left = r->body_len > (size_t)r->body_read
                         ? r->body_len - (size_t)r->body_read : 0;
       if (!left) return 0;

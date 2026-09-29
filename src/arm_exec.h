@@ -288,6 +288,10 @@ void arm_exec_note_destructive(const char *what, const char *host_path,
  * 'L' in *sv).  'F' supplies the IEEE-754 float bits in *iv. */
 int arm_exec_apk_meta(const char *key, int32_t *iv, const char **sv);
 const char *arm_exec_apk_meta_keys(void);
+/* meta-data nested under one <service>/<activity>/<receiver>/<provider>,
+ * keyed by the component's dotted class name.  Same ';' encoding as
+ * arm_exec_apk_meta_keys(); empty when that component declares none. */
+const char *arm_exec_apk_component_meta_keys(const char *component);
 /* The audio output the emulator actually presents, as AudioManager reports it
  * (PROPERTY_OUTPUT_FRAMES_PER_BUFFER / PROPERTY_OUTPUT_SAMPLE_RATE).  An app
  * that asks Java for these must get the same numbers the OpenSL ES pump runs
