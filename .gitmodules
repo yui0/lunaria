@@ -1,0 +1,3 @@
+[submodule "src/luna-ui"]
+	path = src/luna-ui
+	url = https://github.com/Berry-OS/luna-ui.git

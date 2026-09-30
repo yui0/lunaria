@@ -12,10 +12,96 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* ---- OpenSL PCM queues --------------------------------------------------
+ * Borrowed buffers remain queued until the host accepts their mixed frames.
+ * Render a queue copy first, then advance the original by accepted frames.
+ * NULL mix advances without copying; OpenSL results are 0, 2 and 7. */
+
+#define LUNA_PCM_BUFFERS 64
+struct luna_pcm_buffer {
+    const uint8_t *data;
+    unsigned frames, position;
+};
+struct luna_pcm_queue {
+    struct luna_pcm_buffer buffers[LUNA_PCM_BUFFERS];
+    unsigned head, count, capacity, rate, channels, phase;
+    uint32_t retired;
+};
+static inline void luna_pcm_clear(struct luna_pcm_queue *q)
+{
+    q->head = q->count = q->phase = q->retired = 0;
+    memset(q->buffers, 0, sizeof q->buffers);
+}
+
+static inline int luna_pcm_enqueue(struct luna_pcm_queue *q, const void *data, unsigned bytes)
+{
+    if (!data || !bytes || !q->rate || !q->channels ||
+        bytes % (q->channels * sizeof(int16_t))) return 2;
+    if (q->count >= q->capacity || q->count >= LUNA_PCM_BUFFERS) return 7;
+    struct luna_pcm_buffer *b = &q->buffers[(q->head + q->count) % LUNA_PCM_BUFFERS];
+    b->data = (const uint8_t *)data;
+    b->frames = bytes / (q->channels * sizeof(int16_t));
+    b->position = 0;
+    ++q->count;
+    return 0;
+}
+
+static inline void luna_pcm_advance_source(struct luna_pcm_queue *q, unsigned output_rate)
+{
+    while (q->phase >= output_rate && q->count) {
+        struct luna_pcm_buffer *b = &q->buffers[q->head];
+        q->phase -= output_rate;
+        if (++b->position == b->frames) {
+            q->head = (q->head + 1) % LUNA_PCM_BUFFERS;
+            --q->count;
+            ++q->retired;
+        }
+    }
+}
+
+static inline unsigned luna_pcm_mix(struct luna_pcm_queue *q, int32_t *mix, unsigned frames,
+                      unsigned output_rate, unsigned output_channels)
+{
+    if (!output_rate || !output_channels || !q->rate || !q->channels) return 0;
+    unsigned produced = 0;
+    /* Keep fractional phase across enqueue boundaries, including source
+     * frames skipped by the last accepted output frame of a downsample. */
+    luna_pcm_advance_source(q, output_rate);
+    while (produced < frames && q->count) {
+        struct luna_pcm_buffer *b = &q->buffers[q->head];
+        if (mix) {
+            const uint8_t *src = b->data + b->position * q->channels * sizeof(int16_t);
+            for (unsigned c = 0; c < output_channels; ++c) {
+                int32_t sample;
+                if (output_channels == 1 && q->channels > 1) {
+                    sample = 0;
+                    for (unsigned j = 0; j < q->channels; ++j) {
+                        int16_t v;
+                        memcpy(&v, src + j * sizeof v, sizeof v);
+                        sample += v;
+                    }
+                    sample /= (int32_t)q->channels;
+                } else {
+                    int16_t v;
+                    unsigned channel = q->channels == 1 ? 0 : c % q->channels;
+                    memcpy(&v, src + channel * sizeof v, sizeof v);
+                    sample = v;
+                }
+                mix[produced * output_channels + c] += sample;
+            }
+        }
+        ++produced;
+        q->phase += q->rate;
+        luna_pcm_advance_source(q, output_rate);
+    }
+    return produced;
+}
 
 /* ---- guest RAM profile -------------------------------------------------- *
  *

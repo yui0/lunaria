@@ -1804,7 +1804,14 @@ enum SvcId : uint32_t {
     SVC_AMOTION_HISTSIZE,
     SVC_AMOTION_HISTTIME,
     SVC_AMOTION_HISTFLOAT,
-    SVC_SPLIT_LAST = SVC_AMOTION_HISTFLOAT,
+    /* OpenSL player and buffer queue lifecycle. */
+    SVC_SL_PLAY_SETSTATE,
+    SVC_SL_PLAY_GETSTATE,
+    SVC_SL_PLAY_GETPOSITION,
+    SVC_SL_PLAY_GETDURATION,
+    SVC_SL_BQ_CLEAR,
+    SVC_SL_OBJ_DESTROY,
+    SVC_SPLIT_LAST = SVC_SL_OBJ_DESTROY,
     /* A host function bound at run time, found through the index its
      * trampoline carries (see HostCallFn in arm_exec.h).  One number for all of them. */
     SVC_HOSTCALL,

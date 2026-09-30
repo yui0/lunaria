@@ -22,7 +22,7 @@
 #include "luna_overlay.h"
 #include <sys/stat.h>
 #include <dirent.h>
-#include "luna_keymap.h"
+#include "luna_input.h"
 #include <stdarg.h>
 #include "lunaria_os.h"
 #include "dvm/dvm.h"
@@ -39,6 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 static bool  g_ready;          /* luna_init() has run against a live context */
 static bool  g_failed;         /* …and failed; do not retry every frame */
@@ -1469,6 +1470,10 @@ static int menu_sub_rows(struct menu_buf *b)
    } else if (g_menu_sub == SUB_SOUND) {
       y += menu_header(b, "SOUND OUTPUT");
       const char *cur = luna_os_audio_device();
+      /* "None" closes the playback device so another program can open the
+       * card.  Mute only zeros samples and still holds the PCM. */
+      y += menu_item(b, "dev-off", "None", cur && !strcmp(cur, "off"), NULL);
+      y += menu_sep(b);
       for (int i = 0; i < g_menu_ndev; ++i) {
          snprintf(id, sizeof id, "dev-%d", i);
          y += menu_item(b, id, g_menu_dev_desc[i], cur && !strcmp(cur, g_menu_dev_name[i]), NULL);
@@ -1590,6 +1595,150 @@ static void menu_screenshot_path(char *out, size_t cap)
             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
 
+/* The right-click menu writes into the running package's block of
+ * lunaria.conf.  Lines outside any block are common and win the next launch;
+ * this only records what that app chose.  value == NULL drops the key, which
+ * is how "follow the device density" is stored: the name is simply absent. */
+static void menu_conf_set(const char *key, const char *value)
+{
+   const char *pkg = getenv("ANDROID_PACKAGE_NAME");
+   const char *path = getenv("LUNARIA_CONF");
+   char **lines = NULL;
+   int n = 0, cap = 0, sec = -1, end = -1, hit = -1, i, bad = 0;
+   FILE *in;
+   if (!pkg || !*pkg || !path || !*path || !key || !*key) return;
+   if (strchr(pkg, '\n') || strchr(pkg, ']') || strchr(key, '\n') || strchr(key, '=')) return;
+   if (value && (strchr(value, '\n') || strchr(value, '\r'))) return;
+   if (value) setenv(key, value, 1);
+   else unsetenv(key);
+
+   in = fopen(path, "r");
+   if (in) {
+      char buf[4096];
+      while (fgets(buf, sizeof buf, in)) {
+         size_t L;
+         char *copy;
+         if (!strchr(buf, '\n') && !feof(in)) { bad = 1; break; }
+         L = strlen(buf);
+         while (L && (buf[L - 1] == '\n' || buf[L - 1] == '\r')) buf[--L] = 0;
+         copy = (char *)malloc(L + 1);
+         if (!copy) { bad = 1; break; }
+         memcpy(copy, buf, L + 1);
+         if (n == cap) {
+            int ncap = cap ? cap * 2 : 64;
+            char **grown = (char **)realloc(lines, (size_t)ncap * sizeof *lines);
+            if (!grown) { free(copy); bad = 1; break; }
+            lines = grown;
+            cap = ncap;
+         }
+         lines[n++] = copy;
+      }
+      fclose(in);
+   }
+   if (bad) {
+      fprintf(stderr, "[menu] leaving %s unchanged (unreadable or too long a line)\n", path);
+      goto done;
+   }
+
+   for (i = 0; i < n; ++i) {
+      const char *s = lines[i];
+      size_t a = 0, b;
+      while (s[a] == ' ' || s[a] == '\t') ++a;
+      b = strlen(s);
+      while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t')) --b;
+      if (s[a] == '[') {
+         int match = b > a + 1 && s[b - 1] == ']'
+                  && (size_t)(b - a - 2) == strlen(pkg)
+                  && memcmp(s + a + 1, pkg, strlen(pkg)) == 0;
+         if (sec < 0) {
+            if (match) { sec = i; end = n; }
+         } else if (i > sec) {
+            end = i;
+            break;
+         }
+      }
+   }
+   if (sec >= 0) {
+      size_t klen = strlen(key);
+      for (i = sec + 1; i < end; ++i) {
+         if (strncmp(lines[i], key, klen) == 0 && lines[i][klen] == '=') { hit = i; break; }
+      }
+   }
+
+   if (!value) {
+      if (hit >= 0) {
+         free(lines[hit]);
+         memmove(&lines[hit], &lines[hit + 1], (size_t)(n - hit - 1) * sizeof *lines);
+         --n;
+      }
+   } else {
+      size_t need = strlen(key) + 1 + strlen(value) + 1;
+      char *row = (char *)malloc(need);
+      if (!row) goto done;
+      snprintf(row, need, "%s=%s", key, value);
+      if (hit >= 0) {
+         free(lines[hit]);
+         lines[hit] = row;
+      } else if (sec >= 0) {
+         int at = sec + 1;
+         if (n == cap) {
+            char **grown = (char **)realloc(lines, (size_t)(cap + 1) * sizeof *lines);
+            if (!grown) { free(row); goto done; }
+            lines = grown;
+            ++cap;
+         }
+         memmove(&lines[at + 1], &lines[at], (size_t)(n - at) * sizeof *lines);
+         lines[at] = row;
+         ++n;
+      } else {
+         char *hdr;
+         int add = n > 0 ? 3 : 2; /* blank line, [pkg], key */
+         if (n + add > cap) {
+            char **grown = (char **)realloc(lines, (size_t)(n + add) * sizeof *lines);
+            if (!grown) { free(row); goto done; }
+            lines = grown;
+            cap = n + add;
+         }
+         if (n > 0 && lines[n - 1][0] != 0) {
+            char *blank = strdup("");
+            if (!blank) { free(row); goto done; }
+            lines[n++] = blank;
+         }
+         hdr = (char *)malloc(strlen(pkg) + 3);
+         if (!hdr) { free(row); goto done; }
+         snprintf(hdr, strlen(pkg) + 3, "[%s]", pkg);
+         lines[n++] = hdr;
+         lines[n++] = row;
+      }
+   }
+
+   {
+      char tmp[4096];
+      FILE *out;
+      if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) goto done;
+      out = fopen(tmp, "w");
+      if (!out) {
+         fprintf(stderr, "[menu] cannot write %s\n", tmp);
+         goto done;
+      }
+      for (i = 0; i < n; ++i) {
+         if (fputs(lines[i], out) < 0 || fputc('\n', out) == EOF) {
+            fclose(out);
+            unlink(tmp);
+            fprintf(stderr, "[menu] cannot write %s\n", tmp);
+            goto done;
+         }
+      }
+      if (fclose(out) != 0 || rename(tmp, path) != 0) {
+         unlink(tmp);
+         fprintf(stderr, "[menu] cannot replace %s\n", path);
+      }
+   }
+done:
+   for (i = 0; i < n; ++i) free(lines[i]);
+   free(lines);
+}
+
 static void menu_clicked(const char *id)
 {
    if (strncmp(id, "luna-menu", 9)) return;
@@ -1617,11 +1766,16 @@ static void menu_clicked(const char *id)
       arm_exec_android_key(4 /* AKEYCODE_BACK */);
    } else if (!strcmp(id, "volup") || !strcmp(id, "voldown")) {
       float v = luna_os_audio_volume() + (id[3] == 'u' ? 0.1f : -0.1f);
+      char saved[16];
       luna_os_audio_set_volume(v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v);
       if (luna_os_audio_muted()) luna_os_audio_set_muted(0);
+      snprintf(saved, sizeof saved, "%.2f", luna_os_audio_volume());
+      menu_conf_set("LUNARIA_AUDIO_VOLUME", saved);
+      menu_conf_set("LUNARIA_AUDIO_MUTE", "0");
       keep_open = true;
    } else if (!strcmp(id, "mute")) {
       luna_os_audio_set_muted(!luna_os_audio_muted());
+      menu_conf_set("LUNARIA_AUDIO_MUTE", luna_os_audio_muted() ? "1" : "0");
       menu_notice_locked(luna_os_audio_muted() ? "Sound muted" : "Sound on");
    } else if (!strncmp(id, "sub-", 4)) {
       const int sub = !strcmp(id + 4, "sound") ? SUB_SOUND : !strcmp(id + 4, "zoom") ? SUB_ZOOM
@@ -1644,36 +1798,59 @@ static void menu_clicked(const char *id)
       if (i >= 0 && i < g_nkeyfiles && keyfile_path(path, sizeof path, g_keyfiles[i].name)) {
          if (g_keyfiles[i].directory) {
             snprintf(g_keydir, sizeof g_keydir, "%s", path); keyfiles_read(); keep_open = true;
-         } else if (luna_keymap_select(path)) menu_notice_locked("Keyboard controls loaded");
-         else { menu_notice_locked("Cannot load keymap file"); keep_open = true; }
+         } else if (luna_keymap_select(path)) {
+            menu_conf_set("LUNARIA_KEYMAP", path);
+            menu_notice_locked("Keyboard controls loaded");
+         } else { menu_notice_locked("Cannot load keymap file"); keep_open = true; }
       } else keep_open = true;
    } else if (!strcmp(id, "km-off") || !strcmp(id, "km-reload")) {
       char path[4096]; luna_keymap_current(path, sizeof path);
       if (!strcmp(id, "km-off")) strcpy(path, "off");
-      if (luna_keymap_select(path)) menu_notice_locked(!strcmp(path, "off") ? "Keyboard controls off" : "Keyboard controls reloaded");
-      else { menu_notice_locked("Cannot load keymap file"); keep_open = true; }
+      if (luna_keymap_select(path)) {
+         if (!strcmp(id, "km-off")) menu_conf_set("LUNARIA_KEYMAP", "off");
+         menu_notice_locked(!strcmp(path, "off") ? "Keyboard controls off" : "Keyboard controls reloaded");
+      } else { menu_notice_locked("Cannot load keymap file"); keep_open = true; }
+   } else if (!strcmp(id, "dev-off")) {
+      if (luna_os_audio_select_device("off") == 0) {
+         menu_conf_set("LUNARIA_ALSA_DEVICE", "off");
+         menu_notice_locked("Sound output off");
+      } else menu_notice_locked("Cannot turn sound output off");
    } else if (!strncmp(id, "dev-", 4)) {
       const int i = atoi(id + 4);
       if (i >= 0 && i < g_menu_ndev) {
          char msg[256];
-         if (luna_os_audio_select_device(g_menu_dev_name[i]) == 0)
+         if (luna_os_audio_select_device(g_menu_dev_name[i]) == 0) {
+            menu_conf_set("LUNARIA_ALSA_DEVICE", g_menu_dev_name[i]);
             snprintf(msg, sizeof msg, "Switching sound output: %s", g_menu_dev_desc[i]);
-         else snprintf(msg, sizeof msg, "Cannot use %s", g_menu_dev_desc[i]);
+         } else snprintf(msg, sizeof msg, "Cannot use %s", g_menu_dev_desc[i]);
          menu_notice_locked(msg);
       }
    } else if (!strncmp(id, "zoom-", 5)) {
+      /* zoom-0 is "use the device density": the name is omitted, because a
+       * stored 0 would read back as a zoom.  The getter never returns 0, it
+       * answers the density in that case, so the choice is the menu id. */
       dvm_webview_set_zoom((float)atoi(id + 5) / 1000.0f);
+      if (!strcmp(id, "zoom-0")) menu_conf_set("LUNARIA_WEB_ZOOM", NULL);
+      else {
+         char saved[16];
+         snprintf(saved, sizeof saved, "%.3f", (float)atoi(id + 5) / 1000.0f);
+         menu_conf_set("LUNARIA_WEB_ZOOM", saved);
+      }
       char msg[64];
       snprintf(msg, sizeof msg, "WebView zoom %d%%", (int)(dvm_webview_zoom() * 100.0f + 0.5f));
       menu_notice_locked(msg);
    } else if (!strncmp(id, "eng-", 4)) {
       dvm_webview_set_engine(id + 4);
+      menu_conf_set("LUNARIA_WEB_ENGINE", id + 4);
       char msg[64];
       snprintf(msg, sizeof msg, "WebView engine: %s", id + 4);
       menu_notice_locked(msg);
    } else if (!strcmp(id, "reload")) {
       dvm_webview_reload();
    } else if (!strcmp(id, "full")) {
+      /* The toggle lands on the window thread after this returns, so the
+       * value to keep is the one the window is on its way to. */
+      menu_conf_set("LUNARIA_FULLSCREEN", arm_exec_is_fullscreen() ? "0" : "1");
       arm_exec_toggle_fullscreen();
    } else if (!strcmp(id, "quit")) {
       arm_exec_request_quit();

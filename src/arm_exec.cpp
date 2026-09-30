@@ -183,7 +183,7 @@ extern "C" void dynarmic_a64_set_progress_hook(void (*fn)(uint64_t compiles,
 extern "C" {
 #include "arm_exec.h"
 #include "luna_gl_inspect.h"
-#include "luna_keymap.h"
+#include "luna_input.h"
 #include "linker64.h"
 #include "jvm/jvm.h"
 #include "jvm/jni.h"
@@ -2378,6 +2378,7 @@ static uint32_t g_fast64_feof_va         = 0;
 static uint32_t g_fast64_fgets_va        = 0;
 static uint32_t g_fast64_mutex_lock_va   = 0;
 static uint32_t g_fast64_mutex_unlock_va = 0;
+static uint32_t g_fast64_mutex_trylock_va = 0;
 static uint32_t g_fast64_mutex_init_va    = 0;
 static uint32_t g_fast64_mutex_destroy_va = 0;
 static uint32_t g_fast64_iswalnum_va     = 0;
@@ -2444,7 +2445,10 @@ static const std::unordered_map<std::string_view, DirectVaFn> &fast64_direct_va_
             if (g_fastmutex_lock_va) return g_fastmutex_unlock_va;
             return g_fast64_mutex_lock_va && !fast64_slow_mutex()
                        ? g_fast64_mutex_unlock_va : 0u; }},
-        {"pthread_mutex_trylock", FG(g_fastmutex_lock_va, g_fastmutex_trylock_va)},
+        {"pthread_mutex_trylock", +[]() -> uint32_t {
+            if (g_fastmutex_lock_va) return g_fastmutex_trylock_va;
+            return g_fast64_mutex_trylock_va && !fast64_slow_mutex()
+                       ? g_fast64_mutex_trylock_va : 0u; }},
         {"pthread_mutex_init", +[]() -> uint32_t {
             return g_fast64_mutex_init_va && !fast64_slow_mutex()
                        ? g_fast64_mutex_init_va : 0u; }},
@@ -5016,6 +5020,11 @@ static constexpr uint64_t GUEST_SA_RESTART   = 0x10000000u;
 static constexpr uint64_t GUEST_SA_NODEFER   = 0x40000000u;
 static constexpr uint64_t GUEST_SA_RESETHAND = 0x80000000u;
 
+/* End this engine's slice after the current SVC.  Defined with
+ * g_yield_requested; a restarted sleep uses it so the instruction after
+ * nanosleep does not run before the original deadline. */
+static void arm_end_slice(void);
+
 static void signal_handlers_exec_reset(uint32_t pid)
 {
     for (auto it = g_sighandlers.begin(); it != g_sighandlers.end(); )
@@ -5768,16 +5777,17 @@ struct ArmThread {
      * time went up while it slept — a reading no device can produce, and one
      * an anti-tamper check reads as a tampered clock. */
     uint64_t                     cpu_ns = 0;
-    /* A sleep is interruptible.  When a handler runs and returns, the sleep
-     * does not resume: nanosleep answers EINTR and stores what was left of it
-     * through `rem`.  Cross Worlds' security module is built on that — one
-     * thread sleeps, another pthread_kill()s it, and the sleeper is expected
-     * to come back short — so a sleep that quietly ran to its deadline was
-     * read as a tampered clock and the module aborted the process.  `raw` is
-     * whether the caller came through the `svc #0` stub, which returns the
-     * negative error itself, or through libc, which returns -1 and errno. */
+    /* A sleep is interruptible.  Without SA_RESTART, nanosleep answers EINTR
+     * and stores what was left of it through `rem`.  With SA_RESTART the
+     * kernel continues the same deadline; aborting it anyway made every
+     * sampling signal (this title's signal 30) turn a parked wait into
+     * another syscall.  TIMER_ABSTIME clock_nanosleep is the exception: it
+     * is never restarted and does not write `rem`.  `raw` is whether the
+     * caller came through the `svc #0` stub, which returns the negative
+     * error itself, or through libc, which returns -1 and errno. */
     GuestVA                      sleep_rem_va = 0;
     bool                         sleep_raw = false;
+    bool                         sleep_abstime = false;
     /* Pending signals are a bit set, not a callback.  pthread_kill merely
      * publishes a bit and returns; the target engine installs the handler in
      * that thread's own register context at its next slice boundary. */
@@ -8348,19 +8358,23 @@ static bool a64_deliver_pending_signal(ArmExecCtx &ctx, ArmThread &t) {
         signal_action_erase(t.process_pid, sig);
     }
     /* Which wait the signal interrupted decides what the interrupted call
-     * has to report.  A device answers EINTR for a sleep and a poll/read;
-     * sem_wait restarts when SA_RESTART is set, while a condition variable
-     * and a mutex are restarted underneath the caller.  Naming it here is
-     * the only way to see which one a guest was actually in. */
-    fprintf(stderr, "[signal] interrupted tid=%u wait: sleep=%d fds=%d sem=%d "
-            "futex=%d cond=%d mutex=%d rwlock=%d join=%d egl=%d\n", t.id,
-            frame.wait.sleep_until_ns != 0, (int)frame.wait.waiting_fds,
-            frame.wait.waiting_sem != 0, frame.wait.waiting_futex != 0,
-            frame.wait.waiting_cond != 0, frame.wait.waiting_mutex != 0,
-            frame.wait.waiting_rwlock != 0, frame.wait.waiting_join != 0,
-            frame.wait.waiting_egl_sync != 0);
-    fprintf(stderr, "[signal] deliver sig=%d to tid=%u pc=0x%llx depth=%u\n",
-            sig, t.id, (unsigned long long)handler, (unsigned)t.signal_depth);
+     * has to report.  A device answers EINTR for a sleep and a poll/read
+     * unless SA_RESTART asked the kernel to continue them; sem_wait restarts
+     * when SA_RESTART is set, while a condition variable and a mutex are
+     * restarted underneath the caller.  The line is a trace: this title
+     * delivers a kick signal to every parked worker, and writing it while
+     * the execution lock is held was the stall. */
+    if (lunaria_env("LUNARIA_TRACE_SIG")) {
+        fprintf(stderr, "[signal] interrupted tid=%u wait: sleep=%d fds=%d sem=%d "
+                "futex=%d cond=%d mutex=%d rwlock=%d join=%d egl=%d\n", t.id,
+                frame.wait.sleep_until_ns != 0, (int)frame.wait.waiting_fds,
+                frame.wait.waiting_sem != 0, frame.wait.waiting_futex != 0,
+                frame.wait.waiting_cond != 0, frame.wait.waiting_mutex != 0,
+                frame.wait.waiting_rwlock != 0, frame.wait.waiting_join != 0,
+                frame.wait.waiting_egl_sync != 0);
+        fprintf(stderr, "[signal] deliver sig=%d to tid=%u pc=0x%llx depth=%u\n",
+                sig, t.id, (unsigned long long)handler, (unsigned)t.signal_depth);
+    }
     return true;
 }
 
@@ -8388,41 +8402,62 @@ static bool a64_rt_sigreturn(ArmExecCtx &ctx, uint32_t tid) {
         arm_signal_resume_futex(ctx, *t, frame);
         arm_signal_resume_sem(ctx, *t, frame);
     }
-    /* The handler ran, so a sleep it interrupted is over.  Report what a
-     * device reports: EINTR, and the time that was left through `rem`. */
+    /* The handler ran.  SA_RESTART continues a relative sleep through the
+     * deadline already recorded (x0 was stored as success when the sleep
+     * parked, which is what a restarted call returns).  TIMER_ABSTIME and a
+     * handler without SA_RESTART answer EINTR.  A deadline that passed while
+     * the handler ran is success, not an error. */
     if (t && t->sleep_until_ns) {
         const uint64_t now = host_mono_ns();
-        const uint64_t left = t->sleep_until_ns > now ? t->sleep_until_ns - now : 0;
-        if (t->sleep_rem_va) {
-            const int64_t sec = (int64_t)(left / 1000000000ull);
-            const int64_t nsec = (int64_t)(left % 1000000000ull);
-            if (ctx.is_arm64) {
-                std::memcpy(ctx.mem.ptr(t->sleep_rem_va), &sec, 8);
-                std::memcpy(ctx.mem.ptr(t->sleep_rem_va + 8), &nsec, 8);
-            } else {
-                ctx.mem.write32(t->sleep_rem_va,     (uint32_t)sec);
-                ctx.mem.write32(t->sleep_rem_va + 4, (uint32_t)nsec);
+        const bool expired = now >= t->sleep_until_ns;
+        const bool restart = frame.restart_wait && !t->sleep_abstime && !expired;
+        if (!restart) {
+            const uint64_t left = expired ? 0
+                : t->sleep_until_ns - now;
+            if (!expired && t->sleep_rem_va && !t->sleep_abstime) {
+                const int64_t sec = (int64_t)(left / 1000000000ull);
+                const int64_t nsec = (int64_t)(left % 1000000000ull);
+                if (ctx.is_arm64) {
+                    std::memcpy(ctx.mem.ptr(t->sleep_rem_va), &sec, 8);
+                    std::memcpy(ctx.mem.ptr(t->sleep_rem_va + 8), &nsec, 8);
+                } else {
+                    ctx.mem.write32(t->sleep_rem_va,     (uint32_t)sec);
+                    ctx.mem.write32(t->sleep_rem_va + 4, (uint32_t)nsec);
+                }
             }
+            t->sleep_until_ns = 0;
+            sleep_heap_remove(t->id);
+            uint64_t rv = 0;
+            if (!expired) {
+                rv = t->sleep_raw ? (uint64_t)(int64_t)(-EINTR)
+                                  : ~0ull /* -1, with errno below */;
+                if (!t->sleep_raw)
+                    if (uint32_t eva = errno_va(ctx, t->id))
+                        ctx.mem.write32(eva, (uint32_t)EINTR);
+            }
+            g_svc_jit64->SetRegister(0, rv);
+            t->regs64[0] = rv;
+            t->regs[0] = (uint32_t)rv;
+            t->sleep_rem_va = 0;
+            t->sleep_raw = false;
+            t->sleep_abstime = false;
+        } else {
+            /* x0 is already the success this restarted call will return, and
+             * the PC is the instruction after it.  Running that instruction
+             * now would spend the rest of the quantum before the deadline,
+             * and the next nanosleep would replace the deadline the kernel
+             * is supposed to keep.  Ending the slice parks the thread on
+             * the deadline still in sleep_until_ns. */
+            arm_end_slice();
         }
-        t->sleep_until_ns = 0;
-        sleep_heap_remove(t->id);
-        const uint64_t rv = t->sleep_raw ? (uint64_t)(int64_t)(-EINTR)
-                                         : ~0ull /* -1, with errno below */;
-        if (!t->sleep_raw)
-            if (uint32_t eva = errno_va(ctx, t->id))
-                ctx.mem.write32(eva, (uint32_t)EINTR);
-        g_svc_jit64->SetRegister(0, rv);
-        t->regs64[0] = rv;
-        t->regs[0] = (uint32_t)rv;
-        t->sleep_rem_va = 0;
-        t->sleep_raw = false;
     }
     signal_mask_store(tid, frame.old_mask);
     --*depth;
     if (tid == 0) ++g_main_signal_returns;
     g_svc_context_restored = true;
-    fprintf(stderr, "[signal] return tid=%u depth=%u\n",
-            tid, (unsigned)*depth);
+    if (lunaria_env("LUNARIA_TRACE_SIG"))
+        fprintf(stderr, "[signal] return tid=%u depth=%u\n",
+                tid, (unsigned)*depth);
     return true;
 }
 
@@ -8758,8 +8793,8 @@ static uint32_t futex_wake_parked(GuestVA uaddr, uint32_t max_wake)
 
 /* A kernel futex waiter is dequeued before entering a signal handler.
  * WAKE during the handler must not count that waiter.  SA_RESTART queues a
- * fresh wait after sigreturn, including the value check.  A timed raw wait
- * instead returns EINTR.
+ * fresh wait after sigreturn, timed or not, including the value check and
+ * the original deadline.  Without SA_RESTART the wait returns EINTR.
  * Merely restoring waiting_futex lost the wake-list entry permanently. */
 static void arm_signal_suspend_futex(ArmThread &t)
 {
@@ -8821,7 +8856,11 @@ static void arm_signal_resume_futex(ArmExecCtx &ctx, ArmThread &t,
     const GuestVA uaddr = t.waiting_futex;
     const bool cond = t.futex_is_cond;
     int error = 0;
-    if (!cond && (!frame.restart_wait || t.futex_timed)) error = EINTR;
+    /* Timed and untimed FUTEX_WAIT both restart when SA_RESTART is set.
+     * Forcing EINTR on every timed wait turned a kick signal into a fresh
+     * syscall on every worker, which is what kept svc 0 on the top of the
+     * slice log during this title's load. */
+    if (!cond && !frame.restart_wait) error = EINTR;
     else if (guest_word_load(ctx.mem, uaddr) != t.futex_val) error = EAGAIN;
     else if (t.futex_timed && host_mono_ns() >= t.futex_until_ns)
         error = ETIMEDOUT;
@@ -9849,6 +9888,7 @@ static void guest_raise_signal(ArmExecCtx &ctx, uint32_t tid, int sig) {
  * that thread's own JIT.  Per host thread: with a parallel engine pool the
  * request belongs to one engine, not to all of them. */
 static thread_local bool g_yield_requested = false;
+static void arm_end_slice(void) { g_yield_requested = true; }
 /* An SVC handler that parked the thread and wants the call made again when it
  * wakes, rather than a result written back.  The A64 entry point rewinds the
  * PC onto the svc instruction; x0-x7 were never touched, so the re-issued call
@@ -11907,7 +11947,7 @@ static void drive_opensles_callbacks(ArmExecCtx &ctx);
  * samplesPerSec, the last in milli-Hz as OpenSL ES defines it.  Writes the
  * rate in Hz and the channel count and returns true when the description is
  * one a player can take; leaves the outputs alone otherwise. */
-enum { LUNA_SL_DATAFORMAT_PCM = 1u };
+enum { LUNA_SL_DATAFORMAT_PCM = 2u };
 
 static bool luna_sl_pcm_format(uint32_t format_type, uint32_t num_channels,
                                uint32_t samples_per_sec, uint32_t *rate_hz,
@@ -11925,28 +11965,19 @@ static bool luna_sl_pcm_format(uint32_t format_type, uint32_t num_channels,
 
 struct SlBufferQueue {
     uint32_t itf       = 0;   /* buffer-queue interface — callback argument 0 */
-    uint32_t queued    = 0;   /* buffers handed to us and not yet retired */
-    uint32_t retired   = 0;   /* running index, as GetState reports it */
-    uint64_t next_due  = 0;   /* CLOCK_MONOTONIC ns of the next retirement */
-    uint64_t period_ns = 10'000'000ull;
+    luna_pcm_queue pcm{};
+    uint32_t notified = 0;
     uint32_t rate      = 48000; /* source SLDataFormat_PCM, Hz */
     uint32_t channels  = 2;
-    uint64_t end_frame[64] = {}; /* device-played boundary for each buffer */
-    uint32_t end_head  = 0;
-    uint32_t end_count = 0;
-    uint64_t last_end  = 0;
+    /* SL_PLAYSTATE_*: STOPPED 1, PAUSED 2, PLAYING 3.  0 is not a state, and
+     * leaving the out-parameter untouched made GetPlayState report that. */
+    uint32_t play_state = 1u;
+    uint64_t play_origin_ns = 0; /* CLOCK_MONOTONIC when the current PLAYING run began */
+    uint64_t play_pos_ms = 0;    /* position frozen across pause */
 };
 static std::map<uint32_t, SlBufferQueue> g_sl_queues;  /* key: owner instance */
 
-/* The host sound card, opened the first time the guest hands us PCM.
- *
- * Until now the buffer queue was a metronome: buffers were retired on a timer
- * and their contents thrown away, so the guest's mixer ran at the right speed
- * and nothing was heard.  The bytes it enqueues are ordinary interleaved
- * 16-bit frames — exactly what the platform sink takes — so playing them is a
- * copy into the ring in luna_os_audio_write().  LUNARIA_AUDIO=0 goes back to
- * the silent metronome (useful when a machine has no card, and for comparing
- * timing with and without the device in the loop). */
+/* Open the shared output device; source PCM is mixed by the buffer consumer. */
 static bool audio_sink_ready(uint32_t rate, uint32_t channels) {
     static int state = 0;   /* 0 unopened, 1 open, -1 explicitly disabled */
     static uint64_t retry_ns = 0;
@@ -11960,29 +11991,7 @@ static bool audio_sink_ready(uint32_t rate, uint32_t channels) {
     const uint64_t now = host_mono_ns();
     if (now < retry_ns) return false;
     retry_ns = now + 3'000'000'000ull;
-    /* luna_os_audio_open() calls into CoreAudio (AudioQueueNewOutput,
-     * AudioQueueAllocateBuffer x N, AudioQueueStart) to stand up the HAL
-     * device -- host-side negotiation that can legitimately stall for a
-     * while on the first call (device busy, HAL thread not up yet).  That
-     * makes it exactly the kind of host call ArmLockDropped exists for:
-     * nothing this thread touches during the open is guest CPU state or
-     * guest memory, so there is no reason to hold every other engine's
-     * next SVC hostage while CoreAudio negotiates.
-     *
-     * This does NOT explain the "svc35 held the lock 300ms" line seen in
-     * [slice] stats during early boot -- bisected with timestamp prints
-     * bracketing this whole function and the SVC_SL_BQ_ENQUEUE case body,
-     * and neither ever took more than a few ms.  The lock is acquired once
-     * per slice (a batch of JIT-run guest instructions), and arm_lock_tag()
-     * is sticky until the next tagged section changes it; when a fast
-     * SVC_SL_BQ_ENQUEUE call is simply the last thing to set the tag before
-     * a long, otherwise-untagged stretch of guest code runs to the slice's
-     * quantum boundary, the release attributes that whole stretch to svc35
-     * even though the SVC itself is not what took the time.  That reflects
-     * genuine compute-bound guest execution during boot (DEX class loading
-     * + ARM JIT translation, already identified elsewhere), not a bug in
-     * this handler -- dropping the lock here is kept as a correct, general
-     * improvement on its own terms, not as a fix for that measurement. */
+    /* Device negotiation can block; it does not require the guest CPU lock. */
     int opened;
     { ArmLockDropped unlock_for_coreaudio;
       opened = luna_os_audio_open(rate, channels); }
@@ -13874,134 +13883,6 @@ extern "C" int arm_exec_take_view_resize(int *w, int *h) {
     return 1;
 }
 
-static void gl_present_fallback_blit(void) {
-    if (!pfn_glBindFramebuffer || !pfn_glReadPixels || !pfn_glGetIntegerv)
-        return;
-    using BlitFn = void (*)(GLint,GLint,GLint,GLint,GLint,GLint,GLint,GLint,GLbitfield,GLenum);
-    static BlitFn blit = nullptr;
-    if (!blit) {
-        blit = (BlitFn)dlsym(g_libgles2 ? g_libgles2 : RTLD_DEFAULT, "glBlitFramebuffer");
-        if (!blit) blit = (BlitFn)eglGetProcAddress("glBlitFramebuffer");
-    }
-    if (!blit) return;
-
-    GLint prev_draw = 0, prev_read = 0;
-    pfn_glGetIntegerv(0x8CA6, &prev_draw);
-    pfn_glGetIntegerv(0x8CAA, &prev_read);
-
-    EGLint win_w = g_fb_w, win_h = g_fb_h;
-    if (g_egl_dpy != EGL_NO_DISPLAY && g_egl_surf != EGL_NO_SURFACE) {
-        eglQuerySurface(g_egl_dpy, g_egl_surf, EGL_WIDTH, &win_w);
-        eglQuerySurface(g_egl_dpy, g_egl_surf, EGL_HEIGHT, &win_h);
-    }
-    if (win_w <= 0 || win_h <= 0) return;
-
-    pfn_glBindFramebuffer(0x8CA8 /* READ */, 0);
-    unsigned char fb0[4] = {};
-    pfn_glReadPixels(win_w / 2, win_h / 2, 1, 1, 0x1908, 0x1401, fb0);
-    if (fb0[0] | fb0[1] | fb0[2]) {
-        pfn_glBindFramebuffer(0x8CA9, (GLuint)prev_draw);
-        pfn_glBindFramebuffer(0x8CA8, (GLuint)prev_read);
-        return;
-    }
-
-    // Prefer scene-centre hits on real-sized attachments over 1x1 clear stubs.
-    const int probe[][2] = {{160,90},{80,45},{320,180},{1,1},{0,0}};
-    GLint best_fb = 0;
-    int best_score = -1;
-    for (GLint fb = 1; fb <= 32; ++fb) {
-        pfn_glBindFramebuffer(0x8CA8, (GLuint)fb);
-        GLenum st = pfn_glCheckFramebufferStatus
-            ? pfn_glCheckFramebufferStatus(0x8CA8) : 0;
-        if (st != 0x8CD5u) continue;
-        GLint att_tex = 0, tw = 0, th = 0;
-        if (pfn_glGetFramebufferAttachmentParameteriv) {
-            pfn_glGetFramebufferAttachmentParameteriv(
-                0x8CA8, 0x8CE0, 0x8CD1, &att_tex);
-        }
-        auto ts = g_gl_tex_size.find((GLuint)att_tex);
-        if (ts != g_gl_tex_size.end()) {
-            tw = ts->second.first;
-            th = ts->second.second;
-        }
-        if (tw > 0 && th > 0 && (tw <= 1 || th <= 1))
-            continue; /* skip known 1x1 stubs */
-        int score = -1;
-        for (int i = 0; i < 5; ++i) {
-            unsigned char px[4] = {};
-            pfn_glReadPixels(probe[i][0], probe[i][1], 1, 1, 0x1908, 0x1401, px);
-            if (px[0] | px[1] | px[2]) {
-                score = (5 - i) * 10;
-                if (!(px[0] == 255 && px[1] == 255 && px[2] == 255))
-                    score += 5;
-                if (tw >= 320 && th >= 180) score += 20;
-                break;
-            }
-        }
-        if (score > best_score) {
-            best_score = score;
-            best_fb = fb;
-        }
-    }
-    if (best_fb <= 0) {
-        pfn_glBindFramebuffer(0x8CA9, (GLuint)prev_draw);
-        pfn_glBindFramebuffer(0x8CA8, (GLuint)prev_read);
-        return;
-    }
-
-    pfn_glBindFramebuffer(0x8CA8, (GLuint)best_fb);
-    GLint src_w = 0, src_h = 0, att_tex = 0;
-    if (pfn_glGetFramebufferAttachmentParameteriv) {
-        pfn_glGetFramebufferAttachmentParameteriv(
-            0x8CA8, 0x8CE0 /* COLOR_ATTACHMENT0 */,
-            0x8CD1 /* OBJECT_NAME */, &att_tex);
-    }
-    using TexLev = void (*)(GLenum, GLint, GLenum, GLint *);
-    static TexLev get_tex_lev = nullptr;
-    if (!get_tex_lev)
-        get_tex_lev = (TexLev)host_gl_proc({"glGetTexLevelParameteriv"});
-    if (get_tex_lev && att_tex && pfn_glBindTexture && pfn_glActiveTexture) {
-        GLint prev_tex = 0, prev_unit = 0;
-        pfn_glGetIntegerv(0x84E0, &prev_unit);
-        pfn_glGetIntegerv(0x8069, &prev_tex);
-        pfn_glActiveTexture(0x84C0);
-        pfn_glBindTexture(0x0DE1, (GLuint)att_tex);
-        get_tex_lev(0x0DE1, 0, 0x1000 /* WIDTH */, &src_w);
-        get_tex_lev(0x0DE1, 0, 0x1001 /* HEIGHT */, &src_h);
-        pfn_glBindTexture(0x0DE1, (GLuint)prev_tex);
-        if (prev_unit) pfn_glActiveTexture((GLenum)prev_unit);
-    }
-    /* UE keeps 1x1 clear-colour stubs (white/green/grey).  Stretching those
-     * fills the window with a solid colour and hides the real black-screen
-     * bug — only blit real scene-sized attachments. */
-    if (src_w <= 1 || src_h <= 1) {
-        static int skip = 0;
-        if (skip++ < 8)
-            fprintf(stderr, "[egl] present-fallback skip fb=%d tex=%d %dx%d "
-                    "(stub) tid=%u\n", best_fb, att_tex, src_w, src_h,
-                    g_current_tid);
-        pfn_glBindFramebuffer(0x8CA9, (GLuint)prev_draw);
-        pfn_glBindFramebuffer(0x8CA8, (GLuint)prev_read);
-        return;
-    }
-
-    pfn_glBindFramebuffer(0x8CA9 /* DRAW */, 0);
-    egl_ensure_window_surface_current();
-    GLboolean scis = pfn_glIsEnabled ? pfn_glIsEnabled(0x0C11) : 0;
-    if (scis && pfn_glDisable) pfn_glDisable(0x0C11);
-    blit(0, 0, src_w, src_h, 0, 0, win_w, win_h,
-         0x00004000 /* COLOR_BUFFER_BIT */, 0x2601 /* LINEAR */);
-    if (scis && pfn_glEnable) pfn_glEnable(0x0C11);
-    static int n = 0;
-    if (n++ < 8)
-        fprintf(stderr, "[egl] present-fallback blit fb=%d tex=%d %dx%d -> %dx%d "
-                "tid=%u\n", best_fb, att_tex, src_w, src_h, win_w, win_h,
-                g_current_tid);
-
-    pfn_glBindFramebuffer(0x8CA9, (GLuint)prev_draw);
-    pfn_glBindFramebuffer(0x8CA8, (GLuint)prev_read);
-}
-
 /* Which draws this tracer reports.
  *
  * It was hard-wired to "framebuffer 0, first three presents", which answers
@@ -14944,6 +14825,13 @@ static bool ensure_glfw_window() {
             g_fb_h = fbh;
         }
         fprintf(stderr, "[arm_exec] GLFW window created (%dx%d)\n", g_fb_w, g_fb_h);
+        /* Full screen is a menu setting kept in lunaria.conf.  The toggle is
+         * applied on the window thread, which is this one once the pump runs. */
+        {
+            const char *fs = std::getenv("LUNARIA_FULLSCREEN");
+            if (fs && *fs && std::strcmp(fs, "0") != 0)
+                arm_exec_toggle_fullscreen();
+        }
         window_take_app_identity(g_glfw);
         glfwSetFramebufferSizeCallback(g_glfw, glfw_fb_size_cb);
         glfwSetMouseButtonCallback(g_glfw, glfw_mouse_button_cb);
@@ -24443,9 +24331,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         regs[0] = v;
         regs[1] = (uint32_t)(v >> 32);
     };
-    /* A result the ABI returns in two registers: div_t and ldiv_t are two
-     * `int`/`long` members and are small enough to come back in r0/r1 (x0/x1)
-     * on both ABIs. */
+    /* A result the ABI returns in two registers, such as A64 ldiv_t. */
     auto ret_pair = [&](uint64_t a, uint64_t b) {
         g_svc_ret64  = true;
         g_svc_ret_x1 = true;
@@ -26691,6 +26577,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 if (ArmThread *st = arm_thread_by_tid(g_current_tid)) {
                     st->sleep_rem_va = (nr == 265) ? argp(3) : argp(1);
                     st->sleep_raw = true;
+                    st->sleep_abstime = nr == 265 && (argp(1) & 1u) != 0;
                 }
                 /* The kernel validates the request before it sleeps at
                  * all: a negative tv_sec or a tv_nsec outside one second is
@@ -31851,8 +31738,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         /* Present, and everything the emulator composites into it, is host GL
          * and nothing else.  The present itself blocks until the compositor
          * hands back a buffer — a whole vsync interval when the queue is full
-         * — and the composite before it draws the overlay and the fallback
-         * blit, which is more host GPU work again.  Holding the ARM execution
+         * — and the composite before it draws the overlay which is more host GPU work again.  Holding the ARM execution
          * lock across all of it stopped every other engine for the length of
          * a frame, every frame: on a device the other threads keep running
          * while one thread waits inside eglSwapBuffers.
@@ -31865,7 +31751,6 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         EGLBoolean ok;
         {
             unsigned swap_depth = arm_lock_unlock_all();
-            gl_present_fallback_blit();
             if (luna_comp_active()) {
                 /* Queue the frame for the compositor, which puts the
                  * emulator's own windows over it on its own thread. */
@@ -36767,6 +36652,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                              : (svc_no == SVC_CLOCK_NANOSLEEP) ? argp(3)
                                                                : 0;
             st->sleep_raw = false;
+            st->sleep_abstime = svc_no == SVC_CLOCK_NANOSLEEP && (argp(1) & 1u) != 0;
         }
         guest_sleep_ns(req_ns);
         ret32(0);
@@ -38377,13 +38263,28 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         SlBufferQueue &q = g_sl_queues[obj];
         const GuestVA src = sl_page_off(ctx, argp(2));
         if (src) {
+            const GuestVA loc = sl_page_off(ctx, sl_load(ctx, src));
+            if (loc) q.pcm.capacity = ctx.mem.read32(loc + 4u);
             const GuestVA fmt = sl_page_off(ctx, sl_load(ctx, src + sl_word(ctx)));
-            if (fmt)
-                (void)luna_sl_pcm_format(ctx.mem.read32(fmt),
+            if (!fmt || !luna_sl_pcm_format(ctx.mem.read32(fmt),
                                          ctx.mem.read32(fmt + 4u),
                                          ctx.mem.read32(fmt + 8u),
-                                         &q.rate, &q.channels);
+                                         &q.rate, &q.channels) ||
+                ctx.mem.read32(fmt + 12u) != 16u ||
+                ctx.mem.read32(fmt + 16u) != 16u ||
+                ctx.mem.read32(fmt + 24u) != 2u) { // little endian
+                g_sl_queues.erase(obj);
+                ret32(12u);
+                break;
+            }
         }
+        if (!q.pcm.capacity || q.pcm.capacity > LUNA_PCM_BUFFERS) {
+            g_sl_queues.erase(obj);
+            ret32(2u);
+            break;
+        }
+        q.pcm.rate = q.rate;
+        q.pcm.channels = q.channels;
         store_ptr(argp(1), (GuestVA)sl_guest_ptr(ctx, obj));
         fprintf(stderr, "[opensles] CreateAudioPlayer -> 0x%08x (%u Hz %u ch)\n",
                 obj, q.rate, q.channels);
@@ -38395,6 +38296,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         uint32_t self  = sl_page_off(ctx, argp(0));
         uint32_t owner = self ? (uint32_t)sl_load(ctx, sl_field(ctx, self, 4)) : 0u;
         uint32_t slot  = owner ? owner : self;
+        if (!slot || g_sl_queues[slot].play_state != 1u) {
+            ret32(1u); // SL_RESULT_PRECONDITIONS_VIOLATED
+            break;
+        }
         if (slot) {
             sl_store(ctx, sl_field(ctx, slot, 2), argp(1));
             sl_store(ctx, sl_field(ctx, slot, 3), argp(2));
@@ -38408,42 +38313,37 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_SL_BQ_ENQUEUE: {
         // Enqueue(self, const void *buffer, SLuint32 size).
+        if (!argp(1) || !arg32(2)) {
+            ret32(2); // SL_RESULT_PARAMETER_INVALID
+            break;
+        }
         uint32_t self  = sl_page_off(ctx, argp(0));
         uint32_t owner = self ? (uint32_t)sl_load(ctx, sl_field(ctx, self, 4)) : 0u;
         uint32_t slot  = owner ? owner : self;
         if (slot) {
             SlBufferQueue &q = g_sl_queues[slot];
             if (!q.itf) q.itf = self;
-            uint32_t size = (uint32_t)arg32(2);
-            uint32_t rate = q.rate;
-            uint32_t chan = q.channels;
-            // FMixerPlatformAndroid submits int16 frames.
-            uint64_t frames = size / (uint64_t)(chan * 2u);
-            /* Play it.  The write never blocks: whatever does not fit in the
-             * ring is dropped, which is what a device does when the app hands
-             * it audio faster than the card takes it. */
-            if (frames && audio_sink_ready(rate, chan)) {
-                if (const uint8_t *pcm = ctx.mem.ptr(argp(1)))
-                    frames = (uint64_t)luna_os_audio_write(pcm, (unsigned)frames);
+            /* OpenSL owns the pointer until its consumer has copied every
+             * frame. A full host ring must leave the source queue intact. */
+            ret32((uint32_t)luna_pcm_enqueue(&q.pcm, ctx.mem.ptr(argp(1)),
+                                            (unsigned)arg32(2)));
+        } else {
+            ret32(2u);
+        }
+        break;
+    }
+    case SVC_SL_BQ_CLEAR:
+    case SVC_SL_OBJ_DESTROY: {
+        uint32_t self = sl_page_off(ctx, argp(0));
+        uint32_t owner = self ? (uint32_t)sl_load(ctx, sl_field(ctx, self, 4)) : 0u;
+        uint32_t slot = owner ? owner : self;
+        auto it = g_sl_queues.find(slot);
+        if (it != g_sl_queues.end()) {
+            if (svc_no == SVC_SL_OBJ_DESTROY) g_sl_queues.erase(it);
+            else {
+                luna_pcm_clear(&it->second.pcm);
+                it->second.notified = 0;
             }
-            uint64_t ns = frames ? frames * 1'000'000'000ull / rate : 10'000'000ull;
-            if (ns < 1'000'000ull)    ns = 1'000'000ull;
-            if (ns > 100'000'000ull)  ns = 100'000'000ull;
-            q.period_ns = ns;
-            if (frames && q.end_count < 64u) {
-                const uint64_t played = luna_os_audio_played_frames();
-                if (q.last_end < played) q.last_end = played;
-                q.last_end += frames;
-                q.end_frame[(q.end_head + q.end_count) % 64u] = q.last_end;
-                ++q.end_count;
-            }
-            ++q.queued;
-            static int enq_log = 0;
-            if (enq_log++ < 8)
-                fprintf(stderr, "[opensles] Enqueue size=%u -> %llu frames, "
-                        "period %llu us (queued=%u)\n", size,
-                        (unsigned long long)frames,
-                        (unsigned long long)(ns / 1000ull), q.queued);
         }
         ret32(0);
         break;
@@ -38471,10 +38371,78 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         uint32_t slot  = owner ? owner : self;
         uint32_t count = 0, index = 0;
         if (auto it = g_sl_queues.find(slot); it != g_sl_queues.end()) {
-            count = it->second.queued;
-            index = it->second.retired;
+            count = it->second.pcm.count;
+            index = it->second.pcm.retired;
         }
         if (r1) { ctx.mem.write32(r1, count); ctx.mem.write32(r1 + 4u, index); }
+        ret32(0);
+        break;
+    }
+    case SVC_SL_PLAY_SETSTATE: {
+        /* SetPlayState(self, state).  SL_PLAYSTATE_STOPPED=1, PAUSED=2,
+         * PLAYING=3. Empty queues wait for the application to enqueue PCM. */
+        uint32_t self  = sl_page_off(ctx, argp(0));
+        uint32_t owner = self ? (uint32_t)sl_load(ctx, sl_field(ctx, self, 4)) : 0u;
+        uint32_t slot  = owner ? owner : self;
+        uint32_t state = (uint32_t)arg32(1);
+        if (!slot || state < 1u || state > 3u) { ret32(2u); break; }
+        SlBufferQueue &q = g_sl_queues[slot];
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        const uint64_t now = (uint64_t)ts.tv_sec * 1'000'000'000ull
+                           + (uint64_t)ts.tv_nsec;
+        if (q.play_state == 3u && state != 3u && q.play_origin_ns && now > q.play_origin_ns)
+            q.play_pos_ms += (now - q.play_origin_ns) / 1'000'000ull;
+        if (state == 3u && q.play_state != 3u)
+            q.play_origin_ns = now;
+        if (state == 1u)
+            q.play_pos_ms = 0;
+        q.play_state = state;
+        fprintf(stderr, "[opensles] SetPlayState slot=0x%x state=%u\n", slot, state);
+        ret32(0);
+        break;
+    }
+    case SVC_SL_PLAY_GETSTATE: {
+        uint32_t self  = sl_page_off(ctx, argp(0));
+        uint32_t owner = self ? (uint32_t)sl_load(ctx, sl_field(ctx, self, 4)) : 0u;
+        uint32_t slot  = owner ? owner : self;
+        uint32_t state = 1u;
+        if (auto it = g_sl_queues.find(slot); it != g_sl_queues.end())
+            state = it->second.play_state;
+        GuestVA out = argp(1);
+        if (out) ctx.mem.write32(out, state);
+        ret32(0);
+        break;
+    }
+    case SVC_SL_PLAY_GETPOSITION: {
+        /* Milliseconds since PLAYING, held across pause, cleared on stop.
+         * A movie player reads this as the frame clock.  Returning success
+         * without writing the out-parameter left that clock at 0. */
+        uint32_t self  = sl_page_off(ctx, argp(0));
+        uint32_t owner = self ? (uint32_t)sl_load(ctx, sl_field(ctx, self, 4)) : 0u;
+        uint32_t slot  = owner ? owner : self;
+        uint64_t ms = 0;
+        if (auto it = g_sl_queues.find(slot); it != g_sl_queues.end()) {
+            const SlBufferQueue &q = it->second;
+            ms = q.play_pos_ms;
+            if (q.play_state == 3u && q.play_origin_ns) {
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                uint64_t now = (uint64_t)ts.tv_sec * 1'000'000'000ull
+                             + (uint64_t)ts.tv_nsec;
+                if (now > q.play_origin_ns)
+                    ms += (now - q.play_origin_ns) / 1'000'000ull;
+            }
+        }
+        GuestVA out = argp(1);
+        if (out) ctx.mem.write32(out, (uint32_t)ms);
+        ret32(0);
+        break;
+    }
+    case SVC_SL_PLAY_GETDURATION: {
+        /* SL_TIME_UNKNOWN.  A finite zero reads as "already finished". */
+        GuestVA out = argp(1);
+        if (out) ctx.mem.write32(out, 0xffffffffu);
         ret32(0);
         break;
     }
@@ -40871,6 +40839,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 if (ArmThread *st = arm_thread_by_tid(g_current_tid)) {
                     st->sleep_rem_va = (nr == 265) ? argp(4) : argp(2);
                     st->sleep_raw = true;
+                    st->sleep_abstime = nr == 265 && (argp(2) & 1u) != 0;
                 }
                 /* Same validation as the raw svc#0 path above. */
                 const GuestVA rq = (nr == 265) ? argp(3) : argp(1);
@@ -42743,16 +42712,21 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         guest_mutex_adopt_static(ctx.mem, mva);
         if (mva) {
             const uint32_t owner = (g_current_tid + 1u) & 0xffu;
-            const bool errorcheck =
-                guest_mutex_type_of(mva) == GUEST_MUTEX_ERRORCHECK;
+            const int mtype = guest_mutex_type_of(mva);
             bool took = false;
             for (;;) {
                 const uint32_t raw = guest_word_load(ctx.mem, mva);
                 const uint32_t w = mutex_state(raw);
-                if (w >= 0x100u && (w & 0xffu) != owner) break;
-                /* trylock on an ERRORCHECK mutex this thread already holds is
-                 * EBUSY, not a recursion. */
-                if (errorcheck && w >= 0x100u) break;
+                /* bionic's NORMAL mutex has no owner on the fast path: any
+                 * nonzero state, including one this thread just stored, is
+                 * EBUSY.  Succeeding and bumping the count made trylock
+                 * recursive, so one unlock left the mutex held and every
+                 * later lock queued behind a thread that believed it had
+                 * already let go.  RECURSIVE is the only type that re-enters.
+                 * ERRORCHECK answers EBUSY to the owner as well. */
+                if (w >= 0x100u &&
+                    (mtype != GUEST_MUTEX_RECURSIVE || (w & 0xffu) != owner))
+                    break;
                 if (guest_word_cas(ctx.mem, mva, raw,
                                    (raw & MUTEX_FLAG_BITS) |
                                    ((w & ~0xffu) + 0x100u) | owner)) { took = true; break; }
@@ -45497,10 +45471,20 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
 
     
     case SVC_DIV: {
-        /* div_t div(int, int): two ints, returned in r0/r1 (x0/x1). */
-        if ((int32_t)r1 == 0) { ret32(0); break; }
-        div_t d = div((int)(int32_t)r0, (int)(int32_t)r1);
-        ret_pair((uint32_t)d.quot, (uint32_t)d.rem);
+        /* AAPCS64 packs this eight-byte aggregate into x0.  AAPCS32
+         * supplies a hidden result pointer in r0, shifting the operands
+         * to r1/r2.  Returning the members separately lost the remainder
+         * on A64 (e.g. div(1,1000) turned a 1ms sleep into a busy loop). */
+        const int32_t num = ctx.is_arm64 ? (int32_t)r0 : (int32_t)r1;
+        const int32_t den = ctx.is_arm64 ? (int32_t)r1 : (int32_t)r2;
+        if (!den) { ret32(0); break; }
+        div_t d = div(num, den);
+        if (ctx.is_arm64) {
+            ret64((uint32_t)d.quot | ((uint64_t)(uint32_t)d.rem << 32));
+        } else {
+            ctx.mem.write32(r0, (uint32_t)d.quot);
+            ctx.mem.write32(r0 + 4u, (uint32_t)d.rem);
+        }
         break;
     }
     case SVC_LDIV: {
@@ -50023,92 +50007,74 @@ static void drive_aaudio_callbacks(ArmExecCtx &ctx) {
     }
 }
 
-// Retire played OpenSL ES buffers and call the guest back for more.
+/* Android's AudioTrack consumer copies queued PCM, then posts one callback
+ * per completely consumed buffer. Mix sources onto one output timeline: two
+ * players must overlap, rather than competing to fill or overwrite a ring. */
 static void drive_opensles_callbacks(ArmExecCtx &ctx) {
     if (g_in_cb() || g_sl_queues.empty()) return;
-    static const bool enabled = [] {
-        const char *e = lunaria_env("LUNARIA_SL_PUMP");
-        return !e || strcmp(e, "0") != 0;
-    }();
-    if (!enabled) return;
-
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    const uint64_t now = (uint64_t)ts.tv_sec * 1'000'000'000ull + (uint64_t)ts.tv_nsec;
-
-    /* How much audio to keep standing in the sink.  A buffer is retired when
-     * the device has played it, and the ring's fill level is the only honest
-     * account of that.  Retiring one buffer per pump pass on a wall clock made
-     * playback a function of the pump's frame rate instead: this title pumps
-     * 20-35 times a second and enqueues 10 ms buffers, so the guest was asked
-     * for a third of the audio it had to produce, the card ran dry between
-     * passes, and every dry spell is an audible break.  Ask for more while the
-     * sink is below the mark, which is what a device's mixer does. */
-    for (auto &kv : g_sl_queues) {
-        SlBufferQueue &q = kv.second;
-        if (!q.queued || !q.itf) continue;
-        const bool sink = audio_sink_ready(q.rate, q.channels);
-        uint64_t cb  = sl_load(ctx, sl_field(ctx, kv.first, 2));
-        uint64_t arg = sl_load(ctx, sl_field(ctx, kv.first, 3));
-        if (!cb) continue;
-        if (!q.next_due) q.next_due = now;      /* first buffer: retire at once */
-        /* Without a card there is nothing to measure, so the metronome stays:
-         * the guest's mixer still has to run at the right speed. */
-        if (!sink && now < q.next_due) continue;
-        /* A real OpenSL mixer refills while a fraction of a period is still
-         * standing in the sink, not only once the sink has gone completely
-         * silent -- the callback and the enqueue it does take real time, and
-         * asking only after the buffer already finished playing leaves zero
-         * margin for that.  One period of headroom is the same margin the
-         * ALSA buffer size above gives the host side; ask for the next
-         * buffer once the device is within that much of catching up to the
-         * oldest one still queued, instead of requiring it to have already
-         * caught up. */
-        if (sink && q.end_count) {
-            const uint64_t played = luna_os_audio_played_frames();
-            const uint64_t end = q.end_frame[q.end_head];
-            const uint64_t low_water_frames =
-                (uint64_t)q.rate * q.period_ns / 1'000'000'000ull;
-            if (played + low_water_frames < end) continue;
-        } else if (sink) {
-            continue;   /* nothing tracked to measure the sink's headroom against */
-        }
-        /* Bound the work one pump pass may hand the guest.  Each retirement
-         * runs guest code that enqueues the next buffer, and a sink that
-         * cannot be filled (writes failing, rate mismatch) would otherwise
-         * spin here for the whole frame. */
-        unsigned retired_now = 0;
-        do {
-            --q.queued;
-            ++q.retired;
-            if (sink && q.end_count) {
-                q.end_head = (q.end_head + 1u) % 64u;
-                --q.end_count;
+    const uint32_t rate = g_sl_sample_rate;
+    const unsigned channels = 2u;
+    const bool sink = audio_sink_ready(rate, channels);
+    const uint64_t now = host_mono_ns();
+    const uint64_t silent_played = now / 1'000'000'000ull * rate +
+        now % 1'000'000'000ull * rate / 1'000'000'000ull;
+    static uint64_t silent_end = 0;
+    if (silent_end < silent_played) silent_end = silent_played;
+    const unsigned target = rate / 10u; // bound output latency to 100 ms
+    unsigned callbacks = 0;
+    for (unsigned pass = 0; pass < 64u; ++pass) {
+        /* Restart the scan after guest code: a callback can destroy a player,
+         * clear its queue, or create another player. No iterator survives it. */
+        while (callbacks < 64u) {
+            uint32_t slot = 0;
+            uint64_t cb = 0, arg = 0, itf = 0;
+            for (auto &kv : g_sl_queues) {
+                SlBufferQueue &q = kv.second;
+                if (q.play_state != 3u || q.notified == q.pcm.retired) continue;
+                ++q.notified;
+                slot = kv.first;
+                cb = sl_load(ctx, sl_field(ctx, slot, 2));
+                arg = sl_load(ctx, sl_field(ctx, slot, 3));
+                itf = sl_guest_ptr(ctx, q.itf);
+                break;
             }
-            /* Anchor on the due time, not on `now`: a late pump must not push
-             * the whole stream out. */
-            q.next_due += q.period_ns;
-            if (q.next_due < now) q.next_due = now;
-            uint64_t itf_ptr = sl_guest_ptr(ctx, q.itf);
-            {
+            if (!slot) break;
+            ++callbacks;
+            if (cb) {
                 AudioCbIdentity as_audio_thread(ctx);
-                if (ctx.is_arm64) call_guest_cb64(ctx, cb, itf_ptr, arg, 0, 0, nullptr, 0);
-                else              call_guest_cb(ctx, (uint32_t)cb, (uint32_t)itf_ptr,
-                                                (uint32_t)arg);
+                if (ctx.is_arm64) call_guest_cb64(ctx, cb, itf, arg, 0, 0, nullptr, 0);
+                else call_guest_cb(ctx, (uint32_t)cb, (uint32_t)itf, (uint32_t)arg);
             }
-            static uint64_t pump_n = 0;
-            if (pump_n < 8 || (pump_n % 2000) == 0)
-                fprintf(stderr, "[opensles] pump #%llu itf=0x%08x cb=0x%llx "
-                        "queued=%u period=%lluus sink=%u frames\n",
-                        (unsigned long long)pump_n,
-                        q.itf, (unsigned long long)cb, q.queued,
-                        (unsigned long long)(q.period_ns / 1000ull),
-                        luna_os_audio_queued_frames());
-            ++pump_n;
-        } while (sink && q.queued && ++retired_now < 64u && q.end_count &&
-                 luna_os_audio_played_frames() +
-                         (uint64_t)q.rate * q.period_ns / 1'000'000'000ull >=
-                     q.end_frame[q.end_head]);
+        }
+        const uint64_t queued = sink ? luna_os_audio_queued_frames() :
+                                       silent_end - silent_played;
+        if (queued >= target || callbacks >= 64u) break;
+        unsigned wanted = (unsigned)(target - queued);
+        if (wanted > 256u) wanted = 256u;
+        int32_t mix[256 * 2]{};
+        int16_t pcm[256 * 2];
+        unsigned produced = 0;
+        for (auto &kv : g_sl_queues) {
+            SlBufferQueue &q = kv.second;
+            if (q.play_state != 3u) continue;
+            luna_pcm_mix(&q.pcm, nullptr, 0, rate, channels);
+            luna_pcm_queue preview = q.pcm;
+            unsigned n = luna_pcm_mix(&preview, mix, wanted, rate, channels);
+            if (n > produced) produced = n;
+        }
+        if (!produced) break;
+        for (unsigned i = 0; i < produced * channels; ++i) {
+            int32_t v = mix[i];
+            pcm[i] = (int16_t)(v < -32768 ? -32768 : v > 32767 ? 32767 : v);
+        }
+        int accepted = sink ? luna_os_audio_write(pcm, produced) : (int)produced;
+        if (accepted <= 0) break;
+        if (!sink) silent_end += (unsigned)accepted;
+        for (auto &kv : g_sl_queues) {
+            SlBufferQueue &q = kv.second;
+            if (q.play_state == 3u)
+                luna_pcm_mix(&q.pcm, nullptr, (unsigned)accepted, rate, channels);
+        }
     }
 }
 
@@ -50187,19 +50153,27 @@ static void build_fast_mutex_stubs(ArmExecCtx &ctx) {
      * blocking — it is defined never to block.  A mutex carrying the slow bit
      * still goes to the handler: it may be free, and only the handler knows
      * what its type allows.  The free test is the masked state, so an unlocked
-     * recursive mutex (word == MUTEX_RECURSIVE_BIT) is free. */
+     * recursive mutex (word == MUTEX_RECURSIVE_BIT) is free.
+     *
+     * A matching owner re-enters only when the recursive bit is set.  NORMAL
+     * has no owner on the fast path, so a second trylock is EBUSY; counting it
+     * as a new hold left the mutex locked after one unlock.  An owner byte of
+     * 0 with a count is a bionic static initializer, not a live lock, and goes
+     * to the handler so it can be adopted. */
     p = (p + 15) & ~15u;
     g_fastmutex_trylock_va = p;
     const uint32_t trylock_code[] = {
         movw(2, CUR_TID_VA & 0xffffu), movt(2, CUR_TID_VA >> 16),
-        0xE5922000u, 0xE20220FFu, 0xE3500000u, 0x0A00000Eu, /* beq ret0(21) */
-        0xE1903F9Fu, 0xE3130101u, 0x1A000010u,             /* bne slow(26) */
-        0xE3C31420u, 0xE3510C01u, 0x3A000002u,             /* bic rec; blo take */
-        0xE20310FFu, 0xE1510002u, 0x1A000007u,             /* bne busy(23) */
+        0xE5922000u, 0xE20220FFu, 0xE3500000u, 0x0A000012u,
+        0xE1903F9Fu, 0xE3130101u, 0x1A000014u,
+        0xE3C31202u, 0xE3510C01u, 0x3A000006u,
+        0xE20310FFu, 0xE3510000u, 0x0A00000Eu,
+        0xE1510002u, 0x1A000009u,
+        0xE3130202u, 0x0A000007u,
         0xE3C3C0FFu, 0xE28CCC01u, 0xE18CC002u, 0xE1801F9Cu,
-        0xE3510000u, 0x1AFFFFF0u,                          /* bne retry(6) */
-        0xE3A00000u, 0xE12FFF1Eu,                         /* ret0, bx lr */
-        0xF57FF01Fu, 0xE3A00010u, 0xE12FFF1Eu,            /* busy: EBUSY */
+        0xE3510000u, 0x1AFFFFECu,
+        0xE3A00000u, 0xE12FFF1Eu,
+        0xF57FF01Fu, 0xE3A00010u, 0xE12FFF1Eu,
         0xF57FF01Fu, 0xEF000000u | SVC_PTHREAD_MUTEX_TRYLOCK, 0xE12FFF1Eu,
     };
     for (uint32_t w : trylock_code) { ctx.mem.write32(p, w); p += 4; }
@@ -50279,9 +50253,15 @@ static void build_opensles_tables(ArmExecCtx &ctx) {
     set(SL_VT_OBJECT, 0, SVC_SL_OBJ_REALIZE);
     set(SL_VT_OBJECT, 2, SVC_SL_OBJ_GETSTATE);
     set(SL_VT_OBJECT, 3, SVC_SL_OBJ_GETINTERFACE);
+    set(SL_VT_OBJECT, 6, SVC_SL_OBJ_DESTROY);
     set(SL_VT_ENGINE, 2, SVC_SL_ENG_CREATE_PLAYER);
     set(SL_VT_ENGINE, 7, SVC_SL_ENG_CREATE_OUTMIX);
+    set(SL_VT_PLAY,   0, SVC_SL_PLAY_SETSTATE);
+    set(SL_VT_PLAY,   1, SVC_SL_PLAY_GETSTATE);
+    set(SL_VT_PLAY,   2, SVC_SL_PLAY_GETDURATION);
+    set(SL_VT_PLAY,   3, SVC_SL_PLAY_GETPOSITION);
     set(SL_VT_BUFQ,   0, SVC_SL_BQ_ENQUEUE);
+    set(SL_VT_BUFQ,   1, SVC_SL_BQ_CLEAR);
     set(SL_VT_BUFQ,   2, SVC_SL_BQ_GETSTATE);
     set(SL_VT_BUFQ,   3, SVC_SL_BQ_REGISTER);
     g_sl_inst_next = sl_inst_base(ctx);
@@ -52594,7 +52574,6 @@ static bool guest_window_present_frame(void)
 
     if (!eglMakeCurrent(dpy, surf, surf, ctx)) { (void)eglGetError(); return false; }
     arm_exec_egl_invalidate_current();
-    gl_present_fallback_blit();          /* the guest's last frame, underneath */
     luna_overlay_present(g_fb_w, g_fb_h);
     eglSwapBuffers(dpy, surf);
     ++g_host_egl_swap_count;
@@ -59231,6 +59210,41 @@ static void build_fast_rwlock_stubs64(ArmExecCtx &ctx) {
             ctx.mem.write32(FAST_SYNC64_PAGE + 0x210u + (uint32_t)(i * 4), mu[i]);
         g_fast64_mutex_lock_va   = FAST_SYNC64_PAGE + 0x190u;
         g_fast64_mutex_unlock_va = FAST_SYNC64_PAGE + 0x210u;
+        /* trylock.  Unlock ends at 0x25C and iswalnum starts at 0x264, so this
+         * lives after pthread_self.  Same word as lock, but a held mutex that
+         * this thread does not re-enter answers EBUSY and never blocks.
+         *   cbz x0,ret0; mrs x9,tpidr_el0; ldr w10,[x9,#0xbf8];
+         *   retry: ldaxr w11,[x0]; tbnz w11,#30,slow;
+         *   ubfx w12,w11,#0,#29; cmp w12,#0x100; b.lo take;
+         *   and w13,w12,#0xff; cbz w13,slow; cmp w13,w10; b.ne busy;
+         *   tbz w11,#29,busy;
+         *   take: and w12,w11,#~0xff; add w12,w12,#0x100; orr w12,w12,w10;
+         *   stlxr w13,w12,[x0]; cbnz w13,retry;
+         *   ret0: mov w0,#0; ret; busy: clrex; mov w0,#EBUSY; ret;
+         *   slow: clrex; svc; ret
+         * Owner byte 0 with a count is a static initializer, so it takes the
+         * SVC that adopts it.  Only the recursive bit re-enters. */
+        {
+            static_assert(TLS64_OWNER_OFF == 0xBF8u,
+                          "the ldr offset below encodes TLS64_OWNER_OFF");
+            static_assert(MUTEX_RECURSIVE_BIT == 0x20000000u &&
+                          MUTEX_SLOW_BIT == 0x40000000u,
+                          "the bit tests below encode the mutex flag bits");
+            const uint32_t mt[] = {                  /* +0x1840 */
+                0xB4000240u, 0xD53BD049u, 0xB94BF92Au, 0x885FFC0Bu,
+                0x37F0026Bu, 0x5300716Cu, 0x7104019Fu, 0x540000C3u,
+                0x12001D8Du, 0x340001CDu, 0x6B0A01BFu, 0x54000121u,
+                0x36E8010Bu, 0x12185D6Cu, 0x1104018Cu, 0x2A0A018Cu,
+                0x880DFC0Cu, 0x35FFFE4Du, 0x52800000u, 0xD65F03C0u,
+                0xD5033F5Fu, 0x52800200u, 0xD65F03C0u,
+                0xD5033F5Fu, 0xD4000001u | (SVC_PTHREAD_MUTEX_TRYLOCK << 5),
+                0xD65F03C0u,
+            };
+            for (size_t i = 0; i < sizeof mt / sizeof mt[0]; ++i)
+                ctx.mem.write32(FAST_SYNC64_PAGE + 0x1840u + (uint32_t)(i * 4),
+                                mt[i]);
+            g_fast64_mutex_trylock_va = FAST_SYNC64_PAGE + 0x1840u;
+        }
         /* The main thread runs before its first set_cur_tid(). */
         ctx.mem.write32((GuestVA)(arm64_tls_for_tid(ctx, 0) + TLS64_OWNER_OFF), 1u);
     }

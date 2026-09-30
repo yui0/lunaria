@@ -127,6 +127,8 @@ void dvm_media_pump_active(struct dvm *vm);
 /* Audio decoders answer these instead of a picture size. */
 void lm_codec_audio_format(const struct lm_codec *c, int *rate, int *channels);
 bool lm_codec_is_video(const struct lm_codec *c);
+/* "video/avc", "video/x-vnd.on2.vp9", … or NULL when this is not a video codec. */
+const char *lm_codec_mime(const struct lm_codec *c);
 
 /* True once the decoder has refused enough of this stream, with nothing ever
  * decoded, that it will not read it at all — a Main/High profile movie handed

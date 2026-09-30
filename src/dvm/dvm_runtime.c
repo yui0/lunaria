@@ -29674,11 +29674,13 @@ static const struct rt_method rt_surface[] = {
  */
 
 #define LM_AVC_CODEC_NAME "c2.lunaria.avc.decoder"
+#define LM_VP9_CODEC_NAME "c2.lunaria.vp9.decoder"
 #define LM_AAC_CODEC_NAME "c2.lunaria.aac.decoder"
 
 /* Every decoder this build can actually produce, in MediaCodecList order. */
 static const struct { const char *name, *mime; } lm_codecs[] = {
    { LM_AVC_CODEC_NAME, "video/avc" },
+   { LM_VP9_CODEC_NAME, "video/x-vnd.on2.vp9" },
    { LM_AAC_CODEC_NAME, "audio/mp4a-latm" },
 };
 
@@ -29735,6 +29737,8 @@ static bool codec_create(struct dvm *vm, const char *mime, union dvm_value *out)
 {
    struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/media/MediaCodec;");
    struct lm_codec *k = lm_codec_new(mime);
+   fprintf(stderr, "[media] createDecoderByType %s -> %s\n",
+           mime ? mime : "null", k ? "ok" : "unsupported");
    if (!c || !k) {
       if (k) lm_codec_free(k);
       dvm__throw(vm, "java/io/IOException", "no decoder for %s",
@@ -29968,8 +29972,9 @@ static bool mc_getOutputFormat(struct dvm *vm, dvm_ref self,
    if (lm_media_trace())
       fprintf(stderr, "[media] java getOutputFormat video=%d %dx%d\n",
               (int)video, w, h);
+   const char *vmime = lm_codec_mime(k);
    union dvm_value mime = {
-      .l = dvm_new_string(vm, video ? "video/avc" : "audio/raw") };
+      .l = dvm_new_string(vm, video ? (vmime ? vmime : "video/avc") : "audio/raw") };
    mf_set(vm, f, "mime", mime);
 #define MF_PUT_INT(key, val)                                                  \
    do {                                                                       \
@@ -30001,6 +30006,124 @@ static bool mc_getOutputFormat(struct dvm *vm, dvm_ref self,
    RETL(f);
 }
 
+/* One plane of an Image: a direct ByteBuffer plus the strides CRI's copy
+ * loop reads.  allocateDirect is what GetDirectBufferAddress can see. */
+static dvm_ref image_plane_buf(struct dvm *vm, const uint8_t *src, size_t n)
+{
+   union dvm_value arg = { .i = (int32_t)n }, outv = { 0 };
+   if (n > 0x7fffffff || !bb_allocateDirect(vm, 0, &arg, 1, &outv) || !outv.l)
+      return 0;
+   struct dvm_object *b = stream_buf(vm, outv.l);
+   if (!b || !b->data || b->length < n) return 0;
+   if (n) memcpy(b->data, src, n);
+   stream_set_field(vm, outv.l, "pos", 0);
+   stream_set_field(vm, outv.l, "count", (int32_t)n);
+   return outv.l;
+}
+
+static dvm_ref image_new_plane(struct dvm *vm, dvm_ref buf,
+                               int32_t row, int32_t pix)
+{
+   struct dvm_class *c =
+      dvm__class_by_desc(vm, "Landroid/media/Image$Plane;");
+   dvm_ref o = c ? dvm_new_object(vm, c) : 0;
+   if (!o) return 0;
+   union dvm_value v;
+   v.l = buf; (void)dvm_set_field(vm, o, "buf", "Ljava/nio/ByteBuffer;", v);
+   v.i = row; (void)dvm_set_field(vm, o, "row", "I", v);
+   v.i = pix; (void)dvm_set_field(vm, o, "pix", "I", v);
+   return o;
+}
+
+static bool plane_getBuffer(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "buf", "Ljava/nio/ByteBuffer;", &v);
+   RETL(v.l);
+}
+
+static bool plane_getRowStride(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "row", "I", &v);
+   RETI(v.i);
+}
+
+static bool plane_getPixelStride(struct dvm *vm, dvm_ref self,
+                                 const union dvm_value *args, int nargs,
+                                 union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "pix", "I", &v);
+   RETI(v.i);
+}
+
+static const struct rt_field rt_image_plane_fields[] = {
+   { "buf", "Ljava/nio/ByteBuffer;" }, { "row", "I" }, { "pix", "I" }, F_END,
+};
+
+static const struct rt_method rt_image_plane[] = {
+   M("getBuffer", "()Ljava/nio/ByteBuffer;", plane_getBuffer),
+   M("getRowStride", "()I", plane_getRowStride),
+   M("getPixelStride", "()I", plane_getPixelStride),
+   M_END,
+};
+
+/* Image.getPlanes().  The decoder writes packed I420, three planes with
+ * pixel stride 1, so this is that layout and nothing else. */
+static bool image_getPlanes(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value yb = { 0 }, ub = { 0 }, vb = { 0 };
+   union dvm_value yw = { 0 }, yh = { 0 }, cw = { 0 }, ch = { 0 };
+   (void)dvm_get_field(vm, self, "y", "Ljava/nio/ByteBuffer;", &yb);
+   (void)dvm_get_field(vm, self, "u", "Ljava/nio/ByteBuffer;", &ub);
+   (void)dvm_get_field(vm, self, "v", "Ljava/nio/ByteBuffer;", &vb);
+   (void)dvm_get_field(vm, self, "yw", "I", &yw);
+   (void)dvm_get_field(vm, self, "yh", "I", &yh);
+   (void)dvm_get_field(vm, self, "cw", "I", &cw);
+   (void)dvm_get_field(vm, self, "ch", "I", &ch);
+   dvm_ref arr = dvm_new_array(vm, 'L', "Landroid/media/Image$Plane;", 3);
+   dvm_ref *slots = arr ? dvm_array_data(vm, arr) : NULL;
+   if (!slots) RETL(0);
+   slots[0] = image_new_plane(vm, yb.l, yw.i, 1);
+   slots[1] = image_new_plane(vm, ub.l, cw.i, 1);
+   slots[2] = image_new_plane(vm, vb.l, cw.i, 1);
+   (void)yh; (void)ch;
+   RETL(arr);
+}
+
+static bool image_getFormat(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)vm; (void)self; (void)args; (void)nargs;
+   RETI(35); /* ImageFormat.YUV_420_888 */
+}
+
+static const struct rt_field rt_image_fields[] = {
+   { "y", "Ljava/nio/ByteBuffer;" }, { "u", "Ljava/nio/ByteBuffer;" },
+   { "v", "Ljava/nio/ByteBuffer;" },
+   { "yw", "I" }, { "yh", "I" }, { "cw", "I" }, { "ch", "I" },
+   F_END,
+};
+
+static const struct rt_method rt_image[] = {
+   M("getPlanes", "()[Landroid/media/Image$Plane;", image_getPlanes),
+   M("getFormat", "()I", image_getFormat),
+   M("close", "()V", nop_void),
+   M_END,
+};
+
 static bool mc_getOutputBuffer(struct dvm *vm, dvm_ref self,
                                const union dvm_value *args, int nargs,
                                union dvm_value *out)
@@ -30018,6 +30141,44 @@ static bool mc_getOutputBuffer(struct dvm *vm, dvm_ref self,
    stream_set_field(vm, bb, "pos", 0);
    stream_set_field(vm, bb, "count", (int32_t)len);
    RETL(bb);
+}
+
+/* getOutputImage(index).  CRI's Android H.264 path copies from Image.Plane
+ * and treats a null Image as "no picture".  The bytes are the packed I420
+ * lm_codec already keeps for the output slot. */
+static bool mc_getOutputImage(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)nargs;
+   struct lm_codec *k = codec_of(vm, self);
+   size_t len = 0;
+   const uint8_t *src = k ? lm_codec_output_buffer(k, ARG(0).i, &len) : NULL;
+   int w = 0, h = 0;
+   lm_codec_output_size(k, &w, &h);
+   int cw = (w + 1) / 2, ch = (h + 1) / 2;
+   size_t ysz = (size_t)w * (size_t)h;
+   size_t csz = (size_t)cw * (size_t)ch;
+   if (!src || w < 1 || h < 1 || len < ysz + csz * 2) RETL(0);
+
+   struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/media/Image;");
+   dvm_ref img = c ? dvm_new_object(vm, c) : 0;
+   if (!img) RETL(0);
+   union dvm_value v;
+   v.l = image_plane_buf(vm, src, ysz);
+   (void)dvm_set_field(vm, img, "y", "Ljava/nio/ByteBuffer;", v);
+   v.l = image_plane_buf(vm, src + ysz, csz);
+   (void)dvm_set_field(vm, img, "u", "Ljava/nio/ByteBuffer;", v);
+   v.l = image_plane_buf(vm, src + ysz + csz, csz);
+   (void)dvm_set_field(vm, img, "v", "Ljava/nio/ByteBuffer;", v);
+   v.i = w;  (void)dvm_set_field(vm, img, "yw", "I", v);
+   v.i = h;  (void)dvm_set_field(vm, img, "yh", "I", v);
+   v.i = cw; (void)dvm_set_field(vm, img, "cw", "I", v);
+   v.i = ch; (void)dvm_set_field(vm, img, "ch", "I", v);
+   static int logged;
+   if (logged++ < 4)
+      fprintf(stderr, "[media] getOutputImage %dx%d\n", w, h);
+   RETL(img);
 }
 
 static bool mc_getOutputBuffers(struct dvm *vm, dvm_ref self,
@@ -30095,6 +30256,7 @@ static const struct rt_method rt_mediacodec[] = {
    M("dequeueOutputBuffer", "(Landroid/media/MediaCodec$BufferInfo;J)I",
      mc_dequeueOutput),
    M("getOutputBuffer", "(I)Ljava/nio/ByteBuffer;", mc_getOutputBuffer),
+   M("getOutputImage", "(I)Landroid/media/Image;", mc_getOutputImage),
    M("getOutputBuffers", "()[Ljava/nio/ByteBuffer;", mc_getOutputBuffers),
    M("getOutputFormat", "()Landroid/media/MediaFormat;", mc_getOutputFormat),
    M("getOutputFormat", "(I)Landroid/media/MediaFormat;", mc_getOutputFormat),
@@ -30238,7 +30400,12 @@ static bool mci_getCaps(struct dvm *vm, dvm_ref self,
    }
    struct dvm_class *c =
       dvm__class_by_desc(vm, "Landroid/media/MediaCodecInfo$CodecCapabilities;");
-   RETL(c ? dvm_new_object(vm, c) : 0);
+   dvm_ref o = c ? dvm_new_object(vm, c) : 0;
+   if (o) {
+      union dvm_value mv = { .l = dvm_new_string(vm, mime) };
+      (void)dvm_set_field(vm, o, "mime", "Ljava/lang/String;", mv);
+   }
+   RETL(o);
 }
 
 static bool rt_false(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -30296,10 +30463,157 @@ static bool cc_maxInstances(struct dvm *vm, dvm_ref self,
    RETI(16);
 }
 
+/* android.util.Range.  CRI reads the ends with getLower()/getUpper() and then
+ * intValue() or doubleValue(), and rejects the movie when the width falls
+ * outside.  A missing Range made that check see 0..0 and drop the picture. */
+static bool range_end(struct dvm *vm, dvm_ref self, const char *which,
+                      union dvm_value *out)
+{
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, which, "Ljava/lang/Object;", &v);
+   RETL(v.l);
+}
+
+static bool range_getLower(struct dvm *vm, dvm_ref self,
+                           const union dvm_value *args, int nargs,
+                           union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   return range_end(vm, self, "lower", out);
+}
+
+static bool range_getUpper(struct dvm *vm, dvm_ref self,
+                           const union dvm_value *args, int nargs,
+                           union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   return range_end(vm, self, "upper", out);
+}
+
+static const struct rt_field rt_range_fields[] = {
+   { "lower", "Ljava/lang/Object;" }, { "upper", "Ljava/lang/Object;" }, F_END,
+};
+
+static const struct rt_method rt_range[] = {
+   M("getLower", "()Ljava/lang/Comparable;", range_getLower),
+   M("getUpper", "()Ljava/lang/Comparable;", range_getUpper),
+   M_END,
+};
+
+static dvm_ref range_new(struct dvm *vm, dvm_ref lower, dvm_ref upper)
+{
+   struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/util/Range;");
+   dvm_ref o = c ? dvm_new_object(vm, c) : 0;
+   if (!o) return 0;
+   union dvm_value v;
+   v.l = lower; (void)dvm_set_field(vm, o, "lower", "Ljava/lang/Object;", v);
+   v.l = upper; (void)dvm_set_field(vm, o, "upper", "Ljava/lang/Object;", v);
+   return o;
+}
+
+static dvm_ref range_ints(struct dvm *vm, int32_t lo, int32_t hi)
+{
+   union dvm_value a = { .i = lo }, b = { .i = hi };
+   return range_new(vm, box_make(vm, "Ljava/lang/Integer;", a),
+                    box_make(vm, "Ljava/lang/Integer;", b));
+}
+
+static dvm_ref range_doubles(struct dvm *vm, double lo, double hi)
+{
+   union dvm_value a = { .d = lo }, b = { .d = hi };
+   return range_new(vm, box_make(vm, "Ljava/lang/Double;", a),
+                    box_make(vm, "Ljava/lang/Double;", b));
+}
+
+/* What libavcodec's H.264 will actually take.  A cutscene above 8K is not a
+ * picture this player is going to show, and 1 lets an odd dimension through
+ * the range check instead of being reported as unsupported. */
+enum { VC_MIN_SIZE = 1, VC_MAX_SIZE = 8192 };
+
+static bool vc_size_ok(int32_t w, int32_t h)
+{
+   return w >= VC_MIN_SIZE && w <= VC_MAX_SIZE &&
+          h >= VC_MIN_SIZE && h <= VC_MAX_SIZE;
+}
+
+static bool vc_widths(struct dvm *vm, dvm_ref self,
+                      const union dvm_value *args, int nargs,
+                      union dvm_value *out)
+{
+   (void)self; (void)args; (void)nargs;
+   RETL(range_ints(vm, VC_MIN_SIZE, VC_MAX_SIZE));
+}
+
+static bool vc_heights(struct dvm *vm, dvm_ref self,
+                       const union dvm_value *args, int nargs,
+                       union dvm_value *out)
+{
+   (void)self; (void)args; (void)nargs;
+   RETL(range_ints(vm, VC_MIN_SIZE, VC_MAX_SIZE));
+}
+
+static bool vc_frame_rates(struct dvm *vm, dvm_ref self,
+                           const union dvm_value *args, int nargs,
+                           union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   if (!vc_size_ok(ARG(0).i, ARG(1).i)) RETL(0);
+   RETL(range_doubles(vm, 1.0, 240.0));
+}
+
+static bool vc_is_size(struct dvm *vm, dvm_ref self,
+                       const union dvm_value *args, int nargs,
+                       union dvm_value *out)
+{
+   (void)vm; (void)self; (void)nargs;
+   RETI(vc_size_ok(ARG(0).i, ARG(1).i) ? 1 : 0);
+}
+
+static bool vc_is_size_rate(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)vm; (void)self; (void)nargs;
+   RETI(vc_size_ok(ARG(0).i, ARG(1).i) && ARG(2).d >= 0.0 && ARG(2).d <= 240.0);
+}
+
+static const struct rt_method rt_videocaps[] = {
+   M("getSupportedWidths", "()Landroid/util/Range;", vc_widths),
+   M("getSupportedHeights", "()Landroid/util/Range;", vc_heights),
+   M("getSupportedFrameRatesFor", "(II)Landroid/util/Range;", vc_frame_rates),
+   M("isSizeSupported", "(II)Z", vc_is_size),
+   M("areSizeAndRateSupported", "(IID)Z", vc_is_size_rate),
+   M_END,
+};
+
+static bool cc_getVideoCapabilities(struct dvm *vm, dvm_ref self,
+                                    const union dvm_value *args, int nargs,
+                                    union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value mime = { 0 };
+   (void)dvm_get_field(vm, self, "mime", "Ljava/lang/String;", &mime);
+   const char *m = mime.l ? dvm_string_utf8(vm, mime.l) : NULL;
+   if (!m || !lm_codec_supported(m) ||
+       (strcmp(m, "video/avc") && strcmp(m, "video/x-vnd.on2.vp9") &&
+        strcmp(m, "video/vp9")))
+      RETL(0);
+   struct dvm_class *c = dvm__class_by_desc(
+      vm, "Landroid/media/MediaCodecInfo$VideoCapabilities;");
+   RETL(c ? dvm_new_object(vm, c) : 0);
+}
+
+static const struct rt_field rt_codeccaps_fields[] = {
+   { "mime", "Ljava/lang/String;" }, F_END,
+};
+
 static const struct rt_method rt_codeccaps[] = {
    M("isFeatureSupported", "(Ljava/lang/String;)Z", cc_isFeatureSupported),
    M("isFeatureRequired", "(Ljava/lang/String;)Z", rt_false),
    M("getMaxSupportedInstances", "()I", cc_maxInstances),
+   M("getVideoCapabilities",
+     "()Landroid/media/MediaCodecInfo$VideoCapabilities;",
+     cc_getVideoCapabilities),
    M_END,
 };
 
@@ -34648,6 +34962,15 @@ static const struct rt_method rt_debug_memory_info[] = {
  * they have to be the parameters the emulator's OpenSL ES pump really runs at.
  * Null is a documented answer for an unknown key — Android returns it on
  * devices without low-latency audio — and callers already handle it. */
+static const struct rt_field rt_audio_manager_sfields[] = {
+   { "PROPERTY_OUTPUT_SAMPLE_RATE", "Ljava/lang/String;" },
+   { "PROPERTY_OUTPUT_FRAMES_PER_BUFFER", "Ljava/lang/String;" },
+   { "PROPERTY_SUPPORT_MIC_NEAR_ULTRASOUND", "Ljava/lang/String;" },
+   { "PROPERTY_SUPPORT_SPEAKER_NEAR_ULTRASOUND", "Ljava/lang/String;" },
+   { "PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED", "Ljava/lang/String;" },
+   F_END,
+};
+
 static bool audio_getProperty(struct dvm *vm, dvm_ref self,
                               const union dvm_value *args, int nargs,
                               union dvm_value *out)
@@ -62907,7 +63230,15 @@ static const struct rt_class rt_classes[] = {
    { "Landroid/media/MediaCodecInfo;", "Ljava/lang/Object;",
      rt_mediacodecinfo, rt_mediacodecinfo_fields, NULL },
    { "Landroid/media/MediaCodecInfo$CodecCapabilities;", "Ljava/lang/Object;",
-     rt_codeccaps, NULL, NULL },
+     rt_codeccaps, rt_codeccaps_fields, NULL },
+   { "Landroid/media/MediaCodecInfo$VideoCapabilities;", "Ljava/lang/Object;",
+     rt_videocaps, NULL, NULL },
+   { "Landroid/util/Range;", "Ljava/lang/Object;",
+     rt_range, rt_range_fields, NULL },
+   { "Landroid/media/Image;", "Ljava/lang/Object;",
+     rt_image, rt_image_fields, NULL },
+   { "Landroid/media/Image$Plane;", "Ljava/lang/Object;",
+     rt_image_plane, rt_image_plane_fields, NULL },
    { "Landroid/graphics/SurfaceTexture;", "Ljava/lang/Object;",
      rt_surfacetexture, rt_surfacetexture_fields, NULL },
    { "Landroid/view/Surface;", "Ljava/lang/Object;",
@@ -63010,7 +63341,7 @@ static const struct rt_class rt_classes[] = {
    { "Landroid/app/ActivityManager;", "Ljava/lang/Object;",
      rt_activity_manager, NULL, NULL },
    { "Landroid/media/AudioManager;", "Ljava/lang/Object;",
-     rt_audio_manager, rt_audio_manager_fields, NULL },
+     rt_audio_manager, rt_audio_manager_fields, NULL, rt_audio_manager_sfields },
    { "Landroid/media/AudioDeviceInfo;", "Ljava/lang/Object;",
      rt_audio_device, rt_audio_device_fields, NULL },
    /* getDefaultAdapter() is null on a device without Bluetooth, and this one
@@ -64188,6 +64519,19 @@ struct dvm_class *dvm_runtime_define(struct dvm *vm, const char *desc)
       c->sslots[3].i = (int32_t)':';
       if (c->sslots[0].l) dvm_pin(vm, c->sslots[0].l);
       if (c->sslots[1].l) dvm_pin(vm, c->sslots[1].l);
+   }
+
+   /* JNI callers obtain these keys with GetStaticObjectField rather than
+    * Java's inlined constants. Keep the fields discoverable and populated. */
+   if (!strcmp(desc, "Landroid/media/AudioManager;") && c->sslots) {
+      for (int i = 0; i < c->nsfields; ++i) {
+         char key[128];
+         snprintf(key, sizeof key, "android.media.property.%s",
+                  c->sfields[i].name + strlen("PROPERTY_"));
+         c->sslots[i].l = dvm_new_string(vm, key);
+         if (c->sslots[i].l) dvm_pin(vm, c->sslots[i].l);
+         c->sfields[i].access |= DEX_ACC_PUBLIC | DEX_ACC_FINAL;
+      }
    }
 
    /* android.os.Build — same property table SystemProperties.get() reads. */

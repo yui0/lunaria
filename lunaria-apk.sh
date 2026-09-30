@@ -22,48 +22,92 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$argv0")" && pwd) \
 # LUNARIA_* names are honoured — it is read, not sourced, so a stray command in
 # it cannot run.  A variable already set in the environment always wins, so
 # `LUNARIA_DEVICE=pixel7 ./lunaria-apk.sh …` still overrides the file for one
-# run.
+# run.  After that, common lines win over the [package.name] block the menu
+# writes for one app.
 #
 # There is one place to look: `lunaria.conf` in the directory the launcher was
 # started from.  A search path (the launcher's own directory, ~/.config, an
 # environment override) means the settings actually in force are wherever the
 # first hit happened to be, which is the wrong thing to have to work out when a
 # run behaves differently than the file in front of you says it should.
+#
+# Two layers live in that one file.  Lines before the first [package] block
+# are the common settings and they win.  A [package.name] block is what the
+# right-click menu writes for that app; it fills in only a name the common
+# lines and the environment left unset.
+LUNARIA_CONF="$PWD/lunaria.conf"
+export LUNARIA_CONF
+
+lunaria_conf_apply() {
+    _name=${1%%=*}
+    _value=${1#*=}
+    _value=${_value%"${_value##*[! ]}"}
+    case "$_value" in
+        \"*\") _value=${_value#\"}; _value=${_value%\"} ;;
+        \'*\') _value=${_value#\'}; _value=${_value%\'} ;;
+    esac
+    eval "_cur=\${$_name-}"
+    [ -n "$_cur" ] && return 0
+    export "$_name=$_value"
+}
+
 lunaria_load_conf() {
-    _conf="$PWD/lunaria.conf"
+    _conf="$LUNARIA_CONF"
     [ -f "$_conf" ] || return 0
     msg "config: $_conf"
+    _section=0
     while IFS= read -r _line || [ -n "$_line" ]; do
         case "$_line" in
             ''|'#'*) continue ;;
-            LUNARIA_*=*) ;;
-            *) continue ;;
+            '['*']') _section=1; continue ;;
         esac
-        _name=${_line%%=*}
-        _value=${_line#*=}
-        # Strip one layer of surrounding quotes and trailing blanks.
-        _value=${_value%"${_value##*[! ]}"}
-        case "$_value" in
-            \"*\") _value=${_value#\"}; _value=${_value%\"} ;;
-            \'*\') _value=${_value#\'}; _value=${_value%\'} ;;
+        # A package block is loaded later, once the package name is known,
+        # and only for names the common lines did not set.
+        [ "$_section" = 1 ] && continue
+        case "$_line" in
+            LUNARIA_*=*) lunaria_conf_apply "$_line" ;;
         esac
-        # The environment wins: a setting made for this run is not overridden
-        # by the installation's default.
-        eval "_cur=\${$_name-}"
-        [ -n "$_cur" ] && continue
-        export "$_name=$_value"
+    done < "$_conf"
+}
+
+# The running package's own block.  Common lines and the environment already
+# applied stay as they are.
+lunaria_load_apk_conf() {
+    _pkg=$1
+    _conf="$LUNARIA_CONF"
+    [ -n "$_pkg" ] && [ -f "$_conf" ] || return 0
+    _want=0
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        case "$_line" in
+            '['*']')
+                _hdr=${_line#\[}
+                _hdr=${_hdr%%\]*}
+                _hdr=${_hdr#"${_hdr%%[! ]*}"}
+                _hdr=${_hdr%"${_hdr##*[! ]}"}
+                if [ "$_hdr" = "$_pkg" ]; then _want=1; else _want=0; fi
+                continue
+                ;;
+        esac
+        [ "$_want" = 1 ] || continue
+        case "$_line" in
+            ''|'#'*) continue ;;
+            LUNARIA_*=*) lunaria_conf_apply "$_line" ;;
+        esac
     done < "$_conf"
 }
 lunaria_load_conf
 # A keymap may be a bundled layout name or a user-created profile file.
-case "${LUNARIA_KEYMAP-}" in
-    genshin|crossworlds) export LUNARIA_KEYMAP="$script_dir/keymaps/$LUNARIA_KEYMAP.conf" ;;
-esac
-if [ -n "${LUNARIA_KEYMAP-}" ] && [ "$LUNARIA_KEYMAP" != off ]; then
-    [ -r "$LUNARIA_KEYMAP" ] || err "cannot read keymap: $LUNARIA_KEYMAP"
-    LUNARIA_KEYMAP=$(realpath "$LUNARIA_KEYMAP")
-    export LUNARIA_KEYMAP
-fi
+lunaria_keymap_resolve() {
+    case "${LUNARIA_KEYMAP-}" in
+        genshin|crossworlds) export LUNARIA_KEYMAP="$script_dir/keymaps/$LUNARIA_KEYMAP.conf" ;;
+    esac
+    if [ -n "${LUNARIA_KEYMAP-}" ] && [ "$LUNARIA_KEYMAP" != off ]; then
+        [ -r "$LUNARIA_KEYMAP" ] || err "cannot read keymap: $LUNARIA_KEYMAP"
+        LUNARIA_KEYMAP=$(realpath "$LUNARIA_KEYMAP")
+        export LUNARIA_KEYMAP
+    fi
+}
+lunaria_keymap_resolve
 
 [ -z "$1" ] && err 'usage: <apk-or-xapk>'
 inputfile="$(realpath "$1")"
@@ -432,6 +476,8 @@ fi
 
 export ANDROID_PACKAGE_CODE_PATH="$tmpdir"
 export ANDROID_PACKAGE_NAME="$pkgname"
+lunaria_load_apk_conf "$pkgname"
+lunaria_keymap_resolve
 
 # An install-time asset pack IS a split APK.  Play Core finds one through
 # ApplicationInfo.splitNames / splitSourceDirs, so the emulator has to report

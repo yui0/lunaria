@@ -229,7 +229,7 @@ static const char boot_css_base[] =
    ".flake:nth-child(24){width:13px;height:13px;top:-167px;left:37%;opacity:0.8;"
      "filter:blur(4px);animation:41s flakes linear infinite;}"
 
-   ".hero{position:fixed;left:50%;top:38%;width:140px;height:140px;"
+   ".hero{position:fixed;left:50%;top:41%;width:140px;height:140px;"
      "margin-left:-70px;margin-top:-70px;}"
    ".ring{position:absolute;left:0;top:0;width:140px;height:140px;"
      "border-radius:999px;"
@@ -245,19 +245,22 @@ static const char boot_css_base[] =
    ".ring-label{padding-top:4px;font-size:9px;font-weight:700;"
      "letter-spacing:2px;color:var(--quiet);}"
 
-   ".copy{position:fixed;left:50%;top:64%;width:420px;margin-left:-210px;"
-     "text-align:center;opacity:1;}"
-   ".wordmark{font-size:25px;font-weight:700;letter-spacing:10px;"
-     "color:var(--ink);padding-left:10px;"
+   ".copy{position:fixed;left:50%;top:54%;width:460px;margin-left:-230px;"
+     "text-align:center;opacity:1;display:flex;flex-direction:column;"
+     "align-items:center;}"
+   ".wordmark{width:100%;font-size:25px;font-weight:700;letter-spacing:10px;"
+     "color:var(--ink);text-align:center;"
      "text-shadow:0 2px 16px rgba(0,48,96,0.25);}"
-   ".line{padding-top:19px;font-size:13px;color:var(--muted);"
+   ".line{padding-top:14px;width:100%;font-size:13px;color:var(--muted);"
+     "text-align:center;line-height:1.45;"
      "text-shadow:0 1px 8px rgba(0,48,96,0.22);}"
-   ".sub{padding-top:7px;font-size:12px;color:var(--quiet);"
+   ".sub{padding-top:5px;width:100%;font-size:12px;color:var(--quiet);"
+     "text-align:center;line-height:1.45;"
      "text-shadow:0 1px 8px rgba(0,48,96,0.22);}"
 
-   "@media (max-width:560px){.hero{transform:scale(0.82);}"
-     ".copy{width:300px;margin-left:-150px;}.wordmark{font-size:21px;"
-     "letter-spacing:8px;padding-left:8px;}}"
+   "@media (max-width:560px){.hero{top:40%;transform:scale(0.82);}"
+     ".copy{top:53%;width:320px;margin-left:-160px;}.wordmark{font-size:21px;"
+     "letter-spacing:8px;}.line{font-size:12px;}.sub{font-size:11px;}}"
    "@media (prefers-reduced-motion:reduce){.flake{animation:none;}}";
 
 static char g_boot_css[32 * 1024];

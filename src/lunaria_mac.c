@@ -568,6 +568,8 @@ static void luna_aq_callback(void *user, AudioQueueRef q, AudioQueueBufferRef b)
    AudioQueueEnqueueBuffer(q, b, 0, NULL);
 }
 
+static void audio_saved_prefs(void);
+
 int luna_os_audio_open(unsigned rate, unsigned channels)
 {
    if (g_aq_open) return 0;
@@ -617,11 +619,30 @@ int luna_os_audio_open(unsigned rate, unsigned channels)
    }
    g_aq_open = 1;
    fprintf(stderr, "[audio] AudioQueue %u Hz %u ch\n", rate, channels);
+   audio_saved_prefs();
    return 0;
 }
 
 static _Atomic int g_aq_gain_q15 = 32768;
 static _Atomic int g_aq_muted;
+
+static void audio_saved_prefs(void)
+{
+   static int done;
+   const char *v, *m;
+   if (done) return;
+   done = 1;
+   v = getenv("LUNARIA_AUDIO_VOLUME");
+   if (v && *v) {
+      float g = (float)atof(v);
+      if (g < 0.0f) g = 0.0f;
+      if (g > 1.0f) g = 1.0f;
+      atomic_store_explicit(&g_aq_gain_q15, (int)(g * 32768.0f + 0.5f), memory_order_relaxed);
+   }
+   m = getenv("LUNARIA_AUDIO_MUTE");
+   if (m && *m && strcmp(m, "0") != 0)
+      atomic_store_explicit(&g_aq_muted, 1, memory_order_relaxed);
+}
 
 void luna_os_audio_set_volume(float gain)
 {
@@ -629,9 +650,9 @@ void luna_os_audio_set_volume(float gain)
    if (gain > 1.0f) gain = 1.0f;
    atomic_store_explicit(&g_aq_gain_q15, (int)(gain * 32768.0f + 0.5f), memory_order_relaxed);
 }
-float luna_os_audio_volume(void) { return (float)atomic_load(&g_aq_gain_q15) / 32768.0f; }
+float luna_os_audio_volume(void) { audio_saved_prefs(); return (float)atomic_load(&g_aq_gain_q15) / 32768.0f; }
 void luna_os_audio_set_muted(int muted) { atomic_store(&g_aq_muted, muted ? 1 : 0); }
-int luna_os_audio_muted(void) { return atomic_load(&g_aq_muted); }
+int luna_os_audio_muted(void) { audio_saved_prefs(); return atomic_load(&g_aq_muted); }
 /* AudioQueue plays on the system's current output; choosing one is the
  * system's Sound settings. */
 int luna_os_audio_devices(char (*names)[128], char (*descs)[128], int max)
@@ -641,11 +662,16 @@ int luna_os_audio_devices(char (*names)[128], char (*descs)[128], int max)
    snprintf(descs[0], 128, "System output");
    return 1;
 }
+static char g_mac_audio_dev[128] = "default";
 int luna_os_audio_select_device(const char *name)
 {
-   return (!name || !*name || !strcmp(name, "default")) ? 0 : -1;
+   const char *use = !name || !*name ? "default" : name;
+   if (!strcmp(use, "none")) use = "off";
+   if (strcmp(use, "default") && strcmp(use, "off")) return -1;
+   snprintf(g_mac_audio_dev, sizeof g_mac_audio_dev, "%s", use);
+   return 0;
 }
-const char *luna_os_audio_device(void) { return "default"; }
+const char *luna_os_audio_device(void) { return g_mac_audio_dev; }
 
 int luna_os_audio_write(const void *pcm16, unsigned frames)
 {

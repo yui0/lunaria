@@ -696,6 +696,58 @@ size_t malloc_usable_size(const void *p)
 #include <pthread.h>
 #include <time.h>
 
+/* {0,0} is success and is not a sleep.  Answering it with a syscall made a
+ * poll leave the JIT tens of thousands of times a second.  A positive
+ * request still enters the kernel so the thread is parked. */
+long lunaria_raw_nanosleep(const struct timespec *req, struct timespec *rem);
+long lunaria_raw_clock_nanosleep(clockid_t clockid, int flags,
+                                 const struct timespec *req,
+                                 struct timespec *rem);
+__asm__(".text\n"
+        ".p2align 2\n"
+        ".type lunaria_raw_nanosleep, %function\n"
+        "lunaria_raw_nanosleep:\n"
+        "  mov x8, #101\n"
+        "  svc #0\n"
+        "  ret\n"
+        ".type lunaria_raw_clock_nanosleep, %function\n"
+        "lunaria_raw_clock_nanosleep:\n"
+        "  mov x8, #115\n"
+        "  svc #0\n"
+        "  ret\n");
+
+static int timespec_ok(const struct timespec *t)
+{
+   return t->tv_sec >= 0 && t->tv_nsec >= 0 && t->tv_nsec < 1000000000L;
+}
+
+__attribute__((visibility("default")))
+int nanosleep(const struct timespec *req, struct timespec *rem)
+{
+   long rc;
+   if (!req) { set_errno(EFAULT); return -1; }
+   if (!timespec_ok(req)) { set_errno(EINVAL); return -1; }
+   if (req->tv_sec == 0 && req->tv_nsec == 0) return 0;
+   rc = lunaria_raw_nanosleep(req, rem);
+   if (rc < 0) { set_errno((int)-rc); return -1; }
+   return 0;
+}
+
+/* Returns the error number itself.  TIMER_ABSTIME is 1.  An absolute time
+ * of zero is already in the past; the kernel answers that. */
+__attribute__((visibility("default")))
+int clock_nanosleep(clockid_t clockid, int flags, const struct timespec *req,
+                    struct timespec *rem)
+{
+   long rc;
+   if (!req) return EFAULT;
+   if (!timespec_ok(req)) return EINVAL;
+   if ((flags & TIMER_ABSTIME) == 0 && req->tv_sec == 0 && req->tv_nsec == 0)
+      return 0;
+   rc = lunaria_raw_clock_nanosleep(clockid, flags, req, rem);
+   return rc < 0 ? (int)-rc : 0;
+}
+
 #define COND_SHARED_MASK   0x0001u
 #define COND_CLOCK_MASK    0x0002u   /* set: CLOCK_MONOTONIC */
 #define COND_COUNTER_STEP  0x0004u

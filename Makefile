@@ -369,10 +369,10 @@ DVM_HDR = src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
 # layer inside the VM publishes the document, and the swap path in arm_exec
 # presents it.  Both sides then resolve to the same single instance of the
 # engine — two copies would each hold half of the state.
-runtime/libjvm.so: src/trace.h src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c src/jvm/jvm.h src/jvm/jni.h $(DVM_SRC) $(DVM_HDR) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_keymap.o $(BUILD_DIR)/luna_gl_inspect.o
+runtime/libjvm.so: src/trace.h src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c src/jvm/jvm.h src/jvm/jni.h $(DVM_SRC) $(DVM_HDR) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_gl_inspect.o
 	mkdir -p runtime
 	$(CC) $(CFLAGS) $(SANITIZE) -fPIC $(CPPFLAGS) -D_GNU_SOURCE -Wno-pedantic $(LDFLAGS) $(HOST_SO_LDFLAGS) -shared \
-	    src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c $(DVM_SRC) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_keymap.o $(BUILD_DIR)/luna_gl_inspect.o \
+	    src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c $(DVM_SRC) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_gl_inspect.o \
 	    -lm $(HOST_CRYPTO_LIBS) $(HOST_ICU_LIBS) \
 	    $(HOST_GL_LIBS) $(HOST_Z_LIBS) -o $@
 
@@ -404,7 +404,7 @@ libpthread.so: runtime/libpthread.so
 
 # arm_exec.o: compiled with C++20 and dynarmic headers; linked into lunaria
 $(BUILD_DIR)/arm_exec.o: | $(BUILD_DIR)
-$(BUILD_DIR)/arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/luna_input.h src/luna_keymap.h src/arm.h src/svc_ids.h src/lib/guest.c src/jvm/jvm.h src/binary128.h src/linker64.h src/trace.h $(DYNARMIC_LIB)
+$(BUILD_DIR)/arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/luna_input.h src/arm.h src/svc_ids.h src/lib/guest.c src/jvm/jvm.h src/binary128.h src/linker64.h src/trace.h $(DYNARMIC_LIB)
 	$(CXX) -std=c++20 $(OPTFLAGS) -fPIC \
 	    $(SANITIZE) \
 	    $(DYNARMIC_INCS) \
@@ -417,6 +417,25 @@ $(BUILD_DIR)/arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/luna_input.h src/lu
 $(BUILD_DIR)/binary128.o: | $(BUILD_DIR)
 $(BUILD_DIR)/binary128.o: src/binary128.c src/binary128.h
 	$(CC) -std=c11 $(OPTFLAGS) -fPIC $(CPPFLAGS) -c src/binary128.c -o $@
+
+test/test_pcm_queue: test/pcm_queue_test.c src/arm_exec.h
+	$(CC) -std=c11 $(OPTFLAGS) -Wall -Wextra -Isrc test/pcm_queue_test.c -o $@
+
+.PHONY: pcm-queue-test
+pcm-queue-test: test/test_pcm_queue
+	./test/test_pcm_queue
+
+# Override SL_TEST_CC with the NDK's aarch64-linux-android21-clang path.
+SL_TEST_CC ?= $(firstword $(wildcard $(LUNARIA_ANDROID_NDK)/toolchains/llvm/prebuilt/*/bin/aarch64-linux-android21-clang $(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/*/bin/aarch64-linux-android21-clang /root/image/android/ndk/*/toolchains/llvm/prebuilt/*/bin/aarch64-linux-android21-clang))
+test/libslqueuetest.so: test/opensles_queue_test.c
+	@test -n "$(SL_TEST_CC)" || { echo "Set SL_TEST_CC to the Android NDK compiler" >&2; exit 1; }
+	"$(SL_TEST_CC)" -std=c11 -shared -fPIC -nostdlib -O1 -Wl,--unresolved-symbols=ignore-all $< -o $@
+
+.PHONY: opensles-queue-test
+opensles-queue-test: lunaria test/libslqueuetest.so
+	LD_LIBRARY_PATH="$(CURDIR):$(CURDIR)/runtime" LUNARIA_ALSA_DEVICE=null LUNARIA_MAX_FRAMES=120 ./lunaria test/libslqueuetest.so > .slqueuetest.out 2>&1
+	@rg 'slqueuetest' .slqueuetest.out
+	@rg -q 'RESULT PASS' .slqueuetest.out && ! rg -q 'slqueuetest.*FAIL|NoExecuteFault' .slqueuetest.out
 
 $(BUILD_DIR)/linker64.o: | $(BUILD_DIR)
 $(BUILD_DIR)/linker64.o: src/linker64.c src/linker64.h
@@ -461,7 +480,7 @@ $(BUILD_DIR)/loader.o: src/loader.c src/arm_exec.h src/arm.h
 # luna_overlay.o: the emulator's own UI surface, backed by luna-ui.  Built with
 # the project's own warning set relaxed — luna-ui.h is a 680 KB single-header
 # library from another tree, and its diagnostics are not this build's to fix.
-LUNA_UI_DIR ?= ../luna-ui
+LUNA_UI_DIR ?= src/luna-ui
 $(BUILD_DIR)/luna_overlay.o: | $(BUILD_DIR)
 $(BUILD_DIR)/luna_overlay.o: src/luna_overlay.c src/luna_overlay.h src/luna_ime.h src/lunaria_os.h src/arm_exec.h src/dvm/dvm.h $(LUNA_UI_DIR)/luna-ui.h
 	$(CC) -std=c11 $(OPTFLAGS) -fPIC $(CPPFLAGS) -I$(LUNA_UI_DIR) -D_GNU_SOURCE \
@@ -536,7 +555,7 @@ clean:
 	    $(BUILD_DIR)/stb_vorbis.o libdl.so libpthread.so
 	$(RM) -r runtime
 	$(RM) test/test_dynarmic_arm test/test_a64_memory_abort test/test_unity test/test_dvm test/dvm_test.dex test/test_regex test/test_http_chunked test/test_charset test/test_vulkan_bridge
-	$(RM) test/test_boot_card test/test_keymap test/test_motion_event test/libkeymapguest.so test/libkeymapndk.so
+	$(RM) test/test_audio_clock test/test_pcm_queue test/test_boot_card test/test_keymap test/test_motion_event test/libkeymapguest.so test/libkeymapndk.so test/libslqueuetest.so
 	$(RM) test/libabitest64.so test/libabitest32.so test/abi_test_values.h
 	$(RM) test/abi_pkg/classes.dex
 
@@ -555,11 +574,11 @@ test/dvm_test.dex: test/make_dex.py
 # Sanitizers are on by default but need libasan at link time; pass
 # DVM_TEST_SAN= to build without them where that runtime is not installed.
 DVM_TEST_SAN ?= -fsanitize=address,undefined
-test/test_dvm: test/dvm_test.c test/dvm_host_fixture.c src/jvm/packages.c $(DVM_SRC) $(DVM_HDR) $(LUNA_OS_OBJ) $(BUILD_DIR)/luna_keymap.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o
+test/test_dvm: test/dvm_test.c test/dvm_host_fixture.c src/jvm/packages.c $(DVM_SRC) $(DVM_HDR) $(LUNA_OS_OBJ) $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o
 	$(CC) -std=c11 -g -O1 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -Isrc \
 	    $(CPPFLAGS) \
 	    $(DVM_TEST_SAN) \
-	    test/dvm_test.c test/dvm_host_fixture.c src/jvm/packages.c $(DVM_SRC:src/dvm/dvm_jni.c=) $(LUNA_OS_OBJ) $(BUILD_DIR)/luna_keymap.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o \
+	    test/dvm_test.c test/dvm_host_fixture.c src/jvm/packages.c $(DVM_SRC:src/dvm/dvm_jni.c=) $(LUNA_OS_OBJ) $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o \
 	    -lm $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_CRYPTO_LIBS) $(HOST_ICU_LIBS) $(HOST_Z_LIBS) $(HOST_SYSTEM_DL_LIBS) $(HOST_GL_LIBS) -o $@
 
 # Pass a real classes.dex as DVM_DEX to also run every method in it.
@@ -568,10 +587,10 @@ DVM_DEX ?=
 # through a real title's boot.
 # luna_ime.o comes along because the overlay presents through it: the input
 # method is part of the surface now, not a separate layer.
-test/test_boot_card: test/boot_card_test.c $(BUILD_DIR)/luna_keymap.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o \
+test/test_boot_card: test/boot_card_test.c $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o \
                      src/luna_overlay.h src/luna_boot.h src/luna_ime.h
 	$(CC) -std=c11 -O2 -g $(CPPFLAGS) -D_GNU_SOURCE $(HOST_TEST_RPATH) \
-	    test/boot_card_test.c $(BUILD_DIR)/luna_keymap.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o \
+	    test/boot_card_test.c $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o \
 	    $(HOST_GL_LIBS) -lm -o $@
 
 boot-card-test: test/test_boot_card
@@ -618,6 +637,22 @@ http-chunked-test: test/test_http_chunked
 # HTTP server through the emulator's socket SVCs (see test/net_test.c).
 # Needs clang with the aarch64 target and lld; both come with the clang
 # package listed in the prerequisites.
+test/libdivtest.so: test/div_test.c
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
+	    -Wl,--unresolved-symbols=ignore-all -o $@ $<
+
+test/libdivtest32.so: test/div_test.c
+	clang -target armv7-linux-gnueabi -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
+	    -Wl,--unresolved-symbols=ignore-all -o $@ $<
+
+.PHONY: div-test
+div-test: lunaria test/libdivtest.so test/libdivtest32.so
+	@rc=0; for so in test/libdivtest.so test/libdivtest32.so; do \
+	    LD_LIBRARY_PATH="$(CURDIR):$(CURDIR)/runtime" ./lunaria $$so > .divtest.out 2>&1; \
+	    grep 'divtest' .divtest.out; \
+	    grep -q 'RESULT PASS' .divtest.out && ! grep -q 'RESULT FAIL' .divtest.out || rc=1; \
+	 done; exit $$rc
+
 test/libglversiontest.so: test/gl_version_test.c
 	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
 	    -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libglversiontest.so \
@@ -1302,12 +1337,9 @@ dist-clean:
 $(BUILD_DIR)/luna_input.o: src/luna_input.c src/luna_input.h | $(BUILD_DIR)
 	$(CC) -std=c11 $(OPTFLAGS) -fPIC $(CPPFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/luna_keymap.o: src/luna_keymap.c src/luna_keymap.h | $(BUILD_DIR)
-	$(CC) -std=c11 $(OPTFLAGS) -fPIC $(CPPFLAGS) -c $< -o $@
-
 .PHONY: keymap-test
-test/test_keymap: test/keymap_test.c src/luna_input.c src/luna_keymap.c src/luna_input.h src/luna_keymap.h
-	$(CC) -std=c11 -g -Wall -Wextra -Werror -Isrc test/keymap_test.c src/luna_input.c src/luna_keymap.c -pthread -lm -o $@
+test/test_keymap: test/keymap_test.c src/luna_input.c src/luna_input.h
+	$(CC) -std=c11 -g -Wall -Wextra -Werror -Isrc test/keymap_test.c src/luna_input.c -pthread -lm -o $@
 keymap-test: test/test_keymap
 	./test/test_keymap
 
@@ -1331,8 +1363,18 @@ test/libkeymapndk.so: test/keymap_guest_test.c src/jvm/jni.h
 keymap-smoke-test: lunaria test/libkeymapguest.so test/libkeymapndk.so
 	python3 test/keymap_smoke.py
 
-$(BUILD_DIR)/luna_overlay.o: src/luna_keymap.h
+$(BUILD_DIR)/luna_overlay.o: src/luna_input.h
 
 $(BUILD_DIR)/luna_gl_inspect.o: src/luna_gl_inspect.c src/luna_gl_inspect.h | $(BUILD_DIR)
 	$(CC) -std=c11 $(OPTFLAGS) -fPIC $(CPPFLAGS) -c $< -o $@
 $(BUILD_DIR)/arm_exec.o: src/luna_gl_inspect.h
+
+ifeq ($(LUNA_OS_NAME),Linux)
+.PHONY: audio-clock-test
+test/test_audio_clock: test/audio_clock_test.c $(LUNA_OS_OBJ) src/lunaria_os.h
+	$(CC) -std=c11 $(OPTFLAGS) $(CPPFLAGS) test/audio_clock_test.c $(LUNA_OS_OBJ) \
+	    $(HOST_AUDIO_LIBS) $(HOST_WINDOW_LIBS) -pthread -o $@
+audio-clock-test: test/test_audio_clock
+	./test/test_audio_clock null
+	./test/test_audio_clock off
+endif

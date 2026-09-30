@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <io.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <windows.h>
@@ -389,10 +390,27 @@ void *luna_os_offscreen_window(void *glfw_window, int w, int h)
  * they read back consistently. */
 static float g_win_gain = 1.0f;
 static int   g_win_muted;
+static char  g_win_audio_dev[128] = "default";
+static void audio_saved_prefs(void)
+{
+   static int done;
+   const char *v, *m;
+   if (done) return;
+   done = 1;
+   v = getenv("LUNARIA_AUDIO_VOLUME");
+   if (v && *v) {
+      float g = (float)atof(v);
+      if (g < 0.0f) g = 0.0f;
+      if (g > 1.0f) g = 1.0f;
+      g_win_gain = g;
+   }
+   m = getenv("LUNARIA_AUDIO_MUTE");
+   if (m && *m && strcmp(m, "0") != 0) g_win_muted = 1;
+}
 void luna_os_audio_set_volume(float gain) { g_win_gain = gain < 0.0f ? 0.0f : gain > 1.0f ? 1.0f : gain; }
-float luna_os_audio_volume(void) { return g_win_gain; }
+float luna_os_audio_volume(void) { audio_saved_prefs(); return g_win_gain; }
 void luna_os_audio_set_muted(int muted) { g_win_muted = muted ? 1 : 0; }
-int luna_os_audio_muted(void) { return g_win_muted; }
+int luna_os_audio_muted(void) { audio_saved_prefs(); return g_win_muted; }
 int luna_os_audio_devices(char (*names)[128], char (*descs)[128], int max)
 {
    if (max < 1) return 0;
@@ -400,5 +418,12 @@ int luna_os_audio_devices(char (*names)[128], char (*descs)[128], int max)
    snprintf(descs[0], 128, "System output");
    return 1;
 }
-int luna_os_audio_select_device(const char *name) { return (!name || !*name || !strcmp(name, "default")) ? 0 : -1; }
-const char *luna_os_audio_device(void) { return "default"; }
+int luna_os_audio_select_device(const char *name)
+{
+   const char *use = !name || !*name ? "default" : name;
+   if (!strcmp(use, "none")) use = "off";
+   if (strcmp(use, "default") && strcmp(use, "off")) return -1;
+   snprintf(g_win_audio_dev, sizeof g_win_audio_dev, "%s", use);
+   return 0;
+}
+const char *luna_os_audio_device(void) { return g_win_audio_dev; }

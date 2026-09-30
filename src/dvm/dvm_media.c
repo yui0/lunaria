@@ -282,10 +282,12 @@ static bool avcodec_ready(void)
       return false;
    }
    av.register_all();
-   fprintf(stderr, "[media] libavcodec ready (aac %s, h264 %s)\n",
+   fprintf(stderr, "[media] libavcodec ready (aac %s, h264 %s, vp9 %s)\n",
            av.find_decoder_by_name("aac") ? "yes" : "no",
            av.decode_video2 && av.frame_best_effort_ts &&
-           av.find_decoder_by_name("h264") ? "yes" : "no");
+           av.find_decoder_by_name("h264") ? "yes" : "no",
+           av.decode_video2 && av.frame_best_effort_ts &&
+           av.find_decoder_by_name("vp9") ? "yes" : "no");
    state = 1;
    return true;
 }
@@ -299,10 +301,26 @@ static bool avcodec_aac_ready(void)
  * Main and High with CABAC and B-frames included.  openh264 only reads
  * Constrained Baseline, so it is the decoder of last resort: libavcodec's
  * h264 is used whenever it is present. */
-static bool avcodec_h264_ready(void)
+static bool avcodec_video_ready(const char *name)
 {
    return avcodec_ready() && av.decode_video2 && av.frame_best_effort_ts &&
-          av.flush_buffers && av.find_decoder_by_name("h264");
+          av.flush_buffers && av.find_decoder_by_name(name);
+}
+
+static bool avcodec_h264_ready(void)
+{
+   return avcodec_video_ready("h264");
+}
+
+static bool avcodec_vp9_ready(void)
+{
+   return avcodec_video_ready("vp9");
+}
+
+static bool is_vp9_mime(const char *mime)
+{
+   return !strcasecmp(mime, "video/x-vnd.on2.vp9") ||
+          !strcasecmp(mime, "video/vp9");
 }
 
 /* ------------------------------------------------------------------------ *
@@ -454,10 +472,12 @@ struct lm_codec {
    bool video;
    bool started;
    ISVCDecoder *dec;        /* openh264, when libavcodec has no h264 */
-   void *vctx, *vframe;     /* libavcodec h264 */
+   void *vctx, *vframe;     /* libavcodec video (h264 or vp9) */
    uint8_t *vpad;           /* input copy with the padding libavcodec reads */
    size_t vpad_cap;
    bool vcsd_pending;       /* csd-0/1 still to go in front of the next AU */
+   bool prepend_csd;        /* H.264 parameter sets belong on the first AU */
+   char mime[48];
 
    /* The codec thread (libavcodec only).  MediaCodec decodes on a thread of
     * its own; doing it inside queueInputBuffer / releaseOutputBuffer put the
@@ -529,6 +549,7 @@ bool lm_codec_supported(const char *mime)
    if (!mime) return false;
    if (!strcasecmp(mime, "video/avc"))
       return avcodec_h264_ready() || openh264_ready();
+   if (is_vp9_mime(mime)) return avcodec_vp9_ready();
    if (is_aac_mime(mime)) return avcodec_aac_ready();
    return false;
 }
@@ -549,6 +570,26 @@ static struct lm_codec *aac_codec_new(void)
    return c;
 }
 
+/* Opens a libavcodec video decoder into c.  prepend_csd is for H.264, whose
+ * parameter sets have to ride on the first access unit.  VP9 frames stand
+ * alone; the codec-private bytes are not a picture. */
+static bool av_video_open(struct lm_codec *c, const char *decoder, bool prepend_csd)
+{
+   void *codec = av.find_decoder_by_name(decoder);
+   c->vctx = codec ? av.alloc_context3(codec) : NULL;
+   c->vframe = c->vctx ? av.frame_alloc() : NULL;
+   if (!c->vframe || av.open2(c->vctx, codec, NULL) < 0) {
+      fprintf(stderr, "[media] libavcodec could not open the %s decoder\n", decoder);
+      if (c->vframe) av.frame_free(&c->vframe);
+      if (c->vctx) { av.close(c->vctx); c->vctx = NULL; }
+      return false;
+   }
+   c->prepend_csd = prepend_csd;
+   pthread_mutex_init(&c->mu, NULL);
+   pthread_cond_init(&c->cv, NULL);
+   return true;
+}
+
 struct lm_codec *lm_codec_new(const char *mime)
 {
    if (!lm_codec_supported(mime)) return NULL;
@@ -557,20 +598,16 @@ struct lm_codec *lm_codec_new(const char *mime)
    struct lm_codec *c = calloc(1, sizeof *c);
    if (!c) return NULL;
    c->video = true;
+   snprintf(c->mime, sizeof c->mime, "%s", mime ? mime : "video/avc");
+
+   if (is_vp9_mime(mime)) {
+      if (!av_video_open(c, "vp9", false)) { free(c); return NULL; }
+      return c;
+   }
 
    if (avcodec_h264_ready()) {
-      void *codec = av.find_decoder_by_name("h264");
-      c->vctx = av.alloc_context3(codec);
-      c->vframe = c->vctx ? av.frame_alloc() : NULL;
-      if (c->vframe && av.open2(c->vctx, codec, NULL) >= 0) {
-         pthread_mutex_init(&c->mu, NULL);
-         pthread_cond_init(&c->cv, NULL);
-         return c;
-      }
-      fprintf(stderr, "[media] libavcodec could not open the H.264 decoder\n");
-      if (c->vframe) av.frame_free(&c->vframe);
-      free(c);
-      return NULL;
+      if (!av_video_open(c, "h264", true)) { free(c); return NULL; }
+      return c;
    }
 
    if (lm_WelsCreateDecoder(&c->dec) != 0 || !c->dec) {
@@ -677,7 +714,7 @@ static bool keep_picture(struct lm_codec *c, uint8_t *const planes[3],
       memcpy(v + (size_t)y * cw, planes[2] + (size_t)y * stride[2], (size_t)cw);
    }
    if (c->width != w || c->height != h)
-      fprintf(stderr, "[media] H.264 picture %dx%d\n", w, h);
+      fprintf(stderr, "[media] %s picture %dx%d\n", c->mime, w, h);
    o->len = need;
    o->w = w;
    o->h = h;
@@ -705,7 +742,7 @@ static bool avcodec_decode_packet(struct lm_codec *c, const uint8_t *data,
       /* The parameter sets travel with the first access unit: on their own
        * they are a packet with no picture, which libavcodec rejects. */
       size_t pre = 0;
-      if (with_csd)
+      if (with_csd && c->prepend_csd)
          for (int i = 0; i < c->ncsd; ++i) pre += c->csd[i].len;
       if (pre + len + PAD > c->vpad_cap) {
          uint8_t *p = realloc(c->vpad, pre + len + PAD);
@@ -714,7 +751,7 @@ static bool avcodec_decode_packet(struct lm_codec *c, const uint8_t *data,
          c->vpad_cap = pre + len + PAD;
       }
       size_t at = 0;
-      if (with_csd)
+      if (with_csd && c->prepend_csd)
          for (int i = 0; i < c->ncsd; ++i) {
             memcpy(c->vpad + at, c->csd[i].p, c->csd[i].len);
             at += c->csd[i].len;
@@ -734,8 +771,8 @@ static bool avcodec_decode_packet(struct lm_codec *c, const uint8_t *data,
    if (used < 0) {
       static int warned;
       if (warned++ < 8)
-         fprintf(stderr, "[media] libavcodec h264 decode failed (%d) on %zu bytes\n",
-                 used, len);
+         fprintf(stderr, "[media] libavcodec %s decode failed (%d) on %zu bytes\n",
+                 c->mime, used, len);
       return false;
    }
    return got != 0;
@@ -755,8 +792,9 @@ static bool avcodec_keep_frame(struct lm_codec *c)
    if (fmt != AV_PIX_FMT_YUV420P && fmt != AV_PIX_FMT_YUVJ420P) {
       static int warned;
       if (warned++ < 4)
-         fprintf(stderr, "[media] H.264 pixel format %d is not 4:2:0 — "
-                 "this build converts only I420\n", fmt);
+         fprintf(stderr, "[media] %s pixel format %d is not 4:2:0 — "
+                 "this build converts only I420\n",
+                 c->mime, fmt);
       return false;
    }
    if (w <= 0 || h <= 0 || w > 8192 || h > 8192 || ls[0] < w ||
@@ -1067,6 +1105,12 @@ bool lm_codec_undecodable(const struct lm_codec *c)
 bool lm_codec_is_video(const struct lm_codec *c)
 {
    return c && c->video;
+}
+
+const char *lm_codec_mime(const struct lm_codec *c)
+{
+   if (!c || !c->video || !c->mime[0]) return NULL;
+   return c->mime;
 }
 
 bool lm_codec_start(struct lm_codec *c)

@@ -133,3 +133,23 @@
 #LUNARIA_WEB_ENGINE=auto
 # A browser binary by path (not a shell wrapper); overrides auto/chrome/luna.
 #LUNARIA_WEB_BROWSER=/opt/google/chrome/chrome
+
+# ---------------------------------------------------------------------------
+# Right-click menu (sound, WebView, keyboard, full screen).
+#
+# A line above the first [package] block is common: it applies to every app
+# and it wins over the same name inside a package block.  The menu writes the
+# change into that app's block, so the next launch of the same APK picks it
+# up wherever the common lines left the name unset.  Package blocks come after
+# the common lines.  A name already set in the environment still wins over both.
+#
+#   LUNARIA_ALSA_DEVICE    sound output (an ALSA PCM name, or off)
+#   LUNARIA_AUDIO_VOLUME   0..1
+#   LUNARIA_AUDIO_MUTE     1 mutes
+#   LUNARIA_WEB_ENGINE     auto / chrome / luna / off
+#   LUNARIA_WEB_ZOOM       CSS pixels per view pixel; omit to follow density
+#   LUNARIA_KEYMAP         a keymap file, or off
+#   LUNARIA_FULLSCREEN     1 starts in full screen
+#
+# [com.miHoYo.GenshinImpact]
+# LUNARIA_KEYMAP=keymaps/genshin.conf

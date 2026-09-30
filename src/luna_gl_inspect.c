@@ -9,6 +9,46 @@
 #include <string.h>
 #include <unistd.h>
 struct block_sample { unsigned char *bytes; GLint length; };
+static void inspect_draw_state(GLuint program, GLint fbo)
+{
+    GLint viewport[4], scissor[4], depth, src, dst, draw, read, ref, func;
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    glGetIntegerv(GL_SCISSOR_BOX, scissor);
+    glGetIntegerv(GL_DEPTH_FUNC, &depth);
+    glGetIntegerv(GL_BLEND_SRC_RGB, &src);
+    glGetIntegerv(GL_BLEND_DST_RGB, &dst);
+    glGetIntegerv(GL_DRAW_BUFFER0, &draw);
+    glGetIntegerv(GL_READ_BUFFER, &read);
+    glGetIntegerv(GL_STENCIL_REF, &ref);
+    glGetIntegerv(GL_STENCIL_FUNC, &func);
+    GLboolean color[4], write;
+    glGetBooleanv(GL_COLOR_WRITEMASK, color);
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &write);
+    fprintf(stderr, "[gl-state] p=%u vp=%d,%d,%d,%d scissor=%d:%d,%d,%d,%d depth=%d:%x:%d blend=%d:%x,%x stencil=%d:%x:%d cull=%d discard=%d color=%d%d%d%d draw=%x read=%x\n",
+        program, viewport[0],viewport[1],viewport[2],viewport[3],
+        glIsEnabled(GL_SCISSOR_TEST),scissor[0],scissor[1],scissor[2],scissor[3],
+        glIsEnabled(GL_DEPTH_TEST),depth,write,glIsEnabled(GL_BLEND),src,dst,
+        glIsEnabled(GL_STENCIL_TEST),func,ref,glIsEnabled(GL_CULL_FACE),
+        glIsEnabled(GL_RASTERIZER_DISCARD),color[0],color[1],color[2],color[3],draw,read);
+    if (fbo) return;
+    GLuint shaders[8]; GLsizei count = 0;
+    glGetAttachedShaders(program, 8, &count, shaders);
+    for (GLsizei i = 0; i < count; ++i) {
+        GLint length = 0;
+        glGetShaderiv(shaders[i], GL_SHADER_SOURCE_LENGTH, &length);
+        if (length <= 1 || length > (1 << 20)) continue;
+        char *text = malloc((size_t)length);
+        if (!text) continue;
+        GLsizei used = 0;
+        glGetShaderSource(shaders[i], length, &used, text);
+        char path[160];
+        snprintf(path, sizeof path, "/tmp/lunaria-gl-%ld-p%u-s%u.glsl",
+                 (long)getpid(), program, shaders[i]);
+        FILE *out = fopen(path, "wb");
+        if (out) { fwrite(text, 1, (size_t)used, out); fclose(out); }
+        free(text);
+    }
+}
 static void inspect_attributes(GLuint program)
 {
     GLint count = 0, previous = 0;
@@ -195,6 +235,7 @@ void luna_gl_inspect_draw(uint64_t frame)
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
     fprintf(stderr, "[gl-inspect] frame=%llu program=%d fbo=%d uniforms=%d blocks=%d\n",
             (unsigned long long)frame, program, fbo, n, nb);
+    inspect_draw_state((GLuint)program, fbo);
     const char *extensions = (const char *)glGetString(GL_EXTENSIONS);
     if (extensions && strstr(extensions, "GL_EXT_sRGB_write_control"))
         fprintf(stderr, "[gl-inspect] framebuffer-srgb=%d\n", glIsEnabled(0x8db9));

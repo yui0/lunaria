@@ -448,6 +448,29 @@ static unsigned luna_audio_used(void)
    return (h - t) % LUNA_AUDIO_RING_FRAMES;
 }
 
+/* A sink can accept PCM immediately (ALSA null/file plugins). Accepted
+ * frames must still retire at the negotiated sample rate. Keep an absolute
+ * deadline so sleep rounding does not accumulate; hardware writes that
+ * already waited need no additional delay. */
+static void audio_wait_frames(struct timespec *deadline, unsigned frames, unsigned rate)
+{
+   struct timespec now;
+   uint64_t ns = (uint64_t)frames * 1000000000ull / rate;
+   deadline->tv_sec += (time_t)(ns / 1000000000ull);
+   deadline->tv_nsec += (long)(ns % 1000000000ull);
+   if (deadline->tv_nsec >= 1000000000L) {
+      ++deadline->tv_sec;
+      deadline->tv_nsec -= 1000000000L;
+   }
+   clock_gettime(CLOCK_MONOTONIC, &now);
+   if (now.tv_sec > deadline->tv_sec ||
+       (now.tv_sec == deadline->tv_sec && now.tv_nsec >= deadline->tv_nsec)) {
+      *deadline = now;
+      return;
+   }
+   while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, deadline, NULL) == EINTR) {}
+}
+
 static void *luna_audio_thread(void *arg)
 {
    (void)arg;
@@ -458,6 +481,8 @@ static void *luna_audio_thread(void *arg)
    unsigned period = (unsigned)g_audio.frames ? (unsigned)g_audio.frames : 256u;
    int16_t *chunk = (int16_t *)malloc((size_t)period * g_audio_ch * sizeof *chunk);
    if (!chunk) return NULL;
+   struct timespec deadline;
+   clock_gettime(CLOCK_MONOTONIC, &deadline);
    unsigned long starved_periods = 0, starved_frames = 0;
    while (!atomic_load_explicit(&g_audio_stop, memory_order_acquire)) {
       /* Hand the card a whole period every period, always.  A mixer does not
@@ -466,8 +491,8 @@ static void *luna_audio_thread(void *arg)
        * period before writing anything let the card run out instead — every
        * dry spell is an -EPIPE, a restart of the stream, and an audible click
        * — which is what a producer that cannot keep up sounds like here.
-       * snd_pcm_writei blocks while the card still has audio, so it, not a
-       * sleep, is what paces this loop. */
+       * Hardware writes normally pace the loop; the monotonic deadline
+       * below also paces sinks that accept frames without waiting. */
       unsigned t = atomic_load_explicit(&g_audio_tail, memory_order_relaxed);
       unsigned have = luna_audio_used();
       if (have > period) have = period;
@@ -476,7 +501,7 @@ static void *luna_audio_thread(void *arg)
          for (unsigned c = 0; c < g_audio_ch; ++c)
             chunk[i * g_audio_ch + c] = g_audio_ring[src + c];
       }
-      if (have < period) {
+      if (have < period && g_audio.handle) {
          memset(chunk + (size_t)have * g_audio_ch, 0,
                 (size_t)(period - have) * g_audio_ch * sizeof *chunk);
          /* Say so: silence covers the gap, it does not fill it.  A run that
@@ -504,6 +529,15 @@ static void *luna_audio_thread(void *arg)
          pthread_mutex_lock(&g_audio_dev_lock);
          snprintf(want, sizeof want, "%s", g_audio_dev_want[0] ? g_audio_dev_want : "default");
          pthread_mutex_unlock(&g_audio_dev_lock);
+         if (!strcmp(want, "off")) {
+            /* Close the PCM.  While it stays open, even muted, dmix cannot
+             * hand the card to another program. */
+            if (g_audio.handle) AUDIO_close(&g_audio);
+            pthread_mutex_lock(&g_audio_dev_lock);
+            snprintf(g_audio_dev_now, sizeof g_audio_dev_now, "off");
+            pthread_mutex_unlock(&g_audio_dev_lock);
+            fprintf(stderr, "[audio] output released\n");
+         } else {
          AUDIO next;
          memset(&next, 0, sizeof next);
          int opened = !strcmp(want, g_audio_dev_now) ? 2 :
@@ -546,6 +580,20 @@ static void *luna_audio_thread(void *arg)
             fprintf(stderr, "[audio] cannot switch output to '%s'; keeping '%s'\n",
                     want, g_audio_dev_now);
          }
+         }
+      }
+      if (!g_audio.handle) {
+         /* No PCM is open.  "None" closed it on purpose.  The guest mixer
+          * still retires buffers from g_audio_played, so advance that clock
+          * for one period and leave the card free. */
+         unsigned freq = g_audio.freq ? g_audio.freq : 48000u;
+         audio_wait_frames(&deadline, period, freq);
+         if (have)
+            atomic_store_explicit(&g_audio_tail,
+                                  (t + have) % LUNA_AUDIO_RING_FRAMES,
+                                  memory_order_release);
+         atomic_fetch_add_explicit(&g_audio_played, period, memory_order_release);
+         continue;
       }
       const int wrote = AUDIO_play(&g_audio, (char *)chunk, (int)period);
       /* Frames the card accepted, silence padding included.  This is the
@@ -578,6 +626,8 @@ static void *luna_audio_thread(void *arg)
          atomic_store_explicit(&g_audio_tail,
                                (t + consumed) % LUNA_AUDIO_RING_FRAMES,
                                memory_order_release);
+      audio_wait_frames(&deadline, taken ? taken : period,
+                        g_audio.freq ? g_audio.freq : 48000u);
       atomic_fetch_add_explicit(&g_audio_played, taken, memory_order_release);
       period = next_period;
    }
@@ -585,8 +635,30 @@ static void *luna_audio_thread(void *arg)
    return NULL;
 }
 
+/* Volume and mute are remembered in lunaria.conf.  Applied once, before the
+ * first playback and before the menu reads them back. */
+static void audio_saved_prefs(void)
+{
+   static int done;
+   const char *v, *m;
+   if (done) return;
+   done = 1;
+   v = getenv("LUNARIA_AUDIO_VOLUME");
+   if (v && *v) {
+      float g = (float)atof(v);
+      if (g < 0.0f) g = 0.0f;
+      if (g > 1.0f) g = 1.0f;
+      atomic_store_explicit(&g_audio_gain_q15, (int)(g * 32768.0f + 0.5f),
+                            memory_order_relaxed);
+   }
+   m = getenv("LUNARIA_AUDIO_MUTE");
+   if (m && *m && strcmp(m, "0") != 0)
+      atomic_store_explicit(&g_audio_muted, 1, memory_order_relaxed);
+}
+
 int luna_os_audio_open(unsigned rate, unsigned channels)
 {
+   audio_saved_prefs();
    if (g_audio_open) return 0;
    if (!rate) rate = 48000u;
    if (channels < 1u || channels > 8u) channels = 2u;
@@ -601,12 +673,43 @@ int luna_os_audio_open(unsigned rate, unsigned channels)
     * silently substitute one for the other. */
    char devbuf[128];
    snprintf(devbuf, sizeof devbuf, "%s", (dev && *dev) ? dev : "default");
+   const int start_off = !strcmp(devbuf, "off") || !strcmp(devbuf, "none");
    /* A period of about 10 ms: small enough that the guest's own buffer queue
     * keeps its timing, large enough not to wake the thread constantly. */
    unsigned period = rate / 100u;
    if (period < 64u) period = 64u;
-   if (AUDIO_init(&g_audio, devbuf, rate, (int)channels, (int)period, 1,
+   if (start_off) {
+      memset(&g_audio, 0, sizeof g_audio);
+      g_audio.freq = rate;
+      g_audio.ch = (int)channels;
+      g_audio.frames = period;
+      g_audio.req_frames = (int)period;
+      g_audio.flag = 1;
+      g_audio.format = SND_PCM_FORMAT_S16_LE;
+      snprintf(devbuf, sizeof devbuf, "off");
+   } else if (AUDIO_init(&g_audio, devbuf, rate, (int)channels, (int)period, 1,
                   SND_PCM_FORMAT_S16_LE) != 0) {
+      /* "default" on this host is whatever asound.conf names, and that is
+       * often card 0 even when the only card is not 0.  An implicit request
+       * then walks the cards and opens the first one that plays.  An explicit
+       * LUNARIA_ALSA_DEVICE is left alone: the caller named that device. */
+      int opened = -1;
+      if (!(dev && *dev)) {
+         int c = -1;
+         while (snd_card_next(&c) >= 0 && c >= 0) {
+            char alt[32];
+            snprintf(alt, sizeof alt, "plughw:%d,0", c);
+            if (AUDIO_init(&g_audio, alt, rate, (int)channels, (int)period, 1,
+                           SND_PCM_FORMAT_S16_LE) == 0) {
+               snprintf(devbuf, sizeof devbuf, "%s", alt);
+               opened = 0;
+               fprintf(stderr, "[audio] ALSA 'default' did not open; using '%s'\n",
+                       alt);
+               break;
+            }
+         }
+      }
+      if (opened != 0) {
       /* The usual reason on a desktop is that something else holds the card
        * exclusively (a player on hw:N,0 keeps even dmix from opening it).
        * Say so, and name the way out, rather than reporting "no audio". */
@@ -618,6 +721,7 @@ int luna_os_audio_open(unsigned rate, unsigned channels)
                  "using the card?  LUNARIA_ALSA_DEVICE names a different one, "
                  "LUNARIA_AUDIO=0 turns playback off\n", devbuf);
       return -1;
+      }
    }
    g_audio_ring = (int16_t *)calloc((size_t)LUNA_AUDIO_RING_FRAMES * channels,
                                     sizeof *g_audio_ring);
@@ -636,8 +740,12 @@ int luna_os_audio_open(unsigned rate, unsigned channels)
       return -1;
    }
    snprintf(g_audio_dev_now, sizeof g_audio_dev_now, "%s", devbuf);
-   fprintf(stderr, "[audio] ALSA '%s' %u Hz %u ch, %lu-frame periods\n",
-           devbuf, g_audio.freq, channels, (unsigned long)g_audio.frames);
+   if (start_off)
+      fprintf(stderr, "[audio] output off (%u Hz %u ch); no ALSA device is held\n",
+              g_audio.freq, channels);
+   else
+      fprintf(stderr, "[audio] ALSA '%s' %u Hz %u ch, %lu-frame periods\n",
+              devbuf, g_audio.freq, channels, (unsigned long)g_audio.frames);
    return 0;
 }
 
@@ -650,6 +758,7 @@ void luna_os_audio_set_volume(float gain)
 
 float luna_os_audio_volume(void)
 {
+   audio_saved_prefs();
    return (float)atomic_load_explicit(&g_audio_gain_q15, memory_order_relaxed) / 32768.0f;
 }
 
@@ -660,6 +769,7 @@ void luna_os_audio_set_muted(int muted)
 
 int luna_os_audio_muted(void)
 {
+   audio_saved_prefs();
    return atomic_load_explicit(&g_audio_muted, memory_order_relaxed);
 }
 
@@ -698,8 +808,10 @@ int luna_os_audio_devices(char (*names)[128], char (*descs)[128], int max)
 
 int luna_os_audio_select_device(const char *name)
 {
+   const char *use = name && *name ? name : "default";
+   if (!strcmp(use, "none")) use = "off";
    pthread_mutex_lock(&g_audio_dev_lock);
-   snprintf(g_audio_dev_want, sizeof g_audio_dev_want, "%s", name && *name ? name : "default");
+   snprintf(g_audio_dev_want, sizeof g_audio_dev_want, "%s", use);
    pthread_mutex_unlock(&g_audio_dev_lock);
    /* Not open yet: the choice is where the stream will open. */
    if (!g_audio_open) {
@@ -729,17 +841,11 @@ int luna_os_audio_write(const void *pcm16, unsigned frames)
    const unsigned h = atomic_load_explicit(&g_audio_head, memory_order_relaxed);
    const unsigned free_frames = LUNA_AUDIO_RING_FRAMES - 1u - luna_audio_used();
    if (frames > free_frames) {
-      /* The ring is full and the excess is silently discarded below —
-       * without this line that loss was invisible next to [audio] sink
-       * starved, which reports the opposite direction (the sink going
-       * dry).  A full ring means the producer (drive_opensles_callbacks)
-       * is enqueuing faster than the device drains it, which happens right
-       * after the low-water-mark fix hands back a burst of buffers at once;
-       * seeing this fire is what tells whether that burst is too large. */
+      /* The caller retains frames the nonblocking sink cannot accept. */
       static unsigned complained;
       if (complained++ % 200u == 0u)
-         fprintf(stderr, "[audio] ring full: dropping %u of %u frames "
-                 "(used=%u/%u)\n", frames - free_frames, frames,
+         fprintf(stderr, "[audio] ring full: accepting %u of %u frames "
+                 "(used=%u/%u)\n", free_frames, frames,
                  luna_audio_used(), LUNA_AUDIO_RING_FRAMES);
       frames = free_frames;
    }
