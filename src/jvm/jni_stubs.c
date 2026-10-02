@@ -9,8 +9,8 @@
  */
 
 #include <assert.h>
-#include <dlfcn.h>
-#include <err.h>
+#include "lunaria_os.h"
+
 #include <libgen.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -231,7 +231,7 @@ java_lang_System_getProperty(JNIEnv *env, jobject object, va_list args)
       int (*fun)(const char*, char*);
    } __system_property_get;
 
-   if (!(__system_property_get.ptr = dlsym(RTLD_DEFAULT, "__system_property_get")))
+   if (!(__system_property_get.ptr = luna_os_library_symbol(NULL, "__system_property_get")))
       return NULL;
 
    char value[92]; // PROP_VALUE_MAX 92
@@ -251,7 +251,7 @@ java_lang_System_load(JNIEnv *env, jobject object, va_list args)
    /* Absolute path into the guest ELF loader.  Host/apkenv dlopen rejects
     * aarch64 APS2 objects the arm64 loader already unpacks. */
    if (arm_exec_system_load(lib) < 0)
-      warnx("java/lang/System/load: failed to load `%s`", lib);
+      fprintf(stderr, "java/lang/System/load: failed to load `%s`\n", lib);
 
    (*env)->ReleaseStringUTFChars(env, jlib, lib);
 }
@@ -391,13 +391,13 @@ java_lang_Class_getName(JNIEnv *env, jobject object)
          } jvm_get_class_name;
       } jvm;
 
-      if ((jvm.jnienv_get_jvm.ptr = dlsym(RTLD_DEFAULT, "jnienv_get_jvm")) && (jvm.jvm_get_class_name.ptr = dlsym(RTLD_DEFAULT, "jvm_get_class_name"))) {
+      if ((jvm.jnienv_get_jvm.ptr = luna_os_library_symbol(NULL, "jnienv_get_jvm")) && (jvm.jvm_get_class_name.ptr = luna_os_library_symbol(NULL, "jvm_get_class_name"))) {
          struct jvm *jvm_ = jvm.jnienv_get_jvm.fun(env);
          return (*env)->NewStringUTF(env, jvm.jvm_get_class_name.fun(jvm_, object));
       }
    }
 
-   warnx("%s: returning NULL, as running in unknown JVM and don't know how to get class name", __func__);
+   fprintf(stderr, "%s: returning NULL, as running in unknown JVM and don't know how to get class name\n", __func__);
    return NULL;
 }
 
@@ -489,14 +489,6 @@ java_util_Locale_getCountry(JNIEnv *env, jobject object)
 {
    assert(env && object);
    return (*env)->NewStringUTF(env, "US");
-}
-
-jobject
-java_lang_Thread_currentThread(JNIEnv *env, jclass clazz)
-{
-   assert(env);
-   static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/lang/Thread"))));
 }
 
 /* Choreographer.getInstance() → singleton stub.  UnityChoreographer's init
@@ -612,22 +604,6 @@ java_util_Scanner_close(JNIEnv *env, jobject object)
    (void)env; (void)object;
 }
 
-/* Iterator.hasNext() → false: the stub iterator from Set.iterator() is empty. */
-jboolean
-java_util_Iterator_hasNext(JNIEnv *env, jobject object)
-{
-   (void)env; (void)object;
-   return 0;
-}
-
-/* Iterator.next() → NULL: called only if hasNext() was wrongly believed true. */
-jobject
-java_util_Iterator_next(JNIEnv *env, jobject object)
-{
-   (void)env; (void)object;
-   return NULL;
-}
-
 /* Object.toString() → empty string: avoids wild jumps when Unity stringifies
  * objects whose class has no registered native toString handler. */
 jstring
@@ -637,28 +613,8 @@ java_lang_Object_toString(JNIEnv *env, jobject object)
    return (*env)->NewStringUTF(env, "");
 }
 
-/* Map.entrySet() → a Set stub, Set.iterator() → an Iterator stub.  These back
- * the empty SharedPreferences.getAll() map: the migration loop calls
- * getAll().entrySet().iterator().hasNext(), and hasNext() defaults to false, so
- * a valid (empty) Set/Iterator pair lets it iterate zero times and move on. */
-jobject
-java_util_Map_entrySet(JNIEnv *env, jobject object, va_list args)
-{
-   assert(env && object); (void)args;
-   static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/util/Set"))));
-}
-
-jobject
-java_util_Set_iterator(JNIEnv *env, jobject object, va_list args)
-{
-   assert(env && object); (void)args;
-   static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/util/Iterator"))));
-}
-
-
-
+/* Collections are owned by the DVM runtime. JNI calls must reach its Map,
+ * Set and Iterator methods so native writes and bytecode reads share state. */
 
 /* Rate-limited call trace so we can see which MotionEvent/InputDevice getters
  * Unity actually reads after nativeInjectEvent. */
@@ -1572,7 +1528,7 @@ android_content_Context_getCacheDir(JNIEnv *env, jobject object, va_list args)
        * without a path made "Error emptying previous jar directory". */
       const char *p = getenv("ANDROID_CACHE_DIR");
       jni_file_set_path(sv, (p && *p) ? p : "/tmp/lunaria-cache");
-      mkdir("/tmp/lunaria-cache", 0755);
+      luna_file_mkdir("/tmp/lunaria-cache", 0755);
    }
    return sv;
 }
@@ -1587,7 +1543,7 @@ android_content_Context_getExternalCacheDir(JNIEnv *env, jobject object, va_list
       sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"));
       const char *p = getenv("ANDROID_EXTERNAL_CACHE_DIR");
       jni_file_set_path(sv, (p && *p) ? p : "/tmp/lunaria-ext-cache");
-      mkdir("/tmp/lunaria-ext-cache", 0755);
+      luna_file_mkdir("/tmp/lunaria-ext-cache", 0755);
    }
    return sv;
 }
@@ -1618,10 +1574,10 @@ android_content_Context_getDir(JNIEnv *env, jobject object, va_list args)
    const char *base = getenv("ANDROID_FILES_DIR");
    if (!base || !*base)
       base = "/tmp/lunaria-files";
-   mkdir(base, 0755);
+   luna_file_mkdir(base, 0755);
    char path[PATH_MAX];
    snprintf(path, sizeof path, "%s/app_%s", base, namebuf);
-   mkdir(path, 0755);
+   luna_file_mkdir(path, 0755);
    jobject file = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"));
    jni_file_set_path(file, path);
    return file;
@@ -1645,55 +1601,6 @@ android_net_Uri_encode(JNIEnv *env, jobject object, va_list args)
    jstring str = va_arg(args, jstring);
    (*env)->GetStringUTFChars(env, str, NULL);
    return str;
-}
-
-jstring
-android_content_SharedPreferences_getString(JNIEnv *env, jobject object, va_list args)
-{
-   assert(env && object);
-   if (!args) return NULL;
-   jstring str1 = va_arg(args, jstring);
-   jstring str2 = va_arg(args, jstring);
-   (*env)->GetStringUTFChars(env, str1, NULL);
-   (*env)->GetStringUTFChars(env, str2, NULL);
-   return str2;
-}
-
-jint
-android_content_SharedPreferences_getInt(JNIEnv *env, jobject object, va_list args)
-{
-   assert(env && object);
-   if (!args) return 0;
-   va_arg(args, jstring); /* key */
-   return va_arg(args, jint); /* defVal */
-}
-
-jfloat
-android_content_SharedPreferences_getFloat(JNIEnv *env, jobject object, va_list args)
-{
-   assert(env && object);
-   return 0.0f;
-}
-
-jboolean
-android_content_SharedPreferences_getBoolean(JNIEnv *env, jobject object, va_list args)
-{
-   assert(env && object);
-   return JNI_FALSE;
-}
-
-jlong
-android_content_SharedPreferences_getLong(JNIEnv *env, jobject object, va_list args)
-{
-   assert(env && object);
-   return 0LL;
-}
-
-jboolean
-android_content_SharedPreferences_contains(JNIEnv *env, jobject object, va_list args)
-{
-   assert(env && object);
-   return JNI_FALSE;
 }
 
 jstring
@@ -2255,17 +2162,6 @@ android_os_Looper_getMainLooper(JNIEnv *env, jobject object, va_list args)
    return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "android/os/Looper"))));
 }
 
-/* Context.getSharedPreferences(String name, int mode) — PlayerPrefs storage.
- * Returns a stub; putInt/apply stubs prevent NPE on editor calls. */
-jobject
-android_content_Context_getSharedPreferences(JNIEnv *env, jobject object, va_list args)
-{
-   (void)object; (void)args;
-   static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env,
-               (*env)->FindClass(env, "android/content/SharedPreferences"))));
-}
-
 /* Context.getResources() → Resources → Configuration.
  *
  * Both UE (FAndroidMisc locale/orientation queries) and the Netmarble SDK walk
@@ -2374,34 +2270,6 @@ jint android_content_res_Configuration_touchscreen(JNIEnv *env, jobject o)
 jint android_content_res_Configuration_navigation(JNIEnv *env, jobject o)
 { (void)env; (void)o; return 1; }
 
-jobject
-android_content_SharedPreferences_edit(JNIEnv *env, jobject object, va_list args)
-{
-   (void)args;
-   static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env,
-               (*env)->FindClass(env, "android/content/SharedPreferences_Editor"))));
-}
-
-/* Editor.putInt / putBoolean / putString — fluent interface, return self. */
-jobject android_content_SharedPreferences_Editor_putInt(JNIEnv *env, jobject object, va_list args)     { (void)args; return object; }
-jobject android_content_SharedPreferences_Editor_putBoolean(JNIEnv *env, jobject object, va_list args) { (void)args; return object; }
-jobject android_content_SharedPreferences_Editor_putString(JNIEnv *env, jobject object, va_list args)  { (void)args; return object; }
-jobject android_content_SharedPreferences_Editor_putFloat(JNIEnv *env, jobject object, va_list args)   { (void)args; return object; }
-jobject android_content_SharedPreferences_Editor_putLong(JNIEnv *env, jobject object, va_list args)    { (void)args; return object; }
-jobject android_content_SharedPreferences_Editor_remove(JNIEnv *env, jobject object, va_list args)     { (void)args; return object; }
-
-void android_content_SharedPreferences_Editor_apply(JNIEnv *env, jobject object, va_list args)
-{
-   (void)env; (void)object; (void)args;
-}
-
-jboolean android_content_SharedPreferences_Editor_commit(JNIEnv *env, jobject object, va_list args)
-{
-   (void)env; (void)object; (void)args;
-   return 1;
-}
-
 /* Context.MODE_PRIVATE — static int constant (0).  Read via GetStaticIntField;
  * the default (0) is already correct, but provide it explicitly so the symbol
  * resolves and stops the "unimplemented symbol" probe each frame. */
@@ -2410,19 +2278,6 @@ android_content_Context_MODE_PRIVATE(JNIEnv *env, jobject object)
 {
    (void)env; (void)object;
    return 0;
-}
-
-/* SharedPreferences.getAll() → an (empty) Map stub.  Unity's PlayerPrefs
- * migration enumerates getAll().entrySet().iterator(); returning NULL made the
- * guest dispatch entrySet() on a null object → vtable load through a garbage
- * pointer → wild jump (e.g. 0x28000304).  An empty Map whose iterator reports
- * hasNext()==false lets the migration loop run zero iterations and continue. */
-jobject
-android_content_SharedPreferences_getAll(JNIEnv *env, jobject object, va_list args)
-{
-   assert(env && object); (void)args;
-   static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/util/Map"))));
 }
 
 /* ApplicationInfo.minSdkVersion / targetSdkVersion — int fields read by Unity's
@@ -2911,7 +2766,7 @@ void java_lang_Class_getMemoryInfo(JNIEnv *env, jobject obj, va_list args)
 { android_app_ActivityManager_getMemoryInfo(env, obj, args); }
 
 /* java.lang.StringBuilder is implemented in libjvm.so (jvm.c) so that
- * dlsym(RTLD_DEFAULT, …) always resolves within the same DSO. */
+ * luna_os_library_symbol(NULL, …) always resolves within the same DSO. */
 
 /* ---- android.content.pm.ActivityInfo screen orientation constants ---- */
 /* Android SDK values: UNSPECIFIED=-1 LANDSCAPE=0 PORTRAIT=1 REVERSE_LANDSCAPE=8
@@ -3193,15 +3048,6 @@ jstring java_lang_Object_READ_PHONE_STATE(JNIEnv *e, jobject o)
 { return android_Manifest_permission_READ_PHONE_STATE(e, o); }
 jstring java_lang_Class_READ_PHONE_STATE(JNIEnv *e, jobject o)
 { return android_Manifest_permission_READ_PHONE_STATE(e, o); }
-
-/* ---- java.util.HashMap.put(K,V) → returns null (new key) ---- */
-jobject
-java_util_HashMap_put(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return NULL; }
-jobject java_lang_Object_put(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return NULL; }
-jobject java_lang_Class_put(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return NULL; }
 
 /* Activity.isFinishing() — Netmarble cancelNotification / checkActivity.
  * Without a host stub the DVM reports a miss and treats the call as falsey

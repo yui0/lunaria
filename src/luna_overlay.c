@@ -29,7 +29,6 @@
 #include "luna_ime.h"
 #include "arm_exec.h"
 
-#include <dlfcn.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -141,22 +140,20 @@ void luna_app_request_redraw(void) { }
 static void *overlay_get_proc(const char *name)
 {
    void *p = (void *)eglGetProcAddress(name);
-   if (!p) p = dlsym(RTLD_DEFAULT, name);
+   if (!p) p = luna_os_library_symbol(NULL, name);
    if (getenv("LUNARIA_UI_TRACE_GLPROC")) {
-      static void *libgles, *libgl;
-      static bool opened;
-      if (!opened) {
-         opened = true;
-         libgles = dlopen("libGLESv2.so.2", RTLD_LAZY | RTLD_NOLOAD);
-         libgl = dlopen("libGL.so.1", RTLD_LAZY | RTLD_NOLOAD);
-      }
-      void *es = libgles ? dlsym(libgles, name) : NULL;
-      void *gl = libgl ? dlsym(libgl, name) : NULL;
+#ifdef _WIN32
+      const char *gles_module = "libGLESv2.dll", *gl_module = "opengl32.dll";
+#else
+      const char *gles_module = "libGLESv2.so.2", *gl_module = "libGL.so.1";
+#endif
+      void *es = luna_os_library_loaded_symbol(gles_module, name);
+      void *gl = luna_os_library_loaded_symbol(gl_module, name);
       static int n;
       if (n++ < 24)
          fprintf(stderr, "[overlay] proc %-28s egl=%p default=%p "
                  "gles=%p gl=%p%s\n", name, (void *)eglGetProcAddress(name),
-                 dlsym(RTLD_DEFAULT, name), es, gl,
+                 luna_os_library_symbol(NULL, name), es, gl,
                  (es && p != es) ? "  <== NOT the GLES symbol" : "");
    }
    return p;
@@ -532,15 +529,13 @@ static bool overlay_start(int w, int h)
 enum { OV_BOOT, OV_APP };
 static int g_screen = OV_APP;
 
-/* The boot card is published.  Deliberately *not* "and no guest window is
- * up": if the two were decided by different rules the screen could alternate
- * between them from frame to frame, and each flip is a reparse.  While the
- * card is published it is the screen; a guest window that arrives meanwhile
- * is drawn once the card comes down. */
+/* Android windows take priority even before the game's first frame: an
+ * error dialog may itself be what prevents that frame from ever arriving.
+ * Both presenters use this decision so the documents cannot alternate. */
 static bool overlay_boot_up(void)
 {
    pthread_mutex_lock(&g_doc_lock);
-   const bool up = g_status_html != NULL;
+   const bool up = g_status_html != NULL && g_html == NULL;
    pthread_mutex_unlock(&g_doc_lock);
    return up && !g_failed;
 }
@@ -863,6 +858,7 @@ static void overlay_present_screen(int w, int h, int screen)
     * only thing drawn; a guest swap that arrives meanwhile is presented as
     * the guest drew it, with nothing of the emulator's on top. */
    if (screen == OV_APP && overlay_boot_up()) return;
+   if (screen == OV_BOOT && luna_overlay_guest_window_up()) return;
    /* The emulator's UI has one owner: with a compositor, its thread. */
    if (atomic_load(&g_hosted) &&
        (!atomic_load(&g_host_thread_set) ||
@@ -1231,7 +1227,7 @@ float luna_overlay_line_height(float px)
  * The emulator's menu (right click)
  * ======================================================================== */
 
-enum { SUB_NONE, SUB_SOUND, SUB_ZOOM, SUB_ENGINE, SUB_KEYMAP };
+enum { SUB_NONE, SUB_SOUND, SUB_ZOOM, SUB_ENGINE, SUB_KEYMAP, SUB_RESOLUTION };
 
 #define MENU_W 248
 #define ROW_H 24
@@ -1244,6 +1240,46 @@ static bool   g_menu_open;
 static double g_menu_x, g_menu_y;
 static int    g_menu_w, g_menu_h;
 static int    g_menu_sub;
+static bool g_settings_open;
+struct resolution { int width, height; };
+static const struct resolution g_resolutions[] = {
+   {800, 450}, {1024, 576}, {1280, 720}, {1600, 900}, {1920, 1080}, {1024, 768}
+};
+static int g_settings_resolution = -1;
+static int g_saved_resolution = -1;
+static bool g_settings_loaded;
+static bool g_resolution_dirty;
+static void resolution_values(int index, int *width, int *height)
+{
+   *width = g_resolutions[index].width; *height = g_resolutions[index].height;
+   if (g_menu_h > g_menu_w) { int t = *width; *width = *height; *height = t; }
+}
+struct menu_setting { const char *key, *label; int value, initial; const int *choices; size_t count; };
+static const int ram_choices[] = {512, 1024, 2048, 4096, 6144, 8192, 12288, 16384};
+static const int cpu_choices[] = {1, 2, 4, 6, 8, 12, 16};
+static const int engine_choices[] = {0, 1, 2, 3, 4, 6, 8};
+static const int dpi_choices[] = {0, 160, 240, 320, 420, 480, 640};
+#define SETTING(key, label, choices) {key, label, 0, 0, choices, sizeof choices / sizeof choices[0]}
+static struct menu_setting g_settings[] = {
+   SETTING("LUNARIA_MEM_TOTAL_MB", "Memory reported to Android (MiB)", ram_choices),
+   SETTING("LUNARIA_CPU_COUNT", "CPU cores reported to Android", cpu_choices),
+   SETTING("LUNARIA_A64_ENGINES", "Parallel execution engines", engine_choices),
+   SETTING("LUNARIA_DPI", "Screen density (DPI)", dpi_choices),
+};
+#undef SETTING
+static void settings_load(void)
+{
+   g_settings_resolution = g_saved_resolution; g_resolution_dirty = false;
+   for (size_t i = 0; i < sizeof g_settings / sizeof g_settings[0]; ++i) {
+      struct menu_setting *v = &g_settings[i];
+      if (!g_settings_loaded) {
+         const char *env = getenv(v->key);
+         v->initial = env ? atoi(env) : i == 0 ? 6144 : i == 1 ? 4 : 0;
+      }
+      v->value = v->initial;
+   }
+   g_settings_loaded = true;
+}
 static char   g_menu_dev_name[MAX_DEVICES][128], g_menu_dev_desc[MAX_DEVICES][128];
 static int    g_menu_ndev;
 static char   g_menu_notice[256];
@@ -1282,7 +1318,7 @@ static void keyfiles_read(void)
       if (!g_keydir[0]) strcpy(g_keydir, "/");
    }
    char resolved[4096];
-   if (realpath(g_keydir, resolved)) snprintf(g_keydir, sizeof g_keydir, "%s", resolved);
+   if (luna_file_realpath(g_keydir, resolved, sizeof resolved)) snprintf(g_keydir, sizeof g_keydir, "%s", resolved);
    DIR *dir = opendir(g_keydir);
    g_keydir_error = !dir;
    if (!dir) return;
@@ -1409,7 +1445,7 @@ static int menu_clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi
 
 /* The main panel's rows; returns its height and the top of each submenu's
  * parent row. */
-static int menu_main_rows(struct menu_buf *b, int *sound_y, int *zoom_y, int *engine_y, int *keymap_y)
+static int menu_main_rows(struct menu_buf *b, int *sound_y, int *zoom_y, int *engine_y, int *keymap_y, int *resolution_y)
 {
    int y = PAD;
    char v[64];
@@ -1439,6 +1475,9 @@ static int menu_main_rows(struct menu_buf *b, int *sound_y, int *zoom_y, int *en
    y += menu_sep(b);
    y += menu_item(b, "full", arm_exec_is_fullscreen() ? "Exit Full Screen" : "Enter Full Screen",
              false, NULL);
+   *resolution_y = y;
+   y += menu_item(b, "sub-resolution", "Resolution", false, "\xe2\x80\xba");
+   y += menu_item(b, "settings", "Settings...", false, NULL);
    y += menu_item(b, "quit", "Quit Lunaria", false, NULL);
    return y + PAD;
 }
@@ -1447,7 +1486,15 @@ static int menu_sub_rows(struct menu_buf *b)
 {
    int y = PAD;
    char id[32];
-   if (g_menu_sub == SUB_KEYMAP) {
+   if (g_menu_sub == SUB_RESOLUTION) {
+      y += menu_header(b, "RESOLUTION");
+      for (size_t i = 0; i < sizeof g_resolutions / sizeof g_resolutions[0]; ++i) {
+         int width, height; char label[32]; resolution_values((int)i, &width, &height);
+         snprintf(id, sizeof id, "res-%zu", i);
+         snprintf(label, sizeof label, "%d x %d", width, height);
+         y += menu_item(b, id, label, width == g_menu_w && height == g_menu_h, NULL);
+      }
+   } else if (g_menu_sub == SUB_KEYMAP) {
       char current[4096]; luna_keymap_current(current, sizeof current);
       y += menu_header(b, "KEYMAP FILE");
       y += menu_item(b, "km-off", "Off", !strcmp(current, "off"), NULL);
@@ -1519,9 +1566,40 @@ static void menu_publish_locked(void)
       } else luna_overlay_set_menu(NULL, NULL, false);
       return;
    }
+   if (g_settings_open) {
+      struct menu_buf doc = {0};
+      const int width = g_menu_w < 488 ? g_menu_w - 16 : 472;
+      menu_put(&doc, "<div id=\"luna-menu-backdrop\"></div>");
+      menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;width:%dpx;\">",
+                (g_menu_w - width) / 2, menu_clampi((g_menu_h - 310) / 2, 8, g_menu_h), width);
+      menu_header(&doc, "SETTINGS — THIS APP");
+      menu_item(&doc, NULL, "Resolution applies now; other changes on restart.", false, NULL);
+      menu_sep(&doc);
+      for (size_t i = 0; i < sizeof g_settings / sizeof g_settings[0]; ++i) {
+         char id[32], value[32];
+         snprintf(id, sizeof id, "setting-%zu", i);
+         snprintf(value, sizeof value, "%d", g_settings[i].value);
+         menu_item(&doc, id, g_settings[i].label, false, g_settings[i].value ? value : "Automatic");
+      }
+      char resolution[32];
+      int rw = g_menu_w, rh = g_menu_h;
+      if (g_settings_resolution >= 0) resolution_values(g_settings_resolution, &rw, &rh);
+      snprintf(resolution, sizeof resolution, "%d x %d", rw, rh);
+      menu_item(&doc, "settings-resolution", "Resolution", false, resolution);
+      menu_item(&doc, NULL, "Click a value to choose the next preset.", false, NULL);
+      menu_item(&doc, NULL, "Global config / environment overrides take priority.", false, NULL);
+      menu_sep(&doc);
+      menu_item(&doc, "settings-save", "Save", false, NULL);
+      menu_item(&doc, "settings-cancel", "Cancel", false, NULL);
+      if (g_menu_notice[0]) menu_item(&doc, NULL, g_menu_notice, false, NULL);
+      menu_put(&doc, "</div>");
+      luna_overlay_set_menu(doc.p, g_menu_style, true);
+      free(doc.p);
+      return;
+   }
    struct menu_buf rows = { 0 }, sub = { 0 }, doc = { 0 };
-   int sound_y = 0, zoom_y = 0, engine_y = 0, keymap_y = 0;
-   const int h = menu_main_rows(&rows, &sound_y, &zoom_y, &engine_y, &keymap_y);
+   int sound_y = 0, zoom_y = 0, engine_y = 0, keymap_y = 0, resolution_y = 0;
+   const int h = menu_main_rows(&rows, &sound_y, &zoom_y, &engine_y, &keymap_y, &resolution_y);
    const int mx = menu_clampi((int)g_menu_x, 4, g_menu_w - MENU_W - 4 > 4 ? g_menu_w - MENU_W - 4 : 4);
    const int my = menu_clampi((int)g_menu_y, 4, g_menu_h - h - 4 > 4 ? g_menu_h - h - 4 : 4);
    menu_put(&doc, "<div id=\"luna-menu-backdrop\"></div>");
@@ -1529,7 +1607,7 @@ static void menu_publish_locked(void)
    menu_put(&doc, rows.p ? rows.p : "");
    menu_put(&doc, "</div>");
    if (g_menu_sub != SUB_NONE) {
-      const int parent_y = g_menu_sub == SUB_SOUND ? sound_y : g_menu_sub == SUB_ZOOM ? zoom_y : g_menu_sub == SUB_ENGINE ? engine_y : keymap_y;
+      const int parent_y = g_menu_sub == SUB_SOUND ? sound_y : g_menu_sub == SUB_ZOOM ? zoom_y : g_menu_sub == SUB_ENGINE ? engine_y : g_menu_sub == SUB_RESOLUTION ? resolution_y : keymap_y;
       const int sh = menu_sub_rows(&sub);
       /* To the right of the menu, the parent row at its first item; to the
        * left when that would leave the surface. */
@@ -1589,8 +1667,8 @@ static void menu_screenshot_path(char *out, size_t cap)
    if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode))
       snprintf(dir, sizeof dir, "%s", home && *home ? home : ".");
    time_t t = time(NULL);
-   struct tm tm;
-   localtime_r(&t, &tm);
+   struct tm tm = {0};
+   luna_localtime(&t, &tm);
    snprintf(out, cap, "%s/Lunaria %04d-%02d-%02d %02d.%02d.%02d.png", dir,
             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
@@ -1599,18 +1677,17 @@ static void menu_screenshot_path(char *out, size_t cap)
  * lunaria.conf.  Lines outside any block are common and win the next launch;
  * this only records what that app chose.  value == NULL drops the key, which
  * is how "follow the device density" is stored: the name is simply absent. */
-static void menu_conf_set(const char *key, const char *value)
+static bool menu_conf_write(const char *key, const char *value, bool apply)
 {
    const char *pkg = getenv("ANDROID_PACKAGE_NAME");
    const char *path = getenv("LUNARIA_CONF");
    char **lines = NULL;
    int n = 0, cap = 0, sec = -1, end = -1, hit = -1, i, bad = 0;
+   bool saved = false;
    FILE *in;
-   if (!pkg || !*pkg || !path || !*path || !key || !*key) return;
-   if (strchr(pkg, '\n') || strchr(pkg, ']') || strchr(key, '\n') || strchr(key, '=')) return;
-   if (value && (strchr(value, '\n') || strchr(value, '\r'))) return;
-   if (value) setenv(key, value, 1);
-   else unsetenv(key);
+   if (!pkg || !*pkg || !path || !*path || !key || !*key) return false;
+   if (strchr(pkg, '\n') || strchr(pkg, ']') || strchr(key, '\n') || strchr(key, '=')) return false;
+   if (value && (strchr(value, '\n') || strchr(value, '\r'))) return false;
 
    in = fopen(path, "r");
    if (in) {
@@ -1732,11 +1809,34 @@ static void menu_conf_set(const char *key, const char *value)
       if (fclose(out) != 0 || rename(tmp, path) != 0) {
          unlink(tmp);
          fprintf(stderr, "[menu] cannot replace %s\n", path);
-      }
+      } else saved = true;
    }
 done:
    for (i = 0; i < n; ++i) free(lines[i]);
    free(lines);
+   if (saved && apply) {
+      if (value) luna_os_setenv(key, value, 1);
+      else luna_os_unsetenv(key);
+   }
+   return saved;
+}
+
+static void menu_conf_set(const char *key, const char *value)
+{
+   if (!menu_conf_write(key, value, true)) menu_notice_locked("Cannot save settings");
+}
+
+static bool resolution_save(int index)
+{
+   int width, height; char w[16], h[16]; resolution_values(index, &width, &height);
+   snprintf(w, sizeof w, "%d", width); snprintf(h, sizeof h, "%d", height);
+   bool saved_w = menu_conf_write("LUNARIA_WIDTH", w, false);
+   bool saved_h = menu_conf_write("LUNARIA_HEIGHT", h, false);
+   if (saved_w && saved_h) {
+      g_saved_resolution = index;
+      arm_exec_request_view_resize(width, height);
+   }
+   return saved_w && saved_h;
 }
 
 static void menu_clicked(const char *id)
@@ -1746,7 +1846,47 @@ static void menu_clicked(const char *id)
    if (*id == '-') ++id;
    pthread_mutex_lock(&g_menu_lock);
    bool keep_open = false;
-   if (!strcmp(id, "backdrop")) {
+   if (!strcmp(id, "settings")) {
+      settings_load(); g_settings_open = true; g_menu_sub = SUB_NONE; keep_open = true;
+   } else if (!strncmp(id, "setting-", 8)) {
+      char *end = NULL; long i = strtol(id + 8, &end, 10);
+      if (g_settings_open && end != id + 8 && !*end && i >= 0 && (size_t)i < sizeof g_settings / sizeof g_settings[0]) {
+         struct menu_setting *v = &g_settings[i];
+         size_t next = 0;
+         while (next < v->count && v->choices[next] <= v->value) ++next;
+         v->value = v->choices[next == v->count ? 0 : next];
+      }
+      keep_open = true;
+   } else if (!strcmp(id, "settings-resolution")) {
+      g_settings_resolution = (g_settings_resolution + 1) % (sizeof g_resolutions / sizeof g_resolutions[0]);
+      g_resolution_dirty = true; keep_open = true;
+   } else if (!strncmp(id, "res-", 4)) {
+      char *end = NULL; long i = strtol(id + 4, &end, 10);
+      if (end != id + 4 && !*end && i >= 0 && (size_t)i < sizeof g_resolutions / sizeof g_resolutions[0]) {
+         bool saved = resolution_save((int)i);
+         menu_notice_locked(saved ? "Resolution changed and saved." : "Cannot save resolution");
+         keep_open = !saved;
+      }
+   } else if (!strcmp(id, "settings-save")) {
+      bool saved = true, restart_required = false;
+      for (size_t i = 0; i < sizeof g_settings / sizeof g_settings[0]; ++i) {
+         struct menu_setting *v = &g_settings[i]; char value[32];
+         if (v->value == v->initial) continue;
+         restart_required = true;
+         snprintf(value, sizeof value, "%d", v->value);
+         if (menu_conf_write(v->key, v->value ? value : NULL, false)) v->initial = v->value;
+         else saved = false;
+      }
+      if (g_resolution_dirty) {
+         if (resolution_save(g_settings_resolution)) g_resolution_dirty = false;
+         else saved = false;
+      }
+      g_settings_open = !saved; keep_open = !saved;
+      menu_notice_locked(saved ? (restart_required ? "Settings saved. Restart to apply hardware settings." : "Settings saved. Resolution applies now.") : "Cannot save settings; check lunaria.conf");
+   } else if (!strcmp(id, "settings-cancel")) {
+      g_settings_open = false;
+   } else if (!strcmp(id, "backdrop")) {
+      g_settings_open = false;
       /* a click outside: close (a submenu first) */
       if (g_menu_sub != SUB_NONE) { g_menu_sub = SUB_NONE; keep_open = true; }
    } else if (!strcmp(id, "shot")) {
@@ -1779,7 +1919,7 @@ static void menu_clicked(const char *id)
       menu_notice_locked(luna_os_audio_muted() ? "Sound muted" : "Sound on");
    } else if (!strncmp(id, "sub-", 4)) {
       const int sub = !strcmp(id + 4, "sound") ? SUB_SOUND : !strcmp(id + 4, "zoom") ? SUB_ZOOM
-                    : !strcmp(id + 4, "keymap") ? SUB_KEYMAP : SUB_ENGINE;
+                    : !strcmp(id + 4, "keymap") ? SUB_KEYMAP : !strcmp(id + 4, "resolution") ? SUB_RESOLUTION : SUB_ENGINE;
       g_menu_sub = g_menu_sub == sub ? SUB_NONE : sub;
       if (g_menu_sub == SUB_KEYMAP) keyfiles_read();
       if (g_menu_sub == SUB_SOUND) g_menu_ndev = luna_os_audio_devices(g_menu_dev_name, g_menu_dev_desc, MAX_DEVICES);
@@ -1866,6 +2006,7 @@ void luna_menu_open(double x, double y, int w, int h)
    luna_overlay_set_menu_handler(menu_clicked);
    pthread_mutex_lock(&g_menu_lock);
    g_menu_open = true;
+   g_settings_open = false;
    g_menu_sub = SUB_NONE;
    g_menu_x = x;
    g_menu_y = y;
@@ -1879,6 +2020,7 @@ void luna_menu_close(void)
 {
    pthread_mutex_lock(&g_menu_lock);
    g_menu_open = false;
+   g_settings_open = false;
    g_menu_sub = SUB_NONE;
    menu_publish_locked();
    pthread_mutex_unlock(&g_menu_lock);

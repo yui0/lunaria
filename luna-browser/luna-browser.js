@@ -518,7 +518,7 @@ const escAttr = s => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
 
 class Element extends Node {
    get nodeType() { return 1; }
-   get localName() { return this._uid ? L.tag(this._uid).toLowerCase() : this._tag; }
+   get localName() { return this._uid ? (L.tag(this._uid) || this._tag || '').toLowerCase() : this._tag; }
    get tagName() { return this.localName.toUpperCase(); }
    get nodeName() { return this.tagName; }
    get namespaceURI() { return 'http://www.w3.org/1999/xhtml'; }
@@ -527,10 +527,12 @@ class Element extends Node {
       if (!this._uid) return null;
       const p = L.parent(this._uid);
       if (p) return W(p);
-      if (this.localName === 'body' && L.connected(this._uid)) return document.documentElement;
+      if ((this.localName === 'body' || this.localName === 'head') && L.connected(this._uid)) return document.documentElement;
       return null;
    }
    get childNodes() {
+      if (!this._uid && this === document.documentElement)
+         return list([document.head, document.body].filter(Boolean));
       const out = this._uid ? L.children(this._uid).map(W) : [];
       if (this._uid && !out.length && !this._vkids) {
          const t = L.text(this._uid);
@@ -654,22 +656,30 @@ class Element extends Node {
    getClientRects() { const r = this.getBoundingClientRect(); return r.width || r.height ? [r] : []; }
    get offsetWidth() { return Math.round(this.getBoundingClientRect().width); }
    get offsetHeight() { return Math.round(this.getBoundingClientRect().height); }
-   get offsetLeft() { return Math.round(this.getBoundingClientRect().x); }
-   get offsetTop() { return Math.round(this.getBoundingClientRect().y); }
-   get offsetParent() { return this.isConnected ? document.body : null; }
-   get clientWidth() { return this.offsetWidth; }
-   get clientHeight() { return this.offsetHeight; }
+   get offsetLeft() { return this._uid ? Math.round(L.offset(this._uid)[0]) : 0; }
+   get offsetTop() { return this._uid ? Math.round(L.offset(this._uid)[1]) : 0; }
+   get offsetParent() { return this._uid ? W(L.offset(this._uid)[2]) : null; }
+   get clientWidth() { return this === document.documentElement ? g.innerWidth : this.offsetWidth; }
+   get clientHeight() { return this === document.documentElement ? g.innerHeight : this.offsetHeight; }
    get clientLeft() { return 0; } get clientTop() { return 0; }
-   get scrollTop() { return this._uid ? L.scroll(this._uid)[0] : 0; }
-   set scrollTop(v) { if (this._uid) L.scroll(this._uid, +v || 0); }
-   get scrollLeft() { return this._uid ? L.scroll(this._uid)[1] : 0; }
-   set scrollLeft(v) { if (this._uid) L.scroll(this._uid, undefined, +v || 0); }
-   get scrollHeight() { return this._uid ? Math.max(L.scroll(this._uid)[2], this.clientHeight) : 0; }
-   get scrollWidth() { return this._uid ? Math.max(L.scroll(this._uid)[3], this.clientWidth) : 0; }
-   scrollTo(x, y) { if (typeof x === 'object') { y = x.top; x = x.left; } if (this._uid) L.scroll(this._uid, y, x); }
+   get scrollTop() { if (this === document.documentElement) return g.scrollY; return this._uid ? L.scroll(this._uid)[0] : 0; }
+   set scrollTop(v) { if (this === document.documentElement) { g.scrollTo(undefined, v); return; } if (this._uid) L.scroll(this._uid, +v || 0); }
+   get scrollLeft() { if (this === document.documentElement) return g.scrollX; return this._uid ? L.scroll(this._uid)[1] : 0; }
+   set scrollLeft(v) { if (this === document.documentElement) { g.scrollTo(v, undefined); return; } if (this._uid) L.scroll(this._uid, undefined, +v || 0); }
+   get scrollHeight() { if (this === document.documentElement) return L.documentScroll()[3]; return this._uid ? Math.max(L.scroll(this._uid)[2], this.clientHeight) : 0; }
+   get scrollWidth() { if (this === document.documentElement) return L.documentScroll()[2]; return this._uid ? Math.max(L.scroll(this._uid)[3], this.clientWidth) : 0; }
+   scrollTo(x, y) { if (this === document.documentElement) return g.scrollTo(x, y); if (typeof x === 'object') { y = x.top; x = x.left; } if (this._uid) L.scroll(this._uid, y, x); }
    scroll(x, y) { this.scrollTo(x, y); }
    scrollBy(x, y) { if (typeof x === 'object') { y = x.top; x = x.left; } this.scrollTo((this.scrollLeft + (x || 0)), (this.scrollTop + (y || 0))); }
-   scrollIntoView() {}
+   scrollIntoView(options) {
+      if (!this.isConnected) return;
+      const r = this.getBoundingClientRect();
+      const end = options === false || options && options.block === 'end';
+      const nearest = options && options.block === 'nearest';
+      let dy = end ? r.bottom - g.innerHeight : r.top;
+      if (nearest) dy = r.top < 0 ? r.top : r.bottom > g.innerHeight ? r.bottom - g.innerHeight : 0;
+      g.scrollBy(0, dy);
+   }
    focus() { if (this._uid) L.focus(this._uid); syncFocus(); }
    blur() { if (this._uid && L.focus() === this._uid) L.focus(0); syncFocus(); }
    click() { const e = new MouseEvent('click', { bubbles: true, cancelable: true }); if (dispatch(this, e)) activate(this); }
@@ -759,7 +769,7 @@ class HTMLInputElement extends HTMLElement {
    get value() { return this._uid ? L.value(this._uid) : this.getAttribute('value') || ''; }
    set value(v) { if (this._uid) L.value(this._uid, String(v)); else this.setAttribute('value', v); }
    get checked() { return this._checked !== undefined ? this._checked : this.hasAttribute('checked'); }
-   set checked(v) { hide(this, '_checked', !!v); }
+   set checked(v) { hide(this, '_checked', !!v); if (this._uid) L.setChecked(this._uid, !!v); }
    get defaultValue() { return this.getAttribute('value') || ''; }
    get form() { return this.closest('form'); }
    select() { this.focus(); }
@@ -805,15 +815,34 @@ for (const k of ['protocol', 'host', 'hostname', 'port', 'pathname', 'search', '
    });
 }
 class HTMLImageElement extends HTMLElement {
-   get complete() { return true; }
-   get naturalWidth() { return this.offsetWidth; } get naturalHeight() { return this.offsetHeight; }
-   decode() { return Promise.resolve(); }
+   get complete() { return this._pending !== true; }
+   get naturalWidth() { return this._nw || 0; } get naturalHeight() { return this._nh || 0; }
+   get currentSrc() { return this.src; }
+   decode() { return this._pending ? new Promise((res, rej) => { const done = () => { this._pending ? setTimeout(done, 5) : res(); }; done(); }) : Promise.resolve(); }
+   setAttribute(n, v) {
+      super.setAttribute(n, v);
+      if (String(n).toLowerCase() === 'src') this._startLoad();
+   }
+   /* The picture is read (the page cache usually has it already); load or
+    * error fires after the script that set src has finished. */
+   _startLoad() {
+      const src = this.getAttribute('src');
+      hide(this, '_pending', true);
+      const token = (this._tok = (this._tok || 0) + 1);
+      setTimeout(() => {
+         if (token !== this._tok) return;
+         const sz = src ? L.imageSize(src) : null;
+         hide(this, '_pending', false);
+         if (sz) { hide(this, '_nw', sz[0]); hide(this, '_nh', sz[1]); this.dispatchEvent(new Event('load')); }
+         else this.dispatchEvent(new Event('error'));
+      }, 0);
+   }
 }
 reflect(HTMLImageElement, [['src', 'src', 'u'], 'alt', ['width', 'width', 'n'], ['height', 'height', 'n'], 'srcset', 'loading', 'crossOrigin']);
 Object.defineProperty(HTMLImageElement.prototype, 'src', {
    configurable: true,
    get() { const v = this.getAttribute('src'); return v === null ? '' : L.resolve(v) || v; },
-   set(v) { this.setAttribute('src', v); setTimeout(() => this.dispatchEvent(new Event('load')), 0); },
+   set(v) { this.setAttribute('src', v); },
 });
 class HTMLFormElement extends HTMLElement {
    get elements() { return this.querySelectorAll('input,select,textarea,button'); }
@@ -920,7 +949,8 @@ class Document extends Node {
    get nodeName() { return '#document'; }
    get parentNode() { return null; }
    get documentElement() { return this._html; }
-   get head() { return this._head; }
+   get scrollingElement() { return this._html; }
+   get head() { return W(L.query(0, 'head', false)) || this._head; }
    get body() { return W(L.body()); }
    set body(v) {}
    get childNodes() { return list([this._html]); }
@@ -934,6 +964,7 @@ class Document extends Node {
    get baseURI() { return L.url(); }
    get domain() { return location.hostname; }
    get referrer() { return ''; }
+   get lastModified() { if (!this._lastModified) { const d = new Date(), p = n => String(n).padStart(2, '0'); this._lastModified = `${p(d.getMonth()+1)}/${p(d.getDate())}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; } return this._lastModified; }
    get cookie() { return L.cookie(); } set cookie(v) { L.cookie(String(v)); }
    get characterSet() { return 'UTF-8'; } get charset() { return 'UTF-8'; } get inputEncoding() { return 'UTF-8'; }
    get contentType() { return 'text/html'; }
@@ -947,21 +978,40 @@ class Document extends Node {
    get links() { return this.querySelectorAll('a[href]'); }
    get fonts() { return { ready: Promise.resolve(), status: 'loaded', addEventListener() {}, check() { return true; }, load() { return Promise.resolve([]); }, add() {} }; }
    get location() { return location; } set location(v) { location.href = v; }
-   get implementation() { return { createHTMLDocument: () => document, hasFeature: () => true }; }
+   get implementation() {
+      /* A scratch document (jQuery.parseHTML, DOMPurify): its own detached
+       * html/head/body, never the page's, so writing to it cannot touch the page. */
+      const make = (title) => {
+         const d = Object.create(document);
+         const html = document.createElement('div'), head = document.createElement('div'), body = document.createElement('div');
+         html.appendChild(head); html.appendChild(body);
+         Object.defineProperties(d, {
+            documentElement: { value: html }, head: { value: head }, body: { value: body },
+            title: { value: String(title || ''), writable: true },
+            querySelector: { value: (q) => html.querySelector(q) },
+            querySelectorAll: { value: (q) => html.querySelectorAll(q) },
+            getElementById: { value: (id) => html.querySelector('#' + CSS.escape(String(id))) },
+            getElementsByTagName: { value: (t) => html.querySelectorAll(String(t)) },
+            _scratch: { value: true },
+         });
+         return d;
+      };
+      return { createHTMLDocument: make, createDocument: () => make(''), hasFeature: () => true };
+   }
    get styleSheets() { return []; }
    hasFocus() { return true; }
-   getElementById(id) { return W(L.byId(String(id))) || vquery(this._head, '#' + id, false)[0] || null; }
+   getElementById(id) { return W(L.byId(String(id))) || vquery(this.head, '#' + id, false)[0] || null; }
    getElementsByName(n) { return this.querySelectorAll('[name="' + String(n).replace(/"/g, '\\"') + '"]'); }
    querySelector(s) { return W(L.query(0, String(s), false)) || vquery(this._html, s, false)[0] || null; }
    querySelectorAll(s) {
       const r = L.query(0, String(s), true).map(W);
-      for (const v of vquery(this._head, s, true)) if (!r.includes(v)) r.push(v);
+      for (const v of vquery(this.head, s, true)) if (!r.includes(v)) r.push(v);
       return list(r);
    }
    getElementsByClassName(c) { return this.querySelectorAll(String(c).trim().split(/\s+/).map(x => '.' + CSS.escape(x)).join('')); }
    getElementsByTagName(t) {
       t = String(t).toLowerCase();
-      if (t === 'head') return list([this._head]);
+      if (t === 'head') return list([this.head]);
       if (t === 'html') return list([this._html]);
       return this.querySelectorAll(t === '*' ? '*' : t);
    }
@@ -991,9 +1041,17 @@ class Document extends Node {
    elementFromPoint(x, y) { return this.body; }
    open() { return this; } close() {}
    write(...s) {
-      /* After load the document is replaced; during it, content is appended. */
-      const b = this.body;
-      if (b) b.insertAdjacentHTML('beforeend', s.join(''));
+      const script = this.currentScript;
+      if (script && script.parentNode) {
+         const anchor = this._writeScript === script ? this._writeTail : script;
+         const next = anchor.nextSibling;
+         anchor.insertAdjacentHTML('afterend', s.join(''));
+         this._writeScript = script;
+         this._writeTail = next ? next.previousSibling : anchor.parentNode.lastChild;
+      } else {
+         const b = this.body;
+         if (b) b.insertAdjacentHTML('beforeend', s.join(''));
+      }
    }
    writeln(...s) { this.write(...s, '\n'); }
 }
@@ -1005,6 +1063,7 @@ g.document = document;
 /* ---------------------------------------------------------------- window */
 
 g.window = g; g.self = g; g.top = g; g.parent = g; g.frames = g; g.opener = null;
+for (const k of ['onload', 'onerror', 'onresize', 'onfocus', 'onblur', 'onscroll', 'onbeforeunload', 'onunload']) g[k] = null;
 g.name = ''; g.closed = false; g.length = 0; g.frameElement = null;
 for (const k of ['addEventListener', 'removeEventListener', 'dispatchEvent'])
    g[k] = EventTarget.prototype[k];
@@ -1013,8 +1072,8 @@ Object.defineProperties(g, {
    innerHeight: { get: () => L.viewport()[1], configurable: true },
    outerWidth: { get: () => L.viewport()[0], configurable: true },
    outerHeight: { get: () => L.viewport()[1], configurable: true },
-   scrollX: { get: () => 0, configurable: true }, scrollY: { get: () => 0, configurable: true },
-   pageXOffset: { get: () => 0, configurable: true }, pageYOffset: { get: () => 0, configurable: true },
+   scrollX: { get: () => L.documentScroll()[0], configurable: true }, scrollY: { get: () => L.documentScroll()[1], configurable: true },
+   pageXOffset: { get: () => L.documentScroll()[0], configurable: true }, pageYOffset: { get: () => L.documentScroll()[1], configurable: true },
    screenX: { value: 0, configurable: true }, screenY: { value: 0, configurable: true },
    isSecureContext: { get: () => /^(https:|file:|about:)/.test(L.url()) || /^http:\/\/(localhost|127\.)/.test(L.url()), configurable: true },
    origin: { get: () => location.origin, configurable: true },
@@ -1026,8 +1085,8 @@ g.screen = {
    colorDepth: 24, pixelDepth: 24,
    orientation: { get type() { const v = L.viewport(); return v[0] >= v[1] ? 'landscape-primary' : 'portrait-primary'; }, angle: 0, addEventListener() {}, removeEventListener() {}, lock: () => Promise.resolve() },
 };
-g.scrollTo = g.scroll = (x, y) => { const b = document.body; if (b) b.scrollTo(x, y); };
-g.scrollBy = (x, y) => { const b = document.body; if (b) b.scrollBy(x, y); };
+g.scrollTo = g.scroll = (x, y) => { if (typeof x === 'object') { y = x.top; x = x.left; } L.documentScroll(x, y); };
+g.scrollBy = (x, y) => { if (typeof x === 'object') { y = x.top; x = x.left; } g.scrollTo(g.scrollX + (+x || 0), g.scrollY + (+y || 0)); };
 g.alert = m => L.log('info', 'alert: ' + m);
 g.confirm = m => { L.log('info', 'confirm: ' + m); return true; };
 g.prompt = (m, d) => { L.log('info', 'prompt: ' + m); return d === undefined ? null : d; };
@@ -1036,7 +1095,7 @@ g.focus = () => {}; g.blur = () => {}; g.stop = () => {};
 g.close = () => { g.closed = true; };
 g.open = (u) => { if (u) location.assign(u); return null; };
 g.postMessage = (data, origin) => setTimeout(() => dispatch(g, new MessageEvent('message', { data, origin: location.origin, source: g })), 0);
-g.getSelection = () => ({ rangeCount: 0, toString: () => '', removeAllRanges() {}, addRange() {}, getRangeAt() { return document.createRange(); }, collapse() {} });
+g.getSelection = () => ({ rangeCount: 0, toString: () => L.selection(), removeAllRanges() {}, addRange() {}, getRangeAt() { return document.createRange(); }, collapse() {} });
 g.getComputedStyle = (el) => {
    const decl = el && el.style ? el.style : styleProxy(document.createElement('div'));
    return new Proxy(decl, {
@@ -1803,6 +1862,9 @@ g.__lb_key = function (type, key, code) {
    return !ok;
 };
 g.__lb_resize = function () { dispatch(g, new UIEvent('resize')); };
+let parserScripts = [];
+g.__lb_parser_scripts = function () { parserScripts = Array.from(document.scripts); };
+g.__lb_current_script = function (index) { document._current = parserScripts[index] || null; };
 g.__lb_ready = function (stage) {
    if (stage === 1) {
       document._ready = 'interactive';

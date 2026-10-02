@@ -1,13 +1,124 @@
 /* SPDX-License-Identifier: MPL-2.0 */
-/* Diagnostic only: create the LUNARIA_UNIFORM_DUMP marker to capture four
- * frames. Remove/recreate it to capture again. Never modifies guest data. */
-#include "luna_gl_inspect.h"
+/* Host-side services for the emulator core: fd readiness notification and the
+ * GL draw inspector.  Neither holds guest state. */
+#include "luna_host.h"
+#include <errno.h>
 #include <GLES3/gl3.h>
 #include <EGL/egl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+/* ---- fd readiness monitor ---- */
+#ifdef __linux__
+#include <pthread.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <time.h>
+#include <limits.h>
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t thread;
+static int epfd = -1, wakefd = -1, stopping;
+static struct pollfd *watched;
+static size_t watched_count;
+static int64_t deadline = INT64_MAX;
+static void (*on_ready)(void);
+static void notify(void) { uint64_t one = 1; (void)write(wakefd, &one, sizeof one); }
+static int64_t now_ms(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+static void *run(void *unused) {
+    (void)unused;
+    for (;;) {
+        int timeout = -1;
+        pthread_mutex_lock(&lock);
+        int stop = stopping;
+        if (deadline != INT64_MAX) {
+            int64_t left = deadline - now_ms();
+            timeout = left <= 0 ? 0 : left > INT_MAX ? INT_MAX : (int)left;
+        }
+        pthread_mutex_unlock(&lock);
+        if (stop) break;
+        struct epoll_event events[16];
+        int n = epoll_wait(epfd, events, 16, timeout);
+        if (n < 0) { if (errno == EINTR) continue; break; }
+        int ready = n == 0;
+        for (int i = 0; i < n; ++i) {
+            if (events[i].data.fd == wakefd) {
+                uint64_t value; while (read(wakefd, &value, sizeof value) > 0) {}
+            } else ready = 1;
+        }
+        if (ready) on_ready();
+    }
+    return NULL;
+}
+int luna_fd_monitor_start(void (*ready)(void)) {
+    if (epfd >= 0) return 0;
+    epfd = epoll_create1(EPOLL_CLOEXEC);
+    wakefd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (epfd < 0 || wakefd < 0) goto fail;
+    struct epoll_event event = {.events = EPOLLIN, .data.fd = wakefd};
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, wakefd, &event)) goto fail;
+    stopping = 0; deadline = INT64_MAX; on_ready = ready;
+    int error = pthread_create(&thread, NULL, run, NULL);
+    if (error) { errno = error; goto fail; }
+    return 0;
+fail:
+    { int error = errno;
+      if (epfd >= 0) close(epfd);
+      if (wakefd >= 0) close(wakefd);
+      epfd = wakefd = -1; errno = error; return -1; }
+}
+int luna_fd_monitor_update(const struct pollfd *fds, size_t count, int64_t due) {
+    if (epfd < 0) { errno = ENOSYS; return -1; }
+    struct pollfd *next = count ? malloc(count * sizeof *next) : NULL;
+    if (count && !next) return -1;
+    size_t n = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (fds[i].fd < 0) continue;
+        size_t j;
+        for (j = 0; j < n && next[j].fd != fds[i].fd; ++j) {}
+        if (j == n) { next[n] = fds[i]; next[n++].revents = 0; }
+        else next[j].events |= fds[i].events;
+    }
+    pthread_mutex_lock(&lock);
+    for (size_t i = 0; i < watched_count; ++i) {
+        size_t j;
+        for (j = 0; j < n && next[j].fd != watched[i].fd; ++j) {}
+        if (j == n) (void)epoll_ctl(epfd, EPOLL_CTL_DEL, watched[i].fd, NULL);
+    }
+    int failed = 0;
+    for (size_t i = 0; i < n; ++i) {
+        struct epoll_event event = {.events = (uint16_t)next[i].events | EPOLLONESHOT,
+                                   .data.fd = next[i].fd};
+        if (epoll_ctl(epfd, EPOLL_CTL_MOD, next[i].fd, &event) &&
+            epoll_ctl(epfd, EPOLL_CTL_ADD, next[i].fd, &event)) failed = 1;
+    }
+    free(watched); watched = next; watched_count = n; deadline = due;
+    notify();
+    pthread_mutex_unlock(&lock);
+    return failed ? -1 : 0;
+}
+void luna_fd_monitor_stop(void) {
+    if (epfd < 0) return;
+    pthread_mutex_lock(&lock); stopping = 1; notify(); pthread_mutex_unlock(&lock);
+    pthread_join(thread, NULL);
+    close(epfd); close(wakefd); epfd = wakefd = -1;
+    free(watched); watched = NULL; watched_count = 0;
+}
+#else
+int luna_fd_monitor_start(void (*ready)(void)) { (void)ready; errno = ENOSYS; return -1; }
+int luna_fd_monitor_update(const struct pollfd *fds, size_t count, int64_t due) {
+    (void)fds; (void)count; (void)due; errno = ENOSYS; return -1;
+}
+void luna_fd_monitor_stop(void) {}
+#endif
+
+/* ---- GL draw inspector ---- */
+/* Diagnostic only: create the LUNARIA_UNIFORM_DUMP marker to capture four
+ * frames. Remove/recreate it to capture again. Never modifies guest data. */
 struct block_sample { unsigned char *bytes; GLint length; };
 static void inspect_draw_state(GLuint program, GLint fbo)
 {

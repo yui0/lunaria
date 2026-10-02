@@ -42,8 +42,11 @@ static bool FPMulAdd32Fast(u32 addend, u32 op1, u32 op2, FPCR fpcr,
 #endif
     constexpr u32 exp_mask = FPInfo<u32>::exponent_mask;
     for (const u32 bits : {addend, op1, op2}) {
+        // Zero is exact in binary64 and needs no special case; subnormals,
+        // infinities and NaNs take the exact path.
         const u32 exponent = bits & exp_mask;
-        if (exponent == 0 || exponent == exp_mask) {
+        if (exponent == exp_mask ||
+            (exponent == 0 && (bits & FPInfo<u32>::mantissa_mask) != 0)) {
             return false;
         }
     }

@@ -50,6 +50,7 @@
 #include <unistd.h>
 
 #include "jvm.h"
+#include "lunaria_os.h"
 #include "arm_exec.h"
 
 /* ApplicationInfo.flags, as the framework defines them.  The ledger stores the
@@ -150,7 +151,7 @@ static const char *guest_root(void)
       const char *r = getenv("LUNARIA_GUEST_ROOT");
       if (!r || !*r) r = "/tmp/lunaria-guest-root";
       snprintf(root, sizeof root, "%s", r);
-      (void)mkdir(root, 0755);
+      (void)luna_file_mkdir(root, 0755);
    }
    return root;
 }
@@ -160,10 +161,10 @@ static void mkdir_p(char *path)
    for (char *p = path + 1; *p; ++p) {
       if (*p != '/') continue;
       *p = '\0';
-      (void)mkdir(path, 0755);
+      (void)luna_file_mkdir(path, 0755);
       *p = '/';
    }
-   (void)mkdir(path, 0755);
+   (void)luna_file_mkdir(path, 0755);
 }
 
 /* A package's APK, as far as anything outside its own installer can tell, is a

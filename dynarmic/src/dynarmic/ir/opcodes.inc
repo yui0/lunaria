@@ -115,8 +115,9 @@ OPCODE(LogicalShiftRight32,                                 U32,            U32,
 OPCODE(LogicalShiftRight64,                                 U64,            U64,            U8                                              )
 OPCODE(ArithmeticShiftRight32,                              U32,            U32,            U8,             U1                              )
 OPCODE(ArithmeticShiftRight64,                              U64,            U64,            U8                                              )
-OPCODE(RotateRight32,                                       U32,            U32,            U8,             U1                              )
-OPCODE(RotateRight64,                                       U64,            U64,            U8                                              )
+// Use names that cannot collide with Windows' RotateRight32/64 macros.
+OPCODE(Ror32,                                               U32,            U32,            U8,             U1                              )
+OPCODE(Ror64,                                               U64,            U64,            U8                                              )
 OPCODE(RotateRightExtended,                                 U32,            U32,            U1                                              )
 OPCODE(LogicalShiftLeftMasked32,                            U32,            U32,            U32                                             )
 OPCODE(LogicalShiftLeftMasked64,                            U64,            U64,            U64                                             )

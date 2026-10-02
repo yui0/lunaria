@@ -168,7 +168,7 @@ ResultAndCarry<U32> IREmitter::ArithmeticShiftRight(const U32& value_in, const U
 }
 
 ResultAndCarry<U32> IREmitter::RotateRight(const U32& value_in, const U8& shift_amount, const U1& carry_in) {
-    const auto result = Inst<U32>(Opcode::RotateRight32, value_in, shift_amount, carry_in);
+    const auto result = Inst<U32>(Opcode::Ror32, value_in, shift_amount, carry_in);
     const auto carry_out = Inst<U1>(Opcode::GetCarryFromOp, result);
     return {result, carry_out};
 }
@@ -205,9 +205,9 @@ U32U64 IREmitter::ArithmeticShiftRight(const U32U64& value_in, const U8& shift_a
 
 U32U64 IREmitter::RotateRight(const U32U64& value_in, const U8& shift_amount) {
     if (value_in.GetType() == Type::U32) {
-        return Inst<U32>(Opcode::RotateRight32, value_in, shift_amount, Imm1(0));
+        return Inst<U32>(Opcode::Ror32, value_in, shift_amount, Imm1(0));
     } else {
-        return Inst<U64>(Opcode::RotateRight64, value_in, shift_amount);
+        return Inst<U64>(Opcode::Ror64, value_in, shift_amount);
     }
 }
 

@@ -24,7 +24,7 @@
  *
  * UTF-8, ISO-8859-1, US-ASCII and the UTF-16 family are done here; every
  * other charset (GBK, Shift_JIS, EUC-KR, Big5, windows-125x …) goes through
- * ICU's converters, which is what Android's own charsets are.
+ * the platform code-page API on Windows and iconv on Linux/macOS.
  */
 #ifndef LUNARIA_DVM_CHARSET_H
 #define LUNARIA_DVM_CHARSET_H
@@ -40,7 +40,7 @@ enum jcs_kind {
    JCS_UTF16,      /* BOM-detecting on decode, BOM + big-endian on encode */
    JCS_UTF16BE,
    JCS_UTF16LE,
-   JCS_ICU,
+   JCS_NATIVE,
 };
 
 struct jcs {

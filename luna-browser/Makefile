@@ -43,16 +43,30 @@ build/luna-browser.js.h: luna-browser.js
 	@mkdir -p build
 	sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/' $< > $@
 
-build/luna-browser.o: luna-browser.c build/luna-browser.js.h $(LUNA_UI)/luna-ui.h
+build/luna-browser.o: luna-browser.c build/luna-browser.js.h $(wildcard $(LUNA_UI)/*.h)
 	$(CC) $(CFLAGS) $(WARN) -Ibuild -I$(QJS) -I$(LUNA_UI) -c $< -o $@
 
 luna-browser: build/luna-browser.o $(QJS_OBJ)
 	$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
 
-test: luna-browser
-	./test/run.sh
+test: script-dom-test http-framing-test document-layout-test css-robust-test text-edit-test
+
+script-dom-test: luna-browser
+	python3 test/script_dom.py
+
+document-layout-test: luna-browser
+	python3 test/document_layout.py
+
+text-edit-test: luna-browser
+	python3 test/text_edit.py
+
+css-robust-test: luna-browser
+	python3 test/css_robust.py
+
+http-framing-test: luna-browser
+	python3 test/http_framing.py
 
 clean:
 	rm -rf build luna-browser
 
-.PHONY: all test clean
+.PHONY: all test script-dom-test http-framing-test document-layout-test css-robust-test text-edit-test clean

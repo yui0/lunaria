@@ -1814,6 +1814,26 @@ enum SvcId : uint32_t {
     SVC_SPLIT_LAST = SVC_SL_OBJ_DESTROY,
     /* A host function bound at run time, found through the index its
      * trampoline carries (see HostCallFn in arm_exec.h).  One number for all of them. */
+    SVC_GL32_IsEnabledi,
+    SVC_GL32_GetGraphicsResetStatus,
+    SVC_GL32_MinSampleShading,
+    SVC_GL32_PrimitiveBoundingBox,
+    SVC_GL32_ReadnPixels,
+    SVC_GL32_DrawRangeElementsBaseVertex,
+    SVC_GL32_TexParameterIiv,
+    SVC_GL32_GetTexParameterIiv,
+    SVC_GL32_SamplerParameterIiv,
+    SVC_GL32_GetSamplerParameterIiv,
+    SVC_GL32_TexParameterIuiv,
+    SVC_GL32_GetTexParameterIuiv,
+    SVC_GL32_SamplerParameterIuiv,
+    SVC_GL32_GetSamplerParameterIuiv,
+    SVC_GL32_GetnUniformfv,
+    SVC_GL32_GetnUniformiv,
+    SVC_GL32_GetnUniformuiv,
+    SVC_GL32_GetDebugMessageLog,
+    SVC_GL32_ObjectPtrLabel,
+    SVC_GL32_GetObjectPtrLabel,
     SVC_HOSTCALL,
     /* Add new SVCs above this line.  One past the highest SVC: build_jni_tables()
      * builds a trampoline for every number below it, and the unknown-symbol pool

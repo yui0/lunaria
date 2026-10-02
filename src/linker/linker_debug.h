@@ -95,6 +95,9 @@ extern int apkenv_format_log(int, const char *, const char *, ...);
 #define TRACE(x...)          _PRINTVF(1, TRUE, x)
 #define WARN(fmt,args...)    \
         _PRINTVF(-1, TRUE, "%s:%d| WARNING: " fmt, __FILE__, __LINE__, ## args)
+#ifdef ERROR
+#undef ERROR
+#endif
 #define ERROR(fmt,args...)    \
         printf("%s:%d| ERROR: " fmt, __FILE__, __LINE__, ## args)
 

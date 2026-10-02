@@ -453,7 +453,7 @@ static void *comp_main(void *arg)
       /* How long the picture may stay as it is: the boot card and the input
        * method's caret animate; a static screen needs nothing until the guest
        * or the UI changes it. */
-      const bool boot = luna_boot_active() && !have_frame;
+      const bool boot = luna_boot_active() && !have_frame && !luna_overlay_guest_window_up();
       const bool ime = luna_ime_active();
       const uint64_t period = boot ? 16000000ull : ime ? 33000000ull
                              : luna_overlay_active() ? 100000000ull
@@ -554,7 +554,7 @@ static void *comp_main(void *arg)
       else if (have_frame && shown >= 0)
          draw_texture(g_comp_tex[shown], g_frame_w[shown], g_frame_h[shown], w, h);
 
-      if (luna_boot_active() && !have_frame)
+      if (luna_boot_active() && !have_frame && !luna_overlay_guest_window_up())
          luna_overlay_present_boot(w, h);
       else
          luna_overlay_present(w, h);

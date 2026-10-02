@@ -21,15 +21,15 @@
 #include "dvm/dvm_internal.h"
 #include "dvm/dvm_media.h"
 #include "dvm/dvm_net.h"
-#include "dvm/host_socket.h"
 #include "dvm/regex.h"
 #include "dvm/charset.h"
-#include "dvm/host_socket.h"
 #include "arm_exec.h"
 #include "arm.h"
 #include "jvm/jvm.h"
 #include "luna_ime.h"
 #include "lunaria_os.h"
+extern uint64_t arm_exec_jni_thread_token(void) __attribute__((weak));
+extern int arm_exec_jni_thread_alive(uint64_t token) __attribute__((weak));
 
 #include <GLES2/gl2.h>
 #include <GLES3/gl3.h>
@@ -39,7 +39,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/stat.h>
-#include <sys/statvfs.h>
+
 #include <sys/types.h>
 #include <unistd.h>
 #include <openssl/bio.h>
@@ -51,10 +51,9 @@
 #include <openssl/rand.h>
 #include <openssl/rsa.h>
 #include <openssl/x509.h>
-#include <unicode/uchar.h>
-#include <unicode/unorm2.h>
-#include <unicode/ustring.h>
+#include "luna_unicode.h"
 #include <math.h>
+#ifndef _WIN32
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -62,9 +61,9 @@
 #include <sys/ioctl.h>
 #include <poll.h>
 #include <netinet/tcp.h>
+#endif
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
-#include <unicode/uidna.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdarg.h>
@@ -76,6 +75,11 @@
 #include <time.h>
 #include "webview_cdp.h"
 #include "luna_overlay.h"
+
+#define DVM_PATH_MAX 4096
+#ifndef NAME_MAX
+#define NAME_MAX 255
+#endif
 
 #define ARG(i) (((i) < nargs) ? args[i] : (union dvm_value){ 0 })
 #define RETI(v) do { out->i = (int32_t)(v); return true; } while (0)
@@ -504,9 +508,13 @@ struct rt_bytes {
 
 static bool bytes_append(struct rt_bytes *b, const void *data, size_t n)
 {
+   if (n > SIZE_MAX - b->len) return false;
    if (b->len + n > b->cap) {
       size_t cap = b->cap ? b->cap : 256;
-      while (cap < b->len + n) cap *= 2;
+      while (cap < b->len + n) {
+         if (cap > SIZE_MAX / 2) { cap = b->len + n; break; }
+         cap *= 2;
+      }
       uint8_t *np = realloc(b->p, cap);
       if (!np) return false;
       b->p = np;
@@ -515,6 +523,23 @@ static bool bytes_append(struct rt_bytes *b, const void *data, size_t n)
    memcpy(b->p + b->len, data, n);
    b->len += n;
    return true;
+}
+
+static bool bytes_printf(struct rt_bytes *buffer, const char *format, ...)
+{
+   va_list args, copy;
+   va_start(args, format);
+   va_copy(copy, args);
+   int length = vsnprintf(NULL, 0, format, copy);
+   va_end(copy);
+   if (length < 0) { va_end(args); return false; }
+   char *text = malloc((size_t)length + 1);
+   if (!text) { va_end(args); return false; }
+   int written = vsnprintf(text, (size_t)length + 1, format, args);
+   va_end(args);
+   bool ok = written == length && bytes_append(buffer, text, (size_t)length);
+   free(text);
+   return ok;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -3494,7 +3519,7 @@ static bool cl_class_getResourceAsStream(struct dvm *vm, dvm_ref self,
                                          int nargs, union dvm_value *out)
 {
    (void)nargs;
-   char path[PATH_MAX];
+   char path[DVM_PATH_MAX];
    if (!cl_resource_name(vm, self, ARG(0).l, true, path, sizeof path)) RETL(0);
    RETL(classpath_resource_stream(vm, path));
 }
@@ -3533,7 +3558,7 @@ static bool cl_getResource(struct dvm *vm, dvm_ref self,
                            union dvm_value *out)
 {
    (void)nargs;
-   char path[PATH_MAX];
+   char path[DVM_PATH_MAX];
    if (!cl_resource_name(vm, self, ARG(0).l, self != 0, path, sizeof path))
       RETL(0);
    RETL(classpath_resource_url(vm, path));
@@ -3989,7 +4014,7 @@ static void thread_ensure_identity(struct dvm *vm, dvm_ref self)
 
 static dvm_ref main_thread_of(struct dvm *vm)
 {
-   static dvm_ref main_thread;
+   dvm_ref main_thread = vm->main_thread;
    if (!main_thread) {
       main_thread =
          dvm_new_object(vm, dvm__class_by_desc(vm, "Ljava/lang/Thread;"));
@@ -3998,6 +4023,7 @@ static dvm_ref main_thread_of(struct dvm *vm)
       (void)dvm_set_field(vm, main_thread, "name", "Ljava/lang/String;", n);
       union dvm_value id = { .j = 1 };
       (void)dvm_set_field(vm, main_thread, "tid", "J", id);
+      vm->main_thread = main_thread;
    }
    return main_thread;
 }
@@ -4006,7 +4032,7 @@ static bool t_currentThread(struct dvm *vm, dvm_ref self, const union dvm_value 
                             int nargs, union dvm_value *out)
 {
    (void)self; (void)args; (void)nargs;
-   dvm_ref t = vm->cur_thread ? vm->cur_thread : main_thread_of(vm);
+   dvm_ref t = dvm__current_thread(vm);
    thread_ensure_identity(vm, t);
    RETL(t);
 }
@@ -4397,7 +4423,11 @@ static bool t_isAlive(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                       int nargs, union dvm_value *out)
 {
    (void)args; (void)nargs;
-   if (vm->cur_thread == self) RETI(1);   /* asking about itself */
+   if (dvm__current_thread(vm) == self) RETI(1);   /* asking about itself */
+   union dvm_value native = { 0 };
+   (void)dvm_get_field(vm, self, "nativeToken", "J", &native);
+   if (native.j && arm_exec_jni_thread_alive)
+      RETI(arm_exec_jni_thread_alive((uint64_t)native.j));
    /* A thread that got a host thread says so itself. */
    union dvm_value alive = { 0 };
    if (dvm_get_field(vm, self, "alive", "Z", &alive) && alive.i) RETI(1);
@@ -5756,31 +5786,11 @@ static const struct rt_method rt_charseq[] = {
    M_END,
 };
 
-static const UNormalizer2 *normalizer_for_form(struct dvm *vm, dvm_ref form,
-                                               UErrorCode *error)
+static int normalizer_form(struct dvm *vm, dvm_ref form)
 {
    union dvm_value ordinal = { .i = 1 };
    if (form) (void)dvm_get_field(vm, form, "ordinal", "I", &ordinal);
-   switch (ordinal.i) {
-   case 0: return unorm2_getNFDInstance(error);
-   case 2: return unorm2_getNFKDInstance(error);
-   case 3: return unorm2_getNFKCInstance(error);
-   default: return unorm2_getNFCInstance(error);
-   }
-}
-
-static UChar *normalizer_utf16(const char *source, int32_t *length,
-                               UErrorCode *error)
-{
-   int32_t needed = 0;
-   u_strFromUTF8(NULL, 0, &needed, source ? source : "", -1, error);
-   if (*error != U_BUFFER_OVERFLOW_ERROR && U_FAILURE(*error)) return NULL;
-   *error = U_ZERO_ERROR;
-   UChar *result = malloc(((size_t)needed + 1) * sizeof *result);
-   if (!result) { *error = U_MEMORY_ALLOCATION_ERROR; return NULL; }
-   u_strFromUTF8(result, needed + 1, length, source ? source : "", -1, error);
-   if (U_FAILURE(*error)) { free(result); return NULL; }
-   return result;
+   return ordinal.i;
 }
 
 static bool normalizer_is_normalized(struct dvm *vm, dvm_ref self,
@@ -5789,17 +5799,14 @@ static bool normalizer_is_normalized(struct dvm *vm, dvm_ref self,
 {
    (void)self;
    const char *source = nargs ? dvm_string_utf8(vm, ARG(0).l) : "";
-   UErrorCode error = U_ZERO_ERROR; int32_t length = 0;
-   UChar *text = normalizer_utf16(source, &length, &error);
-   const UNormalizer2 *normalizer = normalizer_for_form(vm,
-      nargs > 1 ? ARG(1).l : 0, &error);
-   UBool result = text && normalizer && U_SUCCESS(error)
-      ? unorm2_isNormalized(normalizer, text, length, &error) : false;
-   free(text);
-   if (U_FAILURE(error)) {
-      dvm__throw(vm, "java/lang/IllegalArgumentException", "%s", u_errorName(error));
+   char *text = luna_unicode_normalize(source ? source : "",
+      normalizer_form(vm, nargs > 1 ? ARG(1).l : 0));
+   if (!text) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException", "Invalid Unicode input");
       return false;
    }
+   bool result = !strcmp(source ? source : "", text);
+   free(text);
    RETI(result);
 }
 
@@ -5809,34 +5816,14 @@ static bool normalizer_normalize(struct dvm *vm, dvm_ref self,
 {
    (void)self;
    const char *source = nargs ? dvm_string_utf8(vm, ARG(0).l) : "";
-   UErrorCode error = U_ZERO_ERROR; int32_t length = 0;
-   UChar *text = normalizer_utf16(source, &length, &error);
-   const UNormalizer2 *normalizer = normalizer_for_form(vm,
-      nargs > 1 ? ARG(1).l : 0, &error);
-   int32_t needed = 0;
-   if (text && normalizer && U_SUCCESS(error))
-      needed = unorm2_normalize(normalizer, text, length, NULL, 0, &error);
-   if (error == U_BUFFER_OVERFLOW_ERROR) error = U_ZERO_ERROR;
-   UChar *normalized = U_SUCCESS(error)
-      ? malloc(((size_t)needed + 1) * sizeof *normalized) : NULL;
-   if (normalized)
-      (void)unorm2_normalize(normalizer, text, length, normalized, needed + 1, &error);
-   int32_t utf8_needed = 0;
-   if (normalized && U_SUCCESS(error)) {
-      u_strToUTF8(NULL, 0, &utf8_needed, normalized, needed, &error);
-      if (error == U_BUFFER_OVERFLOW_ERROR) error = U_ZERO_ERROR;
-   }
-   char *utf8 = U_SUCCESS(error) ? malloc((size_t)utf8_needed + 1) : NULL;
-   if (utf8)
-      u_strToUTF8(utf8, utf8_needed + 1, NULL, normalized, needed, &error);
-   free(text); free(normalized);
-   if (!utf8 || U_FAILURE(error)) {
-      free(utf8);
-      dvm__throw(vm, "java/lang/IllegalArgumentException", "%s", u_errorName(error));
+   char *text = luna_unicode_normalize(source ? source : "",
+      normalizer_form(vm, nargs > 1 ? ARG(1).l : 0));
+   if (!text) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException", "Invalid Unicode input");
       return false;
    }
-   dvm_ref result = dvm_new_string_n(vm, utf8, (size_t)utf8_needed);
-   free(utf8);
+   dvm_ref result = dvm_new_string(vm, text);
+   free(text);
    RETL(result);
 }
 
@@ -7073,7 +7060,7 @@ static bool exec_new_work_stealing(struct dvm *vm, dvm_ref self,
 {
    (void)self; (void)args; (void)nargs;
    int n = nargs > 0 && ARG(0).i > 0 ? ARG(0).i
-         : (int)sysconf(_SC_NPROCESSORS_ONLN);
+         : luna_os_cpu_count();
    return exec_new_common(vm, "Ljava/util/concurrent/ExecutorService;",
                           n > 0 ? n : 1, out);
 }
@@ -9599,26 +9586,25 @@ static const struct rt_method rt_boolean[] = {
                     int nargs, union dvm_value *out)                          \
    {                                                                          \
       (void)vm; (void)self; (void)nargs;                                      \
-      const UChar32 c = (UChar32)ARG(0).i;                                    \
+      const int32_t c = ARG(0).i;                                    \
       RETI(expr);                                                             \
    }
 
-/* libcore answers these from ICU's character database, and so does this.
- * u_isWhitespace and u_isJavaSpaceChar are ICU's implementations of exactly
- * Character.isWhitespace and isSpaceChar. */
-CHAR_FN(ch_isUpperCase, u_isupper(c))
-CHAR_FN(ch_isLowerCase, u_islower(c))
-CHAR_FN(ch_isDigit, u_isdigit(c))
-CHAR_FN(ch_isLetter, u_isalpha(c))
-CHAR_FN(ch_isLetterOrDigit, u_isalnum(c))
-CHAR_FN(ch_isWhitespace, u_isWhitespace(c))
-CHAR_FN(ch_isSpaceChar, u_isJavaSpaceChar(c))
-CHAR_FN(ch_toUpperCase, u_toupper(c))
-CHAR_FN(ch_toLowerCase, u_tolower(c))
-CHAR_FN(ch_isAlphabetic, u_hasBinaryProperty(c, UCHAR_ALPHABETIC))
-CHAR_FN(ch_isIdeographic, u_hasBinaryProperty(c, UCHAR_IDEOGRAPHIC))
+/* Character classifications use the compiled Unicode database; whitespace
+ * follows Java's exclusions for non-breaking space characters. */
+CHAR_FN(ch_isUpperCase, luna_uc_uppercase(c))
+CHAR_FN(ch_isLowerCase, luna_uc_lowercase(c))
+CHAR_FN(ch_isDigit, luna_uc_digit(c))
+CHAR_FN(ch_isLetter, luna_uc_alpha(c))
+CHAR_FN(ch_isLetterOrDigit, luna_uc_alnum(c))
+CHAR_FN(ch_isWhitespace, luna_uc_whitespace(c))
+CHAR_FN(ch_isSpaceChar, luna_uc_spacechar(c))
+CHAR_FN(ch_toUpperCase, luna_uc_upper(c))
+CHAR_FN(ch_toLowerCase, luna_uc_lower(c))
+CHAR_FN(ch_isAlphabetic, luna_uc_property(c, LUNA_UC_ALPHABETIC))
+CHAR_FN(ch_isIdeographic, luna_uc_property(c, LUNA_UC_IDEOGRAPHIC))
 CHAR_FN(ch_isISOControl, (c >= 0 && c <= 0x1f) || (c >= 0x7f && c <= 0x9f))
-CHAR_FN(ch_isDefined, u_isdefined(c))
+CHAR_FN(ch_isDefined, luna_uc_defined(c))
 CHAR_FN(ch_charCount, c >= 0x10000 ? 2 : 1)
 CHAR_FN(ch_isSupplementaryCodePoint, c >= 0x10000 && c <= 0x10ffff)
 CHAR_FN(ch_isValidCodePoint, c >= 0 && c <= 0x10ffff)
@@ -9629,8 +9615,8 @@ CHAR_FN(ch_isSurrogate, c >= 0xd800 && c <= 0xdfff)
 CHAR_FN(ch_highSurrogate, 0xd800 + ((c - 0x10000) >> 10))
 CHAR_FN(ch_lowSurrogate, 0xdc00 + ((c - 0x10000) & 0x3ff))
 
-/* Character.getType: ICU's UCharCategory values are Java's constants. */
-CHAR_FN(ch_getType, (int32_t)u_charType(c))
+/* Java leaves category 17 unused; Unicode private-use starts at 17. */
+CHAR_FN(ch_getType, luna_uc_type(c) >= 17 ? luna_uc_type(c) + 1 : luna_uc_type(c))
 
 static bool ch_toCodePoint(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
@@ -11878,7 +11864,7 @@ static bool dexfile_open(struct dvm *vm, dvm_ref self, const char *guest_path)
       dvm__throw(vm, "java/io/IOException", "no dex path");
       return false;
    }
-   char host[PATH_MAX];
+   char host[DVM_PATH_MAX];
    const char *hp = arm_exec_map_guest_path(guest_path, host, sizeof host);
    /* loadDex() takes a jar/apk as readily as a bare .dex, and that is the form
     * this SDK writes: the file starts "PK\x03\x04" with classes.dex inside.
@@ -11919,7 +11905,7 @@ static bool dexfile_open(struct dvm *vm, dvm_ref self, const char *guest_path)
        * so a file written under a name or a root the loader does not see
        * shows up instead of being invisible. */
       if (hp) {
-         char dir[PATH_MAX];
+         char dir[DVM_PATH_MAX];
          snprintf(dir, sizeof dir, "%s", hp);
          char *slash = strrchr(dir, '/');
          if (slash) *slash = '\0';
@@ -11928,7 +11914,7 @@ static bool dexfile_open(struct dvm *vm, dvm_ref self, const char *guest_path)
             struct dirent *e;
             int shown = 0;
             while ((e = readdir(d)) && shown < 12) {
-               char full[PATH_MAX + NAME_MAX + 2];
+               char full[DVM_PATH_MAX + NAME_MAX + 2];
                struct stat es;
                if (snprintf(full, sizeof full, "%s/%s", dir, e->d_name)
                    >= (int)sizeof full)
@@ -13578,7 +13564,7 @@ static bool dexcl_init(struct dvm *vm, dvm_ref self, const union dvm_value *args
    if (path.l) {
       const char *gp = dvm_string_utf8(vm, path.l);
       if (gp && *gp) {
-         char host[PATH_MAX];
+         char host[DVM_PATH_MAX];
          const char *hp = arm_exec_map_guest_path(gp, host, sizeof host);
          if (hp) {
             /* Multi-path ClassLoader entries are ':'-separated. */
@@ -13799,9 +13785,15 @@ static bool t_sleep(struct dvm *vm, dvm_ref self, const union dvm_value *args,
 {
    (void)self; (void)out;
    int64_t ms = nargs > 0 ? ARG(0).j : 0;
+   int32_t ns = nargs > 1 ? ARG(1).i : 0;
    if (ms < 0) {
       dvm__throw(vm, "java/lang/IllegalArgumentException",
                  "millis < 0: %lld", (long long)ms);
+      return false;
+   }
+   if (ns < 0 || ns > 999999) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException",
+                 "nanos out of range: %d", ns);
       return false;
    }
    if (dvm__thread_take_interrupt(vm)) {
@@ -13811,15 +13803,7 @@ static bool t_sleep(struct dvm *vm, dvm_ref self, const union dvm_value *args,
    if (vm->drain_depth < DVM_DRAIN_MAX_DEPTH && vm->npending)
       dvm__drain_for_wait(vm);
    vm->call_steps = 0;
-   if (ms > 0) {
-      /* On a thread of its own the sleep is real: the caller wakes when it
-       * asked to.  On the thread that drives the pump and the guest CPU it
-       * cannot be — every guest thread shares it, so a full-length sleep stops
-       * the emulator.  A short one keeps a polling caller off the CPU without
-       * stalling everyone else; skipping it entirely was measurably worse,
-       * because the spin took cycles the render thread needed. */
-      if (!dvm_on_bytecode_thread() && ms > 2)
-         ms = 2;
+   if (ms > 0 || ns > 0) {
       /* The sleeper waits on its own thread's channel, which is what
        * interrupt() signals.  dvm_gil_wait_for() gives both the interpreter
        * lock and the ARM execution lock back for the duration: a sleeper that
@@ -13827,12 +13811,18 @@ static bool t_sleep(struct dvm *vm, dvm_ref self, const union dvm_value *args,
        * loops `while (ButtonPressed == -1) Thread.sleep(100)` inside a JNI
        * call, and the thread that would press the button needs both. */
       dvm_ref me = dvm__current_thread(vm);
-      const uint64_t deadline = dvm__now_ms() + (uint64_t)ms;
+      const uint64_t duration = (uint64_t)ms > ((uint64_t)INT64_MAX - (uint64_t)ns) / 1000000ull
+                             ? (uint64_t)INT64_MAX : (uint64_t)ms * 1000000ull + (uint64_t)ns;
+      struct timespec start;
+      clock_gettime(CLOCK_MONOTONIC, &start);
       for (;;) {
-         const uint64_t now = dvm__now_ms();
-         if (now >= deadline) break;
+         struct timespec now;
+         clock_gettime(CLOCK_MONOTONIC, &now);
+         const uint64_t elapsed = (uint64_t)(now.tv_sec - start.tv_sec) * 1000000000ull
+                                + (uint64_t)(now.tv_nsec - start.tv_nsec);
+         if (elapsed >= duration) break;
          dvm__thread_set_wait(vm, (uintptr_t)me);
-         dvm_gil_wait_for(vm, (uintptr_t)me, (unsigned)(deadline - now));
+         dvm_gil_wait_for_ns(vm, (uintptr_t)me, duration - elapsed);
          dvm__thread_set_wait(vm, 0);
          if (dvm__thread_take_interrupt(vm)) {
             dvm__throw(vm, "java/lang/InterruptedException",
@@ -13915,7 +13905,23 @@ static bool t_getContextClassLoader(struct dvm *vm, dvm_ref self,
 /* The current thread's Thread object. */
 dvm_ref dvm__current_thread(struct dvm *vm)
 {
-   return vm->cur_thread ? vm->cur_thread : main_thread_of(vm);
+   if (vm->cur_thread) return vm->cur_thread;
+   uint64_t token = arm_exec_jni_thread_token ? arm_exec_jni_thread_token() : 0;
+   unsigned slot = (unsigned)((token - 1u) & 255u);
+   if (!token || !slot) return main_thread_of(vm);
+   struct dvm_attached_thread *state = &vm->native_threads[slot];
+   if (!state->thread || state->token != token) {
+      if (state->thread) dvm_unpin(vm, state->thread);
+      state->thread = dvm_new_object(vm, dvm__class_by_desc(vm, "Ljava/lang/Thread;"));
+      state->token = token;
+      if (state->thread) {
+         dvm_pin(vm, state->thread);
+         union dvm_value native = { .j = (int64_t)token };
+         (void)dvm_set_field(vm, state->thread, "nativeToken", "J", native);
+         thread_ensure_identity(vm, state->thread);
+      }
+   }
+   return state->thread;
 }
 
 bool dvm__thread_take_interrupt(struct dvm *vm)
@@ -14170,6 +14176,7 @@ static const struct rt_field rt_thread_fields[] = {
     * on so the interrupt can wake it (0 while it is running). */
    { "interrupted", "Z" },
    { "waitChannel", "J" },
+   { "nativeToken", "J" },
    /* Set by start(), cleared by the host thread on its way out.  It is what
     * isAlive() and join() read: a detached host thread leaves nothing else
     * behind to ask. */
@@ -17287,8 +17294,8 @@ static bool file_space(struct dvm *vm, dvm_ref self,
 {
    (void)args; (void)nargs;
    const char *hp = file_host_path(vm, self);
-   struct statvfs st;
-   if (!hp || statvfs(hp, &st) != 0) RETJ(0);
+   struct luna_os_fs_info st;
+   if (!hp || luna_os_statfs(hp, &st) != 0) RETJ(0);
    const char *n = builtin_name();
    const uint64_t blocks = !strcmp(n, "getTotalSpace") ? st.f_blocks
                          : !strcmp(n, "getFreeSpace") ? st.f_bfree : st.f_bavail;
@@ -22274,7 +22281,7 @@ static int jp_next_clean(struct jparse *j)
          if (j->p == j->end) return c;
          if (*j->p == '*') {
             ++j->p;
-            const char *e = memmem(j->p, (size_t)(j->end - j->p), "*/", 2);
+            const char *e = luna_memmem(j->p, (size_t)(j->end - j->p), "*/", 2);
             if (!e) {
                jp_fail(j, "Unterminated comment");
                return -1;
@@ -23917,8 +23924,44 @@ static bool time_zone_of(struct dvm *vm, dvm_ref self, char *buf, size_t sz)
 
 /* Breaks `ms` down in the named zone.  TZ is swapped around the call because
  * the host's only zone-aware breakdown is localtime_r. */
+#ifdef _WIN32
+static _Thread_local int32_t time_zone_offset;
+static _Thread_local char time_zone_display[128];
+#endif
+static const char *time_zone_label(const struct tm *tm)
+{
+#ifdef _WIN32
+   (void)tm;
+   return time_zone_display[0] ? time_zone_display : "UTC";
+#else
+   return tm->tm_zone ? tm->tm_zone : "UTC";
+#endif
+}
+static time_t time_utc(struct tm *tm)
+{
+#ifdef _WIN32
+   int64_t ms;
+   return luna_calendar_assemble(tm, "UTC", 0, &ms) == 0 ? (time_t)(ms / 1000) : (time_t)-1;
+#else
+   return timegm(tm);
+#endif
+}
+
 static void time_break(int64_t ms, const char *zone, struct tm *tm)
 {
+#ifdef _WIN32
+   if (!zone || !*zone) zone = arm_exec_device_timezone();
+   if (luna_calendar_break(ms, zone, tm, &time_zone_offset,
+                           time_zone_display, sizeof time_zone_display) != 0) {
+      if (luna_calendar_break(ms, "UTC", tm, &time_zone_offset,
+                              time_zone_display, sizeof time_zone_display) != 0) {
+         memset(tm, 0, sizeof *tm);
+         time_zone_offset = 0;
+         strcpy(time_zone_display, "UTC");
+      }
+   }
+#else
+
    time_t secs = (time_t)(ms / 1000);
    if (ms < 0 && ms % 1000) --secs;
    if (!zone || !*zone) zone = arm_exec_device_timezone();
@@ -23940,6 +23983,7 @@ static void time_break(int64_t ms, const char *zone, struct tm *tm)
    else unsetenv("TZ");
    tzset();
    arm_exec_timezone_unlock();
+#endif
 }
 
 /* Seconds east of UTC at `ms`, in the given zone. */
@@ -23947,7 +23991,11 @@ static int32_t time_offset(int64_t ms, const char *zone)
 {
    struct tm tm;
    time_break(ms, zone, &tm);
+   #ifdef _WIN32
+   return time_zone_offset;
+#else
    return (int32_t)tm.tm_gmtoff;
+#endif
 }
 
 /* --- java.util.Date ----------------------------------------------------- */
@@ -24065,7 +24113,7 @@ static bool tz_getID(struct dvm *vm, dvm_ref self, const union dvm_value *args,
    if (env && *env) RETL(dvm_new_string(vm, env));
    struct tm tm;
    time_break(now_millis(), "", &tm);
-   RETL(dvm_new_string(vm, tm.tm_zone ? tm.tm_zone : "UTC"));
+   RETL(dvm_new_string(vm, time_zone_label(&tm)));
 }
 
 static bool tz_getOffset(struct dvm *vm, dvm_ref self,
@@ -24094,7 +24142,7 @@ static bool tz_getRawOffset(struct dvm *vm, dvm_ref self,
    jan.tm_mon = 0;
    jan.tm_mday = 15;
    jan.tm_isdst = -1;
-   RETI(time_offset((int64_t)timegm(&jan) * 1000, zone) * 1000);
+   RETI(time_offset((int64_t)time_utc(&jan) * 1000, zone) * 1000);
 }
 
 static bool tz_inDaylightTime(struct dvm *vm, dvm_ref self,
@@ -24118,7 +24166,7 @@ static bool tz_getDisplayName(struct dvm *vm, dvm_ref self,
    (void)time_zone_of(vm, self, zone, sizeof zone);
    struct tm tm;
    time_break(now_millis(), zone, &tm);
-   RETL(dvm_new_string(vm, tm.tm_zone ? tm.tm_zone : "UTC"));
+   RETL(dvm_new_string(vm, time_zone_label(&tm)));
 }
 
 /* --- java.util.Calendar ------------------------------------------------- */
@@ -24271,12 +24319,18 @@ static bool cal_get(struct dvm *vm, dvm_ref self, const union dvm_value *args,
  * same way time_break() wraps localtime_r(). */
 static int64_t time_assemble(struct tm *tm, const char *zone, int64_t sub_ms)
 {
+#ifdef _WIN32
+   if (!zone || !*zone) zone = arm_exec_device_timezone();
+   int64_t result;
+   return luna_calendar_assemble(tm, zone, sub_ms, &result) == 0 ? result : -1;
+#else
+
    time_t t;
    tm->tm_isdst = -1;
    if (!zone || !*zone) {
       t = mktime(tm);
    } else if (!strcmp(zone, "UTC") || !strcmp(zone, "GMT")) {
-      t = timegm(tm);
+      t = time_utc(tm);
    } else {
       char *old = getenv("TZ");
       char saved[128] = "";
@@ -24289,6 +24343,7 @@ static int64_t time_assemble(struct tm *tm, const char *zone, int64_t sub_ms)
       tzset();
    }
    return (int64_t)t * 1000 + sub_ms;
+#endif
 }
 
 static bool cal_set(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -24428,7 +24483,7 @@ static void sdf_field(struct rt_bytes *b, char c, int n, const struct tm *tm,
       else snprintf(buf, sizeof buf, "%.3s", kDays[tm->tm_wday % 7]);
       break;
    case 'z':
-      snprintf(buf, sizeof buf, "%s", tm->tm_zone ? tm->tm_zone : "UTC");
+      snprintf(buf, sizeof buf, "%s", time_zone_label(tm));
       break;
    case 'Z': {
       int m = off_secs / 60;
@@ -25244,12 +25299,20 @@ static const struct rt_const rt_consts[] = {
  * was really "the emulator forgets who you are".
  * ------------------------------------------------------------------------ */
 
+struct prefs_disk_state {
+   pthread_mutex_t lock;
+   atomic_uint_fast64_t saved_generation;
+   atomic_uint_fast64_t failed_generation;
+};
+
 struct rt_prefs_file {
    char *name;
    dvm_ref map;
    /* apply() changed the map and has not been written out yet — see
     * ed_apply() and dvm_prefs_flush(). */
    bool dirty;
+   uint64_t generation;
+   struct prefs_disk_state *disk;
 };
 
 static struct rt_prefs_file *g_prefs;
@@ -25259,19 +25322,125 @@ static int g_nprefs;
  * was a C data race whenever a Java thread grew it. */
 static atomic_bool g_prefs_any_dirty;
 
+struct prefs_write {
+   struct prefs_write *next;
+   struct prefs_disk_state *disk;
+   uint64_t generation;
+   char *xml;
+   size_t length;
+   char dir[DVM_PATH_MAX - 300], path[DVM_PATH_MAX], tmp[DVM_PATH_MAX + 8];
+};
+static pthread_mutex_t g_prefs_write_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_prefs_write_cv = PTHREAD_COND_INITIALIZER;
+static pthread_once_t g_prefs_writer_once = PTHREAD_ONCE_INIT;
+static struct prefs_write *g_prefs_write_head, *g_prefs_write_tail;
+static unsigned g_prefs_write_pending;
+static bool g_prefs_writer_ready;
+
 /* mkdir -p: the preferences directory is created on first write, the way the
  * framework creates it on first commit. */
 static void prefs_mkdir_p(const char *path)
 {
-   char buf[PATH_MAX];
+   char buf[DVM_PATH_MAX];
    snprintf(buf, sizeof buf, "%s", path);
    for (char *p = buf + 1; *p; ++p) {
       if (*p != '/') continue;
       *p = '\0';
-      (void)mkdir(buf, 0777);
+      (void)luna_file_mkdir(buf, 0777);
       *p = '/';
    }
-   (void)mkdir(buf, 0777);
+   (void)luna_file_mkdir(buf, 0777);
+}
+
+static bool prefs_write_disk(struct prefs_write *job)
+{
+   struct prefs_disk_state *disk = job->disk;
+   pthread_mutex_lock(&disk->lock);
+   uint64_t saved = atomic_load_explicit(&disk->saved_generation, memory_order_acquire);
+   bool ok = saved >= job->generation && saved != 0;
+   if (!ok) {
+      prefs_mkdir_p(job->dir);
+      int fd = luna_file_open(job->tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+      ok = fd >= 0;
+      size_t pos = 0;
+      while (ok && pos < job->length) {
+         ssize_t n = luna_fd_write(fd, job->xml + pos, job->length - pos);
+         if (n < 0 && errno == EINTR) continue;
+         if (n <= 0) ok = false;
+         else pos += (size_t)n;
+      }
+      if (ok && luna_file_sync(fd, 0) != 0) ok = false;
+      if (fd >= 0 && luna_fd_close(fd) != 0) ok = false;
+      if (ok && luna_file_rename(job->tmp, job->path) != 0) ok = false;
+      if (ok)
+         atomic_store_explicit(&disk->saved_generation, job->generation, memory_order_release);
+      else luna_file_unlink(job->tmp);
+   }
+   uint64_t failed = atomic_load_explicit(&disk->failed_generation, memory_order_acquire);
+   saved = atomic_load_explicit(&disk->saved_generation, memory_order_acquire);
+   if (ok && failed <= saved) failed = 0;
+   if (!ok && failed < job->generation) failed = job->generation;
+   atomic_store_explicit(&disk->failed_generation, failed, memory_order_release);
+   pthread_mutex_unlock(&disk->lock);
+   if (failed) atomic_store_explicit(&g_prefs_any_dirty, true, memory_order_release);
+   return ok;
+}
+
+static void *prefs_writer_main(void *unused)
+{
+   (void)unused;
+   for (;;) {
+      pthread_mutex_lock(&g_prefs_write_lock);
+      while (!g_prefs_write_head)
+         pthread_cond_wait(&g_prefs_write_cv, &g_prefs_write_lock);
+      struct prefs_write *job = g_prefs_write_head;
+      g_prefs_write_head = job->next;
+      if (!g_prefs_write_head) g_prefs_write_tail = NULL;
+      pthread_mutex_unlock(&g_prefs_write_lock);
+      (void)prefs_write_disk(job);
+      free(job->xml);
+      free(job);
+      pthread_mutex_lock(&g_prefs_write_lock);
+      --g_prefs_write_pending;
+      pthread_cond_broadcast(&g_prefs_write_cv);
+      pthread_mutex_unlock(&g_prefs_write_lock);
+   }
+   return NULL;
+}
+
+static void prefs_writer_start(void)
+{
+   pthread_t thread;
+   if (pthread_create(&thread, NULL, prefs_writer_main, NULL) == 0) {
+      pthread_detach(thread);
+      g_prefs_writer_ready = true;
+   }
+}
+
+static bool prefs_write_enqueue(struct prefs_write *job)
+{
+   pthread_once(&g_prefs_writer_once, prefs_writer_start);
+   if (!g_prefs_writer_ready) return false;
+   pthread_mutex_lock(&g_prefs_write_lock);
+   /* Replace queued intermediate states of the same file. The writer owns
+    * its active snapshot; a newer queued snapshot follows it. */
+   for (struct prefs_write *p = g_prefs_write_head; p; p = p->next) {
+      if (p->disk != job->disk) continue;
+      free(p->xml);
+      p->xml = job->xml;
+      p->length = job->length;
+      p->generation = job->generation;
+      free(job);
+      pthread_mutex_unlock(&g_prefs_write_lock);
+      return true;
+   }
+   if (g_prefs_write_tail) g_prefs_write_tail->next = job;
+   else g_prefs_write_head = job;
+   g_prefs_write_tail = job;
+   ++g_prefs_write_pending;
+   pthread_cond_signal(&g_prefs_write_cv);
+   pthread_mutex_unlock(&g_prefs_write_lock);
+   return true;
 }
 
 /* /data/data/<pkg>/shared_prefs, derived from the files dir the launcher
@@ -25297,7 +25466,7 @@ static void prefs_dir(char *buf, size_t n)
 static void prefs_path(const char *name, char *buf, size_t n)
 {
    /* Leaves room for "/<name>.xml" so the join below cannot be truncated. */
-   char dir[PATH_MAX - 300];
+   char dir[DVM_PATH_MAX - 300];
    prefs_dir(dir, sizeof dir);
    char safe[256];
    size_t i = 0;
@@ -25344,20 +25513,28 @@ static void prefs_xml_unescape(char *s)
 
 /* Writes the map as the XML a device would leave behind, so the file is
  * readable (and editable) with the same expectations. */
-static void prefs_save(struct dvm *vm, const char *name, dvm_ref map)
+static bool prefs_save(struct dvm *vm, const char *name, dvm_ref map, bool async)
 {
    struct dvm_object *o = map ? dvm__obj(vm, map) : NULL;
    struct rt_map *mp = o ? o->data : NULL;
-   if (!mp) return;
+   if (!mp) return false;
+   struct prefs_disk_state *disk = NULL;
+   uint64_t generation = 0;
+   for (int i = 0; i < g_nprefs; ++i)
+      if (g_prefs[i].map == map) {
+         disk = g_prefs[i].disk;
+         generation = g_prefs[i].generation;
+         break;
+      }
+   if (!disk) return false;
 
-   char dir[PATH_MAX - 300], path[PATH_MAX], tmp[PATH_MAX + 8];
+   char dir[DVM_PATH_MAX - 300], path[DVM_PATH_MAX], tmp[DVM_PATH_MAX + 8];
    prefs_dir(dir, sizeof dir);
-   prefs_mkdir_p(dir);
    prefs_path(name, path, sizeof path);
    snprintf(tmp, sizeof tmp, "%s.tmp", path);
-   FILE *f = fopen(tmp, "w");
-   if (!f) return;
-   fprintf(f, "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map>\n");
+   struct rt_bytes xml_buffer = { 0 };
+   bool complete = true;
+   complete &= bytes_printf(&xml_buffer, "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map>\n");
    for (uint32_t i = 0; i < mp->size; ++i) {
       const char *k = mp->e[i].k ? dvm_string_utf8(vm, mp->e[i].k) : NULL;
       if (!k) continue;
@@ -25372,48 +25549,68 @@ static void prefs_save(struct dvm *vm, const char *name, dvm_ref map)
          char *ve = malloc(strlen(sv) * 6 + 1);
          if (ve) {
             prefs_xml_escape(sv, ve, strlen(sv) * 6 + 1);
-            fprintf(f, "    <string name=\"%s\">%s</string>\n", ke, ve);
+            complete &= bytes_printf(&xml_buffer, "    <string name=\"%s\">%s</string>\n", ke, ve);
             free(ve);
-         }
+         } else complete = false;
          continue;
       }
       struct dvm_class *vc = dvm_object_class(vm, v);
       const char *cn = vc ? vc->name : "";
       union dvm_value bv = box_get(vm, v);
       if (!strcmp(cn, "java/lang/Integer"))
-         fprintf(f, "    <int name=\"%s\" value=\"%d\" />\n", ke, bv.i);
+         complete &= bytes_printf(&xml_buffer, "    <int name=\"%s\" value=\"%d\" />\n", ke, bv.i);
       else if (!strcmp(cn, "java/lang/Long"))
-         fprintf(f, "    <long name=\"%s\" value=\"%lld\" />\n", ke,
+         complete &= bytes_printf(&xml_buffer, "    <long name=\"%s\" value=\"%lld\" />\n", ke,
                  (long long)bv.j);
       else if (!strcmp(cn, "java/lang/Float"))
-         fprintf(f, "    <float name=\"%s\" value=\"%.9g\" />\n", ke,
+         complete &= bytes_printf(&xml_buffer, "    <float name=\"%s\" value=\"%.9g\" />\n", ke,
                  (double)bv.f);
       else if (!strcmp(cn, "java/lang/Boolean"))
-         fprintf(f, "    <boolean name=\"%s\" value=\"%s\" />\n", ke,
+         complete &= bytes_printf(&xml_buffer, "    <boolean name=\"%s\" value=\"%s\" />\n", ke,
                  bv.i ? "true" : "false");
       else if (vo && vo->data && (!strcmp(cn, "java/util/HashSet") ||
                                   !strcmp(cn, "java/util/ArrayList"))) {
          /* putStringSet keeps the collection itself; Android writes it as a
           * <set> of <string>s. */
          struct rt_list *l = vo->data;
-         fprintf(f, "    <set name=\"%s\">\n", ke);
+         complete &= bytes_printf(&xml_buffer, "    <set name=\"%s\">\n", ke);
          for (uint32_t j = 0; j < l->size; ++j) {
             const char *e = l->items[j] ? dvm_string_utf8(vm, l->items[j]) : NULL;
             if (!e) continue;
             char *ee = malloc(strlen(e) * 6 + 1);
-            if (!ee) continue;
+            if (!ee) { complete = false; continue; }
             prefs_xml_escape(e, ee, strlen(e) * 6 + 1);
-            fprintf(f, "        <string>%s</string>\n", ee);
+            complete &= bytes_printf(&xml_buffer, "        <string>%s</string>\n", ee);
             free(ee);
          }
-         fprintf(f, "    </set>\n");
+         complete &= bytes_printf(&xml_buffer, "    </set>\n");
       }
    }
-   fprintf(f, "</map>\n");
-   fclose(f);
-   /* Rename last: a run interrupted mid-write must not leave a half file that
-    * the next launch reads as the app's state. */
-   if (rename(tmp, path) != 0) unlink(tmp);
+   complete &= bytes_printf(&xml_buffer, "</map>\n");
+   if (!complete) { free(xml_buffer.p); return false; }
+   char *xml = (char *)xml_buffer.p;
+   size_t xml_len = xml_buffer.len;
+   struct prefs_write *job = calloc(1, sizeof *job);
+   if (!job) { free(xml); return false; }
+   job->disk = disk;
+   job->generation = generation;
+   job->xml = xml;
+   job->length = xml_len;
+   snprintf(job->dir, sizeof job->dir, "%s", dir);
+   snprintf(job->path, sizeof job->path, "%s", path);
+   snprintf(job->tmp, sizeof job->tmp, "%s", tmp);
+   if (async && prefs_write_enqueue(job)) return true;
+   /* Only a plain C snapshot crosses this gap. Disk latency must not hold
+    * the interpreter or ARM execution lock. Serialize writers separately;
+    * an older snapshot must never overwrite a newer successful commit. */
+   unsigned armd = arm_lock_unlock_all();
+   unsigned gild = dvm_gil_unlock_all(vm);
+   const bool ok = prefs_write_disk(job);
+   free(job->xml);
+   free(job);
+   dvm_gil_relock(vm, gild);
+   arm_lock_relock(armd);
+   return ok;
 }
 
 /* Reads one attribute out of an element, e.g. name="..." */
@@ -25436,7 +25633,7 @@ static bool prefs_attr(const char *el, const char *attr, char *buf, size_t n)
 
 static void prefs_load(struct dvm *vm, const char *name, dvm_ref map)
 {
-   char path[PATH_MAX];
+   char path[DVM_PATH_MAX];
    prefs_path(name, path, sizeof path);
    FILE *f = fopen(path, "r");
    if (!f) return;
@@ -25532,6 +25729,13 @@ static dvm_ref prefs_map(struct dvm *vm, const char *name)
    g_prefs[g_nprefs].name = strdup(name);
    g_prefs[g_nprefs].map = m;
    g_prefs[g_nprefs].dirty = false;
+   g_prefs[g_nprefs].generation = 0;
+   g_prefs[g_nprefs].disk = calloc(1, sizeof *g_prefs[g_nprefs].disk);
+   if (g_prefs[g_nprefs].disk) {
+      pthread_mutex_init(&g_prefs[g_nprefs].disk->lock, NULL);
+      atomic_init(&g_prefs[g_nprefs].disk->saved_generation, 0);
+      atomic_init(&g_prefs[g_nprefs].disk->failed_generation, 0);
+   }
    ++g_nprefs;
    prefs_load(vm, name, m);
    return m;
@@ -25658,26 +25862,28 @@ static bool prefs_getAll(struct dvm *vm, dvm_ref self,
    RETL(copy);
 }
 
-/* edit() hands back an editor over the same map.  Writes land immediately;
- * apply()/commit() are then the no-ops they look like.  Modelling the staging
- * buffer would only matter for an editor that is built and dropped without
- * committing, which no caller does. */
+/* Editor changes stay private until apply/commit publishes them. */
 static bool prefs_edit(struct dvm *vm, dvm_ref self,
                        const union dvm_value *args, int nargs,
                        union dvm_value *out)
 {
    (void)args; (void)nargs;
-   RETL(prefs_make(vm, "Landroid/content/SharedPreferences$Editor;",
-                    prefs_backing(vm, self)));
+   dvm_ref editor = prefs_make(vm, "Landroid/content/SharedPreferences$Editor;",
+                               prefs_backing(vm, self));
+   union dvm_value pending = { .l = coll_new_map(vm) };
+   if (editor) (void)dvm_set_field(vm, editor, "pending", "Ljava/lang/Object;", pending);
+   RETL(editor);
 }
 
 static bool prefs_put(struct dvm *vm, dvm_ref self, dvm_ref key, dvm_ref val)
 {
-   dvm_ref m = prefs_backing(vm, self);
+   union dvm_value pending = { 0 };
+   (void)dvm_get_field(vm, self, "pending", "Ljava/lang/Object;", &pending);
+   dvm_ref m = pending.l;
    if (!m || !key) return false;
    union dvm_value kv[2] = { { .l = key }, { .l = val } }, ignored = { 0 };
-   if (val) (void)map_put(vm, m, kv, 2, &ignored);
-   else (void)map_remove(vm, m, kv, 1, &ignored);
+   /* A null value is the removal marker in this editor's staging map. */
+   (void)map_put(vm, m, kv, 2, &ignored);
    return true;
 }
 
@@ -25719,10 +25925,33 @@ static bool ed_clear(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                      int nargs, union dvm_value *out)
 {
    (void)args; (void)nargs;
-   dvm_ref m = prefs_backing(vm, self);
-   union dvm_value ignored = { 0 };
-   if (m) (void)map_clear(vm, m, NULL, 0, &ignored);
+   union dvm_value clear = { .i = 1 };
+   (void)dvm_set_field(vm, self, "clear", "Z", clear);
    RETL(self);
+}
+
+static void prefs_publish_editor(struct dvm *vm, dvm_ref self)
+{
+   dvm_ref m = prefs_backing(vm, self);
+   union dvm_value pending = { 0 }, clear = { 0 }, ignored = { 0 };
+   (void)dvm_get_field(vm, self, "pending", "Ljava/lang/Object;", &pending);
+   (void)dvm_get_field(vm, self, "clear", "Z", &clear);
+   if (!m) return;
+   if (clear.i) (void)map_clear(vm, m, NULL, 0, &ignored);
+   struct dvm_object *obj = pending.l ? dvm__obj(vm, pending.l) : NULL;
+   struct rt_map *changes = obj ? obj->data : NULL;
+   if (changes) {
+      for (uint32_t i = 0; i < changes->size; ++i) {
+         union dvm_value kv[2] = {{ .l = changes->e[i].k }, { .l = changes->e[i].v }};
+         if (kv[1].l) (void)map_put(vm, m, kv, 2, &ignored);
+         else (void)map_remove(vm, m, kv, 1, &ignored);
+      }
+      (void)map_clear(vm, pending.l, NULL, 0, &ignored);
+   }
+   clear.i = 0;
+   (void)dvm_set_field(vm, self, "clear", "Z", clear);
+   for (int i = 0; i < g_nprefs; ++i)
+      if (g_prefs[i].map == m) ++g_prefs[i].generation;
 }
 
 /* apply() and commit() are where a device makes the change durable.  They were
@@ -25730,16 +25959,21 @@ static bool ed_clear(struct dvm *vm, dvm_ref self, const union dvm_value *args,
  * the file is rewritten. */
 static bool ed_flush(struct dvm *vm, dvm_ref self)
 {
+   prefs_publish_editor(vm, self);
    dvm_ref m = prefs_backing(vm, self);
    const char *name = m ? prefs_name_of(m) : NULL;
    if (!name) return false;
-   prefs_save(vm, name, m);
+   uint64_t generation = 0;
    for (int i = 0; i < g_nprefs; ++i)
-      if (g_prefs[i].map == m) g_prefs[i].dirty = false;
+      if (g_prefs[i].map == m) generation = g_prefs[i].generation;
+   const bool saved = prefs_save(vm, name, m, false);
+   for (int i = 0; i < g_nprefs; ++i)
+      if (g_prefs[i].map == m && g_prefs[i].generation == generation)
+         g_prefs[i].dirty = !saved;
    bool any = false;
    for (int i = 0; i < g_nprefs && !any; ++i) any = g_prefs[i].dirty;
-   atomic_store_explicit(&g_prefs_any_dirty, any, memory_order_release);
-   return true;
+   if (any) atomic_store_explicit(&g_prefs_any_dirty, true, memory_order_release);
+   return saved;
 }
 
 /* The whole difference between apply() and commit() is who waits for the disk.
@@ -25750,13 +25984,14 @@ static bool ed_flush(struct dvm *vm, dvm_ref self)
  * Writing the file here as well made every apply() serialise the entire map
  * back to XML and rename it into place.  AppsFlyer's counters, which are
  * applied several times per SDK call, spent a Cross Worlds loading screen
- * inside rename(2).  Now the map is marked and the frame pump writes it —
+ * inside luna_file_rename(2).  Now the map is marked and the frame pump writes it —
  * at most one write per file per frame, however many applies there were. */
 static bool ed_apply(struct dvm *vm, dvm_ref self,
                      const union dvm_value *args, int nargs,
                      union dvm_value *out)
 {
    (void)args; (void)nargs;
+   prefs_publish_editor(vm, self);
    dvm_ref m = prefs_backing(vm, self);
    for (int i = 0; i < g_nprefs; ++i)
       if (g_prefs[i].map == m) {
@@ -25775,15 +26010,36 @@ void dvm_prefs_flush(struct dvm *vm)
    if (!vm) return;
    /* The common case is a single atomic load and no lock.  Do not inspect the
     * resizable table until the interpreter lock is ours. */
-   if (!atomic_load_explicit(&g_prefs_any_dirty, memory_order_acquire)) return;
+   if (!atomic_exchange_explicit(&g_prefs_any_dirty, false, memory_order_acq_rel)) return;
    unsigned cookie = dvm_gil_enter_from_guest(vm);
    for (int i = 0; i < g_nprefs; ++i) {
+      struct prefs_disk_state *disk = g_prefs[i].disk;
+      if (disk && atomic_load_explicit(&disk->failed_generation, memory_order_acquire) &&
+          atomic_load_explicit(&disk->saved_generation, memory_order_acquire) < g_prefs[i].generation)
+         g_prefs[i].dirty = true;
       if (!g_prefs[i].dirty) continue;
-      g_prefs[i].dirty = false;
-      prefs_save(vm, g_prefs[i].name, g_prefs[i].map);
+      const uint64_t generation = g_prefs[i].generation;
+      const bool saved = prefs_save(vm, g_prefs[i].name, g_prefs[i].map, true);
+      if (g_prefs[i].generation == generation) g_prefs[i].dirty = !saved;
    }
-   atomic_store_explicit(&g_prefs_any_dirty, false, memory_order_release);
+   bool any = false;
+   for (int i = 0; i < g_nprefs && !any; ++i) any = g_prefs[i].dirty;
+   if (any) atomic_store_explicit(&g_prefs_any_dirty, true, memory_order_release);
    dvm_gil_leave_to_guest(vm, cookie);
+}
+
+void dvm_prefs_finish(struct dvm *vm)
+{
+   if (!vm) return;
+   dvm_prefs_flush(vm);
+   unsigned armd = arm_lock_unlock_all();
+   unsigned gild = dvm_gil_unlock_all(vm);
+   pthread_mutex_lock(&g_prefs_write_lock);
+   while (g_prefs_write_pending)
+      pthread_cond_wait(&g_prefs_write_cv, &g_prefs_write_lock);
+   pthread_mutex_unlock(&g_prefs_write_lock);
+   dvm_gil_relock(vm, gild);
+   arm_lock_relock(armd);
 }
 
 static bool ed_commit(struct dvm *vm, dvm_ref self,
@@ -25796,6 +26052,12 @@ static bool ed_commit(struct dvm *vm, dvm_ref self,
 
 static const struct rt_field rt_prefs_fields[] = {
    { "store", "Ljava/lang/Object;" }, F_END
+};
+
+static const struct rt_field rt_prefs_editor_fields[] = {
+   { "store", "Ljava/lang/Object;" },
+   { "pending", "Ljava/lang/Object;" },
+   { "clear", "Z" }, F_END
 };
 
 static const struct rt_method rt_prefs[] = {
@@ -26725,7 +26987,7 @@ static bool cipher_init(struct dvm *vm, dvm_ref self,
    union dvm_value transform = { 0 };
    (void)dvm_get_field(vm, self, "transform", "Ljava/lang/String;", &transform);
    const char *name = transform.l ? dvm_string_utf8(vm, transform.l) : NULL;
-   if (!iv.l && ARG(0).i == JCE_ENCRYPT && name && strcasestr(name, "/GCM/")) {
+   if (!iv.l && ARG(0).i == JCE_ENCRYPT && name && luna_strcasestr(name, "/GCM/")) {
       uint8_t nonce[12];
       if (RAND_bytes(nonce, (int)sizeof nonce) != 1) {
          dvm__throw(vm, "java/security/ProviderException",
@@ -26815,7 +27077,7 @@ static bool cipher_rsa(struct dvm *vm, int opmode, const char *pad,
                         : EVP_PKEY_decrypt_init(ctx)) > 0;
    if (ok) {
       int p = RSA_PKCS1_PADDING;
-      bool oaep = pad && strcasestr(pad, "OAEP");
+      bool oaep = pad && luna_strcasestr(pad, "OAEP");
       if (oaep) p = RSA_PKCS1_OAEP_PADDING;
       else if (pad && (!strcasecmp(pad, "NoPadding") || !*pad))
          p = RSA_NO_PADDING;
@@ -26827,11 +27089,11 @@ static bool cipher_rsa(struct dvm *vm, int opmode, const char *pad,
        * alone cannot say which one wrote the ciphertext.  The label digest is
        * set here and the MGF1 choice is decided by trying both below. */
       if (ok && oaep) {
-         const char *w = strcasestr(pad, "OAEPWith");
+         const char *w = luna_strcasestr(pad, "OAEPWith");
          if (w) {
             char name[32];
             const char *b = w + 8;
-            const char *e = strcasestr(b, "And");
+            const char *e = luna_strcasestr(b, "And");
             size_t n = e ? (size_t)(e - b) : strlen(b);
             if (n >= sizeof name) n = sizeof name - 1;
             memcpy(name, b, n);
@@ -27596,7 +27858,7 @@ static void ks_data_dir(char *buf, size_t n)
 
 static void ks_alias_path(const char *alias, char *buf, size_t n)
 {
-   char dir[PATH_MAX - 300];
+   char dir[DVM_PATH_MAX - 300];
    ks_data_dir(dir, sizeof dir);
    char safe[256];
    size_t i = 0;
@@ -27623,7 +27885,7 @@ static void ks_persist(struct dvm *vm, dvm_ref alias, dvm_ref key)
    uint32_t alg_len = (uint32_t)strlen(alg_s);
    if (alg_len > 256u) alg_len = 256u;
 
-   char dir[PATH_MAX - 300], path[PATH_MAX], tmp[PATH_MAX + 8];
+   char dir[DVM_PATH_MAX - 300], path[DVM_PATH_MAX], tmp[DVM_PATH_MAX + 8];
    ks_data_dir(dir, sizeof dir);
    prefs_mkdir_p(dir);
    ks_alias_path(aname, path, sizeof path);
@@ -27647,14 +27909,14 @@ static void ks_persist(struct dvm *vm, dvm_ref alias, dvm_ref key)
    ok = ok && fwrite(le, 1, 4, fp) == 4;
    ok = ok && fwrite(key_bytes_p, 1, key_len, fp) == key_len;
    if (fclose(fp) != 0) ok = 0;
-   if (!ok) { unlink(tmp); return; }
-   if (rename(tmp, path) != 0) unlink(tmp);
+   if (!ok) { luna_file_unlink(tmp); return; }
+   if (luna_file_rename(tmp, path) != 0) luna_file_unlink(tmp);
 }
 
 static dvm_ref ks_load_one(struct dvm *vm, const char *alias_utf8)
 {
    if (!alias_utf8 || !*alias_utf8) return 0;
-   char path[PATH_MAX];
+   char path[DVM_PATH_MAX];
    ks_alias_path(alias_utf8, path, sizeof path);
    FILE *fp = fopen(path, "rb");
    if (!fp) return 0;
@@ -27688,7 +27950,7 @@ static dvm_ref ks_load_one(struct dvm *vm, const char *alias_utf8)
 static void ks_hydrate(struct dvm *vm, dvm_ref map)
 {
    if (!map) return;
-   char dir[PATH_MAX];
+   char dir[DVM_PATH_MAX];
    ks_data_dir(dir, sizeof dir);
    DIR *d = opendir(dir);
    if (!d) return;
@@ -30809,7 +31071,7 @@ static bool mplayer_setDataSourcePath(struct dvm *vm, dvm_ref self,
       dvm__throw(vm, "java/io/IOException", "no data source");
       return false;
    }
-   int fd = open(path, O_RDONLY | O_CLOEXEC);
+   int fd = luna_file_open(path, O_RDONLY | LUNA_FILE_CLOEXEC, 0);
    if (fd < 0) {
       dvm__throw(vm, "java/io/IOException", "%s", path);
       return false;
@@ -30824,7 +31086,7 @@ static bool mplayer_setDataSourcePath(struct dvm *vm, dvm_ref self,
    }
    a[0].l = fdo; a[1].j = 0; a[2].j = 0;
    bool ok = mplayer_setDataSourceFD(vm, self, a, 3, out);
-   close(fd);   /* lm_mp4 kept its own dup() */
+   luna_fd_close(fd);   /* lm_mp4 kept its own dup() */
    return ok;
 }
 
@@ -31599,7 +31861,7 @@ static bool mextractor_setDataSourcePath(struct dvm *vm, dvm_ref self,
 {
    (void)nargs;
    const char *path = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
-   int fd = path ? open(path, O_RDONLY | O_CLOEXEC) : -1;
+   int fd = path ? luna_file_open(path, O_RDONLY | LUNA_FILE_CLOEXEC, 0) : -1;
    if (fd < 0) {
       dvm__throw(vm, "java/io/IOException", "%s", path ? path : "null");
       return false;
@@ -31607,7 +31869,7 @@ static bool mextractor_setDataSourcePath(struct dvm *vm, dvm_ref self,
    struct lm_mp4 *old = extractor_of(vm, self);
    if (old) lm_mp4_free(old);
    struct lm_mp4 *m = lm_mp4_open(fd, 0, 0);
-   close(fd);
+   luna_fd_close(fd);
    union dvm_value v = { .j = (int64_t)(uintptr_t)m };
    (void)dvm_set_field(vm, self, "mp4", "J", v);
    if (!m) {
@@ -32347,7 +32609,7 @@ static char *glsl_lower_external(const char *src)
    for (char *p = strstr(s, "#extension"); p; p = strstr(p + 1, "#extension")) {
       char *eol = strchr(p, '\n');
       size_t len = eol ? (size_t)(eol - p) : strlen(p);
-      if (!memmem(p, len, "GL_OES_EGL_image_external",
+      if (!luna_memmem(p, len, "GL_OES_EGL_image_external",
                   sizeof "GL_OES_EGL_image_external" - 1))
          continue;
       memset(p, ' ', len);
@@ -33353,7 +33615,7 @@ static void cookie_jar_store(struct cookie_jar *jar, const char *host,
    for (size_t i = 0; i < jar->n; ++i) {
       if (strcmp(jar->v[i].host, host) || strcmp(jar->v[i].name, name))
          continue;
-      char *nv = strndup(value, vlen);
+      char *nv = luna_strndup(value, vlen);
       if (!nv) return;
       free(jar->v[i].value);
       jar->v[i].value = nv;
@@ -33369,7 +33631,7 @@ static void cookie_jar_store(struct cookie_jar *jar, const char *host,
    struct cookie *c = &jar->v[jar->n];
    c->host = strdup(host);
    c->name = strdup(name);
-   c->value = strndup(value, vlen);
+   c->value = luna_strndup(value, vlen);
    if (c->host && c->name && c->value) ++jar->n;
    else { free(c->host); free(c->name); free(c->value); }
 }
@@ -33859,18 +34121,18 @@ static const char *file_host_path(struct dvm *vm, dvm_ref self)
    const char *p = object_is_a(vm, self, "Ljava/lang/String;")
       ? dvm_string_utf8(vm, self) : file_path(vm, self);
    if (!p || !*p) return p;
-   static char bank[4][PATH_MAX];
+   static char bank[4][DVM_PATH_MAX];
    static int next;
    char *buf = bank[next];
    next = (next + 1) % 4;
-   return arm_exec_map_guest_path(p, buf, PATH_MAX);
+   return arm_exec_map_guest_path(p, buf, DVM_PATH_MAX);
 }
 
 static bool file_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                       int nargs, union dvm_value *out)
 {
    (void)out;
-   char joined[PATH_MAX];
+   char joined[DVM_PATH_MAX];
    /* dvm_string_utf8() stringifies arbitrary objects, so trying it first on
     * File(File,String) produced "java/io/File@..." instead of the parent's
     * path.  Select by Java type before converting. */
@@ -33891,7 +34153,7 @@ static bool file_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
        * another repeats the whole data root inside the name
        * (".../cache//var/lunaria/data/<pkg>/no_backup/x").  Nothing reads
        * those names, but they are what the app then opens, prints and hashes,
-       * and PATH_MAX is finite.  Keep the child relative to the root it
+       * and DVM_PATH_MAX is finite.  Keep the child relative to the root it
        * already names. */
       const char *child = b;
       if (child[0] == '/') {
@@ -33900,7 +34162,7 @@ static bool file_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
           * root.  What is left is the part that actually distinguishes the
           * file. */
          const char *files = getenv("ANDROID_FILES_DIR");
-         char pkgdir[PATH_MAX];
+         char pkgdir[DVM_PATH_MAX];
          const char *roots[2] = { NULL, getenv("LUNARIA_DATA_ROOT") };
          if (files && *files) {
             snprintf(pkgdir, sizeof pkgdir, "%s", files);
@@ -34040,31 +34302,26 @@ static bool file_setLastModified(struct dvm *vm, dvm_ref self,
    if (!p || !*p) RETI(0);
    int64_t ms = ARG(0).j;
    if (ms < 0) RETI(0);
-   struct timespec ts[2];
-   ts[0].tv_sec = 0;
-   ts[0].tv_nsec = UTIME_OMIT;
-   ts[1].tv_sec = (time_t)(ms / 1000);
-   ts[1].tv_nsec = (long)((ms % 1000) * 1000000L);
-   RETI(utimensat(AT_FDCWD, p, ts, 0) == 0 ? 1 : 0);
+   RETI(luna_file_set_modified(p, ms) == 0 ? 1 : 0);
 }
 
-/* mkdirs() creates the whole chain; mkdir() only the leaf. */
+/* mkdirs() creates the whole chain; luna_file_mkdir() only the leaf. */
 static bool file_mkdir_impl(struct dvm *vm, dvm_ref self, bool parents,
                             union dvm_value *out)
 {
    const char *p = file_host_path(vm, self);
    if (!p || !*p) RETI(0);
-   char buf[PATH_MAX];
+   char buf[DVM_PATH_MAX];
    snprintf(buf, sizeof buf, "%s", p);
    if (parents) {
       for (char *q = buf + 1; *q; ++q) {
          if (*q != '/') continue;
          *q = '\0';
-         (void)mkdir(buf, 0777);
+         (void)luna_file_mkdir(buf, 0777);
          *q = '/';
       }
    }
-   if (mkdir(buf, 0777) == 0) RETI(1);
+   if (luna_file_mkdir(buf, 0777) == 0) RETI(1);
    struct stat st;
    RETI(errno == EEXIST && stat(buf, &st) == 0 && S_ISDIR(st.st_mode));
 }
@@ -34093,8 +34350,8 @@ static bool file_createNewFile(struct dvm *vm, dvm_ref self,
    (void)args; (void)nargs;
    const char *p = file_host_path(vm, self);
    if (!p || !*p) RETI(0);
-   int fd = open(p, O_CREAT | O_EXCL | O_WRONLY, 0666);
-   if (fd >= 0) { close(fd); RETI(1); }
+   int fd = luna_file_open(p, O_CREAT | O_EXCL | O_WRONLY, 0666);
+   if (fd >= 0) { luna_fd_close(fd); RETI(1); }
    if (errno == EEXIST) RETI(0);
    dvm__throw(vm, "java/io/IOException", "%s: %s", p, strerror(errno));
    return false;
@@ -34121,11 +34378,11 @@ static bool file_createTempFile(struct dvm *vm, dvm_ref self,
    }
    if (!directory || !*directory) directory = "/tmp";
 
-   char guest[PATH_MAX];
+   char guest[DVM_PATH_MAX];
    snprintf(guest, sizeof guest, "%s%s%sXXXXXX%s", directory,
             directory[strlen(directory) - 1] == '/' ? "" : "/",
             prefix, suffix ? suffix : ".tmp");
-   char host[PATH_MAX];
+   char host[DVM_PATH_MAX];
    const char *mapped = arm_exec_map_guest_path(guest, host, sizeof host);
    if (!mapped) {
       dvm__throw(vm, "java/io/IOException", "%s: invalid path", guest);
@@ -34136,13 +34393,13 @@ static bool file_createTempFile(struct dvm *vm, dvm_ref self,
     * writable copy either way. */
    if (mapped != host) snprintf(host, sizeof host, "%s", mapped);
    int suffix_len = (int)strlen(suffix ? suffix : ".tmp");
-   int fd = mkstemps(host, suffix_len);
+   int fd = luna_file_mkstemps(host, suffix_len);
    if (fd < 0) {
       dvm__throw(vm, "java/io/IOException", "%s: %s", guest,
                  strerror(errno));
       return false;
    }
-   close(fd);
+   luna_fd_close(fd);
 
    /* mkstemps changed the host spelling in place.  The guest and host paths
     * have the same tail, so copy the generated six characters back. */
@@ -34170,7 +34427,7 @@ static bool file_renameTo(struct dvm *vm, dvm_ref self,
    const char *to = (nargs > 0 && ARG(0).l) ? file_host_path(vm, ARG(0).l) : NULL;
    if (!from || !*from || !to || !*to) RETI(0);
    arm_exec_note_destructive("File.renameTo", from, to);
-   RETI(rename(from, to) == 0);
+   RETI(luna_file_rename(from, to) == 0);
 }
 
 static dvm_ref path_make(struct dvm *vm, const char *p)
@@ -34198,8 +34455,8 @@ static bool file_getCanonicalFile(struct dvm *vm, dvm_ref self,
 {
    (void)args; (void)nargs;
    const char *p = file_path(vm, self);
-   char resolved[PATH_MAX];
-   const char *canonical = p && realpath(p, resolved) ? resolved : p;
+   char resolved[DVM_PATH_MAX];
+   const char *canonical = p && luna_file_realpath(p, resolved, sizeof resolved) ? resolved : p;
    struct dvm_class *c = dvm__class_by_desc(vm, "Ljava/io/File;");
    dvm_ref file = c ? dvm_new_object(vm, c) : 0;
    if (file) {
@@ -34215,7 +34472,7 @@ static bool file_getAbsoluteFile(struct dvm *vm, dvm_ref self,
 {
    (void)args; (void)nargs;
    const char *p = file_path(vm, self);
-   char absolute[PATH_MAX];
+   char absolute[DVM_PATH_MAX];
    if (p && p[0] == '/') {
       snprintf(absolute, sizeof absolute, "%s", p);
    } else {
@@ -34240,11 +34497,11 @@ static bool files_createDirectories(struct dvm *vm, dvm_ref self,
    (void)dvm_get_field(vm, ARG(0).l, "path", "Ljava/lang/String;", &pathv);
    const char *p = dvm_string_utf8(vm, pathv.l);
    if (!p || !*p) RETL(ARG(0).l);
-   char buf[PATH_MAX]; snprintf(buf, sizeof buf, "%s", p);
+   char buf[DVM_PATH_MAX]; snprintf(buf, sizeof buf, "%s", p);
    for (char *q = buf + 1; *q; ++q) if (*q == '/') {
-      *q = '\0'; (void)mkdir(buf, 0777); *q = '/';
+      *q = '\0'; (void)luna_file_mkdir(buf, 0777); *q = '/';
    }
-   if (mkdir(buf, 0777) != 0 && errno != EEXIST) {
+   if (luna_file_mkdir(buf, 0777) != 0 && errno != EEXIST) {
       dvm__throw(vm, "java/io/IOException", "%s: %s", p, strerror(errno));
       return false;
    }
@@ -34364,7 +34621,7 @@ static bool environment_getDataDirectory(
 {
    (void)self; (void)args; (void)nargs;
    const char *path = getenv("ANDROID_FILES_DIR");
-   char root[PATH_MAX];
+   char root[DVM_PATH_MAX];
    if (path && *path) {
       /* .../<package>/files → .../<package> */
       snprintf(root, sizeof root, "%s", path);
@@ -34443,7 +34700,7 @@ static bool parcel_fd_open(struct dvm *vm, dvm_ref self,
    if (mode & 0x08000000u) flags |= O_CREAT;
    if (mode & 0x04000000u) flags |= O_TRUNC;
    if (mode & 0x02000000u) flags |= O_APPEND;
-   int fd = path ? open(path, flags, 0666) : -1;
+   int fd = path ? luna_file_open(path, flags, 0666) : -1;
    if (fd < 0) {
       dvm__throw(vm, "java/io/FileNotFoundException", "%s: %s",
                  path ? path : "null", strerror(errno));
@@ -34451,7 +34708,7 @@ static bool parcel_fd_open(struct dvm *vm, dvm_ref self,
    }
    struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/os/ParcelFileDescriptor;");
    dvm_ref result = c ? dvm_new_object(vm, c) : 0;
-   if (!result) { close(fd); RETL(0); }
+   if (!result) { luna_fd_close(fd); RETL(0); }
    union dvm_value value = { .i = fd };
    (void)dvm_set_field(vm, result, "fd", "I", value);
    RETL(result);
@@ -34474,7 +34731,7 @@ static bool parcel_fd_close(struct dvm *vm, dvm_ref self,
    union dvm_value fd = { .i = -1 };
    (void)args; (void)nargs;
    (void)dvm_get_field(vm, self, "fd", "I", &fd);
-   if (fd.i >= 0) close(fd.i);
+   if (fd.i >= 0) luna_fd_close(fd.i);
    fd.i = -1;
    (void)dvm_set_field(vm, self, "fd", "I", fd);
    RETV();
@@ -34653,7 +34910,7 @@ static int32_t process_rss_kib(void)
          total = resident = 0;
       fclose(f);
    }
-   long page = sysconf(_SC_PAGESIZE);
+   long page = (long)luna_os_page_size();
    return (resident > 0 && page > 0)
       ? (int32_t)(((int64_t)resident * page) / 1024) : 0;
 }
@@ -36350,7 +36607,7 @@ static bool file_listFiles(struct dvm *vm, dvm_ref self,
          closedir(d); return false;
       }
       if (!accepted) continue;
-      char joined[PATH_MAX];
+      char joined[DVM_PATH_MAX];
       snprintf(joined, sizeof joined, "%s/%s", p, ent->d_name);
       dvm_ref f = dvm_new_object(vm, fc);
       if (!f) continue;
@@ -38300,7 +38557,7 @@ static dvm_ref pm_component_info(struct dvm *vm, const char *desc)
    return info;
 }
 
-/* Resolve an installed manifest provider by authority.  lunaria-apk.sh has
+/* Resolve an installed manifest provider by authority.  The native APK launcher has
  * already decoded the binary manifest into the same provider table used by
  * loader.c to start providers, so PackageManager must expose that table too;
  * returning null here made FileProvider reject metadata that had in fact been
@@ -39572,9 +39829,9 @@ int dvm_webview_count(void)
 
 static const char *webview_luna_browser(void)
 {
-   static char path[PATH_MAX];
+   static char path[DVM_PATH_MAX];
 #if defined(__linux__)
-   char exe[PATH_MAX];
+   char exe[DVM_PATH_MAX];
    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
    if (n > 0) {
       exe[n] = '\0';
@@ -39806,12 +40063,12 @@ static void webview_bridge_call(struct dvm *vm, dvm_ref view, const char *payloa
             if (*p == '{' || *p == '[') ++depth;
             else if ((*p == '}' || *p == ']') && --depth == 0) { ++p; break; }
          }
-         vals[n] = strndup(start, (size_t)(p - start));
+         vals[n] = luna_strndup(start, (size_t)(p - start));
          kinds[n] = 's';
       } else {
          const char *start = p;
          while (*p && *p != ',' && *p != ']') ++p;
-         vals[n] = strndup(start, (size_t)(p - start));
+         vals[n] = luna_strndup(start, (size_t)(p - start));
          kinds[n] = !strncmp(start, "true", 4) ? 'b' : !strncmp(start, "false", 5) ? 'f'
                   : !strncmp(start, "null", 4) ? '0' : 'n';
       }
@@ -40094,7 +40351,7 @@ static void webview_host_capture_image(struct webview_host_view *slot,
    FILE *file = fopen(temp, "wb");
    if (file) {
       const bool written = fwrite(png, 1, length, file) == length;
-      if (fclose(file) == 0 && written && rename(temp, slot->image) == 0) {
+      if (fclose(file) == 0 && written && luna_file_rename(temp, slot->image) == 0) {
          if (!slot->image_ready) g_ui_dirty = true;
          slot->image_ready = true;
          luna_overlay_image_changed(slot->image);
@@ -41451,6 +41708,8 @@ static bool view_set_insets_listener(struct dvm *vm, dvm_ref self,
 }
 
 static const struct rt_field rt_view_fields[] = {
+   { "alertDialog", "Landroid/app/AlertDialog;" },
+   { "alertWhich", "I" },
    { "propertyAnimator", "Landroid/view/ViewPropertyAnimator;" },
    { "alpha", "F" }, { "alphaSet", "Z" },
    { "animation", "Landroid/view/animation/Animation;" },
@@ -42032,6 +42291,10 @@ static bool view_getAnimation(struct dvm *vm, dvm_ref self,
                               const union dvm_value *args, int nargs,
                               union dvm_value *out);
 
+static bool view_perform_click(struct dvm *vm, dvm_ref self,
+                                const union dvm_value *args, int nargs,
+                                union dvm_value *out);
+
 static const struct rt_method rt_view[] = {
    M("setAnimation", "(Landroid/view/animation/Animation;)V", view_setAnimation),
    M("startAnimation", "(Landroid/view/animation/Animation;)V",
@@ -42131,6 +42394,7 @@ static const struct rt_method rt_view[] = {
    M("setOutlineProvider", "(Landroid/view/ViewOutlineProvider;)V", view_set_outline),
    M("getLayoutDirection", "()I", view_get_layout_direction),
    M("setOnClickListener", "(Landroid/view/View$OnClickListener;)V", view_set_click_listener),
+   M("performClick", "()Z", view_perform_click),
    M("setOnTouchListener", "(Landroid/view/View$OnTouchListener;)V", view_set_touch_listener),
    M("setClickable", "(Z)V", view_set_clickable),
    M("isSelected", "()Z", view_get_selected),
@@ -42800,13 +43064,13 @@ static bool drawable_resolve_opacity(struct dvm *vm, dvm_ref self,
                                      union dvm_value *out)
 {
    (void)vm; (void)self; (void)nargs;
-   enum { UNKNOWN = 0, OPAQUE = -1, TRANSLUCENT = -3 };
+   enum { OPACITY_UNKNOWN = 0, OPACITY_OPAQUE = -1, OPACITY_TRANSLUCENT = -3 };
    const int32_t a = ARG(0).i, b = ARG(1).i;
    if (a == b) RETI(a);
-   if (a == UNKNOWN || b == UNKNOWN) RETI(UNKNOWN);
-   if (a == OPAQUE) RETI(b);
-   if (b == OPAQUE) RETI(a);
-   RETI(TRANSLUCENT);
+   if (a == OPACITY_UNKNOWN || b == OPACITY_UNKNOWN) RETI(OPACITY_UNKNOWN);
+   if (a == OPACITY_OPAQUE) RETI(b);
+   if (b == OPACITY_OPAQUE) RETI(a);
+   RETI(OPACITY_TRANSLUCENT);
 }
 
 /* Drawable.setColorFilter — store the filter.  Netmarble's channel buttons
@@ -43840,7 +44104,7 @@ static dvm_ref context_path_file(struct dvm *vm, const char *env_name,
 {
    const char *base = getenv(env_name);
    if (!base || !*base) base = fallback;
-   char path[PATH_MAX];
+   char path[DVM_PATH_MAX];
    if (child && *child)
       snprintf(path, sizeof path, "%s/%s", base, child);
    else
@@ -44053,7 +44317,7 @@ static bool context_get_package_name(struct dvm *vm, dvm_ref self,
  *
  * These were unresolved, which answers 0 — and 0 is PERMISSION_GRANTED, so
  * every permission the manifest never asked for read as held.  The install
- * decides what an app has, and lunaria-apk.sh already publishes that list as
+ * decides what an app has, and the native APK launcher already publishes that list as
  * ANDROID_REQUESTED_PERMISSIONS, so answer from it. */
 static bool ctx_check_permission(struct dvm *vm, dvm_ref self,
                                  const union dvm_value *args, int nargs,
@@ -47242,7 +47506,7 @@ static char **ax_string_pool(const unsigned char *b, size_t n,
             used = ax_len8(b + q, pos + size - q, &bytes);
             if (!used || q + used + bytes > pos + size) continue;
             q += used;
-            strings[i] = strndup((const char *)b + q, bytes);
+            strings[i] = luna_strndup((const char *)b + q, bytes);
          } else {
             if (q + 2 > pos + size) continue;
             uint32_t chars = ax_u16(b + q); q += 2;
@@ -47771,7 +48035,7 @@ static bool typeface_createFrom(struct dvm *vm, dvm_ref self,
       found = data != NULL;
       free(data);
    } else {
-      char host[PATH_MAX];
+      char host[DVM_PATH_MAX];
       const char *hp = arm_exec_map_guest_path(path, host, sizeof host);
       found = hp && access(hp, R_OK) == 0;
    }
@@ -48079,7 +48343,7 @@ static void ui_emit_background_shape(struct dvm *vm, struct ui_buf *css,
       dvm__class_by_desc(vm, "Landroid/graphics/drawable/NinePatchDrawable;");
    struct dvm_class *oc = dvm_object_class(vm, bg);
    if (oc && nc && dvm__class_assignable(vm, oc, nc)) {
-      char bi[PATH_MAX + 160];
+      char bi[DVM_PATH_MAX + 160];
       if (ninepatch_border_image_css(vm, bg, bi, sizeof bi)) ui_puts(css, bi);
    } else if (oc && gc && dvm__class_assignable(vm, oc, gc)) {
       const float r = ui_float(vm, bg, "cornerRadius");
@@ -49722,6 +49986,8 @@ static bool imm_show_soft_input(struct dvm *vm, dvm_ref self,
                                 const union dvm_value *args, int nargs,
                                 union dvm_value *out);
 
+static bool dialog_button_click(struct dvm *vm, dvm_ref button);
+
 static void ui_dispatch_click(struct dvm *vm, dvm_ref clicked)
 {
    /* A tap on an enabled EditText focuses it and brings up the input method
@@ -49750,6 +50016,7 @@ static void ui_dispatch_click(struct dvm *vm, dvm_ref clicked)
    dvm_ref listener = ui_obj(vm, target, "clickListener",
                              "Landroid/view/View$OnClickListener;");
    if (!listener) {
+      if (dialog_button_click(vm, target)) return;
       fprintf(stderr, "[ui] click v%u (no OnClickListener)\n", (unsigned)target);
       return;
    }
@@ -49762,6 +50029,28 @@ static void ui_dispatch_click(struct dvm *vm, dvm_ref clicked)
    union dvm_value a = { .l = target }, ignored = { 0 };
    if (!dvm_call(vm, m, listener, &a, 1, &ignored))
       ui_report_exception(vm, "onClick");
+}
+
+static bool view_perform_click(struct dvm *vm, dvm_ref self,
+                                const union dvm_value *args, int nargs,
+                                union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   if (ui_is_a(vm, self, "android/widget/CompoundButton")) {
+      union dvm_value ignored = { 0 };
+      if (!compound_toggle(vm, self, NULL, 0, &ignored)) return false;
+   }
+   dvm_ref listener = ui_obj(vm, self, "clickListener",
+                             "Landroid/view/View$OnClickListener;");
+   if (listener) {
+      struct dvm_class *c = dvm_object_class(vm, listener);
+      struct dvm_method *m = c ? dvm_find_method(vm, c, "onClick",
+                                   "(Landroid/view/View;)V") : NULL;
+      union dvm_value a = { .l = self }, ignored = { 0 };
+      if (m && !dvm_call(vm, m, listener, &a, 1, &ignored)) return false;
+      RETI(1);
+   }
+   RETI(dialog_button_click(vm, self));
 }
 
 /* --- what the rest of the runtime calls -------------------------------- */
@@ -50401,6 +50690,8 @@ static bool adb_init(struct dvm *vm, dvm_ref self,
    (void)out;
    union dvm_value v = { .l = nargs > 0 ? ARG(0).l : 0 };
    (void)dvm_set_field(vm, self, "context", "Landroid/content/Context;", v);
+   v.i = 1;
+   (void)dvm_set_field(vm, self, "cancelable", "Z", v);
    RETV();
 }
 
@@ -50462,6 +50753,49 @@ static bool adb_set_message(struct dvm *vm, dvm_ref self,
    RETL(self);
 }
 
+/* The overload decides whether the first argument is a resource id or
+ * a CharSequence. Keep labels and listeners until create(), then copy them. */
+static bool adb_set_text_field(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out, const char *field)
+{
+   union dvm_value text = { .l = nargs ? ARG(0).l : 0 };
+   const char *sig = builtin_sig();
+   if (sig && sig[1] == 'I' &&
+       !res_getString(vm, 0, args, 1, &text)) return false;
+   (void)dvm_set_field(vm, self, field, "Ljava/lang/CharSequence;", text);
+   RETL(self);
+}
+static bool adb_set_title_resource(struct dvm *vm, dvm_ref self,
+                                   const union dvm_value *args, int nargs,
+                                   union dvm_value *out)
+{ return adb_set_text_field(vm, self, args, nargs, out, "title"); }
+static bool adb_set_message_resource(struct dvm *vm, dvm_ref self,
+                                     const union dvm_value *args, int nargs,
+                                     union dvm_value *out)
+{ return adb_set_text_field(vm, self, args, nargs, out, "message"); }
+static bool adb_set_button(struct dvm *vm, dvm_ref self,
+                           const union dvm_value *args, int nargs,
+                           union dvm_value *out, const char *label,
+                           const char *listener)
+{
+   if (!adb_set_text_field(vm, self, args, nargs, out, label)) return false;
+   union dvm_value v = { .l = nargs > 1 ? ARG(1).l : 0 };
+   (void)dvm_set_field(vm, self, listener,
+                       "Landroid/content/DialogInterface$OnClickListener;", v);
+   RETL(self);
+}
+static bool adb_positive(struct dvm *vm, dvm_ref self,
+                          const union dvm_value *args, int nargs, union dvm_value *out)
+{ return adb_set_button(vm, self, args, nargs, out, "positiveText", "positiveListener"); }
+static bool adb_negative(struct dvm *vm, dvm_ref self,
+                          const union dvm_value *args, int nargs, union dvm_value *out)
+{ return adb_set_button(vm, self, args, nargs, out, "negativeText", "negativeListener"); }
+static bool adb_neutral(struct dvm *vm, dvm_ref self,
+                         const union dvm_value *args, int nargs, union dvm_value *out)
+{ return adb_set_button(vm, self, args, nargs, out, "neutralText", "neutralListener"); }
+static bool dialog_build_alert_content(struct dvm *vm, dvm_ref dialog);
+
 /* create() builds the dialog the builder describes.  Everything the builder
  * was told has to travel with it — the cancelable flag decides whether the
  * user may dismiss it, and the text is what it says. */
@@ -50479,6 +50813,27 @@ static bool adb_create(struct dvm *vm, dvm_ref self,
    union dvm_value copy = { 0 };
    (void)dvm_get_field(vm, self, "context", "Landroid/content/Context;", &copy);
    (void)dvm_set_field(vm, dialog, "context", "Landroid/content/Context;", copy);
+   static const char *const texts[] = {
+      "title", "message", "positiveText", "negativeText", "neutralText"
+   };
+   for (unsigned i = 0; i < sizeof texts / sizeof texts[0]; ++i) {
+      copy.l = 0;
+      (void)dvm_get_field(vm, self, texts[i], "Ljava/lang/CharSequence;", &copy);
+      (void)dvm_set_field(vm, dialog, texts[i], "Ljava/lang/CharSequence;", copy);
+   }
+   static const char *const listeners[] = {
+      "positiveListener", "negativeListener", "neutralListener"
+   };
+   for (unsigned i = 0; i < sizeof listeners / sizeof listeners[0]; ++i) {
+      copy.l = 0;
+      (void)dvm_get_field(vm, self, listeners[i],
+                         "Landroid/content/DialogInterface$OnClickListener;", &copy);
+      (void)dvm_set_field(vm, dialog, listeners[i],
+                         "Landroid/content/DialogInterface$OnClickListener;", copy);
+   }
+   copy.l = 0;
+   (void)dvm_get_field(vm, self, "view", "Landroid/view/View;", &copy);
+   (void)dvm_set_field(vm, dialog, "customView", "Landroid/view/View;", copy);
    /* Builder.setCancelable() defaults to true, and adb_init sets it. */
    copy.i = 0;
    (void)dvm_get_field(vm, self, "cancelable", "Z", &copy);
@@ -50514,6 +50869,7 @@ static bool dialog_show(struct dvm *vm, dvm_ref self,
    /* onCreate() before the listener: the subclass inflates its layout there,
     * and an OnShowListener's first act is usually to look a view up in it. */
    if (!dialog_ensure_created(vm, self)) return false;
+   if (!dialog_build_alert_content(vm, self)) return false;
    union dvm_value v = { .i = 1 };
    (void)dvm_set_field(vm, self, "showing", "Z", v);
    /* Say what it says.  A modal dialog is where a title stops, and the one
@@ -50524,15 +50880,15 @@ static bool dialog_show(struct dvm *vm, dvm_ref self,
       union dvm_value b = { 0 }, t = { 0 }, m = { 0 };
       (void)dvm_get_field(vm, self, "builder",
                           "Landroid/app/AlertDialog$Builder;", &b);
-      if (b.l) {
-         (void)dvm_get_field(vm, b.l, "title", "Ljava/lang/CharSequence;", &t);
-         (void)dvm_get_field(vm, b.l, "message", "Ljava/lang/CharSequence;", &m);
-      }
+      (void)dvm_get_field(vm, self, "title", "Ljava/lang/CharSequence;", &t);
+      (void)dvm_get_field(vm, self, "message", "Ljava/lang/CharSequence;", &m);
       const char *ts = t.l ? rt_charseq_utf8(vm, t.l) : NULL;
       const char *ms = m.l ? rt_charseq_utf8(vm, m.l) : NULL;
-      fprintf(stderr, "[dialog] shown%s%s%s%s%s%s\n",
+      fprintf(stderr, "[dialog] shown%s%s%s%s%s%s class=%s content=%u\n",
               ts ? " title=\"" : "", ts ? ts : "", ts ? "\"" : "",
-              ms ? " message=\"" : "", ms ? ms : "", ms ? "\"" : "");
+              ms ? " message=\"" : "", ms ? ms : "", ms ? "\"" : "",
+              dvm_class_name(dvm_object_class(vm, self)),
+              (unsigned)ui_obj(vm, self, "contentView", "Landroid/view/View;"));
       if (!dialog_user_cancelable(vm, self))
          fprintf(stderr, "[dialog]   not cancelable: it has to be answered\n");
    }
@@ -50675,6 +51031,13 @@ static bool dialog_is_showing(struct dvm *vm, dvm_ref self,
 }
 
 static const struct rt_field rt_alert_builder_fields[] = {
+   { "positiveText", "Ljava/lang/CharSequence;" },
+   { "negativeText", "Ljava/lang/CharSequence;" },
+   { "neutralText", "Ljava/lang/CharSequence;" },
+   { "positiveListener", "Landroid/content/DialogInterface$OnClickListener;" },
+   { "negativeListener", "Landroid/content/DialogInterface$OnClickListener;" },
+   { "neutralListener", "Landroid/content/DialogInterface$OnClickListener;" },
+
    { "context", "Landroid/content/Context;" },
    { "view", "Landroid/view/View;" },
    { "cancelable", "Z" },
@@ -50690,25 +51053,31 @@ static const struct rt_method rt_alert_builder[] = {
      adb_set_view),
    /* The resource-id forms carry an id this runtime has no string table for;
     * the text forms are the ones that arrive with their content. */
-   M("setTitle", "(I)Landroid/app/AlertDialog$Builder;", adb_return_self),
+   M("setTitle", "(I)Landroid/app/AlertDialog$Builder;", adb_set_title_resource),
    M("setTitle", "(Ljava/lang/CharSequence;)Landroid/app/AlertDialog$Builder;",
      adb_set_title),
-   M("setMessage", "(I)Landroid/app/AlertDialog$Builder;", adb_return_self),
+   M("setMessage", "(I)Landroid/app/AlertDialog$Builder;", adb_set_message_resource),
    M("setMessage",
      "(Ljava/lang/CharSequence;)Landroid/app/AlertDialog$Builder;",
      adb_set_message),
    M("setPositiveButton",
      "(ILandroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;",
-     adb_return_self),
+     adb_positive),
    M("setPositiveButton",
      "(Ljava/lang/CharSequence;Landroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;",
-     adb_return_self),
+     adb_positive),
    M("setNegativeButton",
      "(ILandroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;",
-     adb_return_self),
+     adb_negative),
    M("setNeutralButton",
      "(ILandroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;",
-     adb_return_self),
+     adb_neutral),
+   M("setNegativeButton",
+     "(Ljava/lang/CharSequence;Landroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;",
+     adb_negative),
+   M("setNeutralButton",
+     "(Ljava/lang/CharSequence;Landroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;",
+     adb_neutral),
    M("setCancelable", "(Z)Landroid/app/AlertDialog$Builder;",
      adb_set_cancelable),
    M("create", "()Landroid/app/AlertDialog;", adb_create),
@@ -50983,6 +51352,16 @@ static const struct rt_method rt_toast[] = {
 };
 
 static const struct rt_field rt_alert_dialog_fields[] = {
+   { "customView", "Landroid/view/View;" },
+   { "title", "Ljava/lang/CharSequence;" },
+   { "message", "Ljava/lang/CharSequence;" },
+   { "positiveText", "Ljava/lang/CharSequence;" },
+   { "negativeText", "Ljava/lang/CharSequence;" },
+   { "neutralText", "Ljava/lang/CharSequence;" },
+   { "positiveListener", "Landroid/content/DialogInterface$OnClickListener;" },
+   { "negativeListener", "Landroid/content/DialogInterface$OnClickListener;" },
+   { "neutralListener", "Landroid/content/DialogInterface$OnClickListener;" },
+
    { "builder", "Landroid/app/AlertDialog$Builder;" },
    { "buttonPositive", "Landroid/widget/Button;" },
    { "buttonNegative", "Landroid/widget/Button;" },
@@ -51103,13 +51482,14 @@ static bool dialog_find_view_by_id(struct dvm *vm, dvm_ref self,
  * calls getId() on it, so a null here killed the whole message box.  One
  * Button per slot, created on demand and kept, because callers set a listener
  * on it and expect the same object back next time. */
-static bool dialog_get_button(struct dvm *vm, dvm_ref self,
+static bool dialog_make_button(struct dvm *vm, dvm_ref self,
                               const union dvm_value *args, int nargs,
                               union dvm_value *out)
 {
    (void)nargs;
    /* -1 POSITIVE, -2 NEGATIVE, -3 NEUTRAL — the DialogInterface constants. */
    const int which = ARG(0).i;
+   if (which < -3 || which > -1) RETL(0);
    const char *slot = which == -2 ? "buttonNegative"
                     : which == -3 ? "buttonNeutral"
                                   : "buttonPositive";
@@ -51119,11 +51499,118 @@ static bool dialog_get_button(struct dvm *vm, dvm_ref self,
       struct dvm_class *bc = dvm__class_by_desc(vm, "Landroid/widget/Button;");
       v.l = bc ? dvm_new_object(vm, bc) : 0;
       if (!v.l) RETL(0);
-      union dvm_value id = { .i = which };
+      union dvm_value id = { .i = which == -2 ? 0x0102001a
+                                     : which == -3 ? 0x0102001b : 0x01020019 };
+      union dvm_value owner = { .l = self }, slot_id = { .i = which };
+      (void)dvm_set_field(vm, v.l, "alertDialog", "Landroid/app/AlertDialog;", owner);
+      (void)dvm_set_field(vm, v.l, "alertWhich", "I", slot_id);
+      union dvm_value color = { .i = (int32_t)0xff1a73e8 };
+      (void)dvm_set_field(vm, v.l, "textColor", "I", color);
       (void)dvm_set_field(vm, v.l, "id", "I", id);
       (void)dvm_set_field(vm, self, slot, "Landroid/widget/Button;", v);
    }
    RETL(v.l);
+}
+
+/* A standard AlertDialog owns a real View tree, just like a custom dialog.
+ * UE installs its View listener after show(), through getButton(). */
+static dvm_ref alert_view(struct dvm *vm, const char *klass)
+{
+   struct dvm_class *c = dvm__class_by_desc(vm, klass);
+   return c ? dvm_new_object(vm, c) : 0;
+}
+static void alert_add(struct dvm *vm, dvm_ref parent, dvm_ref child)
+{
+   union dvm_value a = { .l = child }, ignored = { 0 };
+   (void)vg_add_view(vm, parent, &a, 1, &ignored);
+}
+static bool dialog_build_alert_content(struct dvm *vm, dvm_ref dialog)
+{
+   if (!ui_is_a(vm, dialog, "android/app/AlertDialog")) return true;
+   if (ui_obj(vm, dialog, "contentView", "Landroid/view/View;")) return true;
+   dvm_ref root = alert_view(vm, "Landroid/widget/LinearLayout;");
+   if (!root) return false;
+   union dvm_value v = { .i = 1 };
+   (void)dvm_set_field(vm, root, "orientation", "I", v);
+   static const char *const padding[] = {
+      "paddingLeft", "paddingTop", "paddingRight", "paddingBottom"
+   };
+   v.i = 24;
+   for (unsigned i = 0; i < 4; ++i) (void)dvm_set_field(vm, root, padding[i], "I", v);
+   v.i = (int32_t)0xfffafafa;
+   (void)dvm_set_field(vm, root, "backgroundColor", "I", v);
+   static const char *const texts[] = { "title", "message" };
+   for (unsigned i = 0; i < 2; ++i) {
+      dvm_ref text = ui_obj(vm, dialog, texts[i], "Ljava/lang/CharSequence;");
+      if (!text) continue;
+      dvm_ref tv = alert_view(vm, "Landroid/widget/TextView;");
+      if (!tv) return false;
+      v.l = text;
+      (void)text_set_text(vm, tv, &v, 1, NULL);
+      v.f = i ? 16.f : 20.f;
+      (void)dvm_set_field(vm, tv, "textSize", "F", v);
+      v.i = (int32_t)0xff202124;
+      (void)dvm_set_field(vm, tv, "textColor", "I", v);
+      v.i = 16;
+      (void)dvm_set_field(vm, tv, "paddingBottom", "I", v);
+      alert_add(vm, root, tv);
+   }
+   dvm_ref custom = ui_obj(vm, dialog, "customView", "Landroid/view/View;");
+   if (custom) alert_add(vm, root, custom);
+   dvm_ref row = alert_view(vm, "Landroid/widget/LinearLayout;");
+   if (!row) return false;
+   v.i = 0;
+   (void)dvm_set_field(vm, row, "orientation", "I", v);
+   static const char *const labels[] = { "positiveText", "negativeText", "neutralText" };
+   /* Negative, neutral, positive: the affirmative button is on the right. */
+   static const int order[] = { 1, 2, 0 };
+   for (unsigned j = 0; j < 3; ++j) {
+      int i = order[j];
+      dvm_ref label = ui_obj(vm, dialog, labels[i], "Ljava/lang/CharSequence;");
+      if (!label) continue;
+      union dvm_value a = { .i = -1 - i }, button = { 0 };
+      if (!dialog_make_button(vm, dialog, &a, 1, &button) || !button.l) return false;
+      a.l = label;
+      (void)text_set_text(vm, button.l, &a, 1, NULL);
+      alert_add(vm, row, button.l);
+   }
+   alert_add(vm, root, row);
+   v.l = root;
+   (void)dvm_set_field(vm, dialog, "contentView", "Landroid/view/View;", v);
+   return true;
+}
+static bool dialog_button_click(struct dvm *vm, dvm_ref button)
+{
+   dvm_ref dialog = ui_obj(vm, button, "alertDialog", "Landroid/app/AlertDialog;");
+   if (!dialog) return false;
+   int which = ui_int(vm, button, "alertWhich");
+   const char *field = which == -2 ? "negativeListener"
+                     : which == -3 ? "neutralListener" : "positiveListener";
+   dvm_ref listener = ui_obj(vm, dialog, field,
+                              "Landroid/content/DialogInterface$OnClickListener;");
+   if (listener) {
+      struct dvm_class *c = dvm_object_class(vm, listener);
+      struct dvm_method *m = c ? dvm_find_method(vm, c, "onClick",
+                                 "(Landroid/content/DialogInterface;I)V") : NULL;
+      union dvm_value a[2] = { { .l = dialog }, { .i = which } }, ignored = { 0 };
+      if (m && !dvm_call(vm, m, listener, a, 2, &ignored)) {
+         ui_report_exception(vm, "dialog onClick");
+         return true;
+      }
+   }
+   (void)dialog_dismiss(vm, dialog, NULL, 0, NULL);
+   return true;
+}
+
+static bool dialog_get_button(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   int which = nargs ? ARG(0).i : 0;
+   const char *slot = which == -1 ? "buttonPositive"
+                    : which == -2 ? "buttonNegative"
+                    : which == -3 ? "buttonNeutral" : NULL;
+   RETL(slot ? ui_obj(vm, self, slot, "Landroid/widget/Button;") : 0);
 }
 
 /* Dialog.onCreate() runs once, the first time the dialog is shown — that is
@@ -51870,8 +52357,15 @@ static bool choreographer_post(struct dvm *vm, dvm_ref self,
    union dvm_value value = { .l = callback };
    (void)dvm_set_field(vm, frame, "callback",
                        "Landroid/view/Choreographer$FrameCallback;", value);
+   /* Choreographer dispatches on its calling Looper. Unity moves frame
+    * pacing onto a HandlerThread after its splash; posting to the main queue
+    * there leaves nativeRender waiting for a callback that it must itself
+    * return to let the main pump drain. */
+   union dvm_value looper = { 0 };
+   if (!looper_my(vm, 0, NULL, 0, &looper)) return false;
+   dvm_ref target = looper.l == looper_main(vm) ? 0 : looper.l;
    /* The queue uses milliseconds; round the emulated 60 Hz period to 17 ms. */
-   if (!queue_runnable_for(vm, frame, false, 17, 0, self, callback)) {
+   if (!queue_runnable_for(vm, frame, false, 17, target, self, callback)) {
       dvm__throw(vm, "java/lang/IllegalStateException", "Choreographer queue full");
       return false;
    }
@@ -52559,7 +53053,7 @@ static bool sqlite_helper_database(struct dvm *vm, dvm_ref self,
       union dvm_value name = { 0 };
       (void)dvm_get_field(vm, self, "name", "Ljava/lang/String;", &name);
       const char *dbname = name.l ? dvm_string_utf8(vm, name.l) : NULL;
-      char dbpath[PATH_MAX];
+      char dbpath[DVM_PATH_MAX];
       if (dbname && *dbname) {
          const char *base = getenv("ANDROID_DATABASES_DIR");
          if (!base || !*base) base = "/tmp/lunaria-databases";
@@ -52655,7 +53149,7 @@ static bool sqlite_exec_sql(struct dvm *vm, dvm_ref self,
       const char *p = sql;
       while (p && isspace((unsigned char)*p)) ++p;
       if (vm->trace && sql) fprintf(stderr, "[dvm] SQLite execSQL: %.160s\n", sql);
-      if (p && strcasestr(p, "create table") == p) {
+      if (p && luna_strcasestr(p, "create table") == p) {
          dvm_ref list = sqlite_schema_list(vm, self);
          union dvm_value item = ARG(0), ignored = { 0 };
          if (list) (void)list_add(vm, list, &item, 1, &ignored);
@@ -52838,7 +53332,7 @@ static bool file_output_init(struct dvm *vm, dvm_ref self,
    const char *path = ARG(0).l ? file_host_path(vm, ARG(0).l) : NULL;
    bool append = nargs > 1 && ARG(1).i != 0;
    int fd = path && *path
-      ? open(path, O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC), 0666)
+      ? luna_file_open(path, O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC), 0666)
       : -1;
    if (fd < 0) {
       dvm__throw(vm, "java/io/FileNotFoundException", "%s: %s",
@@ -52860,7 +53354,7 @@ static bool file_stream_close(struct dvm *vm, dvm_ref self,
    (void)args; (void)nargs;
    union dvm_value fd = { .i = -1 };
    (void)dvm_get_field(vm, self, "fd", "I", &fd);
-   if (fd.i >= 0) close(fd.i);
+   if (fd.i >= 0) luna_fd_close(fd.i);
    fd.i = -1;
    (void)dvm_set_field(vm, self, "fd", "I", fd);
    RETV();
@@ -52924,7 +53418,7 @@ static bool file_output_write(struct dvm *vm, dvm_ref self,
    }
    unsigned gil = handoff ? dvm_gil_unlock_all(vm) : 0;
    while (len) {
-      ssize_t n = write(fd.i, p, len);
+      ssize_t n = luna_fd_write(fd.i, p, len);
       if (n < 0 && errno == EINTR) continue;
       if (n <= 0) { werr = errno ? errno : EIO; break; }
       p += n; len -= (size_t)n;
@@ -52944,7 +53438,7 @@ static bool file_output_flush(struct dvm *vm, dvm_ref self,
    (void)args; (void)nargs;
    union dvm_value fd = { .i = -1 };
    (void)dvm_get_field(vm, self, "fd", "I", &fd);
-   if (fd.i >= 0 && fsync(fd.i) < 0) {
+   if (fd.i >= 0 && luna_file_sync(fd.i, 0) < 0) {
       dvm__throw(vm, "java/io/IOException", "%s", strerror(errno)); return false;
    }
    RETV();
@@ -53009,7 +53503,7 @@ static bool file_input_init(struct dvm *vm, dvm_ref self,
 {
    (void)nargs;
    const char *path = ARG(0).l ? file_host_path(vm, ARG(0).l) : NULL;
-   int fd = path ? open(path, O_RDONLY) : -1;
+   int fd = path ? luna_file_open(path, O_RDONLY, 0) : -1;
    if (fd < 0) {
       dvm__throw(vm, "java/io/FileNotFoundException", "%s: %s",
                  path ? path : "null", strerror(errno)); return false;
@@ -53028,7 +53522,7 @@ static bool file_input_read(struct dvm *vm, dvm_ref self,
    if (fd.i < 0) { dvm__throw(vm, "java/io/IOException", "stream closed"); return false; }
    if (!nargs) {
       uint8_t byte; ssize_t n;
-      do n = read(fd.i, &byte, 1); while (n < 0 && errno == EINTR);
+      do n = luna_fd_read(fd.i, &byte, 1); while (n < 0 && errno == EINTR);
       if (n < 0) { dvm__throw(vm, "java/io/IOException", "%s", strerror(errno)); return false; }
       RETI(n ? byte : -1);
    }
@@ -53054,7 +53548,7 @@ static bool file_input_read(struct dvm *vm, dvm_ref self,
          if (fstat(fd.i, &st) == 0 && S_ISREG(st.st_mode)) handoff = false;
       }
       unsigned gil = handoff ? dvm_gil_unlock_all(vm) : 0;
-      do n = read(fd.i, (uint8_t *)array->data + offset, (size_t)count);
+      do n = luna_fd_read(fd.i, (uint8_t *)array->data + offset, (size_t)count);
       while (n < 0 && errno == EINTR);
       if (handoff) dvm_gil_relock(vm, gil);
    }
@@ -53088,9 +53582,9 @@ static bool raf_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
     * only add sync-on-write) opens read/write and creates. */
    bool writable = mode && mode[0] == 'r' && mode[1] == 'w';
    int flags = writable ? (O_RDWR | O_CREAT) : O_RDONLY;
-   if (writable && mode[2] == 's') flags |= O_SYNC;
-   else if (writable && mode[2] == 'd') flags |= O_DSYNC;
-   int fd = path ? open(path, flags, 0666) : -1;
+   if (writable && mode[2] == 's') flags |= LUNA_FILE_SYNC;
+   else if (writable && mode[2] == 'd') flags |= LUNA_FILE_DSYNC;
+   int fd = path ? luna_file_open(path, flags, 0666) : -1;
    if (fd < 0) {
       dvm__throw(vm, "java/io/FileNotFoundException", "%s: %s",
                  path ? path : "null", strerror(errno));
@@ -53207,7 +53701,7 @@ static ssize_t dvm_io_read_unlocked(struct dvm *vm, int fd, uint8_t *dst,
    if (count > sizeof stage) count = sizeof stage;
    unsigned g = dvm_gil_unlock_all(vm);
    ssize_t n;
-   do n = read(fd, stage, count); while (n < 0 && errno == EINTR);
+   do n = luna_fd_read(fd, stage, count); while (n < 0 && errno == EINTR);
    dvm_gil_relock(vm, g);
    if (n > 0) memcpy(dst, stage, (size_t)n);
    return n;
@@ -53221,7 +53715,7 @@ static ssize_t dvm_io_write_unlocked(struct dvm *vm, int fd,
    memcpy(stage, src, count);
    unsigned g = dvm_gil_unlock_all(vm);
    ssize_t n;
-   do n = write(fd, stage, count); while (n < 0 && errno == EINTR);
+   do n = luna_fd_write(fd, stage, count); while (n < 0 && errno == EINTR);
    dvm_gil_relock(vm, g);
    return n;
 }
@@ -53234,7 +53728,7 @@ static bool raf_read(struct dvm *vm, dvm_ref self, const union dvm_value *args,
    uint8_t byte;
    ssize_t n;
    if (!nargs) {
-      do n = read(fd, &byte, 1); while (n < 0 && errno == EINTR);
+      do n = luna_fd_read(fd, &byte, 1); while (n < 0 && errno == EINTR);
       if (n < 0) { dvm__throw(vm, "java/io/IOException", "%s", strerror(errno)); return false; }
       RETI(n ? byte : -1);
    }
@@ -53292,7 +53786,7 @@ static bool raf_writeByte(struct dvm *vm, dvm_ref self,
    if (fd < 0) { dvm__throw(vm, "java/io/IOException", "stream closed"); return false; }
    uint8_t byte = (uint8_t)ARG(0).i;
    ssize_t n;
-   do n = write(fd, &byte, 1); while (n < 0 && errno == EINTR);
+   do n = luna_fd_write(fd, &byte, 1); while (n < 0 && errno == EINTR);
    if (n != 1) { dvm__throw(vm, "java/io/IOException", "%s", strerror(errno)); return false; }
    RETV();
 }
@@ -53358,7 +53852,7 @@ static bool file_descriptor_sync(struct dvm *vm, dvm_ref self,
    union dvm_value fd = { .i = -1 };
    if (!dvm_get_field(vm, self, "descriptor", "I", &fd))
       (void)dvm_get_field(vm, self, "fd", "I", &fd);
-   if (fd.i >= 0 && fsync(fd.i) < 0) {
+   if (fd.i >= 0 && luna_file_sync(fd.i, 0) < 0) {
       dvm__throw(vm, "java/io/SyncFailedException", "%s", strerror(errno)); return false;
    }
    RETV();
@@ -53391,21 +53885,9 @@ static bool file_channel_lock_impl(struct dvm *vm, dvm_ref self,
       dvm__throw(vm, "java/lang/IllegalArgumentException", "invalid lock range");
       return false;
    }
-   struct flock fl = { 0 };
-   fl.l_type = shared ? F_RDLCK : F_WRLCK;
-   fl.l_whence = SEEK_SET;
-   fl.l_start = (off_t)position;
-   fl.l_len = size == INT64_MAX ? 0 : (off_t)size;
-   /* OFD locks keep separate channels in this process separate, as Java's
-    * FileChannel does.  Classic POSIX record locks are the portable fallback. */
-#ifdef F_OFD_SETLK
-   int command = nonblocking ? F_OFD_SETLK : F_OFD_SETLKW;
-#else
-   int command = nonblocking ? F_SETLK : F_SETLKW;
-#endif
    int rc;
    unsigned gil = dvm_gil_unlock_all(vm);
-   do rc = fcntl(fd.i, command, &fl); while (rc < 0 && errno == EINTR);
+   do rc = luna_file_lock(fd.i, position, size, shared, nonblocking, 0); while (rc < 0 && errno == EINTR);
    int saved_errno = errno;
    dvm_gil_relock(vm, gil);
    if (rc < 0) {
@@ -53464,7 +53946,7 @@ static bool file_channel_force(struct dvm *vm, dvm_ref self,
       dvm__throw(vm, "java/nio/channels/ClosedChannelException", "channel closed");
       return false;
    }
-   int rc = nargs && !ARG(0).i ? fdatasync(fd.i) : fsync(fd.i);
+   int rc = nargs && !ARG(0).i ? luna_file_sync(fd.i, 1) : luna_file_sync(fd.i, 0);
    if (rc < 0) {
       dvm__throw(vm, "java/io/IOException", "force: %s", strerror(errno));
       return false;
@@ -53488,17 +53970,7 @@ static bool file_lock_release(struct dvm *vm, dvm_ref self,
    (void)dvm_get_field(vm, self, "position", "J", &position);
    (void)dvm_get_field(vm, self, "size", "J", &size);
    if (fd.i >= 0) {
-      struct flock fl = { 0 };
-      fl.l_type = F_UNLCK;
-      fl.l_whence = SEEK_SET;
-      fl.l_start = (off_t)position.j;
-      fl.l_len = size.j == INT64_MAX ? 0 : (off_t)size.j;
-#ifdef F_OFD_SETLK
-      int command = F_OFD_SETLK;
-#else
-      int command = F_SETLK;
-#endif
-      if (fcntl(fd.i, command, &fl) < 0) {
+      if (luna_file_lock(fd.i, position.j, size.j, 0, 1, 1) < 0) {
          dvm__throw(vm, "java/io/IOException", "unlock: %s", strerror(errno));
          return false;
       }
@@ -53551,7 +54023,7 @@ static int cursor_projection_name(const char *sql, int wanted,
                                   char *out, size_t out_size)
 {
    if (!sql || wanted < 0 || !out_size) return -1;
-   const char *select = strcasestr(sql, "select");
+   const char *select = luna_strcasestr(sql, "select");
    if (!select) return -1;
    const char *p = select + 6;
    while (isspace((unsigned char)*p)) ++p;
@@ -53601,7 +54073,7 @@ static int cursor_star_name(struct dvm *vm, dvm_ref self, int wanted,
                             char *out, size_t out_size)
 {
    const char *query = cursor_sql(vm, self);
-   const char *from = query ? strcasestr(query, " from ") : NULL;
+   const char *from = query ? luna_strcasestr(query, " from ") : NULL;
    if (!from) return -1;
    from += 6;
    while (isspace((unsigned char)*from) || *from == '`' || *from == '"') ++from;
@@ -53617,7 +54089,7 @@ static int cursor_star_name(struct dvm *vm, dvm_ref self, int wanted,
    struct rt_list *list = schemas.l ? list_of(vm, schemas.l) : NULL;
    for (uint32_t s = 0; list && s < list->size; ++s) {
       const char *ddl = dvm_string_utf8(vm, list->items[s]);
-      const char *decl = ddl ? strcasestr(ddl, "create table") : NULL;
+      const char *decl = ddl ? luna_strcasestr(ddl, "create table") : NULL;
       if (!decl) continue;
       decl += 12;
       while (isspace((unsigned char)*decl)) ++decl;
@@ -53912,19 +54384,19 @@ static const struct rt_field rt_statfs_fields[] = {
 
 /* The stored path is the name the app used, which is an Android path.  It has
  * to go through the guest namespace before it names a filesystem on this
- * machine, exactly as file_host_path() does for java.io.File: statvfs() of an
+ * machine, exactly as file_host_path() does for java.io.File: luna_os_statfs() of an
  * unmapped "/storage/emulated/0/..." answers about a directory that does not
  * exist here, and the title reads the resulting zeroes as a full disk. */
-static bool statfs_stat(struct dvm *vm, dvm_ref self, struct statvfs *st)
+static bool statfs_stat(struct dvm *vm, dvm_ref self, struct luna_os_fs_info *st)
 {
    union dvm_value v = { 0 };
    if (!dvm_get_field(vm, self, "path", "Ljava/lang/String;", &v) || !v.l)
       return false;
    const char *path = dvm_string_utf8(vm, v.l);
    if (!path || !*path) return false;
-   char host[PATH_MAX];
+   char host[DVM_PATH_MAX];
    const char *hp = arm_exec_map_guest_path(path, host, sizeof host);
-   bool ok = hp && statvfs(hp, st) == 0;
+   bool ok = hp && luna_os_statfs(hp, st) == 0;
    if (getenv("LUNARIA_TRACE_FS"))
       fprintf(stderr, "[statfs] %s -> %s: %s avail=%lluMB total=%lluMB\n",
               path, hp ? hp : "(null)", ok ? "ok" : strerror(errno),
@@ -53945,7 +54417,7 @@ static bool statfs_init(struct dvm *vm, dvm_ref self,
                                                : dvm_string_utf8(vm, a);
    union dvm_value v = { .l = dvm_new_string(vm, p && *p ? p : "/") };
    (void)dvm_set_field(vm, self, "path", "Ljava/lang/String;", v);
-   struct statvfs st;
+   struct luna_os_fs_info st;
    if (!statfs_stat(vm, self, &st)) {
       /* Android throws rather than reporting a zero-sized filesystem. */
       dvm__throw(vm, "java/lang/IllegalArgumentException",
@@ -53961,7 +54433,7 @@ static bool statfs_init(struct dvm *vm, dvm_ref self,
                     union dvm_value *out)                                    \
    {                                                                         \
       (void)args; (void)nargs;                                               \
-      struct statvfs st;                                                     \
+      struct luna_os_fs_info st;                                                     \
       if (!statfs_stat(vm, self, &st)) ret(0);                               \
       if (getenv("LUNARIA_TRACE_FS"))                                        \
          fprintf(stderr, "[statfs] %s = %lld\n", #name,                      \
@@ -55392,8 +55864,7 @@ static bool keyevent_modifier_mask(struct dvm *vm, dvm_ref self,
 /* KeyEvent.getDeadChar(accent, c): the precomposed character for a dead-key
  * accent followed by a base character, or 0 when the pair does not combine.
  * AOSP builds this from a fixed table; the same answers fall out of Unicode
- * NFC composition once the spacing accent is mapped to its combining mark,
- * and ICU is already linked in for the normalizer. */
+ * NFC composition once the spacing accent is mapped to its combining mark. */
 static bool keyevent_getDeadChar(struct dvm *vm, dvm_ref self,
                                  const union dvm_value *args, int nargs,
                                  union dvm_value *out)
@@ -55415,10 +55886,7 @@ static bool keyevent_getDeadChar(struct dvm *vm, dvm_ref self,
    for (size_t i = 0; i < sizeof marks / sizeof marks[0]; ++i)
       if (accent == marks[i].spacing) { mark = marks[i].combining; break; }
    if (!mark) RETI(0);
-   UErrorCode err = U_ZERO_ERROR;
-   const UNormalizer2 *nfc = unorm2_getNFCInstance(&err);
-   if (U_FAILURE(err) || !nfc) RETI(0);
-   UChar32 composed = unorm2_composePair(nfc, (UChar32)c, (UChar32)mark);
+   int32_t composed = luna_uc_compose(c, mark);
    RETI(composed < 0 ? 0 : (int32_t)composed);
 }
 
@@ -55575,7 +56043,7 @@ static bool inet_getByName(struct dvm *vm, dvm_ref self,
    snprintf(hostbuf, sizeof hostbuf, "%s", host);
    unsigned dns_armd = arm_lock_unlock_all();
    unsigned dns_gild = dvm_gil_unlock_all(vm);
-   const int gai = getaddrinfo(hostbuf, NULL, &hints, &res);
+   const int gai = luna_socket_dns(hostbuf, NULL, &hints, &res);
    dvm_gil_relock(vm, dns_gild);
    arm_lock_relock(dns_armd);
    if (gai != 0 || !res) {
@@ -55669,7 +56137,7 @@ static bool inet_getAllByName(struct dvm *vm, dvm_ref self,
    hints.ai_socktype = SOCK_STREAM;
    unsigned armd = arm_lock_unlock_all();
    unsigned gild = dvm_gil_unlock_all(vm);
-   const int gai = getaddrinfo(hostbuf, NULL, &hints, &res);
+   const int gai = luna_socket_dns(hostbuf, NULL, &hints, &res);
    dvm_gil_relock(vm, gild);
    arm_lock_relock(armd);
    if (getenv("LUNARIA_TRACE_SOCKET"))
@@ -56014,7 +56482,7 @@ static bool dgs_init(struct dvm *vm, dvm_ref self,
                      union dvm_value *out)
 {
    (void)out;
-   int fd = socket(AF_INET, SOCK_DGRAM, 0);
+   int fd = luna_socket_open(AF_INET, SOCK_DGRAM, 0);
    if (fd < 0) {
       dvm__throw(vm, "java/net/SocketException", "%s", strerror(errno));
       return false;
@@ -56026,8 +56494,8 @@ static bool dgs_init(struct dvm *vm, dvm_ref self,
    sa.sin_family = AF_INET;
    sa.sin_addr.s_addr = htonl(INADDR_ANY);
    sa.sin_port = htons((uint16_t)(nargs > 0 ? ARG(0).i : 0));
-   if (bind(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
-      close(fd);
+   if (luna_socket_bind(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
+      luna_fd_close(fd);
       dvm__throw(vm, "java/net/SocketException", "bind: %s", strerror(errno));
       return false;
    }
@@ -56042,7 +56510,7 @@ static bool dgs_close(struct dvm *vm, dvm_ref self,
 {
    (void)args; (void)nargs; (void)out;
    int fd = dgs_fd(vm, self);
-   if (fd >= 0) close(fd);
+   if (fd >= 0) luna_fd_close(fd);
    union dvm_value v = { .i = -1 };
    (void)dvm_set_field(vm, self, "fd", "I", v);
    RETV();
@@ -56059,7 +56527,7 @@ static bool dgs_setSoTimeout(struct dvm *vm, dvm_ref self,
    int fd = dgs_fd(vm, self);
    if (fd >= 0) {
       struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
-      (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+      (void)luna_socket_set_option(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
    }
    RETV();
 }
@@ -56070,7 +56538,7 @@ static bool dgs_setBroadcast(struct dvm *vm, dvm_ref self,
 {
    (void)out;
    int fd = dgs_fd(vm, self), on = nargs > 0 ? ARG(0).i : 0;
-   if (fd >= 0) (void)setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &on, sizeof on);
+   if (fd >= 0) (void)luna_socket_set_option(fd, SOL_SOCKET, SO_BROADCAST, &on, sizeof on);
    RETV();
 }
 
@@ -56082,7 +56550,7 @@ static bool dgs_getLocalPort(struct dvm *vm, dvm_ref self,
    int fd = dgs_fd(vm, self);
    struct sockaddr_in sa;
    socklen_t len = sizeof sa;
-   if (fd < 0 || getsockname(fd, (struct sockaddr *)&sa, &len) != 0) RETI(-1);
+   if (fd < 0 || luna_socket_name(fd, (struct sockaddr *)&sa, &len) != 0) RETI(-1);
    RETI(ntohs(sa.sin_port));
 }
 
@@ -56122,7 +56590,7 @@ static bool dgs_send(struct dvm *vm, dvm_ref self,
       dvm__throw(vm, "java/net/SocketException", "no destination address");
       return false;
    }
-   if (sendto(fd, b + off.i, (size_t)len.i, 0,
+   if (luna_socket_sendto(fd, b + off.i, (size_t)len.i, 0,
               (struct sockaddr *)&sa, sizeof sa) < 0) {
       dvm__throw(vm, "java/io/IOException", "sendto: %s", strerror(errno));
       return false;
@@ -56156,7 +56624,7 @@ static bool dgs_receive(struct dvm *vm, dvm_ref self,
    struct sockaddr_in from;
    socklen_t flen = sizeof from;
    memset(&from, 0, sizeof from);
-   ssize_t got = recvfrom(fd, b + off.i, room, 0,
+   ssize_t got = luna_socket_recvfrom(fd, b + off.i, room, 0,
                           (struct sockaddr *)&from, &flen);
    if (got < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -56267,12 +56735,12 @@ static void sock_release(struct dvm *vm, struct rt_sock *s)
          struct rt_sock *u = sock_of(vm, s->layered);
          if (u && !u->closed) {
             u->closed = true;
-            if (u->fd >= 0) shutdown(u->fd, SHUT_RDWR);
+            if (u->fd >= 0) luna_socket_shutdown(u->fd, SHUT_RDWR);
             sock_release(vm, u);
          }
       }
    } else if (s->fd >= 0) {
-      close(s->fd);
+      luna_fd_close(s->fd);
       s->fd = -1;
    }
 }
@@ -56341,7 +56809,7 @@ static bool sock_connect_from(struct dvm *vm, dvm_ref self, const char *host,
       return false;
    }
    if (s->closed) {            /* closed by another thread while connecting */
-      close(fd);
+      luna_fd_close(fd);
       sock_throw_closed(vm);
       return false;
    }
@@ -56351,7 +56819,7 @@ static bool sock_connect_from(struct dvm *vm, dvm_ref self, const char *host,
    snprintf(s->host, sizeof s->host, "%s", host ? host : target);
    struct sockaddr_storage ss;
    socklen_t sl = sizeof ss;
-   if (!getpeername(fd, (struct sockaddr *)&ss, &sl)) {
+   if (!luna_socket_peer(fd, (struct sockaddr *)&ss, &sl)) {
       if (ss.ss_family == AF_INET)
          inet_ntop(AF_INET, &((struct sockaddr_in *)&ss)->sin_addr, s->addr,
                    sizeof s->addr);
@@ -56360,18 +56828,18 @@ static bool sock_connect_from(struct dvm *vm, dvm_ref self, const char *host,
                    s->addr, sizeof s->addr);
    }
    sl = sizeof ss;
-   if (!getsockname(fd, (struct sockaddr *)&ss, &sl))
+   if (!luna_socket_name(fd, (struct sockaddr *)&ss, &sl))
       s->local_port = ntohs(ss.ss_family == AF_INET6
                                ? ((struct sockaddr_in6 *)&ss)->sin6_port
                                : ((struct sockaddr_in *)&ss)->sin_port);
    dvm_sock_set_timeout(fd, s->timeout_ms);
    if (s->tcp_nodelay) {
       int one = 1;
-      setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+      luna_socket_set_option(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
    }
    if (s->keepalive) {
       int one = 1;
-      setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+      luna_socket_set_option(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
    }
    return true;
 }
@@ -56470,7 +56938,7 @@ static bool sock_close(struct dvm *vm, dvm_ref self,
    /* Wake whoever is blocked on it — Okio's timeout watchdog and OkHttp's
     * cancel() both close a socket another thread is reading.  close(2)
     * alone does not interrupt a blocked recv(); shutdown(2) does. */
-   if (fd >= 0 && (!s->layered || s->auto_close)) shutdown(fd, SHUT_RDWR);
+   if (fd >= 0 && (!s->layered || s->auto_close)) luna_socket_shutdown(fd, SHUT_RDWR);
    sock_release(vm, s);
    RETV();
 }
@@ -56514,7 +56982,7 @@ static bool sock_setTcpNoDelay(struct dvm *vm, dvm_ref self,
    if (!s) RETV();
    s->tcp_nodelay = ARG(0).i != 0;
    int fd = sock_fd(vm, s), v = s->tcp_nodelay;
-   if (fd >= 0) setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &v, sizeof v);
+   if (fd >= 0) luna_socket_set_option(fd, IPPROTO_TCP, TCP_NODELAY, &v, sizeof v);
    RETV();
 }
 
@@ -56536,7 +57004,7 @@ static bool sock_setKeepAlive(struct dvm *vm, dvm_ref self,
    if (!s) RETV();
    s->keepalive = ARG(0).i != 0;
    int fd = sock_fd(vm, s), v = s->keepalive;
-   if (fd >= 0) setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &v, sizeof v);
+   if (fd >= 0) luna_socket_set_option(fd, SOL_SOCKET, SO_KEEPALIVE, &v, sizeof v);
    RETV();
 }
 
@@ -56563,7 +57031,7 @@ static bool sock_setBufferSize(struct dvm *vm, dvm_ref self,
       return false;
    }
    if (fd >= 0)
-      setsockopt(fd, SOL_SOCKET,
+      luna_socket_set_option(fd, SOL_SOCKET,
                  name && strstr(name, "Receive") ? SO_RCVBUF : SO_SNDBUF,
                  &v, sizeof v);
    RETV();
@@ -56578,7 +57046,7 @@ static bool sock_getBufferSize(struct dvm *vm, dvm_ref self,
    const char *name = builtin_name();
    int fd = s ? sock_fd(vm, s) : -1, v = 0;
    socklen_t sl = sizeof v;
-   if (fd < 0 || getsockopt(fd, SOL_SOCKET,
+   if (fd < 0 || luna_socket_get_option(fd, SOL_SOCKET,
                             name && strstr(name, "Receive") ? SO_RCVBUF
                                                             : SO_SNDBUF,
                             &v, &sl) < 0)
@@ -56639,7 +57107,7 @@ static bool sock_shutdownInput(struct dvm *vm, dvm_ref self,
       return false;
    }
    s->in_shut = true;
-   if (s->fd >= 0) shutdown(s->fd, SHUT_RD);
+   if (s->fd >= 0) luna_socket_shutdown(s->fd, SHUT_RD);
    RETV();
 }
 
@@ -56656,7 +57124,7 @@ static bool sock_shutdownOutput(struct dvm *vm, dvm_ref self,
       return false;
    }
    s->out_shut = true;
-   if (s->fd >= 0) shutdown(s->fd, SHUT_WR);
+   if (s->fd >= 0) luna_socket_shutdown(s->fd, SHUT_WR);
    RETV();
 }
 
@@ -56737,7 +57205,7 @@ static bool sock_getLocalAddress(struct dvm *vm, dvm_ref self,
    char text[INET6_ADDRSTRLEN] = "0.0.0.0";
    struct sockaddr_storage ss;
    socklen_t sl = sizeof ss;
-   if (fd >= 0 && !getsockname(fd, (struct sockaddr *)&ss, &sl)) {
+   if (fd >= 0 && !luna_socket_name(fd, (struct sockaddr *)&ss, &sl)) {
       if (ss.ss_family == AF_INET)
          inet_ntop(AF_INET, &((struct sockaddr_in *)&ss)->sin_addr, text,
                    sizeof text);
@@ -56882,7 +57350,7 @@ static bool sis_read(struct dvm *vm, dvm_ref self, const union dvm_value *args,
    if (tls) {
       n = dvm_tls_read(tls, dst, count, timeout);
    } else {
-      do n = recv(fd, dst, count, 0); while (n < 0 && errno == EINTR);
+      do n = luna_socket_recv(fd, dst, count, 0); while (n < 0 && errno == EINTR);
       if (n < 0) {
          e = errno;
          if (e == EAGAIN || e == EWOULDBLOCK) n = -2;
@@ -56922,7 +57390,7 @@ static bool sis_available(struct dvm *vm, dvm_ref self,
    if (!s || s->closed) { sock_throw_closed(vm); return false; }
    if (s->tls) RETI((int32_t)dvm_tls_pending(s->tls));
    int n = 0, fd = sock_fd(vm, s);
-   if (fd >= 0 && ioctl(fd, FIONREAD, &n) < 0) n = 0;
+   if (fd >= 0 && luna_socket_available(fd, &n) < 0) n = 0;
    RETI(n);
 }
 
@@ -56982,7 +57450,7 @@ static bool sos_write(struct dvm *vm, dvm_ref self, const union dvm_value *args,
       size_t done = 0;
       n = 0;
       while (done < count) {
-         ssize_t w = send(fd, src + done, count - done, MSG_NOSIGNAL);
+         ssize_t w = luna_socket_send(fd, src + done, count - done, LUNA_SEND_NOSIGNAL);
          if (w < 0 && errno == EINTR) continue;
          if (w < 0) { e = errno; n = -1; break; }
          done += (size_t)w;
@@ -57152,14 +57620,14 @@ static bool ss_bind_to(struct dvm *vm, dvm_ref self, const char *addr,
       return false;
    }
    const bool v6 = addr && strchr(addr, ':');
-   int fd = host_socket_cloexec(v6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
+   int fd = luna_socket_open(v6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
    if (fd < 0) {
       dvm__throw(vm, "java/net/SocketException", "%s", strerror(errno));
       return false;
    }
    /* Android's ServerSocket turns SO_REUSEADDR on by default. */
    int reuse = s->reuse_addr || !s->fd_configured;
-   setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof reuse);
+   luna_socket_set_option(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof reuse);
    s->reuse_addr = reuse;
    struct sockaddr_storage ss;
    memset(&ss, 0, sizeof ss);
@@ -57180,16 +57648,16 @@ static bool ss_bind_to(struct dvm *vm, dvm_ref self, const char *addr,
       if (addr && *addr) rc = inet_pton(AF_INET, addr, &a->sin_addr);
       sl = sizeof *a;
    }
-   if (rc != 1 || bind(fd, (struct sockaddr *)&ss, sl) < 0 ||
-       listen(fd, backlog > 0 ? backlog : 50) < 0) {
+   if (rc != 1 || luna_socket_bind(fd, (struct sockaddr *)&ss, sl) < 0 ||
+       luna_socket_listen(fd, backlog > 0 ? backlog : 50) < 0) {
       int e = rc != 1 ? EADDRNOTAVAIL : errno;
-      close(fd);
+      luna_fd_close(fd);
       dvm__throw(vm, "java/net/BindException", "bind failed: %s (%s)",
                  strerror(e), e == EADDRINUSE ? "EADDRINUSE" : "errno");
       return false;
    }
    sl = sizeof ss;
-   if (!getsockname(fd, (struct sockaddr *)&ss, &sl))
+   if (!luna_socket_name(fd, (struct sockaddr *)&ss, &sl))
       s->local_port = ntohs(ss.ss_family == AF_INET6
                                ? ((struct sockaddr_in6 *)&ss)->sin6_port
                                : ((struct sockaddr_in *)&ss)->sin_port);
@@ -57233,7 +57701,7 @@ static bool ss_bind(struct dvm *vm, dvm_ref self,
       /* A named local address has to be resolved to be bound. */
       struct addrinfo hints = { 0 }, *res = NULL;
       hints.ai_socktype = SOCK_STREAM;
-      if (!getaddrinfo(host, NULL, &hints, &res) && res) {
+      if (!luna_socket_dns(host, NULL, &hints, &res) && res) {
          if (res->ai_family == AF_INET)
             inet_ntop(AF_INET, &((struct sockaddr_in *)res->ai_addr)->sin_addr,
                       addr, sizeof addr);
@@ -57271,11 +57739,11 @@ static bool ss_accept(struct dvm *vm, dvm_ref self,
    unsigned gild = dvm_gil_unlock_all(vm);
    struct pollfd p = { .fd = lfd, .events = POLLIN };
    int pr;
-   do pr = poll(&p, 1, timeout > 0 ? timeout : -1);
+   do pr = luna_socket_poll(&p, 1, timeout > 0 ? timeout : -1);
    while (pr < 0 && errno == EINTR);
    if (pr == 0) timed_out = true;
    else if (pr > 0 && (p.revents & POLLIN)) {
-      do fd = host_accept_cloexec(lfd, (struct sockaddr *)&peer, &pl);
+      do fd = luna_socket_accept(lfd, (struct sockaddr *)&peer, &pl);
       while (fd < 0 && errno == EINTR);
       if (fd < 0) e = errno;
    } else {
@@ -57288,7 +57756,7 @@ static bool ss_accept(struct dvm *vm, dvm_ref self,
    const bool closed = s->closed;
    sock_release(vm, s);
    if (closed) {
-      if (fd >= 0) close(fd);
+      if (fd >= 0) luna_fd_close(fd);
       sock_throw_closed(vm);
       return false;
    }
@@ -57304,7 +57772,7 @@ static bool ss_accept(struct dvm *vm, dvm_ref self,
    dvm_ref c = new_socket(vm, "Ljava/net/Socket;");
    struct rt_sock *cs = c ? sock_of(vm, c) : NULL;
    if (!cs) {
-      close(fd);
+      luna_fd_close(fd);
       dvm__throw(vm, "java/lang/OutOfMemoryError", "Socket");
       return false;
    }
@@ -57336,7 +57804,7 @@ static bool ss_setReuseAddress(struct dvm *vm, dvm_ref self,
    if (!s) RETV();
    if (s->closed) { sock_throw_closed(vm); return false; }
    int v = ARG(0).i != 0;
-   if (s->fd >= 0) setsockopt(s->fd, SOL_SOCKET, SO_REUSEADDR, &v, sizeof v);
+   if (s->fd >= 0) luna_socket_set_option(s->fd, SOL_SOCKET, SO_REUSEADDR, &v, sizeof v);
    s->reuse_addr = v;
    s->fd_configured = true;
    RETV();
@@ -57611,7 +58079,7 @@ static bool sslsock_do_handshake(struct dvm *vm, dvm_ref self)
       if (!ok) {
          s = sock_of(vm, self);
          s->closed = true;
-         if (fd >= 0) shutdown(fd, SHUT_RDWR);
+         if (fd >= 0) luna_socket_shutdown(fd, SHUT_RDWR);
          sock_release(vm, s);
          dvm__throw(vm, "javax/net/ssl/SSLHandshakeException", "%s", why);
          return false;
@@ -58659,9 +59127,10 @@ static const struct rt_method rt_proxy_type[] = {
 
 /* --- java.net.IDN -------------------------------------------------------- */
 
-/* libcore's IDN is ICU's IDNA2003 conversion, and the Java flags
- * (ALLOW_UNASSIGNED = 1, USE_STD3_ASCII_RULES = 2) are ICU's UIDNA_* values.
- * A failure is IllegalArgumentException, as libcore reports it. */
+/* Match libcore's IDNA2003 conversion and Java flags
+ * (ALLOW_UNASSIGNED = 1, USE_STD3_ASCII_RULES = 2).
+ * Invalid toASCII input raises IllegalArgumentException; toUnicode returns
+ * the original input when conversion fails. */
 static bool idn_convert(struct dvm *vm, const union dvm_value *args,
                         int nargs, union dvm_value *out, bool to_ascii)
 {
@@ -58671,50 +59140,15 @@ static bool idn_convert(struct dvm *vm, const union dvm_value *args,
    }
    const char *in = dvm_string_utf8(vm, ARG(0).l);
    const int32_t flags = nargs >= 2 ? ARG(1).i : 0;
-   UErrorCode st = U_ZERO_ERROR;
-   int32_t ulen = 0;
-   u_strFromUTF8(NULL, 0, &ulen, in ? in : "", -1, &st);
-   st = U_ZERO_ERROR;
-   UChar *src = calloc((size_t)ulen + 1, sizeof *src);
-   UChar *dst = calloc(1024, sizeof *dst);
-   if (!src || !dst) {
-      free(src); free(dst);
-      dvm__throw(vm, "java/lang/OutOfMemoryError", "IDN");
+   char *text = luna_idn_convert(in ? in : "", (unsigned)flags, to_ascii);
+   if (!text) {
+      if (!to_ascii) RETL(ARG(0).l);
+      dvm__throw(vm, "java/lang/IllegalArgumentException", "Invalid IDN: %s", in ? in : "");
       return false;
    }
-   u_strFromUTF8(src, ulen + 1, NULL, in ? in : "", -1, &st);
-   UParseError pe;
-   int32_t n = 0;
-   /* ICU deprecates the IDNA2003 entry points in favour of UTS #46, but
-    * IDNA2003 is what java.net.IDN is specified as and what libcore calls. */
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-   if (U_SUCCESS(st)) {
-      n = to_ascii
-         ? uidna_IDNToASCII(src, ulen, dst, 1023, flags, &pe, &st)
-         : uidna_IDNToUnicode(src, ulen, dst, 1023, flags, &pe, &st);
-   }
-#pragma GCC diagnostic pop
-   if (U_FAILURE(st)) {
-      free(src); free(dst);
-      if (!to_ascii) RETL(ARG(0).l);   /* toUnicode: input unchanged */
-      dvm__throw(vm, "java/lang/IllegalArgumentException",
-                 "Invalid input to toASCII: %s", in ? in : "");
-      return false;
-   }
-   char utf8[4096];
-   int32_t blen = 0;
-   st = U_ZERO_ERROR;
-   u_strToUTF8(utf8, (int32_t)sizeof utf8 - 1, &blen, dst, n, &st);
-   free(src);
-   free(dst);
-   if (U_FAILURE(st)) {
-      dvm__throw(vm, "java/lang/IllegalArgumentException", "IDN: %s",
-                 u_errorName(st));
-      return false;
-   }
-   utf8[blen] = '\0';
-   RETL(dvm_new_string(vm, utf8));
+   dvm_ref result = dvm_new_string(vm, text);
+   free(text);
+   RETL(result);
 }
 
 static bool idn_toASCII(struct dvm *vm, dvm_ref self,
@@ -58878,7 +59312,7 @@ static dvm_ref date_from_asn1(struct dvm *vm, const ASN1_TIME *t)
    struct tm tm;
    memset(&tm, 0, sizeof tm);
    if (!t || ASN1_TIME_to_tm(t, &tm) != 1) return 0;
-   int64_t ms = (int64_t)timegm(&tm) * 1000;
+   int64_t ms = (int64_t)time_utc(&tm) * 1000;
    struct dvm_class *c = dvm__class_by_desc(vm, "Ljava/util/Date;");
    dvm_ref d = c ? dvm_new_object(vm, c) : 0;
    if (!d) return 0;
@@ -60519,7 +60953,7 @@ static bool os_chmod(struct dvm *vm, dvm_ref self,
       dvm__throw(vm, "java/lang/NullPointerException", "path");
       return false;
    }
-   char host[PATH_MAX];
+   char host[DVM_PATH_MAX];
    const char *hp = arm_exec_map_guest_path(path, host, sizeof host);
    if (!hp || chmod(hp, (mode_t)ARG(1).i) < 0) {
       throw_errno(vm, "chmod", hp ? errno : ENOENT);
@@ -60605,7 +61039,7 @@ struct rt_bitmap {
    int32_t density;         /* DisplayMetrics density of the pixels */
    bool recycled, is_mutable, has_alpha;
    unsigned gen, png_gen;   /* png[] is current when png_gen == gen */
-   char png[PATH_MAX];
+   char png[DVM_PATH_MAX];
 };
 
 static struct rt_bitmap *bitmap_of(struct dvm *vm, dvm_ref b)
@@ -60665,10 +61099,10 @@ static const char *bitmap_png_path(struct dvm *vm, dvm_ref b)
    if (bm->png[0] && bm->png_gen == bm->gen) return bm->png;
    static unsigned seq;
    const char *base = getenv("TMPDIR");
-   char dir[PATH_MAX];
+   char dir[DVM_PATH_MAX];
    snprintf(dir, sizeof dir, "%s/lunaria-bitmaps-%d", base ? base : "/tmp",
             (int)getpid());
-   (void)mkdir(dir, 0700);
+   (void)luna_file_mkdir(dir, 0700);
    if (!bm->png[0])
       snprintf(bm->png, sizeof bm->png, "%s/b%u.png", dir, ++seq);
    uint8_t *rgba = malloc((size_t)bm->w * (size_t)bm->h * 4);
@@ -60984,7 +61418,7 @@ static bool bf_decodeFile(struct dvm *vm, dvm_ref self,
    (void)self;
    const char *p = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
    if (!p) RETL(0);
-   char host[PATH_MAX];
+   char host[DVM_PATH_MAX];
    const char *hp = arm_exec_map_guest_path(p, host, sizeof host);
    size_t len = 0;
    uint8_t *data = hp ? read_host_file(hp, &len) : NULL;
@@ -61187,7 +61621,7 @@ static bool bm_recycle(struct dvm *vm, dvm_ref self,
       bm->recycled = true;
       free(bm->px);
       bm->px = NULL;
-      if (bm->png[0]) unlink(bm->png);
+      if (bm->png[0]) luna_file_unlink(bm->png);
    }
    RETV();
 }
@@ -63886,7 +64320,7 @@ static const struct rt_class rt_classes[] = {
    { "Landroid/content/SharedPreferences;", "Ljava/lang/Object;", rt_prefs,
      rt_prefs_fields, NULL },
    { "Landroid/content/SharedPreferences$Editor;", "Ljava/lang/Object;",
-     rt_prefs_editor, rt_prefs_fields, NULL },
+     rt_prefs_editor, rt_prefs_editor_fields, NULL },
    { "Ljava/nio/charset/Charset;", "Ljava/lang/Object;", rt_charset,
      rt_charset_fields, NULL },
    { "Ljava/nio/charset/StandardCharsets;", "Ljava/lang/Object;", NULL, NULL,

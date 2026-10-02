@@ -129,6 +129,17 @@ static inline long lunaria_env_long(const char *name, long def)
     return (end != e) ? v : def;
 }
 
+/* Guest addresses are unsigned 32-bit values even on Windows, whose host
+ * long is signed 32-bit. In particular 0xF0000000 must not become LONG_MAX. */
+static inline uint32_t lunaria_env_u32(const char *name, uint32_t def)
+{
+    const char *e = getenv(name);
+    if (!e || !*e) return def;
+    char *end = NULL;
+    unsigned long long value = strtoull(e, &end, 0);
+    return end != e && value <= UINT32_MAX ? (uint32_t)value : def;
+}
+
 /* Clamp phone-class totals into a sane range for the emulator. */
 static inline long lunaria_mem_total_mb(void)
 {
@@ -275,6 +286,8 @@ uint32_t arm_exec_env_va(void);
 
 /* Poll GLFW events (call from the render loop). */
 void arm_exec_glfw_poll(void);
+int arm_exec_host_ui_thread(void);
+void arm_exec_service_host_ui(void);
 
 /* GL_VENDOR / GL_RENDERER / GL_VERSION / GL_SHADING_LANGUAGE_VERSION /
  * GL_EXTENSIONS of the host GL, cached while a context was current so Java-side
@@ -355,6 +368,10 @@ void arm_exec_timezone_unlock(void);
  * identity while it calls back through JNI into guest native code. */
 void arm_exec_dvm_thread_attach(void);
 void arm_exec_dvm_thread_detach(void);
+/* Stable across engine migration; changes when a guest thread slot is reused.
+ * The low byte of token - 1 identifies its slot (0..255). */
+uint64_t arm_exec_jni_thread_token(void);
+int arm_exec_jni_thread_alive(uint64_t token);
 
 /* Java Looper.prepare* and the NDK ALooper for a thread are one looper on a
  * device.  Call when the bytecode VM binds a Looper to the current thread so
@@ -528,6 +545,8 @@ uint64_t arm_exec_guest_exit_count(void);
  * fills the width/height outputs with the new view size, so the pump can deliver the engine's
  * surfaceChanged notification. */
 int arm_exec_take_view_resize(int *w, int *h);
+/* Queue a host window resize for the main-thread event pump. */
+void arm_exec_request_view_resize(int w, int h);
 
 /* Return the directory of the main ARM library (set when arm_exec_jni_onload
  * is first called).  Used by libjvm-java.c findLibrary to return full paths. */

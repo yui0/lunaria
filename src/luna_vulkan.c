@@ -37,7 +37,7 @@
 #define VK_USE_PLATFORM_ANDROID_KHR
 #include <vulkan/vulkan.h>
 
-#include <dlfcn.h>
+#include "lunaria_os.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -81,12 +81,11 @@ struct lvk_cmd {
 
 static void *g_lib;
 
-/* dlsym() for a function: POSIX's own idiom, which ISO C's rule against
- * object-to-function pointer casts does not reach. */
+/* Copy the OS loader address into its typed Vulkan function pointer. */
 static PFN_vkVoidFunction lib_fn(const char *name)
 {
    PFN_vkVoidFunction f;
-   void *p = dlsym(g_lib, name);
+   void *p = luna_os_library_symbol(g_lib, name);
    memcpy(&f, &p, sizeof f);
    return f;
 }
@@ -1303,11 +1302,15 @@ static void vk_init(void)
               "supported; Vulkan stays off\n");
       return;
    }
-   g_lib = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-   if (!g_lib) g_lib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+#ifdef _WIN32
+   g_lib = luna_os_library_open_local("vulkan-1.dll");
+#else
+   g_lib = luna_os_library_open_local("libvulkan.so.1");
+   if (!g_lib) g_lib = luna_os_library_open_local("libvulkan.so");
+#endif
    if (!g_lib) {
       fprintf(stderr, "[vulkan] no host libvulkan (%s); Vulkan stays off\n",
-              dlerror());
+              luna_os_library_error());
       return;
    }
    g_gipa = (PFN_vkGetInstanceProcAddr)lib_fn("vkGetInstanceProcAddr");
@@ -1345,6 +1348,6 @@ uint64_t luna_vk_symbol(const char *name)
    if (i < 0) return 0;
    /* dlsym() on libvulkan.so: what the host loader exports, plus the
     * Android entry points emulated here. */
-   if (!g_special[i] && !dlsym(g_lib, name)) return 0;
+   if (!g_special[i] && !luna_os_library_symbol(g_lib, name)) return 0;
    return tramp_at(i);
 }

@@ -1670,7 +1670,9 @@ bool dvm_jni_invoke_locked(JNIEnv *env, const char *class_name, const char *meth
       char buf[512];
       dvm_describe_exception(vm, dvm_exception(vm), buf, sizeof buf);
       fprintf(stderr, "[dvm] %s.%s%s threw %s\n", class_name, method, msig, buf);
+      jthrowable exception = (jthrowable)to_jobject(vm, env, dvm_exception(vm));
       dvm_clear_exception(vm);
+      if (exception) (*env)->Throw(env, exception);
       memset(&ret, 0, sizeof ret);
    }
 

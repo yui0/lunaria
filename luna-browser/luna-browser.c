@@ -62,6 +62,121 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Incremental HTTP/1.1 response framing.  A return value of 1 means that the
+ * response is complete, 0 requests more bytes, and -1 rejects invalid framing.
+ * No socket close is needed for length-delimited or chunked responses. */
+struct http_frame {
+   size_t start, body, cursor, length;
+   int headers, chunked, trailers, close_delimited, no_body, complete;
+};
+
+static int http_decimal(const char *p, const char *end, size_t *out)
+{
+   int found = 0;
+   size_t first = 0;
+   for (;;) {
+      while (p < end && (*p == ' ' || *p == '\t')) p++;
+      if (p == end || !isdigit((unsigned char)*p)) return -1;
+      size_t n = 0;
+      while (p < end && isdigit((unsigned char)*p)) {
+         unsigned d = (unsigned)(*p++ - '0');
+         if (n > (SIZE_MAX - d) / 10) return -1;
+         n = n * 10 + d;
+      }
+      if (found && n != first) return -1;
+      first = n; found = 1;
+      while (p < end && (*p == ' ' || *p == '\t')) p++;
+      if (p == end) { *out = first; return 0; }
+      if (*p++ != ',') return -1;
+   }
+}
+
+static int http_frame_feed(struct http_frame *f, const char *data, size_t n,
+                           const char *method)
+{
+   if (f->complete) return 1;
+   while (!f->headers) {
+      const char *begin = data + f->start;
+      const char *end = memmem(begin, n - f->start, "\r\n\r\n", 4);
+      if (!end) return 0;
+      const char *line = memmem(begin, (size_t)(end - begin), "\r\n", 2);
+      if (!line) line = end;
+      const char *space = memchr(begin, ' ', (size_t)(line - begin));
+      if (!space || line - space < 4 || !isdigit((unsigned char)space[1]) ||
+          !isdigit((unsigned char)space[2]) || !isdigit((unsigned char)space[3])) return -1;
+      int status = (space[1] - '0') * 100 + (space[2] - '0') * 10 + space[3] - '0';
+      size_t body = (size_t)(end - data) + 4;
+      if (status >= 100 && status < 200 && status != 101) {
+         f->start = body;
+         if (body == n) return 0;
+         continue;
+      }
+      int have_length = 0, have_transfer = 0;
+      for (const char *p = line + 2; p < end; ) {
+         const char *next = memmem(p, (size_t)(end + 2 - p), "\r\n", 2);
+         if (!next) return -1;
+         const char *colon = memchr(p, ':', (size_t)(next - p));
+         if (!colon) return -1;
+         const char *value = colon + 1;
+         while (value < next && (*value == ' ' || *value == '\t')) value++;
+         const char *tail = next;
+         while (tail > value && (tail[-1] == ' ' || tail[-1] == '\t')) tail--;
+         if (colon - p == 14 && !strncasecmp(p, "content-length", 14)) {
+            size_t length;
+            if (http_decimal(value, tail, &length) < 0 ||
+                (have_length && f->length != length)) return -1;
+            f->length = length; have_length = 1;
+         } else if (colon - p == 17 && !strncasecmp(p, "transfer-encoding", 17)) {
+            if (have_transfer || tail - value != 7 || strncasecmp(value, "chunked", 7)) return -1;
+            f->chunked = 1; have_transfer = 1;
+         }
+         p = next + 2;
+      }
+      f->body = f->cursor = body;
+      f->headers = 1;
+      f->no_body = !strcasecmp(method, "HEAD") || status == 101 || status == 204 || status == 304;
+      if (f->no_body) { f->complete = 1; return 1; }
+      if (have_transfer && have_length) return -1;
+      f->close_delimited = !have_transfer && !have_length;
+   }
+   if (f->close_delimited) return 0;
+   if (!f->chunked) {
+      if (n - f->body >= f->length) { f->complete = 1; return 1; }
+      return 0;
+   }
+   for (;;) {
+      if (f->length) {
+         if (n - f->cursor < f->length || n - f->cursor - f->length < 2) return 0;
+         f->cursor += f->length;
+         if (data[f->cursor] != '\r' || data[f->cursor + 1] != '\n') return -1;
+         f->cursor += 2; f->length = 0;
+      }
+      const char *line = data + f->cursor;
+      const char *end = memmem(line, n - f->cursor, "\r\n", 2);
+      if (!end) return 0;
+      if (f->trailers) {
+         f->cursor = (size_t)(end - data) + 2;
+         if (end == line) { f->complete = 1; return 1; }
+         if (!memchr(line, ':', (size_t)(end - line))) return -1;
+         continue;
+      }
+      size_t length = 0;
+      const char *p = line;
+      if (p == end || !isxdigit((unsigned char)*p)) return -1;
+      while (p < end && isxdigit((unsigned char)*p)) {
+         unsigned c = (unsigned char)*p++;
+         unsigned digit = c <= '9' ? c - '0' : (c | 32u) - 'a' + 10u;
+         if (length > (SIZE_MAX - digit) / 16) return -1;
+         length = length * 16 + digit;
+      }
+      while (p < end && (*p == ' ' || *p == '\t')) p++;
+      if (p < end && *p != ';') return -1;
+      f->cursor = (size_t)(end - data) + 2;
+      f->length = length;
+      if (!length) f->trailers = 1;
+   }
+}
+
 #ifndef LB_NO_TLS
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -844,15 +959,36 @@ static int http_exchange(const char *url, const char *method, const char *extra_
       sent += n;
    }
    free(req.p);
+   if ((size_t)sent < req.len) {
+      conn_close(&c); url_free(&u);
+      r->error = lb_strdup("HTTP request send failed");
+      return -1;
+   }
    struct buf in = { 0 };
+   struct http_frame frame = { 0 };
+   int framing = 0, received_eof = 0;
    char chunk[16384];
    for (;;) {
       ptrdiff_t n = conn_read(&c, chunk, sizeof chunk);
-      if (n <= 0) break;
+      if (n <= 0) { received_eof = n == 0; break; }
       buf_put(&in, chunk, (size_t)n);
+      framing = http_frame_feed(&frame, in.p, in.len, method);
+      if (framing) break;
    }
    conn_close(&c);
    url_free(&u);
+   if (framing < 0 || (!frame.complete &&
+       !(received_eof && frame.headers && frame.close_delimited))) {
+      free(in.p);
+      r->error = lb_strdup(framing < 0 ? "invalid HTTP response framing" : "incomplete HTTP response");
+      return -1;
+   }
+   /* Informational responses precede the final response, without a body. */
+   if (frame.start) {
+      in.len -= frame.start;
+      memmove(in.p, in.p + frame.start, in.len);
+      in.p[in.len] = 0;
+   }
    char *head_end = in.p ? strstr(in.p, "\r\n\r\n") : NULL;
    if (!head_end) { free(in.p); r->error = lb_strdup("no HTTP response"); return -1; }
    r->status = atoi(in.p + strcspn(in.p, " "));
@@ -877,6 +1013,7 @@ static int http_exchange(const char *url, const char *method, const char *extra_
    r->headers = buf_take(&h);
    const unsigned char *b = (unsigned char *)head_end + 4;
    size_t blen = in.len - (size_t)((char *)b - in.p);
+   if (frame.no_body) blen = 0;
    char *te = header_get(r->headers, "transfer-encoding");
    if (te && strcasestr(te, "chunked")) {
       struct buf out = { 0 };
@@ -1197,6 +1334,117 @@ static void page_emit(const char *method, const char *params)
    if (g_page.emit) g_page.emit(method, params ? params : "{}");
 }
 
+static int cache_find(const char *abs)
+{
+   for (int i = 0; i < g_page.ncache; ++i)
+      if (!strcmp(g_page.cache[i].url, abs)) return i;
+   return -1;
+}
+
+/* Takes ownership of url and body. */
+static void cache_add(char *url, unsigned char *body, size_t len)
+{
+   void *grown = realloc(g_page.cache, sizeof *g_page.cache * (size_t)(g_page.ncache + 1));
+   if (!grown) { free(url); free(body); return; }
+   g_page.cache = grown;
+   g_page.cache[g_page.ncache].url = url;
+   g_page.cache[g_page.ncache].data = body;
+   g_page.cache[g_page.ncache].len = len;
+   g_page.ncache++;
+}
+
+/* Subresources named by the markup are fetched in parallel before parsing, so
+ * a page costs the slowest request rather than the sum of all of them.
+ * lb_read_resource and script loading then find them in the cache. */
+#define PF_MAX     96
+#define PF_THREADS 12
+struct pf_job { char *url; struct response r; };
+struct pf_pool { struct pf_job *jobs; int n, next; };
+
+static void *pf_worker(void *arg)
+{
+   struct pf_pool *pool = arg;
+   for (;;) {
+      int i = __atomic_fetch_add(&pool->next, 1, __ATOMIC_RELAXED);
+      if (i >= pool->n) return NULL;
+      lb_fetch(pool->jobs[i].url, "GET", NULL, NULL, 0, &pool->jobs[i].r);
+   }
+}
+
+static int tag_attr(const char *tag, const char *end, const char *name, char *out, size_t outsz)
+{
+   size_t nl = strlen(name);
+   for (const char *p = tag; p + nl < end; ++p) {
+      if (p == tag || !isspace((unsigned char)p[-1])) continue;
+      if (strncasecmp(p, name, nl)) continue;
+      const char *a = p + nl;
+      while (a < end && isspace((unsigned char)*a)) a++;
+      if (a >= end || *a != '=') continue;
+      a++;
+      while (a < end && isspace((unsigned char)*a)) a++;
+      char q = (*a == '"' || *a == '\'') ? *a++ : 0;
+      size_t k = 0;
+      while (a < end && (q ? *a != q : (!isspace((unsigned char)*a) && *a != '>')) && k + 1 < outsz) out[k++] = *a++;
+      out[k] = 0;
+      return 1;
+   }
+   return 0;
+}
+
+static void page_prefetch(const char *html)
+{
+   if (!strncmp(g_page.url, "file:", 5) || !strncmp(g_page.url, "about:", 6)) return;
+   struct pf_pool pool = { calloc(PF_MAX, sizeof(struct pf_job)), 0, 0 };
+   if (!pool.jobs) return;
+   int images = 0;
+   for (const char *p = html; (p = strchr(p, '<')) != NULL && pool.n < PF_MAX; ) {
+      if (!strncmp(p, "<!--", 4)) { const char *e = strstr(p, "-->"); if (!e) break; p = e + 3; continue; }
+      int kind = !strncasecmp(p, "<link", 5) ? 1 : !strncasecmp(p, "<script", 7) ? 2 :
+                 !strncasecmp(p, "<img", 4) ? 3 : 0;
+      if (!kind) { p++; continue; }
+      const char *end = p + 1;
+      for (char q = 0; *end && (q || *end != '>'); ++end)
+         if (q) { if (*end == q) q = 0; } else if (*end == '"' || *end == '\'') q = *end;
+      char val[1024], rel[128];
+      const char *attr = kind == 1 ? "href" : "src";
+      int ok = tag_attr(p + 1, end, attr, val, sizeof val) && val[0];
+      if (ok && kind == 1) ok = tag_attr(p + 1, end, "rel", rel, sizeof rel) && strcasestr(rel, "stylesheet");
+      if (ok && kind == 3 && ++images > 40) ok = 0;
+      if (ok && !strncasecmp(val, "data:", 5)) ok = 0;
+      if (ok) {
+         decode_html_entities(val);
+         char *abs = url_resolve(g_page.url, val);
+         char *hash = abs ? strchr(abs, '#') : NULL;
+         if (hash) *hash = 0;
+         int dup = !abs || cache_find(abs) >= 0;
+         for (int i = 0; !dup && i < pool.n; ++i) dup = !strcmp(pool.jobs[i].url, abs);
+         if (dup) free(abs); else pool.jobs[pool.n++].url = abs;
+      }
+      if (!*end) break;
+      p = end;
+   }
+   if (pool.n > 1) {
+      pthread_t th[PF_THREADS];
+      int nt = pool.n < PF_THREADS ? pool.n : PF_THREADS, started = 0;
+      for (int i = 0; i < nt; ++i)
+         if (pthread_create(&th[started], NULL, pf_worker, &pool) == 0) started++;
+      if (!started) pf_worker(&pool);
+      for (int i = 0; i < started; ++i) pthread_join(th[i], NULL);
+   }
+   for (int i = 0; i < pool.n; ++i) {
+      struct pf_job *j = &pool.jobs[i];
+      if (pool.n == 1) lb_fetch(j->url, "GET", NULL, NULL, 0, &j->r);
+      LB_LOG("prefetch %s -> %d %s\n", j->url, j->r.status, j->r.error ? j->r.error : "");
+      if (j->r.body && j->r.status >= 200 && j->r.status < 300) {
+         cache_add(j->url, j->r.body, j->r.length);
+         j->r.body = NULL; j->url = NULL;
+      }
+      free(j->url);
+      response_free(&j->r);
+   }
+   free(pool.jobs);
+}
+
 /* luna-ui's resource reader: every relative reference in the document is a
  * URL relative to the page.  Local font files are the engine's own and are
  * left to its plain file loader. */
@@ -1209,33 +1457,26 @@ static unsigned char *lb_read_resource(const char *path, size_t *out_size)
       return NULL;
    char *abs = url_resolve(g_page.url, path);
    if (!abs) return NULL;
-   for (int i = 0; i < g_page.ncache; ++i) {
-      if (strcmp(g_page.cache[i].url, abs)) continue;
+   int hit = cache_find(abs);
+   if (hit >= 0) {
       free(abs);
-      unsigned char *copy = malloc(g_page.cache[i].len + 1);
+      unsigned char *copy = malloc(g_page.cache[hit].len + 1);
       if (!copy) return NULL;
-      memcpy(copy, g_page.cache[i].data, g_page.cache[i].len);
-      copy[g_page.cache[i].len] = 0;
-      *out_size = g_page.cache[i].len;
+      memcpy(copy, g_page.cache[hit].data, g_page.cache[hit].len);
+      copy[g_page.cache[hit].len] = 0;
+      *out_size = g_page.cache[hit].len;
       return copy;
    }
    struct response r;
    int ok = lb_fetch(abs, "GET", NULL, NULL, 0, &r) == 0 && r.status >= 200 && r.status < 300;
    LB_LOG("resource %s -> %d %s\n", abs, r.status, r.error ? r.error : "");
    unsigned char *data = NULL;
-   if (ok) {
-      void *grown = realloc(g_page.cache, sizeof *g_page.cache * (size_t)(g_page.ncache + 1));
-      if (grown) {
-         g_page.cache = grown;
-         g_page.cache[g_page.ncache].url = abs;
-         g_page.cache[g_page.ncache].data = r.body;
-         g_page.cache[g_page.ncache].len = r.length;
-         g_page.ncache++;
-         abs = NULL;
-         data = malloc(r.length + 1);
-         if (data) { memcpy(data, r.body, r.length); data[r.length] = 0; *out_size = r.length; }
-         r.body = NULL;
-      }
+   if (ok && r.body) {
+      data = malloc(r.length + 1);
+      if (data) { memcpy(data, r.body, r.length); data[r.length] = 0; *out_size = r.length; }
+      cache_add(abs, r.body, r.length);
+      abs = NULL;
+      r.body = NULL;
    }
    free(abs);
    response_free(&r);
@@ -1757,6 +1998,45 @@ static JSValue lb_remove(JSContext *ctx, JSValueConst this_val, int argc, JSValu
    return JS_NewBool(ctx, i >= 0 && luna_dom_remove(i) == 0);
 }
 
+static JSValue lb_set_checked(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+   (void)this_val; (void)argc;
+   int i = uid_idx(ctx, argv[0]);
+   if (i >= 0) luna_dom_set_checked(i, JS_ToBool(ctx, argv[1]) > 0);
+   g_page.dirty = 1;
+   return JS_UNDEFINED;
+}
+
+static JSValue lb_selection(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+   (void)this_val; (void)argc; (void)argv;
+   char *t = luna_selection_text();
+   JSValue v = JS_NewString(ctx, t ? t : "");
+   free(t);
+   return v;
+}
+
+/* __lb.imageSize(url) -> [width, height], or null when it cannot be read as a picture. */
+static JSValue lb_image_size(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+   (void)this_val; (void)argc;
+   const char *u = JS_ToCString(ctx, argv[0]);
+   if (!u) return JS_NULL;
+   size_t n = 0;
+   unsigned char *data = lb_read_resource(u, &n);
+   JS_FreeCString(ctx, u);
+   if (!data) return JS_NULL;
+   int w = 0, h = 0, comp = 0;
+   int ok = stbi_info_from_memory(data, (int)n, &w, &h, &comp);
+   if (!ok && n > 4 && (memmem(data, n < 512 ? n : 512, "<svg", 4) != NULL)) { w = 300; h = 150; ok = 1; }
+   free(data);
+   if (!ok) return JS_NULL;
+   JSValue a = JS_NewArray(ctx);
+   JS_SetPropertyUint32(ctx, a, 0, JS_NewInt32(ctx, w));
+   JS_SetPropertyUint32(ctx, a, 1, JS_NewInt32(ctx, h));
+   return a;
+}
+
 static JSValue lb_parent(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
 {
    (void)this_val; (void)argc;
@@ -1858,7 +2138,8 @@ static void text_of(int i, struct buf *b)
 {
    int kids = 0;
    for (int j = i + 1; j < elem_count; ++j) if (elements[j].parent_idx == i && el_node(j)) { kids = 1; break; }
-   const char *own = elements[i].is_input ? "" : elements[i].text;
+   const char *own = elements[i].is_input ? "" :
+      elements[i].dom_raw_text ? elements[i].dom_raw_text : elements[i].text;
    if (!kids || elements[i].direct_text_before_children) buf_puts(b, own);
    for (int j = i + 1; j < elem_count; ++j)
       if (elements[j].parent_idx == i && el_node(j)) text_of(j, b);
@@ -1892,6 +2173,12 @@ static JSValue lb_set_text(JSContext *ctx, JSValueConst this_val, int argc, JSVa
          i = uid_idx(ctx, argv[0]);
       }
       if (i >= 0) {
+         if (elements[i].dom_raw_text) {
+            char *raw = lb_strdup(s);
+            if (!raw) { JS_FreeCString(ctx, s); return JS_ThrowOutOfMemory(ctx); }
+            free(elements[i].dom_raw_text);
+            elements[i].dom_raw_text = raw;
+         }
          luna_set_text(i, s);
          elements[i].direct_text_before_children = s[0] != '\0';
       }
@@ -1935,11 +2222,17 @@ static void html_of(int i, struct buf *b, int outer)
    }
    int kids = 0;
    for (int j = i + 1; j < elem_count; ++j) if (elements[j].parent_idx == i && el_node(j)) { kids = 1; break; }
-   const char *own = e->is_input && strcasecmp(e->type, "textarea") ? "" : e->text;
-   if (!kids || e->direct_text_before_children) html_escape(b, own, 0);
+   const char *own = e->is_input && strcasecmp(e->type, "textarea") ? "" :
+      e->dom_raw_text ? e->dom_raw_text : e->text;
+   const int raw = !strcasecmp(e->type, "script") || !strcasecmp(e->type, "style");
+   if (!kids || e->direct_text_before_children) {
+      if (raw) buf_puts(b, own); else html_escape(b, own, 0);
+   }
    for (int j = i + 1; j < elem_count; ++j)
       if (elements[j].parent_idx == i && el_node(j)) html_of(j, b, 1);
-   if (kids && !e->direct_text_before_children) html_escape(b, own, 0);
+   if (kids && !e->direct_text_before_children) {
+      if (raw) buf_puts(b, own); else html_escape(b, own, 0);
+   }
    if (outer) buf_printf(b, "</%s>", e->type);
 }
 
@@ -1961,6 +2254,10 @@ static JSValue lb_set_html(JSContext *ctx, JSValueConst this_val, int argc, JSVa
    int i = uid_idx(ctx, argv[0]);
    const char *s = JS_ToCString(ctx, argv[1]);
    if (!s) return JS_EXCEPTION;
+   if (i >= 0 && elements[i].dom_raw_text) {
+      JS_FreeCString(ctx, s);
+      return lb_set_text(ctx, this_val, argc, argv);
+   }
    if (i >= 0) { luna_dom_set_inner_html(i, s); g_page.dirty = 1; }
    JS_FreeCString(ctx, s);
    return JS_UNDEFINED;
@@ -2030,6 +2327,53 @@ static JSValue lb_scroll(JSContext *ctx, JSValueConst this_val, int argc, JSValu
    JS_SetPropertyUint32(ctx, out, 1, JS_NewFloat64(ctx, e->scroll_left));
    JS_SetPropertyUint32(ctx, out, 2, JS_NewFloat64(ctx, e->scroll_content_h));
    JS_SetPropertyUint32(ctx, out, 3, JS_NewFloat64(ctx, e->scroll_content_w));
+   return out;
+}
+
+static JSValue lb_offset(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+   (void)this_val; (void)argc;
+   layout_now();
+   int i = uid_idx(ctx, argv[0]), parent = -1;
+   JSValue out = JS_NewArray(ctx);
+   float x = 0, y = 0;
+   if (i >= 0) {
+      LunaElement *e = &elements[i];
+      x = e->x; y = e->y;
+      if (is_visible(i) && !e->position_fixed && strcmp(e->type, "body") && strcmp(e->type, "html")) {
+         for (int p = e->parent_idx; p >= 0; p = elements[p].parent_idx) {
+            LunaElement *a = &elements[p];
+            if (is_positioned_element(a) || !strcmp(a->type, "body") ||
+                !strcmp(a->type, "table") || !strcmp(a->type, "td") || !strcmp(a->type, "th")) {
+               parent = p; break;
+            }
+         }
+      }
+      if (parent >= 0) {
+         LunaElement *a = &elements[parent];
+         x -= a->x + a->border_width; y -= a->y + a->border_width;
+      }
+   }
+   JS_SetPropertyUint32(ctx, out, 0, JS_NewFloat64(ctx, x));
+   JS_SetPropertyUint32(ctx, out, 1, JS_NewFloat64(ctx, y));
+   JS_SetPropertyUint32(ctx, out, 2, js_uid(ctx, parent));
+   return out;
+}
+
+static JSValue lb_document_scroll(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+   (void)this_val;
+   layout_now();
+   float x, y, w, h;
+   luna_document_scroll_state(&x, &y, &w, &h);
+   double v;
+   if (argc > 0 && !JS_IsUndefined(argv[0]) && JS_ToFloat64(ctx, &v, argv[0]) == 0) x = v;
+   if (argc > 1 && !JS_IsUndefined(argv[1]) && JS_ToFloat64(ctx, &v, argv[1]) == 0) y = v;
+   if (argc) { luna_document_scroll(x, y); g_page.dirty = 1; layout_now(); }
+   luna_document_scroll_state(&x, &y, &w, &h);
+   JSValue out = JS_NewArray(ctx);
+   float values[] = {x, y, w, h};
+   for (int i = 0; i < 4; ++i) JS_SetPropertyUint32(ctx, out, i, JS_NewFloat64(ctx, values[i]));
    return out;
 }
 
@@ -2153,7 +2497,13 @@ static int js_eval_url(const char *rel, int module)
 {
    char *url = url_resolve(g_page.url, rel);
    struct response r;
-   int ok = lb_fetch(url, "GET", NULL, NULL, 0, &r) == 0 && r.status >= 200 && r.status < 300;
+   int hit = cache_find(url), ok;
+   if (hit >= 0) {
+      memset(&r, 0, sizeof r);
+      r.body = lb_strndup((const char *)g_page.cache[hit].data, g_page.cache[hit].len);
+      r.length = g_page.cache[hit].len;
+      ok = r.body != NULL;
+   } else ok = lb_fetch(url, "GET", NULL, NULL, 0, &r) == 0 && r.status >= 200 && r.status < 300;
    LB_LOG("script %s -> %d\n", url, r.status);
    if (ok) ok = js_eval((const char *)r.body, r.length, r.url ? r.url : url, module) == 0;
    else fprintf(stderr, "[luna-browser] script %s failed: %d %s\n", url, r.status,
@@ -2475,6 +2825,9 @@ static const JSCFunctionListEntry lb_funcs[] = {
    JS_CFUNC_DEF("createText", 1, lb_create_text),
    JS_CFUNC_DEF("insert", 3, lb_insert),
    JS_CFUNC_DEF("remove", 1, lb_remove),
+   JS_CFUNC_DEF("setChecked", 2, lb_set_checked),
+   JS_CFUNC_DEF("imageSize", 1, lb_image_size),
+   JS_CFUNC_DEF("selection", 0, lb_selection),
    JS_CFUNC_DEF("parent", 1, lb_parent),
    JS_CFUNC_DEF("children", 1, lb_children),
    JS_CFUNC_DEF("tag", 1, lb_tag),
@@ -2491,6 +2844,8 @@ static const JSCFunctionListEntry lb_funcs[] = {
    JS_CFUNC_DEF("value", 2, lb_value),
    JS_CFUNC_DEF("focus", 1, lb_focus),
    JS_CFUNC_DEF("scroll", 3, lb_scroll),
+   JS_CFUNC_DEF("documentScroll", 2, lb_document_scroll),
+   JS_CFUNC_DEF("offset", 1, lb_offset),
    JS_CFUNC_DEF("title", 1, lb_title),
    JS_CFUNC_DEF("css", 1, lb_css),
    JS_CFUNC_DEF("http", 5, lb_http),
@@ -2581,13 +2936,12 @@ static int js_open(void)
  * Loading a document
  * ======================================================================== */
 
-struct script_tag { char *src, *code; int module; };
+struct script_tag { char *src, *code; int module, ordinal; };
 
-/* The document's scripts in source order.  luna-ui's parser skips <script>;
- * they are run here once the tree exists. */
+/* Execute the document's scripts once in source order, after its DOM exists. */
 static int scan_scripts(const char *html, struct script_tag **out)
 {
-   int n = 0;
+   int n = 0, ordinal = 0;
    *out = NULL;
    for (const char *p = html; (p = strchr(p, '<')) != NULL; ) {
       if (!strncmp(p, "<!--", 4)) {
@@ -2595,13 +2949,29 @@ static int scan_scripts(const char *html, struct script_tag **out)
          p = e ? e + 3 : p + strlen(p);
          continue;
       }
+      const char *raw_tags[] = {"style", "title", "textarea", "iframe", "noscript"};
+      int skipped = 0;
+      for (size_t k = 0; k < sizeof(raw_tags) / sizeof(raw_tags[0]); ++k) {
+         size_t len = strlen(raw_tags[k]);
+         if (strncasecmp(p + 1, raw_tags[k], len) ||
+             (p[len + 1] != '>' && !isspace((unsigned char)p[len + 1]))) continue;
+         char closing[32]; snprintf(closing, sizeof closing, "</%s", raw_tags[k]);
+         const char *e = strcasestr(p + len + 1, closing);
+         while (e && e[len + 2] != '>' && !isspace((unsigned char)e[len + 2])) e = strcasestr(e + 2, closing);
+         p = e ? e + len + 2 : p + strlen(p);
+         skipped = 1; break;
+      }
+      if (skipped) continue;
       if (strncasecmp(p, "<script", 7) || (p[7] != '>' && !isspace((unsigned char)p[7]))) { p++; continue; }
       const char *gt = strchr(p, '>');
       if (!gt) break;
       char *attrs = lb_strndup(p + 7, (size_t)(gt - p - 7));
       const char *close = strcasestr(gt + 1, "</script");
+      while (close && close[8] != '>' && !isspace((unsigned char)close[8]))
+         close = strcasestr(close + 2, "</script");
       const char *end = close ? close : gt + 1 + strlen(gt + 1);
       struct script_tag t = { 0 };
+      t.ordinal = ordinal++;
       char type[64] = "", src[1024] = "";
       /* A tiny attribute read, same rules as luna-ui's (quoted values). */
       const char *a;
@@ -2640,7 +3010,7 @@ static int scan_scripts(const char *html, struct script_tag **out)
 
 /* The part of the HTML UA stylesheet luna-ui does not build in. */
 static const char lb_ua_css[] =
-   "head,script,style,template,[hidden]{display:none}"
+   "head,script,style,template,noscript,input[type=hidden],[hidden]{display:none}"
    "input,textarea,select{border:1px solid #767676;border-radius:2px;padding:1px 2px;"
    "background:#ffffff;color:#000000;font-size:13.33px}"
    "button{border:1px solid #767676;border-radius:3px;padding:1px 6px;background:#efefef;"
@@ -2655,7 +3025,7 @@ static const char lb_ua_css[] =
    "code,kbd,samp,pre,tt{font-family:monospace}"
    "small{font-size:13.33px}sub,sup{font-size:12px}"
    "hr{border-top:1px solid #9a9a9a;margin:8px 0}"
-   "table{border-spacing:2px}td,th{padding:1px}";
+   "table{border-spacing:2px}";
 
 static void page_teardown(void)
 {
@@ -2696,6 +3066,7 @@ static void page_load_html(const char *html, const char *url)
       url_free(&u);
    } else luna_set_html_base_dir(g_page.url);
    snprintf(luna_doc_title, sizeof luna_doc_title, "%s", "");
+   page_prefetch(html);
    js_open();
    luna_parse_css(lb_ua_css);
    for (int i = 0; i < g_page.nboot; ++i) js_eval(g_page.boot_scripts[i], strlen(g_page.boot_scripts[i]), "boot", 0);
@@ -2712,12 +3083,19 @@ static void page_load_html(const char *html, const char *url)
    luna_resize((float)g_page.w, (float)g_page.h);
    struct script_tag *scripts = NULL;
    int n = scan_scripts(html, &scripts);
+   JS_FreeValue(g_page.ctx, js_hook("__lb_parser_scripts", 0, NULL));
    for (int i = 0; i < n; ++i) {
+      JSValue index = JS_NewInt32(g_page.ctx, scripts[i].module ? -1 : scripts[i].ordinal);
+      JS_FreeValue(g_page.ctx, js_hook("__lb_current_script", 1, &index));
+      JS_FreeValue(g_page.ctx, index);
       if (scripts[i].src) js_eval_url(scripts[i].src, scripts[i].module);
       else if (scripts[i].code) js_eval(scripts[i].code, strlen(scripts[i].code), g_page.url, scripts[i].module);
       free(scripts[i].src);
       free(scripts[i].code);
    }
+   JSValue no_script = JS_NewInt32(g_page.ctx, -1);
+   JS_FreeValue(g_page.ctx, js_hook("__lb_current_script", 1, &no_script));
+   JS_FreeValue(g_page.ctx, no_script);
    free(scripts);
    ready_state(1);
    page_emit("Page.domContentEventFired", NULL);
@@ -2830,8 +3208,18 @@ static void flush_pointer_events(double x, double y, int touch)
    sync_focus_and_value();
 }
 
+static void cdp_emit(const char *method, const char *params);
+static char *g_page_clip;            /* the clipboard as the page process knows it */
+
+/* CDP modifiers (alt 1, ctrl 2, meta 4, shift 8) as luna-ui's. */
+static int cdp_mods(int m)
+{
+   return ((m & 1) ? LUNA_MOD_ALT : 0) | ((m & 2) ? LUNA_MOD_CONTROL : 0) |
+          ((m & 4) ? LUNA_MOD_SUPER : 0) | ((m & 8) ? LUNA_MOD_SHIFT : 0);
+}
+
 /* action: 1 down, 0 up, -1 move. */
-static void page_pointer(double x, double y, int action, int touch)
+static void page_pointer(double x, double y, int action, int touch, int button, int mods)
 {
    luna_mouse_move(x, y);
    if (action < 0) {
@@ -2841,11 +3229,26 @@ static void page_pointer(double x, double y, int action, int touch)
                           JS_NewInt32(g_page.ctx, 0), JS_FALSE, JS_NewBool(g_page.ctx, touch) };
          JS_FreeValue(g_page.ctx, js_hook("__lb_pointer", 7, a));
       }
+      /* The link under the pointer, for the window's status line. */
+      {
+         static char *last;
+         char *href = luna_link_at_point(x, y);
+         if ((href ? 1 : 0) != (last ? 1 : 0) || (href && strcmp(href, last))) {
+            struct buf b = { 0 };
+            buf_puts(&b, "{\"url\":");
+            buf_json_str(&b, href ? href : "");
+            buf_puts(&b, "}");
+            cdp_emit("Lunaria.hover", b.p);
+            free(b.p);
+            free(last);
+            last = href;
+         } else free(href);
+      }
       g_page.dirty = 1;
       return;
    }
-   g_page.pressed = action == 1;
-   luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT, action ? LUNA_PRESS : LUNA_RELEASE, 0, x, y);
+   if (button == LUNA_MOUSE_BUTTON_LEFT) g_page.pressed = action == 1;
+   luna_mouse_button(button, action ? LUNA_PRESS : LUNA_RELEASE, mods, x, y);
    flush_pointer_events(x, y, touch);
    g_page.dirty = 1;
 }
@@ -2854,7 +3257,7 @@ static void page_wheel(double x, double y, double dx, double dy)
 {
    luna_mouse_move(x, y);
    /* CDP deltas are pixels; luna-ui's wheel unit is a notch. */
-   luna_scroll(-dx / 100.0, -dy / 100.0);
+   luna_scroll(-dx / 18.0, -dy / 18.0);
    if (g_page.ctx) {
       JSValue a[5] = { JS_NewUint32(g_page.ctx, node_uid_at(luna_element_at_point(x, y))),
                        JS_NewFloat64(g_page.ctx, x), JS_NewFloat64(g_page.ctx, y),
@@ -2886,14 +3289,17 @@ static const struct { const char *name; int key; int vk; } g_keys[] = {
    { "End", LUNA_KEY_END, 35 }, { "Home", LUNA_KEY_HOME, 36 },
    { "ArrowLeft", LUNA_KEY_LEFT, 37 }, { "ArrowUp", LUNA_KEY_UP, 38 },
    { "ArrowRight", LUNA_KEY_RIGHT, 39 }, { "ArrowDown", LUNA_KEY_DOWN, 40 },
-   { "Delete", LUNA_KEY_DELETE, 46 }, { NULL, 0, 0 },
+   { "Delete", LUNA_KEY_DELETE, 46 }, { "Insert", LUNA_KEY_INSERT, 45 }, { " ", LUNA_KEY_SPACE, 32 }, { NULL, 0, 0 },
 };
 
 /* One key transition.  The page's keydown can cancel the default action,
  * which is luna-ui's editing of the focused field. */
-static void page_key(const char *key, int vk, int down, const char *text)
+static void page_key(const char *key, int vk, int down, const char *text, int mods)
 {
    int lkey = LUNA_KEY_UNKNOWN;
+   /* Shortcuts (Ctrl+A, Ctrl+C ...): the letter itself is the key. */
+   if ((mods & (LUNA_MOD_CONTROL | LUNA_MOD_SUPER)) && key && key[0] && !key[1] && isalpha((unsigned char)key[0]))
+      lkey = toupper((unsigned char)key[0]);
    for (int i = 0; g_keys[i].name; ++i)
       if ((key && !strcmp(key, g_keys[i].name)) || (vk && vk == g_keys[i].vk)) {
          lkey = g_keys[i].key;
@@ -2911,7 +3317,7 @@ static void page_key(const char *key, int vk, int down, const char *text)
       for (int i = 0; i < 3; ++i) JS_FreeValue(g_page.ctx, a[i]);
    }
    if (!prevented) {
-      if (lkey != LUNA_KEY_UNKNOWN) luna_key(lkey, 0, down ? LUNA_PRESS : LUNA_RELEASE, 0);
+      if (lkey != LUNA_KEY_UNKNOWN) luna_key(lkey, 0, down ? LUNA_PRESS : LUNA_RELEASE, mods);
       else if (down && text && text[0]) page_text(text);
    }
    sync_focus_and_value();
@@ -3426,11 +3832,30 @@ static void cdp_handle(const char *text)
       const char *type = jstr(params, "type");
       double x = jnum(params, "x", 0), y = jnum(params, "y", 0);
       cdp_reply(id, in_session, "{}");
-      if (type && !strcmp(type, "mousePressed")) page_pointer(x, y, 1, 0);
-      else if (type && !strcmp(type, "mouseReleased")) page_pointer(x, y, 0, 0);
-      else if (type && !strcmp(type, "mouseMoved")) page_pointer(x, y, -1, 0);
+      const char *bname = jstr(params, "button");
+      int button = bname && !strcmp(bname, "right") ? LUNA_MOUSE_BUTTON_RIGHT :
+                   bname && !strcmp(bname, "middle") ? 2 : LUNA_MOUSE_BUTTON_LEFT;
+      int mods = cdp_mods((int)jnum(params, "modifiers", 0));
+      if (type && !strcmp(type, "mousePressed")) page_pointer(x, y, 1, 0, button, mods);
+      else if (type && !strcmp(type, "mouseReleased")) page_pointer(x, y, 0, 0, button, mods);
+      else if (type && !strcmp(type, "mouseMoved")) page_pointer(x, y, -1, 0, 0, mods);
       else if (type && !strcmp(type, "mouseWheel"))
          page_wheel(x, y, jnum(params, "deltaX", 0), jnum(params, "deltaY", 0));
+   } else if (!strcmp(method, "Lunaria.find")) {
+      const char *text = jstr(params, "text");
+      int forward = jnum(params, "forward", 1) != 0;
+      if (jnum(params, "restart", 0) != 0) luna_selection_clear();
+      int found = text && text[0] ? luna_find_text(text, forward) : (luna_selection_clear(), 0);
+      g_page.dirty = 1;
+      cdp_reply(id, in_session, "{}");
+      char r[40];
+      snprintf(r, sizeof r, "{\"found\":%d}", found);
+      cdp_emit("Lunaria.findResult", r);
+   } else if (!strcmp(method, "Lunaria.setClipboard")) {
+      const char *text = jstr(params, "text");
+      free(g_page_clip);
+      g_page_clip = lb_strdup(text ? text : "");
+      cdp_reply(id, in_session, "{}");
    } else if (!strcmp(method, "Input.dispatchTouchEvent")) {
       const char *type = jstr(params, "type");
       const struct jv *pts = jget(params, "touchPoints");
@@ -3438,10 +3863,10 @@ static void cdp_handle(const char *text)
       static double tx, ty;
       if (p0) { tx = jnum(p0, "x", tx); ty = jnum(p0, "y", ty); }
       cdp_reply(id, in_session, "{}");
-      if (type && !strcmp(type, "touchStart")) page_pointer(tx, ty, 1, 1);
-      else if (type && !strcmp(type, "touchMove")) page_pointer(tx, ty, -1, 1);
+      if (type && !strcmp(type, "touchStart")) page_pointer(tx, ty, 1, 1, LUNA_MOUSE_BUTTON_LEFT, 0);
+      else if (type && !strcmp(type, "touchMove")) page_pointer(tx, ty, -1, 1, 0, 0);
       else if (type && (!strcmp(type, "touchEnd") || !strcmp(type, "touchCancel")))
-         page_pointer(tx, ty, 0, 1);
+         page_pointer(tx, ty, 0, 1, LUNA_MOUSE_BUTTON_LEFT, 0);
    } else if (!strcmp(method, "Input.insertText") || !strcmp(method, "Input.imeSetComposition")) {
       const char *text = jstr(params, "text");
       cdp_reply(id, in_session, "{}");
@@ -3453,8 +3878,8 @@ static void cdp_handle(const char *text)
       int vk = (int)jnum(params, "windowsVirtualKeyCode", 0);
       cdp_reply(id, in_session, "{}");
       if (type && (!strcmp(type, "keyDown") || !strcmp(type, "rawKeyDown")))
-         page_key(key, vk, 1, !strcmp(type, "keyDown") ? text : NULL);
-      else if (type && !strcmp(type, "keyUp")) page_key(key, vk, 0, NULL);
+         page_key(key, vk, 1, !strcmp(type, "keyDown") ? text : NULL, cdp_mods((int)jnum(params, "modifiers", 0)));
+      else if (type && !strcmp(type, "keyUp")) page_key(key, vk, 0, NULL, cdp_mods((int)jnum(params, "modifiers", 0)));
       else if (type && !strcmp(type, "char") && text) page_text(text);
    } else if (strstr(method, ".enable") || strstr(method, ".disable") ||
               !strcmp(method, "Target.setDiscoverTargets") || !strcmp(method, "Target.setAutoAttach") ||
@@ -3578,6 +4003,25 @@ static void usage(void)
          "  -v                        log\n", stderr);
 }
 
+/* The page process has no system clipboard: a copy is reported to the window
+ * (Lunaria.clipboard), which owns the real one, and the window pushes its
+ * contents back (Lunaria.setClipboard) before a paste can need them. */
+static void lb_set_clipboard(const char *utf8)
+{
+   free(g_page_clip);
+   g_page_clip = lb_strdup(utf8 ? utf8 : "");
+   struct buf b = { 0 };
+   buf_puts(&b, "{\"text\":");
+   buf_json_str(&b, g_page_clip);
+   buf_puts(&b, "}");
+   cdp_emit("Lunaria.clipboard", b.p);
+   free(b.p);
+}
+
+static char *lb_get_clipboard(void) { return g_page_clip ? lb_strdup(g_page_clip) : NULL; }
+
+static char *lb_resolve_href(const char *href) { return url_resolve(g_page.url, href); }
+
 static void setup_luna_platform(void)
 {
    static LunaPlatform platform;
@@ -3585,6 +4029,8 @@ static void setup_luna_platform(void)
    platform.get_time = lb_platform_time;
    platform.get_proc = gl_proc;
    platform.read_resource = lb_read_resource;
+   platform.set_clipboard = lb_set_clipboard;
+   platform.get_clipboard = lb_get_clipboard;
    platform.struct_size = (uint32_t)sizeof platform;
    luna_set_platform(&platform);
 }
@@ -3596,6 +4042,7 @@ static int headless_init(void)
    luna_set_gles3(g_gl.es);
    LunaInitConfig cfg = { (float)g_page.w, (float)g_page.h, gl_proc, 1 };
    if (!luna_init(&cfg)) { fprintf(stderr, "luna-browser: luna_init failed\n"); return -1; }
+   luna_set_url_resolver(lb_resolve_href);
    luna_set_mouse_press_hook(hook_press);
    luna_set_mouse_release_hook(hook_release);
    luna_set_web_compat(1);
@@ -3647,7 +4094,9 @@ static const char ui_html[] =
    "<button id=\"fwd\" title=\"Forward\">\xe2\x80\xba</button>"
    "<button id=\"reload\" title=\"Reload\">\xe2\x86\xbb</button>"
    "<input id=\"url\" type=\"text\" spellcheck=\"false\">"
-   "</div><div id=\"view\"></div><div id=\"status\"></div></body>";
+   "</div><div id=\"view\"></div>"
+   "<div id=\"findbox\"><input id=\"find\" type=\"text\" placeholder=\"Find in page\"><span id=\"fcnt\"></span></div>"
+   "<div id=\"status\"></div></body>";
 static const char ui_css[] =
    "body{margin:0;background:#ffffff;font-family:sans-serif;}"
    "#bar{position:fixed;left:0;top:0;right:0;height:44px;box-sizing:border-box;display:flex;"
@@ -3662,7 +4111,13 @@ static const char ui_css[] =
    "background-repeat:no-repeat;}"
    "#status{position:fixed;left:0;bottom:0;padding:2px 8px;font-size:12px;color:#5f6368;"
    "background:#f1f3f4;border-top-right-radius:4px;display:none;}"
-   "#status.on{display:block;}";
+   "#status.on{display:block;}"
+   "#findbox{position:fixed;right:16px;top:52px;display:none;align-items:center;gap:8px;padding:6px 10px;"
+   "background:#ffffff;border:1px solid #dadce0;border-radius:8px;}"
+   "#findbox.on{display:flex;}"
+   "#find{width:200px;height:26px;box-sizing:border-box;border:1px solid #dadce0;border-radius:4px;padding:0 8px;"
+   "font-size:14px;background:#ffffff;color:#202124;}"
+   "#fcnt{font-size:12px;color:#5f6368;}";
 
 static struct {
    pid_t pid;
@@ -3677,9 +4132,13 @@ static struct {
    int sent_w, sent_h;
    float scale;
    int pressed;                      /* a button went down over the page */
+   float zoom;                       /* page zoom (Ctrl +/-) */
+   int loading, find_on, url_click;
+   char find_last[256];
+   char hover[1024];
    double mx, my;
    char *start;
-} g_ui = { .pid = -1, .to = -1, .from = -1, .going = -1, .scale = 1.0f };
+} g_ui = { .pid = -1, .to = -1, .from = -1, .going = -1, .scale = 1.0f, .zoom = 1.0f };
 
 static int ui_el(const char *id) { return luna_get_element_by_id(id); }
 
@@ -3723,6 +4182,13 @@ static void ui_status(const char *text)
    if (text && *text) luna_add_class(i, "on"); else luna_remove_class(i, "on");
 }
 
+/* The status line: the link under the pointer, else the loading note. */
+static void ui_show_hover(const char *url)
+{
+   snprintf(g_ui.hover, sizeof g_ui.hover, "%s", url ? url : "");
+   ui_status(g_ui.hover[0] ? g_ui.hover : g_ui.loading ? "Loading\xe2\x80\xa6" : NULL);
+}
+
 static void ui_buttons(void)
 {
    int b = ui_el("back"), f = ui_el("fwd");
@@ -3760,6 +4226,7 @@ static void ui_navigate(const char *url)
    buf_puts(&b, "}");
    ui_send("Page.navigate", b.p, 1);
    free(b.p);
+   g_ui.loading = 1;
    ui_status("Loading\xe2\x80\xa6");
 }
 
@@ -3773,7 +4240,7 @@ static void ui_go(int delta)
 
 static void ui_on_back(LunaElement *e) { (void)e; ui_go(-1); }
 static void ui_on_fwd(LunaElement *e) { (void)e; ui_go(1); }
-static void ui_on_reload(LunaElement *e) { (void)e; ui_send("Page.reload", NULL, 1); ui_status("Loading\xe2\x80\xa6"); }
+static void ui_on_reload(LunaElement *e) { (void)e; ui_send("Page.reload", NULL, 1); g_ui.loading = 1; ui_status("Loading\xe2\x80\xa6"); }
 
 /* A page committed: the address bar, the history, then its title. */
 static void ui_committed(const char *url)
@@ -3816,11 +4283,20 @@ static void ui_message(const char *text)
       char ack[48];
       snprintf(ack, sizeof ack, "{\"sessionId\":%d}", (int)jnum(params, "sessionId", 0));
       ui_send("Page.screencastFrameAck", ack, 1);
+   } else if (method && !strcmp(method, "Lunaria.clipboard")) {
+      const char *text = jstr(params, "text");
+      if (text) luna_clipboard_set(text);
    } else if (method && !strcmp(method, "Page.frameNavigated")) {
       const char *url = jstr(jget(params, "frame"), "url");
       if (url) ui_committed(url);
+   } else if (method && !strcmp(method, "Lunaria.hover")) {
+      ui_show_hover(jstr(params, "url"));
+   } else if (method && !strcmp(method, "Lunaria.findResult")) {
+      int c = ui_el("fcnt");
+      if (c >= 0) luna_set_text(c, jnum(params, "found", 0) ? "" : (g_ui.find_last[0] ? "No matches" : ""));
    } else if (method && !strcmp(method, "Page.loadEventFired")) {
-      ui_status(NULL);
+      g_ui.loading = 0;
+      ui_show_hover(g_ui.hover);
       g_ui.title_id = ui_send("Runtime.evaluate",
                               "{\"expression\":\"document.title\",\"returnByValue\":true}", 1);
    } else if (!method && g_ui.title_id && (unsigned)jnum(m, "id", 0) == g_ui.title_id) {
@@ -3868,13 +4344,16 @@ static void ui_viewport(void)
    int x, y, w, h;
    luna_platform_get_window_rect(&x, &y, &w, &h);
    h -= UI_BAR;
-   if (w <= 0 || h <= 0 || (w == g_ui.sent_w && h == g_ui.sent_h)) return;
+   static float sent_zoom;
+   if (w <= 0 || h <= 0 || (w == g_ui.sent_w && h == g_ui.sent_h && sent_zoom == g_ui.zoom)) return;
    char p[160];
+   /* Zoom shrinks the page's CSS viewport and magnifies it by the same factor. */
    snprintf(p, sizeof p, "{\"width\":%d,\"height\":%d,\"deviceScaleFactor\":%g,\"mobile\":false}",
-            w, h, (double)g_ui.scale);
+            (int)((float)w / g_ui.zoom + 0.5f), (int)((float)h / g_ui.zoom + 0.5f), (double)(g_ui.scale * g_ui.zoom));
    ui_send("Emulation.setDeviceMetricsOverride", p, 1);
    g_ui.sent_w = w;
    g_ui.sent_h = h;
+   sent_zoom = g_ui.zoom;
 }
 
 static int ui_spawn(void)
@@ -3936,6 +4415,18 @@ static void ui_frame(double dt, void *user)
    (void)dt; (void)user;
    ui_pump();
    ui_viewport();
+   if (g_ui.find_on) {                                   /* find as you type */
+      const char *t = luna_get_value(ui_el("find"));
+      if (t && strcmp(t, g_ui.find_last)) {
+         snprintf(g_ui.find_last, sizeof g_ui.find_last, "%s", t);
+         struct buf b = { 0 };
+         buf_puts(&b, "{\"text\":");
+         buf_json_str(&b, t);
+         buf_puts(&b, ",\"forward\":1,\"restart\":1}");
+         ui_send("Lunaria.find", b.p, 1);
+         free(b.p);
+      }
+   }
 }
 
 static void ui_render(int fbw, int fbh, void *user)
@@ -3950,27 +4441,53 @@ static void ui_render(int fbw, int fbh, void *user)
 
 static int ui_in_view(double y) { return y >= UI_BAR; }
 
-static void ui_mouse(const char *type, double x, double y, int button, int clicks)
+/* luna-ui's modifier mask as CDP's (alt 1, ctrl 2, meta 4, shift 8). */
+static int ui_cdp_mods(int mods)
 {
-   char p[200];
+   return ((mods & LUNA_MOD_ALT) ? 1 : 0) | ((mods & LUNA_MOD_CONTROL) ? 2 : 0) |
+          ((mods & LUNA_MOD_SUPER) ? 4 : 0) | ((mods & LUNA_MOD_SHIFT) ? 8 : 0);
+}
+
+/* Hands the system clipboard to the page, for a paste it may be asked for. */
+static void ui_push_clipboard(void)
+{
+   char *c = luna_clipboard_get();
+   struct buf b = { 0 };
+   buf_puts(&b, "{\"text\":");
+   buf_json_str(&b, c ? c : "");
+   buf_puts(&b, "}");
+   ui_send("Lunaria.setClipboard", b.p, 1);
+   free(b.p);
+   if (c) luna_clipboard_free(c);
+}
+
+static void ui_mouse(const char *type, double x, double y, int button, int clicks, int mods)
+{
+   char p[240];
    static const char *names[] = { "left", "right", "middle" };
-   snprintf(p, sizeof p, "{\"type\":\"%s\",\"x\":%.1f,\"y\":%.1f,\"button\":\"%s\",\"clickCount\":%d}",
-            type, x, y - UI_BAR, button >= 0 && button < 3 ? names[button] : "none", clicks);
+   snprintf(p, sizeof p, "{\"type\":\"%s\",\"x\":%.1f,\"y\":%.1f,\"button\":\"%s\",\"clickCount\":%d,\"modifiers\":%d}",
+            type, x / g_ui.zoom, (y - UI_BAR) / g_ui.zoom, button >= 0 && button < 3 ? names[button] : "none", clicks, ui_cdp_mods(mods));
    ui_send("Input.dispatchMouseEvent", p, 1);
 }
 
 static int ui_mouse_button(int button, int action, int mods, double x, double y, void *user)
 {
-   (void)mods; (void)user;
+   (void)user;
+   if (button == LUNA_MOUSE_BUTTON_LEFT && !ui_in_view(y)) {
+      int u = ui_el("url");
+      if (action == LUNA_PRESS) g_ui.url_click = u >= 0 && luna_focused_element() != u && luna_element_at_point(x, y) == u;
+      else if (action == LUNA_RELEASE && g_ui.url_click) { g_ui.url_click = 0; luna_input_select_all(u); }
+   }
    if (action == LUNA_PRESS && ui_in_view(y)) {
       luna_focus_element(-1);          /* the page has the keyboard now */
       g_ui.pressed = 1;
-      ui_mouse("mousePressed", x, y, button, 1);
+      if (button == LUNA_MOUSE_BUTTON_RIGHT) ui_push_clipboard();
+      ui_mouse("mousePressed", x, y, button, 1, mods);
       return 1;
    }
    if (action == LUNA_RELEASE && g_ui.pressed) {
       g_ui.pressed = 0;
-      ui_mouse("mouseReleased", x, y, button, 1);
+      ui_mouse("mouseReleased", x, y, button, 1, mods);
       return 1;
    }
    return 0;
@@ -3980,7 +4497,7 @@ static int ui_mouse_move(double x, double y, void *user)
 {
    (void)user;
    g_ui.mx = x; g_ui.my = y;
-   if (ui_in_view(y) || g_ui.pressed) ui_mouse("mouseMoved", x, y, g_ui.pressed ? 0 : -1, 0);
+   if (ui_in_view(y) || g_ui.pressed) ui_mouse("mouseMoved", x, y, g_ui.pressed ? 0 : -1, 0, 0);
    return 0;
 }
 
@@ -3990,15 +4507,15 @@ static int ui_scroll(double dx, double dy, void *user)
    if (!ui_in_view(g_ui.my)) return 0;
    char p[200];
    snprintf(p, sizeof p, "{\"type\":\"mouseWheel\",\"x\":%.1f,\"y\":%.1f,\"deltaX\":%.1f,\"deltaY\":%.1f}",
-            g_ui.mx, g_ui.my - UI_BAR, -dx * 60.0, -dy * 60.0);
+            g_ui.mx / g_ui.zoom, (g_ui.my - UI_BAR) / g_ui.zoom, -dx * 60.0 / g_ui.zoom, -dy * 60.0 / g_ui.zoom);
    ui_send("Input.dispatchMouseEvent", p, 1);
    return 1;
 }
 
 static int ui_page_has_keys(void)
 {
-   int u = ui_el("url");
-   return luna_focused_element() != u;
+   int f = luna_focused_element();
+   return f != ui_el("url") && f != ui_el("find");
 }
 
 static int ui_key(int key, int scancode, int action, int mods, void *user)
@@ -4010,12 +4527,55 @@ static int ui_key(int key, int scancode, int action, int mods, void *user)
    if (down && ((ctrl && key == LUNA_KEY_L) || key == LUNA_KEY_F6)) {
       int u = ui_el("url");
       luna_focus_element(u);
+      luna_input_select_all(u);
+      return 1;
+   }
+   if (down && ctrl && key == LUNA_KEY_F) {                       /* find in page */
+      int f = ui_el("find"), box = ui_el("findbox");
+      if (box >= 0) luna_add_class(box, "on");
+      g_ui.find_on = 1;
+      if (f >= 0) { luna_focus_element(f); luna_input_select_all(f); }
+      return 1;
+   }
+   if (down && ctrl && (key == LUNA_KEY_EQUAL || key == LUNA_KEY_KP_ADD || key == LUNA_KEY_MINUS ||
+                        key == LUNA_KEY_KP_SUBTRACT || key == LUNA_KEY_0 || key == LUNA_KEY_KP_0)) {   /* zoom */
+      static const float steps[] = { 0.25f, 0.33f, 0.5f, 0.67f, 0.75f, 0.8f, 0.9f, 1.0f, 1.1f, 1.25f, 1.5f, 1.75f, 2.0f, 2.5f, 3.0f, 4.0f, 5.0f };
+      int n = (int)(sizeof steps / sizeof steps[0]), cur = 0;
+      for (int i = 0; i < n; ++i) if (steps[i] <= g_ui.zoom + 0.001f) cur = i;
+      if (key == LUNA_KEY_0 || key == LUNA_KEY_KP_0) g_ui.zoom = 1.0f;
+      else if (key == LUNA_KEY_EQUAL || key == LUNA_KEY_KP_ADD) g_ui.zoom = steps[cur + 1 < n ? cur + 1 : cur];
+      else g_ui.zoom = steps[cur > 0 ? cur - 1 : 0];
+      char z[48];
+      snprintf(z, sizeof z, "%d%%", (int)(g_ui.zoom * 100.0f + 0.5f));
+      ui_status(g_ui.zoom == 1.0f ? NULL : z);
       return 1;
    }
    if (down && ((ctrl && key == LUNA_KEY_R) || key == LUNA_KEY_F5)) { ui_on_reload(NULL); return 1; }
    if (down && (mods & LUNA_MOD_ALT) && key == LUNA_KEY_LEFT) { ui_go(-1); return 1; }
    if (down && (mods & LUNA_MOD_ALT) && key == LUNA_KEY_RIGHT) { ui_go(1); return 1; }
    if (!ui_page_has_keys()) {
+      if (luna_focused_element() == ui_el("find")) {
+         if (down && key == LUNA_KEY_ENTER) {
+            const char *t = luna_get_value(ui_el("find"));
+            if (t && *t) {
+               struct buf b = { 0 };
+               buf_puts(&b, "{\"text\":");
+               buf_json_str(&b, t);
+               buf_printf(&b, ",\"forward\":%d}", (mods & LUNA_MOD_SHIFT) ? 0 : 1);
+               ui_send("Lunaria.find", b.p, 1);
+               free(b.p);
+            }
+            return 1;
+         }
+         if (down && key == LUNA_KEY_ESCAPE) {
+            g_ui.find_on = 0;
+            luna_remove_class(ui_el("findbox"), "on");
+            ui_send("Lunaria.find", "{\"text\":\"\"}", 1);
+            luna_focus_element(-1);
+            return 1;
+         }
+         return 0;
+      }
       if (down && key == LUNA_KEY_ENTER) {
          char *url = ui_typed_url(luna_get_value(ui_el("url")));
          if (url) { ui_navigate(url); free(url); }
@@ -4029,11 +4589,33 @@ static int ui_key(int key, int scancode, int action, int mods, void *user)
       }
       return 0;                        /* typing in the address bar */
    }
+   if (ctrl && key == LUNA_KEY_V) {      /* paste: the system clipboard, as typed text */
+      if (down) {
+         char *c = luna_clipboard_get();
+         if (c && *c) {
+            struct buf b = { 0 };
+            buf_puts(&b, "{\"text\":");
+            buf_json_str(&b, c);
+            buf_puts(&b, "}");
+            ui_send("Input.insertText", b.p, 1);
+            free(b.p);
+         }
+         if (c) luna_clipboard_free(c);
+      }
+      return 1;
+   }
+   if (ctrl && key >= LUNA_KEY_A && key <= LUNA_KEY_Z) {      /* Ctrl+A, Ctrl+C, Ctrl+X ... */
+      char p[200];
+      snprintf(p, sizeof p, "{\"type\":\"%s\",\"key\":\"%c\",\"windowsVirtualKeyCode\":%d,\"modifiers\":%d}",
+               down ? "rawKeyDown" : "keyUp", tolower(key), key, ui_cdp_mods(mods));
+      ui_send("Input.dispatchKeyEvent", p, 1);
+      return 1;
+   }
    for (int i = 0; g_keys[i].name; ++i) {
       if (g_keys[i].key != key) continue;
       char p[200];
-      snprintf(p, sizeof p, "{\"type\":\"%s\",\"key\":\"%s\",\"windowsVirtualKeyCode\":%d}",
-               down ? "rawKeyDown" : "keyUp", g_keys[i].name, g_keys[i].vk);
+      snprintf(p, sizeof p, "{\"type\":\"%s\",\"key\":\"%s\",\"windowsVirtualKeyCode\":%d,\"modifiers\":%d}",
+               down ? "rawKeyDown" : "keyUp", g_keys[i].name, g_keys[i].vk, ui_cdp_mods(mods));
       ui_send("Input.dispatchKeyEvent", p, 1);
       return 1;
    }

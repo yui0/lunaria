@@ -16,18 +16,53 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 #include <elf.h>
+#ifndef _WIN32
 #include <err.h>
+#else
+#include <stdarg.h>
+#endif
 #include <limits.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <time.h>
+#include "lunaria_os.h"
+#ifdef _WIN32
+#include <pthread.h>
+#endif
 #include "linker/dlfcn.h"
 #include "linker/linker.h"
 #include "jvm/jvm.h"
 #include "arm_exec.h"
 #include "dvm/dvm_jni.h"
+
+#ifdef _WIN32
+/* This call targets the Android ELF loader, using Android flag values. */
+#define RTLD_LOCAL 0
+#define RTLD_NOW 2
+static void warnx(const char *format, ...) {
+   va_list args;
+   va_start(args, format); vfprintf(stderr, format, args); va_end(args);
+   fputc('\n', stderr);
+}
+static void errx(int status, const char *format, ...) {
+   va_list args;
+   va_start(args, format); vfprintf(stderr, format, args); va_end(args);
+   fputc('\n', stderr); exit(status);
+}
+static void err(int status, const char *format, ...) {
+   int saved = errno;
+   va_list args;
+   va_start(args, format); vfprintf(stderr, format, args); va_end(args);
+   fprintf(stderr, ": %s\n", strerror(saved)); exit(status);
+}
+#endif
+
+/* Android library leaves are bounded independently of the host filesystem. */
+#define LUNA_GUEST_NAME_MAX 255
 
 static lunaria_touch_event
 touch_to_lunaria(const ArmExecTouchEvent *te)
@@ -45,7 +80,7 @@ extern void arm64_exec_svc_ring_dump(void);
  * dependency such as libunity.so -> libmain.so was silently left unresolved.
  * Android system libraries are provided by Lunaria's SVC/runtime bridge and
  * therefore deliberately have no guest ELF beside the APK libraries. */
-static int a64_dep_seen(const char *name, char seen[][NAME_MAX + 1], size_t n)
+static int a64_dep_seen(const char *name, char seen[][LUNA_GUEST_NAME_MAX + 1], size_t n)
 {
    for (size_t i = 0; i < n; ++i)
       if (!strcmp(name, seen[i])) return 1;
@@ -66,7 +101,7 @@ static int a64_vaddr_to_offset(const Elf64_Phdr *ph, size_t n,
 }
 
 static size_t a64_read_needed(const char *path,
-                              char names[][NAME_MAX + 1], size_t cap)
+                              char names[][LUNA_GUEST_NAME_MAX + 1], size_t cap)
 {
    FILE *f = fopen(path, "rb");
    Elf64_Ehdr eh;
@@ -108,10 +143,10 @@ static size_t a64_read_needed(const char *path,
       if (fseeko(f, (off_t)(strtab_off + dyn[i].d_un.d_val), SEEK_SET)) continue;
       size_t len = 0;
       int ch;
-      while (len < NAME_MAX && (ch = fgetc(f)) != EOF && ch != '\0')
+      while (len < LUNA_GUEST_NAME_MAX && (ch = fgetc(f)) != EOF && ch != '\0')
          names[count][len++] = (char)ch;
       names[count][len] = '\0';
-      if (len && (ch == '\0' || len == NAME_MAX)) ++count;
+      if (len && (ch == '\0' || len == LUNA_GUEST_NAME_MAX)) ++count;
    }
    free(dyn);
 out:
@@ -192,20 +227,20 @@ static void a64_preload_platform_libs(void)
 }
 
 static void a64_preload_needed(const char *path, const char *dir,
-                               char seen[][NAME_MAX + 1], size_t *seen_n)
+                               char seen[][LUNA_GUEST_NAME_MAX + 1], size_t *seen_n)
 {
-   char needed[64][NAME_MAX + 1];
+   char needed[64][LUNA_GUEST_NAME_MAX + 1];
    size_t n = a64_read_needed(path, needed, 64);
    for (size_t i = 0; i < n; ++i) {
       char dep_path[PATH_MAX];
       struct stat st;
       if (a64_dep_seen(needed[i], seen, *seen_n)) continue;
       if (*seen_n < 128) {
-         memcpy(seen[*seen_n], needed[i], NAME_MAX + 1);
-         seen[*seen_n][NAME_MAX] = '\0';
+         memcpy(seen[*seen_n], needed[i], LUNA_GUEST_NAME_MAX + 1);
+         seen[*seen_n][LUNA_GUEST_NAME_MAX] = '\0';
          ++*seen_n;
       }
-      size_t dir_len = strlen(dir), name_len = strnlen(needed[i], NAME_MAX + 1);
+      size_t dir_len = strlen(dir), name_len = strnlen(needed[i], LUNA_GUEST_NAME_MAX + 1);
       if (dir_len + name_len + 1 > sizeof dep_path) {
          warnx("AArch64 dependency path too long: %s", needed[i]);
          continue;
@@ -249,7 +284,7 @@ static void a64_preload_needed(const char *path, const char *dir,
 void arm64_loader_load_needed(const char *path)
 {
    char dir[PATH_MAX];
-   char seen[128][NAME_MAX + 1];
+   char seen[128][LUNA_GUEST_NAME_MAX + 1];
    size_t seen_n = 0;
    const char *slash = path ? strrchr(path, '/') : NULL;
    size_t n = slash ? (size_t)(slash - path) + 1u : 0u;
@@ -276,7 +311,7 @@ void arm64_loader_load_needed(const char *path)
 #define TF_MAX 16
 static struct { float x, y; int up_frame; } g_tf_hold[TF_MAX];
 static int g_tf_nhold;
-static int g_tf_fd = -2;
+static intptr_t g_tf_fd = -2;
 static char g_tf_buf[256];
 static size_t g_tf_len;
 
@@ -375,13 +410,7 @@ static void touch_fifo_tick(int frame_count)
       const char *path = getenv("LUNARIA_TOUCH_FIFO");
       g_tf_fd = -1;
       if (path && *path) {
-         if (mkfifo(path, 0600) != 0 && errno != EEXIST)
-            fprintf(stderr, "[loader] TOUCH_FIFO mkfifo(%s): %s\n",
-                    path, strerror(errno));
-         /* O_RDWR keeps a writer on the pipe, so the reader never sees the
-          * end-of-file that a closing writer would otherwise deliver on every
-          * command. */
-         g_tf_fd = open(path, O_RDWR | O_NONBLOCK);
+         g_tf_fd = luna_os_command_pipe_open(path);
          if (g_tf_fd < 0)
             fprintf(stderr, "[loader] TOUCH_FIFO open(%s): %s\n",
                     path, strerror(errno));
@@ -396,9 +425,9 @@ static void touch_fifo_tick(int frame_count)
 
    for (;;) {
       char chunk[128];
-      ssize_t n = read(g_tf_fd, chunk, sizeof chunk);
+      ptrdiff_t n = luna_os_command_pipe_read(g_tf_fd, chunk, sizeof chunk);
       if (n <= 0) break;
-      for (ssize_t i = 0; i < n; ++i) {
+      for (ptrdiff_t i = 0; i < n; ++i) {
          if (chunk[i] == '\n' || chunk[i] == ';') {
             g_tf_buf[g_tf_len] = '\0';
             if (g_tf_len) touch_fifo_line(g_tf_buf, frame_count);
@@ -658,6 +687,15 @@ static void svc_dump_handler(int sig) {
  * for explicit debugging, but never inject it into a normal Android run.
  * The normal-runtime diagnostic is /tmp/lunaria-threads, consumed by
  * thread_dump_request_tick() above. */
+#ifdef _WIN32
+static void *unsafe_alarm_thread(void *value)
+{
+   uintptr_t seconds = (uintptr_t)value;
+   while (seconds--) Sleep(1000);
+   svc_dump_handler(0);
+   return NULL;
+}
+#endif
 static void schedule_unsafe_alarm_dump(void)
 {
    const char *value = getenv("LUNARIA_UNSAFE_ALARM_DUMP_S");
@@ -672,8 +710,15 @@ static void schedule_unsafe_alarm_dump(void)
               "LUNARIA_UNSAFE_ALARM_DUMP_S=%s\n", value);
       return;
    }
+#ifdef _WIN32
+   pthread_t worker;
+   int error = pthread_create(&worker, NULL, unsafe_alarm_thread, (void *)(uintptr_t)seconds);
+   if (error) fprintf(stderr, "[loader] diagnostic timer: %s\n", strerror(error));
+   else pthread_detach(worker);
+#else
    signal(SIGALRM, svc_dump_handler);
    alarm((unsigned int)seconds);
+#endif
 }
 
 /* libmono.so @ 0x20000000: mono_defaults struct and key fields */
@@ -978,7 +1023,7 @@ static const char *const ue_files_roots[] = { "UE4Game", "UnrealGame", NULL };
 static const char *
 ue_project_name(const char *pkg)
 {
-   static char name[NAME_MAX + 1];
+   static char name[LUNA_GUEST_NAME_MAX + 1];
    if (*name) return name;
 
    const char *dir = getenv("ANDROID_PACKAGE_CODE_PATH");
@@ -1031,7 +1076,7 @@ ue_project_name(const char *pkg)
       struct dirent *de;
       while ((de = readdir(d))) {
          if (de->d_name[0] == '.') continue;
-         char paks[PATH_MAX + NAME_MAX + NAME_MAX + 32];
+         char paks[PATH_MAX + LUNA_GUEST_NAME_MAX + LUNA_GUEST_NAME_MAX + 32];
          struct stat sb;
          if (snprintf(paks, sizeof paks, "%s/%s/%s/Content/Paks",
                       ue, de->d_name, de->d_name) >= (int)sizeof paks)
@@ -1601,7 +1646,9 @@ run_ue4_game_arm(struct jvm *jvm)
       arm_exec_run_pending_threads();
    }
 
+#ifndef _WIN32
    signal(SIGUSR1, svc_dump_handler);
+#endif
    schedule_unsafe_alarm_dump();
 
    int max_frames = 0;
@@ -2117,7 +2164,9 @@ run_ue4_game_arm64(struct jvm *jvm)
    }
 
    g_dump_arm64 = 1;
+#ifndef _WIN32
    signal(SIGUSR1, svc_dump_handler);
+#endif
    schedule_unsafe_alarm_dump();
 
    int max_frames = 0;
@@ -2303,7 +2352,9 @@ run_unity_game_arm64(struct jvm *jvm, jobject existing_context,
 
    fprintf(stderr, "[loader] arm64 entering Unity render loop\n");
    g_dump_arm64 = 1;
+#ifndef _WIN32
    signal(SIGUSR1, svc_dump_handler);
+#endif
    schedule_unsafe_alarm_dump();
 
    int frame_count = 0, fail_streak = 0, last_ok = -1, resized_after_init = 0;
@@ -2353,6 +2404,7 @@ run_unity_game_arm64(struct jvm *jvm, jobject existing_context,
             }
          }
       }
+      touch_test_tick(frame_count);
       ArmExecTouchEvent te;
       if (va_inject && arm_exec_touch_next(&te)) {
          if (va_fwd_dalv)
@@ -2370,13 +2422,22 @@ run_unity_game_arm64(struct jvm *jvm, jobject existing_context,
       }
 
       arm_exec_drain_gl_thread_jobs();
+      const uint64_t render_start = frame_now_ns();
       int ok = (int)arm64_exec_call_unlimited(va_render, env, ctx, 0, 0);
+      frame_stage_add(FRAME_STAGE_SCHED, render_start);
       if (arm_exec_guest_exit_count() > 0 || arm_exec_guest_abort_count() > 0) {
          fprintf(stderr, "[loader] guest process terminated during nativeRender "
                          "(frame %d)\n", frame_count);
          break;
       }
 
+      int resized_w = 0, resized_h = 0;
+      if (arm_exec_take_view_resize(&resized_w, &resized_h) && va_resize) {
+         arm64_exec_call6(va_resize, env, ctx, (uint64_t)resized_w, (uint64_t)resized_h,
+                          (uint64_t)resized_w, (uint64_t)resized_h);
+         fprintf(stderr, "[loader] nativeResize(%d,%d) — view resized\n",
+                 resized_w, resized_h);
+      }
       if (!resized_after_init && frame_count >= 1 && va_resize) {
          int w = arm64_exec_fb_width(), h = arm64_exec_fb_height();
          arm64_exec_call6(va_resize, env, ctx, (uint64_t)w, (uint64_t)h,
@@ -2384,10 +2445,17 @@ run_unity_game_arm64(struct jvm *jvm, jobject existing_context,
          resized_after_init = 1;
       }
 
+      const uint64_t sched_start = frame_now_ns();
       arm64_exec_run_pending_threads();
+      frame_stage_add(FRAME_STAGE_SCHED, sched_start);
       pump_java_frame();
+      const uint64_t swap_start = frame_now_ns();
       arm64_exec_egl_swap();
+      frame_stage_add(FRAME_STAGE_SWAP, swap_start);
+      const uint64_t input_start = frame_now_ns();
       arm64_exec_glfw_poll();
+      frame_stage_add(FRAME_STAGE_INPUT, input_start);
+      perf_tick();
       ++frame_count;
       if (ok != last_ok || frame_count <= 5 || (frame_count % 50 == 0)) {
          fprintf(stderr, "[loader] arm64 nativeRender -> %d (frame %d)\n",
@@ -2408,7 +2476,7 @@ run_unity_game_arm64(struct jvm *jvm, jobject existing_context,
 
 /* Start the package the way Android does: construct the launcher Activity and
  * run its lifecycle out of the dex.  `ANDROID_LAUNCH_ACTIVITY` comes from
- * lunaria-apk.sh, which already parses the APK's AndroidManifest.
+ * the native APK launcher, which already parses the APK's AndroidManifest.
  *
  * This is the engine-agnostic path.  It carries no knowledge of Unity or
  * Unreal: whatever the APK's Activity does in onCreate — loading its native
@@ -2860,7 +2928,9 @@ run_jni_game_arm(struct jvm *jvm)
    arm_exec_run_pending_threads();
    fprintf(stderr, "[loader] entering render loop\n");
    /* SIGUSR1: dump SVC ring buffer on demand (kill -USR1 <pid>) */
+#ifndef _WIN32
    signal(SIGUSR1, svc_dump_handler);
+#endif
    schedule_unsafe_alarm_dump();
 
    /* 注意: nativeDone() はここでは呼ばない。Unity 5+ では nativeDone() は
@@ -2955,6 +3025,13 @@ run_jni_game_arm(struct jvm *jvm)
       /* Android では surfaceChanged -> nativeResize がエンジン初期化後にも
        * 届く。ループ前の nativeResize はエンジン未初期化で無視されるため
        * (画面が 128x128 の既定値のままになる)、初回フレーム完了後に再送する。 */
+      int resized_w = 0, resized_h = 0;
+      if (arm_exec_take_view_resize(&resized_w, &resized_h) && va_resize) {
+         arm_exec_call6(va_resize, env, ctx, (uint32_t)resized_w, (uint32_t)resized_h,
+                          (uint32_t)resized_w, (uint32_t)resized_h);
+         fprintf(stderr, "[loader] nativeResize(%d,%d) — view resized\n",
+                 resized_w, resized_h);
+      }
       if (!resized_after_init && frame_count >= 1 && va_resize) {
          int w = arm_exec_fb_width(), h = arm_exec_fb_height();
          arm_exec_call6(va_resize, env, ctx, (uint32_t)w, (uint32_t)h,
@@ -3044,8 +3121,15 @@ raw_start(void *entry, int argc, const char *argv[])
 #endif
 }
 
+int luna_apk_prepare(int *argc, const char ***argv);
+
+#ifdef _WIN32
+static int
+lunaria_main(int argc, const char *argv[])
+#else
 int
 main(int argc, const char *argv[])
+#endif
 {
    /* Keep loader milestones in chronological order when stdout and stderr are
     * redirected to one startup log.  Fully buffered stdout otherwise leaves
@@ -3069,22 +3153,28 @@ main(int argc, const char *argv[])
     *
     * So open /dev/null over whatever is missing before any of it exists. */
    for (int fd = 0; fd <= 2; ++fd) {
-      if (fcntl(fd, F_GETFD) != -1 || errno != EBADF)
+      if (luna_fd_get_cloexec(fd) != -1 || errno != EBADF)
          continue;
-      int nul = open("/dev/null", fd == 0 ? O_RDONLY : O_WRONLY);
+#ifdef _WIN32
+      const char *null_path = "NUL";
+#else
+      const char *null_path = "/dev/null";
+#endif
+      int nul = luna_file_open(null_path, fd == 0 ? O_RDONLY : O_WRONLY, 0);
       if (nul < 0)
          break;
       if (nul != fd) {
-         dup2(nul, fd);
-         close(nul);
+         int copied = luna_fd_dup_to(nul, fd, 0);
+         luna_fd_close(nul);
+         if (copied < 0) break;
       }
-      fprintf(stderr, "[loader] fd %d was closed — opened /dev/null on it "
+      fprintf(stderr, "[loader] fd %d was closed — opened %s on it "
               "(a guest descriptor must never land on stdin/stdout/stderr)\n",
-              fd);
+              fd, null_path);
    }
 
-   if (argc < 2)
-      errx(EXIT_FAILURE, "usage: <elf file or jni library>");
+   int launch = luna_apk_prepare(&argc, &argv);
+   if (launch) return launch < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 
    printf("loading module: %s\n", argv[1]);
 
@@ -3140,9 +3230,9 @@ main(int argc, const char *argv[])
    /* ARM64 ELF: use A64 dynarmic emulation path */
    if (arm64_elf_is_arm64(argv[1])) {
       printf("detected ARM64 ELF — using A64 dynarmic emulation\n");
-      setenv("GC_DONT_GC", "1", 0);
-      setenv("GC_MAXIMUM_HEAP_SIZE", "268435456", 0);
-      setenv("GC_INITIAL_HEAP_SIZE", "67108864",  0);
+      luna_os_setenv("GC_DONT_GC", "1", 0);
+      luna_os_setenv("GC_MAXIMUM_HEAP_SIZE", "268435456", 0);
+      luna_os_setenv("GC_INITIAL_HEAP_SIZE", "67108864",  0);
       static struct jvm jvm;
       jvm_init(&jvm);
 
@@ -3152,7 +3242,7 @@ main(int argc, const char *argv[])
       /* Pre-load companion libraries from the same directory */
       {
          char dir[4096], libpath[4096];
-         char dep_seen[128][NAME_MAX + 1] = {{0}};
+         char dep_seen[128][LUNA_GUEST_NAME_MAX + 1] = {{0}};
          size_t dep_seen_n = 0;
          struct stat stbuf;
          snprintf(dir, sizeof(dir), "%s", argv[1]);
@@ -3236,15 +3326,15 @@ main(int argc, const char *argv[])
        * 注意: bdwgc は GC_DONT_GC の「存在」で判定するため、有効化時は
        * setenv せず unsetenv しておく。 */
       if (getenv("LUNARIA_GC_ENABLE"))
-         unsetenv("GC_DONT_GC");
+         luna_os_unsetenv("GC_DONT_GC");
       else
-         setenv("GC_DONT_GC", "1", 0);
+         luna_os_setenv("GC_DONT_GC", "1", 0);
       /* Boehm GC computes max_heap_size from the 32-bit address space (~4 GB),
        * producing requests of ~3.7 GB which our mmap bump allocator must reject.
        * With zero heap the GC calls GC_scratch_alloc(0) -> ABORT("Bad GET_MEM arg").
        * Cap the heap to 256 MB so the GC gets usable memory without flooding. */
-      setenv("GC_MAXIMUM_HEAP_SIZE", "268435456", 0); /* 256 MB */
-      setenv("GC_INITIAL_HEAP_SIZE", "67108864",  0); /* 64 MB */
+      luna_os_setenv("GC_MAXIMUM_HEAP_SIZE", "268435456", 0); /* 256 MB */
+      luna_os_setenv("GC_INITIAL_HEAP_SIZE", "67108864",  0); /* 64 MB */
       static struct jvm jvm;
       jvm_init(&jvm);
 
@@ -3336,7 +3426,7 @@ main(int argc, const char *argv[])
 
    {
       char abs[PATH_MAX], paths[4096];
-      if (!realpath(argv[1], abs))
+      if (!luna_file_realpath(argv[1], abs, sizeof abs))
          snprintf(abs, sizeof abs, "%s", argv[1]);
       snprintf(paths, sizeof(paths), "%s", dirname(abs));
       dl_parse_library_path(paths, ":");
@@ -3400,3 +3490,23 @@ main(int argc, const char *argv[])
    printf("exiting\n");
    return ret;
 }
+
+#ifdef _WIN32
+/* Decode Windows arguments losslessly, including drag-and-drop Unicode paths. */
+int wmain(int argc, wchar_t *wide_argv[])
+{
+   char **argv = calloc((size_t)argc + 1, sizeof *argv);
+   if (!argv) return EXIT_FAILURE;
+   for (int i = 0; i < argc; i++) {
+      int n = WideCharToMultiByte(CP_UTF8, 0, wide_argv[i], -1, NULL, 0, NULL, NULL);
+      if (!n || !(argv[i] = malloc((size_t)n)) ||
+          !WideCharToMultiByte(CP_UTF8, 0, wide_argv[i], -1, argv[i], n, NULL, NULL)) {
+         for (int j = 0; j <= i; j++) free(argv[j]);
+         free(argv); return EXIT_FAILURE;
+      }
+   }
+   int result = lunaria_main(argc, (const char **)argv);
+   for (int i = 0; i < argc; i++) free(argv[i]);
+   free(argv); return result;
+}
+#endif

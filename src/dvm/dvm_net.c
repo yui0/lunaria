@@ -12,25 +12,38 @@
  */
 
 #include "dvm/dvm_net.h"
-#include "dvm/host_socket.h"
+#include "lunaria_os.h"
 
 #include <errno.h>
+#ifndef _WIN32
 #include <arpa/inet.h>
 #include <netdb.h>
+#endif
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#ifndef _WIN32
 #include <sys/socket.h>
 #include <sys/time.h>
+#endif
 #include <unistd.h>
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
 #define HTTP_MAX_REDIRECTS 5
+
+static const char *http_case_find(const char *text, const char *part)
+{
+   size_t length = strlen(part);
+   if (!length) return text;
+   for (; *text; ++text)
+      if (!strncasecmp(text, part, length)) return text;
+   return NULL;
+}
 
 /* OpenSSL writes to the host socket without MSG_NOSIGNAL.  A peer closing an
  * HTTP/2 connection must be reported to Java as an I/O error, not terminate
@@ -39,10 +52,12 @@
 static pthread_once_t host_sigpipe_once = PTHREAD_ONCE_INIT;
 static void ignore_host_sigpipe(void)
 {
+#ifndef _WIN32
    struct sigaction action = { 0 };
    action.sa_handler = SIG_IGN;
    sigemptyset(&action.sa_mask);
    (void)sigaction(SIGPIPE, &action, NULL);
+#endif
 }
 
 /* ------------------------------------------------------------------------ *
@@ -67,7 +82,7 @@ static void stream_close(struct stream *s)
       s->ctx = NULL;
    }
    if (s->fd >= 0) {
-      close(s->fd);
+      luna_fd_close(s->fd);
       s->fd = -1;
    }
 }
@@ -80,7 +95,7 @@ static ssize_t stream_write(struct stream *s, const void *buf, size_t len)
       if (s->ssl)
          n = SSL_write(s->ssl, (const char *)buf + done, (int)(len - done));
       else
-         n = write(s->fd, (const char *)buf + done, len - done);
+         n = luna_fd_write(s->fd, (const char *)buf + done, len - done);
       if (n <= 0) {
          if (!s->ssl && n < 0 && errno == EINTR) continue;
          return -1;
@@ -126,7 +141,7 @@ static ssize_t stream_read(struct stream *s, void *buf, size_t len)
          if (e == SSL_ERROR_SYSCALL && errno == 0) return 0;
          return -1;
       }
-      n = read(s->fd, buf, len);
+      n = luna_fd_read(s->fd, buf, len);
       if (n < 0 && errno == EINTR) continue;
       if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
          if (waited_ms >= HTTP_READ_STALL_MS) { errno = ETIMEDOUT; return -1; }
@@ -260,6 +275,9 @@ static bool buf_str(struct buf *b, const char *s)
  * Connect
  * ------------------------------------------------------------------------ */
 
+static int connect_one(const struct addrinfo *a, const char *local_addr,
+                       int local_port, int timeout_ms);
+
 static bool connect_to(const struct url *u, int timeout_ms, struct stream *s,
                        char *err, size_t errsz)
 {
@@ -270,7 +288,7 @@ static bool connect_to(const struct url *u, int timeout_ms, struct stream *s,
    struct addrinfo hints = { 0 }, *res = NULL;
    hints.ai_family = AF_UNSPEC;
    hints.ai_socktype = SOCK_STREAM;
-   int rc = getaddrinfo(u->host, u->port, &hints, &res);
+   int rc = luna_socket_dns(u->host, u->port, &hints, &res);
    if (rc || !res) {
       snprintf(err, errsz, "%s: %s", u->host, gai_strerror(rc));
       return false;
@@ -284,19 +302,17 @@ static bool connect_to(const struct url *u, int timeout_ms, struct stream *s,
          const bool is_v4 = a->ai_family == AF_INET;
          if (pass == 0 && !is_v4) continue;
          if (pass == 1 && is_v4) continue;
-         fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+         fd = connect_one(a, NULL, 0, timeout_ms);
          if (fd < 0) continue;
          struct timeval tv = {
             .tv_sec = timeout_ms / 1000,
             .tv_usec = (timeout_ms % 1000) * 1000,
          };
          if (timeout_ms > 0) {
-            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+            luna_socket_set_option(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+            luna_socket_set_option(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
          }
-         if (!connect(fd, a->ai_addr, a->ai_addrlen)) break;
-         close(fd);
-         fd = -1;
+         break;
       }
    }
    freeaddrinfo(res);
@@ -326,7 +342,7 @@ static bool connect_to(const struct url *u, int timeout_ms, struct stream *s,
       stream_close(s);
       return false;
    }
-   SSL_set_fd(s->ssl, fd);
+   SSL_set_fd(s->ssl, (int)luna_socket_native(fd));
    SSL_set_tlsext_host_name(s->ssl, u->host);
    SSL_set1_host(s->ssl, u->host);
    if (SSL_connect(s->ssl) != 1) {
@@ -592,7 +608,7 @@ static bool exchange(const char *method, const struct url *u,
    free(raw.p);
 
    const char *te = header_get(out, "Transfer-Encoding");
-   out->chunked = te && strcasestr(te, "chunked");
+   out->chunked = te && http_case_find(te, "chunked");
    const char *cl = header_get(out, "Content-Length");
    out->content_length = cl ? strtoll(cl, NULL, 10) : -1;
    if (out->chunked) out->content_length = -1;
@@ -935,10 +951,10 @@ void dvm_http_response_free(struct dvm_http_response *r)
  * ------------------------------------------------------------------------ */
 
 #include <fcntl.h>
-#include <poll.h>
 #include <pthread.h>
-#include <netinet/in.h>
+#ifndef _WIN32
 #include <netinet/tcp.h>
+#endif
 #include <openssl/x509v3.h>
 
 /* A connect that honours Socket.connect(address, timeout): non-blocking
@@ -973,44 +989,47 @@ static int bind_local(int fd, int family, const char *local_addr,
       }
       sl = sizeof *a4;
    }
-   return bind(fd, (struct sockaddr *)&ss, sl);
+   return luna_socket_bind(fd, (struct sockaddr *)&ss, sl);
 }
 
 static int connect_one(const struct addrinfo *a, const char *local_addr,
                        int local_port, int timeout_ms)
 {
-   int fd = host_socket_cloexec(a->ai_family, a->ai_socktype, a->ai_protocol);
+   int fd = luna_socket_open(a->ai_family, a->ai_socktype, a->ai_protocol);
    if (fd < 0) return -1;
    if (bind_local(fd, a->ai_family, local_addr, local_port) < 0) {
       int e = errno;
-      close(fd);
+      luna_fd_close(fd);
       errno = e;
       return -1;
    }
    if (timeout_ms <= 0) {
-      if (!connect(fd, a->ai_addr, a->ai_addrlen)) return fd;
+      if (!luna_socket_connect(fd, a->ai_addr, a->ai_addrlen)) return fd;
       int e = errno;
-      close(fd);
+      luna_fd_close(fd);
       errno = e;
       return -1;
    }
-   int fl = fcntl(fd, F_GETFL, 0);
-   fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-   int rc = connect(fd, a->ai_addr, a->ai_addrlen);
+   int nonblock = luna_socket_get_nonblock(fd);
+   if (nonblock < 0 || luna_socket_nonblock(fd, 1) != 0) {
+      int error = errno;
+      luna_fd_close(fd); errno = error; return -1;
+   }
+   int rc = luna_socket_connect(fd, a->ai_addr, a->ai_addrlen);
    if (rc < 0 && errno == EINPROGRESS) {
       struct pollfd p = { .fd = fd, .events = POLLOUT };
       int pr;
-      do pr = poll(&p, 1, timeout_ms); while (pr < 0 && errno == EINTR);
+      do pr = luna_socket_poll(&p, 1, timeout_ms); while (pr < 0 && errno == EINTR);
       if (pr == 0) {
-         close(fd);
+         luna_fd_close(fd);
          errno = ETIMEDOUT;
          return -1;
       }
       int soerr = 0;
       socklen_t sl = sizeof soerr;
-      if (pr < 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) < 0 ||
+      if (pr < 0 || luna_socket_get_option(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) < 0 ||
           soerr) {
-         close(fd);
+         luna_fd_close(fd);
          errno = soerr ? soerr : errno;
          return -1;
       }
@@ -1018,11 +1037,14 @@ static int connect_one(const struct addrinfo *a, const char *local_addr,
    }
    if (rc < 0) {
       int e = errno;
-      close(fd);
+      luna_fd_close(fd);
       errno = e;
       return -1;
    }
-   fcntl(fd, F_SETFL, fl);
+   if (luna_socket_nonblock(fd, nonblock) != 0) {
+      int error = errno;
+      luna_fd_close(fd); errno = error; return -1;
+   }
    return fd;
 }
 
@@ -1034,7 +1056,7 @@ int dvm_sock_connect(const char *host, int port, const char *local_addr,
    struct addrinfo hints = { 0 }, *res = NULL;
    hints.ai_family = AF_UNSPEC;
    hints.ai_socktype = SOCK_STREAM;
-   int rc = getaddrinfo(host, portstr, &hints, &res);
+   int rc = luna_socket_dns(host, portstr, &hints, &res);
    if (rc || !res) {
       snprintf(err, errsz, "Unable to resolve host \"%s\": %s", host,
                gai_strerror(rc));
@@ -1065,13 +1087,13 @@ void dvm_sock_set_timeout(int fd, int timeout_ms)
       .tv_sec = timeout_ms > 0 ? timeout_ms / 1000 : 0,
       .tv_usec = timeout_ms > 0 ? (timeout_ms % 1000) * 1000 : 0,
    };
-   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+   luna_socket_set_option(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 }
 
 /* One TLS session.  HTTP/2 reads a connection on one thread while others
  * write it, and an SSL object must not be entered by two threads at once, so
  * every SSL_* call on it takes `mu`.  Waiting for the socket happens outside
- * the lock, in poll(): after the handshake the fd is non-blocking, and a
+ * the lock, in luna_socket_poll(): after the handshake the fd is non-blocking, and a
  * reader that would block releases the session before it sleeps. */
 struct dvm_tls {
    SSL_CTX *ctx;
@@ -1168,7 +1190,7 @@ struct dvm_tls *dvm_tls_connect(int fd, const char *host, int verify,
    }
    tls_apply_ciphers(t->ssl, ciphers, nciphers);
    if (alpn && alpn_len) SSL_set_alpn_protos(t->ssl, alpn, (unsigned)alpn_len);
-   SSL_set_fd(t->ssl, fd);
+   SSL_set_fd(t->ssl, (int)luna_socket_native(fd));
    if (host && *host) {
       /* SNI is for names only (RFC 6066 §3); an address goes in the IP SAN
        * check instead. */
@@ -1197,7 +1219,11 @@ struct dvm_tls *dvm_tls_connect(int fd, const char *host, int verify,
    }
    SSL_set_mode(t->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE |
                         SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-   fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+   if (luna_socket_nonblock(fd, 1) != 0) {
+      snprintf(err, errsz, "TLS nonblocking mode: %s", strerror(errno));
+      dvm_tls_free(t);
+      return NULL;
+   }
    return t;
 }
 
@@ -1210,7 +1236,7 @@ static int tls_wait(int fd, int want, int timeout_ms)
       .events = (short)(want == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN),
    };
    int r;
-   do r = poll(&p, 1, timeout_ms > 0 ? timeout_ms : -1);
+   do r = luna_socket_poll(&p, 1, timeout_ms > 0 ? timeout_ms : -1);
    while (r < 0 && errno == EINTR);
    if (r == 0) return -2;
    if (r < 0) return -1;

@@ -175,6 +175,7 @@ struct dvm_dex {
    dvm_ref *string_cache;
 };
 
+struct dvm_attached_thread { uint64_t token; dvm_ref thread; };
 struct dvm {
    struct dvm_hooks hooks;
 
@@ -233,6 +234,8 @@ struct dvm {
    int npending, pending_cap;
    /* The Thread the interpreter is currently inside, or 0 for the main one. */
    dvm_ref cur_thread;
+   dvm_ref main_thread;
+   struct dvm_attached_thread native_threads[256];
    /* How many drains of the pending queue are on the stack.  This used to be a
     * flat re-entrancy lock, which made every blocking wait inside a Runnable
     * unsatisfiable: the work being waited for sits in this same queue, so a

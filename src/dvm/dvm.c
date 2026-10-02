@@ -3740,7 +3740,17 @@ void dvm_main_looper_tick(struct dvm *vm)
    /* Same contract as dvm_media_pump_active(): called from the frame pump,
     * which does not carry the interpreter lock. */
    unsigned cookie = dvm_gil_enter_from_guest(vm);
+   /* A pump turn belongs to Android's main Looper, not to the guest JNI
+    * invocation that last used this host thread. That invocation may have
+    * parked inside a modal wait with drain_depth > 0. Borrowing its state
+    * suppresses UI redraws and clicks forever, while preserving it lets the
+    * suspended invocation resume with its own stack and exception intact. */
+   struct dvm_tstate saved, main_turn = { 0 };
+   dvm__tstate_save(vm, &saved);
+   main_turn.cur_thread = vm->main_thread;
+   dvm__tstate_load(vm, &main_turn);
    dvm__run_pending_threads(vm);
+   dvm__tstate_load(vm, &saved);
    dvm_gil_leave_to_guest(vm, cookie);
 }
 
@@ -4086,8 +4096,30 @@ void dvm_gil_leave_to_guest(struct dvm *vm, unsigned cookie)
    dvm_gil_release(vm);
 }
 
+extern int arm_exec_host_ui_thread(void) __attribute__((weak));
+extern void arm_exec_service_host_ui(void) __attribute__((weak));
+
+/* A modal JNI call can wait on the same host thread that normally pumps the
+ * UI. Waiting releases execution, including the Android window's redraw and
+ * input work. Do not run unrelated Handler callbacks recursively here. */
+static void ui_before_platform_wait(struct dvm *vm)
+{
+   static _Thread_local bool active;
+   if (active || !arm_exec_host_ui_thread || !arm_exec_host_ui_thread()) return;
+   active = true;
+   struct dvm_tstate saved, main_turn = { 0 };
+   dvm__tstate_save(vm, &saved);
+   main_turn.cur_thread = vm->main_thread;
+   dvm__tstate_load(vm, &main_turn);
+   dvm__ui_tick(vm);
+   dvm__tstate_load(vm, &saved);
+   if (arm_exec_service_host_ui) arm_exec_service_host_ui();
+   active = false;
+}
+
 void dvm_gil_wait(struct dvm *vm, unsigned ms)
 {
+   ui_before_platform_wait(vm);
    /* Snapshot while still owning GIL.  A producer cannot change a VM
     * condition until this thread releases GIL, so any later condition change
     * also advances the sequence. */
@@ -4123,9 +4155,22 @@ void dvm_gil_wait(struct dvm *vm, unsigned ms)
 void dvm_gil_wait_for(struct dvm *vm, uintptr_t channel, unsigned ms)
 {
    if (!channel) { dvm_gil_wait(vm, ms); return; }
+   dvm_gil_wait_for_ns(vm, channel, (uint64_t)ms * 1000000ull);
+}
+
+void dvm_gil_wait_for_ns(struct dvm *vm, uintptr_t channel, uint64_t ns)
+{
+   ui_before_platform_wait(vm);
 
    struct dvm_event_waiter w;
-   pthread_cond_init(&w.cv, NULL);
+   pthread_condattr_t attr;
+   pthread_condattr_init(&attr);
+   clockid_t clock = CLOCK_REALTIME;
+#if defined(__linux__)
+   if (!pthread_condattr_setclock(&attr, CLOCK_MONOTONIC)) clock = CLOCK_MONOTONIC;
+#endif
+   pthread_cond_init(&w.cv, &attr);
+   pthread_condattr_destroy(&attr);
    w.channel = channel;
    w.ready = false;
 
@@ -4142,9 +4187,9 @@ void dvm_gil_wait_for(struct dvm *vm, uintptr_t channel, unsigned ms)
     * something that needs it to happen. */
    unsigned ael = arm_lock_unlock_all();
    struct timespec ts;
-   clock_gettime(CLOCK_REALTIME, &ts);
-   ts.tv_sec  += (time_t)(ms / 1000u);
-   ts.tv_nsec += (long)(ms % 1000u) * 1000000L;
+   clock_gettime(clock, &ts);
+   ts.tv_sec  += (time_t)(ns / 1000000000ull);
+   ts.tv_nsec += (long)(ns % 1000000000ull);
    if (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ++ts.tv_sec; }
 
    pthread_mutex_lock(&g_gil.m);
@@ -4544,7 +4589,7 @@ void dvm_destroy(struct dvm *vm)
 {
    if (!vm) return;
    /* A pending apply() must reach the disk before the process goes away. */
-   dvm_prefs_flush(vm);
+   dvm_prefs_finish(vm);
 
    free(vm->pending_threads);
    free(vm->pending_is_thread);

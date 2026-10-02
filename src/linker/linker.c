@@ -53,13 +53,14 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <dlfcn.h>
 #include <sys/stat.h>
 #include <assert.h>
 
 #include <pthread.h>
 
+#ifndef _WIN32
 #include <sys/mman.h>
+#endif
 
 /* special private C library header - see Android.mk */
 #include "bionic_tls.h"
@@ -184,7 +185,7 @@ enum {
 //static struct r_debug _r_debug = {1, NULL, &rtld_db_dlactivity,
 //                                  RT_CONSISTENT, 0};
 /* apkenv */
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(_WIN32)
 static struct r_debug _r_debug = {1, NULL, 0, RT_CONSISTENT, 0};
 #define rtld_db_dlactivity() ((void)0)
 #else
@@ -651,14 +652,12 @@ int apkenv_add_sopath(const char *path)
 
 static int apkenv__open_lib(const char *name)
 {
-    int fd;
-    struct stat filestat;
-
-    if ((stat(name, &filestat) >= 0) && S_ISREG(filestat.st_mode)) {
-        if ((fd = open(name, O_RDONLY)) >= 0)
-            return fd;
-    }
-
+    int fd = luna_file_open(name, O_RDONLY, 0);
+    if (fd < 0) return -1;
+    luna_file_info file;
+    if (!luna_file_fd_info(fd, &file) && (file.mode & 0170000) == 0100000)
+        return fd;
+    luna_fd_close(fd);
     return -1;
 }
 
@@ -709,7 +708,7 @@ static int apkenv_open_library(const char *name, char *fullpath)
 }
 
 typedef struct {
-    long mmap_addr;
+    uint32_t mmap_addr;
     char tag[4]; /* 'P', 'R', 'E', ' ' */
 } prelink_info_t;
 
@@ -718,16 +717,16 @@ typedef struct {
 static unsigned long
 apkenv_is_prelinked(int fd, const char *name)
 {
-    off_t sz;
+    luna_file_info file;
     prelink_info_t info;
 
-    sz = lseek(fd, -sizeof(prelink_info_t), SEEK_END);
-    if (sz < 0) {
-        DL_ERR("lseek() failed!");
+    if (luna_file_fd_info(fd, &file) || file.size < (int64_t)sizeof info) {
+        DL_ERR("Could not locate prelink trailer for `%s`\n", name);
         return 0;
     }
 
-    if (read(fd, &info, sizeof(info)) != sizeof(info)) {
+    if (luna_file_pread(fd, &info, sizeof info,
+                        file.size - (int64_t)sizeof info) != sizeof info) {
         WARN("Could not read prelink_info_t structure for `%s`\n", name);
         return 0;
     }
@@ -866,9 +865,11 @@ apkenv_get_lib_extents(int fd, const char *name, void *__hdr, size_t *total_sz)
 
 static int apkenv_reserve_mem_region(soinfo *si)
 {
-    void *base = mmap((void *)si->base, si->size, PROT_NONE,
-                      MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (base == MAP_FAILED) {
+    void *base = luna_os_reserve((void *)si->base, si->size, 1);
+    if (base && luna_os_protect(base, si->size, LUNA_PROT_NONE)) {
+        luna_os_release(base, si->size); base = NULL;
+    }
+    if (!base) {
         DL_ERR("%5d can NOT map (%sprelinked) library '%s' at 0x%08lx "
               "as requested, will try general pool: %d (%s)",
               apkenv_pid, (si->base ? "" : "non-"), si->name, (unsigned long)si->base,
@@ -878,7 +879,7 @@ static int apkenv_reserve_mem_region(soinfo *si)
         DL_ERR("OOPS: %5d %sprelinked library '%s' mapped at 0x%08lx, "
               "not at 0x%08lx", apkenv_pid, (si->base ? "" : "non-"),
               si->name, (unsigned long)base, (unsigned long)si->base);
-        munmap(base, si->size);
+        luna_os_release(base, si->size);
         return -1;
     }
     return 0;
@@ -898,13 +899,34 @@ static int apkenv_alloc_mem_region(soinfo *si)
     /* On a 64-bit host loading 32-bit ELF, force allocation below 2 GB so
      * that 32-bit absolute relocations (e.g. i386 int 0x80 syscalls using
      * direct data-section addresses) remain valid after relocation. */
+#ifndef _WIN32
 #if !defined(ANDROID_64BIT_LINKER) && defined(MAP_32BIT)
     int map_flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT;
 #else
     int map_flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #endif
-    void *base = mmap(NULL, si->size, PROT_NONE, map_flags, -1, 0);
-    if (base == MAP_FAILED) {
+#endif
+#ifdef _WIN32
+    void *base = NULL;
+# if !defined(ANDROID_64BIT_LINKER)
+    /* Keep the complete image below 2 GiB; guest addresses are 32-bit.
+     * Exact allocations fail on occupied regions and never replace them. */
+    for (uintptr_t at = 0x10000000; at < 0x80000000 && si->size <= 0x80000000 - at;
+         at += 0x10000) {
+        base = luna_os_reserve((void *)at, si->size, 1);
+        if (base) break;
+    }
+# else
+    base = luna_os_reserve(NULL, si->size, 0);
+# endif
+    if (base && luna_os_protect(base, si->size, LUNA_PROT_NONE)) {
+        luna_os_release(base, si->size); base = NULL;
+    }
+#else
+    void *base = mmap(NULL, si->size, LUNA_PROT_NONE, map_flags, -1, 0);
+    if (base == MAP_FAILED) base = NULL;
+#endif
+    if (!base) {
         DL_ERR("%5d mmap of library '%s' failed: %d (%s)\n",
               apkenv_pid, si->name,
               errno, strerror(errno));
@@ -922,9 +944,9 @@ err:
 }
 
 #define MAYBE_MAP_FLAG(x,from,to)    (((x) & (from)) ? (to) : 0)
-#define PFLAGS_TO_PROT(x)            (MAYBE_MAP_FLAG((x), PF_X, PROT_EXEC) | \
-                                      MAYBE_MAP_FLAG((x), PF_R, PROT_READ) | \
-                                      MAYBE_MAP_FLAG((x), PF_W, PROT_WRITE))
+#define PFLAGS_TO_PROT(x)            (MAYBE_MAP_FLAG((x), PF_X, LUNA_PROT_EXEC) | \
+                                      MAYBE_MAP_FLAG((x), PF_R, LUNA_PROT_READ) | \
+                                      MAYBE_MAP_FLAG((x), PF_W, LUNA_PROT_WRITE))
 /* apkenv_load_segments
  *
  *     This function loads all the loadable (PT_LOAD) segments into memory
@@ -940,7 +962,7 @@ err:
  *     0 on success, -1 on failure.
  */
 static int
-apkenv_load_segments(int fd, void *header, soinfo *si)
+apkenv_load_segments(int fd, void *header, size_t image_size, soinfo *si)
 {
     AElf(Ehdr) *ehdr = (AElf(Ehdr) *)header;
     AElf(Phdr) *phdr = (AElf(Phdr) *)((unsigned char *)header + ehdr->e_phoff);
@@ -963,6 +985,13 @@ apkenv_load_segments(int fd, void *header, soinfo *si)
     for (cnt = 0; cnt < ehdr->e_phnum; ++cnt, ++phdr) {
         if (phdr->p_type == PT_LOAD) {
             DEBUG_DUMP_PHDR(phdr, "PT_LOAD", apkenv_pid);
+            if (phdr->p_filesz > phdr->p_memsz || phdr->p_offset > image_size ||
+                phdr->p_filesz > image_size - phdr->p_offset ||
+                phdr->p_vaddr > si->size || phdr->p_memsz > si->size - phdr->p_vaddr ||
+                (phdr->p_vaddr & PAGE_MASK) != (phdr->p_offset & PAGE_MASK)) {
+                DL_ERR("Invalid load segment in `%s`", si->name);
+                goto fail;
+            }
             /* we want to map in the segment on a page boundary */
             tmp = base + (phdr->p_vaddr & (~PAGE_MASK));
             /* add the # of bytes we masked off above to the total length. */
@@ -972,6 +1001,25 @@ apkenv_load_segments(int fd, void *header, soinfo *si)
                   "(0x%zx). p_vaddr=0x%lx p_offset=0x%lx ]\n", apkenv_pid, si->name,
                   (unsigned long)tmp, len, (unsigned long)phdr->p_vaddr,
                   (unsigned long)phdr->p_offset);
+#ifdef _WIN32
+            /* Load private ELF pages into the image's owned reservation.
+             * Windows file views cannot replace 4 KiB subranges of it. */
+            size_t prefix = phdr->p_vaddr & PAGE_MASK;
+            size_t span = (prefix + phdr->p_memsz + PAGE_SIZE - 1) & ~(size_t)PAGE_MASK;
+            size_t image_offset = phdr->p_offset & ~(size_t)PAGE_MASK;
+            size_t file_span = (len + PAGE_SIZE - 1) & ~(size_t)PAGE_MASK;
+            if (span > si->size - (phdr->p_vaddr & ~(uintptr_t)PAGE_MASK) ||
+                (span && luna_os_protect((void *)tmp, span,
+                    LUNA_PROT_READ | LUNA_PROT_WRITE | (phdr->p_flags & PF_X ? LUNA_PROT_EXEC : 0)))) {
+                DL_ERR("Could not commit load segment in `%s`", si->name);
+                goto fail;
+            }
+            pbase = (unsigned char *)tmp;
+            size_t copy = image_size - image_offset;
+            if (copy > file_span) copy = file_span;
+            if (copy) memcpy(pbase, (unsigned char *)header + image_offset, copy);
+            if (span > copy) memset(pbase + copy, 0, span - copy);
+#else
             pbase = mmap((void *)tmp, len, PFLAGS_TO_PROT(phdr->p_flags),
                          MAP_PRIVATE | MAP_FIXED, fd,
                          phdr->p_offset & (~PAGE_MASK));
@@ -982,6 +1030,8 @@ apkenv_load_segments(int fd, void *header, soinfo *si)
                       (unsigned long)phdr->p_offset);
                 goto fail;
             }
+
+#endif
 
             /* If 'len' didn't end on page boundary, and it's a writable
              * segment, zero-fill the rest. */
@@ -994,6 +1044,10 @@ apkenv_load_segments(int fd, void *header, soinfo *si)
                 extra_len = base + phdr->p_vaddr + phdr->p_memsz - tmp;
                 TRACE("[ %5d - Need to extend segment from '%s' @ 0x%08lx "
                       "(0x%zx) ]\n", apkenv_pid, si->name, (unsigned long)tmp, extra_len);
+#ifdef _WIN32
+                extra_base = (unsigned char *)tmp;
+                memset(extra_base, 0, extra_len);
+#else
                 extra_base = mmap((void *)tmp, extra_len,
                                   PFLAGS_TO_PROT(phdr->p_flags),
                                   MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS,
@@ -1004,6 +1058,7 @@ apkenv_load_segments(int fd, void *header, soinfo *si)
                           extra_len);
                     goto fail;
                 }
+#endif
                 TRACE("[ %5d - Segment from '%s' extended @ 0x%08lx "
                       "(0x%zx)\n", apkenv_pid, si->name, (unsigned long)(uintptr_t)extra_base,
                       extra_len);
@@ -1020,8 +1075,8 @@ apkenv_load_segments(int fd, void *header, soinfo *si)
                     si->wrprotect_start = (uintptr_t)pbase;
                 if (((uintptr_t)pbase + len) > si->wrprotect_end)
                     si->wrprotect_end = (uintptr_t)pbase + len;
-                mprotect(pbase, len,
-                         PFLAGS_TO_PROT(phdr->p_flags) | PROT_WRITE);
+                luna_os_protect(pbase, len,
+                         PFLAGS_TO_PROT(phdr->p_flags) | LUNA_PROT_WRITE);
             }
         } else if (phdr->p_type == PT_DYNAMIC) {
             DEBUG_DUMP_PHDR(phdr, "PT_DYNAMIC", apkenv_pid);
@@ -1066,7 +1121,7 @@ apkenv_load_segments(int fd, void *header, soinfo *si)
     return 0;
 
 fail:
-    munmap((void *)si->base, si->size);
+    luna_os_release((void *)si->base, si->size);
     si->flags |= FLAG_ERROR;
     return -1;
 }
@@ -1086,7 +1141,7 @@ get_wr_offset(int fd, const char *name, Elf32_Ehdr *ehdr)
     int cnt;
     unsigned wr_offset = 0xffffffff;
 
-    shdr_start = mmap(0, shdr_sz, PROT_READ, MAP_PRIVATE, fd,
+    shdr_start = mmap(0, shdr_sz, LUNA_PROT_READ, MAP_PRIVATE, fd,
                       ehdr->e_shoff & (~PAGE_MASK));
     if (shdr_start == MAP_FAILED) {
         WARN("%5d - Could not read section header info from '%s'. Will not "
@@ -1101,17 +1156,42 @@ get_wr_offset(int fd, const char *name, Elf32_Ehdr *ehdr)
         }
     }
 
-    munmap(shdr_start, shdr_sz);
+    luna_os_release(shdr_start, shdr_sz);
     return wr_offset;
 }
 #endif
+
+/* Read a complete image without changing the descriptor position. Windows
+ * uses binary CRT descriptors and 64-bit OS metadata/offsets for this path. */
+static uint8_t *apkenv_read_library_image(int fd, size_t *length)
+{
+    luna_file_info file;
+    if (luna_file_fd_info(fd, &file)) return NULL;
+    if (file.size < (int64_t)sizeof(AElf(Ehdr))) { errno = ENOEXEC; return NULL; }
+    if ((uint64_t)file.size > SIZE_MAX) { errno = EOVERFLOW; return NULL; }
+    size_t size = (size_t)file.size;
+    uint8_t *bytes = malloc(size);
+    if (!bytes) return NULL;
+    size_t copied = 0;
+    while (copied < size) {
+        ptrdiff_t count = luna_file_pread(fd, bytes + copied, size - copied, (int64_t)copied);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) {
+            int error = count < 0 ? errno : EIO;
+            free(bytes); errno = error; return NULL;
+        }
+        copied += (size_t)count;
+    }
+    *length = size;
+    return bytes;
+}
 
 static soinfo *
 apkenv_load_library(const char *name, const bool try_glibc)
 {
     char fullpath[512];
     int fd = apkenv_open_library(name, fullpath);
-    int cnt;
+    uint8_t *bytes = NULL;
     size_t ext_sz;
     uintptr_t req_base;
     const char *bname;
@@ -1121,37 +1201,26 @@ apkenv_load_library(const char *name, const bool try_glibc)
         char path[4096];
         snprintf(path, sizeof(path), RUNTIMEPATH "/%s", name);
         if (try_glibc &&
-                (dlopen(name, RTLD_NOW | RTLD_GLOBAL) ||
-                 dlopen(path, RTLD_NOW | RTLD_GLOBAL))) {
-            DEBUG("Loaded %s with glibc dlopen\n", name);
+                (luna_os_library_open(name) ||
+                 luna_os_library_open(path))) {
+            DEBUG("Loaded %s as a host library\n", name);
             return NULL;
         }
         DL_ERR("Bionic library '%s' not found", name);
         return NULL;
     }
 
-    off_t end;
-    if ((end = lseek(fd, 0, SEEK_END)) < 0) {
-        DL_ERR("lseek() failed!");
+    size_t image_size;
+    bytes = apkenv_read_library_image(fd, &image_size);
+    if (!bytes) {
+        DL_ERR("Could not read ELF image `%s`: %s", name, strerror(errno));
         goto fail;
     }
-
-    uint8_t *bytes;
-    if (!(bytes = calloc(1, end))) {
-        DL_ERR("calloc() failed!");
-        goto fail;
-    }
-
-    /* We have to read the ELF header to figure out what to do with this image
-     */
-    if (lseek(fd, 0, SEEK_SET) < 0) {
-        DL_ERR("lseek() failed!");
-        goto fail;
-    }
-
-
-    if ((cnt = read(fd, bytes, end)) < 0) {
-        DL_ERR("read() failed!");
+    AElf(Ehdr) *image_header = (AElf(Ehdr) *)bytes;
+    if (image_header->e_phentsize != sizeof(AElf(Phdr)) ||
+        image_header->e_phoff > image_size ||
+        image_header->e_phnum > (image_size - image_header->e_phoff) / sizeof(AElf(Phdr))) {
+        DL_ERR("Invalid program header table in `%s`", name);
         goto fail;
     }
 
@@ -1191,7 +1260,7 @@ apkenv_load_library(const char *name, const bool try_glibc)
           apkenv_pid, name, (void *)si->base, ext_sz);
 
     /* Now actually load the library's segments into right places in memory */
-    if (apkenv_load_segments(fd, bytes, si) < 0) {
+    if (apkenv_load_segments(fd, bytes, image_size, si) < 0) {
         goto fail;
     }
 
@@ -1204,12 +1273,14 @@ apkenv_load_library(const char *name, const bool try_glibc)
     }
     /**/
 
-    close(fd);
+    free(bytes);
+    luna_fd_close(fd);
     return si;
 
 fail:
+    free(bytes);
     if (si) apkenv_free_info(si);
-    close(fd);
+    luna_fd_close(fd);
     return NULL;
 }
 
@@ -1226,7 +1297,7 @@ apkenv_init_library(soinfo *si)
             /* We failed to link.  However, we can only restore libbase
             ** if no additional libraries have moved it since we updated it.
             */
-        munmap((void *)si->base, si->size);
+        luna_os_release((void *)si->base, si->size);
         return NULL;
     }
 
@@ -1293,7 +1364,7 @@ unsigned apkenv_unload_library(soinfo *si)
         if ((si->gnu_relro_start != 0) && (si->gnu_relro_len != 0)) {
             uintptr_t start = (si->gnu_relro_start & ~(uintptr_t)PAGE_MASK);
             size_t len = (si->gnu_relro_start - start) + si->gnu_relro_len;
-            if (mprotect((void *)start, len, PROT_READ | PROT_WRITE) < 0)
+            if (luna_os_protect((void *)start, len, LUNA_PROT_READ | LUNA_PROT_WRITE) < 0)
                 DL_ERR("%5d %s: could not undo GNU_RELRO protections. "
                        "Expect a crash soon. errno=%d (%s)",
                        apkenv_pid, si->name, errno, strerror(errno));
@@ -1320,7 +1391,7 @@ unsigned apkenv_unload_library(soinfo *si)
             }
         }
 
-        munmap((char *)si->base, si->size);
+        luna_os_release((char *)si->base, si->size);
         apkenv_notify_gdb_of_unload(si);
         apkenv_free_info(si);
         si->refcount = 0;
@@ -1360,11 +1431,11 @@ static int apkenv_reloc_library(soinfo *si, AElf(Rela) *rela, unsigned count)
             memcpy(wrap_sym_name + 7, sym_name, MIN(sizeof(wrap_sym_name) - 7, strlen(sym_name)));
             sym_addr = 0;
 
-            if ((sym_addr = (uintptr_t)dlsym(RTLD_DEFAULT, wrap_sym_name))) {
+            if ((sym_addr = (uintptr_t)luna_os_library_symbol(NULL, wrap_sym_name))) {
                LINKER_DEBUG_PRINTF("%s hooked symbol %s to %lx\n", si->name, wrap_sym_name, (unsigned long)sym_addr);
             } else if ((s = apkenv__do_lookup(si, sym_name, &base))) {
                 // normal symbol
-            } else if ((sym_addr = (uintptr_t)dlsym(RTLD_DEFAULT, sym_name))) {
+            } else if ((sym_addr = (uintptr_t)luna_os_library_symbol(NULL, sym_name))) {
                if (strstr(sym_name, "pthread_"))
                   fprintf(stderr, "symbol may need to be wrapped: %s\n", sym_name);
                LINKER_DEBUG_PRINTF("%s hooked symbol %s to %lx\n", si->name, sym_name, (unsigned long)sym_addr);
@@ -1547,11 +1618,11 @@ static int apkenv_reloc_library(soinfo *si, AElf(Rel) *rel, unsigned count)
             memcpy(wrap_sym_name + 7, sym_name, MIN(sizeof(wrap_sym_name) - 7, strlen(sym_name)));
             sym_addr = 0;
 
-            if ((sym_addr = (uintptr_t)dlsym(RTLD_DEFAULT, wrap_sym_name))) {
+            if ((sym_addr = (uintptr_t)luna_os_library_symbol(NULL, wrap_sym_name))) {
                LINKER_DEBUG_PRINTF("%s hooked symbol %s to %lx\n", si->name, wrap_sym_name, (unsigned long)sym_addr);
             } else if ((s = apkenv__do_lookup(si, sym_name, &base))) {
                 // normal symbol
-            } else if ((sym_addr = (uintptr_t)dlsym(RTLD_DEFAULT, sym_name))) {
+            } else if ((sym_addr = (uintptr_t)luna_os_library_symbol(NULL, sym_name))) {
                if (strstr(sym_name, "pthread_"))
                   fprintf(stderr, "symbol may need to be wrapped: %s\n", sym_name);
                LINKER_DEBUG_PRINTF("%s hooked symbol %s to %lx\n", si->name, sym_name, (unsigned long)sym_addr);
@@ -1830,7 +1901,12 @@ static int apkenv_nullify_closed_stdio (void)
     int dev_null, i, status;
     int return_value = 0;
 
-    dev_null = open("/dev/null", O_RDWR);
+#ifdef _WIN32
+    const char *null_path = "NUL";
+#else
+    const char *null_path = "/dev/null";
+#endif
+    dev_null = luna_file_open(null_path, O_RDWR, 0);
     if (dev_null < 0) {
         DL_ERR("Cannot open /dev/null.");
         return -1;
@@ -1845,10 +1921,9 @@ static int apkenv_nullify_closed_stdio (void)
             continue;
 
         TRACE("[ %5d Nullifying stdio file descriptor %d]\n", apkenv_pid, i);
-        /* The man page of fcntl does not say that fcntl(..,F_GETFL)
-           can be interrupted but we do this just to be safe. */
+        /* Probe descriptor validity, preserving the historical EINTR retry. */
         do {
-          status = fcntl(i, F_GETFL);
+          status = luna_fd_get_cloexec(i);
         } while (status < 0 && errno == EINTR);
 
         /* If file is openned, we are good. */
@@ -1867,7 +1942,7 @@ static int apkenv_nullify_closed_stdio (void)
            repeat if there is a signal.  Note that any errors in closing
            the stdio descriptor are lost.  */
         do {
-            status = dup2(dev_null, i);
+            status = luna_fd_dup_to(dev_null, i, 0);
         } while (status < 0 && errno == EINTR);
 
         if (status < 0) {
@@ -1881,7 +1956,7 @@ static int apkenv_nullify_closed_stdio (void)
     if (dev_null > 2) {
         TRACE("[ %5d Closing /dev/null file-descriptor=%d]\n", apkenv_pid, dev_null);
         do {
-            status = close(dev_null);
+            status = luna_fd_close(dev_null);
         } while (status < 0 && errno == EINTR);
 
         if (status < 0) {
@@ -2045,9 +2120,9 @@ static int apkenv_link_image(soinfo *si, unsigned wr_offset)
                      * However, we will remember what range of addresses
                      * should be write protected.
                      */
-                    mprotect((void *) (si->base + phdr->p_vaddr),
+                    luna_os_protect((void *) (si->base + phdr->p_vaddr),
                              phdr->p_memsz,
-                             PFLAGS_TO_PROT(phdr->p_flags) | PROT_WRITE);
+                             PFLAGS_TO_PROT(phdr->p_flags) | LUNA_PROT_WRITE);
                 }
             } else if (phdr->p_type == PT_DYNAMIC) {
                 if (si->dynamic != (AElf(Dyn) *)-1) {
@@ -2282,7 +2357,7 @@ static int apkenv_link_image(soinfo *si, unsigned wr_offset)
      * that made this possible.
      */
     if(wr_offset < 0xffffffff){
-        mprotect((void*) si->base, wr_offset, PROT_READ | PROT_EXEC);
+        luna_os_protect((void*) si->base, wr_offset, LUNA_PROT_READ | LUNA_PROT_EXEC);
     }
 #else
     /* TODO: Verify that this does the right thing in all cases, as it
@@ -2292,16 +2367,16 @@ static int apkenv_link_image(soinfo *si, unsigned wr_offset)
      * To prevent re-scanning the program header, we would have to build a
      * list of loadable segments in si, and then scan that instead. */
     if (si->wrprotect_start != UINTPTR_MAX && si->wrprotect_end != 0) {
-        mprotect((void *)si->wrprotect_start,
+        luna_os_protect((void *)si->wrprotect_start,
                  si->wrprotect_end - si->wrprotect_start,
-                 PROT_READ | PROT_EXEC);
+                 LUNA_PROT_READ | LUNA_PROT_EXEC);
     }
 #endif
 
     if (si->gnu_relro_start != 0 && si->gnu_relro_len != 0) {
         uintptr_t start = (si->gnu_relro_start & ~(uintptr_t)PAGE_MASK);
         size_t len = (si->gnu_relro_start - start) + si->gnu_relro_len;
-        if (mprotect((void *)start, len, PROT_READ) < 0) {
+        if (luna_os_protect((void *)start, len, LUNA_PROT_READ) < 0) {
             DL_ERR("%5d GNU_RELRO mprotect of library '%s' failed: %d (%s)\n",
                    apkenv_pid, si->name, errno, strerror(errno));
             goto fail;
@@ -2333,7 +2408,7 @@ void dl_parse_library_path(const char *path, char *delim)
 
     len = apkenv_strlcpy(apkenv_ldpaths_buf, path, sizeof(apkenv_ldpaths_buf));
 
-    while (i < LDPATH_MAX && (apkenv_ldpaths[i] = strsep(&apkenv_ldpaths_bufp, delim))) {
+    while (i < LDPATH_MAX && (apkenv_ldpaths[i] = luna_strsep(&apkenv_ldpaths_bufp, delim))) {
         if (*apkenv_ldpaths[i] != '\0')
             ++i;
     }
@@ -2356,7 +2431,7 @@ static void apkenv_parse_apkenv_preloads(const char *path, char *delim)
 
     len = apkenv_strlcpy(apkenv_ldpreloads_buf, path, sizeof(apkenv_ldpreloads_buf));
 
-    while (i < LDPRELOAD_MAX && (apkenv_ldpreload_names[i] = strsep(&apkenv_ldpreloads_bufp, delim))) {
+    while (i < LDPRELOAD_MAX && (apkenv_ldpreload_names[i] = luna_strsep(&apkenv_ldpreloads_bufp, delim))) {
         if (*apkenv_ldpreload_names[i] != '\0') {
             ++i;
         }
@@ -2423,7 +2498,13 @@ static uintptr_t apkenv___linker_init_post_relocation(uintptr_t **elfdata)
     }
 
     /* Kernel did not provide AT_SECURE - fall back on legacy test. */
+#ifdef _WIN32
+    /* Native Windows processes have no POSIX setuid/setgid launch mode.
+     * An explicit guest AT_SECURE above still takes precedence. */
+    apkenv_program_is_setuid = 0;
+#else
     apkenv_program_is_setuid = (getuid() != geteuid()) || (getgid() != getegid());
+#endif
 
 sanitize:
     /* Sanitize environment if we're loading a setuid program */

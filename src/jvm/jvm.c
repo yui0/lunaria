@@ -15,7 +15,7 @@
 #include <assert.h>
 #include <pthread.h>
 #include <stdatomic.h>
-#include "dlfcn.h"
+#include "lunaria_os.h"
 #include "jvm.h"
 #include "trace.h"
 #include "dvm/dvm_jni.h"
@@ -37,6 +37,31 @@ static pthread_mutex_t g_jni_monitor_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_jni_monitor_cond  = PTHREAD_COND_INITIALIZER;
 static _Atomic uint64_t g_next_jni_monitor_token = 1;
 static _Thread_local uint64_t g_jni_monitor_token;
+
+/* Pending exceptions belong to the attached thread, even though VM object
+ * handles and metadata are shared. */
+struct jvm_exception_state {
+   struct jvm *owner;
+   uint64_t token;
+   jthrowable pending_exception;
+   char pending_exception_class[128];
+   char pending_exception_msg[256];
+};
+static _Thread_local struct jvm_exception_state g_jni_exception;
+static struct jvm_exception_state g_guest_jni_exceptions[256];
+extern uint64_t arm_exec_jni_thread_token(void) __attribute__((weak));
+static struct jvm_exception_state *jvm_exception_state(struct jvm *vm)
+{
+   const uint64_t token = arm_exec_jni_thread_token ? arm_exec_jni_thread_token() : 0;
+   struct jvm_exception_state *state = token
+       ? &g_guest_jni_exceptions[(token - 1u) & 255u] : &g_jni_exception;
+   if (state->owner != vm || state->token != token) {
+      memset(state, 0, sizeof *state);
+      state->owner = vm;
+      state->token = token;
+   }
+   return state;
+}
 
 /* Classes, method/field IDs and the wrapper cache are process-wide VM
  * metadata.  Android permits JNI lookups concurrently from attached threads;
@@ -68,10 +93,14 @@ static void jvm_meta_unlock(void)
 
 static uint64_t jni_monitor_token(void)
 {
+   if (arm_exec_jni_thread_token) {
+      uint64_t guest = arm_exec_jni_thread_token();
+      if (guest) return guest;
+   }
    if (!g_jni_monitor_token)
       g_jni_monitor_token = atomic_fetch_add_explicit(
          &g_next_jni_monitor_token, 1, memory_order_relaxed);
-   return g_jni_monitor_token;
+   return g_jni_monitor_token | (UINT64_C(1) << 63);
 }
 
 static inline char*
@@ -229,6 +258,81 @@ compare_motion(const struct jvm_object *a, const struct jvm_object *b)
    return true;
 }
 
+/* Classes, methods, strings and opaque singletons are looked up by a key that
+ * never changes after the slot is filled, so they are indexed by hash.  Arrays
+ * (compared by their current, mutable contents) and motion events are not, and
+ * keep the linear scan. */
+static bool
+jvm_object_interned(const struct jvm_object *o)
+{
+   return o->type == JVM_OBJECT_OPAQUE || o->type == JVM_OBJECT_METHOD ||
+          o->type == JVM_OBJECT_CLASS || o->type == JVM_OBJECT_STRING;
+}
+
+static uint32_t
+jvm_hash_bytes(uint32_t h, const void *data, size_t n)
+{
+   const unsigned char *p = data;
+   for (size_t i = 0; i < n; ++i)
+      h = (h ^ p[i]) * 16777619u;
+   return (h ^ (uint32_t)n) * 16777619u;
+}
+
+static uint32_t
+jvm_hash_word(uint32_t h, uintptr_t v)
+{
+   return jvm_hash_bytes(h, &v, sizeof v);
+}
+
+static uint32_t
+jvm_object_hash(const struct jvm_object *o)
+{
+   uint32_t h = 2166136261u ^ (uint32_t)o->type;
+   switch (o->type) {
+      case JVM_OBJECT_OPAQUE:
+         return jvm_hash_word(h, (uintptr_t)o->this_klass);
+      case JVM_OBJECT_CLASS:
+         return jvm_hash_bytes(h, o->klass.name.data, o->klass.name.size);
+      case JVM_OBJECT_STRING:
+         return jvm_hash_bytes(h, o->string.data, o->string.size);
+      case JVM_OBJECT_METHOD:
+         h = jvm_hash_word(h, (uintptr_t)o->method.klass);
+         h = jvm_hash_bytes(h, o->method.name.data, o->method.name.size);
+         return jvm_hash_bytes(h, o->method.signature.data, o->method.signature.size);
+      default:
+         return h;
+   }
+}
+
+#define JVM_INTERN_MASK ((uint32_t)(ARRAY_SIZE(((struct jvm *)0)->intern_head) - 1))
+
+static void
+jvm_index_add(struct jvm *jvm, uintptr_t i)
+{
+   if (!jvm_object_interned(&jvm->objects[i]))
+      return;
+   const uint32_t h = jvm_object_hash(&jvm->objects[i]);
+   jvm->intern_hash[i] = h;
+   jvm->intern_next[i] = jvm->intern_head[h & JVM_INTERN_MASK];
+   jvm->intern_head[h & JVM_INTERN_MASK] = (uint32_t)(i + 1);
+}
+
+static void
+jvm_index_remove(struct jvm *jvm, uintptr_t i)
+{
+   if (!jvm_object_interned(&jvm->objects[i]))
+      return;
+   uint32_t *link = &jvm->intern_head[jvm->intern_hash[i] & JVM_INTERN_MASK];
+   while (*link) {
+      if (*link == (uint32_t)(i + 1)) {
+         *link = jvm->intern_next[i];
+         jvm->intern_next[i] = 0;
+         return;
+      }
+      link = &jvm->intern_next[*link - 1];
+   }
+}
+
 static jobject
 jvm_find_object(struct jvm *jvm, const struct jvm_object *o)
 {
@@ -243,12 +347,26 @@ jvm_find_object(struct jvm *jvm, const struct jvm_object *o)
       compare_string,
       compare_motion,
    };
+   assert(o->type < JVM_OBJECT_LAST);
+
+   if (jvm_object_interned(o)) {
+      /* Duplicates can exist, and the linear scan this replaced answered with
+       * the lowest slot, so keep doing that. */
+      const uint32_t h = jvm_object_hash(o);
+      uintptr_t best = 0;
+      for (uint32_t n = jvm->intern_head[h & JVM_INTERN_MASK]; n; n = jvm->intern_next[n - 1]) {
+         if (jvm->intern_hash[n - 1] != h || (best && n >= best) ||
+             o->type != jvm->objects[n - 1].type)
+            continue;
+         if (comparator[o->type](o, &jvm->objects[n - 1]))
+            best = n;
+      }
+      return (jobject)best;
+   }
 
    for (uintptr_t i = 0; i < ARRAY_SIZE(jvm->objects); ++i) {
       if (o->type != jvm->objects[i].type)
          continue;
-
-      assert(o->type < JVM_OBJECT_LAST);
       if (comparator[o->type](o, &jvm->objects[i]))
          return (jobject)(i + 1);
    }
@@ -360,6 +478,7 @@ jvm_add_object(struct jvm *jvm, const struct jvm_object *o)
     * would otherwise be handed to a different method. */
    jvm->wrap_cached[i] = false;
    jvm->wrap_cache[i] = NULL;
+   jvm_index_add(jvm, i);
 
    if (!jvm->objects[i].this_klass)
       jvm_assign_default_class(jvm, &jvm->objects[i]);
@@ -408,6 +527,7 @@ jvm_deref_object(struct jvm *jvm, jobject object)
       return;
    }
    uintptr_t idx = (uintptr_t)object - 1;
+   jvm_index_remove(jvm, idx);
    jvm_object_release(o);
    if (idx < jvm->next_object)
       jvm->next_object = idx;
@@ -438,6 +558,7 @@ jvm_release_bridge_local(struct jvm *jvm, jobject object)
       return false;
    }
    uintptr_t idx = (uintptr_t)object - 1;
+   jvm_index_remove(jvm, idx);
    jvm_object_release(o);
    jvm->wrap_cached[idx] = false;
    jvm->wrap_cache[idx] = NULL;
@@ -719,11 +840,11 @@ JNIEnv_Throw(JNIEnv* p0, jthrowable p1)
 {
    assert(p0 && p1);
    struct jvm *jvm = jnienv_get_jvm(p0);
-   jvm->pending_exception = p1;
+   jvm_exception_state(jvm)->pending_exception = p1;
    const char *cls = jvm_get_class_name(jvm, p1);
-   snprintf(jvm->pending_exception_class, sizeof jvm->pending_exception_class,
+   snprintf(jvm_exception_state(jvm)->pending_exception_class, sizeof jvm_exception_state(jvm)->pending_exception_class,
             "%s", cls ? cls : "java/lang/Throwable");
-   jvm->pending_exception_msg[0] = '\0';
+   jvm_exception_state(jvm)->pending_exception_msg[0] = '\0';
    return 0;
 }
 
@@ -735,11 +856,11 @@ JNIEnv_ThrowNew(JNIEnv* p0, jclass p1, const char* p2)
    jobject e = p0[0]->AllocObject(p0, p1);
    /* AllocObject can only fail if the class handle is bad; the exception
     * still has to become pending, so fall back to the class object itself. */
-   jvm->pending_exception = e ? e : (jthrowable)p1;
+   jvm_exception_state(jvm)->pending_exception = e ? e : (jthrowable)p1;
    const char *cls = jvm_get_class_name(jvm, p1);
-   snprintf(jvm->pending_exception_class, sizeof jvm->pending_exception_class,
+   snprintf(jvm_exception_state(jvm)->pending_exception_class, sizeof jvm_exception_state(jvm)->pending_exception_class,
             "%s", cls ? cls : "java/lang/Throwable");
-   snprintf(jvm->pending_exception_msg, sizeof jvm->pending_exception_msg,
+   snprintf(jvm_exception_state(jvm)->pending_exception_msg, sizeof jvm_exception_state(jvm)->pending_exception_msg,
             "%s", p2 ? p2 : "");
    return 0;
 }
@@ -754,10 +875,10 @@ jvm_throw_new(struct jvm *jvm, const char *class_name, const char *msg)
       JNIEnv_ThrowNew(env, cls, msg);
       return;
    }
-   jvm->pending_exception = (jthrowable)(uintptr_t)1;
-   snprintf(jvm->pending_exception_class, sizeof jvm->pending_exception_class,
+   jvm_exception_state(jvm)->pending_exception = (jthrowable)(uintptr_t)1;
+   snprintf(jvm_exception_state(jvm)->pending_exception_class, sizeof jvm_exception_state(jvm)->pending_exception_class,
             "%s", class_name);
-   snprintf(jvm->pending_exception_msg, sizeof jvm->pending_exception_msg,
+   snprintf(jvm_exception_state(jvm)->pending_exception_msg, sizeof jvm_exception_state(jvm)->pending_exception_msg,
             "%s", msg ? msg : "");
 }
 
@@ -765,7 +886,7 @@ static jthrowable
 JNIEnv_ExceptionOccurred(JNIEnv* p0)
 {
    assert(p0);
-   return jnienv_get_jvm(p0)->pending_exception;
+   return jvm_exception_state(jnienv_get_jvm(p0))->pending_exception;
 }
 
 static void
@@ -773,10 +894,10 @@ JNIEnv_ExceptionDescribe(JNIEnv* p0)
 {
    assert(p0);
    struct jvm *jvm = jnienv_get_jvm(p0);
-   if (!jvm->pending_exception) return;
-   fprintf(stderr, "[jvm] exception: %s%s%s\n", jvm->pending_exception_class,
-           jvm->pending_exception_msg[0] ? ": " : "",
-           jvm->pending_exception_msg);
+   if (!jvm_exception_state(jvm)->pending_exception) return;
+   fprintf(stderr, "[jvm] exception: %s%s%s\n", jvm_exception_state(jvm)->pending_exception_class,
+           jvm_exception_state(jvm)->pending_exception_msg[0] ? ": " : "",
+           jvm_exception_state(jvm)->pending_exception_msg);
 }
 
 static void
@@ -784,9 +905,9 @@ JNIEnv_ExceptionClear(JNIEnv* p0)
 {
    assert(p0);
    struct jvm *jvm = jnienv_get_jvm(p0);
-   jvm->pending_exception = NULL;
-   jvm->pending_exception_class[0] = '\0';
-   jvm->pending_exception_msg[0] = '\0';
+   jvm_exception_state(jvm)->pending_exception = NULL;
+   jvm_exception_state(jvm)->pending_exception_class[0] = '\0';
+   jvm_exception_state(jvm)->pending_exception_msg[0] = '\0';
 }
 
 static void
@@ -1142,10 +1263,10 @@ jvm_wrap_method_uncached(struct jvm *jvm, jmethodID method_id)
    if (!strcmp(method.signature.data, "(I)F")) {
       char indexed[260];
       snprintf(indexed, sizeof indexed, "%s__I", symbol);
-      if ((sym = wrapper_create(indexed, dlsym(RTLD_DEFAULT, indexed))))
+      if ((sym = wrapper_create(indexed, luna_os_library_symbol(NULL, indexed))))
          return sym;
    }
-   if ((sym = wrapper_create(symbol, dlsym(RTLD_DEFAULT, symbol))))
+   if ((sym = wrapper_create(symbol, luna_os_library_symbol(NULL, symbol))))
       return sym;
 
    /* Walk up to the class that declares the method. */
@@ -1161,7 +1282,7 @@ jvm_wrap_method_uncached(struct jvm *jvm, jmethodID method_id)
             break;
          method.klass = jvm_make_class(jvm, super);
          jvm_form_symbol(jvm, &method, symbol, sizeof(symbol));
-         if ((sym = wrapper_create(symbol, dlsym(RTLD_DEFAULT, symbol))))
+         if ((sym = wrapper_create(symbol, luna_os_library_symbol(NULL, symbol))))
             return sym;
          name = super;
       }
@@ -1170,12 +1291,12 @@ jvm_wrap_method_uncached(struct jvm *jvm, jmethodID method_id)
    method.klass = jvm_make_class(jvm, "java/lang/Object");
    jvm_form_symbol(jvm, &method, symbol, sizeof(symbol));
 
-   if ((sym = wrapper_create(symbol, dlsym(RTLD_DEFAULT, symbol))))
+   if ((sym = wrapper_create(symbol, luna_os_library_symbol(NULL, symbol))))
       return sym;
 
    method.klass = jvm_make_class(jvm, "java/lang/Class");
    jvm_form_symbol(jvm, &method, symbol, sizeof(symbol));
-   return wrapper_create(symbol, dlsym(RTLD_DEFAULT, symbol));
+   return wrapper_create(symbol, luna_os_library_symbol(NULL, symbol));
 }
 
 /* How much work the cache is saving: resolves that actually ran, the time they
@@ -2221,7 +2342,9 @@ JNIEnv_MonitorExit(JNIEnv* p0, jobject p1)
    }
    if (!--o->monitor_depth) {
       o->monitor_owner = 0;
-      pthread_cond_signal(&g_jni_monitor_cond);
+      /* Waiters on different object monitors share this condition.  A single
+       * signal may select a waiter whose own monitor is still held. */
+      pthread_cond_broadcast(&g_jni_monitor_cond);
    }
    pthread_mutex_unlock(&g_jni_monitor_mutex);
    return JNI_OK;
@@ -2296,7 +2419,7 @@ static jboolean
 JNIEnv_ExceptionCheck(JNIEnv* p0)
 {
    assert(p0);
-   return jnienv_get_jvm(p0)->pending_exception ? JNI_TRUE : JNI_FALSE;
+   return jvm_exception_state(jnienv_get_jvm(p0))->pending_exception ? JNI_TRUE : JNI_FALSE;
 }
 
 static jobject
@@ -2604,6 +2727,7 @@ static jint
 JavaVM_DetachCurrentThread(JavaVM *vm)
 {
    assert(vm);
+   memset(jvm_exception_state(javavm_get_jvm(vm)), 0, sizeof(struct jvm_exception_state));
    return JNI_OK;
 }
 
@@ -2720,6 +2844,8 @@ jvm_release(struct jvm *jvm)
    if (!jvm)
       return;
 
+   dvm_prefs_finish(dvm_jni_vm());
+
    for (size_t i = 0; i < ARRAY_SIZE(jvm->objects); ++i)
       jvm_object_release(&jvm->objects[i]);
 
@@ -2735,6 +2861,10 @@ void
 jvm_init(struct jvm *jvm)
 {
    assert(jvm);
+   for (size_t i = 0; i < ARRAY_SIZE(g_guest_jni_exceptions); ++i)
+      if (g_guest_jni_exceptions[i].owner == jvm)
+         memset(&g_guest_jni_exceptions[i], 0, sizeof g_guest_jni_exceptions[i]);
+   if (g_jni_exception.owner == jvm) memset(&g_jni_exception, 0, sizeof g_jni_exception);
    *jvm = (struct jvm){0};
    vm_init(&jvm->vm, &jvm->invoke);
    env_init(&jvm->env, &jvm->native);

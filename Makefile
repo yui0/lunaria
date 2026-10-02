@@ -50,11 +50,20 @@ endif
 # Intermediate objects and scratch space live outside the source tree.
 BUILD_DIR ?= /tmp/lunaria-build
 LUNA_OS_OBJ = $(BUILD_DIR)/lunaria_os.o
+LUNA_FNM_OBJ = $(BUILD_DIR)/luna_fnmatch.o
 
 # The dynarmic sub-build's driver.  Only the macOS branch below used to set
 # this, so `make dynarmic-build` on a Linux host ran an empty command and
 # reported the archive as up to date without ever producing it.
 CMAKE ?= cmake
+DYNARMIC_JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+
+LIBC_SRC = src/lib/libc.c
+LIBC_CPPFLAGS =
+LIBC_HEADERS = src/lib/libc-ctype.h src/lib/libc-sysconf.h src/lib/libc-verbose.h
+HOST_LINK_ALIASES = libdl.so libpthread.so
+HOST_JVM_LIB = runtime/libjvm.so
+
 
 # Host graphics and system libraries.  The macOS build uses GLFW's Cocoa
 # backend and ANGLE's Metal backend from .deps/; no X11 or Linux libEGL is
@@ -66,10 +75,10 @@ MAC_SDK           = $(shell xcrun --show-sdk-path)
 CMAKE             = $(MAC_DEPS)/bin/cmake
 DYNARMIC_CMAKE_FLAGS = -DBOOST_ROOT=$(abspath $(MAC_DEPS)/boost) \
 	-DBoost_NO_SYSTEM_PATHS=ON -DCMAKE_CXX_FLAGS=-DFMT_CONSTEVAL=
-HOST_CPPFLAGS     = -DEGL_NO_PLATFORM_SPECIFIC_TYPES -DU_DISABLE_RENAMING=1 \
+HOST_CPPFLAGS     = -DEGL_NO_PLATFORM_SPECIFIC_TYPES \
 	-I$(MAC_DEPS)/linux-abi -I$(MAC_DEPS)/khronos/include \
 	-I$(MAC_DEPS)/vulkan/include \
-	-I$(MAC_DEPS)/glfw/include -I$(MAC_DEPS)/icu/include \
+	-I$(MAC_DEPS)/glfw/include \
 	-I$(MAC_DEPS)/moltenvk/include \
 	-I$(MAC_OPENSSL)/include
 HOST_GL_LIBS      = $(MAC_DEPS)/lib/libEGL.dylib $(MAC_DEPS)/lib/libGLESv2.dylib
@@ -78,7 +87,7 @@ HOST_WINDOW_LIBS  = $(MAC_DEPS)/lib/libglfw3.a -framework Cocoa \
 	-framework IOKit -framework CoreFoundation -framework QuartzCore \
 	-framework AudioToolbox
 HOST_CRYPTO_LIBS  = -L$(MAC_OPENSSL)/lib -lssl -lcrypto
-HOST_ICU_LIBS     = -licucore
+HOST_CHARSET_LIBS     = -liconv
 HOST_DL_LIBS      = runtime/libdl.so
 HOST_SYSTEM_DL_LIBS =
 HOST_RT_LIBS      =
@@ -88,14 +97,16 @@ HOST_SO_LDFLAGS   = -Wl,-undefined,dynamic_lookup \
 	-Wl,-install_name,@rpath/$(@F)
 HOST_EXPORT       = -Wl,-export_dynamic
 HOST_RPATH        = -Wl,-rpath,@loader_path/runtime \
+	-Wl,-rpath,@loader_path/lib -Wl,-rpath,@loader_path/../Resources/runtime \
+	-Wl,-rpath,@loader_path/../Resources/lib \
 	-Wl,-rpath,@loader_path/.deps/lib -Wl,-rpath,$(MAC_OPENSSL)/lib
 HOST_TEST_RPATH   = -Wl,-rpath,@loader_path/../.deps/lib
-LUNARIA_LIBDIRS   = -L. -Lruntime
+LUNARIA_LIBDIRS   = -L.
 
 OPENH264_SO       = runtime/libopenh264.dylib
 OPENH264_ARCH    ?= mac-arm64
 OPENH264_URL      = http://ciscobinary.openh264.org/libopenh264-$(OPENH264_VERSION)-$(OPENH264_ARCH).dylib.bz2
-PTHREAD_SRC       = src/lib/pthread_mac.c
+PTHREAD_SRC       = src/lib/runtime_svc.c
 HOST_AUDIO_LIBS   =
 HOST_BIONIC_LIBC  =
 else
@@ -104,7 +115,7 @@ HOST_GL_LIBS      = -lEGL -lGLESv2
 HOST_Z_LIBS       = -lz
 HOST_WINDOW_LIBS  = $(shell pkg-config --libs glfw3)
 HOST_CRYPTO_LIBS  = -lssl -lcrypto
-HOST_ICU_LIBS     = -licuuc
+HOST_CHARSET_LIBS     =
 HOST_DL_LIBS      = -ldl
 HOST_SYSTEM_DL_LIBS = -ldl
 HOST_RT_LIBS      = -lrt
@@ -113,14 +124,15 @@ HOST_RT_LIBS      = -lrt
 HOST_AUDIO_LIBS   = -lasound
 HOST_LIBC_LIBS    = $(shell pkg-config --libs libbsd libunwind)
 HOST_LIBC_LDFLAGS = -Wl,-wrap,_IO_file_xsputn
-HOST_SO_LDFLAGS   =
+HOST_SO_LDFLAGS   = -Wl,-soname,$(@F)
 HOST_EXPORT       = -rdynamic
-HOST_RPATH        = -Wl,-Y,runtime,-rpath,$(PREFIX)$(LIBDIR)$(RUNTIMEDIR)
+HOST_RPATH        = -Wl,--disable-new-dtags,-rpath,'$$ORIGIN/runtime:$$ORIGIN/lib' \
+	-Wl,-rpath,$(PREFIX)$(LIBDIR)$(RUNTIMEDIR)
 HOST_TEST_RPATH   =
 # Guest Android stubs live in runtime/, but -Lruntime must not appear on the
 # host executable link line: ld would resolve -lc to runtime/libc.so (the guest
-# bionic shim) instead of the system libc.  -Wl,-Y,runtime below is enough for
-# -ljvm and the libdl/libpthread symlinks in .
+# bionic shim) instead of the system libc. JVM is linked by its explicit
+# path and SONAME; libdl/libpthread retain the aliases in the source root.
 LUNARIA_LIBDIRS   = -L.
 OPENH264_SO       = runtime/libopenh264.so
 OPENH264_ARCH    ?= linux64
@@ -130,13 +142,60 @@ PTHREAD_SRC       = src/lib/pthread.c
 HOST_BIONIC_LIBC  = runtime/libc.so
 endif
 
+ifneq (,$(filter src/lunaria_windows.c,$(LUNA_OS_SRC)))
+# Guest synchronization runs in the emulator's SVC scheduler, as on macOS.
+PTHREAD_SRC = src/lib/runtime_svc.c
+LIBC_SRC = src/lib/runtime_svc.c
+LIBC_CPPFLAGS = -DLUNARIA_SVC_LIBC
+LIBC_HEADERS =
+HOST_LIBC_LIBS =
+HOST_LIBC_LDFLAGS =
+HOST_RT_LIBS =
+HOST_AUDIO_LIBS =
+HOST_BIONIC_LIBC =
+HOST_SYSTEM_DL_LIBS =
+HOST_RPATH =
+HOST_TEST_RPATH =
+HOST_EXPORT = $(BUILD_DIR)/lunaria.def
+HOST_NM = $(shell $(CC) -print-prog-name=gcc-nm)
+HOST_SO_LDFLAGS = -Wl,--export-all-symbols
+HOST_LINK_ALIASES =
+HOST_DL_LIBS = $(BUILD_DIR)/libdl.o
+HOST_JVM_LIB = $(BUILD_DIR)/libjvm.o
+LUNARIA_LIBDIRS =
+# Windows needs UCRT for per-thread locales and UTF-8 conversion.
+WINDOWS_CRT_FLAGS ?= -mcrtdll=ucrt
+CPPFLAGS += $(WINDOWS_CRT_FLAGS)
+# Unicode data is compiled in; Windows supplies timezone and code-page APIs.
+HOST_CHARSET_LIBS =
+WINDOWS_ENTRY_FLAGS = -municode
+HOST_NATIVE_LIBS = -lws2_32 -ladvapi32 -lpsapi -lwinmm -lntdll -lgdi32 -liphlpapi -lregex
+WINDOWS_CMAKE_GENERATOR ?= Ninja
+DYNARMIC_CMAKE_FLAGS += -G "$(WINDOWS_CMAKE_GENERATOR)" \
+	-DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=AMD64 \
+	-DCMAKE_C_COMPILER=$(CC) -DCMAKE_CXX_COMPILER=$(CXX) \
+	-DCMAKE_C_FLAGS="$(WINDOWS_CRT_FLAGS)" -DCMAKE_CXX_FLAGS="$(WINDOWS_CRT_FLAGS)" \
+	-DDYNARMIC_USE_LLVM=OFF
+OPENH264_SO = runtime/openh264.dll
+OPENH264_ARCH = win64
+OPENH264_URL = https://ciscobinary.openh264.org/openh264-$(OPENH264_VERSION)-$(OPENH264_ARCH).dll.bz2
+LUNARIA_BIN = lunaria.exe
+else
+LUNARIA_BIN = lunaria
+endif
+
 CPPFLAGS += $(HOST_CPPFLAGS)
 
-bins = lunaria
+bins = $(LUNARIA_BIN)
 libs = runtime/libpthread.so runtime/libdl.so runtime/libc.so runtime/libandroid.so \
        runtime/liblog.so runtime/libEGL.so runtime/libOpenSLES.so runtime/libjvm.so \
        runtime/libm.so runtime/libz.so runtime/libmediandk.so runtime/libGLESv3.so
 libs += runtime/libvulkan.so
+ifneq (,$(filter src/lunaria_windows.c,$(LUNA_OS_SRC)))
+# Guest platform libraries are answered by arm_exec's SVC/ABI layer. Link
+# host implementations into the executable; no host runtime DLLs are needed.
+libs =
+endif
 
 # The H.264 decoder is part of a working build, not an optional extra: a title
 # whose intro is an .mp4 waits on that movie, so a build without it stops at the
@@ -151,6 +210,12 @@ all: host-all
 endif
 
 host-all: $(bins) $(OPENH264_SO)
+
+# Preserve the documented target when the Windows linker writes an .exe.
+ifeq ($(LUNARIA_BIN),lunaria.exe)
+.PHONY: lunaria
+lunaria: $(LUNARIA_BIN)
+endif
 
 macos-deps:
 	scripts/fetch-macos-deps.sh
@@ -230,8 +295,8 @@ $(SYSLIB_LIBC):
 # NDK libz.so files are API stubs (their functions are eight-byte trap
 # veneers), not executable device implementations.  The adjacent libz.a is
 # the real Android C implementation.  Link all of it into one guest DSO so a
-# z_stream remains entirely in Android memory and inflate/crc32 do not cross
-# the emulator ABI on every input block.
+# guest-only consumers can use a complete implementation. Default platform
+# zlib imports use the faster host SVC handlers as one consistent family.
 $(SYSLIB_LIBZ):
 	@mkdir -p $(SYSLIB_DIR)
 	@set -e; \
@@ -245,12 +310,13 @@ $(SYSLIB_LIBZ):
 	    [ -n "$$archive" ] || continue; \
 	    toolroot=$${archive%%/sysroot/usr/lib/aarch64-linux-android/libz.a}; \
 	    compiler="$$toolroot/bin/aarch64-linux-android21-clang"; \
+	    [ -x "$$compiler" ] || compiler="$$toolroot/bin/clang.exe"; \
 	    [ -x "$$compiler" ] && break; \
 	    archive=""; compiler=""; \
 	done; \
 	[ -n "$$archive" ] || { echo "syslib: no Android NDK arm64 libz.a found" >&2; exit 1; }; \
 	echo "syslib: linking Android $$archive"; \
-	"$$compiler" -shared -Wl,-soname,libz.so -Wl,--whole-archive \
+	"$$compiler" --target=aarch64-linux-android21 -shared -Wl,-soname,libz.so -Wl,--whole-archive \
 	    "$$archive" -Wl,--no-whole-archive -o $@; \
 	head -c 20 $@ | od -An -tu1 -j18 -N1 | grep -q 183 || \
 	    { echo "syslib: $@ is not AArch64" >&2; rm -f $@; exit 1; }
@@ -270,10 +336,11 @@ $(SYSLIB_GUEST): src/lib/guest.c
 	            /root/image/android/ndk; do \
 	    [ -n "$$root" ] || continue; \
 	    cand=`find "$$root" -name aarch64-linux-android21-clang 2>/dev/null | head -1`; \
+	    [ -n "$$cand" ] || cand=`find "$$root" -path '*/prebuilt/*/bin/clang.exe' 2>/dev/null | head -1`; \
 	    [ -n "$$cand" ] && [ -x "$$cand" ] && { compiler="$$cand"; break; }; \
 	done; \
 	[ -n "$$compiler" ] || { echo "guestlib: no Android NDK aarch64 clang found" >&2; exit 1; }; \
-	"$$compiler" -std=c11 -O2 -fPIC -shared -fno-builtin-malloc -fno-builtin-free -fno-builtin-calloc -fno-builtin-realloc \
+	"$$compiler" --target=aarch64-linux-android21 -std=c11 -O2 -fPIC -shared -fno-builtin-malloc -fno-builtin-free -fno-builtin-calloc -fno-builtin-realloc \
 	    -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
 	    -fno-stack-protector -mno-outline-atomics -Wall -Wextra -Isrc \
 	    -nostdlib -Wl,-soname,liblunaria_guest.so -Wl,--no-undefined \
@@ -327,11 +394,11 @@ runtime/libdl.so: src/trace.h src/linker/dlfcn.c src/linker/linker.c src/linker/
 	    src/linker/dlfcn.c src/linker/linker.c src/linker/linker_environ.c src/linker/rt.c src/linker/strlcpy.c \
 	    $(HOST_SYSTEM_DL_LIBS) -lpthread -o $@
 
-runtime/libc.so: src/trace.h src/lib/libc.c src/lib/libc-ctype.h src/lib/libc-sysconf.h src/lib/libc-verbose.h
+runtime/libc.so: src/trace.h $(LIBC_SRC) $(LIBC_HEADERS)
 	mkdir -p runtime
 	$(CC) $(CFLAGS) -fPIC -Wno-deprecated-declarations $(CPPFLAGS) -D_GNU_SOURCE \
 	    $(HOST_LIBC_LDFLAGS) $(LDFLAGS) $(HOST_SO_LDFLAGS) -shared \
-	    src/lib/libc.c \
+	    $(LIBC_CPPFLAGS) $(LIBC_SRC) \
 	    $(HOST_LIBC_LIBS) -o $@
 
 # Small Android API stubs: one driver (src/lib/stub.c), one -DLUNARIA_STUB_* per .so
@@ -339,7 +406,7 @@ STUB_SO = $(CC) $(CFLAGS) -fPIC $(CPPFLAGS) $(LDFLAGS) $(HOST_SO_LDFLAGS) -Isrc/
 
 runtime/libandroid.so:
 	mkdir -p runtime
-	$(STUB_SO) -DLUNARIA_STUB_ANDROID -o $@ $(HOST_WINDOW_LIBS)
+	$(STUB_SO) -DLUNARIA_STUB_ANDROID -o $@ $(HOST_WINDOW_LIBS) $(HOST_NATIVE_LIBS)
 
 runtime/liblog.so:
 	mkdir -p runtime
@@ -347,19 +414,19 @@ runtime/liblog.so:
 
 runtime/libEGL.so:
 	mkdir -p runtime
-	$(STUB_SO) -DLUNARIA_STUB_EGL -D_GNU_SOURCE -o $@ $(HOST_GL_LIBS) $(HOST_WINDOW_LIBS)
+	$(STUB_SO) -DLUNARIA_STUB_EGL -D_GNU_SOURCE -o $@ $(HOST_GL_LIBS) $(HOST_WINDOW_LIBS) $(HOST_NATIVE_LIBS)
 
 runtime/libOpenSLES.so: src/trace.h
 	mkdir -p runtime
 	$(CC) $(CFLAGS) -Wno-pedantic -fPIC $(CPPFLAGS) $(LDFLAGS) $(HOST_SO_LDFLAGS) -Isrc/lib -shared \
 	    src/lib/stub.c -DLUNARIA_STUB_OPENSLES -o $@
 
-DVM_SRC = src/dvm/dex.c src/dvm/dvm.c src/dvm/dvm_runtime.c src/dvm/dvm_jni.c \
+DVM_SRC = src/luna_unicode.c src/dvm/dex.c src/dvm/dvm.c src/dvm/dvm_runtime.c src/dvm/dvm_jni.c \
           src/dvm/dvm_net.c src/dvm/dvm_media.c src/dvm/regex.c src/dvm/charset.c \
           src/webview_cdp.c $(WEBVIEW_CDP_HOST_SRC)
-DVM_HDR = src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
-          src/dvm/dvm_net.h src/dvm/host_socket.h src/dvm/dvm_media.h \
-          src/dvm/regex.h src/dvm/charset.h \
+DVM_HDR = src/luna_unicode.h src/unicode/character_data.h src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
+          src/dvm/dvm_net.h src/lunaria_os.h src/dvm/dvm_media.h \
+          src/dvm/regex.h src/dvm/charset.h  \
           src/webview_cdp.h
 
 # The Dalvik bytecode emulator lives in libjvm.so: it is reached from jvm.c
@@ -369,20 +436,21 @@ DVM_HDR = src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
 # layer inside the VM publishes the document, and the swap path in arm_exec
 # presents it.  Both sides then resolve to the same single instance of the
 # engine — two copies would each hold half of the state.
-runtime/libjvm.so: src/trace.h src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c src/jvm/jvm.h src/jvm/jni.h $(DVM_SRC) $(DVM_HDR) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_gl_inspect.o
+runtime/libjvm.so: src/trace.h src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c src/jvm/jvm.h src/jvm/jni.h $(DVM_SRC) $(DVM_HDR) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o $(BUILD_DIR)/luna_input.o
 	mkdir -p runtime
 	$(CC) $(CFLAGS) $(SANITIZE) -fPIC $(CPPFLAGS) -D_GNU_SOURCE -Wno-pedantic $(LDFLAGS) $(HOST_SO_LDFLAGS) -shared \
-	    src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c $(DVM_SRC) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_gl_inspect.o \
-	    -lm $(HOST_CRYPTO_LIBS) $(HOST_ICU_LIBS) \
+	    src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c $(DVM_SRC) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o $(BUILD_DIR)/luna_input.o \
+	    -lm $(HOST_CRYPTO_LIBS) $(HOST_CHARSET_LIBS) \
+	    $(HOST_WINDOW_LIBS) $(HOST_NATIVE_LIBS) -lpthread \
 	    $(HOST_GL_LIBS) $(HOST_Z_LIBS) -o $@
 
 runtime/libm.so:
 	mkdir -p runtime
-	$(STUB_SO) -DLUNARIA_STUB_MATH -D_GNU_SOURCE -o $@ $(HOST_DL_LIBS) -lm
+	$(STUB_SO) -DLUNARIA_STUB_MATH -D_GNU_SOURCE -o $@ $(HOST_SYSTEM_DL_LIBS) -lm
 
 runtime/libz.so:
 	mkdir -p runtime
-	$(STUB_SO) -DLUNARIA_STUB_ZLIB -o $@ $(HOST_DL_LIBS) -lz
+	$(STUB_SO) -DLUNARIA_STUB_ZLIB -o $@ $(HOST_SYSTEM_DL_LIBS) $(HOST_Z_LIBS)
 
 runtime/libmediandk.so:
 	mkdir -p runtime
@@ -402,9 +470,12 @@ libdl.so: runtime/libdl.so
 libpthread.so: runtime/libpthread.so
 	ln -sfn runtime/libpthread.so $@
 
+$(BUILD_DIR)/luna_fnmatch.o: src/lib/musl/fnmatch.c src/lunaria_os.h src/luna_unicode.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -c $< -o $@
+
 # arm_exec.o: compiled with C++20 and dynarmic headers; linked into lunaria
 $(BUILD_DIR)/arm_exec.o: | $(BUILD_DIR)
-$(BUILD_DIR)/arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/luna_input.h src/arm.h src/svc_ids.h src/lib/guest.c src/jvm/jvm.h src/binary128.h src/linker64.h src/trace.h $(DYNARMIC_LIB)
+$(BUILD_DIR)/arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/lunaria_os.h src/luna_host.h      src/luna_input.h src/arm.h src/svc_ids.h src/lib/guest.c src/jvm/jvm.h src/binary128.h src/linker64.h src/trace.h $(DYNARMIC_LIB)
 	$(CXX) -std=c++20 $(OPTFLAGS) -fPIC \
 	    $(SANITIZE) \
 	    $(DYNARMIC_INCS) \
@@ -474,7 +545,7 @@ $(BUILD_DIR)/luna_vulkan.o: src/luna_vulkan.c src/luna_vulkan_cmds.h src/arm_exe
 
 # loader.o: compiled as C11 (arm_exec.h is C-compatible)
 $(BUILD_DIR)/loader.o: | $(BUILD_DIR)
-$(BUILD_DIR)/loader.o: src/loader.c src/arm_exec.h src/arm.h
+$(BUILD_DIR)/loader.o: src/loader.c src/arm_exec.h src/arm.h src/jvm/jvm.h src/jvm/jni.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -c src/loader.c -o $@
 
 # luna_overlay.o: the emulator's own UI surface, backed by luna-ui.  Built with
@@ -515,21 +586,43 @@ $(BUILD_DIR)/lunaria_os.o: $(LUNA_OS_SRC) src/lunaria_os.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 	    -c $(LUNA_OS_SRC) -o $@
 
-lunaria: $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/luna_vulkan.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(LUNA_OS_OBJ) libdl.so libpthread.so \
-       runtime/libpthread.so $(HOST_BIONIC_LIBC) \
-       runtime/libandroid.so runtime/liblog.so \
-       runtime/libEGL.so runtime/libOpenSLES.so \
-       runtime/libjvm.so runtime/libm.so runtime/libz.so \
-       runtime/libmediandk.so runtime/libGLESv3.so
-lunaria: runtime/libvulkan.so
-	$(CXX) -std=c++20 $(OPTFLAGS) $(HOST_EXPORT) \
+LUNARIA_OBJECTS = $(BUILD_DIR)/apk.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/luna_vulkan.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(BUILD_DIR)/luna_host.o $(LUNA_OS_OBJ) $(LUNA_FNM_OBJ)
+ifneq (,$(filter src/lunaria_windows.c,$(LUNA_OS_SRC)))
+WINDOWS_STUBS = ANDROID LOG OPENSLES MEDIANDK VULKAN
+WINDOWS_STUB_OBJECTS = $(addprefix $(BUILD_DIR)/stub_,$(addsuffix .o,$(WINDOWS_STUBS)))
+$(BUILD_DIR)/stub_ANDROID.o: src/lib/inc/android.c
+$(BUILD_DIR)/stub_LOG.o: src/lib/inc/log.c
+$(BUILD_DIR)/stub_OPENSLES.o: src/lib/inc/opensles.c
+$(BUILD_DIR)/stub_MEDIANDK.o: src/lib/inc/mediandk.c
+$(BUILD_DIR)/stub_VULKAN.o: src/lib/inc/vulkan.c
+$(WINDOWS_STUB_OBJECTS): src/trace.h src/lunaria_os.h
+$(BUILD_DIR)/stub_%.o: src/lib/stub.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc/lib -DLUNARIA_STUB_$* -c src/lib/stub.c -o $@
+WINDOWS_JVM_SRC = src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c $(DVM_SRC)
+WINDOWS_JVM_UI = $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o $(BUILD_DIR)/luna_input.o
+$(BUILD_DIR)/libjvm.o: $(WINDOWS_JVM_SRC) $(DVM_HDR) src/jvm/jvm.h src/jvm/jni.h $(WINDOWS_JVM_UI) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -Wno-pedantic \
+	    -r -nostdlib $(WINDOWS_JVM_SRC) $(WINDOWS_JVM_UI) -o $@
+WINDOWS_DL_SRC = src/linker/dlfcn.c src/linker/linker.c src/linker/linker_environ.c src/linker/rt.c src/linker/strlcpy.c
+$(BUILD_DIR)/libdl.o: $(WINDOWS_DL_SRC) src/linker/linker.h src/lunaria_os.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -DLINKER_DEBUG=1 -DRUNTIMEPATH='"runtime"' \
+	    -Wno-pedantic -Wno-pointer-to-int-cast -Wno-int-to-pointer-cast -Wno-incompatible-pointer-types \
+	    -r -nostdlib $(WINDOWS_DL_SRC) -o $@
+$(HOST_EXPORT): scripts/windows-exports.py $(LUNARIA_OBJECTS) $(HOST_DL_LIBS) $(HOST_JVM_LIB) $(WINDOWS_STUB_OBJECTS)
+	python3 scripts/windows-exports.py "$(HOST_NM)" "$@" $(LUNARIA_OBJECTS) $(HOST_DL_LIBS) $(HOST_JVM_LIB) $(WINDOWS_STUB_OBJECTS)
+$(LUNARIA_BIN): $(HOST_EXPORT) $(HOST_DL_LIBS) $(HOST_JVM_LIB) $(WINDOWS_STUB_OBJECTS)
+endif
+
+$(LUNARIA_BIN): $(LUNARIA_OBJECTS) $(HOST_LINK_ALIASES) $(libs)
+	$(CXX) -std=c++20 $(WINDOWS_CRT_FLAGS) $(WINDOWS_ENTRY_FLAGS) $(OPTFLAGS) $(HOST_EXPORT) \
 	    $(SANITIZE) \
 	    $(LUNARIA_LIBDIRS) $(HOST_RPATH) $(LDFLAGS) \
-	    $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/luna_vulkan.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(LUNA_OS_OBJ) \
+	    $(BUILD_DIR)/apk.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/luna_vulkan.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(BUILD_DIR)/luna_host.o $(LUNA_OS_OBJ) $(LUNA_FNM_OBJ) \
 	    $(DYNARMIC_LIBS) \
-	    $(HOST_DL_LIBS) -lpthread -ljvm \
-	    $(HOST_WINDOW_LIBS) $(HOST_GL_LIBS) $(HOST_Z_LIBS) $(HOST_CRYPTO_LIBS) \
-	    $(HOST_AUDIO_LIBS) -o $@
+	    $(WINDOWS_STUB_OBJECTS) \
+	    $(HOST_DL_LIBS) -lpthread $(HOST_JVM_LIB) \
+	    $(HOST_WINDOW_LIBS) $(HOST_GL_LIBS) $(HOST_Z_LIBS) $(HOST_CRYPTO_LIBS) $(HOST_CHARSET_LIBS) \
+	    $(HOST_AUDIO_LIBS) $(HOST_NATIVE_LIBS) -o $@
 
 install-bin: $(bins)
 	install -Dm755 $(bins) -t "$(DESTDIR)$(PREFIX)$(BINDIR)"
@@ -551,7 +644,7 @@ luna-browser-test: luna-browser test/test_webview_cdp_host
 	./test/test_webview_cdp_host luna-browser/luna-browser $${TMPDIR:-/tmp}/lunaria-luna-browser-test
 
 clean:
-	$(RM) $(bins) $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/lunaria_os.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o \
+	$(RM) $(bins) $(BUILD_DIR)/apk.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/luna_fnmatch.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/lunaria_os.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o \
 	    $(BUILD_DIR)/stb_vorbis.o libdl.so libpthread.so
 	$(RM) -r runtime
 	$(RM) test/test_dynarmic_arm test/test_a64_memory_abort test/test_unity test/test_dvm test/dvm_test.dex test/test_regex test/test_http_chunked test/test_charset test/test_vulkan_bridge
@@ -579,7 +672,7 @@ test/test_dvm: test/dvm_test.c test/dvm_host_fixture.c src/jvm/packages.c $(DVM_
 	    $(CPPFLAGS) \
 	    $(DVM_TEST_SAN) \
 	    test/dvm_test.c test/dvm_host_fixture.c src/jvm/packages.c $(DVM_SRC:src/dvm/dvm_jni.c=) $(LUNA_OS_OBJ) $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o \
-	    -lm $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_CRYPTO_LIBS) $(HOST_ICU_LIBS) $(HOST_Z_LIBS) $(HOST_SYSTEM_DL_LIBS) $(HOST_GL_LIBS) -o $@
+	    -lm $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_CRYPTO_LIBS) $(HOST_CHARSET_LIBS) $(HOST_Z_LIBS) $(HOST_SYSTEM_DL_LIBS) $(HOST_GL_LIBS) -o $@
 
 # Pass a real classes.dex as DVM_DEX to also run every method in it.
 DVM_DEX ?=
@@ -610,7 +703,7 @@ vulkan-test: test/test_vulkan_bridge
 
 test/test_charset: test/charset_test.c src/dvm/charset.c src/dvm/charset.h
 	$(CC) -std=c11 -g -Wall -Wextra -D_GNU_SOURCE -Isrc $(CPPFLAGS) -o $@ \
-	    test/charset_test.c src/dvm/charset.c $(HOST_ICU_LIBS)
+	    test/charset_test.c src/dvm/charset.c $(HOST_CHARSET_LIBS)
 
 # java.nio.charset on its own: decoding and encoding with a device's
 # replacement rules, and the streaming decoder InputStreamReader uses.
@@ -625,7 +718,7 @@ regex-test: test/test_regex
 dvm-test: test/test_dvm test/dvm_test.dex
 	./test/test_dvm test/dvm_test.dex $(DVM_DEX)
 
-test/test_http_chunked: test/http_chunked_test.c src/dvm/dvm_net.c src/dvm/dvm_net.h
+test/test_http_chunked: test/http_chunked_test.c src/dvm/dvm_net.c src/dvm/dvm_net.h src/lunaria_os.h
 	$(CC) -std=c11 -O2 -g -Wall -Wextra -D_GNU_SOURCE -Isrc \
 	    test/http_chunked_test.c src/dvm/dvm_net.c \
 	    $(HOST_CRYPTO_LIBS) -lpthread -o $@
@@ -770,6 +863,7 @@ test/libdlweak.so: test/dlopen_fixture.c
 
 test/libdltest.so: test/dlopen_test.c
 	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
+	    '-DDL_FIXTURE_DIR="$(PWD)/test"' \
 	    -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libdltest.so -o $@ $<
 
 dl-test: lunaria test/libdltest.so test/libdlfixture.so test/libdlmissing.so \
@@ -801,6 +895,50 @@ test/libabitest32.so: test/abi_test.c test/abi_test_values.h
 	clang -target armv7a-linux-gnueabi -mfloat-abi=softfp -mfpu=vfpv3 \
 	    $(ABI_TEST_CFLAGS) -Wl,-soname,libabitest32.so -o $@ $<
 
+$(BUILD_DIR)/guest_string_boundary32.so: test/guest_string_boundary.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabi -mfloat-abi=softfp -mfpu=vfpv3 \
+	    $(ABI_TEST_CFLAGS) -o $@ $<
+
+$(BUILD_DIR)/guest_string_boundary64.so: test/guest_string_boundary.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -o $@ $<
+
+.PHONY: guest-string-test
+guest-string-test: lunaria $(BUILD_DIR)/guest_string_boundary32.so $(BUILD_DIR)/guest_string_boundary64.so
+	@for so in $(BUILD_DIR)/guest_string_boundary32.so $(BUILD_DIR)/guest_string_boundary64.so; do \
+	    LUNARIA_AUDIO=0 ./lunaria "$$so" > "$$so.log" 2>&1 || true; \
+	    grep 'string-boundary' "$$so.log"; \
+	    grep -q 'RESULT PASS' "$$so.log" || exit 1; \
+	done
+
+$(BUILD_DIR)/guest_signal_suspend32.so: test/guest_signal_suspend.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabi -mfloat-abi=softfp -mfpu=vfpv3 \
+	    $(ABI_TEST_CFLAGS) -o $@ $<
+
+$(BUILD_DIR)/guest_signal_suspend64.so: test/guest_signal_suspend.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -o $@ $<
+
+.PHONY: guest-signal-test
+$(BUILD_DIR)/mutex_wake32.so: test/mutex_wake_progress.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabihf $(ABI_TEST_CFLAGS) -fno-builtin -o $@ $<
+
+$(BUILD_DIR)/mutex_wake64.so: test/mutex_wake_progress.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -fno-builtin -o $@ $<
+
+.PHONY: mutex-wake-test
+mutex-wake-test: lunaria $(BUILD_DIR)/mutex_wake32.so $(BUILD_DIR)/mutex_wake64.so
+	@for so in $(BUILD_DIR)/mutex_wake32.so $(BUILD_DIR)/mutex_wake64.so; do \
+	    timeout 30s env LUNARIA_A64_ENGINES=1 LUNARIA_AUDIO=0 ./lunaria "$$so" > "$$so.log" 2>&1; \
+	    grep 'mutex-wake.*RESULT' "$$so.log"; \
+	    grep -q 'RESULT PASS' "$$so.log" || exit 1; \
+	done
+
+guest-signal-test: lunaria $(BUILD_DIR)/guest_signal_suspend32.so $(BUILD_DIR)/guest_signal_suspend64.so
+	@for so in $(BUILD_DIR)/guest_signal_suspend32.so $(BUILD_DIR)/guest_signal_suspend64.so; do \
+	    LUNARIA_AUDIO=0 ./lunaria "$$so" > "$$so.log" 2>&1 || true; \
+	    grep 'signal-suspend' "$$so.log"; \
+	    grep -q 'RESULT PASS' "$$so.log" || exit 1; \
+	done
+
 test/libschedtest64.so: test/sched_test.c
 	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) \
 	    -Wl,-soname,libschedtest64.so -o $@ $<
@@ -816,6 +954,67 @@ test/liblocktest.so: test/lock_test.c
 test/libprimarymutex.so: test/primary_mutex_test.c
 	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
 	    -Wl,-soname,libprimarymutex.so -o $@ $<
+
+test/libjnicollections.so: test/jni_collections_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
+	    -Wl,-soname,libjnicollections.so -o $@ $<
+
+test/libjnisleep.so: test/jni_sleep_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
+	    -Wl,-soname,libjnisleep.so -o $@ $<
+
+.PHONY: jni-sleep-test
+jni-sleep-test: lunaria test/libjnisleep.so test/dvm_test.dex
+	@mkdir -p $(BUILD_DIR)/jni-sleep
+	@cp test/dvm_test.dex $(BUILD_DIR)/jni-sleep/classes.dex
+	@timeout -k 2s 30s env \
+	    ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/jni-sleep" \
+	    LUNARIA_A64_SELF_SCHED=1 \
+	    LD_LIBRARY_PATH="$(CURDIR):$(CURDIR)/runtime" \
+	    ./lunaria test/libjnisleep.so > .jnisleep.out 2>&1; \
+	grep 'jnisleep.*\(elapsed\|RESULT\)' .jnisleep.out; \
+	grep -q 'RESULT PASS' .jnisleep.out && ! grep -q 'RESULT FAIL' .jnisleep.out
+
+test/libjniprefs-write.so: test/jni_prefs_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -DPREFS_WRITE=1 \
+	    -Wl,-soname,libjniprefs-write.so -o $@ $<
+
+test/libjniprefs-read.so: test/jni_prefs_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -DPREFS_WRITE=0 \
+	    -Wl,-soname,libjniprefs-read.so -o $@ $<
+
+test/libjniprefs-failure.so: test/jni_prefs_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -DPREFS_WRITE=2 \
+	    -Wl,-soname,libjniprefs-failure.so -o $@ $<
+
+.PHONY: jni-prefs-test
+jni-prefs-test: lunaria test/libjniprefs-write.so test/libjniprefs-read.so test/libjniprefs-failure.so test/dvm_test.dex
+	@mkdir -p $(BUILD_DIR)/jni-prefs/code $(BUILD_DIR)/jni-prefs/store
+	@cp test/dvm_test.dex $(BUILD_DIR)/jni-prefs/code/classes.dex
+	@rm -f $(BUILD_DIR)/jni-prefs/store/native-regression.xml
+	@touch $(BUILD_DIR)/jni-prefs/blocked
+	@rc=0; for phase in write read failure; do \
+	    prefs_dir="$(BUILD_DIR)/jni-prefs/store"; \
+	    if [ "$$phase" = failure ]; then prefs_dir="$(BUILD_DIR)/jni-prefs/blocked"; fi; \
+	    timeout -k 2s 30s env \
+	        ANDROID_PREFS_DIR="$$prefs_dir" \
+	        ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/jni-prefs/code" \
+	        LD_LIBRARY_PATH="$(CURDIR):$(CURDIR)/runtime" \
+	        ./lunaria test/libjniprefs-$$phase.so > .jniprefs-$$phase.out 2>&1; \
+	    grep 'jniprefs.*RESULT' .jniprefs-$$phase.out; \
+	    grep -q 'RESULT PASS' .jniprefs-$$phase.out || rc=1; \
+	done; exit $$rc
+
+.PHONY: jni-collections-test
+jni-collections-test: lunaria test/libjnicollections.so test/dvm_test.dex
+	@mkdir -p $(BUILD_DIR)/jni-collections
+	@cp test/dvm_test.dex $(BUILD_DIR)/jni-collections/classes.dex
+	@timeout -k 2s 30s env \
+	    ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/jni-collections" \
+	    LD_LIBRARY_PATH="$(CURDIR):$(CURDIR)/runtime" \
+	    ./lunaria test/libjnicollections.so > .jnicollections.out 2>&1; \
+	grep 'jnicollections.*RESULT' .jnicollections.out; \
+	grep -q 'RESULT PASS' .jnicollections.out && ! grep -q 'RESULT FAIL' .jnicollections.out
 
 primary-mutex-test: lunaria test/libprimarymutex.so
 	@rc=0; for mode in 0 1; do \
@@ -1119,7 +1318,7 @@ $(DYNARMIC_LIB): $(DYNARMIC_SOURCES) $(DYNARMIC_DIR)/CMakeLists.txt
 	    $(DYNARMIC_CMAKE_FLAGS) \
 	    -DDYNARMIC_FRONTENDS="A32;A64" \
 	    -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-	$(CMAKE) --build $(DYNARMIC_BUILD) -j$(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+	$(CMAKE) --build $(DYNARMIC_BUILD) -j$(DYNARMIC_JOBS)
 
 # These archives are emitted by the same CMake build.  Listing the relation
 # keeps a clean tree buildable: otherwise make sees them as prerequisites of
@@ -1160,12 +1359,6 @@ test/test_webview_cdp: test/test_webview_cdp.c src/webview_cdp.c src/webview_cdp
 webview-cdp-test: test/test_webview_cdp
 	./test/test_webview_cdp
 
-test/test_host_socket: test/host_socket_test.c src/dvm/host_socket.h
-	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -Isrc test/host_socket_test.c -o $@
-
-host-socket-test: test/test_host_socket
-	./test/test_host_socket
-
 test/test_webview_cdp_host: test/test_webview_cdp_host.c $(WEBVIEW_CDP_HOST_SRC) src/webview_cdp.c src/webview_cdp.h
 	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -Isrc \
 	    test/test_webview_cdp_host.c $(WEBVIEW_CDP_HOST_SRC) \
@@ -1189,7 +1382,7 @@ os-event-test: test/test_os_event
 # fresh libdynarmic.a that nothing depends on leaves the old code in the
 # binary.  This has to sit below the DYNARMIC_LIBS definition — make expands
 # prerequisites as it reads the rule.
-lunaria: $(DYNARMIC_LIBS)
+$(LUNARIA_BIN): $(DYNARMIC_LIBS)
 
 dynarmic-build: $(DYNARMIC_LIB)
 
@@ -1262,6 +1455,8 @@ DIST_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo
 DIST_ARCH    ?= $(shell uname -m)
 ifeq ($(LUNA_OS_NAME),Darwin)
 DIST_OS      ?= macos
+else ifneq (,$(filter src/lunaria_windows.c,$(LUNA_OS_SRC)))
+DIST_OS      ?= windows
 else
 DIST_OS      ?= linux
 endif
@@ -1274,8 +1469,15 @@ DIST_STAGE    = $(BUILD_DIR)/dist/$(DIST_NAME)
 # are newer.  Keep the CPU baseline portable; -march=native would make the
 # resulting archive fail on older machines of the same architecture.
 DIST_OPTFLAGS ?= -O3 -DNDEBUG -flto -fomit-frame-pointer
+DIST_CFLAGS   ?= $(DIST_OPTFLAGS) $(WARNINGS) -std=c11
+ifeq ($(DIST_OS),macos)
+DIST_LDFLAGS  ?= -flto
+else ifeq ($(DIST_OS),windows)
+DIST_LDFLAGS  ?= -flto -Wl,-O2
+else
 DIST_LDFLAGS  ?= -flto -Wl,-O2 -Wl,--as-needed
-DIST_BUILD_DIR ?= /tmp/lunaria-dist-build
+endif
+DIST_BUILD_DIR ?= /tmp/lunaria-dist-build/$(DIST_OS)-$(DIST_ARCH)
 DIST_DYNARMIC_BUILD ?= $(DIST_BUILD_DIR)/dynarmic
 
 dist-stage:
@@ -1284,30 +1486,38 @@ dist-stage:
 	    DYNARMIC_BUILD="$(DIST_DYNARMIC_BUILD)" \
 	    DIST_STAGE="$(DIST_STAGE)" \
 	    OPTFLAGS="$(DIST_OPTFLAGS)" \
+	    CFLAGS="$(DIST_CFLAGS)" \
 	    OPT_LDFLAGS="$(DIST_LDFLAGS)" \
+	    SANITIZE= \
 	    DYNARMIC_IPO=ON
 
-dist-stage-build: lunaria $(libs)
+dist-stage-build: $(LUNARIA_BIN) $(libs) $(OPENH264_SO)
 	sh scripts/make-dist.sh "$(DIST_STAGE)" "$(DIST_OS)" "$(DIST_ARCH)"
+ifeq ($(DIST_OS),windows)
+# Include real guest code for the audited JIT paths, rather than silently
+# shipping a distribution that routes every audited math/memory call via SVC.
+dist-stage-build: syslib guestlib
+endif
 
 # The archive, next to the sources, ready to upload.
 dist: dist-stage
+ifeq ($(DIST_OS),windows)
+	$(RM) "$(CURDIR)/$(DIST_NAME).zip"
+	cd "$(dir $(DIST_STAGE))" && zip -qr "$(CURDIR)/$(DIST_NAME).zip" "$(DIST_NAME)"
+	@echo "$(DIST_NAME).zip"
+else
 	cd "$(dir $(DIST_STAGE))" && tar czf "$(CURDIR)/$(DIST_NAME).tar.gz" "$(DIST_NAME)"
 	@echo "$(DIST_NAME).tar.gz"
+endif
 
-# macOS bundle.  A .app is a directory with a fixed shape; the emulator's own
-# entry point is the launcher script, so the bundle's executable is a stub
-# that runs it with the bundle's Resources as the working directory.
+# macOS bundle: the native executable launches APKs itself and locates its
+# runtime libraries, fonts and keymaps in ../Resources.
 MAC_APP = $(BUILD_DIR)/dist/Lunaria.app
 dist-mac: dist-stage
 	rm -rf "$(MAC_APP)"
 	mkdir -p "$(MAC_APP)/Contents/MacOS" "$(MAC_APP)/Contents/Resources"
 	cp -R "$(DIST_STAGE)/." "$(MAC_APP)/Contents/Resources/"
-	printf '%s\n' '#!/bin/sh' \
-	    'dir=$$(cd -- "$$(dirname -- "$$0")/../Resources" && pwd)' \
-	    'exec "$$dir/lunaria-apk.sh" "$$@"' \
-	    > "$(MAC_APP)/Contents/MacOS/Lunaria"
-	chmod +x "$(MAC_APP)/Contents/MacOS/Lunaria"
+	mv "$(MAC_APP)/Contents/Resources/lunaria" "$(MAC_APP)/Contents/MacOS/Lunaria"
 	printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
 	    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
 	    '<plist version="1.0"><dict>' \
@@ -1324,7 +1534,7 @@ dist-mac: dist-stage
 
 dist-clean:
 	$(RM) -r "$(BUILD_DIR)/dist"
-	$(RM) lunaria-*.tar.gz lunaria-*.dmg
+	$(RM) lunaria-*.tar.gz lunaria-*.dmg lunaria-*.zip
 
 .PHONY: primary-mutex-test gl-map-test luna-browser luna-browser-test vulkan-test dist dist-stage dist-stage-build dist-mac dist-clean all pixels-test dl-test jit-speed syslib guestlib syslib-clean host-all macos-deps x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
 	        clean install install-bin install-lib test net-test dvm-test http-chunked-test regex-test charset-test abi-test \
@@ -1365,9 +1575,6 @@ keymap-smoke-test: lunaria test/libkeymapguest.so test/libkeymapndk.so
 
 $(BUILD_DIR)/luna_overlay.o: src/luna_input.h
 
-$(BUILD_DIR)/luna_gl_inspect.o: src/luna_gl_inspect.c src/luna_gl_inspect.h | $(BUILD_DIR)
-	$(CC) -std=c11 $(OPTFLAGS) -fPIC $(CPPFLAGS) -c $< -o $@
-$(BUILD_DIR)/arm_exec.o: src/luna_gl_inspect.h
 
 ifeq ($(LUNA_OS_NAME),Linux)
 .PHONY: audio-clock-test
@@ -1378,3 +1585,81 @@ audio-clock-test: test/test_audio_clock
 	./test/test_audio_clock null
 	./test/test_audio_clock off
 endif
+
+HOST_TEST_EXE_SUFFIX = $(if $(filter src/lunaria_windows.c,$(LUNA_OS_SRC)),.exe)
+HOST_MEMORY_TEST = $(BUILD_DIR)/test_host_memory$(HOST_TEST_EXE_SUFFIX)
+ifneq (,$(filter src/lunaria_windows.c,$(LUNA_OS_SRC)))
+HOST_OS_TEST_LIBS = $(HOST_NATIVE_LIBS)
+endif
+$(HOST_MEMORY_TEST): test/host_memory_test.c src/lunaria_os.h $(LUNA_OS_OBJ)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE test/host_memory_test.c $(LUNA_OS_OBJ) \
+	    $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_SYSTEM_DL_LIBS) \
+	    $(HOST_CHARSET_LIBS) $(HOST_OS_TEST_LIBS) -lpthread -o $@
+host-memory-test: $(HOST_MEMORY_TEST)
+	$(HOST_MEMORY_TEST)
+.PHONY: host-memory-test
+
+HOST_SOCKET_TEST = $(BUILD_DIR)/test_host_socket$(HOST_TEST_EXE_SUFFIX)
+$(HOST_SOCKET_TEST): test/host_socket_test.c src/lunaria_os.h $(LUNA_OS_OBJ)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE test/host_socket_test.c $(LUNA_OS_OBJ) \
+	    $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_SYSTEM_DL_LIBS) \
+	    $(HOST_CHARSET_LIBS) $(HOST_OS_TEST_LIBS) -lpthread -o $@
+host-socket-test: $(HOST_SOCKET_TEST)
+	$(HOST_SOCKET_TEST)
+.PHONY: host-socket-test
+
+HOST_ELF_TEST = $(BUILD_DIR)/test_host_elf_segments$(HOST_TEST_EXE_SUFFIX)
+HOST_ELF_TEST_SRC = src/linker/dlfcn.c src/linker/linker_environ.c src/linker/strlcpy.c
+$(HOST_ELF_TEST): test/host_elf_segments_test.c src/linker/linker.c src/linker/linker.h \
+                 src/linker/linker_debug.h src/lunaria_os.h $(HOST_ELF_TEST_SRC) $(LUNA_OS_OBJ)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -DLINKER_DEBUG=0 -DRUNTIMEPATH='"runtime"' \
+	    -Wno-incompatible-pointer-types test/host_elf_segments_test.c $(HOST_ELF_TEST_SRC) $(LUNA_OS_OBJ) \
+	    $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_SYSTEM_DL_LIBS) \
+	    $(HOST_CHARSET_LIBS) $(HOST_OS_TEST_LIBS) -lpthread -o $@
+host-elf-test: $(HOST_ELF_TEST)
+	$(HOST_ELF_TEST)
+.PHONY: host-elf-test
+
+HOST_FILE_TEST = $(BUILD_DIR)/test_host_file$(HOST_TEST_EXE_SUFFIX)
+$(HOST_FILE_TEST): test/host_file_test.c src/lunaria_os.h $(LUNA_OS_OBJ)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE test/host_file_test.c $(LUNA_OS_OBJ) \
+	    $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_SYSTEM_DL_LIBS) \
+	    $(HOST_CHARSET_LIBS) $(HOST_OS_TEST_LIBS) -lpthread -o $@
+host-file-test: $(HOST_FILE_TEST)
+	$(HOST_FILE_TEST)
+.PHONY: host-file-test
+
+$(BUILD_DIR)/luna_host.o: src/luna_host.c src/luna_host.h | $(BUILD_DIR)
+	$(CC) -std=c11 $(OPTFLAGS) -D_GNU_SOURCE -fPIC $(CPPFLAGS) -c $< -o $@
+
+.PHONY: fd-monitor-test
+fd-monitor-test: test/test_fd_monitor
+	./test/test_fd_monitor
+
+test/test_fd_monitor: test/fd_monitor_test.c src/luna_host.c src/luna_host.h
+	$(CC) -std=c11 $(OPTFLAGS) -D_GNU_SOURCE $(CPPFLAGS) -Isrc test/fd_monitor_test.c src/luna_host.c $(HOST_GL_LIBS) -pthread -o $@
+
+.PHONY: run-queue-test
+run-queue-test: test/test_run_queue
+	./test/test_run_queue
+
+test/test_run_queue: test/run_queue_test.c src/lunaria_os.h
+	$(CC) -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Isrc $< -o $@
+
+HOST_PATTERN_TEST = $(BUILD_DIR)/test_host_pattern$(HOST_TEST_EXE_SUFFIX)
+$(HOST_PATTERN_TEST): test/host_pattern_test.c src/lunaria_os.h $(LUNA_FNM_OBJ) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE $< $(LUNA_FNM_OBJ) src/luna_unicode.c $(HOST_CHARSET_LIBS) -o $@
+host-pattern-test: $(HOST_PATTERN_TEST)
+	$(HOST_PATTERN_TEST)
+.PHONY: host-pattern-test
+
+$(BUILD_DIR)/apk.o: src/apk.c src/lunaria_os.h src/dvm/charset.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -c $< -o $@
+
+.PHONY: unicode-test apk-launcher-test
+$(BUILD_DIR)/test_unicode: test/unicode_test.c src/luna_unicode.c src/luna_unicode.h src/unicode/character_data.h | $(BUILD_DIR)
+	$(CC) -std=c11 -D_GNU_SOURCE $(CPPFLAGS) test/unicode_test.c src/luna_unicode.c -o $@
+unicode-test: $(BUILD_DIR)/test_unicode
+	$(BUILD_DIR)/test_unicode
+apk-launcher-test: $(LUNARIA_BIN)
+	python3 test/apk_launcher_test.py ./$(LUNARIA_BIN)

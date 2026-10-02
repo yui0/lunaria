@@ -12,6 +12,7 @@
 #define _GNU_SOURCE
 #include "lunaria_os.h"
 
+#include <locale.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sched.h>
@@ -21,6 +22,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <elf.h>
 #include <link.h>
 
@@ -30,6 +32,7 @@
 #include <sys/prctl.h>
 #include <sys/signalfd.h>
 #include <sys/statvfs.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 
 #define GLFW_INCLUDE_NONE
@@ -38,6 +41,53 @@
 #include <GLFW/glfw3native.h>
 
 /* ---- virtual memory ---------------------------------------------------- */
+
+int luna_os_setenv(const char *name, const char *value, int overwrite)
+{
+   if (!name || !*name || strchr(name, '=') || !value) { errno = EINVAL; return -1; }
+   return setenv(name, value, overwrite);
+}
+int luna_os_random(void *buffer, size_t length)
+{
+   if (length && !buffer) { errno = EFAULT; return -1; }
+   if (length) arc4random_buf(buffer, length);
+   return 0;
+}
+
+void *luna_os_library_open(const char *path)
+{
+   return dlopen(path, RTLD_LAZY | RTLD_GLOBAL);
+}
+
+void *luna_os_library_open_local(const char *path)
+{
+   return dlopen(path, RTLD_NOW | RTLD_LOCAL);
+}
+const char *luna_os_library_error(void)
+{
+   const char *error = dlerror();
+   return error ? error : "unknown loader error";
+}
+
+void *luna_os_library_symbol(void *handle, const char *name)
+{
+   return dlsym(handle ? handle : RTLD_DEFAULT, name);
+}
+
+void luna_os_library_close(void *handle)
+{
+   if (handle) dlclose(handle);
+}
+
+int luna_os_backtrace(void **frames, int capacity)
+{
+   return frames && capacity > 0 ? backtrace(frames, capacity) : 0;
+}
+
+void luna_os_backtrace_print(void *const *frames, int count)
+{
+   if (frames && count > 0) backtrace_symbols_fd(frames, count, 2);
+}
 
 static int luna_prot_to_host(int prot)
 {
@@ -76,6 +126,38 @@ int luna_os_release(void *addr, size_t len)
    return munmap(addr, len);
 }
 
+void *luna_os_map_anon(void *want, size_t len, int replace)
+{
+   if (replace && !want) { errno = EINVAL; return NULL; }
+   int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+   if (replace) flags |= MAP_FIXED;
+   void *p = mmap(want, len, PROT_READ | PROT_WRITE, flags, -1, 0);
+   return p == MAP_FAILED ? NULL : p;
+}
+
+void *luna_os_map_file_flags(void *want, size_t len, int prot, int policy,
+                            int fd, uint64_t off)
+{
+   int flags = (policy & LUNA_MAP_SHARED) ? MAP_SHARED : MAP_PRIVATE;
+   if (policy & LUNA_MAP_FIXED) flags |= MAP_FIXED;
+#ifdef MAP_FIXED_NOREPLACE
+   if (policy & LUNA_MAP_NOREPLACE) flags |= MAP_FIXED_NOREPLACE;
+#endif
+   if ((policy & (LUNA_MAP_FIXED | LUNA_MAP_NOREPLACE)) && !want) {
+      errno = EINVAL;
+      return NULL;
+   }
+   if (policy & LUNA_MAP_NORESERVE) flags |= MAP_NORESERVE;
+#ifdef MAP_POPULATE
+   if (policy & LUNA_MAP_POPULATE) flags |= MAP_POPULATE;
+#endif
+#ifdef MAP_STACK
+   if (policy & LUNA_MAP_STACK) flags |= MAP_STACK;
+#endif
+   void *p = mmap(want, len, luna_prot_to_host(prot), flags, fd, (off_t)off);
+   return p == MAP_FAILED ? NULL : p;
+}
+
 int luna_os_protect(void *addr, size_t len, int prot)
 {
    return mprotect(addr, len, luna_prot_to_host(prot));
@@ -111,6 +193,31 @@ size_t luna_os_page_size(void)
 {
    long v = sysconf(_SC_PAGESIZE);
    return v > 0 ? (size_t)v : 4096u;
+}
+
+int luna_os_memory_advise(void *addr, size_t len, int advice)
+{
+   return madvise(addr, len, advice);
+}
+
+int luna_os_memory_sync(void *addr, size_t len, int flags)
+{
+   if ((flags & ~(LUNA_MS_ASYNC | LUNA_MS_INVALIDATE | LUNA_MS_SYNC)) ||
+       (flags & LUNA_MS_ASYNC && flags & LUNA_MS_SYNC)) { errno = EINVAL; return -1; }
+   int native = (flags & LUNA_MS_ASYNC ? MS_ASYNC : 0) |
+                (flags & LUNA_MS_INVALIDATE ? MS_INVALIDATE : 0) |
+                (flags & LUNA_MS_SYNC ? MS_SYNC : 0);
+   return msync(addr, len, native);
+}
+
+int luna_os_memory_lock(void *addr, size_t len, int unlock)
+{
+   return unlock ? munlock(addr, len) : mlock(addr, len);
+}
+
+int luna_os_residency(void *addr, size_t len, unsigned char *vector)
+{
+   return mincore(addr, len, vector);
 }
 
 /* ---- anonymous shared memory ------------------------------------------- */
@@ -269,6 +376,12 @@ uint64_t luna_os_realtime_ns(void)
 
 /* ---- what the machine has ----------------------------------------------- */
 
+uint64_t luna_os_peak_rss_kb(void)
+{
+   struct rusage usage;
+   return getrusage(RUSAGE_SELF, &usage) == 0 ? (uint64_t)usage.ru_maxrss : 0;
+}
+
 int luna_os_mem_info(uint64_t *total_bytes, uint64_t *avail_bytes)
 {
    /* MemAvailable, not MemFree: the guest wants to know what it could get,
@@ -287,6 +400,39 @@ int luna_os_mem_info(uint64_t *total_bytes, uint64_t *avail_bytes)
    if (!avail) avail = total / 2u;
    if (total_bytes) *total_bytes = total;
    if (avail_bytes) *avail_bytes = avail;
+   return 0;
+}
+
+static void luna_fs_copy(luna_os_fs_info *out, const struct statvfs *st)
+{
+   out->f_bsize = st->f_bsize;
+   out->f_frsize = st->f_frsize;
+   out->f_blocks = st->f_blocks;
+   out->f_bfree = st->f_bfree;
+   out->f_bavail = st->f_bavail;
+   out->f_files = st->f_files;
+   out->f_ffree = st->f_ffree;
+   out->f_favail = st->f_favail;
+   out->f_fsid = st->f_fsid;
+   out->f_flag = st->f_flag;
+   out->f_namemax = st->f_namemax;
+}
+
+int luna_os_statfs(const char *path, luna_os_fs_info *out)
+{
+   if (!path || !out) { errno = EINVAL; return -1; }
+   struct statvfs st;
+   if (statvfs(path, &st) != 0) return -1;
+   luna_fs_copy(out, &st);
+   return 0;
+}
+
+int luna_os_fstatfs(int fd, luna_os_fs_info *out)
+{
+   if (!out) { errno = EINVAL; return -1; }
+   struct statvfs st;
+   if (fstatvfs(fd, &st) != 0) return -1;
+   luna_fs_copy(out, &st);
    return 0;
 }
 
@@ -404,6 +550,25 @@ void *luna_os_offscreen_window(void *glfw_window, int w, int h)
    return (void *)(uintptr_t)win;
 }
 
+void luna_os_offscreen_resize(void *native_window, int w, int h)
+{
+   if (!native_window || w <= 0 || h <= 0 || luna_wayland_backend()) return;
+   Display *dpy = glfwGetX11Display();
+   void *x11 = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
+   if (!dpy || !x11) return;
+   int (*resize)(Display *, Window, unsigned, unsigned);
+   int (*sync)(Display *, Bool);
+   void *sym = dlsym(x11, "XResizeWindow");
+   memcpy(&resize, &sym, sizeof resize);
+   sym = dlsym(x11, "XSync");
+   memcpy(&sync, &sym, sizeof sync);
+   if (resize && sync) {
+      resize(dpy, (Window)(uintptr_t)native_window, (unsigned)w, (unsigned)h);
+      sync(dpy, False);
+   }
+   dlclose(x11);
+}
+
 /* ---- audio out ----------------------------------------------------------
  *
  * ALSA, through the header-only helper in src/alsa.h.  The device is opened
@@ -483,6 +648,7 @@ static void *luna_audio_thread(void *arg)
    if (!chunk) return NULL;
    struct timespec deadline;
    clock_gettime(CLOCK_MONOTONIC, &deadline);
+   uint64_t submitted = 0;
    unsigned long starved_periods = 0, starved_frames = 0;
    while (!atomic_load_explicit(&g_audio_stop, memory_order_acquire)) {
       /* Hand the card a whole period every period, always.  A mixer does not
@@ -593,27 +759,13 @@ static void *luna_audio_thread(void *arg)
                                   (t + have) % LUNA_AUDIO_RING_FRAMES,
                                   memory_order_release);
          atomic_fetch_add_explicit(&g_audio_played, period, memory_order_release);
+         submitted += period;
          continue;
       }
       const int wrote = AUDIO_play(&g_audio, (char *)chunk, (int)period);
-      /* Frames the card accepted, silence padding included.  This is the
-       * device's playback position, and it is what g_audio_played has to
-       * count: the clock a mixer hands out belongs to the card, and the card
-       * does not stop when the application is late.
-       *
-       * Counting only the frames the producer supplied made an underrun
-       * permanent.  The OpenSL buffer queue retires a buffer when the device
-       * has played it (luna_os_audio_played_frames() >= its end mark in
-       * drive_opensles_callbacks), and the guest enqueues the next buffer
-       * from inside that retirement callback.  So the moment the ring ran dry
-       * the counter stopped, no buffer could ever reach its end mark, the
-       * guest was never asked for audio again, and the ring stayed dry --
-       * measured on Cross Worlds as 266 seconds of unbroken silence out of a
-       * 330 second run, all of it after the first underrun during the load.
-       * On a device the mixer consumes a period every period and the app's
-       * buffers retire on that schedule whatever the app managed to produce;
-       * Enqueue already carries the resync (it pulls last_end up to the
-       * current position), so the time lost to silence is simply lost. */
+      /* Count silence as well as source PCM: the mixer clock continues when
+       * the guest producer is late.  Device delay is subtracted below so
+       * buffer completion follows playback rather than submission. */
       unsigned taken = 0u;
       if (wrote >= 0) taken = (unsigned)wrote < period ? (unsigned)wrote : period;
       const unsigned next_period = (unsigned)g_audio.frames ? (unsigned)g_audio.frames : 256u;
@@ -626,9 +778,28 @@ static void *luna_audio_thread(void *arg)
          atomic_store_explicit(&g_audio_tail,
                                (t + consumed) % LUNA_AUDIO_RING_FRAMES,
                                memory_order_release);
-      audio_wait_frames(&deadline, taken ? taken : period,
-                        g_audio.freq ? g_audio.freq : 48000u);
-      atomic_fetch_add_explicit(&g_audio_played, taken, memory_order_release);
+      submitted += taken;
+      snd_pcm_sframes_t pending = 0;
+      const int delay_rc = snd_pcm_delay(g_audio.handle, &pending);
+      uint64_t played;
+      if (delay_rc == 0 && pending > 0) {
+         /* Fill the device queue; blocking writes then pace this consumer.
+          * Sleeping after each accepted period kept the queue nearly empty
+          * and made normal scheduling jitter cause an underrun.  Accepted
+          * samples still queued at the device have not been played. */
+         played = (uint64_t)pending < submitted
+            ? submitted - (uint64_t)pending : 0;
+         clock_gettime(CLOCK_MONOTONIC, &deadline);
+      } else {
+         /* Null/file sinks consume immediately and need a real-time clock. */
+         audio_wait_frames(&deadline, taken ? taken : period,
+                           g_audio.freq ? g_audio.freq : 48000u);
+         played = submitted;
+      }
+      const uint64_t previous = atomic_load_explicit(&g_audio_played,
+                                                     memory_order_relaxed);
+      if (played > previous)
+         atomic_store_explicit(&g_audio_played, played, memory_order_release);
       period = next_period;
    }
    free(chunk);
@@ -879,4 +1050,67 @@ void luna_os_audio_close(void)
    free(g_audio_ring);
    g_audio_ring = NULL;
    g_audio_open = 0;
+}
+
+uint32_t luna_os_lrand48(void) { return (uint32_t)lrand48(); }
+void luna_os_srand48(int32_t seed) { srand48((long)seed); }
+
+int luna_os_pipe_open(int fds[2], int nonblocking, int close_on_exec)
+{ return pipe2(fds, (nonblocking ? O_NONBLOCK : 0) | (close_on_exec ? O_CLOEXEC : 0)); }
+
+luna_os_locale luna_os_locale_new(void)
+{
+   locale_t locale = newlocale(LC_ALL_MASK, "C.UTF-8", (locale_t)0);
+   if (!locale) locale = newlocale(LC_ALL_MASK, "C", (locale_t)0);
+   return (luna_os_locale)locale;
+}
+luna_os_locale luna_os_locale_clone(luna_os_locale locale)
+{
+   if (!locale) { errno = EINVAL; return NULL; }
+   return (luna_os_locale)duplocale((locale_t)locale);
+}
+void luna_os_locale_free(luna_os_locale locale)
+{ if (locale) freelocale((locale_t)locale); }
+int luna_os_locale_use(luna_os_locale locale)
+{ return uselocale(locale ? (locale_t)locale : LC_GLOBAL_LOCALE) ? 0 : -1; }
+
+int luna_os_time_break(int64_t seconds, int local, struct tm *result, int64_t *offset)
+{
+   time_t value = (time_t)seconds;
+   if ((int64_t)value != seconds) { errno = EOVERFLOW; return -1; }
+   if (!(local ? localtime_r(&value, result) : gmtime_r(&value, result))) return -1;
+   *offset = (int64_t)result->tm_gmtoff;
+   return 0;
+}
+int luna_os_time_make(struct tm *value, int64_t *seconds, int64_t *offset)
+{
+   int saved = errno;
+   errno = 0;
+   time_t result = mktime(value);
+   if (result == (time_t)-1 && errno) return -1;
+   *seconds = (int64_t)result;
+   *offset = (int64_t)value->tm_gmtoff;
+   errno = saved;
+   return 0;
+}
+
+int luna_os_unsetenv(const char *name) { return unsetenv(name); }
+intptr_t luna_os_command_pipe_open(const char *path)
+{
+   if (mkfifo(path, 0600) && errno != EEXIST) return -1;
+   return open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+}
+ptrdiff_t luna_os_command_pipe_read(intptr_t pipe, void *buffer, size_t capacity)
+{
+   return read((int)pipe, buffer, capacity);
+}
+void luna_os_command_pipe_close(intptr_t pipe) { close((int)pipe); }
+
+void *luna_os_library_loaded_symbol(const char *module, const char *name)
+{
+   void *handle = dlopen(module, RTLD_LAZY | RTLD_NOLOAD);
+   if (!handle) return NULL;
+   void *symbol = dlsym(handle, name);
+   dlclose(handle);
+   return symbol;
 }

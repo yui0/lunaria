@@ -11,7 +11,7 @@
 #include "dvm/dvm_media.h"
 #include "lunaria_os.h"
 
-#include <dlfcn.h>
+
 #include <pthread.h>
 #include <limits.h>
 #include <stdio.h>
@@ -88,7 +88,7 @@ static void (*lm_WelsDestroyDecoder)(ISVCDecoder *);
 static void *openh264_dlopen(void)
 {
    const char *env = getenv("LUNARIA_OPENH264");
-   if (env && *env) return dlopen(env, RTLD_NOW | RTLD_LOCAL);
+   if (env && *env) return luna_os_library_open_local(env);
 
    char self[PATH_MAX];
    if (luna_os_executable_path(self, sizeof self) == 0) {
@@ -98,20 +98,25 @@ static void *openh264_dlopen(void)
          *slash = '\0';
          if ((size_t)snprintf(path, sizeof path, "%s/runtime/%s",
                               self,
-#ifdef __APPLE__
+#ifdef _WIN32
+                              "openh264.dll"
+#elif defined(__APPLE__)
                               "libopenh264.dylib"
 #else
                               "libopenh264.so"
 #endif
                               ) < sizeof path) {
-            void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+            void *h = luna_os_library_open_local(path);
             if (h) return h;
          }
       }
    }
 
    static const char *const fallbacks[] = {
-#ifdef __APPLE__
+#ifdef _WIN32
+      "openh264.dll",
+      "libopenh264.dll",
+#elif defined(__APPLE__)
       "/usr/local/lib/lunaria/libopenh264.dylib",
       "libopenh264.dylib",
 #else
@@ -121,7 +126,7 @@ static void *openh264_dlopen(void)
 #endif
    };
    for (size_t i = 0; i < sizeof fallbacks / sizeof *fallbacks; ++i) {
-      void *h = dlopen(fallbacks[i], RTLD_NOW | RTLD_LOCAL);
+      void *h = luna_os_library_open_local(fallbacks[i]);
       if (h) return h;
    }
    return NULL;
@@ -138,19 +143,19 @@ static bool openh264_ready(void)
    if (!h) {
       fprintf(stderr, "[media] no openh264: %s\n"
               "[media] H.264 decoding is unavailable — run `make fetch-openh264`"
-              " or set LUNARIA_OPENH264\n", dlerror());
+              " or set LUNARIA_OPENH264\n", luna_os_library_error());
       state = 0;
       return false;
    }
-   *(void **)&lm_WelsCreateDecoder = dlsym(h, "WelsCreateDecoder");
-   *(void **)&lm_WelsDestroyDecoder = dlsym(h, "WelsDestroyDecoder");
+   *(void **)&lm_WelsCreateDecoder = luna_os_library_symbol(h, "WelsCreateDecoder");
+   *(void **)&lm_WelsDestroyDecoder = luna_os_library_symbol(h, "WelsDestroyDecoder");
    if (!lm_WelsCreateDecoder || !lm_WelsDestroyDecoder) {
       fprintf(stderr, "[media] openh264 loaded but WelsCreateDecoder is missing\n");
       state = 0;
       return false;
    }
    unsigned (*ver)(void) = NULL;
-   *(void **)&ver = dlsym(h, "WelsGetCodecVersion");
+   *(void **)&ver = luna_os_library_symbol(h, "WelsGetCodecVersion");
    fprintf(stderr, "[media] openh264 ready%s\n", ver ? "" : " (version unknown)");
    state = 1;
    return true;
@@ -210,7 +215,7 @@ static struct {
 static void *dlopen_any(const char *const *names, size_t n)
 {
    for (size_t i = 0; i < n; ++i) {
-      void *h = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+      void *h = luna_os_library_open_local(names[i]);
       if (h) return h;
    }
    return NULL;
@@ -242,23 +247,31 @@ static bool avcodec_ready(void)
    state = 0;
 
    static const char *const codec_names[] = {
+      #ifdef _WIN32
+      "avcodec-55.dll", "libavcodec-55.dll",
+#else
       "libavcodec.so.55", "libavcodec.so",
+#endif
    };
    static const char *const util_names[] = {
+      #ifdef _WIN32
+      "avutil-52.dll", "libavutil-52.dll",
+#else
       "libavutil.so.52", "libavutil.so",
+#endif
    };
    const char *env = getenv("LUNARIA_LIBAVCODEC");
-   void *c = env && *env ? dlopen(env, RTLD_NOW | RTLD_LOCAL)
+   void *c = env && *env ? luna_os_library_open_local(env)
                          : dlopen_any(codec_names, 2);
    void *u = dlopen_any(util_names, 2);
    if (!c || !u) {
       fprintf(stderr, "[media] no libavcodec/libavutil: %s\n"
               "[media] AAC and libavcodec H.264 decoding are unavailable\n",
-              dlerror());
+              luna_os_library_error());
       return false;
    }
 #define AV_SYM(dst, lib, name) \
-   do { *(void **)&av.dst = dlsym(lib, name); if (!av.dst) { \
+   do { *(void **)&av.dst = luna_os_library_symbol(lib, name); if (!av.dst) { \
         fprintf(stderr, "[media] libav: %s missing\n", name); return false; } } while (0)
    AV_SYM(register_all, c, "avcodec_register_all");
    AV_SYM(find_decoder_by_name, c, "avcodec_find_decoder_by_name");
@@ -272,9 +285,9 @@ static bool avcodec_ready(void)
    AV_SYM(frame_channels, u, "av_frame_get_channels");
    AV_SYM(frame_sample_rate, u, "av_frame_get_sample_rate");
 #undef AV_SYM
-   *(void **)&av.decode_video2 = dlsym(c, "avcodec_decode_video2");
-   *(void **)&av.frame_best_effort_ts = dlsym(u, "av_frame_get_best_effort_timestamp");
-   *(void **)&av.flush_buffers = dlsym(c, "avcodec_flush_buffers");
+   *(void **)&av.decode_video2 = luna_os_library_symbol(c, "avcodec_decode_video2");
+   *(void **)&av.frame_best_effort_ts = luna_os_library_symbol(u, "av_frame_get_best_effort_timestamp");
+   *(void **)&av.flush_buffers = luna_os_library_symbol(c, "avcodec_flush_buffers");
 
    if (!avcodec_probe_layout()) {
       fprintf(stderr, "[media] libavcodec AVPacket layout is not the one this "
@@ -1445,7 +1458,7 @@ void lm_codec_release_output(struct lm_codec *c, int idx, bool render,
  * MP4 demuxing
  *
  * The moov box is read into memory whole (it is the index, tens of KB); the
- * media data stays on disk and samples are pread() on demand.  Everything the
+ * media data stays on disk and samples are luna_file_pread() on demand.  Everything the
  * players need is derived once at open() into a flat per-track sample table,
  * because both MediaExtractor and MediaPlayer walk samples in order and asking
  * the chunk tables per sample would be quadratic.
@@ -1821,7 +1834,7 @@ static bool lm_read_at(int fd, int64_t off, void *dst, size_t len)
 {
    size_t done = 0;
    while (done < len) {
-      ssize_t n = pread(fd, (char *)dst + done, len - done, (off_t)(off + (int64_t)done));
+      ssize_t n = luna_file_pread(fd, (char *)dst + done, len - done, off + (int64_t)done);
       if (n <= 0) return false;
       done += (size_t)n;
    }

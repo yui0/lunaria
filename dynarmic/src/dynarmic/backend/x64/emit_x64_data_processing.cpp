@@ -661,7 +661,7 @@ void EmitX64::EmitArithmeticShiftRight64(EmitContext& ctx, IR::Inst* inst) {
     }
 }
 
-void EmitX64::EmitRotateRight32(EmitContext& ctx, IR::Inst* inst) {
+void EmitX64::EmitRor32(EmitContext& ctx, IR::Inst* inst) {
     const auto carry_inst = inst->GetAssociatedPseudoOperation(IR::Opcode::GetCarryFromOp);
 
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
@@ -734,7 +734,7 @@ void EmitX64::EmitRotateRight32(EmitContext& ctx, IR::Inst* inst) {
     }
 }
 
-void EmitX64::EmitRotateRight64(EmitContext& ctx, IR::Inst* inst) {
+void EmitX64::EmitRor64(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     auto& operand_arg = args[0];
     auto& shift_arg = args[1];

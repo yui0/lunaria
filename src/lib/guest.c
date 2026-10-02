@@ -744,7 +744,12 @@ int clock_nanosleep(clockid_t clockid, int flags, const struct timespec *req,
    if (!timespec_ok(req)) return EINVAL;
    if ((flags & TIMER_ABSTIME) == 0 && req->tv_sec == 0 && req->tv_nsec == 0)
       return 0;
+   /* Like bionic's ErrnoRestorer: a delivered signal handler may change
+    * errno while the raw wait is suspended. Restore the caller's value. */
+   int *error_slot = __errno();
+   const int saved_errno = error_slot ? *error_slot : 0;
    rc = lunaria_raw_clock_nanosleep(clockid, flags, req, rem);
+   if (error_slot) *error_slot = saved_errno;
    return rc < 0 ? (int)-rc : 0;
 }
 

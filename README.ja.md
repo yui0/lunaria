@@ -1,11 +1,13 @@
 # Lunaria
 
-### Android を起動せずに、Linux 上で Android ゲームエンジンを動かす。
+### Android を起動せずに、Android ゲームエンジンを動かす。
 
 [![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-5b5bd6.svg)](LICENSE)
 [![Guests](https://img.shields.io/badge/guest-ARM32%20%7C%20ARM64-20232a.svg)](#仕組み)
 [![Engines](https://img.shields.io/badge/engines-Unity%20%7C%20Unreal-20232a.svg)](#互換性)
 [![Sponsor](https://img.shields.io/badge/sponsor-%E2%99%A5-ea4aaa.svg)](https://github.com/sponsors/yui0)
+
+[English](README.md)
 
 Lunaria は、Android 向けアプリを Linux 上で動かすための実験的な変換レイヤーです。
 APK、XAPK、APKS からネイティブライブラリを読み込み、ARM32/ARM64 コードを
@@ -22,18 +24,18 @@ OpenGL ES、MediaCodec を Linux ホスト側へ橋渡しします。APK 内の 
 > 対応状況はタイトルやゲームエンジンのバージョンによって異なります。
 
 <p align="center">
-  <img src="screenshot_genshin_shore.png" width="49%" alt="原神：モンド城外の水辺に立つ旅人。HUD 全体を表示">
-  &nbsp;
-  <img src="screenshot_crossworlds_cutscene.png" width="49%" alt="二ノ国：Cross Worlds のゲーム内カットシーン。空を背景に白髪の少年">
+  <img src="shots/genshin-mondstadt.png" width="100%" alt="原神：モンド城の上空を滑空する蛍。大聖堂の傍らに二つの竜巻">
 </p>
 
 <p align="center">
-  <img src="screenshot_genshin_dialog.png" width="49%" alt="原神プロローグ：蛍、パイモン、浮遊する仲間が赤く光る石を囲む場面">
+  <img src="shots/genshin-lakeshore.png" width="32%" alt="原神のオープンワールド：湖畔に立つ旅人。秋の木と HUD">
   &nbsp;
-  <img src="screenshot_genshin_cutscene.png" width="49%" alt="原神プロローグのカットシーン：指を差すパイモンと見守る蛍">
+  <img src="shots/genshin-jean.png" width="32%" alt="原神：騎士団の図書室に立つジン。奥の机にリサ">
+  &nbsp;
+  <img src="shots/cross-worlds-cutscene.png" width="32%" alt="二ノ国：Cross Worlds のカットシーン。空を背景に白髪の少年">
 </p>
 
-<p align="center"><sub>原神 7.1.0 · Unity IL2CPP · arm64-v8a &nbsp;·&nbsp; 二ノ国：Cross Worlds · Unreal Engine 4 · arm64-v8a<br>Linux 上のゲストフレームバッファー。APK の改変なし。</sub></p>
+<p align="center"><sub>原神 7.1.0 · Unity IL2CPP · arm64-v8a &nbsp;·&nbsp; 二ノ国：Cross Worlds · Unreal Engine 4 · arm64-v8a<br>Linux 上のゲストフレームバッファー。パッケージは改変していない。</sub></p>
 
 ## Lunaria の特徴
 
@@ -49,6 +51,8 @@ OpenGL ES、MediaCodec を Linux ホスト側へ橋渡しします。APK 内の 
 | **実在端末として認識** | `lunaria.conf` で実在する市販端末プロファイルを返します（既定は Pixel 6） |
 | **AArch64 の並列実行** | `LUNARIA_A64_ENGINES>1` にすると、ホストスレッド上で複数のゲストワーカーを実行 |
 | **タッチ HUD をキーボード操作** | 原神と Cross Worlds 用のキーマップを同梱。WASD、スキル、マウス視点操作を同時使用可能 |
+| **設定が残る** | SharedPreferences をステージし、commit して、次回起動で読み戻す。ログイン、サーバー、変更した音量が残る |
+| **アカウントを分ける** | `--profile` はインストール済みパッケージを共有したまま、設定とログイン状態を分ける |
 | **ヘッドレス対応** | X11 ウィンドウを利用できない場合は、サーフェスレス EGL pbuffer にフォールバック |
 | **診断機能を重視** | フレームキャプチャ、JIT プロファイリング、SVC トレース、ゲストメモリ監視に対応 |
 
@@ -61,40 +65,68 @@ OpenGL ES、MediaCodec を Linux ホスト側へ橋渡しします。APK 内の 
 ### 原神 7.1.0
 
 arm64-v8a 上の Unity IL2CPP、フレームバッファーは **1024×576** です。
-現在の実行では、HoYoverse のスプラッシュ画面、ログイン、サーバー選択を通過し、
-シェーダーコンパイルとリソースダウンロードを完了した後、**TAP TO BEGIN** を越えて
-実際のゲーム世界へ入り、モンド城外の海岸やパイモンとのプロローグカットシーンまで到達します。
-これらのフレームでは、キャラクターや背景もカラーで描画されています。
-
-以前の海岸シーンのキャプチャ（`screenshot_genshin_field.png`、
-`screenshot_genshin_swim.png`、`screenshot_genshin_chat.png`）では、
-旅人がまだ青いシルエットとして表示されています。ログイン画面の柱のマテリアルも引き続き確認中です。
-歩行入力と長時間実行についても、現在検証を続けています。
+2026年10月1日の実行では、保存済みのログインと Asia サーバーが戻り、
+シェーダーコンパイルとリソースのダウンロードを通過してオープンワールドに入りました。
+プロローグ、騎士団の図書室、モンド城の上空飛行はカラーで描画されています。
+フィールドではキーボード移動が通ります。計測に使ったホスト（Xeon E5-2697 v2）では
+フィールドがおよそ 18–22 fps、設定画面がおよそ 30 fps でした。
+変更した音楽音量は再起動後も残っていました。ホストの WebView からアカウントページを開けます。
+Google Play の課金は未実装です。
 
 <p align="center">
-  <img src="screenshot_genshin_shaders.png" width="48%" alt="原神のシェーダーコンパイル中ムービー。青空の下の柱と橋">
+  <img src="shots/genshin-wings.png" width="48%" alt="原神：青空を背景に風の翼を開いた蛍">
   &nbsp;
-  <img src="screenshot_genshin_login.png" width="48%" alt="原神のログイン画面。雲上の橋と夜空">
+  <img src="shots/genshin-lumine.png" width="48%" alt="原神のクローズアップ：味方か、新しい嵐かを問う蛍">
 </p>
 
 <p align="center">
-  <img src="screenshot_genshin_server.png" width="48%" alt="原神のサーバー選択画面。Asia を選択">
+  <img src="shots/genshin-prologue.png" width="48%" alt="原神プロローグ：蛍、パイモン、浮遊する仲間が赤く光る石を囲む場面">
   &nbsp;
-  <img src="screenshot_genshin_mail.png" width="48%" alt="原神のギフトメール画面。メールを開いた状態">
+  <img src="shots/genshin-paimon.png" width="48%" alt="原神プロローグのカットシーン：指を差すパイモンと見守る蛍">
 </p>
 
 <p align="center">
-  <img src="screenshot_genshin_language.png" width="72%" alt="原神の言語設定。日本語を表示">
+  <img src="shots/genshin-knights.png" width="48%" alt="原神：西風騎士団の門前に立つ旅人。近くにガイアとアンバー">
+  &nbsp;
+  <img src="shots/genshin-shore.png" width="48%" alt="原神：夕暮れのモンド城外、水辺に立つ旅人">
 </p>
 
-<p align="center"><sub>シェーダーコンパイル · ログイン · サーバー · メール · 言語設定</sub></p>
+<p align="center"><sub>飛行 · プロローグ · 騎士団の門 · モンド城外の岸</sub></p>
 
-同じ起動過程では、その途中のフレームも取得されています。
-シェーダー進行画面（`screenshot_genshin_compile.png`、`screenshot_genshin_compile_early.png`）、
-データ読み込み（`screenshot_genshin_loading.png`）、**TAP TO BEGIN**
-（`screenshot_genshin_begin.png`）、元素のスプラッシュ画面
-（`screenshot_genshin_elements.png`）、HoYoverse カード
-（`screenshot_genshin_splash.png`）です。
+<details>
+<summary>ログイン、ダウンロード、設定</summary>
+
+<p align="center">
+  <img src="shots/genshin-shaders.png" width="48%" alt="原神のシェーダーコンパイル中の映像。青空の下の柱廊">
+  &nbsp;
+  <img src="shots/genshin-tap.png" width="48%" alt="原神の夕焼けの門。TAP TO BEGIN">
+</p>
+
+<p align="center">
+  <img src="shots/genshin-download.png" width="48%" alt="原神：夜の柱廊の上でアップデートをダウンロード中">
+  &nbsp;
+  <img src="shots/genshin-login.png" width="48%" alt="原神のログイン画面。雲上の橋と夜空">
+</p>
+
+<p align="center">
+  <img src="shots/genshin-server.png" width="48%" alt="原神のサーバー選択画面。Asia を選択">
+  &nbsp;
+  <img src="shots/genshin-library.png" width="48%" alt="原神：図書室の時計の横、横顔のジン">
+</p>
+
+<p align="center">
+  <img src="shots/genshin-language.png" width="72%" alt="原神の言語設定。日本語を表示">
+</p>
+
+<p align="center"><sub>シェーダーコンパイル · TAP TO BEGIN · ダウンロード · ログイン · サーバー · 図書室 · 言語</sub></p>
+
+</details>
+
+途中のフレームも残しています。シェーダー進行（`shots/genshin-compile.png`、
+`shots/genshin-compile-early.png`）、データ読み込み（`shots/genshin-loading.png`）、
+別の **TAP TO BEGIN**（`shots/genshin-begin.png`）、元素のスプラッシュ
+（`shots/genshin-elements.png`）、HoYoverse カード（`shots/genshin-splash.png`）、
+ギフトメール（`shots/genshin-mail.png`）です。
 
 ### 二ノ国：Cross Worlds
 
@@ -110,57 +142,62 @@ arm64-v8a 上で動作する商用 UE4 タイトルです。ゲスト側のロ�
 フレームバッファーは **1024×576** です。
 
 <p align="center">
-  <img src="screenshot_crossworlds_title.png" width="48%" alt="Cross Worlds のタイトル画面">
+  <img src="shots/cross-worlds-village.png" width="48%" alt="Cross Worlds の開始地点の村">
   &nbsp;
-  <img src="screenshot_crossworlds_servers.png" width="48%" alt="Cross Worlds のサーバー選択画面（Luxelion）">
+  <img src="shots/cross-worlds-play.png" width="48%" alt="Cross Worlds のゲーム内プレイ。クエストと HUD を表示">
 </p>
 
 <p align="center">
-  <img src="screenshot_crossworlds_account.png" width="48%" alt="Cross Worlds のアカウント連携ダイアログ">
+  <img src="shots/cross-worlds-chloe.png" width="48%" alt="Cross Worlds のストーリー会話。クロエ">
   &nbsp;
-  <img src="screenshot_crossworlds_character_select.png" width="48%" alt="Cross Worlds のキャラクター選択画面">
+  <img src="shots/cross-worlds-characters.png" width="48%" alt="Cross Worlds のキャラクター選択画面">
+</p>
+
+<p align="center"><sub>開始地点の村 · ゲーム内 · クロエ · キャラクター選択</sub></p>
+
+<details>
+<summary>タイトル、サーバー、イントロ</summary>
+
+<p align="center">
+  <img src="shots/cross-worlds-title.png" width="48%" alt="Cross Worlds のタイトル画面">
+  &nbsp;
+  <img src="shots/cross-worlds-servers.png" width="48%" alt="Cross Worlds のサーバー選択画面（Luxelion）">
 </p>
 
 <p align="center">
-  <img src="screenshot_crossworlds_village.png" width="48%" alt="Cross Worlds の開始地点の村">
+  <img src="shots/cross-worlds-intro.png" width="48%" alt="Cross Worlds の 3D イントロ">
   &nbsp;
-  <img src="screenshot_crossworlds_ingame.png" width="48%" alt="Cross Worlds のゲーム内プレイ。クエストと HUD を表示">
+  <img src="shots/cross-worlds-evermore.png" width="48%" alt="Cross Worlds のエバーモア到着場面">
 </p>
 
 <p align="center">
-  <img src="screenshot_crossworlds_dialog.png" width="48%" alt="Cross Worlds のストーリー会話。クロエ">
+  <img src="shots/cross-worlds-account.png" width="48%" alt="Cross Worlds のアカウント連携ダイアログ">
   &nbsp;
-  <img src="screenshot_crossworlds_evermore.png" width="48%" alt="Cross Worlds のエバーモア到着場面">
+  <img src="shots/cross-worlds-rest.png" width="48%" alt="Cross Worlds の省電力画面。休憩中">
 </p>
 
-<p align="center">
-  <img src="screenshot_crossworlds_intro.png" width="48%" alt="Cross Worlds の 3D イントロ">
-  &nbsp;
-  <img src="screenshot_crossworlds_power_save.png" width="48%" alt="Cross Worlds の省電力画面。休憩中">
-</p>
-
-<p align="center"><sub>タイトル · サーバー · アカウント · キャラクター選択 · 村 · ゲーム内 · クロエ · エバーモア · イントロ · クライアント内蔵の休憩画面</sub></p>
+</details>
 
 ### オープンソースおよび小規模タイトル
 
 <p align="center">
-  <img src="screenshot_btw_menu.png" width="48%" alt="Between Two Worlds のメインメニュー">
+  <img src="shots/between-two-worlds.png" width="48%" alt="Between Two Worlds のメインメニュー">
   &nbsp;
-  <img src="screenshot_fpsmobile_map.png" width="48%" alt="Unreal Engine 4 の FirstPersonExampleMap">
+  <img src="shots/unreal-first-person.png" width="48%" alt="Unreal Engine 4 の FirstPersonExampleMap">
 </p>
 
 <p align="center"><sub>Between Two Worlds · Unity 2023 IL2CPP · 1280×720 &nbsp;·&nbsp; FPSMobile · UE4 · armeabi-v7a · Mesa llvmpipe</sub></p>
 
 <p align="center">
-  <img src="screenshot_unitysample_gameplay.png" width="48%" alt="UnitySampleGame の 3D ゲームプレイ">
+  <img src="shots/unity-sample.png" width="48%" alt="UnitySampleGame の 3D ゲームプレイ">
   &nbsp;
-  <img src="screenshot_timelocker_gameplay.png" width="28%" alt="TIME LOCKER の縦画面チュートリアル">
+  <img src="shots/time-locker.png" width="28%" alt="TIME LOCKER の縦画面チュートリアル">
 </p>
 
 <p align="center"><sub>UnitySampleGame：以前の 1280×720 実行でプレイ可能シーンまで到達 &nbsp;·&nbsp; TIME LOCKER：720×1280 のチュートリアル</sub></p>
 
 <p align="center">
-  <img src="screenshot_blackclover_splash.png" width="360" alt="Black Clover の Unity スプラッシュ画面">
+  <img src="shots/black-clover.png" width="360" alt="Black Clover の Unity スプラッシュ画面">
 </p>
 
 <p align="center"><sub>Black Clover: Asta Fight · Unity スプラッシュ画面、ヘッドレス</sub></p>
@@ -177,9 +214,9 @@ ALSA 出力、キーボードマップ、WebView のズームとエンジン、�
 フルスクリーン、終了を操作できます。
 
 <p align="center">
-  <img src="screenshot_lunaria_bootcard.png" width="48%" alt="Lunaria の起動画面。青空を背景に進捗リングが 95% を示す">
+  <img src="shots/boot.png" width="48%" alt="Lunaria の起動画面。青空を背景に進捗リングが 95% を示す">
   &nbsp;
-  <img src="screenshot_host_menu.png" width="42%" alt="Lunaria のホストメニュー。WebView エンジンのサブメニューを表示">
+  <img src="shots/host-menu.png" width="42%" alt="Lunaria のホストメニュー。WebView エンジンのサブメニューを表示">
 </p>
 
 <p align="center"><sub>起動画面 · ホストメニュー（WebView エンジンは luna-browser、ズーム 200%、ミュート有効）</sub></p>
@@ -195,13 +232,33 @@ sudo apt install \
   build-essential cmake pkg-config \
   libboost-dev libbsd-dev libunwind-dev \
   libglfw3-dev libegl1-mesa-dev libgles2-mesa-dev \
-  libssl-dev libicu-dev zlib1g-dev \
+  libssl-dev zlib1g-dev \
   libasound2-dev libvulkan-dev
 ```
 
 `libvulkan-dev` は Vulkan ブリッジ用のヘッダーを提供します。
 ブリッジは `LUNARIA_VULKAN=1` を設定するまで無効です。有効にすると、
 ホスト側の `libvulkan.so.1` を `dlopen` します。
+
+Windows x86_64 は [MSYS2 UCRT64 シェル](https://www.msys2.org/docs/environments/)を使います。
+
+```bash
+pacman -S --needed git make zip unzip bzip2 \
+  mingw-w64-ucrt-x86_64-{gcc,cmake,ninja,pkgconf,python,boost,glfw,angleproject,openssl,zlib,libgnurx,vulkan-headers}
+```
+
+`ANDROID_HOME` に Build Tools の RenderScript arm64 ライブラリを含む Android SDK、
+`ANDROID_NDK_HOME` に NDK ディレクトリを指定して実行します。
+
+```bash
+make -j4 dist CC=gcc CXX=g++ DYNARMIC_JOBS=4
+```
+
+Windows は JVM・Dalvik・UI・Android のホスト API を `lunaria.exe` に結合します。
+ZIP には外部のホスト DLL と OpenH264、および既存のゲスト JIT 経路で使う
+実際の AArch64 ライブラリを `syslib-arm64/` に含めます。ホスト shim DLL は不要です。
+展開先で PowerShell から `.\lunaria.exe game.apk` を実行するか、APK を実行ファイルへドロップします。
+実行時には MSYS2・シェル・Python・ICU は不要です。
 
 ### 2. ビルド
 
@@ -215,18 +272,23 @@ make x86_64 -j"$(nproc)"   # ホストが x86_64 の場合。単純な `make` �
 
 `make syslib` は `syslib-arm64/` に AArch64 用の libm、bionic libc、libz を配置します。
 このディレクトリが存在する場合、ランチャーは `LUNARIA_SYSLIB_DIR` をそこへ向けます。
-これにより、純粋な算術処理（`pow`、`sincosf`）や inflate をゲスト内で処理できます。
+これにより、監査済みの純粋な算術処理（`pow`、`sincosf`）やメモリ処理をゲスト JIT 内で処理します。
+システムの zlib は、既存の計測でゲスト JIT より高速なホスト実装を SVC 経由で使用します。
 
 `make guestlib` は `src/lib/guest.c` から `liblunaria_guest.so` をビルドします。
 ゼロ時間の `nanosleep` は JIT の外へ出ることなく処理されます。
 
+Unicode の分類・正規化・IDN は本体に組み込んだ文字テーブルを使います。
+その他の文字コードは Windows のコードページまたは Linux/macOS の iconv、
+Windows の日時は OS の時刻規則と小さな CLDR 対応表を使います。ICU はビルド時・実行時とも不要です。
+
 ### 3. パッケージを起動
 
 ```bash
-./lunaria-apk.sh path/to/game.apk
-./lunaria-apk.sh path/to/game.xapk
-./lunaria-apk.sh path/to/game.apks
-LUNARIA_ALSA_DEVICE="hw:7,0" ./lunaria-apk.sh Cross+Worlds_5.03.04_APKPure.xapk
+./lunaria path/to/game.apk
+./lunaria path/to/game.xapk
+./lunaria path/to/game.apks
+LUNARIA_ALSA_DEVICE="hw:7,0" ./lunaria Cross+Worlds_5.03.04_APKPure.xapk
 ```
 
 ランチャーは `arm64-v8a` または `armeabi-v7a` を判定し、メインのネイティブライブラリを探し、
@@ -234,19 +296,51 @@ LUNARIA_ALSA_DEVICE="hw:7,0" ./lunaria-apk.sh Cross+Worlds_5.03.04_APKPure.xapk
 
 XAPK / APKS では、ベース APK 自体は変更せず、split APK の内容をその一時構成へ重ね合わせます。
 展開済みツリーは、パッケージ識別情報をキーとして
-`${LUNARIA_CACHE_DIR:-/tmp/lunaria-cache}` 以下にキャッシュされます。
+起動時に選択したデータ保存先の `cache/packages/` 以下にキャッシュされます。
+`LUNARIA_CACHE_DIR` で展開キャッシュだけを別の場所に変更できます。
 `LUNARIA_NO_CACHE=1` を指定すると、毎回新しく展開します。
+
+展開中は進捗率・処理済み MiB・ファイル数・処理中のファイル名を表示します。
+巨大なファイルの途中でも表示を更新し、キャッシュ確認や大きなファイルのコピーも表示します。
+OBB の別名はハードリンクまたはシンボリックリンクで元のアーカイブを共有し、
+起動のたびに数 GB をコピーする処理を避けます。
 
 1回の起動ではなくインストール単位の設定は、`lunaria.conf`
 （`lunaria.conf.sample` を参照）に記述します。ここでは、ゲストに報告する端末、
 ゲスト `/data` の保存先（`LUNARIA_DATA_ROOT`）、使用する WebView エンジンなどを設定します。
 同じ変数が環境変数として指定されている場合は、その起動に限り環境変数が優先されます。
 
+設定ファイルの既定は起動ディレクトリ直下の `lunaria.conf`、データの既定も
+起動ディレクトリです。設定ファイルは `--config` または `LUNARIA_CONF`、
+データは `--data-root` または設定ファイル内の `LUNARIA_DATA_ROOT` で変更できます。
+相対パスは起動ディレクトリを基準にします。別ドライブのパスや空白を含むパスも指定できます。
+
+```bash
+./lunaria --config ./lunaria.conf --data-root "/mnt/games/Lunaria data" game.xapk
+# macOS: --data-root /Volumes/Games/Lunaria
+# Windows のシェル: --data-root D:/Games/Lunaria
+```
+
+アカウントのプロファイルは、インストール済みの APK と設定したゲームのリソースパスを共有し、
+設定、データベース、ログインファイル、その他の外部ファイルは分けます。
+`default` は既存アカウントのディレクトリをそのまま使います。
+
+```bash
+./lunaria --choose-profile game.xapk
+./lunaria --profile account2 game.xapk
+./lunaria --list-profiles game.xapk
+```
+
+`LUNARIA_PROFILE_PROMPT=1` で起動のたびに選択します。共有するリソース名は
+`LUNARIA_SHARED_ASSETS` にコロン区切りで、新しいプロファイルへ一度だけコピーする
+リソースの一覧は `LUNARIA_PROFILE_SEED_FILES` に書きます。サンプルには原神の
+リソース配置が入っています。新しいプロファイルは、自分のログイン状態から始まります。
+
 複数の ABI を含むパッケージでゲストアーキテクチャを固定したい場合：
 
 ```bash
-LUNARIA_ARCH=armeabi-v7a ./lunaria-apk.sh game.apk
-LUNARIA_ARCH=arm64-v8a  ./lunaria-apk.sh game.apk
+LUNARIA_ARCH=armeabi-v7a ./lunaria game.apk
+LUNARIA_ARCH=arm64-v8a  ./lunaria game.apk
 ```
 
 ## 互換性
@@ -258,13 +352,13 @@ LUNARIA_ARCH=arm64-v8a  ./lunaria-apk.sh game.apk
 |---|---|---|
 | **Ni no Kuni: Cross Worlds** | Unreal Engine 4 · AArch64 XAPK | Linux 上で、ゲストログイン、村、ストーリー会話、ゲーム内カットシーン、実際のプレイまで描画を確認。SharedPreferences も保持されます。現行ビルドの確認では 3D イントロまで描画できていますが、そのビルドでの完全なプレイ確認はまだ未完了です。macOS ではフレームバッファーには描画されるものの、実際のウィンドウは黒いままです |
 | **Blade & Soul Masia** | Unreal Engine 5 · AArch64 APKS | オープニング動画が EOS まで到達。タイトル画面と追加パッチのダイアログを表示でき、Agree を押すとダウンロードが進みます |
-| **Genshin Impact 7.1.0** | Unity IL2CPP · AArch64 XAPK | HoYoverse スプラッシュ、ログイン、サーバー選択を通過し、シェーダーコンパイル、リソースダウンロード、**TAP TO BEGIN**、モンド城外の海岸、プロローグカットシーン（パイモン、日本語会話）まで到達。最近のフレームではキャラクターもカラー描画されています。ホスト WebView でアカウントページを開くことも可能です。歩行入力と長時間実行は引き続き検証中です |
+| **Genshin Impact 7.1.0** | Unity IL2CPP · AArch64 XAPK | Linux 上でオープンワールドまで到達。保存済みのログインと Asia サーバーが戻り、シェーダーコンパイル、リソースダウンロード、**TAP TO BEGIN**、フィールドへ進む。プロローグ、図書室、モンド城上空の飛行はカラーで描画。フィールドではキーボード移動が通り、計測ホストではフィールドおよそ 18–22 fps、設定画面およそ 30 fps。変更した音楽音量は再起動後も残った。ホスト WebView でアカウントページを開ける。Google Play の課金は未実装 |
 | **Between Two Worlds** | Unity 2023 IL2CPP · ARMv7 | プレイ可能。メインストーリーのシーンまで到達 |
 | **Between Two Worlds** | Unity 2023 IL2CPP · AArch64 | 記録済みの実行ではメインメニューまで到達。最近の確認では言語選択画面まで約 70 fps |
 | **FPSMobile** | Unreal Engine 4 · ARMv7 | FirstPersonExampleMap を描画。16,000 回以上の swap を確認 |
-| **UnitySampleGame** | Unity · ARMv7 | 以前の実行では 3D シーンまで到達。現在のビルドでは、SVC 内部から `System.loadLibrary` が ARM32 JIT に再入して abort します |
+| **UnitySampleGame** | Unity · ARMv7 | Start から 3D ゲーム画面に遷移し、描画が継続します（2026-10-02 確認） |
 | **TIME LOCKER** | Unity · ARMv7 | 縦画面のチュートリアルゲームプレイまで到達 |
-| **Black Clover: Asta Fight** | Unity IL2CPP · AArch64 XAPK | Base + split の読み込みに成功し、Unity スプラッシュ画面をヘッドレスで描画 |
+| **Black Clover: Asta Fight** | Unity IL2CPP · AArch64 XAPK | Base + split の読み込みに成功し、タイトル・ステージ選択・ゲーム画面をヘッドレスで描画 |
 | **Blade & Soul Revolution** | Unreal Engine 4 · AArch64 | dex / SDK 初期化を通過してゲーム独自ダイアログまで起動。パッチサーバーへの経路がない場合、クライアントは再接続を要求します |
 | **Daggerfall Unity** | Unity Mono · ARMv7 | Mono ランタイムは起動。描画はまだブロックされています |
 
@@ -283,7 +377,7 @@ curl -L -o test/FPSMobile-armv7.apk \
 curl -L -o test/main.1.com.YourCompany.FPSMobile.obb \
   "https://raw.githubusercontent.com/Abhishrut/UnrealEngineAndroidSamples/main/main.1.com.YourCompany.FPSMobile.obb"
 
-LUNARIA_ARCH=armeabi-v7a ./lunaria-apk.sh test/FPSMobile-armv7.apk
+LUNARIA_ARCH=armeabi-v7a ./lunaria test/FPSMobile-armv7.apk
 ```
 
 ### Between Two Worlds / Unity 2023 IL2CPP
@@ -293,9 +387,14 @@ LUNARIA_ARCH=armeabi-v7a ./lunaria-apk.sh test/FPSMobile-armv7.apk
 ```bash
 make fetch-btw
 
-LUNARIA_ARCH=armeabi-v7a ./lunaria-apk.sh test/btw-android.apk
-LUNARIA_ARCH=arm64-v8a  ./lunaria-apk.sh test/btw-android.apk
+LUNARIA_ARCH=armeabi-v7a ./lunaria test/btw-android.apk
+LUNARIA_ARCH=arm64-v8a  ./lunaria test/btw-android.apk
 ```
+
+この配布ファイルは拡張子が `.apk` ですが、中身は Android App Bundle です。
+ランチャーは protobuf マニフェスト、base モジュール、Unity アセットパックを
+直接読み込みます。`.aab` 拡張子でも起動できます。
+
 
 ### Daggerfall Unity / Unity Mono
 
@@ -303,7 +402,7 @@ LUNARIA_ARCH=arm64-v8a  ./lunaria-apk.sh test/btw-android.apk
 
 ```bash
 make fetch-libunity
-./lunaria-apk.sh test/dfu-mono-32bit.apk
+./lunaria test/dfu-mono-32bit.apk
 ```
 
 </details>
@@ -322,8 +421,8 @@ make fetch-libunity
 現在の設定は変更されません。起動時にキーマップを指定することもできます。
 
 ```sh
-LUNARIA_KEYMAP=genshin ./lunaria-apk.sh /path/to/Genshin.xapk
-LUNARIA_KEYMAP=crossworlds ./lunaria-apk.sh /path/to/CrossWorlds.apks
+LUNARIA_KEYMAP=genshin ./lunaria /path/to/Genshin.xapk
+LUNARIA_KEYMAP=crossworlds ./lunaria /path/to/CrossWorlds.apks
 ```
 
 同梱レイアウトでは、**WASD** を移動、**F** を通常攻撃、
@@ -366,7 +465,7 @@ HUD の大きさや配置を変更した場合は座標も調整してくださ�
 mkdir -p /tmp/lunaria-shots
 LUNARIA_DUMP_DIR=/tmp/lunaria-shots \
 LUNARIA_DUMP_FRAME=0,60,120 \
-./lunaria-apk.sh game.apk
+./lunaria game.apk
 ```
 
 または、*N* 回の swap ごとに保存する場合：
@@ -374,7 +473,7 @@ LUNARIA_DUMP_FRAME=0,60,120 \
 ```bash
 LUNARIA_DUMP_DIR=/tmp/lunaria-shots \
 LUNARIA_SCREENSHOT_EVERY=60 \
-./lunaria-apk.sh game.xapk
+./lunaria game.xapk
 ```
 
 フレームは PNG として保存されます（例：`lunaria_0000.png`）。
@@ -406,7 +505,7 @@ F12 キー、またはホストメニューの **Take Screenshot** を使用し�
   スタックを配置し、dynarmic fastmem を利用できるようにしています。
   `LUNARIA_A64_ENGINES`（1〜8、既定値はホスト CPU コア数から決定）を使うと、
   複数の JIT エンジンをホストスレッド上で並行実行できます。
-  `lunaria-apk.sh` は `LUNARIA_A64_SELF_SCHED=1` を設定するため、
+  `lunaria` は `LUNARIA_A64_SELF_SCHED=1` を設定するため、
   各エンジンは実行可能なゲストを継続的に取得します。
   `LUNARIA_A64_SELF_SCHED=0` にすると、各 frame-pump パスで同期バリアを使う方式へ戻ります。
   自由実行型のエンジンは実機に近い動作となり、スループットが大幅に向上します。
@@ -468,11 +567,11 @@ F12 キー、またはホストメニューの **Take Screenshot** を使用し�
 | `LUNARIA_SYSLIB_DIR` | `syslib-arm64/`（存在する場合） | ゲストコードとして実行する AArch64 プラットフォームライブラリ。`make syslib` で libm、libc、libz を取得し、`make guestlib` で `liblunaria_guest.so` を作成 |
 | `LUNARIA_VULKAN` | off | `1` で Vulkan を公開し、`vk*` 呼び出しをホストへ橋渡し。既定は GLES |
 | `LUNARIA_TOUCH_TEST` | off | `x,y[;x,y…]` 形式でタップを注入（最大 8 個）。単純な数値はフレームバッファーに対する百分率、`640px` はゲストピクセル |
-| `LUNARIA_TOUCH_FIFO` | off | 実行中のタップ入力。`echo 'x,y[,hold]' > $LUNARIA_TOUCH_FIFO` |
+| `LUNARIA_TOUCH_FIFO` | off | 実行中のタップ入力。`echo 'x,y[,hold]' > $LUNARIA_TOUCH_FIFO` Windows は `\\.\pipe\lunaria-touch`（名前付きパイプ）。 |
 | `LUNARIA_KEYMAP` | off | `genshin`、`crossworlds`、`off`、またはキーマップファイルのパス。ホストメニューから実行中に変更可能 |
 | `LUNARIA_DEVICE` | `pixel6` | 端末プロファイル：`pixel6`、`pixel7`、`galaxys21`、`lunaria`。通常は `lunaria.conf` を推奨 |
-| `LUNARIA_DATA_ROOT` | launcher directory | ゲストの `/data` と `/storage`。大規模タイトルのダウンロード先もここ |
-| `LUNARIA_CONF` | `./lunaria.conf` → ランチャーディレクトリ → `~/.config/lunaria/lunaria.conf` | 読み込む設定ファイル。環境変数が優先 |
+| `LUNARIA_DATA_ROOT` | 起動ディレクトリ | ゲストの `/data` と `/storage`。`--data-root DIR` でも指定可能 |
+| `LUNARIA_CONF` | 起動ディレクトリ直下の `lunaria.conf` | 読み書きする設定ファイル。`--config FILE` でも指定可能。別の場所を自動検索しない |
 | `LUNARIA_WEB_ENGINE` | `auto` | `auto`、`chrome`、`luna`、`off`。ホストメニューからセッション中に上書き可能 |
 | `LUNARIA_SCALE` | off | 選択した端末パネル自体を拡大縮小（`0.5` なら半分）。未設定時は `LUNARIA_WIDTH` × `LUNARIA_HEIGHT` |
 | `LUNARIA_TOUCH_FRAME` / `_HOLD` / `_GAP` | `60` / `10` / `60` | 最初の DOWN フレーム / 押下時間 / タップ間隔 |
@@ -495,13 +594,13 @@ F12 キー、またはホストメニューの **Take Screenshot** を使用し�
 | `LUNARIA_DVM_TRACE` | off | エミュレーターが処理できなかったメソッドを `[dvm] miss …` として記録 |
 | `LUNARIA_DEX_START` | on | APK の Activity ライフサイクルを dex から実行。旧来の手書き起動シーケンスと比較する場合のみ `0` |
 | `LUNARIA_NET` | on | `0` でゲストの全 socket 通信を拒否 |
-| `LUNARIA_CACHE_DIR` | `/tmp/lunaria-cache` | ランチャーの永続展開キャッシュ |
+| `LUNARIA_CACHE_DIR` | 起動時のデータ保存先の `cache/packages/` | ランチャーの永続展開キャッシュ。個別に移動可能 |
 | `LUNARIA_NO_CACHE` | off | APK / XAPK / APKS を毎回新しく展開 |
 
 エンジンのエントリポイント（`ANativeActivity_onCreate`、`UnityPlayer.initJni`）を持たない APK でも、
 現在は拒否せず、launcher Activity から起動します。
 
-`lunaria-apk.sh` が manifest から対象 Activity を読み取り、
+`lunaria` が manifest から対象 Activity を読み取り、
 `ANDROID_LAUNCH_ACTIVITY` として渡します。
 ローダーはバイトコード VM 経由で `onCreate` / `onStart` / `onResume` を実行します。
 
@@ -528,7 +627,8 @@ tick 値には `K`、`M`、`G` の接尾辞を使用できます。
 | `keymaps/` | 同梱タッチマップ（`genshin.conf`、`crossworlds.conf`） |
 | `lunaria.conf.sample` | 端末プロファイル、data root、画面スケール、パッケージ台帳、WebView エンジン |
 | `runtime/` | 生成された Android 互換ホスト共有ライブラリ |
-| `lunaria-apk.sh` | APK / XAPK / APKS の解析、展開、起動パイプライン |
+| `src/apk.c` | 本体内の APK / XAPK / APKS 展開キャッシュ、manifest 解析、起動 |
+| `src/luna_unicode.c` | 組み込み Unicode 分類・正規化・IDNA2003 |
 | `PROGRESS.md` | 詳細な互換性メモと現在の開発状況 |
 
 ## トラブルシューティング
@@ -586,7 +686,7 @@ make runtime/libmediandk.so runtime/libGLESv3.so
 
 ```bash
 LUNARIA_TRACE_EXC=1 LUNARIA_DUMP_LAST_SVC=1 \
-./lunaria-apk.sh game.apk 2>&1 | tee lunaria.log
+./lunaria game.apk 2>&1 | tee lunaria.log
 ```
 
 UE5 タイトルでは、可能であればハードウェア GL ドライバーを使用してください。
@@ -634,10 +734,13 @@ Linux では、ウィンドウ表示とフレームバッファーの内容が�
 macOS ビルド（`make dist-mac`）ではフレームバッファーへ描画できるものの、
 画面上の実ウィンドウが黒いままになる場合があります。
 
-Windows 向け OS レイヤーは存在しますが、Windows バイナリはまだありません。
-JIT が現時点でも `mmap` を直接呼び出しているためです。
+Windows の `make dist` は、結合した実行ファイルと依存 DLL を含む ZIP を生成します。
+ZIP の展開先から、Wine 上の ARM32・ARM64 ABI テストと EGL/GLES 初期化を確認しました。
+Windows 実機での表示・音声は未検証です。
 
-`make dist` は、ビルドディレクトリに依存しない Linux 向け配布ツリーを作成します。
+`make dist` は、ビルドディレクトリに依存しない配布ツリーを作成します。
+配布用は `-O3`、`-DNDEBUG`、LTO で最適化し、Dynarmic も Release + IPO で
+専用ディレクトリへ再ビルドします。`-march=native` は指定しません。
 
 Android API の未実装、タイトル固有の問題、大量の診断出力、
 破壊的変更が含まれることを前提にしてください。
