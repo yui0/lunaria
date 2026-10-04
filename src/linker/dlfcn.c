@@ -21,12 +21,27 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 #include <pthread.h>
 #include <time.h>
 #include <stdio.h>
 #include <string.h>
 #include "linker.h"
+#include "lunaria_os.h"
+#ifdef _WIN32
+#define RTLD_LAZY 1
+#define RTLD_NOW 2
+#define RTLD_DEFAULT ((void *)0)
+#define RTLD_NEXT ((void *)-1)
+typedef struct {
+    const char *dli_fname;
+    void *dli_fbase;
+    const char *dli_sname;
+    void *dli_saddr;
+} Dl_info;
+#endif
 #include "linker_format.h"
 
 #include "trace.h"
@@ -82,9 +97,13 @@ void *bionic_dlopen(const char *filename, int flag)
 
         char path[4096];
         snprintf(path, sizeof(path), RUNTIMEPATH "/%s", filename);
+#ifdef _WIN32
+        ret = (soinfo *)luna_os_library_open(filename);
+        if (!ret) ret = (soinfo *)luna_os_library_open(path);
+#else
         ret = (soinfo *)dlopen(filename, flag);
-        if (!ret)
-            ret = (soinfo *)dlopen(path, flag);
+        if (!ret) ret = (soinfo *)dlopen(path, flag);
+#endif
         if (!ret)
             set_dlerror(DL_ERR_CANNOT_LOAD_LIBRARY);
     } else {
@@ -126,11 +145,11 @@ void *bionic_dlsym(void *handle, const char *symbol)
     {
         char wrap_sym_name[1024] = { 'b', 'i', 'o', 'n', 'i', 'c', '_' };
         memcpy(wrap_sym_name + 7, symbol, MIN(sizeof(wrap_sym_name) - 7, strlen(symbol)));
-        if ((sym = dlsym(RTLD_DEFAULT, wrap_sym_name))) {
+        if ((sym = luna_os_library_symbol(NULL, wrap_sym_name))) {
             pthread_mutex_unlock(&apkenv_dl_lock);
             verbose("found bionic_ version");
             return wrapper_create(symbol, sym);
-        } else if ((sym = dlsym(RTLD_DEFAULT, symbol))) {
+        } else if ((sym = luna_os_library_symbol(NULL, symbol))) {
             pthread_mutex_unlock(&apkenv_dl_lock);
             verbose("found system version");
             return wrapper_create(symbol, sym);

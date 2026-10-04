@@ -42,9 +42,9 @@
 #include <stdint.h>
 #include <elf.h>
 /* ELF debugger structures used by the Android loader on non-ELF hosts.
- * glibc declares these in <link.h>; Apple's libc has no such header, so the
+ * glibc declares these in <link.h>; macOS and Windows lack that header, so the
  * three structures the loader actually reads are spelled out here. */
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(_WIN32)
 # if UINTPTR_MAX > 0xffffffffu
 #  define ElfW(type) Elf64_##type
 # else

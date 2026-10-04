@@ -150,3 +150,27 @@ size_t dvm_tls_session_id(const struct dvm_tls *t, uint8_t *out, size_t outsz);
 /* IANA names of the cipher suites this TLS library can offer, NULL-terminated
  * and owned by the library. */
 const char *const *dvm_tls_supported_ciphers(void);
+
+/* DNS-SD host adapter. */
+/* Caller serializes operations. Events own TXT data until event_clear().
+ * Callbacks are collected during poll; guest code never runs inside Avahi. */
+struct nsd_host;
+enum nsd_event_kind { NSD_FOUND, NSD_LOST, NSD_RESOLVED, NSD_FAILED };
+struct nsd_event {
+   uint64_t id;
+   enum nsd_event_kind kind;
+   int error, interface, protocol;
+   char name[256], type[256], domain[256], host[256], address[64];
+   uint16_t port;
+   unsigned char *txt;
+   size_t txt_size;
+};
+struct nsd_host *nsd_host_open(int *error);
+void nsd_host_close(struct nsd_host *host);
+int nsd_host_browse(struct nsd_host *, uint64_t id, const char *type);
+/* Keep the resolver open for service-info change notifications. */
+int nsd_host_resolve(struct nsd_host *, uint64_t id, const struct nsd_event *service);
+int nsd_host_cancel(struct nsd_host *, uint64_t id);
+int nsd_host_poll(struct nsd_host *);
+int nsd_host_next(struct nsd_host *, struct nsd_event *out);
+void nsd_event_clear(struct nsd_event *);

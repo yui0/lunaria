@@ -8,7 +8,6 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <execinfo.h>
 #include <memory>
 #include <mutex>
 

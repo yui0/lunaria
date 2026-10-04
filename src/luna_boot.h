@@ -24,6 +24,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -57,6 +58,15 @@ void luna_boot_guest_presented(void);
 
 /* Takes the card down for good. */
 void luna_boot_finish(const char *why);
+
+/* Installation/profile UI and native-window handoff. */
+int luna_launcher_begin(const char *path);
+void luna_launcher_progress(const char *stage, const char *file, uint64_t bytes, uint64_t total);
+int luna_launcher_cancelled(void);
+int luna_launcher_choose(const char *package, const char *const *profiles,
+                         size_t count, char *choice, size_t capacity);
+void luna_launcher_end(int keep_window);
+void *luna_launcher_take_window(void);
 
 #ifdef __cplusplus
 }

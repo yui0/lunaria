@@ -24,6 +24,7 @@
 
 #include "lunaria_os.h"
 
+#include <locale.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdatomic.h>
@@ -42,10 +43,59 @@
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <dlfcn.h>
+#include <execinfo.h>
+
+int luna_os_setenv(const char *name, const char *value, int overwrite)
+{
+   if (!name || !*name || strchr(name, '=') || !value) { errno = EINVAL; return -1; }
+   return setenv(name, value, overwrite);
+}
+int luna_os_random(void *buffer, size_t length)
+{
+   if (length && !buffer) { errno = EFAULT; return -1; }
+   if (length) arc4random_buf(buffer, length);
+   return 0;
+}
+
+void *luna_os_library_open(const char *path)
+{
+   return dlopen(path, RTLD_LAZY | RTLD_GLOBAL);
+}
+
+void *luna_os_library_open_local(const char *path)
+{
+   return dlopen(path, RTLD_NOW | RTLD_LOCAL);
+}
+const char *luna_os_library_error(void)
+{
+   const char *error = dlerror();
+   return error ? error : "unknown loader error";
+}
+
+void *luna_os_library_symbol(void *handle, const char *name)
+{
+   return dlsym(handle ? handle : RTLD_DEFAULT, name);
+}
+
+void luna_os_library_close(void *handle)
+{
+   if (handle) dlclose(handle);
+}
+
+int luna_os_backtrace(void **frames, int capacity)
+{
+   return frames && capacity > 0 ? backtrace(frames, capacity) : 0;
+}
+
+void luna_os_backtrace_print(void *const *frames, int count)
+{
+   if (frames && count > 0) backtrace_symbols_fd(frames, count, 2);
+}
 #include <sys/mman.h>
 #include <sys/event.h>
 #include <sys/socket.h>
 #include <sys/statvfs.h>
+#include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <sys/types.h>
 
@@ -83,6 +133,34 @@ int luna_os_release(void *addr, size_t len)
    return munmap(addr, len);
 }
 
+void *luna_os_map_anon(void *want, size_t len, int replace)
+{
+   if (replace && !want) { errno = EINVAL; return NULL; }
+   int flags = MAP_PRIVATE | MAP_ANON;
+   if (replace) flags |= MAP_FIXED;
+   void *p = mmap(want, len, PROT_READ | PROT_WRITE, flags, -1, 0);
+   return p == MAP_FAILED ? NULL : p;
+}
+
+void *luna_os_map_file_flags(void *want, size_t len, int prot, int policy,
+                            int fd, uint64_t off)
+{
+   int flags = (policy & LUNA_MAP_SHARED) ? MAP_SHARED : MAP_PRIVATE;
+   if (policy & LUNA_MAP_FIXED) flags |= MAP_FIXED;
+   if ((policy & (LUNA_MAP_FIXED | LUNA_MAP_NOREPLACE)) && !want) {
+      errno = EINVAL;
+      return NULL;
+   }
+   void *p = mmap(want, len, luna_prot_to_host(prot), flags, fd, (off_t)off);
+   if (p == MAP_FAILED) return NULL;
+   if ((policy & LUNA_MAP_NOREPLACE) && p != want) {
+      munmap(p, len);
+      errno = EEXIST;
+      return NULL;
+   }
+   return p;
+}
+
 int luna_os_protect(void *addr, size_t len, int prot)
 {
    return mprotect(addr, len, luna_prot_to_host(prot));
@@ -109,6 +187,41 @@ size_t luna_os_page_size(void)
 {
    long v = sysconf(_SC_PAGESIZE);
    return v > 0 ? (size_t)v : 4096u;
+}
+
+int luna_os_memory_advise(void *addr, size_t len, int advice)
+{
+   int native;
+   switch (advice) {
+   case 0: native = MADV_NORMAL; break;
+   case 1: native = MADV_RANDOM; break;
+   case 2: native = MADV_SEQUENTIAL; break;
+   case 3: native = MADV_WILLNEED; break;
+   case 4: native = MADV_DONTNEED; break;
+   case 8: native = MADV_FREE; break;
+   default: errno = EINVAL; return -1;
+   }
+   return madvise(addr, len, native);
+}
+
+int luna_os_memory_sync(void *addr, size_t len, int flags)
+{
+   if ((flags & ~(LUNA_MS_ASYNC | LUNA_MS_INVALIDATE | LUNA_MS_SYNC)) ||
+       (flags & LUNA_MS_ASYNC && flags & LUNA_MS_SYNC)) { errno = EINVAL; return -1; }
+   int native = (flags & LUNA_MS_ASYNC ? MS_ASYNC : 0) |
+                (flags & LUNA_MS_INVALIDATE ? MS_INVALIDATE : 0) |
+                (flags & LUNA_MS_SYNC ? MS_SYNC : 0);
+   return msync(addr, len, native);
+}
+
+int luna_os_memory_lock(void *addr, size_t len, int unlock)
+{
+   return unlock ? munlock(addr, len) : mlock(addr, len);
+}
+
+int luna_os_residency(void *addr, size_t len, unsigned char *vector)
+{
+   return mincore((const void *)addr, len, (char *)vector);
 }
 
 /* ---- anonymous shared memory ------------------------------------------- */
@@ -431,6 +544,12 @@ uint64_t luna_os_realtime_ns(void)
 
 /* ---- what the machine has ----------------------------------------------- */
 
+uint64_t luna_os_peak_rss_kb(void)
+{
+   struct rusage usage;
+   return getrusage(RUSAGE_SELF, &usage) == 0 ? (uint64_t)usage.ru_maxrss / 1024 : 0;
+}
+
 int luna_os_mem_info(uint64_t *total_bytes, uint64_t *avail_bytes)
 {
    uint64_t total = 0;
@@ -454,6 +573,39 @@ int luna_os_mem_info(uint64_t *total_bytes, uint64_t *avail_bytes)
     * the same intent as Linux's MemAvailable. */
    *avail_bytes = ((uint64_t)vm.free_count + (uint64_t)vm.inactive_count +
                    (uint64_t)vm.purgeable_count) * (uint64_t)page;
+   return 0;
+}
+
+static void luna_fs_copy(luna_os_fs_info *out, const struct statvfs *st)
+{
+   out->f_bsize = st->f_bsize;
+   out->f_frsize = st->f_frsize;
+   out->f_blocks = st->f_blocks;
+   out->f_bfree = st->f_bfree;
+   out->f_bavail = st->f_bavail;
+   out->f_files = st->f_files;
+   out->f_ffree = st->f_ffree;
+   out->f_favail = st->f_favail;
+   out->f_fsid = st->f_fsid;
+   out->f_flag = st->f_flag;
+   out->f_namemax = st->f_namemax;
+}
+
+int luna_os_statfs(const char *path, luna_os_fs_info *out)
+{
+   if (!path || !out) { errno = EINVAL; return -1; }
+   struct statvfs st;
+   if (statvfs(path, &st) != 0) return -1;
+   luna_fs_copy(out, &st);
+   return 0;
+}
+
+int luna_os_fstatfs(int fd, luna_os_fs_info *out)
+{
+   if (!out) { errno = EINVAL; return -1; }
+   struct statvfs st;
+   if (fstatvfs(fd, &st) != 0) return -1;
+   luna_fs_copy(out, &st);
    return 0;
 }
 
@@ -495,6 +647,11 @@ void *luna_os_offscreen_window(void *glfw_window, int w, int h)
 {
    (void)glfw_window; (void)w; (void)h;
    return NULL;
+}
+
+void luna_os_offscreen_resize(void *native_window, int w, int h)
+{
+   (void)native_window; (void)w; (void)h;
 }
 
 /* ---- audio out --------------------------------------------------------- *
@@ -713,4 +870,77 @@ void luna_os_audio_close(void)
    g_aq = NULL;
    free(g_aq_ring);
    g_aq_ring = NULL;
+}
+
+uint32_t luna_os_lrand48(void) { return (uint32_t)lrand48(); }
+void luna_os_srand48(int32_t seed) { srand48((long)seed); }
+
+int luna_os_pipe_open(int fds[2], int nonblocking, int close_on_exec)
+{
+   if (pipe(fds)) return -1;
+   for (int i = 0; i < 2; ++i) {
+      int flags = fcntl(fds[i], F_GETFL);
+      if (flags < 0 || (nonblocking && fcntl(fds[i], F_SETFL, flags | O_NONBLOCK)) ||
+          (close_on_exec && fcntl(fds[i], F_SETFD, FD_CLOEXEC))) {
+         int error = errno; close(fds[0]); close(fds[1]); errno = error; return -1;
+      }
+   }
+   return 0;
+}
+
+luna_os_locale luna_os_locale_new(void)
+{
+   locale_t locale = newlocale(LC_ALL_MASK, "C.UTF-8", (locale_t)0);
+   if (!locale) locale = newlocale(LC_ALL_MASK, "C", (locale_t)0);
+   return (luna_os_locale)locale;
+}
+luna_os_locale luna_os_locale_clone(luna_os_locale locale)
+{
+   if (!locale) { errno = EINVAL; return NULL; }
+   return (luna_os_locale)duplocale((locale_t)locale);
+}
+void luna_os_locale_free(luna_os_locale locale)
+{ if (locale) freelocale((locale_t)locale); }
+int luna_os_locale_use(luna_os_locale locale)
+{ return uselocale(locale ? (locale_t)locale : LC_GLOBAL_LOCALE) ? 0 : -1; }
+
+int luna_os_time_break(int64_t seconds, int local, struct tm *result, int64_t *offset)
+{
+   time_t value = (time_t)seconds;
+   if ((int64_t)value != seconds) { errno = EOVERFLOW; return -1; }
+   if (!(local ? localtime_r(&value, result) : gmtime_r(&value, result))) return -1;
+   *offset = (int64_t)result->tm_gmtoff;
+   return 0;
+}
+int luna_os_time_make(struct tm *value, int64_t *seconds, int64_t *offset)
+{
+   int saved = errno;
+   errno = 0;
+   time_t result = mktime(value);
+   if (result == (time_t)-1 && errno) return -1;
+   *seconds = (int64_t)result;
+   *offset = (int64_t)value->tm_gmtoff;
+   errno = saved;
+   return 0;
+}
+
+int luna_os_unsetenv(const char *name) { return unsetenv(name); }
+intptr_t luna_os_command_pipe_open(const char *path)
+{
+   if (mkfifo(path, 0600) && errno != EEXIST) return -1;
+   return open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+}
+ptrdiff_t luna_os_command_pipe_read(intptr_t pipe, void *buffer, size_t capacity)
+{
+   return read((int)pipe, buffer, capacity);
+}
+void luna_os_command_pipe_close(intptr_t pipe) { close((int)pipe); }
+
+void *luna_os_library_loaded_symbol(const char *module, const char *name)
+{
+   void *handle = dlopen(module, RTLD_LAZY | RTLD_NOLOAD);
+   if (!handle) return NULL;
+   void *symbol = dlsym(handle, name);
+   dlclose(handle);
+   return symbol;
 }

@@ -50,6 +50,7 @@
 #include <unistd.h>
 
 #include "jvm.h"
+#include "lunaria_os.h"
 #include "arm_exec.h"
 
 /* ApplicationInfo.flags, as the framework defines them.  The ledger stores the
@@ -150,7 +151,7 @@ static const char *guest_root(void)
       const char *r = getenv("LUNARIA_GUEST_ROOT");
       if (!r || !*r) r = "/tmp/lunaria-guest-root";
       snprintf(root, sizeof root, "%s", r);
-      (void)mkdir(root, 0755);
+      (void)luna_file_mkdir(root, 0755);
    }
    return root;
 }
@@ -160,10 +161,10 @@ static void mkdir_p(char *path)
    for (char *p = path + 1; *p; ++p) {
       if (*p != '/') continue;
       *p = '\0';
-      (void)mkdir(path, 0755);
+      (void)luna_file_mkdir(path, 0755);
       *p = '/';
    }
-   (void)mkdir(path, 0755);
+   (void)luna_file_mkdir(path, 0755);
 }
 
 /* A package's APK, as far as anything outside its own installer can tell, is a
@@ -537,4 +538,51 @@ int lunaria_android_package_visible(const struct lunaria_android_package *record
       return 1;
    if (csv_has(getenv("ANDROID_QUERY_PACKAGES"), record->name)) return 1;
    return 0;
+}
+
+/* Android's external-source policy is per installed package. Keep it under
+ * the device data root rather than an app's preferences. A declaration of
+ * REQUEST_INSTALL_PACKAGES is not a user grant. */
+static int install_source_path(const char *package_name, char *path, size_t cap)
+{
+   const char *root = getenv("LUNARIA_DATA_ROOT");
+   if (!root || !*root || !package_name || !*package_name) return 0;
+   unsigned char first = (unsigned char)*package_name;
+   if (!((first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z') || first == '_')) return 0;
+   for (const unsigned char *p = (const unsigned char *)package_name; *p; ++p)
+      if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+            (*p >= '0' && *p <= '9') || *p == '_' || *p == '.')) return 0;
+   int n = snprintf(path, cap, "%s/system/install-sources/%s", root, package_name);
+   return n >= 0 && (size_t)n < cap;
+}
+
+int lunaria_android_install_source_allowed(const char *package_name)
+{
+   char path[4096];
+   if (!install_source_path(package_name, path, sizeof path)) return 0;
+   FILE *f = fopen(path, "rb");
+   if (!f) return 0;
+   int value = fgetc(f), end = fgetc(f);
+   int valid = !ferror(f);
+   fclose(f);
+   return valid && value == '1' && end == EOF;
+}
+
+int lunaria_android_install_source_set_allowed(const char *package_name, int allowed)
+{
+   char path[4096];
+   if (!install_source_path(package_name, path, sizeof path)) { errno = EINVAL; return 0; }
+   const char *root = getenv("LUNARIA_DATA_ROOT");
+   char directory[4096];
+   const char *suffixes[] = { "system", "system/install-sources" };
+   for (size_t i = 0; i < sizeof suffixes / sizeof suffixes[0]; ++i) {
+      int n = snprintf(directory, sizeof directory, "%s/%s", root, suffixes[i]);
+      if (n < 0 || (size_t)n >= sizeof directory) { errno = ENAMETOOLONG; return 0; }
+      if (luna_file_mkdir(directory, 0700) && errno != EEXIST) return 0;
+   }
+   FILE *f = fopen(path, "wb");
+   if (!f) return 0;
+   int ok = fputc(allowed ? '1' : '0', f) != EOF;
+   if (fclose(f)) ok = 0;
+   return ok;
 }

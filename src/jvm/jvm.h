@@ -14,7 +14,7 @@
 #include <stdlib.h>
 
 /* Android 実機の getPackageCodePath() / ApplicationInfo.sourceDir は APK ファイル
- * パスを返す。lunaria-apk.sh は展開先を ANDROID_PACKAGE_CODE_PATH に置くので、
+ * パスを返す。the native APK launcher は展開先を ANDROID_PACKAGE_CODE_PATH に置くので、
  * JNI では ANDROID_APK_FILE を優先する。 */
 static inline const char *lunaria_apk_mount_path(void)
 {
@@ -157,6 +157,11 @@ struct lunaria_android_package {
    int target_sdk;
 };
 
+/* Device-owned unknown-source trust, separate from app-owned preferences.
+ * Only the system settings implementation may change it. Unset means denied. */
+int lunaria_android_install_source_allowed(const char *package_name);
+int lunaria_android_install_source_set_allowed(const char *package_name, int allowed);
+
 size_t lunaria_android_package_count(void);
 int lunaria_android_package_at(size_t index,
                                struct lunaria_android_package *out);
@@ -297,6 +302,13 @@ struct jvm {
    void    *wrap_cache[65536];
    bool     wrap_cached[65536];
    unsigned wrap_epoch;
+
+   /* Hash index over the interned object types (see jvm_find_object): chains
+    * of slot numbers + 1, 0 ending a chain.  Appended last for the same
+    * reason as wrap_cache above. */
+   uint32_t intern_head[1u << 17];
+   uint32_t intern_next[65536];
+   uint32_t intern_hash[65536];
 };
 
 /* Raise a JNI exception of `class_name` ("java/lang/ClassNotFoundException")

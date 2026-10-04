@@ -30,14 +30,14 @@
  *  - Memory the guest maps is declared to the guest's address-space table, so
  *    the SVCs that check a guest pointer accept it.
  *
- * Off unless LUNARIA_VULKAN=1: a title that finds no Vulkan uses GLES, and
- * that path is the proven one.
+ * Enabled by default when the host has a Vulkan driver.  LUNARIA_VULKAN=0
+ * disables the bridge explicitly.
  */
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_ANDROID_KHR
 #include <vulkan/vulkan.h>
 
-#include <dlfcn.h>
+#include "lunaria_os.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -69,9 +69,9 @@ struct lvk_cmd {
 
 /* The generic call below relies on the host ABI assigning integer and float
  * arguments to separate register files and the remaining integers to the
- * stack in order — SysV x86-64 and Linux AArch64 both do. */
+ * stack in order — SysV x86-64 and the non-variadic AArch64 ABI do. */
 #if (defined(__x86_64__) && !defined(_WIN32)) || \
-    (defined(__aarch64__) && !defined(__APPLE__))
+    defined(__aarch64__)
 #define LVK_ABI_OK 1
 #else
 #define LVK_ABI_OK 0
@@ -81,12 +81,11 @@ struct lvk_cmd {
 
 static void *g_lib;
 
-/* dlsym() for a function: POSIX's own idiom, which ISO C's rule against
- * object-to-function pointer casts does not reach. */
+/* Copy the OS loader address into its typed Vulkan function pointer. */
 static PFN_vkVoidFunction lib_fn(const char *name)
 {
    PFN_vkVoidFunction f;
-   void *p = dlsym(g_lib, name);
+   void *p = luna_os_library_symbol(g_lib, name);
    memcpy(&f, &p, sizeof f);
    return f;
 }
@@ -1297,17 +1296,23 @@ static const char *const k_queue_ops[] = {
 static void vk_init(void)
 {
    const char *e = getenv("LUNARIA_VULKAN");
-   if (!e || e[0] != '1') return;
+   if (e && e[0] == '0') return;
    if (!LVK_ABI_OK) {
       fprintf(stderr, "[vulkan] this host's calling convention is not "
               "supported; Vulkan stays off\n");
       return;
    }
-   g_lib = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-   if (!g_lib) g_lib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+#ifdef _WIN32
+   g_lib = luna_os_library_open_local("vulkan-1.dll");
+#elif defined(__APPLE__)
+   g_lib = luna_os_library_open_local("libMoltenVK.dylib");
+#else
+   g_lib = luna_os_library_open_local("libvulkan.so.1");
+   if (!g_lib) g_lib = luna_os_library_open_local("libvulkan.so");
+#endif
    if (!g_lib) {
       fprintf(stderr, "[vulkan] no host libvulkan (%s); Vulkan stays off\n",
-              dlerror());
+              luna_os_library_error());
       return;
    }
    g_gipa = (PFN_vkGetInstanceProcAddr)lib_fn("vkGetInstanceProcAddr");
@@ -1337,6 +1342,12 @@ static void vk_init(void)
            (unsigned)NCMD);
 }
 
+bool luna_vk_available(void)
+{
+   pthread_once(&g_once, vk_init);
+   return g_ok;
+}
+
 uint64_t luna_vk_symbol(const char *name)
 {
    pthread_once(&g_once, vk_init);
@@ -1345,6 +1356,6 @@ uint64_t luna_vk_symbol(const char *name)
    if (i < 0) return 0;
    /* dlsym() on libvulkan.so: what the host loader exports, plus the
     * Android entry points emulated here. */
-   if (!g_special[i] && !dlsym(g_lib, name)) return 0;
+   if (!g_special[i] && !luna_os_library_symbol(g_lib, name)) return 0;
    return tramp_at(i);
 }

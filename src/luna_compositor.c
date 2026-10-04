@@ -127,7 +127,10 @@ static struct comp_source *source_for(EGLContext ctx, int w, int h)
    for (int i = 0; i < SLOTS; ++i) {
       if (!src->tex[i]) glGenTextures(1, &src->tex[i]);
       glBindTexture(GL_TEXTURE_2D, src->tex[i]);
-      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA,
+      /* The compositor samples only RGB.  Copying a default framebuffer to
+       * RGBA8 is invalid for some EGL surface formats (ANGLE returns 0x502),
+       * while RGB8 matches their colour data and keeps EGLImage sharing. */
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, w, h, 0, GL_RGB,
                    GL_UNSIGNED_BYTE, NULL);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -453,7 +456,7 @@ static void *comp_main(void *arg)
       /* How long the picture may stay as it is: the boot card and the input
        * method's caret animate; a static screen needs nothing until the guest
        * or the UI changes it. */
-      const bool boot = luna_boot_active() && !have_frame;
+      const bool boot = luna_boot_active() && !have_frame && !luna_overlay_guest_window_up();
       const bool ime = luna_ime_active();
       const uint64_t period = boot ? 16000000ull : ime ? 33000000ull
                              : luna_overlay_active() ? 100000000ull
@@ -554,24 +557,27 @@ static void *comp_main(void *arg)
       else if (have_frame && shown >= 0)
          draw_texture(g_comp_tex[shown], g_frame_w[shown], g_frame_h[shown], w, h);
 
-      if (luna_boot_active() && !have_frame)
+      if (luna_boot_active() && !have_frame && !luna_overlay_guest_window_up())
          luna_overlay_present_boot(w, h);
       else
          luna_overlay_present(w, h);
 
       /* The slot that stopped being shown is free once this frame's reads of
-       * it are done — the guest waits on that before copying into it. */
-      EGLSync done = eglCreateSync(g_dpy, EGL_SYNC_FENCE, NULL);
-      glFlush();
-      pthread_mutex_lock(&g_mu);
+       * it are done — the guest waits on that before copying into it.
+       * With no slot to release, eglSwapBuffers below supplies the flush. */
       const int release_slot = (take >= 0 && prev_shown >= 0 && prev_shown != take)
                                ? prev_shown : -1;
-      if (release_slot >= 0 && g_release_fence[release_slot] == EGL_NO_SYNC) {
-         g_release_fence[release_slot] = done;
-         done = EGL_NO_SYNC;
+      if (release_slot >= 0) {
+         EGLSync done = eglCreateSync(g_dpy, EGL_SYNC_FENCE, NULL);
+         glFlush();
+         pthread_mutex_lock(&g_mu);
+         if (g_release_fence[release_slot] == EGL_NO_SYNC) {
+            g_release_fence[release_slot] = done;
+            done = EGL_NO_SYNC;
+         }
+         pthread_mutex_unlock(&g_mu);
+         if (done != EGL_NO_SYNC) eglDestroySync(g_dpy, done);
       }
-      pthread_mutex_unlock(&g_mu);
-      if (done != EGL_NO_SYNC) eglDestroySync(g_dpy, done);
 
       comp_maybe_dump(w, h);
       eglSwapBuffers(g_dpy, g_win);

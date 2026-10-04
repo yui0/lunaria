@@ -100,6 +100,10 @@ const char *dvm_jni_super_name(const char *class_name);
  * hierarchy, which no dex declares. */
 bool dvm_jni_class_assignable(const char *sub, const char *sup);
 
+/* Attach the launcher Activity to the framework window/Activity stack after
+ * its lifecycle returns. Used for dex apps whose UI is owned by the framework. */
+void dvm_jni_show_activity(JNIEnv *env, jobject activity);
+
 /* Diagnostics for the loader's summary line. */
 void dvm_jni_report(void);
 
@@ -131,3 +135,5 @@ void dvm_main_looper_tick(struct dvm *vm);
 struct dvm;
 struct dvm *dvm_current(void);
 void dvm_gil_yield(struct dvm *vm);
+
+void dvm_glsurface_tick(struct dvm *vm);

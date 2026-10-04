@@ -22,6 +22,13 @@ typedef bool (*dvm_builtin_fn)(struct dvm *vm, dvm_ref self,
                                const union dvm_value *args, int nargs,
                                union dvm_value *out);
 
+/* Live invocation chain, including C builtins and native bridges. Nodes
+ * belong to the invoking thread's C stack; the GIL switches only its head. */
+struct dvm_call_frame {
+   struct dvm_method *method;
+   struct dvm_call_frame *previous;
+};
+
 struct dvm_field {
    const char *name;   /* into the dex mapping, or a literal for builtins */
    const char *type;   /* descriptor */
@@ -175,6 +182,7 @@ struct dvm_dex {
    dvm_ref *string_cache;
 };
 
+struct dvm_attached_thread { uint64_t token; dvm_ref thread; };
 struct dvm {
    struct dvm_hooks hooks;
 
@@ -230,9 +238,18 @@ struct dvm {
     * and did nothing.  A Thread.start() entry has no handler and no token. */
    dvm_ref *pending_owner;
    dvm_ref *pending_token;
+   dvm_ref velocity_pool[2];
+   unsigned velocity_pool_count;
+   struct dvm_nsd *nsd;
+   dvm_ref *active_object_animators;
+   size_t nactive_object_animators, active_object_animators_cap;
    int npending, pending_cap;
+   dvm_ref message_pool[50];
+   unsigned message_pool_size;
    /* The Thread the interpreter is currently inside, or 0 for the main one. */
    dvm_ref cur_thread;
+   dvm_ref main_thread;
+   struct dvm_attached_thread native_threads[256];
    /* How many drains of the pending queue are on the stack.  This used to be a
     * flat re-entrancy lock, which made every blocking wait inside a Runnable
     * unsatisfiable: the work being waited for sits in this same queue, so a
@@ -263,6 +280,7 @@ struct dvm {
     * reading the caller's name out of that trace. */
    struct dvm_method *callstack[128];
    int ncallstack;
+   struct dvm_call_frame *invoke_frame;
    int depth;
    int trace;
    uint64_t steps;       /* since dvm_create, for diagnostics */
@@ -300,6 +318,7 @@ struct dvm_tstate {
    uint32_t cur_pc;
    struct dvm_method *callstack[128];
    int ncallstack;
+   struct dvm_call_frame *invoke_frame;
    int depth;
    uint64_t call_steps;
    uint64_t step_limit;
@@ -316,6 +335,8 @@ void dvm__mark_bytecode_thread(void);
 struct dvm_class *dvm__register_builtin(struct dvm *vm, const char *desc);
 struct dvm_class *dvm__define_primitive(struct dvm *vm, const char *desc);
 struct dvm_class *dvm__class_by_desc(struct dvm *vm, const char *desc);
+void dvm__activity_visible(struct dvm *vm, dvm_ref activity);
+
 bool dvm__class_assignable(struct dvm *vm, struct dvm_class *from,
                            struct dvm_class *to);
 struct dvm_object *dvm__obj(struct dvm *vm, dvm_ref ref);
@@ -488,6 +509,8 @@ bool dvm_runtime_context_broadcast(struct dvm *vm, const char *method,
 
 /* dvm_runtime.c: installs the built-in classes into a fresh VM. */
 void dvm_runtime_install(struct dvm *vm);
+void dvm_nsd_poll(struct dvm *vm);
+void dvm_nsd_finish(struct dvm *vm);
 /* Called by dvm.c when a class has no dex definition, before falling back to
  * the host stubs.  Returns NULL when the runtime has no built-in for it. */
 struct dvm_class *dvm_runtime_define(struct dvm *vm, const char *desc);

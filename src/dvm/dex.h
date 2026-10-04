@@ -177,6 +177,9 @@ bool dex_field_signature(struct dex_file *d, uint32_t class_def_idx,
 const char *dex_class_enclosing_type(struct dex_file *d,
                                      uint32_t class_def_idx);
 
+/* Member classes declare EnclosingClass; local/anonymous classes use EnclosingMethod. */
+bool dex_class_is_member(struct dex_file *d, uint32_t class_def_idx);
+
 /* Runtime-visible class annotations.  `encoded_off` points at the
  * encoded_annotation (its type_idx, not the preceding visibility byte).
  * AnnotationDefault is kept on the annotation interface itself and is used

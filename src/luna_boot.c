@@ -17,11 +17,17 @@
 
 /* The engine is compiled into luna_overlay.c, the one translation unit that
  * defines LUNA_UI_IMPLEMENTATION; this file only calls it. */
+#define GLFW_INCLUDE_NONE
 #define LUNA_UI_NO_PLATFORM
 #include "luna-ui.h"
 
 #include "luna_boot.h"
 #include "luna_overlay.h"
+#include "lunaria_os.h"
+#include <GLFW/glfw3.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES3/gl3.h>
 
 #include <math.h>
 #include <stdatomic.h>
@@ -543,3 +549,218 @@ void luna_boot_finish(const char *why)
    luna_overlay_set_status(NULL, NULL);
    fprintf(stderr, "[boot] card down (%s)\n", why ? why : "done");
 }
+
+/* Installer: render on the main thread and hand the window to the guest. */
+static GLFWwindow *window;
+static EGLDisplay display = EGL_NO_DISPLAY;
+static EGLSurface surface = EGL_NO_SURFACE;
+static EGLContext context = EGL_NO_CONTEXT;
+static int ready, cancelled, choosing, accepted;
+static uint64_t last_frame;
+static const char *const *choices;
+static size_t choice_count;
+
+static const char *sheet =
+    "body{margin:0;background:#f3f4f6;color:#20242b;font-size:16px;}"
+    ".card{position:absolute;left:40px;right:40px;top:44px;padding:28px;"
+    "background:#ffffff;border:1px solid #dce0e5;border-radius:12px;max-height:400px;overflow-y:auto;}"
+    "h1{font-size:26px;margin:0 0 20px 0;}"
+    "p{margin:12px 0;overflow:hidden;}"
+    "button{padding:12px 18px;margin:6px;background:#e9edf2;color:#20242b;"
+    "border:1px solid #ccd2da;border-radius:6px;}"
+    "input{width:100%;height:40px;padding:8px;border:1px solid #ccd2da;}"
+    "#continue{background:#2355a4;color:#ffffff;}";
+
+static void pointer_position(GLFWwindow *w, double *x, double *y)
+{
+    int ww,wh,fw,fh;
+    glfwGetWindowSize(w,&ww,&wh); glfwGetFramebufferSize(w,&fw,&fh);
+    if (ww>0 && wh>0) { *x *= (double)fw/ww; *y *= (double)fh/wh; }
+}
+static void cursor(GLFWwindow *w, double x, double y)
+{ pointer_position(w,&x,&y); luna_mouse_move(x, y); }
+static void mouse(GLFWwindow *w, int button, int action, int mods)
+{ double x,y; glfwGetCursorPos(w,&x,&y); pointer_position(w,&x,&y); luna_mouse_button(button, action, mods, x,y); }
+static void key(GLFWwindow *w, int k, int scan, int action, int mods)
+{
+    (void)w;
+    if (k == GLFW_KEY_ESCAPE && action == GLFW_PRESS) cancelled = 1;
+    luna_key(k, scan, action, mods);
+}
+static void character(GLFWwindow *w, unsigned int c)
+{ (void)w; luna_char(c); }
+static void scroll(GLFWwindow *w, double x, double y)
+{ (void)w; luna_scroll(x, y); }
+
+static void frame(int force)
+{
+    if (!ready) return;
+    uint64_t now = luna_os_monotonic_ns();
+    if (!force && now - last_frame < UINT64_C(33000000)) return;
+    glfwPollEvents();
+    if (glfwWindowShouldClose(window)) cancelled = 1;
+    int w, h;
+    glfwGetFramebufferSize(window, &w, &h);
+    if (w > 0 && h > 0) {
+        luna_resize((float)w, (float)h);
+        glViewport(0, 0, w, h);
+        glClearColor(.95f, .96f, .97f, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        luna_update(luna_platform_time(), last_frame ? (double)(now-last_frame)/1e9 : 0);
+        luna_render(w, h);
+        eglSwapBuffers(display, surface);
+    }
+    last_frame = now;
+}
+static void document(const char *html)
+{
+    luna_reset_css();
+    luna_parse_css(sheet);
+    luna_parse_html(html);
+}
+static void progress_document(void)
+{
+    document("<body><div class=\"card\"><h1>Lunaria</h1>"
+             "<p id=\"stage\">Preparing application</p><p id=\"file\"></p>"
+             "<p id=\"progress\"></p></div></body>");
+}
+
+int luna_launcher_begin(const char *path)
+{
+    const char *pbuffer = getenv("LUNARIA_PBUFFER");
+    if (pbuffer && *pbuffer && *pbuffer != '0') return 0;
+    if (!glfwInit()) return 0;
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    window = glfwCreateWindow(800, 500, "Lunaria — Preparing application", NULL, NULL);
+    if (!window) return 0;
+    display = eglGetDisplay((EGLNativeDisplayType)luna_os_native_display());
+    EGLint major, minor, n;
+    EGLConfig config;
+    const EGLint config_attrs[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_NONE };
+    const EGLint context_attrs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+    if (display == EGL_NO_DISPLAY || !eglInitialize(display, &major, &minor) ||
+        !eglBindAPI(EGL_OPENGL_ES_API) ||
+        !eglChooseConfig(display, config_attrs, &config, 1, &n) || !n) goto fail;
+    surface = eglCreateWindowSurface(display, config,
+        (EGLNativeWindowType)(uintptr_t)luna_os_native_window(window), NULL);
+    context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attrs);
+    if (surface == EGL_NO_SURFACE || context == EGL_NO_CONTEXT ||
+        !eglMakeCurrent(display, surface, surface, context)) goto fail;
+    luna_overlay_prepare_platform();
+    luna_set_gles3(1);
+    LunaInitConfig cfg = {.width=800, .height=500, .frameless=1,
+                          .get_proc=luna_platform_get_proc()};
+    if (!luna_init(&cfg)) goto fail;
+    ready = 1;
+    glfwSetCursorPosCallback(window, cursor);
+    glfwSetMouseButtonCallback(window, mouse);
+    glfwSetKeyCallback(window, key);
+    glfwSetCharCallback(window, character);
+    glfwSetScrollCallback(window, scroll);
+    progress_document();
+    luna_launcher_progress("Opening archive", path, 0, 0);
+    frame(1);
+    fprintf(stderr, "[apk-ui] window shown before archive extraction\n");
+    return 1;
+fail:
+    fprintf(stderr, "[apk-ui] cannot initialize launch UI (EGL 0x%x)\n", eglGetError());
+    luna_launcher_end(0);
+    return 0;
+}
+
+void luna_launcher_progress(const char *stage, const char *file, uint64_t bytes, uint64_t total)
+{
+    if (!ready || choosing) return;
+    if (!stage && luna_os_monotonic_ns() - last_frame < UINT64_C(33000000)) return;
+    if (stage) luna_set_text(luna_get_element_by_id("stage"), stage);
+    if (file) luna_set_text(luna_get_element_by_id("file"), file);
+    char line[96];
+    if (total) snprintf(line, sizeof line, "%u%%  ·  %.1f / %.1f MiB",
+        (unsigned)(100.0L*bytes/total), (double)bytes/1048576, (double)total/1048576);
+    else line[0] = 0;
+    luna_set_text(luna_get_element_by_id("progress"), line);
+    frame(0);
+}
+int luna_launcher_cancelled(void) { return cancelled; }
+
+static void select_profile(LunaElement *element)
+{
+    for (size_t i=0; i<choice_count; ++i) {
+        char id[32]; snprintf(id, sizeof id, "profile%zu", i);
+        if (luna_element_at(luna_get_element_by_id(id)) == element) {
+            luna_set_value(luna_get_element_by_id("name"), choices[i]);
+            break;
+        }
+    }
+}
+static void continue_profile(LunaElement *element) { (void)element; accepted=1; }
+int luna_launcher_choose(const char *package, const char *const *profiles,
+                         size_t count, char *choice, size_t capacity)
+{
+    if (!ready) return -1;
+    if (count > (SIZE_MAX-1024)/160) return -1;
+    size_t size = 1024 + count*160;
+    char *html = malloc(size);
+    if (!html) return -1;
+    size_t at = (size_t)snprintf(html, size,
+        "<body><div class=\"card\"><h1>Select profile</h1><p id=\"package\"></p><div>");
+    for (size_t i=0; i<count; ++i)
+        at += (size_t)snprintf(html+at, size-at,
+            "<button id=\"profile%zu\">%s</button>", i, profiles[i]);
+    snprintf(html+at, size-at, "</div><p>Profile name</p><input id=\"name\" value=\"default\">"
+        "<p id=\"error\"></p><button id=\"continue\">Continue</button></div></body>");
+    choosing = 1; accepted = 0; choices = profiles; choice_count = count;
+    document(html); free(html);
+    luna_set_text(luna_get_element_by_id("package"), package);
+    for (size_t i=0; i<count; ++i) {
+        char id[32]; snprintf(id, sizeof id, "profile%zu", i);
+        luna_set_on_click(luna_get_element_by_id(id), select_profile);
+    }
+    luna_set_on_click(luna_get_element_by_id("continue"), continue_profile);
+    fprintf(stderr, "[apk-ui] profile selection shown for %s\n", package);
+    while (!cancelled) {
+        frame(1);
+        if (accepted) {
+            const char *value = luna_get_value(luna_get_element_by_id("name"));
+            size_t len = value ? strlen(value) : 0;
+            int valid = len && len < capacity && strcmp(value,".") && strcmp(value,"..");
+            if (valid && !((value[0]>='a'&&value[0]<='z') ||
+                (value[0]>='A'&&value[0]<='Z') || (value[0]>='0'&&value[0]<='9') || value[0]=='_')) valid=0;
+            for (size_t i=0; valid && i<len; ++i) {
+                unsigned char c = (unsigned char)value[i];
+                if (!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_'||c=='-'||c=='.')) valid=0;
+            }
+            if (valid) { memcpy(choice, value, len+1); break; }
+            accepted=0;
+            luna_set_text(luna_get_element_by_id("error"), "Use 1–64 letters, digits, dots, hyphens or underscores.");
+        }
+        glfwWaitEventsTimeout(.02);
+    }
+    choosing=0; choices=NULL; choice_count=0;
+    progress_document(); frame(1);
+    return cancelled ? -1 : 0;
+}
+
+void luna_launcher_end(int keep_window)
+{
+    if (window) {
+        glfwSetCursorPosCallback(window, NULL);
+        glfwSetMouseButtonCallback(window, NULL);
+        glfwSetKeyCallback(window, NULL);
+        glfwSetCharCallback(window, NULL);
+        glfwSetScrollCallback(window, NULL);
+    }
+    if (ready) { luna_shutdown(); ready=0; }
+    if (display != EGL_NO_DISPLAY) {
+        eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (context != EGL_NO_CONTEXT) eglDestroyContext(display, context);
+        if (surface != EGL_NO_SURFACE) eglDestroySurface(display, surface);
+        eglTerminate(display);
+    }
+    display=EGL_NO_DISPLAY; context=EGL_NO_CONTEXT; surface=EGL_NO_SURFACE;
+    if (!keep_window && window) { glfwDestroyWindow(window); window=NULL; }
+}
+void *luna_launcher_take_window(void)
+{ GLFWwindow *result=window; window=NULL; return result; }

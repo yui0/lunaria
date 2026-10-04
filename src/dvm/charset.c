@@ -13,8 +13,12 @@
 #include <string.h>
 #include <strings.h>
 
-#include <unicode/ucnv.h>
-#include <unicode/ucnv_cb.h>
+#include <errno.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <iconv.h>
+#endif
 
 #define JCS_FFFD 0xfffdu
 
@@ -61,19 +65,12 @@ void jcs_default(struct jcs *out)
    strcpy(out->name, "UTF-8");
 }
 
-/* Charset.name() for a charset ICU converts: its MIME name, else its IANA
- * name, else ICU's own — the order Android's NativeConverter uses. */
-static void icu_java_name(const char *icu_name, char *out, size_t sz)
-{
-   UErrorCode err = U_ZERO_ERROR;
-   const char *n = ucnv_getStandardName(icu_name, "MIME", &err);
-   if (!n || U_FAILURE(err)) {
-      err = U_ZERO_ERROR;
-      n = ucnv_getStandardName(icu_name, "IANA", &err);
-   }
-   if (!n || U_FAILURE(err)) n = icu_name;
-   snprintf(out, sz, "%s", n);
-}
+struct native_converter;
+static struct native_converter *native_open(const char *, bool);
+static void native_close(struct native_converter *);
+#ifdef _WIN32
+static unsigned native_page(const char *, const char **);
+#endif
 
 bool jcs_lookup(const char *name, struct jcs *out)
 {
@@ -88,23 +85,22 @@ bool jcs_lookup(const char *name, struct jcs *out)
          return true;
       }
    }
-   UErrorCode err = U_ZERO_ERROR;
-   UConverter *c = ucnv_open(name, &err);
-   if (!c || U_FAILURE(err)) {
-      if (c) ucnv_close(c);
-      return false;
-   }
-   const char *icu_name = ucnv_getName(c, &err);
-   out->kind = JCS_ICU;
-   if (U_SUCCESS(err) && icu_name) icu_java_name(icu_name, out->name, sizeof out->name);
-   else snprintf(out->name, sizeof out->name, "%s", name);
-   ucnv_close(c);
-   /* An ICU charset whose Java name is one of ours is ours. */
-   for (size_t i = 0; i < sizeof g_builtin / sizeof g_builtin[0]; ++i)
-      if (!strcasecmp(out->name, g_builtin[i].name)) {
-         out->kind = g_builtin[i].kind;
-         snprintf(out->name, sizeof out->name, "%s", g_builtin[i].name);
-      }
+   struct native_converter *c = native_open(name, true);
+   if (!c) return false;
+   out->kind = JCS_NATIVE;
+#ifdef _WIN32
+   const char *canonical = name;
+   (void)native_page(name, &canonical);
+   snprintf(out->name, sizeof out->name, "%s", canonical);
+#else
+   static const char *const names[] = {"Shift_JIS", "GBK", "GB18030", "Big5", "EUC-JP", "EUC-KR", "KOI8-R", "KOI8-U"};
+   const char *canonical = name;
+   if (!strcasecmp(name,"sjis") || !strcasecmp(name,"shift-jis")) canonical="Shift_JIS";
+   for (size_t i=0;i<sizeof names/sizeof names[0];i++)
+      if (!strcasecmp(name,names[i])) canonical=names[i];
+   snprintf(out->name, sizeof out->name, "%s", canonical);
+#endif
+   native_close(c);
    return true;
 }
 
@@ -275,64 +271,124 @@ static char *utf16_decode(const struct jcs *cs, const uint8_t *in, size_t n,
    return out;
 }
 
-/* --- ICU ------------------------------------------------------------------ */
-
-/* Malformed or unmappable input becomes U+FFFD, the replacement Android's
- * CharsetDecoderICU installs, rather than ICU's per-converter default (which
- * is U+001A for some legacy code pages). */
-static void U_CALLCONV to_u_fffd(const void *ctx, UConverterToUnicodeArgs *args,
-                                 const char *units, int32_t len,
-                                 UConverterCallbackReason reason,
-                                 UErrorCode *err)
+/* Platform converters only handle charsets outside the built-in UTF family. */
+struct native_converter {
+#ifdef _WIN32
+   unsigned cp;
+#else
+   iconv_t handle;
+#endif
+   unsigned char pending[32];
+   size_t count;
+};
+#ifdef _WIN32
+static const struct { const char *name; unsigned cp; const char *aliases; } native_pages[] = {
+   {"Shift_JIS",932,"sjis|shift-jis|ms932|windows-31j|cp932"},
+   {"GBK",936,"cp936|ms936|windows-936"},
+   {"GB18030",54936,"gb18030"}, {"GB2312",936,"euc-cn|gb2312"},
+   {"Big5",950,"big-5|cp950"}, {"EUC-KR",51949,"euckr|euc_kr|ks_c_5601-1987"},
+   {"EUC-JP",51932,"eucjp|euc_jp"},
+   {"KOI8-R",20866,"koi8r"}, {"KOI8-U",21866,"koi8u"},
+   {"ISO-8859-2",28592,"iso8859-2|latin2"}, {"ISO-8859-5",28595,"iso8859-5"},
+   {"ISO-8859-7",28597,"iso8859-7"}, {"ISO-8859-9",28599,"iso8859-9|latin5"},
+   {"ISO-8859-15",28605,"iso8859-15|latin9"},
+   {"windows-1250",1250,"cp1250"}, {"windows-1251",1251,"cp1251"},
+   {"windows-1252",1252,"cp1252"}, {"windows-1253",1253,"cp1253"},
+   {"windows-1254",1254,"cp1254"}, {"windows-1255",1255,"cp1255"},
+   {"windows-1256",1256,"cp1256"}, {"windows-1257",1257,"cp1257"},
+   {"windows-1258",1258,"cp1258"},
+};
+static unsigned native_page(const char *name,const char **canonical)
 {
-   (void)ctx; (void)units; (void)len;
-   if (reason > UCNV_IRREGULAR) return;
-   static const UChar fffd = 0xfffd;
-   *err = U_ZERO_ERROR;
-   ucnv_cbToUWriteUChars(args, &fffd, 1, 0, err);
+   for(size_t i=0;i<sizeof native_pages/sizeof native_pages[0];i++){
+      bool match=!strcasecmp(name,native_pages[i].name);
+      const char *p=native_pages[i].aliases;
+      while(!match&&*p){const char *e=strchr(p,'|');size_t n=e?(size_t)(e-p):strlen(p);
+         match=strlen(name)==n&&!strncasecmp(p,name,n);p=e?e+1:p+n;}
+      if(match&&IsValidCodePage(native_pages[i].cp)){*canonical=native_pages[i].name;return native_pages[i].cp;}
+   }return 0;
 }
-
-static UConverter *icu_open(const struct jcs *cs, bool decoding)
+#endif
+static struct native_converter *native_open(const char *name,bool decoding)
 {
-   UErrorCode err = U_ZERO_ERROR;
-   UConverter *c = ucnv_open(cs->name, &err);
-   if (!c || U_FAILURE(err)) {
-      if (c) ucnv_close(c);
-      return NULL;
-   }
-   if (decoding) {
-      ucnv_setToUCallBack(c, to_u_fffd, NULL, NULL, NULL, &err);
-   } else {
-      err = U_ZERO_ERROR;
-      ucnv_setSubstChars(c, "?", 1, &err);
-   }
+   struct native_converter *c=calloc(1,sizeof *c);if(!c)return NULL;
+#ifdef _WIN32
+   (void)decoding;const char *canon=NULL;c->cp=native_page(name,&canon);if(!c->cp){free(c);return NULL;}
+#else
+   c->handle=iconv_open(decoding?"UTF-16LE":name,decoding?name:"UTF-16LE");
+   if(c->handle==(iconv_t)-1){free(c);return NULL;}
+#endif
    return c;
 }
-
-static char *icu_decode(const struct jcs *cs, const uint8_t *in, size_t n,
-                        size_t *out_len)
+static void native_close(struct native_converter *c)
 {
-   UConverter *c = icu_open(cs, true);
-   if (!c) return NULL;
-   /* A byte never becomes more than two UTF-16 units. */
-   UChar *u = malloc((n * 2 + 2) * sizeof *u);
-   char *out = NULL;
-   if (u) {
-      UErrorCode err = U_ZERO_ERROR;
-      UChar *t = u;
-      const char *s = (const char *)in;
-      ucnv_toUnicode(c, &t, u + n * 2 + 2, &s, s + n, NULL, true, &err);
-      const size_t k = (size_t)(t - u);
-      out = malloc(k * 3 + 1);
-      if (out) {
-         size_t w = jcs_utf16_to_wtf8((const uint16_t *)u, k, out);
-         out[w] = '\0';
-         *out_len = w;
-      }
+   if(!c)return;
+#ifndef _WIN32
+   iconv_close(c->handle);
+#endif
+   free(c);
+}
+/* The pending bytes belong to the decoder, including across short reads. */
+static size_t native_byte(struct native_converter *c,int byte,uint16_t out[16])
+{
+   if(byte>=0&&c->count<sizeof c->pending)c->pending[c->count++]=(unsigned char)byte;
+   if(!c->count)return 0;
+#ifdef _WIN32
+   size_t need=1;
+   if(c->cp==51932){if(c->pending[0]==0x8f)need=3;else if(c->pending[0]>=0x80)need=2;}
+   else if(c->cp==51949&&c->pending[0]>=0x80)need=2;
+   else if(c->cp==54936&&c->pending[0]>=0x81&&c->pending[0]<=0xfe){
+      need=2;if(c->count>=2&&c->pending[1]>='0'&&c->pending[1]<='9')need=4;
+   }else if(IsDBCSLeadByteEx(c->cp,c->pending[0]))need=2;
+   if(c->count<need&&byte>=0)return 0;
+   int n=c->count>=need?MultiByteToWideChar(c->cp,MB_ERR_INVALID_CHARS,(const char *)c->pending,(int)need,(wchar_t *)out,16):0;
+   if(!n){out[0]=JCS_FFFD;n=1;need=1;}
+   memmove(c->pending,c->pending+need,c->count-need);c->count-=need;
+   return (size_t)n;
+#else
+   char *src=(char *)c->pending,*dst=(char *)out;size_t left=c->count,space=32;
+   errno=0;size_t result=iconv(c->handle,&src,&left,&dst,&space);
+   size_t consumed=c->count-left,w=(32-space)/2;
+   memmove(c->pending,src,left);c->count=left;
+   if(result==(size_t)-1&&errno!=E2BIG&&!(errno==EINVAL&&byte>=0)){
+      if(c->count){memmove(c->pending,c->pending+1,--c->count);out[w++]=JCS_FFFD;}
    }
-   free(u);
-   ucnv_close(c);
-   return out;
+   (void)consumed;return w;
+#endif
+}
+static uint8_t *native_encode(const char *name,const uint16_t *u,size_t n,size_t *len)
+{
+   if(n>(SIZE_MAX-32)/8)return NULL;
+   struct native_converter *c=native_open(name,false);if(!c)return NULL;
+   size_t cap=n*8+32;uint8_t *out=malloc(cap);if(!out){native_close(c);return NULL;}
+#ifdef _WIN32
+   int k=WideCharToMultiByte(c->cp,c->cp==54936?0:WC_NO_BEST_FIT_CHARS,(const wchar_t *)u,(int)n,(char *)out,(int)cap,c->cp==54936?NULL:"?",NULL);
+   if(n&&!k){free(out);out=NULL;}else *len=(size_t)k;
+#else
+   char *src=(char *)u,*dst=(char *)out;size_t left=n*2,space=cap;
+   while(left){errno=0;size_t r=iconv(c->handle,&src,&left,&dst,&space);
+      if(r!=(size_t)-1)break;
+      if(errno!=EILSEQ&&errno!=EINVAL){free(out);out=NULL;break;}
+      size_t skip=left>=2?2:left;
+      if(left>=4){uint16_t hi=(unsigned char)src[0]|((unsigned char)src[1]<<8),lo=(unsigned char)src[2]|((unsigned char)src[3]<<8);
+         if(hi>=0xd800&&hi<=0xdbff&&lo>=0xdc00&&lo<=0xdfff)skip=4;}
+      src+=skip;left-=skip;
+      char repl[2]={'?',0},*rptr=repl;size_t rleft=2;
+      if(iconv(c->handle,&rptr,&rleft,&dst,&space)==(size_t)-1){free(out);out=NULL;break;}
+   }
+   if(out){(void)iconv(c->handle,NULL,NULL,&dst,&space);*len=cap-space;}
+#endif
+   native_close(c);return out;
+}
+static char *native_decode(const struct jcs *cs,const uint8_t *in,size_t n,size_t *len)
+{
+   struct native_converter *c=native_open(cs->name,true);if(!c)return NULL;
+   if(n>(SIZE_MAX-4)/6){native_close(c);return NULL;}
+   char *s=malloc(n*6+4);size_t w=0;if(s){
+      for(size_t i=0;i<n;i++){uint16_t u[16];size_t k=native_byte(c,in[i],u);w+=jcs_utf16_to_wtf8(u,k,s+w);}
+      while(c->count){uint16_t u[16];size_t k=native_byte(c,-1,u);w+=jcs_utf16_to_wtf8(u,k,s+w);}
+      s[w]=0;*len=w;
+   }native_close(c);return s;
 }
 
 char *jcs_decode(const struct jcs *cs, const uint8_t *in, size_t n,
@@ -359,8 +415,8 @@ char *jcs_decode(const struct jcs *cs, const uint8_t *in, size_t n,
    case JCS_UTF16BE:
    case JCS_UTF16LE:
       return utf16_decode(cs, in, n, out_len);
-   case JCS_ICU: {
-      char *r = icu_decode(cs, in, n, out_len);
+   case JCS_NATIVE: {
+      char *r = native_decode(cs, in, n, out_len);
       /* A converter that cannot be opened now could when looked up; the
        * bytes still become text rather than nothing. */
       return r ? r : utf8_decode(in, n, out_len);
@@ -407,7 +463,7 @@ uint8_t *jcs_encode(const struct jcs *cs, const char *wtf8, size_t n,
    if (!u) return NULL;
    size_t k = jcs_wtf8_to_utf16(wtf8, n, u);
    uint8_t *out = NULL;
-   if (cs->kind != JCS_ICU) {
+   if (cs->kind != JCS_NATIVE) {
       /* UTF-16 family.  "UTF-16" writes a big-endian byte-order mark; an
        * unpaired surrogate is unmappable and becomes '?'. */
       const bool little = cs->kind == JCS_UTF16LE;
@@ -432,19 +488,13 @@ uint8_t *jcs_encode(const struct jcs *cs, const char *wtf8, size_t n,
       free(u);
       return out;
    }
-   UConverter *c = icu_open(cs, false);
-   if (c) {
-      const size_t cap = (size_t)UCNV_GET_MAX_BYTES_FOR_STRING(k, ucnv_getMaxCharSize(c));
-      out = malloc(cap + 1);
-      if (out) {
-         UErrorCode err = U_ZERO_ERROR;
-         char *t = (char *)out;
-         const UChar *s = (const UChar *)u;
-         ucnv_fromUnicode(c, &t, (char *)out + cap, &s, s + k, NULL, true, &err);
-         *out_len = (size_t)(t - (char *)out);
-      }
-      ucnv_close(c);
+   for (size_t i = 0; i < k; i++) {
+      if (u[i] >= 0xd800 && u[i] <= 0xdbff) {
+         if (i + 1 < k && u[i + 1] >= 0xdc00 && u[i + 1] <= 0xdfff) i++;
+         else u[i] = '?';
+      } else if (u[i] >= 0xdc00 && u[i] <= 0xdfff) u[i] = '?';
    }
+   out = native_encode(cs->name, u, k, out_len);
    free(u);
    return out;
 }
@@ -453,7 +503,7 @@ uint8_t *jcs_encode(const struct jcs *cs, const char *wtf8, size_t n,
 
 struct jcs_decoder {
    struct jcs cs;
-   UConverter *conv;          /* JCS_ICU */
+   struct native_converter *conv; /* JCS_NATIVE */
    uint16_t q[16];            /* decoded units not yet handed out */
    int qh, qn;
    int held;                  /* a byte read ahead and not consumed, or -3 */
@@ -471,8 +521,8 @@ struct jcs_decoder *jcs_decoder_new(const struct jcs *cs)
    d->held = -3;
    d->held_unit = -1;
    d->little = cs->kind == JCS_UTF16LE;
-   if (cs->kind == JCS_ICU) {
-      d->conv = icu_open(cs, true);
+   if (cs->kind == JCS_NATIVE) {
+      d->conv = native_open(cs->name, true);
       if (!d->conv) jcs_default(&d->cs);
    }
    return d;
@@ -481,7 +531,7 @@ struct jcs_decoder *jcs_decoder_new(const struct jcs *cs)
 void jcs_decoder_free(struct jcs_decoder *d)
 {
    if (!d) return;
-   if (d->conv) ucnv_close(d->conv);
+   if (d->conv) native_close(d->conv);
    free(d);
 }
 
@@ -600,20 +650,16 @@ static int dec_fill(struct jcs_decoder *d, int (*next_byte)(void *), void *ctx)
       dq_push(d, u >= 0xdc00 && u <= 0xdfff ? JCS_FFFD : (uint16_t)u);
       return 0;
    }
-   case JCS_ICU: {
+   case JCS_NATIVE: {
       /* One byte at a time: the converter keeps a partial multi-byte
        * sequence in its own state until the byte that completes it. */
       for (;;) {
          int b = dec_byte(d, next_byte, ctx);
          if (b == -2) return -2;
-         UChar out[8];
-         UChar *t = out;
-         UErrorCode err = U_ZERO_ERROR;
-         char byte = (char)b;
-         const char *s = &byte;
-         ucnv_toUnicode(d->conv, &t, out + 8, &s, b < 0 ? s : s + 1, NULL,
-                        b < 0, &err);
-         for (UChar *p = out; p < t; ++p) dq_push(d, *p);
+         uint16_t units[16];
+         size_t count = native_byte(d->conv, b, units);
+         for (size_t i=0;i<count;i++) dq_push(d, units[i]);
+         if (b < 0 && d->conv->count) continue;
          if (b < 0) {
             d->done = true;
             return d->qn ? 0 : -1;

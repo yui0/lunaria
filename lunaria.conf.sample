@@ -1,6 +1,7 @@
 # lunaria.conf — settings that belong to this installation rather than to one
-# run.  Copy to `lunaria.conf` in the directory you start the launcher from --
-# that one place, and no other -- and edit.  `NAME=value`, `#` comments; only
+# run. Copy to `lunaria.conf` in the directory you start the launcher from.
+# Select another file with --config FILE or LUNARIA_CONF=/path/lunaria.conf.
+# Relative paths refer to the startup directory. `NAME=value`, `#` comments; only
 # LUNARIA_* names are read.  A variable already set in the environment wins, so
 #     LUNARIA_DEVICE=pixel7 ./lunaria-apk.sh game.apk
 # still overrides the file for that one run.
@@ -49,7 +50,17 @@
 # somewhere else does not find any of that -- it downloads the lot again.  It
 # also wants a path whose components are ASCII, because a guest that mishandles
 # one then fails for a reason that has nothing to do with the guest.
-#LUNARIA_DATA_ROOT=/var/lunaria
+# --data-root DIR overrides this setting for one launch. Examples:
+#LUNARIA_DATA_ROOT=/mnt/games/lunaria
+#LUNARIA_DATA_ROOT=/Volumes/Games/lunaria
+#LUNARIA_DATA_ROOT=D:/Games/Lunaria
+#LUNARIA_DATA_ROOT="../Game data"
+
+# Unpacked APKs are reusable package data. The default is cache/packages under
+# the common data root selected at startup (or the startup directory itself).
+# Move the package cache independently, including when each package has its
+# own data root in a [package.name] block:
+#LUNARIA_CACHE_DIR=D:/Games/Lunaria/cache/packages
 
 # ---------------------------------------------------------------------------
 # The screen.
@@ -76,12 +87,19 @@
 # a window size does not silently restate what kind of screen this is.
 #LUNARIA_WIDTH=1024
 #LUNARIA_HEIGHT=768
+# Keep the Android display fixed and fit it into the resized host window.
+# Requires the compositor; otherwise resizing changes the Android surface.
+#LUNARIA_RESIZE_MODE=scale
 #LUNARIA_DPI=420
 
 # A panel that is not the selected device's (portrait, short side first).
 #LUNARIA_DEVICE_SCREEN_WIDTH=1080
 #LUNARIA_DEVICE_SCREEN_HEIGHT=2400
 #LUNARIA_DEVICE_SCREEN_DENSITY=420
+
+# Android hardware reports (memory in MiB). These do not reserve host RAM.
+#LUNARIA_MEM_TOTAL_MB=6144
+#LUNARIA_CPU_COUNT=4
 
 # Execution engines for the A64 scheduler.
 #LUNARIA_A64_ENGINES=4
@@ -135,7 +153,11 @@
 #LUNARIA_WEB_BROWSER=/opt/google/chrome/chrome
 
 # ---------------------------------------------------------------------------
-# Right-click menu (sound, WebView, keyboard, full screen).
+# Right-click menu (settings, resolution, sound, WebView, keyboard, full screen).
+# Resolution changes immediately and is saved; other settings apply on restart.
+# Cancel discards edits in the settings dialog.
+# Resolution presets: 800x450, 1024x576, 1280x720, 1600x900, 1920x1080,
+# 1024x768, rotated for portrait windows. Pixel size and DPI are independent.
 #
 # A line above the first [package] block is common: it applies to every app
 # and it wins over the same name inside a package block.  The menu writes the
@@ -153,3 +175,11 @@
 #
 # [com.miHoYo.GenshinImpact]
 # LUNARIA_KEYMAP=keymaps/genshin.conf
+# LUNARIA_PROFILE_PROMPT=1
+# LUNARIA_SHARED_ASSETS=AssetBundles:AudioAssets:VideoAssets:UnityShaderBin:il2cpp:ctable.dat:hardware_model_config.json:vulkan_gpu_list_config.txt
+# LUNARIA_PROFILE_SEED_FILES=data_revision:data_versions_persist:res_revision:res_revision_eternal:res_versions_persist:silence_data_versions_persist:silence_revision:base_res_version_hash:audio_revision:ScriptVersion:PatchDone:ChannelName:vulkan_gpu_list_config_engine.txt
+
+# Guest graphics API: Vulkan is enabled by default when the host bridge is available.
+# Set 0 to expose OpenGL ES only. The right-click Graphics API menu saves
+# this choice per app; restart the app to apply. GLES-only apps still use GLES.
+# LUNARIA_VULKAN=1

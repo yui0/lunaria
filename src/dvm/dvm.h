@@ -101,6 +101,8 @@ struct dvm_hooks {
 
 struct dvm *dvm_create(const struct dvm_hooks *hooks);
 void dvm_destroy(struct dvm *vm);
+void dvm_glsurface_tick(struct dvm *vm);
+void dvm_glsurface_finish(struct dvm *vm);
 
 /* Adds one classes*.dex.  Later files do not override classes already
  * defined, which matches the multidex lookup order. */
@@ -216,6 +218,7 @@ uint64_t dvm_instructions(const struct dvm *vm);
 /* Write out any preferences an apply() left pending.  The frame pump calls
  * this, which is where a device's asynchronous write would land. */
 void dvm_prefs_flush(struct dvm *vm);
+void dvm_prefs_finish(struct dvm *vm);
 /* One frame of the emulator's input method: what the host typed goes to the
  * connected View, and a pending layout pass runs.  Called from the frame pump
  * without the interpreter lock. */
@@ -317,6 +320,7 @@ void dvm_gil_wait(struct dvm *vm, unsigned ms);
 /* As above, but wake only for changes to `channel`.  Channels are opaque
  * non-zero values; a queue's dvm_ref is a convenient stable identifier. */
 void dvm_gil_wait_for(struct dvm *vm, uintptr_t channel, unsigned ms);
+void dvm_gil_wait_for_ns(struct dvm *vm, uintptr_t channel, uint64_t ns);
 
 /* Enter/leave the VM from guest code that holds the ARM execution lock; see
  * the definition for the lock-order argument.  The cookie is opaque and must

@@ -20,8 +20,8 @@ bool Inst::IsArithmeticShift() const {
 }
 
 bool Inst::IsCircularShift() const {
-    return op == Opcode::RotateRight32
-        || op == Opcode::RotateRight64
+    return op == Opcode::Ror32
+        || op == Opcode::Ror64
         || op == Opcode::RotateRightExtended;
 }
 

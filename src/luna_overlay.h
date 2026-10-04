@@ -24,6 +24,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -157,6 +158,8 @@ void luna_overlay_image_changed(const char *path);
 /* Releases the GL objects and the document.  Safe to call without a context;
  * it only forgets state in that case. */
 void luna_overlay_shutdown(void);
+/* Install the shared font, clock and GL callbacks for a pre-guest luna-ui host. */
+void luna_overlay_prepare_platform(void);
 
 /* Decodes a PNG/JPEG/WebP-less image held in memory to 8-bit RGBA with the
  * decoder luna-ui already links; NULL when it cannot.  Free the result with

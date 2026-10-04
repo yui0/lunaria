@@ -1670,13 +1670,25 @@ bool dvm_jni_invoke_locked(JNIEnv *env, const char *class_name, const char *meth
       char buf[512];
       dvm_describe_exception(vm, dvm_exception(vm), buf, sizeof buf);
       fprintf(stderr, "[dvm] %s.%s%s threw %s\n", class_name, method, msig, buf);
+      jthrowable exception = (jthrowable)to_jobject(vm, env, dvm_exception(vm));
       dvm_clear_exception(vm);
+      if (exception) (*env)->Throw(env, exception);
       memset(&ret, 0, sizeof ret);
    }
 
    if (out) *out = dvm_to_jvalue(vm, env, dvm_sig_return_kind(msig), ret);
    g_env = saved;
    return true;
+}
+
+void dvm_jni_show_activity(JNIEnv *env, jobject activity)
+{
+   struct dvm *vm = dvm_jni_vm();
+   if (!vm || !env || !activity) return;
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   dvm_ref ref = from_jobject(vm, env, activity);
+   if (ref) dvm__activity_visible(vm, ref);
+   dvm_gil_leave_to_guest(vm, cookie);
 }
 
 bool dvm_jni_invoke(JNIEnv *env, const char *class_name, const char *method,

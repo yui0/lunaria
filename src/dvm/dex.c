@@ -160,19 +160,21 @@ void dex_close(struct dex_file *d)
  * points above the BMP are encoded as a surrogate pair of three-byte
  * sequences.  Both forms are rejected by anything expecting plain UTF-8, so we
  * normalise them into a private copy the first time such a string is read. */
-static bool mutf8_needs_fixup(const uint8_t *s)
+static bool mutf8_needs_fixup(const uint8_t *s, const uint8_t *end)
 {
    /* c0 80 (the MUTF-8 spelling of U+0000) is left alone: it is already safe
     * to carry in a C string, and it keeps the character count right.  Only
     * surrogate pairs have to be folded into real UTF-8. */
-   for (; *s; ++s)
-      if (s[0] == 0xed && (s[1] & 0xf0) == 0xa0) return true;  /* high surrogate */
+   while ((s = memchr(s, 0xed, (size_t)(end - s))) != NULL) {
+      if (end - s >= 2 && (s[1] & 0xf0) == 0xa0) return true;
+      ++s;
+   }
    return false;
 }
 
-static char *mutf8_to_utf8(const uint8_t *s)
+static char *mutf8_to_utf8(const uint8_t *s, const uint8_t *end)
 {
-   size_t n = strlen((const char *)s);
+   size_t n = (size_t)(end - s);
    char *out = malloc(n + 1);
    if (!out) return NULL;
    char *w = out;
@@ -181,7 +183,7 @@ static char *mutf8_to_utf8(const uint8_t *s)
        * string by a character, which broke length checks on binary payloads
        * carried as strings (Play services stores its signing certificates
        * that way). */
-      if (s[0] == 0xed && (s[1] & 0xf0) == 0xa0 &&
+      if (end - s >= 6 && s[0] == 0xed && (s[1] & 0xf0) == 0xa0 &&
           s[3] == 0xed && (s[4] & 0xf0) == 0xb0) {
          uint32_t hi = 0xd800u | (uint32_t)(s[1] & 0x0f) << 6 | (s[2] & 0x3f);
          uint32_t lo = 0xdc00u | (uint32_t)(s[4] & 0x0f) << 6 | (s[5] & 0x3f);
@@ -211,11 +213,12 @@ const char *dex_string(struct dex_file *d, uint32_t idx)
    if (p >= d->len) return NULL;
 
    /* The data must be NUL-terminated inside the mapping. */
-   if (!memchr(d->p + p, 0, d->len - p)) return NULL;
+   const uint8_t *end = memchr(d->p + p, 0, d->len - p);
+   if (!end) return NULL;
 
    const uint8_t *raw = d->p + p;
-   if (mutf8_needs_fixup(raw)) {
-      char *fixed = mutf8_to_utf8(raw);
+   if (mutf8_needs_fixup(raw, end)) {
+      char *fixed = mutf8_to_utf8(raw, end);
       if (!fixed) return NULL;
       d->fixups[idx] = fixed;
       d->strings[idx] = fixed;
@@ -302,6 +305,7 @@ bool dex_proto_signature(struct dex_file *d, uint32_t proto_idx,
    if (n < 0 || n > 256) return false;
    const char *ret = dex_proto_return(d, proto_idx);
    if (!ret) return false;
+   const size_t rl = strlen(ret);
 
    size_t used = 0;
    if (buf_sz < 3) return false;
@@ -309,12 +313,11 @@ bool dex_proto_signature(struct dex_file *d, uint32_t proto_idx,
    for (int i = 0; i < n; ++i) {
       if (!params[i]) return false;
       size_t l = strlen(params[i]);
-      if (used + l + 2 + strlen(ret) >= buf_sz) return false;
+      if (used + l + 2 + rl > buf_sz) return false;
       memcpy(buf + used, params[i], l);
       used += l;
    }
    buf[used++] = ')';
-   size_t rl = strlen(ret);
    if (used + rl + 1 > buf_sz) return false;
    memcpy(buf + used, ret, rl);
    buf[used + rl] = '\0';
@@ -965,9 +968,10 @@ bool dex_field_signature(struct dex_file *d, uint32_t class_def_idx,
    return dex_signature_text(d, signature_off, out, out_sz);
 }
 
-const char *dex_class_enclosing_type(struct dex_file *d,
-                                     uint32_t class_def_idx)
+static const char *class_enclosing_type(struct dex_file *d,
+                                        uint32_t class_def_idx, bool *member)
 {
+   if (member) *member = false;
    struct dex_class_def cd;
    if (!dex_class_def(d, class_def_idx, &cd) || !cd.annotations_off ||
        (uint64_t)cd.annotations_off + 16u > d->len)
@@ -1003,8 +1007,10 @@ const char *dex_class_enclosing_type(struct dex_file *d,
          uint8_t hdr = d->p[p++];
          uint32_t idx;
          if (!dex_value_index(d, &p, hdr, &idx)) return NULL;
-         if (enclosing_class && (hdr & 0x1fu) == DEX_VALUE_TYPE)
+         if (enclosing_class && (hdr & 0x1fu) == DEX_VALUE_TYPE) {
+            if (member) *member = true;
             return dex_type(d, idx);
+         }
          if (enclosing_method && (hdr & 0x1fu) == DEX_VALUE_METHOD) {
             struct dex_method_id method;
             if (dex_method_id(d, idx, &method))
@@ -1014,6 +1020,18 @@ const char *dex_class_enclosing_type(struct dex_file *d,
       }
    }
    return NULL;
+}
+
+const char *dex_class_enclosing_type(struct dex_file *d, uint32_t class_def_idx)
+{
+   return class_enclosing_type(d, class_def_idx, NULL);
+}
+
+bool dex_class_is_member(struct dex_file *d, uint32_t class_def_idx)
+{
+   bool member = false;
+   (void)class_enclosing_type(d, class_def_idx, &member);
+   return member;
 }
 
 /* --- encoded values ----------------------------------------------------- */

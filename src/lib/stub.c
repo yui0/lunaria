@@ -25,8 +25,6 @@
 # include "inc/opensles.c"
 #elif defined(LUNARIA_STUB_GLESV3)
 # include "inc/glesv3.c"
-#elif defined(LUNARIA_STUB_VULKAN)
-# include "inc/vulkan.c"
 #else
 # error "Define one of the LUNARIA_STUB_* runtime modules"
 #endif

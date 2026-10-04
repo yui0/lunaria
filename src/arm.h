@@ -58,7 +58,7 @@ extern "C" {
 
 /* The ARM execution lock.
  *
- * Guest code itself needs no lock: memory is identity-mapped and each guest
+ * A64 guest code needs no lock: memory is identity-mapped and each guest
  * thread has its own registers, so two of them can run in the JIT at the same
  * time on two host cores.  What cannot run at the same time is the emulator
  * around them — the SVC layer keeps its socket table, thread table, file
@@ -66,8 +66,10 @@ extern "C" {
  * synchronisation, because until now exactly one host thread ever touched
  * them.
  *
- * So the rule is: hold this across everything that leaves guest code, and only
- * that.  It is the same shape as the bytecode VM's interpreter lock (see
+ * A32 fast stubs also share CUR_TID_VA, so A32 holds the lock across each
+ * guest slice and restores that word after blocking SVCs. A64 holds this
+ * across everything that leaves guest code. It is the same shape as the
+ * bytecode VM's interpreter lock (see
  * dvm_gil_acquire), including the part that matters most — a handler that is
  * about to block gives the lock up first, or one thread waiting on a socket
  * would stop every other guest thread.
@@ -165,7 +167,7 @@ void arm_set_parallel_engines(bool on);
 #include <mutex>
 #include <shared_mutex>
 #include <string>
-#include <sys/mman.h>
+#include "lunaria_os.h"
 #include <unordered_map>
 #include <vector>
 
@@ -489,7 +491,7 @@ inline void a64_map_remove(GuestVA lo, GuestVA hi, bool release) {
         if (m.hi <= lo || m.lo >= hi) { ++i; continue; }
         GuestVA clo = std::max(m.lo, lo), chi = std::min(m.hi, hi);
         if (release && m.owned)
-            ::munmap((void *)clo, (size_t)(chi - clo));
+            luna_os_release((void *)clo, (size_t)(chi - clo));
         bool head = m.lo < clo, tail = m.hi > chi;
         if (head && tail) {
             A64Mapping right{chi, m.hi, m.prot, m.owned};
@@ -527,8 +529,9 @@ inline void a64_map_set_prot(GuestVA lo, GuestVA hi, uint32_t prot) {
 
 // Guest VA is host VA, so a mapping must never land inside the image window.
 inline bool a64_va_usable(void *p, uint64_t len) {
-    if (p == MAP_FAILED) return false;
+    if (!p) return false;
     uint64_t lo = (uint64_t)p, hi = lo + len;
+    if (lo < A64_GUEST_SIZE || hi < lo) return false;
     if (lo < A64_GUEST_BASE + A64_GUEST_SIZE && hi > A64_GUEST_BASE) return false;
     // Must stay inside the AArch64 lower-half canonical range (52-bit VA).
     if (hi > 0x0010000000000000ull) return false;
@@ -541,7 +544,7 @@ inline GuestVA a64_va_map(GuestVA hint, uint64_t len, uint32_t prot,
     len = (len + 4095ull) & ~4095ull;
     if (!len) return 0;
     void *want = nullptr;
-    if (hint && !a64_is_guest_va(hint) && hint >= 0x10000ull &&
+    if (hint && !a64_is_guest_va(hint) && hint >= A64_GUEST_SIZE &&
         !(hint & 4095ull) && hint + len <= 0x0010000000000000ull)
         want = (void *)hint;
     if (fixed && !want) { errno = EINVAL; return 0; }
@@ -559,28 +562,22 @@ inline GuestVA a64_va_map(GuestVA hint, uint64_t len, uint32_t prot,
     }
     if (fixed)
         a64_map_remove((GuestVA)want, (GuestVA)want + len, /*release=*/false);
-    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
-    if (fixed) flags |= MAP_FIXED;
-    void *p = ::mmap(want, (size_t)len, PROT_READ | PROT_WRITE,
-                     flags, -1, 0);
+    void *p = luna_os_map_anon(want, (size_t)len, fixed);
     if (fixed && p != want) {
-        if (p != MAP_FAILED) ::munmap(p, (size_t)len);
+        if (p) luna_os_release(p, (size_t)len);
         return 0;
     }
     if (!a64_va_usable(p, len)) {
         if (fixed) {
-            if (p != MAP_FAILED) ::munmap(p, (size_t)len);
+            if (p) luna_os_release(p, (size_t)len);
             return 0;
         }
         // Landed in the image window (or an unusable hint).
         void *bad = p;
-        p = (want || p != MAP_FAILED)
-                ? ::mmap(nullptr, (size_t)len, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)
-                : MAP_FAILED;
-        if (bad != MAP_FAILED) ::munmap(bad, (size_t)len);
+        p = (want || p) ? luna_os_map_anon(nullptr, (size_t)len, 0) : nullptr;
+        if (bad) luna_os_release(bad, (size_t)len);
         if (!a64_va_usable(p, len)) {
-            if (p != MAP_FAILED) ::munmap(p, (size_t)len);
+            if (p) luna_os_release(p, (size_t)len);
             return 0;
         }
     }
@@ -596,39 +593,34 @@ inline GuestVA a64_va_map(GuestVA hint, uint64_t len, uint32_t prot,
  * the SVC — while holding the execution lock — is why the title→world
  * transition crawled while a phone, which only installs a VMA, is instant. */
 inline GuestVA a64_va_mmap_file(GuestVA hint, uint64_t len, uint32_t prot,
-                                int host_flags, int fd, int64_t off) {
+                                int map_flags, int fd, int64_t off) {
     len = (len + 4095ull) & ~4095ull;
     if (!len || fd < 0) return 0;
-    int host_prot = (int)(prot & (PROT_READ | PROT_WRITE | PROT_EXEC));
-    if (!host_prot) host_prot = PROT_NONE;
-    if (!(host_flags & (MAP_SHARED | MAP_PRIVATE)))
-        host_flags |= MAP_PRIVATE;
-    host_flags &= ~MAP_ANONYMOUS;
-    host_flags |= MAP_NORESERVE;
+    int host_prot = (int)(prot & (LUNA_PROT_READ | LUNA_PROT_WRITE | LUNA_PROT_EXEC));
+    if (!(map_flags & (LUNA_MAP_SHARED | LUNA_MAP_PRIVATE)))
+        map_flags |= LUNA_MAP_PRIVATE;
+    map_flags |= LUNA_MAP_NORESERVE;
 
-    bool fixed = (host_flags & MAP_FIXED) != 0;
+    bool fixed = (map_flags & (LUNA_MAP_FIXED | LUNA_MAP_NOREPLACE)) != 0;
     void *want = nullptr;
-    if (hint && !a64_is_guest_va(hint) && hint >= 0x10000ull &&
+    if (hint && !a64_is_guest_va(hint) && hint >= A64_GUEST_SIZE &&
         !(hint & 4095ull) && hint + len <= 0x0010000000000000ull)
         want = (void *)hint;
-    if (fixed && want)
+    if (fixed && want && !(map_flags & LUNA_MAP_NOREPLACE))
         a64_map_remove((GuestVA)want, (GuestVA)want + len, /*release=*/true);
 
-    void *p = ::mmap(want, (size_t)len, host_prot, host_flags, fd, (off_t)off);
+    void *p = luna_os_map_file_flags(want, (size_t)len, host_prot, map_flags, fd, (uint64_t)off);
     if (!a64_va_usable(p, len) || (fixed && want && p != want)) {
         void *bad = p;
         if (fixed) {
-            if (bad != MAP_FAILED) ::munmap(bad, (size_t)len);
+            if (bad) luna_os_release(bad, (size_t)len);
             return 0;
         }
-        int retry = host_flags & ~(int)MAP_FIXED;
-#ifdef MAP_FIXED_NOREPLACE
-        retry &= ~(int)MAP_FIXED_NOREPLACE;
-#endif
-        p = ::mmap(nullptr, (size_t)len, host_prot, retry, fd, (off_t)off);
-        if (bad != MAP_FAILED && bad != p) ::munmap(bad, (size_t)len);
+        int retry = map_flags & ~(LUNA_MAP_FIXED | LUNA_MAP_NOREPLACE);
+        p = luna_os_map_file_flags(nullptr, (size_t)len, host_prot, retry, fd, (uint64_t)off);
+        if (bad && bad != p) luna_os_release(bad, (size_t)len);
         if (!a64_va_usable(p, len)) {
-            if (p != MAP_FAILED) ::munmap(p, (size_t)len);
+            if (p) luna_os_release(p, (size_t)len);
             return 0;
         }
     }
@@ -678,8 +670,8 @@ inline void guest_layout_init(void) {
     static bool once = false;
     if (once) return;
     once = true;
-    long m2b = lunaria_env_long("LUNARIA_MMAP2_BASE", 0);
-    long m2e = lunaria_env_long("LUNARIA_MMAP2_END", 0);
+    uint32_t m2b = lunaria_env_u32("LUNARIA_MMAP2_BASE", 0);
+    uint32_t m2e = lunaria_env_u32("LUNARIA_MMAP2_END", 0);
 
     /* How much of the window malloc and the small-mmap fallback share.
      *
@@ -1004,7 +996,9 @@ inline uint32_t g_reloc_data_start = 0; /* per-library .data start for data_star
 // tiny ARM stub that does nothing and returns r0=0.
 inline uint32_t NOOP_RET0      = 0x41014100u;
 // Fixed guest data the loader synthesises for data-only imports.
-inline uint32_t MISC_DATA     = 0x41014000u;
+/* Separate from LIBC_DATA: tzset writes tzname at +0x100, which must
+ * never overwrite NOOP_RET0 (or environment strings overwrite ctype). */
+inline uint32_t MISC_DATA     = 0x41015000u;
 inline uint32_t SL_PAGE_BASE  = 0x41016000u;
 inline uint32_t misc_sl_iid(void)     { return MISC_DATA + 0x000u; }
 inline uint32_t misc_sl_iid_end(void) { return MISC_DATA + 0x100u; }
@@ -1187,7 +1181,7 @@ inline void guest_va_layout_arm64(void) {
     MMAP_END          = MMAP_BASE;   /* primary arena disabled (see above) */
     g_mmap_next       = MMAP_BASE;
     // Guest mmap now lives in the real 64-bit address space, so the image window only has to hold code.
-    setenv("LUNARIA_MMAP2_BASE", "0xF0000000", 0);
+    luna_os_setenv("LUNARIA_MMAP2_BASE", "0xF0000000", 0);
     lunaria_env_invalidate();
     fprintf(stderr, "[mem] a64 VA: tramp=%08x stack=%08x mmap=[%08x,%08x) "
             "heap=%08x\n",
@@ -1215,8 +1209,15 @@ inline uint32_t guest_clamp_write_n(uint32_t dst, uint32_t n) {
         n = TRAMP_BASE - dst;
         end = (uint64_t)dst + n;
     }
-    if (dst >= TRAMP_BASE && dst < STACK_BASE)
+    if (dst >= TRAMP_BASE && dst < STACK_BASE) {
+        /* Java's allocateDirect pool is writable payload in this window,
+         * not trampoline code. FMOD initializes its native audio buffer
+         * with memset; suppressing that write violates the buffer contract. */
+        if (dst >= DIRECT_BB_BASE && dst < DIRECT_BB_BASE + DIRECT_BB_SIZE)
+            return n < DIRECT_BB_BASE + DIRECT_BB_SIZE - dst ? n :
+                       DIRECT_BB_BASE + DIRECT_BB_SIZE - dst;
         return 0;
+    }
     // Do NOT clamp libc writes to mmap slab size (Unity Dynamic Heap bookkeeping).
     (void)g_mmap_slabs;
     return n;
