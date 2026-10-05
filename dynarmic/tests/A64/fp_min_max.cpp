@@ -64,7 +64,7 @@ u32 force_default_nan(u32 value) {
 template<typename Fn>
 void run_test(u32 instruction, Fn fn) {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(instruction);  // FMAX S0, S1, S2
     env.code_mem.emplace_back(0x14000000);   // B .

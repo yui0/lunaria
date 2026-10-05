@@ -159,7 +159,7 @@ enum nsd_event_kind { NSD_FOUND, NSD_LOST, NSD_RESOLVED, NSD_FAILED };
 struct nsd_event {
    uint64_t id;
    enum nsd_event_kind kind;
-   int error, interface, protocol;
+   int error, interface_index, protocol;
    char name[256], type[256], domain[256], host[256], address[64];
    uint16_t port;
    unsigned char *txt;

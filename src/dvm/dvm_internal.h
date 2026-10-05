@@ -138,6 +138,9 @@ struct dvm_object {
    uint32_t length;
    char elem_kind;
    void *data;
+   /* Builtin payloads may own nested allocations. The callback releases
+    * those allocations and the payload itself; plain arrays use free(). */
+   void (*data_destroy)(void *);
 
    /* java.lang.Class */
    struct dvm_class *klass;
@@ -336,6 +339,7 @@ struct dvm_class *dvm__register_builtin(struct dvm *vm, const char *desc);
 struct dvm_class *dvm__define_primitive(struct dvm *vm, const char *desc);
 struct dvm_class *dvm__class_by_desc(struct dvm *vm, const char *desc);
 void dvm__activity_visible(struct dvm *vm, dvm_ref activity);
+void dvm__main_queue_idle(struct dvm *vm, bool dispatched);
 
 bool dvm__class_assignable(struct dvm *vm, struct dvm_class *from,
                            struct dvm_class *to);

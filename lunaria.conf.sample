@@ -104,6 +104,10 @@
 # Execution engines for the A64 scheduler.
 #LUNARIA_A64_ENGINES=4
 
+# Debug only: stop at the exact faulting A64 memory instruction and preserve
+# its register state. Off by default to prioritize execution speed.
+#LUNARIA_A64_SEGV=1
+
 # ---------------------------------------------------------------------------
 # The installed-package ledger this device reports.
 #

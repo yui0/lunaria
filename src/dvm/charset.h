@@ -74,7 +74,7 @@ uint8_t *jcs_encode(const struct jcs *cs, const char *wtf8, size_t n,
  * bytes written (no terminator). */
 size_t jcs_utf16_to_wtf8(const uint16_t *u, size_t n, char *out);
 
-/* WTF-8 to UTF-16 code units.  `out` needs n units; returns the count. */
+/* WTF-8 to UTF-16 code units. `out` needs n units, or may be NULL to count. */
 size_t jcs_wtf8_to_utf16(const char *s, size_t n, uint16_t *out);
 
 /* A decoder for a byte stream (InputStreamReader): bytes are pulled from

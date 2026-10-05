@@ -187,6 +187,7 @@ struct jvm_string {
 struct jvm_array {
    void *data;
    size_t element_sz, size; // `size` == in elements, `size * element_sz` for bytes
+   bool reference_elements;
 };
 
 struct jvm_class {
@@ -231,6 +232,7 @@ struct jvm_object {
     * DVM-to-native bridge explicitly releases the opaque locals it created
     * once that native call returns (jvm_release_bridge_local). */
    int refs;
+   int array_refs; /* Strong array edges, excluded from JNI-local ownership. */
 
    /* JNI MonitorEnter/Exit state.  Access is serialized by the bridge's
     * monitor mutex; the small owner token avoids depending on pthread_t's
@@ -314,6 +316,11 @@ struct jvm {
 /* Raise a JNI exception of `class_name` ("java/lang/ClassNotFoundException")
  * with `msg`, as ThrowNew would.  Safe to call from the JNI stubs. */
 void jvm_throw_new(struct jvm *jvm, const char *class_name, const char *msg);
+
+/* Internal Java string transfer. Both VMs use WTF-8 with an explicit byte
+ * length; JNI modified UTF-8 is converted only at the native API boundary. */
+jstring jvm_new_string_wtf8(struct jvm *jvm, const char *text, size_t bytes);
+const char *jvm_string_wtf8(struct jvm *jvm, jstring string, size_t *bytes);
 
 const char*
 jvm_get_class_name(struct jvm *jvm, jobject object);

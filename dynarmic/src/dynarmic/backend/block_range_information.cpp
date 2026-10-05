@@ -5,7 +5,7 @@
 
 #include "dynarmic/backend/block_range_information.h"
 
-#include <boost/icl/interval_map.hpp>
+#include <new>
 #include <boost/icl/interval_set.hpp>
 #include <mcl/stdint.hpp>
 #include <tsl/robin_set.h>
@@ -14,24 +14,28 @@ namespace Dynarmic::Backend {
 
 template<typename ProgramCounterType>
 void BlockRangeInformation<ProgramCounterType>::AddRange(boost::icl::discrete_interval<ProgramCounterType> range, IR::LocationDescriptor location) {
-    block_ranges.add(std::make_pair(range, std::set<IR::LocationDescriptor>{location}));
+    if (boost::icl::is_empty(range)) return;
+    if (!dynarmic_block_range_add(&block_ranges, boost::icl::first(range),
+                                 boost::icl::last(range), location.Value())) {
+        throw std::bad_alloc{};
+    }
 }
 
 template<typename ProgramCounterType>
 void BlockRangeInformation<ProgramCounterType>::ClearCache() {
-    block_ranges.clear();
+    dynarmic_block_range_clear(&block_ranges);
 }
 
 template<typename ProgramCounterType>
 tsl::robin_set<IR::LocationDescriptor> BlockRangeInformation<ProgramCounterType>::InvalidateRanges(const boost::icl::interval_set<ProgramCounterType>& ranges) {
     tsl::robin_set<IR::LocationDescriptor> erase_locations;
-    for (auto invalidate_interval : ranges) {
-        auto pair = block_ranges.equal_range(invalidate_interval);
-        for (auto it = pair.first; it != pair.second; ++it) {
-            for (const auto& descriptor : it->second) {
-                erase_locations.insert(descriptor);
-            }
-        }
+    for (const auto& range : ranges) {
+        dynarmic_block_range_query(block_ranges, boost::icl::first(range),
+                                  boost::icl::last(range),
+                                  [](uint64_t location, void* context) {
+                                      auto& locations = *static_cast<tsl::robin_set<IR::LocationDescriptor>*>(context);
+                                      locations.insert(IR::LocationDescriptor{location});
+                                  }, &erase_locations);
     }
     // TODO: EFFICIENCY: Remove ranges that are to be erased.
     return erase_locations;

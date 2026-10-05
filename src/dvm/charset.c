@@ -172,10 +172,14 @@ size_t jcs_wtf8_to_utf16(const char *s, size_t n, uint16_t *out)
       uint32_t cp = wtf8_cp(p + i, n - i, &w);
       i += w;
       if (cp >= 0x10000) {
-         out[k++] = (uint16_t)(0xd800u + ((cp - 0x10000u) >> 10));
-         out[k++] = (uint16_t)(0xdc00u + ((cp - 0x10000u) & 0x3ffu));
+         if (out) {
+            out[k] = (uint16_t)(0xd800u + ((cp - 0x10000u) >> 10));
+            out[k + 1] = (uint16_t)(0xdc00u + ((cp - 0x10000u) & 0x3ffu));
+         }
+         k += 2;
       } else {
-         out[k++] = (uint16_t)cp;
+         if (out) out[k] = (uint16_t)cp;
+         ++k;
       }
    }
    return k;

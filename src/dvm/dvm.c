@@ -245,12 +245,20 @@ void dvm_unpin(struct dvm *vm, dvm_ref ref)
  * would free objects the game still holds.  Objects are reclaimed only where
  * the VM can prove it: string temporaries created and dropped inside one
  * builtin. */
+static void object_data_destroy(struct dvm_object *o)
+{
+   if (o->data_destroy) o->data_destroy(o->data);
+   else free(o->data);
+   o->data = NULL;
+   o->data_destroy = NULL;
+}
+
 static void heap_free(struct dvm *vm, dvm_ref ref)
 {
    struct dvm_object *o = dvm__obj(vm, ref);
    if (!o || o->pins) return;
    free(o->utf8);
-   free(o->data);
+   object_data_destroy(o);
    free(o->slots);
    memset(o, 0, sizeof *o);
    o->next_free = vm->free_head;
@@ -3763,7 +3771,17 @@ void dvm_main_looper_tick(struct dvm *vm)
    dvm__tstate_save(vm, &saved);
    main_turn.cur_thread = vm->main_thread;
    dvm__tstate_load(vm, &main_turn);
+   extern __thread dvm_ref g_current_looper;
+   const dvm_ref saved_looper = g_current_looper;
+   g_current_looper = 0;
+   bool dispatched = false;
+   const uint64_t now = dvm__now_ms();
+   for (int i = 0; i < vm->npending; ++i)
+      if (!vm->pending_is_thread[i] && !vm->pending_looper[i] &&
+          (!vm->pending_due_ms[i] || vm->pending_due_ms[i] <= now)) { dispatched = true; break; }
    dvm__run_pending_threads(vm);
+   dvm__main_queue_idle(vm, dispatched);
+   g_current_looper = saved_looper;
    dvm__tstate_load(vm, &saved);
    dvm_gil_leave_to_guest(vm, cookie);
 }
@@ -4203,14 +4221,17 @@ void dvm_gil_wait_for_ns(struct dvm *vm, uintptr_t channel, uint64_t ns)
     * something that needs it to happen. */
    unsigned ael = arm_lock_unlock_all();
    struct timespec ts;
-   clock_gettime(clock, &ts);
-   ts.tv_sec  += (time_t)(ns / 1000000000ull);
-   ts.tv_nsec += (long)(ns % 1000000000ull);
-   if (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ++ts.tv_sec; }
+   if (ns != UINT64_MAX) {
+      clock_gettime(clock, &ts);
+      ts.tv_sec  += (time_t)(ns / 1000000000ull);
+      ts.tv_nsec += (long)(ns % 1000000000ull);
+      if (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ++ts.tv_sec; }
+   }
 
    pthread_mutex_lock(&g_gil.m);
    while (!w.ready) {
-      int rc = pthread_cond_timedwait(&w.cv, &g_gil.m, &ts);
+      int rc = ns == UINT64_MAX ? pthread_cond_wait(&w.cv, &g_gil.m)
+                               : pthread_cond_timedwait(&w.cv, &g_gil.m, &ts);
       if (rc != 0) break;
    }
    struct dvm_event_waiter **link = &g_event_waiters;
@@ -4620,7 +4641,7 @@ void dvm_destroy(struct dvm *vm)
    for (uint32_t i = 0; i < vm->heap_size; ++i) {
       struct dvm_object *o = heap_slot(vm, i + 1u);
       free(o->utf8);
-      free(o->data);
+      object_data_destroy(o);
       free(o->slots);
    }
    for (uint32_t b = 0; b < vm->heap_nblocks; ++b) free(vm->heap_blocks[b]);

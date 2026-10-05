@@ -102,6 +102,9 @@ bool dvm_jni_class_assignable(const char *sub, const char *sup);
 
 /* Attach the launcher Activity to the framework window/Activity stack after
  * its lifecycle returns. Used for dex apps whose UI is owned by the framework. */
+struct dvm;
+struct luna_touch_event;
+bool dvm_ui_dispatch_touch(struct dvm *vm, const struct luna_touch_event *sample);
 void dvm_jni_show_activity(JNIEnv *env, jobject activity);
 
 /* Diagnostics for the loader's summary line. */

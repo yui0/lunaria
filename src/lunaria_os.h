@@ -26,6 +26,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <errno.h>
 
 /* ---- Filename patterns (Android/Bionic flag values) ---- */
 #define LUNA_FNM_PATHNAME 1
@@ -100,6 +102,51 @@ typedef struct cmsghdr luna_cmsghdr;
 #define LUNA_CMSG_FIRSTHDR(m) CMSG_FIRSTHDR(m)
 #define LUNA_CMSG_NXTHDR(m,c) CMSG_NXTHDR(m,c)
 #endif
+/* Android 12 inet_aton: base-0 numbers, 1..4 components, exact end of
+ * string, optional output, and unchanged errno. strtoul's word width follows
+ * the guest ABI instead of the host's native parser. */
+static inline int luna_socket_inet_aton_word(const char *text, struct in_addr *address,
+                                           unsigned word_bits)
+{
+   uint64_t parts[4] = {0};
+   unsigned count = 0, final_bits;
+   uint32_t value = 0;
+   int result = 0, saved_errno = errno;
+   if (!text) return 0;
+   while (count < 4) {
+      char *end;
+      errno = 0;
+      uint64_t part = strtoull(text, &end, 0);
+      if (errno || end == text || (*end != '.' && *end != '\0')) goto done;
+      if (word_bits == 32) {
+         const char *number = text;
+         while (*number == ' ' || (*number >= '\t' && *number <= '\r')) ++number;
+         uint64_t magnitude = *number == '-' ? (uint64_t)0 - part : part;
+         if (magnitude > UINT32_MAX) goto done;
+         part = (uint32_t)part;
+      }
+      parts[count++] = part;
+      if (!*end) break;
+      text = end + 1;
+      if (count == 4) goto done;
+   }
+   for (unsigned i = 0; i + 1 < count; ++i) {
+      if (parts[i] > 255) goto done;
+      value = (value << 8) | (uint32_t)parts[i];
+   }
+   final_bits = (5 - count) * 8;
+   if (parts[count - 1] > (UINT32_MAX >> (32 - final_bits))) goto done;
+   if (count > 1) value <<= final_bits;
+   value |= (uint32_t)parts[count - 1];
+   if (address) address->s_addr = htonl(value);
+   result = 1;
+done:
+   errno = saved_errno;
+   return result;
+}
+static inline int luna_socket_inet_aton(const char *text, struct in_addr *address)
+{ return luna_socket_inet_aton_word(text, address, 64); }
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -113,7 +160,6 @@ extern "C" {
  * File and socket descriptors consequently cannot collide. Unwrap only for
  * external socket APIs such as OpenSSL's socket BIO. */
 int luna_socket_startup(void);
-int luna_socket_inet_aton(const char *text, struct in_addr *address);
 intptr_t luna_socket_native(int fd);
 int luna_socket_open(int family, int type, int protocol);
 int luna_socket_pair(int family, int type, int protocol, int pair[2]);
@@ -154,8 +200,6 @@ int luna_fd_dup_to(int fd, int target, int close_on_exec);
 #endif
 #else
 static inline int luna_socket_startup(void) { return 0; }
-static inline int luna_socket_inet_aton(const char *text, struct in_addr *address)
-{ return inet_aton(text, address); }
 static inline intptr_t luna_socket_native(int fd) { return fd; }
 static inline int luna_socket_pair(int family, int type, int protocol, int pair[2])
 { return socketpair(family,type,protocol,pair); }
@@ -196,7 +240,11 @@ static inline int luna_socket_nonblock(int fd, int enabled) {
    int flags = fcntl(fd, F_GETFL, 0);
    return flags < 0 ? -1 : fcntl(fd, F_SETFL, enabled ? flags | O_NONBLOCK : flags & ~O_NONBLOCK);
 }
+#ifdef __APPLE__
+int luna_socket_poll(struct pollfd *fds, size_t n, int ms);
+#else
 static inline int luna_socket_poll(struct pollfd *fds, size_t n, int ms) { return poll(fds,n,ms); }
+#endif
 static inline int luna_socket_dns(const char *node, const char *service, const struct addrinfo *h, struct addrinfo **out) { return getaddrinfo(node,service,h,out); }
 static inline int luna_socket_available(int fd, int *bytes) { return ioctl(fd,FIONREAD,bytes); }
 static inline ptrdiff_t luna_socket_recv(int fd, void *p, size_t n, int flags) { return recv(fd,p,n,flags); }
@@ -206,9 +254,18 @@ static inline ptrdiff_t luna_socket_sendto(int fd, const void *p, size_t n, int 
 static inline ptrdiff_t luna_socket_sendmsg(int fd, const struct msghdr *m, int flags) { return sendmsg(fd,m,flags); }
 static inline ptrdiff_t luna_socket_recvmsg(int fd, struct msghdr *m, int flags) { return recvmsg(fd,m,flags); }
 static inline ptrdiff_t luna_fd_writev(int fd, const struct iovec *vectors, int count) { return writev(fd,vectors,count); }
+#ifdef __APPLE__
+/* eventfd/timerfd are emulated (lunaria_mac.c): their read() is the 8-byte
+ * counter and close() releases the emulation slot. */
+ptrdiff_t luna_fd_read(int fd, void *p, size_t n);
+int luna_fd_close(int fd);
+#else
 static inline ptrdiff_t luna_fd_read(int fd, void *p, size_t n) { return read(fd,p,n); }
+#endif
 static inline ptrdiff_t luna_fd_write(int fd, const void *p, size_t n) { return write(fd,p,n); }
+#ifndef __APPLE__
 static inline int luna_fd_close(int fd) { return close(fd); }
+#endif
 static inline int luna_fd_get_nonblock(int fd) { return luna_socket_get_nonblock(fd); }
 static inline int luna_fd_nonblock(int fd, int enabled) { return luna_socket_nonblock(fd, enabled); }
 static inline int luna_fd_get_cloexec(int fd)
@@ -651,6 +708,12 @@ static inline int luna_file_lock(int fd, int64_t start, int64_t length,
 #endif
    return fcntl(fd, command, &region);
 }
+#ifdef __APPLE__
+#ifdef __cplusplus
+extern "C"
+#endif
+int luna_file_flock(int fd, int operation);
+#else
 static inline int luna_file_flock(int fd, int operation)
 {
    int kind = operation & ~LUNA_LOCK_NONBLOCK;
@@ -660,6 +723,7 @@ static inline int luna_file_flock(int fd, int operation)
                 kind == LUNA_LOCK_EXCLUSIVE ? LOCK_EX : LOCK_UN;
    return flock(fd, native | (operation & LUNA_LOCK_NONBLOCK ? LOCK_NB : 0));
 }
+#endif
 static inline int luna_file_fclose(FILE *stream) { return fclose(stream); }
 static inline FILE *luna_file_fopen(const char *path, const char *mode) { return fopen(path, mode); }
 static inline int luna_fd_get_status(int fd) { return fcntl(fd, F_GETFL); }
@@ -1139,6 +1203,12 @@ int luna_os_memory_advise(void *addr, size_t len, int advice);
 #define LUNA_MS_ASYNC 1
 #define LUNA_MS_INVALIDATE 2
 #define LUNA_MS_SYNC 4
+#ifdef __APPLE__
+/* Zero-fill [addr, addr+len) of private anonymous memory, as Linux's
+ * MADV_DONTNEED does and Darwin's does not.  Host pages inside the range
+ * are replaced, the partial pages at its ends are cleared in place. */
+int luna_os_memory_zero(void *addr, size_t len);
+#endif
 int luna_os_memory_sync(void *addr, size_t len, int flags);
 
 /* ---- anonymous shared memory -------------------------------------------
@@ -1199,6 +1269,17 @@ void luna_os_backtrace_print(void *const *frames, int count);
 /* A descriptor that becomes readable when something signals it — the object
  * behind ALooper_wake and the guest's own eventfd.  Counting semantics:
  * every write adds, a read drains.  Returns -1 on failure. */
+/* Timer descriptors share the ordinary read/poll/close descriptor path.
+ * Fields use signed 64-bit seconds/nanoseconds; the guest ABI is marshalled
+ * by the caller. Flags and clock IDs use the Linux/Android values. */
+typedef struct luna_os_timer_spec {
+   int64_t interval_sec, interval_nsec, value_sec, value_nsec;
+} luna_os_timer_spec;
+int luna_os_timer_open(int clock_id, int flags);
+int luna_os_timer_set(int fd, int flags, const luna_os_timer_spec *value,
+                      luna_os_timer_spec *previous);
+int luna_os_timer_get(int fd, luna_os_timer_spec *value);
+
 int luna_os_event_open(unsigned initval, int nonblock);
 int luna_os_event_signal(int fd, uint64_t count);
 int luna_os_event_drain(int fd, uint64_t *out);
@@ -1269,6 +1350,13 @@ int luna_os_fstatfs(int fd, luna_os_fs_info *info);
  * NULL when the platform has no such handle. */
 void *luna_os_native_display(void);
 void *luna_os_native_window(void *glfw_window);
+
+/* Give the application its picture: `rgba` is w*h straight-alpha RGBA8.
+ * GLFW's own glfwSetWindowIcon is a documented no-op on Cocoa, where the
+ * icon belongs to the application (Dock, Cmd-Tab), so each port does what its
+ * platform needs.  Returns 0 on success. */
+int luna_os_set_window_icon(void *glfw_window, int w, int h,
+                            const unsigned char *rgba);
 
 /* A second native window of the same kind as `glfw_window`'s, `w` x `h`,
  * that is never shown.  The compositor owns the visible window; the guest's

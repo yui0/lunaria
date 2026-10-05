@@ -15,7 +15,7 @@
 
 namespace Dynarmic::Optimization {
 
-void A64GetSetElimination(IR::Block& block) {
+void A64GetSetElimination(IR::Block& block, bool precise_memory_abort) {
     using Iterator = IR::Block::iterator;
 
     enum class TrackingType {
@@ -72,6 +72,14 @@ void A64GetSetElimination(IR::Block& block) {
     };
 
     for (auto inst = block.begin(); inst != block.end(); ++inst) {
+        /* Preserve architectural state at every potentially faulting access,
+         * while optimizing the fault-free segments on either side of it. */
+        if (precise_memory_abort && inst->IsMemoryReadOrWrite()) {
+            reg_info = {};
+            vec_info = {};
+            sp_info = {};
+            nzcv_info = {};
+        }
         switch (inst->GetOpcode()) {
         case IR::Opcode::A64GetW: {
             const size_t index = A64::RegNumber(inst->GetArg(0).GetA64RegRef());

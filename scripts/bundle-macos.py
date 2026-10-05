@@ -12,9 +12,16 @@ search=[stage/'runtime',libdir,here/'runtime',here/'.deps/lib',Path(os.environ.g
 queue=[(stage/'lunaria',here/'lunaria')]
 queue.extend((p,here/'runtime'/p.name) for p in (stage/'runtime').iterdir() if p.is_file())
 seen=set()
+def install_id(path):
+    # A dylib lists its own install name among its load commands (the first
+    # line of `otool -L`); it is not something to be found and bundled.
+    result=subprocess.run(['otool','-D',str(path)],check=True,text=True,stdout=subprocess.PIPE)
+    lines=result.stdout.splitlines()
+    return lines[1].strip() if len(lines)>1 else None
 def dependencies(path):
     result=subprocess.run(['otool','-L',str(path)],check=True,text=True,stdout=subprocess.PIPE)
-    return [line.strip().split(' (compatibility version',1)[0] for line in result.stdout.splitlines()[1:]]
+    own=install_id(path) if Path(path)!=stage/'lunaria' else None
+    return [name for name in (line.strip().split(' (compatibility version',1)[0] for line in result.stdout.splitlines()[1:]) if name!=own]
 def resolve(name,source):
     if name.startswith('@loader_path/'):
         candidates=[source.parent/name[len('@loader_path/'):]]

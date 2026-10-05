@@ -178,6 +178,12 @@ dvm_ref dvm_new_object(struct dvm *vm, struct dvm_class *cls);
 dvm_ref dvm_class_object(struct dvm *vm, struct dvm_class *cls);
 dvm_ref dvm_new_string(struct dvm *vm, const char *utf8);
 dvm_ref dvm_new_string_n(struct dvm *vm, const char *utf8, size_t len);
+/* Framework MotionEvent snapshots and Activity/View input delivery. */
+struct luna_touch_event;
+dvm_ref dvm_motion_event_new(struct dvm *vm, const struct luna_touch_event *sample);
+bool dvm_motion_event_read(struct dvm *vm, dvm_ref event, struct luna_touch_event *out);
+bool dvm_ui_dispatch_touch(struct dvm *vm, const struct luna_touch_event *sample);
+
 /* Element kind is one of Z B C S I J F D L. */
 dvm_ref dvm_new_array(struct dvm *vm, char elem, const char *elem_desc, uint32_t length);
 
@@ -320,6 +326,7 @@ void dvm_gil_wait(struct dvm *vm, unsigned ms);
 /* As above, but wake only for changes to `channel`.  Channels are opaque
  * non-zero values; a queue's dvm_ref is a convenient stable identifier. */
 void dvm_gil_wait_for(struct dvm *vm, uintptr_t channel, unsigned ms);
+/* UINT64_MAX waits until notification without a timeout. */
 void dvm_gil_wait_for_ns(struct dvm *vm, uintptr_t channel, uint64_t ns);
 
 /* Enter/leave the VM from guest code that holds the ARM execution lock; see

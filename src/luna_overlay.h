@@ -59,6 +59,10 @@ bool luna_overlay_active(void);
  * the window up itself in that case. */
 bool luna_overlay_guest_window_up(void);
 
+/* Native game key mappings belong only to the focused surface window. */
+void luna_overlay_set_native_input_focus(bool focused);
+bool luna_overlay_guest_keys_captured(void);
+
 /* Pointer/touch in surface pixels.  Returns true when the overlay consumed the
  * event, which is when the guest must not also see it. */
 bool luna_overlay_pointer(double x, double y, int action);
@@ -98,6 +102,7 @@ void luna_overlay_set_menu_handler(luna_overlay_menu_fn fn);
 /* Opens the menu at a surface position (the window thread's right click).
  * w/h is the surface, to keep the menu on it. */
 void luna_menu_open(double x, double y, int w, int h);
+int luna_overlay_screenshot(const char *path);
 void luna_menu_close(void);
 /* Once per window-thread poll: expires the notice line. */
 void luna_menu_tick(void);

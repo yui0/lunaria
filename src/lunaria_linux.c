@@ -27,6 +27,7 @@
 #include <link.h>
 
 #include <sys/eventfd.h>
+#include <sys/timerfd.h>
 #include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -268,6 +269,36 @@ int luna_os_symbol_is_function(void *address)
           (!sym || ELF64_ST_TYPE(sym->st_info) == STT_FUNC);
 }
 
+int luna_os_timer_open(int clock_id, int flags)
+{
+   return timerfd_create(clock_id, flags);
+}
+static void timer_spec_copy(luna_os_timer_spec *out, const struct itimerspec *in)
+{
+   out->interval_sec = in->it_interval.tv_sec;
+   out->interval_nsec = in->it_interval.tv_nsec;
+   out->value_sec = in->it_value.tv_sec;
+   out->value_nsec = in->it_value.tv_nsec;
+}
+int luna_os_timer_set(int fd, int flags, const luna_os_timer_spec *value,
+                      luna_os_timer_spec *previous)
+{
+   struct itimerspec native = {
+      { value->interval_sec, value->interval_nsec },
+      { value->value_sec, value->value_nsec }
+   }, old;
+   int result = timerfd_settime(fd, flags, &native, previous ? &old : NULL);
+   if (!result && previous) timer_spec_copy(previous, &old);
+   return result;
+}
+int luna_os_timer_get(int fd, luna_os_timer_spec *value)
+{
+   struct itimerspec native;
+   int result = timerfd_gettime(fd, &native);
+   if (!result) timer_spec_copy(value, &native);
+   return result;
+}
+
 int luna_os_event_open(unsigned initval, int nonblock)
 {
    return eventfd(initval, EFD_CLOEXEC | (nonblock ? EFD_NONBLOCK : 0));
@@ -474,7 +505,19 @@ void *luna_os_native_display(void)
       setenv("EGL_PLATFORM", "wayland", 1);
       return get_display ? get_display() : NULL;
    }
+   /* Match EGL's native-handle interpretation to GLFW's selected backend,
+    * including X11 windows opened from a Wayland desktop session. */
+   setenv("EGL_PLATFORM", "x11", 1);
    return (void *)glfwGetX11Display();
+}
+
+int luna_os_set_window_icon(void *glfw_window, int w, int h,
+                            const unsigned char *rgba)
+{
+   if (!glfw_window || w <= 0 || h <= 0 || !rgba) return -1;
+   GLFWimage image = { w, h, (unsigned char *)rgba };
+   glfwSetWindowIcon((GLFWwindow *)glfw_window, 1, &image);
+   return 0;
 }
 
 void *luna_os_native_window(void *glfw_window)

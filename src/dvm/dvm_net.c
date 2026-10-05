@@ -1453,14 +1453,14 @@ static int text(char *out, size_t cap, const char *s)
 }
 
 static struct nsd_node *event_new(struct nsd_request *r, enum nsd_event_kind kind,
-                                  int interface, int protocol, const char *name,
+                                  int interface_index, int protocol, const char *name,
                                   const char *type, const char *domain)
 {
    struct nsd_host *h = r->host;
    struct nsd_node *n = calloc(1, sizeof *n);
    if (!n) { h->fatal = -ENOMEM; return NULL; }
    n->event.id = r->id; n->event.kind = kind;
-   n->event.interface = interface; n->event.protocol = protocol;
+   n->event.interface_index = interface_index; n->event.protocol = protocol;
    if (text(n->event.name, sizeof n->event.name, name) ||
        text(n->event.type, sizeof n->event.type, type) ||
        text(n->event.domain, sizeof n->event.domain, domain)) {
@@ -1485,7 +1485,7 @@ static void client_state(void *client, int state, void *data)
 
 #endif
 
-static void browse_result(void *browser, int interface, int protocol, int event,
+static void browse_result(void *browser, int interface_index, int protocol, int event,
                            const char *name, const char *type, const char *domain,
                            unsigned flags, void *data)
 {
@@ -1495,12 +1495,12 @@ static void browse_result(void *browser, int interface, int protocol, int event,
    if (event != 0 && event != 1 && event != 4) return;
    struct nsd_node *n = event_new(r, event == 4 ? NSD_FAILED :
                                   event == 0 ? NSD_FOUND : NSD_LOST,
-                                 interface, protocol, name, type, domain);
+                                 interface_index, protocol, name, type, domain);
    if (n && event == 4) n->event.error = r->host->client_errno(r->host->client);
    event_push(r->host, n);
 }
 
-static void resolve_result(void *resolver, int interface, int protocol, int event,
+static void resolve_result(void *resolver, int interface_index, int protocol, int event,
                             const char *name, const char *type, const char *domain,
                             const char *host, const void *address, uint16_t port,
                             void *txt, unsigned flags, void *data)
@@ -1509,7 +1509,7 @@ static void resolve_result(void *resolver, int interface, int protocol, int even
    struct nsd_request *r = data;
    struct nsd_host *h = r->host;
    struct nsd_node *n = event_new(r, event == 0 ? NSD_RESOLVED : NSD_FAILED,
-                                 interface, protocol, name, type, domain);
+                                 interface_index, protocol, name, type, domain);
    if (!n) return;
    if (event == 0) {
       if (text(n->event.host, sizeof n->event.host, host) || !address ||
@@ -1628,7 +1628,7 @@ int nsd_host_resolve(struct nsd_host *h, uint64_t id, const struct nsd_event *s)
    int error = request_new(h, id, &r);
    if (error) return error;
    r->resolver = 1;
-   r->object = h->resolve_new(h->client, s->interface, s->protocol,
+   r->object = h->resolve_new(h->client, s->interface_index, s->protocol,
                               s->name, s->type, s->domain, s->protocol,
                               2, resolve_result, r);
    if (!r->object) { error = h->client_errno(h->client); nsd_host_cancel(h, id); }

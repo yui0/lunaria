@@ -538,8 +538,7 @@ F12 キー、またはホストメニューの **Take Screenshot** を使用し�
 - **スレッド:** ゲスト pthread は協調的なラウンドロビンスケジューリングを使用し、
   ワーカーごとに独立した JIT コンテキストを持ちます。
   mutex の unlock 時には待機中スレッドへ直接制御を渡せます。
-  ゲストの sleep は実時間だけ待機します（`LUNARIA_GUEST_SLEEP` は既定で有効、
-  `0` を指定した場合のみ無効）。ブロッキング read は通常スケジューラー上に残りますが、
+  ゲストの sleep は実時間だけ待機します。ブロッキング read は通常スケジューラー上に残りますが、
   `LUNARIA_FD_PARK` を設定すると park します。
 - **Java:** JNI 呼び出しに対応するホストスタブがない場合、
   `src/dvm/` が APK 内の `classes*.dex` からそのメソッドを実行します
@@ -581,7 +580,7 @@ F12 キー、またはホストメニューの **Take Screenshot** を使用し�
 | `LUNARIA_A64_SELF_SCHED` | `1` | ランチャーの既定値。エンジンが実行可能ゲストを自由に取得。`0` で barrier-pooled pass に戻す。バイナリ単体ではこの変数が設定されるまで無効 |
 | `LUNARIA_A64_FASTMEM` | `1` | `0` でメモリアクセスをコールバック経由に変更 |
 | `LUNARIA_A64_CODE_CACHE_MB` | `128` | JIT エンジンごとの変換済みコードキャッシュ |
-| `LUNARIA_GUEST_SLEEP` / `LUNARIA_FD_PARK` | on / off | ゲスト sleep を実時間で park / ブロッキング read を park（`LUNARIA_GUEST_SLEEP=0` は診断用） |
+| `LUNARIA_FD_PARK` | on / off | ブロッキング read を park |
 | `LUNARIA_SYSLIB_DIR` | `syslib-arm64/`（存在する場合） | ゲストコードとして実行する AArch64 プラットフォームライブラリ。`make syslib` で libm、libc、libz を取得し、`make guestlib` で `liblunaria_guest.so` を作成 |
 | `LUNARIA_VULKAN` | 利用可能なら on | `0` で Vulkan ブリッジと端末機能の公開を無効にする。タイトルは GLES も選択可能 |
 | `LUNARIA_TOUCH_TEST` | off | `x,y[;x,y…]` 形式でタップを注入（最大 8 個）。単純な数値はフレームバッファーに対する百分率、`640px` はゲストピクセル |

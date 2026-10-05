@@ -612,6 +612,16 @@ static int luna_event_slot(int fd)
    return -1;
 }
 
+/* These platforms have no native timerfd. Keep unsupported operations
+ * explicit until their descriptor adapter implements timer notifications. */
+int luna_os_timer_open(int clock_id, int flags)
+{ (void)clock_id; (void)flags; errno = ENOSYS; return -1; }
+int luna_os_timer_set(int fd, int flags, const luna_os_timer_spec *value,
+                      luna_os_timer_spec *previous)
+{ (void)fd; (void)flags; (void)value; (void)previous; errno = ENOSYS; return -1; }
+int luna_os_timer_get(int fd, luna_os_timer_spec *value)
+{ (void)fd; (void)value; errno = ENOSYS; return -1; }
+
 int luna_os_event_open(unsigned initval, int nonblock)
 {
    SOCKET listener = INVALID_SOCKET, rd = INVALID_SOCKET, wr = INVALID_SOCKET;
@@ -854,6 +864,15 @@ void *luna_os_native_window(void *glfw_window)
 {
    if (!glfw_window) return NULL;
    return (void *)glfwGetWin32Window((GLFWwindow *)glfw_window);
+}
+
+int luna_os_set_window_icon(void *glfw_window, int w, int h,
+                            const unsigned char *rgba)
+{
+   if (!glfw_window || w <= 0 || h <= 0 || !rgba) return -1;
+   GLFWimage image = { w, h, (unsigned char *)rgba };
+   glfwSetWindowIcon((GLFWwindow *)glfw_window, 1, &image);
+   return 0;
 }
 
 void *luna_os_offscreen_window(void *glfw_window, int w, int h)
@@ -2136,19 +2155,6 @@ int luna_file_memstream_finish(luna_file_memstream *writer,
    *data = writer->data; *length = writer->length; writer->data = NULL;
    return 0;
 }
-/* Preserve inet_aton's compact, octal and hexadecimal address forms. */
-int luna_socket_inet_aton(const char *text, struct in_addr *address)
-{
-   if (!text || !address) return 0;
-   struct in_addr parsed;
-   char *end = NULL;
-   if (RtlIpv4StringToAddressA(text, FALSE, &end, &parsed) != 0 || !end) return 0;
-   if (*end && *end != ' ' && *end != '\t' && *end != '\n' &&
-       *end != '\r' && *end != '\v' && *end != '\f') return 0;
-   *address = parsed;
-   return 1;
-}
-
 /* Winsock descriptors and I/O. */
 struct socket_state { unsigned references; int nonblock, append; };
 struct socket_fd { int fd; SOCKET socket; struct socket_state *state; struct socket_fd *next; };

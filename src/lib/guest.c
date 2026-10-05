@@ -20,6 +20,9 @@
  *     the code that touches it is in the shared part below;
  *   - the emulator binds the exports in preference to its own handlers and
  *     publishes the shared state into the two variables at load.
+ *   - link with -Bsymbolic: internal calls and heap-control references belong
+ *     to this provider. Rebinding realloc's malloc call to another libc would
+ *     split allocation ownership even when callers resolve realloc correctly.
  *
  * The file has two parts.  The first is the guest process's malloc heap,
  * which the emulator's own handlers must also use on the same bytes: the

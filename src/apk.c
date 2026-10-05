@@ -68,8 +68,15 @@ static int mkdirs(const char *path)
       char c = *s;
       *s = 0;
       if (*p && !(strlen(p) == 2 && p[1] == ':') && !directory(p) && luna_file_mkdir(p, 0700)) {
-         *s = c;
-         return apk_error("cannot create %s: %s", p, strerror(errno));
+         int error = errno;
+         /* Another launcher may have created the directory after our check. */
+         if (error != EEXIST || !directory(p)) {
+            luna_file_info info;
+            if (error == EEXIST && !luna_file_infoat(LUNA_AT_FDCWD, p, &info, LUNA_AT_NOFOLLOW) &&
+                (info.mode & 0170000) == 0120000)
+               return apk_error("cannot access directory symlink %s: target is unavailable or is not a directory; check the target drive", p);
+            return apk_error("cannot create %s: %s", p, strerror(error));
+         }
       }
       *s = c;
       if (!c)
@@ -119,8 +126,13 @@ struct zip {
    FILE *f;
    struct zip_entry *entries;
    size_t count;
-   uint64_t size;
+   uint64_t size, origin;
 };
+static int zip_seek(struct zip *z, uint64_t offset)
+{
+   if (offset > z->size || offset > UINT64_MAX - z->origin) return -1;
+   return seek_file(z->f, z->origin + offset);
+}
 static void zip_close(struct zip *z)
 {
    if (z->f)
@@ -130,21 +142,15 @@ static void zip_close(struct zip *z)
    free(z->entries);
    memset(z, 0, sizeof *z);
 }
-static int zip_open(struct zip *z, const char *path)
+/* Index a bounded ZIP view, including a stored APK inside an XAPK. */
+static int zip_index(struct zip *z, const char *path)
 {
-   memset(z, 0, sizeof *z);
-   luna_file_info st;
-   if (luna_file_infoat(LUNA_AT_FDCWD, path, &st, 0) || st.size < 22)
-      return apk_error("not a ZIP: %s", path);
-   z->size = (uint64_t)st.size;
-   z->f = open_file(path, "rb");
-   if (!z->f)
-      return apk_error("cannot open %s", path);
+   if (z->size < 22) goto fail;
    size_t tail = (size_t)(z->size < 65557 ? z->size : 65557);
    unsigned char *buf = malloc(tail);
    if (!buf)
       goto fail;
-   if (seek_file(z->f, z->size - tail) || fread(buf, 1, tail, z->f) != tail) {
+   if (zip_seek(z, z->size - tail) || fread(buf, 1, tail, z->f) != tail) {
       free(buf);
       goto fail;
    }
@@ -166,9 +172,9 @@ static int zip_open(struct zip *z, const char *path)
    free(buf);
    if (count == 65535 || cd == UINT32_MAX || cd_size == UINT32_MAX) {
       unsigned char loc[20], rec[56];
-      if (eocd < 20 || seek_file(z->f, eocd - 20) || fread(loc, 1, 20, z->f) != 20 || le32(loc) != 0x07064b50 || le32(loc + 4) || le32(loc + 16) != 1)
+      if (eocd < 20 || zip_seek(z, eocd - 20) || fread(loc, 1, 20, z->f) != 20 || le32(loc) != 0x07064b50 || le32(loc + 4) || le32(loc + 16) != 1)
          goto fail;
-      if (seek_file(z->f, le64(loc + 8)) || fread(rec, 1, 56, z->f) != 56 || le32(rec) != 0x06064b50 || le32(rec + 16) || le32(rec + 20))
+      if (zip_seek(z, le64(loc + 8)) || fread(rec, 1, 56, z->f) != 56 || le32(rec) != 0x06064b50 || le32(rec + 16) || le32(rec + 20))
          goto fail;
       count = le64(rec + 32);
       cd_size = le64(rec + 40);
@@ -182,7 +188,7 @@ static int zip_open(struct zip *z, const char *path)
    uint64_t pos = cd;
    for (uint64_t i = 0; i < count; i++) {
       unsigned char h[46];
-      if (pos > cd + cd_size || cd + cd_size - pos < 46 || seek_file(z->f, pos) || fread(h, 1, 46, z->f) != 46 || le32(h) != 0x02014b50)
+      if (pos > cd + cd_size || cd + cd_size - pos < 46 || zip_seek(z, pos) || fread(h, 1, 46, z->f) != 46 || le32(h) != 0x02014b50)
          goto fail;
       size_t nl = le16(h + 28), xl = le16(h + 30), cl = le16(h + 32);
       if (!nl || nl >= APK_PATH || 46 + nl + xl + cl > cd + cd_size - pos)
@@ -241,6 +247,24 @@ static int zip_open(struct zip *z, const char *path)
 fail:
    zip_close(z);
    return apk_error("invalid or truncated ZIP: %s", path);
+}
+static int zip_open_range(struct zip *z, const char *path,
+                          uint64_t origin, uint64_t size)
+{
+   memset(z, 0, sizeof *z);
+   luna_file_info st;
+   if (luna_file_infoat(LUNA_AT_FDCWD, path, &st, 0) || st.size < 22 ||
+       origin > (uint64_t)st.size || size > (uint64_t)st.size - origin)
+      return apk_error("not a ZIP: %s", path);
+   z->origin = origin;
+   z->size = size ? size : (uint64_t)st.size - origin;
+   z->f = open_file(path, "rb");
+   if (!z->f) return apk_error("cannot open %s", path);
+   return zip_index(z, path);
+}
+static int zip_open(struct zip *z, const char *path)
+{
+   return zip_open_range(z, path, 0, 0);
 }
 static struct zip_entry *zip_find(struct zip *z, const char *name)
 {
@@ -309,10 +333,10 @@ static int zip_read(struct zip *z, const struct zip_entry *e, FILE *out, unsigne
    if (e->flags & 1 || !(e->method == 0 || e->method == 8))
       return apk_error("unsupported ZIP entry: %s", e->name);
    unsigned char h[30];
-   if (seek_file(z->f, e->offset) || fread(h, 1, 30, z->f) != 30 || le32(h) != 0x04034b50)
+   if (zip_seek(z, e->offset) || fread(h, 1, 30, z->f) != 30 || le32(h) != 0x04034b50)
       return -1;
    uint64_t at = e->offset + 30 + le16(h + 26) + le16(h + 28);
-   if (at > z->size || e->compressed > z->size - at || seek_file(z->f, at))
+   if (at > z->size || e->compressed > z->size - at || zip_seek(z, at))
       return -1;
    if (memory && e->size > capacity)
       return -1;
@@ -464,7 +488,7 @@ static int zip_extract(struct zip *z, const char *root, bool overwrite)
 }
 struct manifest {
    char package[256], split[256], activity[512], application[512];
-   char orientation[32], theme[32], min_sdk[32], target_sdk[32];
+   char orientation[32], theme[32], min_sdk[32], target_sdk[32], config_changes[32];
    char receivers[APK_META];
    char providers[APK_META], permissions[APK_META], query_actions[APK_META], query_packages[APK_META];
 };
@@ -634,7 +658,7 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
 {
    memset(m, 0, sizeof *m);
    int result = -1, depth = 0, activity_depth = -1, provider_depth = -1, queries_depth = -1, intent_depth = -1;
-   char activity[512] = "", target[512] = "", orient[32] = "", theme[32] = "", app_theme[32] = "", provider[APK_META] = "";
+   char activity[512] = "", target[512] = "", orient[32] = "", theme[32] = "", app_theme[32] = "", provider[APK_META] = "", changes[32] = "";
    bool main = false, launcher = false, activity_launch = false;
    int receiver_depth = -1, enabled = 1, app_enabled = 1, exported = -1, boot = 0, app_boot = 0;
    bool receiver_filter = false;
@@ -718,6 +742,7 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
          } else if (!strcmp(tag, "intent-filter") && receiver_depth >= 0) {
             receiver_filter = true;
          } else if (!strcmp(tag, "activity") || !strcmp(tag, "activity-alias")) {
+            if (attr_number(changes, sizeof changes, a, count, "configChanges")) goto done;
             if (copy_text(activity, sizeof activity, attr_text(a, count, "name")) || copy_text(target, sizeof target, attr_text(a, count, "targetActivity")) || attr_number(orient, sizeof orient, a, count, "screenOrientation") || attr_number(theme, sizeof theme, a, count, "theme"))
                goto done;
             activity_depth = depth;
@@ -777,6 +802,7 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
          }
          if (depth == activity_depth) {
             if (activity_launch && !*m->activity) {
+               if (copy_text(m->config_changes, sizeof m->config_changes, changes)) goto done;
                if (class_name(m->activity, sizeof m->activity, m->package, *target ? target : activity) || copy_text(m->orientation, sizeof m->orientation, orient) || copy_text(m->theme, sizeof m->theme, *theme ? theme : app_theme))
                   goto done;
             }
@@ -1102,6 +1128,58 @@ static int config_load(const char *path, const char *package)
    fclose(f);
    return result;
 }
+static bool suffix(const char *s, const char *ext);
+
+/* Read the launcher's display inputs before creating its first window.
+ * Stored nested APKs need only central-directory and Manifest reads; a
+ * deflated nested APK requires a temporary seekable stream. */
+static int launcher_display_metadata(const char *path, bool container,
+                                     const char *conf)
+{
+   struct zip outer = {0}, candidate = {0};
+   struct manifest *m = calloc(1, sizeof *m);
+   int result = -1;
+   if (!m || zip_open(&outer, path)) goto done;
+   if (!container) {
+      if (manifest_zip(&outer, m)) goto done;
+   } else {
+      bool found = false;
+      for (size_t i = 0; i < outer.count; ++i) {
+         const struct zip_entry *e = outer.entries + i;
+         if (!suffix(e->name, ".apk")) continue;
+         if (e->flags & 1) goto done;
+         if (e->method == 0) {
+            unsigned char h[30];
+            if (zip_seek(&outer, e->offset) || fread(h, 1, sizeof h, outer.f) != sizeof h ||
+                le32(h) != 0x04034b50) goto done;
+            uint64_t at = e->offset + sizeof h + le16(h + 26) + le16(h + 28);
+            if (at > outer.size || e->size > outer.size - at ||
+                zip_open_range(&candidate, path, at, e->size)) goto done;
+         } else {
+            candidate.f = tmpfile();
+            if (!candidate.f || zip_read(&outer, e, candidate.f, NULL, 0, NULL) ||
+                fflush(candidate.f)) goto done;
+            candidate.size = e->size;
+            if (zip_index(&candidate, e->name)) goto done;
+         }
+         memset(m, 0, sizeof *m);
+         int parsed = manifest_zip(&candidate, m);
+         zip_close(&candidate);
+         if (parsed) goto done;
+         if (!*m->split) { found = true; break; }
+      }
+      if (!found) { apk_error("container has no base APK"); goto done; }
+   }
+   if (config_load(conf, m->package)) goto done;
+   if (*m->orientation) result = env_set("ANDROID_SCREEN_ORIENTATION", m->orientation, true);
+   else { luna_os_unsetenv("ANDROID_SCREEN_ORIENTATION"); result = 0; }
+done:
+   zip_close(&candidate);
+   zip_close(&outer);
+   free(m);
+   return result;
+}
+
 static int copy_file(const char *source, const char *target)
 {
    if (!strcmp(source, target))
@@ -1518,14 +1596,237 @@ static void apk_help(void)
         "APK archives are installed once in cache/packages; application data persists in data/.\n"
         "Environment settings override lunaria.conf; command-line options override both.");
 }
+/* ---- lunaria.conf: where it lives, and its common (outside any [package]) part */
+
+/* An explicit LUNARIA_CONF wins.  Otherwise it is lunaria.conf in the startup
+ * directory -- except for a macOS .app, which Finder starts from "/", where no
+ * one's settings can live: that one keeps it in the user's Application
+ * Support, next to nothing else of ours. */
+static int conf_default_path(char *out, size_t cap)
+{
+   const char *given = getenv("LUNARIA_CONF");
+   char cwd[APK_PATH];
+   if (given && *given)
+      return absolute_path(given, out, cap);
+#ifdef __APPLE__
+   char exe[APK_PATH];
+   const char *home = getenv("HOME");
+   if (home && *home && !luna_os_executable_path(exe, sizeof exe) && strstr(exe, ".app/Contents/")) {
+      char dir[APK_PATH];
+      if (path_join(dir, sizeof dir, home, "Library/Application Support/Lunaria") || mkdirs(dir))
+         return -1;
+      return path_join(out, cap, dir, "lunaria.conf");
+   }
+#endif
+   if (!apk_getcwd(cwd, sizeof cwd))
+      return -1;
+   return path_join(out, cap, cwd, "lunaria.conf");
+}
+
+/* The line's key when it is an active `LUNARIA_*=value` line, else NULL. */
+static char *conf_line_key(char *line, char **value)
+{
+   char *p = trim(line);
+   if (*p == '#' || *p == '[' || !*p)
+      return NULL;
+   char *eq = strchr(p, '=');
+   if (!eq)
+      return NULL;
+   *eq = 0;
+   *value = trim(eq + 1);
+   return trim(p);
+}
+
+/* The value of `key` in the common part of the file, or "" */
+static void conf_get(const char *path, const char *key, char *out, size_t cap)
+{
+   out[0] = 0;
+   FILE *f = open_file(path, "rb");
+   if (!f)
+      return;
+   char line[APK_META];
+   while (fgets(line, sizeof line, f)) {
+      char *p = trim(line), *value = NULL;
+      if (*p == '[')
+         break;
+      char *k = conf_line_key(line, &value);
+      if (k && !strcmp(k, key)) {
+         size_t n = strlen(value);
+         if (n >= 2 && ((value[0] == '"' && value[n - 1] == '"') || (value[0] == '\'' && value[n - 1] == '\''))) {
+            value[n - 1] = 0;
+            value++;
+         }
+         if (strlen(value) < cap)
+            strcpy(out, value);
+         break;
+      }
+   }
+   fclose(f);
+}
+
+/* Sets (or, with an empty value, removes) `key` in the common part, keeping
+ * every other line and every [package] block as it was.  The file is replaced
+ * whole, so an interrupted write leaves the old one. */
+static int conf_set(const char *path, const char *key, const char *value)
+{
+   char **lines = NULL;
+   size_t n = 0, cap = 0;
+   int result = -1;
+   FILE *f = open_file(path, "rb");
+   if (f) {
+      char line[APK_META];
+      while (fgets(line, sizeof line, f)) {
+         size_t len = strlen(line);
+         while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = 0;
+         if (n == cap) {
+            char **grown = realloc(lines, (cap = cap ? cap * 2 : 64) * sizeof *lines);
+            if (!grown)
+               goto done;
+            lines = grown;
+         }
+         if (!(lines[n] = strdup(line)))
+            goto done;
+         n++;
+      }
+      fclose(f);
+      f = NULL;
+   }
+   size_t section = n, found = n;
+   for (size_t i = 0; i < n && section == n; i++) {
+      char copy[APK_META];
+      snprintf(copy, sizeof copy, "%s", lines[i]);
+      char *t = trim(copy), *v = NULL;
+      if (*t == '[') {
+         section = i;
+         break;
+      }
+      char *k = conf_line_key(copy, &v);
+      if (k && !strcmp(k, key))
+         found = i;
+   }
+   char text[APK_META];
+   snprintf(text, sizeof text, "%s=%s", key, value);
+   if (found < n) {
+      free(lines[found]);
+      if (*value) {
+         lines[found] = strdup(text);
+      } else {
+         memmove(lines + found, lines + found + 1, (n - found - 1) * sizeof *lines);
+         n--;
+         lines[n] = NULL;
+         goto write;
+      }
+      if (!lines[found])
+         goto done;
+   } else if (*value) {
+      if (n == cap) {
+         char **grown = realloc(lines, (cap = cap ? cap * 2 : 64) * sizeof *lines);
+         if (!grown)
+            goto done;
+         lines = grown;
+      }
+      memmove(lines + section + 1, lines + section, (n - section) * sizeof *lines);
+      if (!(lines[section] = strdup(text)))
+         goto done;
+      n++;
+   }
+write:;
+   char temp[APK_PATH];
+   if (snprintf(temp, sizeof temp, "%s.tmp", path) >= (int)sizeof temp)
+      goto done;
+   FILE *out = open_file(temp, "wb");
+   if (!out)
+      goto done;
+   for (size_t i = 0; i < n; i++)
+      fprintf(out, "%s\n", lines[i]);
+   if (fclose(out) || luna_file_rename(temp, path)) {
+      remove(temp);
+      goto done;
+   }
+   result = 0;
+done:
+   if (f)
+      fclose(f);
+   for (size_t i = 0; i < n; i++)
+      free(lines[i]);
+   free(lines);
+   if (result)
+      apk_error("cannot save %s: %s", path, strerror(errno));
+   return result;
+}
+
+/* No application on the command line: ask which to open and how this
+ * installation is set up, save what was changed, and carry on as if the path
+ * had been given.  The data folder leads because it is the one choice that
+ * cannot be taken back: a later run pointed elsewhere does not find what an
+ * earlier one downloaded. */
+static int launcher_ask(int *argc, const char ***argv)
+{
+   static const char *const devices[] = {"", "pixel6", "pixel7", "galaxys21", "lunaria", NULL};
+   static const struct { const char *key, *label, *hint; int folder, compact; } fields[] = {
+      {"LUNARIA_DATA_ROOT", "Data folder", "Where the app's files live. Keep it set: a different folder starts from nothing.", 1, 0},
+      {"LUNARIA_CACHE_DIR", "Package cache folder", "Empty: cache/packages inside the data folder.", 1, 0},
+      {"LUNARIA_DEVICE", "Device", "", 0, 1},
+      {"LUNARIA_WIDTH", "Width (px)", "", 0, 1},
+      {"LUNARIA_HEIGHT", "Height (px)", "", 0, 1},
+   };
+   static luna_launcher_setting settings[sizeof fields / sizeof fields[0]];
+   static char chosen[APK_PATH], conf[APK_PATH], before[sizeof fields / sizeof fields[0]][1024];
+   static const char *synthesized[3];
+   if (conf_default_path(conf, sizeof conf))
+      return -1;
+   for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++) {
+      settings[i].key = fields[i].key;
+      settings[i].label = fields[i].label;
+      settings[i].hint = fields[i].hint;
+      settings[i].folder = fields[i].folder;
+      settings[i].compact = fields[i].compact;
+      settings[i].choices = !strcmp(fields[i].key, "LUNARIA_DEVICE") ? devices : NULL;
+      const char *env = getenv(fields[i].key);
+      if (env && *env && strlen(env) < sizeof settings[i].value)
+         strcpy(settings[i].value, env);
+      else
+         conf_get(conf, fields[i].key, settings[i].value, sizeof settings[i].value);
+      strcpy(before[i], settings[i].value);
+   }
+   if (luna_launcher_pick(chosen, sizeof chosen, settings, sizeof fields / sizeof fields[0]) != 0)
+      return 1;
+   for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++) {
+      if (!strcmp(before[i], settings[i].value))
+         continue;
+      if (conf_set(conf, fields[i].key, settings[i].value))
+         return -1;
+      if (*settings[i].value && env_set(fields[i].key, settings[i].value, true))
+         return -1;
+      if (!*settings[i].value && luna_os_unsetenv(fields[i].key))
+         return apk_error("cannot clear %s: %s", fields[i].key, strerror(errno));
+   }
+   if (env_set("LUNARIA_CONF", conf, true))
+      return -1;
+   synthesized[0] = *argc > 0 ? (*argv)[0] : "lunaria";
+   synthesized[1] = chosen;
+   synthesized[2] = NULL;
+   *argc = 2;
+   *argv = synthesized;
+   return 0;
+}
+
 /* 0: enter the loader, 1: command completed, -1: failure. */
 static int apk_prepare_inner(int *argc, const char ***argv)
 {
    if (*argc >= 2 && (!strcmp((*argv)[1], "--apk-process-arm64") || !strcmp((*argv)[1], "--apk-process-arm32")))
       return 0;
    if (*argc < 2) {
-      apk_help();
-      return 1;
+      /* Started with nothing to run (a double-clicked app, a launcher icon).
+       * Without a display there is nobody to ask. */
+      const int asked = launcher_ask(argc, argv);
+      if (asked) {
+         luna_launcher_end(0);
+         if (asked > 0)
+            apk_help();
+         return asked > 0 ? 1 : -1;
+      }
    }
    bool list = false, prepare = false, install = false, choose = false, profile_requested = false;
    bool launch_ui_ready = false;
@@ -1610,13 +1911,12 @@ static int apk_prepare_inner(int *argc, const char ***argv)
    char resources[APK_PATH];
    if (!path_join(resources, sizeof resources, exedir, "../Resources") && directory(resources) && luna_file_realpath(resources, exedir, sizeof exedir)) {}
 #endif
+   if (conf_default_path(conf, sizeof conf) || env_set("LUNARIA_CONF", conf, true) || config_load(conf, NULL))
+      return -1;
    if ((!list && !prepare && !install) || choose) {
-      if (font_defaults(exedir)) return -1;
+      if (launcher_display_metadata(input, container, conf) || font_defaults(exedir)) return -1;
       launch_ui_ready = luna_launcher_begin(input) != 0;
    }
-   char default_conf[APK_PATH];
-   if (path_join(default_conf, sizeof default_conf, cwd, "lunaria.conf") || absolute_path(env_value("LUNARIA_CONF", default_conf), conf, sizeof conf) || env_set("LUNARIA_CONF", conf, true) || config_load(conf, NULL))
-      return -1;
    if (absolute_path(env_value("LUNARIA_DATA_ROOT", cwd), root, sizeof root) || mkdirs(root))
       return -1;
    const char *configured_cache = getenv("LUNARIA_CACHE_DIR");
@@ -1797,6 +2097,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       const char *key, *value;
    } metadata[] = {
       {"ANDROID_LAUNCH_ACTIVITY", m->activity}, {"ANDROID_APPLICATION_CLASS", m->application},
+      {"ANDROID_LAUNCH_CONFIG_CHANGES", m->config_changes},
       {"ANDROID_SCREEN_ORIENTATION", m->orientation}, {"ANDROID_THEME_RESOURCE", m->theme},
       {"ANDROID_RECEIVERS", m->receivers},
       {"ANDROID_CONTENT_PROVIDERS", m->providers}, {"ANDROID_REQUESTED_PERMISSIONS", m->permissions},
@@ -1862,7 +2163,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
    }
    fprintf(stderr, "[apk] %s: %s, %s, profile=%s\n[apk] installed view: %s\n", m->package, arch, hit ? "cache hit" : "installed", profile, inst);
    if (install) {
-      printf("package=%s\nactivity=%s\narch=%s\ninstalled=%s\nmodule=%s\n", m->package, m->activity, arch, inst, main_module);
+      printf("package=%s\nactivity=%s\narch=%s\ninstalled=%s\nmodule=%s\nconfigChanges=%s\n", m->package, m->activity, arch, inst, main_module, *m->config_changes ? m->config_changes : "0");
       result = 1;
       goto done;
    }

@@ -15,7 +15,7 @@ using namespace oaknut::util;
 
 TEST_CASE("A64: ADD", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x8b020020);  // ADD X0, X1, X2
     env.code_mem.emplace_back(0x14000000);  // B .
@@ -36,7 +36,7 @@ TEST_CASE("A64: ADD", "[a64]") {
 
 TEST_CASE("A64: ADD{V,P}", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x0E31B801);  // ADDV b1, v0.8b
     env.code_mem.emplace_back(0x4E31B802);  // ADDV b2, v0.16b
@@ -62,7 +62,7 @@ TEST_CASE("A64: ADD{V,P}", "[a64]") {
 
 TEST_CASE("A64: CLZ", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     oaknut::VectorCodeGenerator code{env.code_mem, nullptr};
     code.CLZ(V3.B16(), V0.B16());
@@ -84,7 +84,7 @@ TEST_CASE("A64: CLZ", "[a64]") {
 
 TEST_CASE("A64: UADDL{V,P}", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x2E303801);  // UADDLV h1, v0.8b
     env.code_mem.emplace_back(0x6E303802);  // UADDLV h2, v0.16b
@@ -110,7 +110,7 @@ TEST_CASE("A64: UADDL{V,P}", "[a64]") {
 
 TEST_CASE("A64: SADDL{V,P}", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x0E303801);  // SADDLV h1, v0.8b
     env.code_mem.emplace_back(0x4E303802);  // SADDLV h2, v0.16b
@@ -136,7 +136,7 @@ TEST_CASE("A64: SADDL{V,P}", "[a64]") {
 
 TEST_CASE("A64: VQADD", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x6e210c02);  // UQADD v2.16b, v0.16b, v1.16b
     env.code_mem.emplace_back(0x4e210c03);  // SQADD v3.16b, v0.16b, v1.16b
@@ -167,7 +167,7 @@ TEST_CASE("A64: VQADD", "[a64]") {
 
 TEST_CASE("A64: VQSUB", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x6e212c02);  // UQSUB v2.16b, v0.16b, v1.16b
     env.code_mem.emplace_back(0x4e212c03);  // SQSUB v3.16b, v0.16b, v1.16b
@@ -198,7 +198,7 @@ TEST_CASE("A64: VQSUB", "[a64]") {
 
 TEST_CASE("A64: REV", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0xdac00c00);  // REV X0, X0
     env.code_mem.emplace_back(0x5ac00821);  // REV W1, W1
@@ -218,7 +218,7 @@ TEST_CASE("A64: REV", "[a64]") {
 
 TEST_CASE("A64: REV32", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0xdac00800);  // REV32 X0, X0
     env.code_mem.emplace_back(0x14000000);  // B .
@@ -234,7 +234,7 @@ TEST_CASE("A64: REV32", "[a64]") {
 
 TEST_CASE("A64: REV16", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0xdac00400);  // REV16 X0, X0
     env.code_mem.emplace_back(0x5ac00421);  // REV16 W1, W1
@@ -254,7 +254,7 @@ TEST_CASE("A64: REV16", "[a64]") {
 
 TEST_CASE("A64: SSHL", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     oaknut::VectorCodeGenerator code{env.code_mem, nullptr};
     code.SSHL(V4.B16(), V4.B16(), V0.B16());
@@ -288,7 +288,7 @@ TEST_CASE("A64: SSHL", "[a64]") {
 
 TEST_CASE("A64: USHL", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     oaknut::VectorCodeGenerator code{env.code_mem, nullptr};
     code.USHL(V4.B16(), V4.B16(), V0.B16());
@@ -334,7 +334,7 @@ TEST_CASE("A64: USHL", "[a64]") {
 
 TEST_CASE("A64: URSHL", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     oaknut::VectorCodeGenerator code{env.code_mem, nullptr};
     code.URSHL(V0.S4(), V1.S4(), V2.S4());
@@ -365,7 +365,7 @@ TEST_CASE("A64: URSHL", "[a64]") {
 
 TEST_CASE("A64: XTN", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x0e212803);  // XTN v3.8b, v0.8h
     env.code_mem.emplace_back(0x0e612824);  // XTN v4.4h, v1.4s
@@ -387,7 +387,7 @@ TEST_CASE("A64: XTN", "[a64]") {
 
 TEST_CASE("A64: TBL", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x0e000100);  // TBL v0.8b,  { v8.16b                           }, v0.8b
     env.code_mem.emplace_back(0x4e010101);  // TBL v1.16b, { v8.16b                           }, v1.16b
@@ -433,7 +433,7 @@ TEST_CASE("A64: TBL", "[a64]") {
 
 TEST_CASE("A64: TBX", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x0e001100);  // TBX v0.8b,  { v8.16b                           }, v0.8b
     env.code_mem.emplace_back(0x4e011101);  // TBX v1.16b, { v8.16b                           }, v1.16b
@@ -479,7 +479,7 @@ TEST_CASE("A64: TBX", "[a64]") {
 
 TEST_CASE("A64: AND", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x8a020020);  // AND X0, X1, X2
     env.code_mem.emplace_back(0x14000000);  // B .
@@ -500,7 +500,7 @@ TEST_CASE("A64: AND", "[a64]") {
 
 TEST_CASE("A64: Bitmasks", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x3200c3e0);  // ORR W0, WZR, #0x01010101
     env.code_mem.emplace_back(0x320c8fe1);  // ORR W1, WZR, #0x00F000F0
@@ -520,7 +520,7 @@ TEST_CASE("A64: Bitmasks", "[a64]") {
 
 TEST_CASE("A64: ANDS NZCV", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x6a020020);  // ANDS W0, W1, W2
     env.code_mem.emplace_back(0x14000000);  // B .
@@ -575,7 +575,7 @@ TEST_CASE("A64: ANDS NZCV", "[a64]") {
 
 TEST_CASE("A64: CBZ", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x34000060);  // 0x00 : CBZ X0, label
     env.code_mem.emplace_back(0x320003e2);  // 0x04 : MOV X2, 1
@@ -608,7 +608,7 @@ TEST_CASE("A64: CBZ", "[a64]") {
 
 TEST_CASE("A64: TBZ", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x36180060);  // 0x00 : TBZ X0, 3, label
     env.code_mem.emplace_back(0x320003e2);  // 0x04 : MOV X2, 1
@@ -652,7 +652,7 @@ TEST_CASE("A64: TBZ", "[a64]") {
 
 TEST_CASE("A64: FABD", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x6eb5d556);  // FABD.4S V22, V10, V21
     env.code_mem.emplace_back(0x14000000);  // B .
@@ -669,7 +669,7 @@ TEST_CASE("A64: FABD", "[a64]") {
 
 TEST_CASE("A64: FABS", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x4ef8f804);  // FABS v4.8h, v0.8h
     env.code_mem.emplace_back(0x4ea0f825);  // FABS v5.4s, v1.4s
@@ -691,7 +691,7 @@ TEST_CASE("A64: FABS", "[a64]") {
 
 TEST_CASE("A64: FMIN (example)", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x4ea1f400);  // FMIN.4S V0, V0, V1
     env.code_mem.emplace_back(0x4ee3f442);  // FMIN.2D V2, V2, V3
@@ -713,7 +713,7 @@ TEST_CASE("A64: FMIN (example)", "[a64]") {
 
 TEST_CASE("A64: FMAX (example)", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x4e21f400);  // FMAX.4S V0, V0, V1
     env.code_mem.emplace_back(0x4e63f442);  // FMAX.2D V2, V2, V3
@@ -735,7 +735,7 @@ TEST_CASE("A64: FMAX (example)", "[a64]") {
 
 TEST_CASE("A64: FMINNM (example)", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x4ea1c400);  // FMINNM.4S V0, V0, V1
     env.code_mem.emplace_back(0x4ee3c442);  // FMINNM.2D V2, V2, V3
@@ -757,7 +757,7 @@ TEST_CASE("A64: FMINNM (example)", "[a64]") {
 
 TEST_CASE("A64: FMAXNM (example)", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x4e21c400);  // FMAXNM.4S V0, V0, V1
     env.code_mem.emplace_back(0x4e63c442);  // FMAXNM.2D V2, V2, V3
@@ -779,7 +779,7 @@ TEST_CASE("A64: FMAXNM (example)", "[a64]") {
 
 TEST_CASE("A64: FMAXNM (example 2)", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x4e3bc6fd);  // FMAXNM.4S V29, V23, V27
     env.code_mem.emplace_back(0x14000000);  // B .
@@ -831,7 +831,7 @@ TEST_CASE("A64: 128-bit exclusive read/write", "[a64]") {
 
 TEST_CASE("A64: CNTPCT_EL0", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0xd53be021);  // MRS X1, CNTPCT_EL0
     env.code_mem.emplace_back(0xd503201f);  // NOP
@@ -852,7 +852,7 @@ TEST_CASE("A64: CNTPCT_EL0", "[a64]") {
 
 TEST_CASE("A64: FNMSUB 1", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x1f618a9c);  // FNMSUB D28, D20, D1, D2
     env.code_mem.emplace_back(0x14000000);  // B .
@@ -870,7 +870,7 @@ TEST_CASE("A64: FNMSUB 1", "[a64]") {
 
 TEST_CASE("A64: FNMSUB 2", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x1f2ab88e);  // FNMSUB S14, S4, S10, S14
     env.code_mem.emplace_back(0x14000000);  // B .
@@ -889,7 +889,7 @@ TEST_CASE("A64: FNMSUB 2", "[a64]") {
 
 TEST_CASE("A64: FMADD", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x1f5e0e4a);  // FMADD D10, D18, D30, D3
     env.code_mem.emplace_back(0x14000000);  // B .
@@ -908,7 +908,7 @@ TEST_CASE("A64: FMADD", "[a64]") {
 
 TEST_CASE("A64: FMLA.4S(lane)", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x4f8f11c0);  // FMLA.4S V0, V14, V15[0]
     env.code_mem.emplace_back(0x4faf11c1);  // FMLA.4S V1, V14, V15[1]
@@ -936,7 +936,7 @@ TEST_CASE("A64: FMLA.4S(lane)", "[a64]") {
 
 TEST_CASE("A64: FMUL.4S(lane)", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x4f8f91c0);  // FMUL.4S V0, V14, V15[0]
     env.code_mem.emplace_back(0x4faf91c1);  // FMUL.4S V1, V14, V15[1]
@@ -959,7 +959,7 @@ TEST_CASE("A64: FMUL.4S(lane)", "[a64]") {
 
 TEST_CASE("A64: FMLA.4S (denormal)", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x4e2fcccc);  // FMLA.4S V12, V6, V15
     env.code_mem.emplace_back(0x14000000);  // B .
@@ -978,7 +978,7 @@ TEST_CASE("A64: FMLA.4S (denormal)", "[a64]") {
 
 TEST_CASE("A64: FMLA.4S (0x80800000)", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x4e38cc2b);  // FMLA.4S V11, V1, V24
     env.code_mem.emplace_back(0x14000000);  // B .
@@ -1000,7 +1000,7 @@ TEST_CASE("A64: FMLA.4S (0x80800000)", "[a64]") {
 // x64 performs rounding before flushing-to-zero.
 TEST_CASE("A64: FMADD (0x80800000)", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x1f0f7319);  // FMADD S25, S24, S15, S28
     env.code_mem.emplace_back(0x14000000);  // B .
@@ -1019,7 +1019,7 @@ TEST_CASE("A64: FMADD (0x80800000)", "[a64]") {
 
 TEST_CASE("A64: FNEG failed to zero upper", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x2ea0fb50);  // FNEG.2S V16, V26
     env.code_mem.emplace_back(0x2e207a1c);  // SQNEG.8B V28, V16
@@ -1038,7 +1038,7 @@ TEST_CASE("A64: FNEG failed to zero upper", "[a64]") {
 
 TEST_CASE("A64: FRSQRTS", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x5eb8fcad);  // FRSQRTS S13, S5, S24
     env.code_mem.emplace_back(0x14000000);  // B .
@@ -1060,7 +1060,7 @@ TEST_CASE("A64: FRSQRTS", "[a64]") {
 
 TEST_CASE("A64: SQDMULH.8H (saturate)", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x4e62b420);  // SQDMULH.8H V0, V1, V2
     env.code_mem.emplace_back(0x14000000);  // B .
@@ -1081,7 +1081,7 @@ TEST_CASE("A64: SQDMULH.8H (saturate)", "[a64]") {
 
 TEST_CASE("A64: SQDMULH.4S (saturate)", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x4ea2b420);  // SQDMULH.4S V0, V1, V2
     env.code_mem.emplace_back(0x14000000);  // B .
@@ -1102,7 +1102,7 @@ TEST_CASE("A64: SQDMULH.4S (saturate)", "[a64]") {
 
 TEST_CASE("A64: This is an infinite loop if fast dispatch is enabled", "[a64]") {
     A64TestEnv env;
-    A64::UserConfig conf{&env};
+    A64::UserConfig conf{.callbacks = &env};
     conf.optimizations &= ~OptimizationFlag::FastDispatch;
     A64::Jit jit{conf};
 
@@ -1119,7 +1119,7 @@ TEST_CASE("A64: This is an infinite loop if fast dispatch is enabled", "[a64]") 
 
 TEST_CASE("A64: EXTR", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x93d8fef7);  // EXTR X23, X23, X24, #63
     env.code_mem.emplace_back(0x14000000);  // B .
@@ -1136,7 +1136,7 @@ TEST_CASE("A64: EXTR", "[a64]") {
 
 TEST_CASE("A64: Isolated GetNZCVFromOp", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0xaa1f03f5);  // MOV X21, XZR
     env.code_mem.emplace_back(0x912a02da);  // ADD X26, X22, #0xa80
@@ -1167,7 +1167,7 @@ TEST_CASE("A64: Isolated GetNZCVFromOp", "[a64]") {
 
 TEST_CASE("A64: Optimization failure when folding ADD", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0xbc4f84be);  // LDR S30, [X5], #248
     env.code_mem.emplace_back(0x9a0c00ea);  // ADC X10, X7, X12
@@ -1263,7 +1263,7 @@ TEST_CASE("A64: Cache Maintenance Instructions", "[a64]") {
     };
 
     CacheMaintenanceTestEnv env;
-    A64::UserConfig conf{&env};
+    A64::UserConfig conf{.callbacks = &env};
     conf.hook_data_cache_operations = true;
     A64::Jit jit{conf};
 
@@ -1290,7 +1290,7 @@ TEST_CASE("A64: Memory access (fastmem)", "[a64]") {
     char* backing_memory = reinterpret_cast<char*>(std::align(page_size, memory_size, buffer_ptr, buffer_size_nconst));
 
     A64FastmemTestEnv env{backing_memory};
-    Dynarmic::A64::UserConfig config{&env};
+    Dynarmic::A64::UserConfig config{.callbacks = &env};
     config.fastmem_pointer = reinterpret_cast<uintptr_t>(backing_memory);
     config.fastmem_address_space_bits = address_width;
     config.recompile_on_fastmem_failure = false;
@@ -1323,7 +1323,7 @@ TEST_CASE("A64: Memory access (fastmem)", "[a64]") {
 
 TEST_CASE("A64: SQRDMULH QC flag when output invalidated", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x0fbcd38b);  // SQRDMULH.2S V11, V28, V28[1]
     env.code_mem.emplace_back(0x7ef0f8eb);  // FMINP.2D    D11, V7
@@ -1343,7 +1343,7 @@ TEST_CASE("A64: SQRDMULH QC flag when output invalidated", "[a64]") {
 
 TEST_CASE("A64: SDIV maximally", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem.emplace_back(0x9ac00c22);  // SDIV X2, X1, X0
     env.code_mem.emplace_back(0x14000000);  // B .
@@ -1367,7 +1367,7 @@ TEST_CASE("A64: SDIV maximally", "[a64]") {
 // const HostLocList any_xmm = { HostLoc::XMM1, HostLoc::XMM2, HostLoc::XMM3, HostLoc::XMM4, HostLoc::XMM5, HostLoc::XMM6 };
 TEST_CASE("A64: rand1", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     env.code_mem = {0x2ea2e69a, 0x6f7168e7, 0x7eb0f816, 0x6ebd369d, 0x1e65c302, 0x1e63011c, 0x1e67c349, 0x0f861bd6, 0x9e59cbbc, 0x5e61cb8b, 0x6e218b01, 0x4eb2409f, 0x7f7c2452, 0x7e207a8d, 0xd503369f};
     env.code_mem.emplace_back(0x14000000);  // B .
@@ -1596,7 +1596,7 @@ TEST_CASE("A64: rand2", "[a64][.]") {
 
 TEST_CASE("A64: SABD", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     oaknut::VectorCodeGenerator code{env.code_mem, nullptr};
     code.SABD(V0.B16(), V3.B16(), V4.B16());
@@ -1654,7 +1654,7 @@ TEST_CASE("A64: SABD", "[a64]") {
 
 TEST_CASE("A64: UZP{1,2}.2D", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     oaknut::VectorCodeGenerator code{env.code_mem, nullptr};
     code.UZP1(V2.D2(), V0.D2(), V1.D2());
@@ -1673,7 +1673,7 @@ TEST_CASE("A64: UZP{1,2}.2D", "[a64]") {
 
 TEST_CASE("A64: UZP{1,2}.S", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     oaknut::VectorCodeGenerator code{env.code_mem, nullptr};
     code.UZP1(V2.S2(), V0.S2(), V1.S2());
@@ -1696,7 +1696,7 @@ TEST_CASE("A64: UZP{1,2}.S", "[a64]") {
 
 TEST_CASE("A64: UZP{1,2}.H", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     oaknut::VectorCodeGenerator code{env.code_mem, nullptr};
     code.UZP1(V2.H4(), V0.H4(), V1.H4());
@@ -1719,7 +1719,7 @@ TEST_CASE("A64: UZP{1,2}.H", "[a64]") {
 
 TEST_CASE("A64: UZP{1,2}.B", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     oaknut::VectorCodeGenerator code{env.code_mem, nullptr};
     code.UZP1(V2.B8(), V0.B8(), V1.B8());
@@ -1742,7 +1742,7 @@ TEST_CASE("A64: UZP{1,2}.B", "[a64]") {
 
 TEST_CASE("A64: {S,U}MIN.S, {S,U}MAX.S", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     oaknut::VectorCodeGenerator code{env.code_mem, nullptr};
     code.SMIN(V2.S4(), V0.S4(), V1.S4());
@@ -1786,7 +1786,7 @@ TEST_CASE("A64: {S,U}MIN.S, {S,U}MAX.S", "[a64]") {
 
 TEST_CASE("A64: {S,U}MIN.H, {S,U}MAX.H", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     oaknut::VectorCodeGenerator code{env.code_mem, nullptr};
     code.SMIN(V2.H8(), V0.H8(), V1.H8());
@@ -1830,7 +1830,7 @@ TEST_CASE("A64: {S,U}MIN.H, {S,U}MAX.H", "[a64]") {
 
 TEST_CASE("A64: {S,U}MIN.B, {S,U}MAX.B", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     oaknut::VectorCodeGenerator code{env.code_mem, nullptr};
     code.SMIN(V2.B16(), V0.B16(), V1.B16());
@@ -1874,7 +1874,7 @@ TEST_CASE("A64: {S,U}MIN.B, {S,U}MAX.B", "[a64]") {
 
 TEST_CASE("A64: {S,U}MINP.S, {S,U}MAXP.S", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     oaknut::VectorCodeGenerator code{env.code_mem, nullptr};
     code.SMINP(V2.S2(), V0.S2(), V1.S2());
@@ -1942,7 +1942,7 @@ TEST_CASE("A64: {S,U}MINP.S, {S,U}MAXP.S", "[a64]") {
 
 TEST_CASE("A64: {S,U}MINP.H, {S,U}MAXP.H", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     oaknut::VectorCodeGenerator code{env.code_mem, nullptr};
     code.SMINP(V2.H4(), V0.H4(), V1.H4());
@@ -2010,7 +2010,7 @@ TEST_CASE("A64: {S,U}MINP.H, {S,U}MAXP.H", "[a64]") {
 
 TEST_CASE("A64: {S,U}MINP.B, {S,U}MAXP.B", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     oaknut::VectorCodeGenerator code{env.code_mem, nullptr};
     code.SMINP(V2.B8(), V0.B8(), V1.B8());
@@ -2084,7 +2084,7 @@ TEST_CASE("A64: {S,U}MINP.B, {S,U}MAXP.B", "[a64]") {
 
 TEST_CASE("A64: SQABS", "[a64]") {
     A64TestEnv env;
-    A64::Jit jit{A64::UserConfig{&env}};
+    A64::Jit jit{A64::UserConfig{.callbacks = &env}};
 
     oaknut::VectorCodeGenerator code{env.code_mem, nullptr};
     // should set QC flag

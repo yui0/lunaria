@@ -334,8 +334,8 @@ IR::Block A64AddressSpace::GenerateIR(IR::LocationDescriptor descriptor) const {
 
     Optimization::A64CallbackConfigPass(ir_block, conf);
     Optimization::NamingPass(ir_block);
-    if (conf.HasOptimization(OptimizationFlag::GetSetElimination) && !conf.check_halt_on_memory_access) {
-        Optimization::A64GetSetElimination(ir_block);
+    if (conf.HasOptimization(OptimizationFlag::GetSetElimination)) {
+        Optimization::A64GetSetElimination(ir_block, conf.check_halt_on_memory_access);
         Optimization::DeadCodeElimination(ir_block);
     }
     if (conf.HasOptimization(OptimizationFlag::ConstProp)) {

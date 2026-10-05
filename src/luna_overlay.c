@@ -16,8 +16,17 @@
 
 #define LUNA_UI_NO_PLATFORM
 #include <limits.h>
+/* The file dialog the launcher's "Browse" opens is luna-ui's own
+ * (luna-window.h): one implementation for every host OS instead of a native
+ * chooser per platform.  Its code has to sit in the translation unit that
+ * defines the engine. */
 #define LUNA_UI_IMPLEMENTATION
 #include "luna-ui.h"
+#define LUNA_WINDOW_IMPLEMENTATION
+#if !defined(_WIN32)   /* its directory/volume code is POSIX; Windows falls back */
+#define LUNA_WINDOW_FILE_DIALOG_IMPLEMENTATION
+#endif
+#include "luna-window.h"
 
 #include "luna_overlay.h"
 #include <sys/stat.h>
@@ -65,6 +74,7 @@ static double g_last_time;
  * luna-ui has no locking of its own, so the handoff is a copied string under a
  * mutex and every luna_* call stays on the presenting thread. */
 static pthread_mutex_t g_doc_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool g_native_input_focus;
 
 void luna_overlay_image_changed(const char *path)
 {
@@ -644,6 +654,11 @@ bool luna_overlay_menu_showing(void)
 
 void luna_overlay_set_menu_handler(luna_overlay_menu_fn fn) { g_menu_fn = fn; }
 
+/* The frame luna-ui last drew, as a PNG: what the launcher screen looks like,
+ * for people who cannot see it (and for checking it without a screenshot
+ * permission). */
+int luna_overlay_screenshot(const char *path) { return take_screenshot(path); }
+
 bool luna_overlay_status_showing(void)
 {
    pthread_mutex_lock(&g_doc_lock);
@@ -713,6 +728,14 @@ static void overlay_element_clicked(LunaElement *e)
  * widget layer decides whether the View it stands for has a listener. */
 static void overlay_wire_clicks(void)
 {
+   /* Rebuilding the View document detaches old focused elements. */
+   pthread_mutex_lock(&g_ptr_lock);
+   if (g_web_focus[0]) {
+      LunaElement *focused = luna_element_at(luna_get_element_by_id(g_web_focus));
+      if (!focused || !strstr(focused->class_name, "lunaria-webview"))
+         g_web_focus[0] = 0;
+   }
+   pthread_mutex_unlock(&g_ptr_lock);
    int n = luna_element_count();
    for (int i = 0; i < n; ++i) {
       LunaElement *e = luna_element_at(i);
@@ -748,7 +771,12 @@ static void overlay_drain_pointer(void)
                            sizeof g_web_pointer_capture, "%s", e->id);
                if (batch[i].action == 1) {
                   pthread_mutex_lock(&g_ptr_lock);
-                  snprintf(g_web_focus, sizeof g_web_focus, "%s", e->id);
+                  /* SurfaceView shares pointer forwarding with WebView,
+                   * but only WebView owns the browser keyboard channel. */
+                  if (strstr(e->class_name, "lunaria-webview"))
+                     snprintf(g_web_focus, sizeof g_web_focus, "%s", e->id);
+                  else
+                     g_web_focus[0] = 0;
                   pthread_mutex_unlock(&g_ptr_lock);
                }
                if (g_web_pointer_capture[0])
@@ -815,6 +843,22 @@ bool luna_overlay_guest_window_up(void)
    bool up = g_html != NULL;
    pthread_mutex_unlock(&g_doc_lock);
    return up && !g_failed;
+}
+
+/* Published by the Android UI thread after resolving window focus. */
+void luna_overlay_set_native_input_focus(bool focused)
+{
+   pthread_mutex_lock(&g_doc_lock);
+   g_native_input_focus = focused;
+   pthread_mutex_unlock(&g_doc_lock);
+}
+
+bool luna_overlay_guest_keys_captured(void)
+{
+   pthread_mutex_lock(&g_doc_lock);
+   bool captured = g_html != NULL && !g_native_input_focus;
+   pthread_mutex_unlock(&g_doc_lock);
+   return captured && !g_failed;
 }
 
 bool luna_overlay_active(void)

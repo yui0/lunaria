@@ -2,6 +2,8 @@ include(TargetArchitectureSpecificSources)
 
 add_library(dynarmic
     backend/block_range_information.cpp
+    backend/block_range_index.c
+    backend/block_range_index.h
     backend/block_range_information.h
     backend/exception_handler.h
     common/always_false.h

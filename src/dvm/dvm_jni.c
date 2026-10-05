@@ -383,6 +383,7 @@ static dvm_ref host_array_to_dvm(struct dvm *vm, JNIEnv *env, jobject o)
          jobject el = (*env)->GetObjectArrayElement(env, (jobjectArray)o, ei);
          slots[ei] = from_jobject(vm, env, el);
          if (slots[ei]) dvm_pin(vm, slots[ei]);
+         if (el) (*env)->DeleteLocalRef(env, el);
       }
       struct dvm_object *ao = r ? dvm__obj(vm, r) : NULL;
       if (ao) ao->host_handle = (uint32_t)(uintptr_t)o;
@@ -518,18 +519,16 @@ static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
          }
       }
    }
-   const char *utf = NULL;
-   /* GetStringUTFChars asserts on a non-string, so probe the class first. */
+   /* Both VM interiors use WTF-8 with an explicit byte length. Avoid JNI's
+    * modified UTF-8 conversion here, retaining NUL and surrogate pairs. */
    jclass sc = (*env)->GetObjectClass(env, o);
    if (sc) {
       jclass strc = (*env)->FindClass(env, "java/lang/String");
-      if (strc && (*env)->IsInstanceOf(env, o, strc))
-         utf = (*env)->GetStringUTFChars(env, (jstring)o, NULL);
-   }
-   if (utf) {
-      dvm_ref r = dvm_new_string(vm, utf);
-      (*env)->ReleaseStringUTFChars(env, (jstring)o, utf);
-      return r;
+      if (strc && (*env)->IsInstanceOf(env, o, strc)) {
+         size_t bytes;
+         const char *utf = jvm_string_wtf8(jnienv_get_jvm(env), (jstring)o, &bytes);
+         return dvm_new_string_n(vm, utf, bytes);
+      }
    }
    /* Wrap it as what it actually is.  Naming every incoming object
     * "java/lang/Object" threw away the one piece of type information the
@@ -639,7 +638,8 @@ static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
 
    const char *s = dvm_string_utf8(vm, r);
    if (s) {
-      jobject h = (jobject)(*env)->NewStringUTF(env, s);
+      size_t bytes = dvm_string_utf8_length(vm, r);
+      jobject h = (jobject)jvm_new_string_wtf8(jnienv_get_jvm(env), s, bytes);
       bridge_record(h, 0, false);
       return h;
    }
@@ -650,6 +650,19 @@ static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
       fprintf(stderr, "[dvm-jni] non-payload object ref=0x%x kind=%d class=%s\n",
               r, raw ? (int)raw->kind : -1,
               (c && c->name) ? c->name : "(none)");
+   }
+
+   /* Preserve the immutable event when a Java View forwards host input to
+    * native code. An opaque MotionEvent has no samples for JNI getters. */
+   if (c && c->name && !strcmp(c->name, "android/view/MotionEvent")) {
+      lunaria_touch_event event = {0};
+      if (!dvm_motion_event_read(vm, r, &event)) return NULL;
+      jobject handle = jvm_new_motion_event(jnienv_get_jvm(env), &event);
+      struct dvm_object *object = dvm__obj(vm, r);
+      if (object) object->host_handle = (uint32_t)(uintptr_t)handle;
+      remember_wrapper((uint32_t)(uintptr_t)handle, r);
+      bridge_record(handle, r, false);
+      return handle;
    }
 
    /* A java.lang.String may never cross JNI as a bare AllocObject(String).
@@ -1370,10 +1383,19 @@ static bool hook_call_native(void *user, struct dvm *vm, const char *class_name,
    jvalue ret;
    memset(&ret, 0, sizeof ret);
    jobject jself = self ? to_jobject(vm, env, self) : NULL;
+   if (getenv("LUNARIA_TOUCH_DIAG") && !strcmp(method, "nativeInjectEvent") && nargs) {
+      lunaria_touch_event event = {0};
+      bool valid = jvm_motion_event_read(jnienv_get_jvm(env), jargs[0].l, &event);
+      fprintf(stderr, "[motion-jni] arg=%p valid=%d action=%d xy=%.1f,%.1f time=%lld down=%lld\n",
+              jargs[0].l, valid, event.action, event.x, event.y,
+              event.event_ms, event.down_ms);
+   }
    if (!g_guest_native(class_name, method, sig, is_static, jself, jargs, nargs, &ret)) {
       bridge_end(vm, env, &frame);
       return false;
    }
+   if (getenv("LUNARIA_TOUCH_DIAG") && !strcmp(method, "nativeInjectEvent"))
+      fprintf(stderr, "[motion-jni] nativeInjectEvent returned %d\n", ret.z);
    /* The native may have written into a direct buffer's guest region; the
     * bytes have to be back in the VM's array before bytecode reads them
     * again (UnityWebRequest's upload loop reads array() on the next line). */
@@ -1654,9 +1676,9 @@ bool dvm_jni_invoke_locked(JNIEnv *env, const char *class_name, const char *meth
 
    dvm_ref dself = 0;
    if (!is_static && self) {
-      /* The receiver is a stub-layer handle.  Give the VM a wrapper carrying
-       * that handle so a call back out lands on the same object. */
-      dself = wrapper_for(vm, env, class_name, (uint32_t)(uintptr_t)self);
+      /* Receivers need the same conversion as arguments: strings and arrays
+       * have VM payloads, while ordinary objects keep their host identity. */
+      dself = from_jobject(vm, env, self);
    } else if (!is_static) {
       dself = dvm_new_object(vm, dvm_find_class(vm, class_name));
    }

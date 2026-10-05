@@ -1848,6 +1848,9 @@ enum SvcId : uint32_t {
     SVC_GL1_TexCoordPointer,
     SVC_GL1_ShadeModel,
     SVC_VSWPRINTF,
+    SVC_TIMERFD_CREATE,
+    SVC_TIMERFD_SETTIME,
+    SVC_TIMERFD_GETTIME,
     /* Add new SVCs above this line.  One past the highest SVC: build_jni_tables()
      * builds a trampoline for every number below it, and the unknown-symbol pool
      * starts here. */

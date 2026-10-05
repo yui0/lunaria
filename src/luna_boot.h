@@ -65,6 +65,24 @@ void luna_launcher_progress(const char *stage, const char *file, uint64_t bytes,
 int luna_launcher_cancelled(void);
 int luna_launcher_choose(const char *package, const char *const *profiles,
                          size_t count, char *choice, size_t capacity);
+/* One setting the launcher screen offers next to the application: a key of
+ * lunaria.conf, what to call it, and its value (filled in by the caller,
+ * edited by the person, read back).  `folder` adds a Browse button that picks
+ * a directory. */
+typedef struct luna_launcher_setting {
+   const char *key, *label, *hint;
+   int folder;
+   int compact;      /* shares a row with the neighbouring compact settings */
+   const char *const *choices; /* NULL-terminated values, or NULL for text */
+   char value[1024];
+} luna_launcher_setting;
+
+/* Started with no application: asks which to open and how this installation
+ * is set up (path field, luna-ui's file dialog for Browse, drag-and-drop).
+ * 0 with the application in `path` and `settings` as edited; -1 when
+ * cancelled or there is no display to ask on. */
+int luna_launcher_pick(char *path, size_t capacity,
+                       luna_launcher_setting *settings, size_t count);
 void luna_launcher_end(int keep_window);
 void *luna_launcher_take_window(void);
 

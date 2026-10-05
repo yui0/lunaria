@@ -36,6 +36,7 @@
 #include <unistd.h>
 
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <mach/mach_host.h>
 #include <mach-o/loader.h>
 #include <mach-o/dyld.h>
@@ -103,6 +104,59 @@ void luna_os_backtrace_print(void *const *frames, int count)
 #include <GLFW/glfw3.h>
 #define GLFW_EXPOSE_NATIVE_COCOA
 #include <GLFW/glfw3native.h>
+
+/* Linux reports a broken pipe writer as ERR, rather than Darwin's HUP.
+ * Inspect only exceptional descriptors; the usual ready path stays native. */
+int luna_socket_poll(struct pollfd *fds, size_t n, int ms)
+{
+   if (n > UINT32_MAX || n > SIZE_MAX / sizeof(struct pollfd)) {
+      errno = EINVAL; return -1;
+   }
+   if (n && !fds) { errno = EFAULT; return -1; }
+   struct pollfd small[64];
+   struct pollfd *host = n <= 64 ? small : malloc(n * sizeof *host);
+   if (!host) { errno = ENOMEM; return -1; }
+   for (size_t i = 0; i < n; ++i) {
+      host[i] = fds[i];
+      /* Darwin needs HUP requested even for events=0. Linux always reports it. */
+      host[i].events |= POLLHUP;
+   }
+   int result = poll(host, n, ms);
+   const int saved_errno = errno;
+   if (result >= 0) for (size_t i = 0; i < n; ++i) {
+      short events = host[i].revents;
+      if (events & POLLHUP) {
+         struct stat info;
+         int mode = fcntl(host[i].fd, F_GETFL);
+         if (mode >= 0 && (mode & O_ACCMODE) == O_WRONLY &&
+             !fstat(host[i].fd, &info) && S_ISFIFO(info.st_mode))
+            events = (events & ~POLLHUP) | POLLERR;
+      }
+      fds[i].revents = events;
+   }
+   if (host != small) free(host);
+   errno = saved_errno;
+   return result;
+}
+
+/* Linux drops the old flock when a conversion conflicts. Darwin keeps it.
+ * Probe nonblocking first so an upgrade never sleeps holding its shared lock.
+ * Repeating an existing lock succeeds without dropping it or opening a race. */
+int luna_file_flock(int fd, int operation)
+{
+   int kind = operation & ~LUNA_LOCK_NONBLOCK;
+   if (kind != LUNA_LOCK_SHARED && kind != LUNA_LOCK_EXCLUSIVE &&
+       kind != LUNA_LOCK_UNLOCK) { errno = EINVAL; return -1; }
+   int native = kind == LUNA_LOCK_SHARED ? LOCK_SH :
+                kind == LUNA_LOCK_EXCLUSIVE ? LOCK_EX : LOCK_UN;
+   if (kind == LUNA_LOCK_UNLOCK) return flock(fd, LOCK_UN);
+   int result = flock(fd, native | LOCK_NB);
+   if (!result || (errno != EWOULDBLOCK && errno != EAGAIN)) return result;
+   const int error = errno;
+   if (flock(fd, LOCK_UN)) return -1;
+   if (operation & LUNA_LOCK_NONBLOCK) { errno = error; return -1; }
+   return flock(fd, native);
+}
 
 /* ---- virtual memory ---------------------------------------------------- */
 
@@ -189,8 +243,43 @@ size_t luna_os_page_size(void)
    return v > 0 ? (size_t)v : 4096u;
 }
 
+/* Validate mapped host ranges using Mach rather than a shadow mapping table. */
+static int luna_memory_range(void *addr, size_t len, int reject_locked)
+{
+   const size_t page = luna_os_page_size();
+   const uintptr_t start = (uintptr_t)addr;
+   if (start % page) { errno = EINVAL; return -1; }
+   if (len > UINTPTR_MAX - (page - 1)) { errno = ENOMEM; return -1; }
+   const size_t rounded = (len + page - 1) & ~(page - 1);
+   if (rounded > UINTPTR_MAX - start) { errno = ENOMEM; return -1; }
+   const uintptr_t end = start + rounded;
+   /* Query the actual mappings, including locks created outside this wrapper.
+    * Darwin does not enforce Linux's INVALIDATE/locked-range exclusion. */
+   for (uintptr_t cursor = start; cursor < end;) {
+      mach_vm_address_t region = cursor;
+      mach_vm_size_t size = 0;
+      vm_region_basic_info_data_64_t info;
+      mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+      mach_port_t object = MACH_PORT_NULL;
+      kern_return_t kr = mach_vm_region(mach_task_self(), &region, &size,
+          VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object);
+      if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+      if (kr != KERN_SUCCESS || region > cursor || !size) {
+         errno = ENOMEM; return -1;
+      }
+      if (reject_locked && info.user_wired_count) {
+         errno = EBUSY; return -1;
+      }
+      if (size >= end - region) break;
+      cursor = (uintptr_t)(region + size);
+   }
+   return 0;
+}
+
 int luna_os_memory_advise(void *addr, size_t len, int advice)
 {
+   /* Darwin rounds unaligned addresses; the Android API rejects them. */
+   if ((uintptr_t)addr % luna_os_page_size()) { errno = EINVAL; return -1; }
    int native;
    switch (advice) {
    case 0: native = MADV_NORMAL; break;
@@ -201,13 +290,70 @@ int luna_os_memory_advise(void *addr, size_t len, int advice)
    case 8: native = MADV_FREE; break;
    default: errno = EINVAL; return -1;
    }
-   return madvise(addr, len, native);
+   int result = madvise(addr, len, native);
+   if (result < 0 && errno == EINVAL) {
+      /* XNU maps KERN_INVALID_ADDRESS to EINVAL; Linux uses ENOMEM. */
+      if (luna_memory_range(addr, len, 0)) return -1;
+      errno = EINVAL;
+   }
+   return result;
+}
+
+/* Linux MADV_DONTNEED on private anonymous memory leaves zero pages behind;
+ * Darwin's keeps the old bytes (MADV_FREE as well), and allocators such as
+ * Scudo and the Mono/il2cpp GC take the zeros for granted when they reuse a
+ * range.  The guest sees 4 KiB pages on 16 KiB host pages, so the range need
+ * not be host-page aligned: whole host pages inside it are swapped for fresh
+ * anonymous pages with the protection they had (which also gives the memory
+ * back), and the partial pages at the ends, shared with neighbouring guest
+ * pages, are cleared in place.  Only for anonymous guest memory. */
+int luna_os_memory_zero(void *addr, size_t len)
+{
+   if (!len) return 0;
+   const uintptr_t page = luna_os_page_size();
+   const uintptr_t lo = (uintptr_t)addr;
+   if (len > UINTPTR_MAX - lo) { errno = ENOMEM; return -1; }
+   const uintptr_t hi = lo + len;
+   /* Every host page the range touches must be mapped. */
+   const uintptr_t span = lo & ~(page - 1);
+   if (luna_memory_range((void *)span, (size_t)(hi - span), 0)) return -1;
+   const uintptr_t first = (lo + page - 1) & ~(page - 1);
+   const uintptr_t last = hi & ~(page - 1);
+   if (first >= last) { memset(addr, 0, len); return 0; }
+   if (lo < first) memset((void *)lo, 0, first - lo);
+   if (hi > last) memset((void *)last, 0, hi - last);
+   for (uintptr_t cursor = first; cursor < last;) {
+      mach_vm_address_t region = cursor;
+      mach_vm_size_t size = 0;
+      vm_region_basic_info_data_64_t info;
+      mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+      mach_port_t object = MACH_PORT_NULL;
+      kern_return_t kr = mach_vm_region(mach_task_self(), &region, &size,
+          VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object);
+      if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+      if (kr != KERN_SUCCESS || region > cursor || !size) { errno = ENOMEM; return -1; }
+      uintptr_t stop = (uintptr_t)(region + size);
+      if (stop > last) stop = last;
+      int prot = (info.protection & VM_PROT_READ ? PROT_READ : 0) |
+                 (info.protection & VM_PROT_WRITE ? PROT_WRITE : 0);
+      if (!(info.protection & VM_PROT_WRITE)) {
+         /* Zero pages are what the caller asked for; a read-only range can
+          * only be replaced, which keeps the protection it had. */
+      }
+      if (mmap((void *)cursor, stop - cursor, prot,
+               MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0) == MAP_FAILED)
+         return -1;
+      cursor = stop;
+   }
+   return 0;
 }
 
 int luna_os_memory_sync(void *addr, size_t len, int flags)
 {
    if ((flags & ~(LUNA_MS_ASYNC | LUNA_MS_INVALIDATE | LUNA_MS_SYNC)) ||
        (flags & LUNA_MS_ASYNC && flags & LUNA_MS_SYNC)) { errno = EINVAL; return -1; }
+   if (luna_memory_range(addr, len, flags & LUNA_MS_INVALIDATE)) return -1;
+   if (!len) return 0;
    int native = (flags & LUNA_MS_ASYNC ? MS_ASYNC : 0) |
                 (flags & LUNA_MS_INVALIDATE ? MS_INVALIDATE : 0) |
                 (flags & LUNA_MS_SYNC ? MS_SYNC : 0);
@@ -221,7 +367,14 @@ int luna_os_memory_lock(void *addr, size_t len, int unlock)
 
 int luna_os_residency(void *addr, size_t len, unsigned char *vector)
 {
-   return mincore((const void *)addr, len, (char *)vector);
+   if (luna_memory_range(addr, len, 0)) return -1;
+   int result = mincore((const void *)addr, len, (char *)vector);
+   if (!result) {
+      const size_t page = luna_os_page_size();
+      size_t count = len / page + (len % page != 0);
+      for (size_t i = 0; i < count; ++i) vector[i] &= 1;
+   }
+   return result;
 }
 
 /* ---- anonymous shared memory ------------------------------------------- */
@@ -337,8 +490,12 @@ static struct {
    _Atomic uint64_t count;
 } g_events[LUNA_EVENT_MAX];
 
+static _Atomic int g_event_live;   /* open event/timer descriptors */
+
 static int luna_event_slot(int fd)
 {
+   if (fd < 0 || !atomic_load_explicit(&g_event_live, memory_order_acquire))
+      return -1;
    for (int i = 0; i < LUNA_EVENT_MAX; ++i)
       if (atomic_load_explicit(&g_events[i].rd, memory_order_acquire) == fd)
          return i;
@@ -369,6 +526,7 @@ int luna_os_event_open(unsigned initval, int nonblock)
    atomic_store_explicit(&g_events[slot].wr, fds[1], memory_order_relaxed);
    atomic_store_explicit(&g_events[slot].count, 0, memory_order_relaxed);
    atomic_store_explicit(&g_events[slot].rd, fds[0], memory_order_release);
+   atomic_fetch_add_explicit(&g_event_live, 1, memory_order_acq_rel);
    if (initval) luna_os_event_signal(fds[0], initval);
    return fds[0];
 }
@@ -393,12 +551,209 @@ int luna_os_event_drain(int fd, uint64_t *out)
    int i = luna_event_slot(fd);
    char b[64];
    if (i < 0) return -1;
-   while (read(fd, b, sizeof b) > 0) { }
+   /* A blocking pipe would sleep in read() once emptied; only read what the
+    * descriptor says is there. */
+   for (struct pollfd pfd = { fd, POLLIN, 0 };
+        poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN);)
+      if (read(fd, b, sizeof b) <= 0) break;
    const uint64_t count = atomic_exchange_explicit(
       &g_events[i].count, 0, memory_order_acq_rel);
    if (!count) { errno = EAGAIN; return -1; }
    if (out) *out = count;
    return 0;
+}
+
+
+/* eventfd and timerfd read(): an 8-byte native-endian counter, never the
+ * pipe's wake bytes.  Returns the byte count, or -1 with errno set; a
+ * descriptor this layer does not own is read as an ordinary file.  A blocking
+ * descriptor waits for the counter to become non-zero. */
+ptrdiff_t luna_fd_read(int fd, void *buffer, size_t length)
+{
+   if (luna_event_slot(fd) < 0) return read(fd, buffer, length);
+   if (length < sizeof(uint64_t)) { errno = EINVAL; return -1; }
+   const int mode = fcntl(fd, F_GETFL);
+   for (;;) {
+      uint64_t count = 0;
+      if (!luna_os_event_drain(fd, &count)) {
+         memcpy(buffer, &count, sizeof count);
+         return (ptrdiff_t)sizeof count;
+      }
+      if (errno != EAGAIN || (mode >= 0 && (mode & O_NONBLOCK))) return -1;
+      struct pollfd pfd = { fd, POLLIN, 0 };
+      if (poll(&pfd, 1, -1) < 0 && errno != EINTR) return -1;
+   }
+}
+
+/* ---- timerfd -------------------------------------------------------------
+ *
+ * Darwin has none.  A timer is an event descriptor whose counter a single
+ * lazily started thread advances: that gives the guest the descriptor
+ * Linux does (readable on expiry, an expiration count, poll/epoll-able)
+ * without a thread per timer. */
+enum { LUNA_TFD_ABSTIME = 1, LUNA_TFD_NONBLOCK = 0x800 };
+static struct luna_timer {
+   int armed, clock;               /* clock: 0 realtime, else monotonic */
+   int64_t next_ns, interval_ns;   /* next_ns is on that clock */
+} g_timers[LUNA_EVENT_MAX];
+static unsigned char g_is_timer[LUNA_EVENT_MAX];
+static pthread_mutex_t g_timer_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_timer_cv = PTHREAD_COND_INITIALIZER;
+static pthread_once_t g_timer_once = PTHREAD_ONCE_INIT;
+
+static int64_t luna_timer_now(int clock)
+{
+   struct timespec ts;
+   clock_gettime(clock == 0 ? CLOCK_REALTIME : CLOCK_MONOTONIC, &ts);
+   return (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
+}
+
+static void *luna_timer_thread(void *unused)
+{
+   (void)unused;
+   pthread_mutex_lock(&g_timer_mu);
+   for (;;) {
+      int64_t wait_ns = INT64_MAX;
+      for (int i = 0; i < LUNA_EVENT_MAX; ++i) {
+         struct luna_timer *t = &g_timers[i];
+         if (!t->armed) continue;
+         const int64_t now = luna_timer_now(t->clock);
+         int64_t due = t->next_ns - now;
+         if (due <= 0) {
+            uint64_t n = 1;
+            if (t->interval_ns > 0) {
+               n += (uint64_t)(-due / t->interval_ns);
+               t->next_ns += (int64_t)n * t->interval_ns;
+               due = t->next_ns - now;
+            } else {
+               t->armed = 0;
+               due = INT64_MAX;
+            }
+            (void)luna_os_event_signal(
+               atomic_load_explicit(&g_events[i].rd, memory_order_acquire), n);
+         }
+         if (t->armed && due < wait_ns) wait_ns = due;
+      }
+      if (wait_ns == INT64_MAX) {
+         pthread_cond_wait(&g_timer_cv, &g_timer_mu);
+      } else {
+         struct timespec rel = { (time_t)(wait_ns / 1000000000ll),
+                                 (long)(wait_ns % 1000000000ll) };
+         pthread_cond_timedwait_relative_np(&g_timer_cv, &g_timer_mu, &rel);
+      }
+   }
+   return NULL;
+}
+
+static void luna_timer_start(void)
+{
+   pthread_t thread;
+   pthread_attr_t attr;
+   pthread_attr_init(&attr);
+   pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+   pthread_create(&thread, &attr, luna_timer_thread, NULL);
+   pthread_attr_destroy(&attr);
+}
+
+int luna_os_timer_open(int clock_id, int flags)
+{
+   /* CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME (Linux numbering) */
+   if (clock_id != 0 && clock_id != 1 && clock_id != 7) { errno = EINVAL; return -1; }
+   if (flags & ~(LUNA_TFD_NONBLOCK | 0x80000)) { errno = EINVAL; return -1; }
+   const int fd = luna_os_event_open(0, (flags & LUNA_TFD_NONBLOCK) != 0);
+   if (fd < 0) return -1;
+   const int slot = luna_event_slot(fd);
+   pthread_mutex_lock(&g_timer_mu);
+   g_timers[slot] = (struct luna_timer){ 0, clock_id == 0 ? 0 : 1, 0, 0 };
+   g_is_timer[slot] = 1;
+   pthread_mutex_unlock(&g_timer_mu);
+   return fd;
+}
+
+static int luna_timer_slot(int fd)
+{
+   const int i = luna_event_slot(fd);
+   if (i < 0 || !g_is_timer[i]) { errno = EINVAL; return -1; }
+   return i;
+}
+
+static void luna_timer_remaining(const struct luna_timer *t,
+                                 luna_os_timer_spec *out)
+{
+   int64_t left = 0;
+   if (t->armed) {
+      left = t->next_ns - luna_timer_now(t->clock);
+      if (left < 1) left = 1;      /* armed but already due: still pending */
+   }
+   out->value_sec = left / 1000000000ll;
+   out->value_nsec = left % 1000000000ll;
+   out->interval_sec = t->interval_ns / 1000000000ll;
+   out->interval_nsec = t->interval_ns % 1000000000ll;
+}
+
+static int luna_timer_ns(int64_t sec, int64_t nsec, int64_t *out)
+{
+   if (sec < 0 || nsec < 0 || nsec >= 1000000000ll) return -1;
+   *out = sec > INT64_MAX / 2000000000ll ? INT64_MAX / 2
+                                         : sec * 1000000000ll + nsec;
+   return 0;
+}
+
+int luna_os_timer_set(int fd, int flags, const luna_os_timer_spec *value,
+                      luna_os_timer_spec *previous)
+{
+   if (!value || (flags & ~LUNA_TFD_ABSTIME)) { errno = EINVAL; return -1; }
+   const int i = luna_timer_slot(fd);
+   if (i < 0) return -1;
+   int64_t first, interval;
+   if (luna_timer_ns(value->value_sec, value->value_nsec, &first) ||
+       luna_timer_ns(value->interval_sec, value->interval_nsec, &interval)) {
+      errno = EINVAL; return -1;
+   }
+   pthread_once(&g_timer_once, luna_timer_start);
+   pthread_mutex_lock(&g_timer_mu);
+   struct luna_timer *t = &g_timers[i];
+   if (previous) luna_timer_remaining(t, previous);
+   t->armed = first != 0;
+   t->interval_ns = interval;
+   t->next_ns = (flags & LUNA_TFD_ABSTIME) ? first
+                                           : luna_timer_now(t->clock) + first;
+   /* Re-arming forgets expirations nobody has read yet, as Linux does. */
+   (void)luna_os_event_drain(fd, NULL);
+   pthread_cond_signal(&g_timer_cv);
+   pthread_mutex_unlock(&g_timer_mu);
+   return 0;
+}
+
+int luna_os_timer_get(int fd, luna_os_timer_spec *value)
+{
+   if (!value) { errno = EINVAL; return -1; }
+   const int i = luna_timer_slot(fd);
+   if (i < 0) return -1;
+   pthread_mutex_lock(&g_timer_mu);
+   luna_timer_remaining(&g_timers[i], value);
+   pthread_mutex_unlock(&g_timer_mu);
+   return 0;
+}
+
+/* close() for descriptors that may be an event or timer: give the slot back
+ * only once both pipe ends are closed, so a reused fd number is never taken
+ * for ours. */
+int luna_fd_close(int fd)
+{
+   const int i = luna_event_slot(fd);
+   if (i < 0) return close(fd);
+   pthread_mutex_lock(&g_timer_mu);
+   g_timers[i].armed = 0;
+   g_is_timer[i] = 0;
+   pthread_mutex_unlock(&g_timer_mu);
+   const int wr = atomic_load_explicit(&g_events[i].wr, memory_order_acquire);
+   atomic_store_explicit(&g_events[i].rd, -1, memory_order_release);
+   if (wr >= 0) close(wr);
+   const int result = close(fd);
+   atomic_store_explicit(&g_events[i].rd, 0, memory_order_release);
+   atomic_fetch_sub_explicit(&g_event_live, 1, memory_order_acq_rel);
+   return result;
 }
 
 /* Android epoll bits and operations.  Keeping them local avoids importing a
@@ -641,6 +996,57 @@ void *luna_os_native_window(void *glfw_window)
    if (!view) return NULL;
    ((void (*)(id, SEL, int))objc_msgSend)(view, set_wants_layer, 1);
    return (void *)((id (*)(id, SEL))objc_msgSend)(view, layer_sel);
+}
+
+/* GLFW's Cocoa backend ignores glfwSetWindowIcon: the icon is the
+ * application's, set through NSApplication.  Build an NSImage from the pixels
+ * with the Objective-C runtime, as luna_os_native_window does, to stay C. */
+int luna_os_set_window_icon(void *glfw_window, int w, int h,
+                            const unsigned char *rgba)
+{
+   (void)glfw_window;
+   if (w <= 0 || h <= 0 || !rgba) return -1;
+   if ((size_t)w > SIZE_MAX / 4 / (size_t)h) return -1;
+   Class rep_class = objc_getClass("NSBitmapImageRep");
+   Class image_class = objc_getClass("NSImage");
+   Class app_class = objc_getClass("NSApplication");
+   if (!rep_class || !image_class || !app_class) return -1;
+
+   SEL alloc_sel = sel_registerName("alloc");
+   SEL release_sel = sel_registerName("release");
+   id rep = ((id (*)(id, SEL))objc_msgSend)((id)rep_class, alloc_sel);
+   rep = ((id (*)(id, SEL, unsigned char **, long, long, long, long, BOOL, BOOL,
+                  id, unsigned long, long, long))objc_msgSend)(
+      rep, sel_registerName("initWithBitmapDataPlanes:pixelsWide:pixelsHigh:"
+                            "bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:"
+                            "colorSpaceName:bitmapFormat:bytesPerRow:bitsPerPixel:"),
+      NULL, w, h, 8, 4, YES, NO,
+      *(id *)dlsym(RTLD_DEFAULT, "NSDeviceRGBColorSpace"),
+      /* NSBitmapFormatAlphaNonpremultiplied */ 2UL, (long)w * 4, 32);
+   if (!rep) return -1;
+   unsigned char *dst = ((unsigned char *(*)(id, SEL))objc_msgSend)(
+      rep, sel_registerName("bitmapData"));
+   if (!dst) {
+      ((void (*)(id, SEL))objc_msgSend)(rep, release_sel);
+      return -1;
+   }
+   memcpy(dst, rgba, (size_t)w * (size_t)h * 4);
+
+   id image = ((id (*)(id, SEL))objc_msgSend)((id)image_class, alloc_sel);
+   typedef struct { double width, height; } icon_size;   /* NSSize == CGSize */
+   const icon_size size = { (double)w, (double)h };
+   image = ((id (*)(id, SEL, icon_size))objc_msgSend)(
+      image, sel_registerName("initWithSize:"), size);
+   ((void (*)(id, SEL, id))objc_msgSend)(
+      image, sel_registerName("addRepresentation:"), rep);
+   ((void (*)(id, SEL))objc_msgSend)(rep, release_sel);
+
+   id app = ((id (*)(id, SEL))objc_msgSend)((id)app_class,
+                                             sel_registerName("sharedApplication"));
+   ((void (*)(id, SEL, id))objc_msgSend)(
+      app, sel_registerName("setApplicationIconImage:"), image);
+   ((void (*)(id, SEL))objc_msgSend)(image, release_sel);   /* app retains */
+   return 0;
 }
 
 void *luna_os_offscreen_window(void *glfw_window, int w, int h)

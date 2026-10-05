@@ -2323,7 +2323,7 @@ run_unity_game_arm64(struct jvm *jvm, jobject existing_context,
    if (!arm64_exec_host_egl_init())
       fprintf(stderr, "[loader] arm64 host EGL re-init failed\n");
 
-   if (va_recreate) {
+   if (va_recreate && call_init_jni) {
       const jobject fake_surf = jvm->native.AllocObject(&jvm->env,
             jvm->native.FindClass(&jvm->env, "android/view/Surface"));
       int unity4_sig = (recreate_sig[0] == '(' && recreate_sig[1] == 'L');
@@ -2724,16 +2724,11 @@ run_dex_activity(struct jvm *jvm, int is_a64)
    dex_call_lifecycle(jvm, activity, cls, "onResume", "()V", 0);
    run_threads();
 
-   /* A GLSurfaceView receives surfaceCreated/surfaceChanged from Android's
-    * window manager after onResume.  The host has no framework compositor to
-    * emit those callbacks, so connect the already-initialised Unity player to
-    * the host Surface here.  The Activity has already called initJni through
-    * its own bytecode; doing that a second time corrupts Unity global state. */
-   if (is_a64 && arm64_exec_lookup_native("com.unity3d.player.UnityPlayer",
-                                "nativeRender"))
-      return run_unity_game_arm64(jvm, activity, 0);
-
+   /* Attach the resumed Activity to its window before running its renderer.
+    * SurfaceView dispatches its lifecycle callbacks through the main Looper;
+    * the app's callback owns connecting its native renderer to that Surface. */
    dvm_jni_show_activity(&jvm->env, activity);
+   pump_java_frame();
 
    int max_frames = 0;
    { const char *mf = getenv("LUNARIA_MAX_FRAMES"); if (mf && *mf) max_frames = atoi(mf); }
@@ -2747,6 +2742,13 @@ run_dex_activity(struct jvm *jvm, int is_a64)
       pump_run_frame(run_threads);
       if (is_a64) arm64_exec_egl_swap(); else arm_exec_egl_swap();
       arm_exec_glfw_poll();
+      /* The framework input queue feeds Activity/View dispatch, independently
+       * of the engine's Java-owned renderer. NativeActivity retains its NDK
+       * input queue; Unity's Java path must not bypass its View callbacks. */
+      ArmExecTouchEvent touch;
+      struct dvm *input_vm=dvm_jni_vm();
+      for (int n=0;input_vm && n<64 && arm_exec_touch_next(&touch);++n)
+         (void)dvm_ui_dispatch_touch(input_vm,&touch);
       perf_tick();
       if (frame < 5 || frame % 50 == 0)
          fprintf(stderr, "[loader] dex pump frame %d\n", frame);

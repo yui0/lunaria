@@ -443,17 +443,6 @@ java_lang_String_equals(JNIEnv *env, jobject object, va_list args)
    return equal;
 }
 
-jbyteArray
-java_lang_String_getBytes(JNIEnv *env, jobject object, va_list args)
-{
-   assert(env && object);
-   const char *utf = (*env)->GetStringUTFChars(env, object, NULL);
-   const size_t len = (utf ? strlen(utf) : 0);
-   jbyteArray bytes = (*env)->NewByteArray(env, len);
-   (*env)->SetByteArrayRegion(env, bytes, 0, len, (jbyte*)utf);
-   return bytes;
-}
-
 jobject
 java_util_Locale_getDefault(JNIEnv *env, jclass clazz)
 {
@@ -1305,6 +1294,18 @@ jstring
 android_content_Context_getPackageCodePath(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
+   return (*env)->NewStringUTF(env, lunaria_android_apk_path());
+}
+
+jstring
+android_content_Context_getPackageResourcePath(JNIEnv *env, jobject object, va_list args)
+{
+   /* ContextImpl returns LoadedApk's resource APK. This installation uses the
+    * same base APK for code and resources, as does ApplicationInfo.publicSourceDir.
+    * JNI framework calls need this entry too: external framework classes do
+    * not execute through the dex method lookup. */
+   assert(env && object);
+   (void)args;
    return (*env)->NewStringUTF(env, lunaria_android_apk_path());
 }
 

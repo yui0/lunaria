@@ -20,10 +20,12 @@
 #define GLFW_INCLUDE_NONE
 #define LUNA_UI_NO_PLATFORM
 #include "luna-ui.h"
+#include "luna-window.h"
 
 #include "luna_boot.h"
 #include "luna_overlay.h"
 #include "lunaria_os.h"
+#include "jvm/jvm.h"
 #include <GLFW/glfw3.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -34,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 /* ---- state ------------------------------------------------------------- *
@@ -67,6 +70,14 @@ static double        g_shown_since;   /* boot_show() timestamp */
 static unsigned      g_dex_pct0;      /* dex % when the card first appeared */
 static atomic_uint   g_guest_swaps;   /* eglSwapBuffers since the card went up */
 static double        g_displayed_pct; /* monotonic % shown on the ring */
+static bool          g_installing;
+static char          g_last_jit[160], g_last_dex[160], g_last_pct[16];
+
+static void boot_document_reset(void)
+{
+   g_ring_pct = -1;
+   g_last_jit[0] = g_last_dex[0] = g_last_pct[0] = 0;
+}
 
 static double boot_now(void)
 {
@@ -358,7 +369,6 @@ static void boot_frame(void)
    char jit[160], dex[160];
    unsigned jit_p = 0, dex_p = 0;
    int pct_i;
-   static char last_jit[160], last_dex[160], last_pct[16];
 
    /* Snowfall keeps moving from luna_update() alone; gating this handler on
     * g_text_dirty left the ring and status lines frozen while the flakes still
@@ -367,26 +377,26 @@ static void boot_frame(void)
    boot_read_line(&g_dex_seq, g_dex_line, dex, sizeof dex, &g_dex_pct100, &dex_p);
    atomic_store_explicit(&g_text_dirty, false, memory_order_relaxed);
 
-   double pct = boot_progress_pct(jit_p, dex_p);
+   double pct = g_installing ? jit_p / 100.0 : boot_progress_pct(jit_p, dex_p);
    pct_i = (int)(pct + 0.5);
 
    char percent[16];
    snprintf(percent, sizeof percent, "%u%%", (unsigned)pct_i);
 
-   if (strcmp(jit, last_jit) != 0) {
+   if (strcmp(jit, g_last_jit) != 0) {
       int i = luna_get_element_by_id("jit");
       if (i >= 0) luna_set_text(i, jit);
-      snprintf(last_jit, sizeof last_jit, "%s", jit);
+      snprintf(g_last_jit, sizeof g_last_jit, "%s", jit);
    }
-   if (strcmp(dex, last_dex) != 0) {
+   if (strcmp(dex, g_last_dex) != 0) {
       int i = luna_get_element_by_id("dex");
       if (i >= 0) luna_set_text(i, dex);
-      snprintf(last_dex, sizeof last_dex, "%s", dex);
+      snprintf(g_last_dex, sizeof g_last_dex, "%s", dex);
    }
-   if (strcmp(percent, last_pct) != 0) {
+   if (strcmp(percent, g_last_pct) != 0) {
       int i = luna_get_element_by_id("pct");
       if (i >= 0) luna_set_text(i, percent);
-      snprintf(last_pct, sizeof last_pct, "%s", percent);
+      snprintf(g_last_pct, sizeof g_last_pct, "%s", percent);
    }
 
    boot_set_ring_pct(pct_i);
@@ -396,7 +406,7 @@ static void boot_show(void)
 {
    bool was = atomic_exchange_explicit(&g_up, true, memory_order_acq_rel);
    if (was) return;
-   g_ring_pct = -1;
+   boot_document_reset();
    g_shown_since = boot_now();
    g_last_compile_time = g_shown_since;
    g_displayed_pct = 3.0;
@@ -424,17 +434,9 @@ bool luna_boot_jit_update(uint64_t compiles, uint64_t compile_ns)
    const double compile_s = (double)compile_ns / 1e9;
    const bool busy = (compiles >= 256 && compile_s >= 0.4) ||
                      (compiles >= 64 && now - g_last_compile_time < 0.35);
-   const int files = atomic_load_explicit(&g_dex_files, memory_order_relaxed);
-   const int done  = atomic_load_explicit(&g_dex_done, memory_order_relaxed);
-   const bool dex_running = files > 0 && done < files;
    const bool up = atomic_load_explicit(&g_up, memory_order_acquire);
-   const bool idle = up && !dex_running && (now - g_last_compile_time) > 1.25;
 
    if (!busy && !up) return false;
-   if (idle) {
-      luna_boot_finish("translation went idle");
-      return false;
-   }
 
    if (!up) g_shown_since = now;
    boot_show();
@@ -555,21 +557,8 @@ static GLFWwindow *window;
 static EGLDisplay display = EGL_NO_DISPLAY;
 static EGLSurface surface = EGL_NO_SURFACE;
 static EGLContext context = EGL_NO_CONTEXT;
-static int ready, cancelled, choosing, accepted;
+static int ready, cancelled, choosing;
 static uint64_t last_frame;
-static const char *const *choices;
-static size_t choice_count;
-
-static const char *sheet =
-    "body{margin:0;background:#f3f4f6;color:#20242b;font-size:16px;}"
-    ".card{position:absolute;left:40px;right:40px;top:44px;padding:28px;"
-    "background:#ffffff;border:1px solid #dce0e5;border-radius:12px;max-height:400px;overflow-y:auto;}"
-    "h1{font-size:26px;margin:0 0 20px 0;}"
-    "p{margin:12px 0;overflow:hidden;}"
-    "button{padding:12px 18px;margin:6px;background:#e9edf2;color:#20242b;"
-    "border:1px solid #ccd2da;border-radius:6px;}"
-    "input{width:100%;height:40px;padding:8px;border:1px solid #ccd2da;}"
-    "#continue{background:#2355a4;color:#ffffff;}";
 
 static void pointer_position(GLFWwindow *w, double *x, double *y)
 {
@@ -581,16 +570,28 @@ static void cursor(GLFWwindow *w, double x, double y)
 { pointer_position(w,&x,&y); luna_mouse_move(x, y); }
 static void mouse(GLFWwindow *w, int button, int action, int mods)
 { double x,y; glfwGetCursorPos(w,&x,&y); pointer_position(w,&x,&y); luna_mouse_button(button, action, mods, x,y); }
+static int pick_select_for = -1;
 static void key(GLFWwindow *w, int k, int scan, int action, int mods)
 {
     (void)w;
-    if (k == GLFW_KEY_ESCAPE && action == GLFW_PRESS) cancelled = 1;
+    /* An open file dialog owns the keyboard, Escape included. */
+    if (luna_file_dialog_handle_key(k, scan, action, mods)) return;
+    if (k == GLFW_KEY_ESCAPE && action == GLFW_PRESS && pick_select_for < 0) cancelled = 1;
     luna_key(k, scan, action, mods);
 }
 static void character(GLFWwindow *w, unsigned int c)
 { (void)w; luna_char(c); }
 static void scroll(GLFWwindow *w, double x, double y)
 { (void)w; luna_scroll(x, y); }
+
+/* A file dropped on the window is the same answer as typing its path. */
+static char dropped[4096];
+static void drop(GLFWwindow *w, int count, const char **paths)
+{
+    (void)w;
+    if (count > 0 && paths[0] && strlen(paths[0]) < sizeof dropped)
+        snprintf(dropped, sizeof dropped, "%s", paths[0]);
+}
 
 static void frame(int force)
 {
@@ -602,36 +603,63 @@ static void frame(int force)
     int w, h;
     glfwGetFramebufferSize(window, &w, &h);
     if (w > 0 && h > 0) {
-        luna_resize((float)w, (float)h);
+        /* Only when the size changed: a resize re-lays the page out, and a
+         * page that is laid out again starts its keyframes over -- the snow
+         * would sit at its first frame for as long as this ran every pass. */
+        static int last_w, last_h;
+        if (w != last_w || h != last_h) {
+            luna_resize((float)w, (float)h);
+            last_w = w; last_h = h;
+        }
         glViewport(0, 0, w, h);
         glClearColor(.95f, .96f, .97f, 1);
         glClear(GL_COLOR_BUFFER_BIT);
-        luna_update(luna_platform_time(), last_frame ? (double)(now-last_frame)/1e9 : 0);
+        if (!choosing) boot_frame();
+        const double dt = last_frame ? (double)(now-last_frame)/1e9 : 0;
+        luna_file_dialog_tick(dt);
+        luna_update(luna_platform_time(), dt);
         luna_render(w, h);
+        luna_file_dialog_render(w, h);
+        /* LUNARIA_LAUNCHER_SHOT=file.png: save the launcher's frame, once, a few
+         * frames in (the first ones are still laying out). */
+        static int frames;
+        const char *shot = getenv("LUNARIA_LAUNCHER_SHOT");
+        if (shot && *shot) {
+            ++frames;
+            char later[4200];
+            snprintf(later, sizeof later, "%s.later.png", shot);
+            if (frames == 8) luna_overlay_screenshot(shot);
+            else if (frames == 200) luna_overlay_screenshot(later);
+        }
         eglSwapBuffers(display, surface);
     }
     last_frame = now;
 }
-static void document(const char *html)
-{
-    luna_reset_css();
-    luna_parse_css(sheet);
-    luna_parse_html(html);
-}
 static void progress_document(void)
 {
-    document("<body><div class=\"card\"><h1>Lunaria</h1>"
-             "<p id=\"stage\">Preparing application</p><p id=\"file\"></p>"
-             "<p id=\"progress\"></p></div></body>");
+    luna_reset_document();
+    luna_reset_css();
+    luna_parse_css(boot_css());
+    luna_parse_html(boot_html());
+    boot_document_reset();
 }
 
-int luna_launcher_begin(const char *path)
+/* The launcher's window, EGL surface and luna-ui instance.  Shared by the
+ * "open an application" screen and the installer, so one window serves the
+ * whole run up to the guest taking it over.  Returns 0 when there is no
+ * display to open it on. */
+static int launcher_window_open(int width, int height)
 {
+    if (ready) return 1;
     const char *pbuffer = getenv("LUNARIA_PBUFFER");
     if (pbuffer && *pbuffer && *pbuffer != '0') return 0;
     if (!glfwInit()) return 0;
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    window = glfwCreateWindow(800, 500, "Lunaria — Preparing application", NULL, NULL);
+    if (width <= 0 || height <= 0) {
+        const struct lunaria_screen *screen = lunaria_screen();
+        width = screen->width; height = screen->height;
+    }
+    window = glfwCreateWindow(width, height, "Lunaria — Preparing application", NULL, NULL);
     if (!window) return 0;
     display = eglGetDisplay((EGLNativeDisplayType)luna_os_native_display());
     EGLint major, minor, n;
@@ -650,19 +678,17 @@ int luna_launcher_begin(const char *path)
         !eglMakeCurrent(display, surface, surface, context)) goto fail;
     luna_overlay_prepare_platform();
     luna_set_gles3(1);
-    LunaInitConfig cfg = {.width=800, .height=500, .frameless=1,
+    LunaInitConfig cfg = {.width=width, .height=height, .frameless=1,
                           .get_proc=luna_platform_get_proc()};
     if (!luna_init(&cfg)) goto fail;
     ready = 1;
+    g_installing = true;
     glfwSetCursorPosCallback(window, cursor);
     glfwSetMouseButtonCallback(window, mouse);
     glfwSetKeyCallback(window, key);
     glfwSetCharCallback(window, character);
     glfwSetScrollCallback(window, scroll);
-    progress_document();
-    luna_launcher_progress("Opening archive", path, 0, 0);
-    frame(1);
-    fprintf(stderr, "[apk-ui] window shown before archive extraction\n");
+    glfwSetDropCallback(window, drop);
     return 1;
 fail:
     fprintf(stderr, "[apk-ui] cannot initialize launch UI (EGL 0x%x)\n", eglGetError());
@@ -670,81 +696,536 @@ fail:
     return 0;
 }
 
+int luna_launcher_begin(const char *path)
+{
+    if (!launcher_window_open(0, 0)) return 0;
+    const struct lunaria_screen *screen = lunaria_screen();
+    /* Resolve the app size after launcher edits and manifest/config loading.
+     * The setup form must not freeze the guest display before these inputs. */
+    int ww, wh;
+    glfwGetWindowSize(window, &ww, &wh);
+    if (ww != screen->width || wh != screen->height)
+        glfwSetWindowSize(window, screen->width, screen->height);
+    progress_document();
+    luna_launcher_progress("Opening archive", path, 0, 0);
+    frame(1);
+    fprintf(stderr, "[apk-ui] window shown before archive extraction (%dx%d)\n",
+            screen->width, screen->height);
+    return 1;
+}
+
 void luna_launcher_progress(const char *stage, const char *file, uint64_t bytes, uint64_t total)
 {
     if (!ready || choosing) return;
     if (!stage && luna_os_monotonic_ns() - last_frame < UINT64_C(33000000)) return;
-    if (stage) luna_set_text(luna_get_element_by_id("stage"), stage);
-    if (file) luna_set_text(luna_get_element_by_id("file"), file);
-    char line[96];
-    if (total) snprintf(line, sizeof line, "%u%%  ·  %.1f / %.1f MiB",
-        (unsigned)(100.0L*bytes/total), (double)bytes/1048576, (double)total/1048576);
-    else line[0] = 0;
-    luna_set_text(luna_get_element_by_id("progress"), line);
+    boot_write_begin(&g_jit_seq);
+    if (stage) snprintf(g_jit_line, sizeof g_jit_line, "%s", stage);
+    unsigned pct = total ? (unsigned)(10000.0L * bytes / total) : 0;
+    atomic_store_explicit(&g_jit_pct100, pct > 10000 ? 10000 : pct, memory_order_relaxed);
+    boot_write_end(&g_jit_seq);
+    boot_write_begin(&g_dex_seq);
+    if (total) snprintf(g_dex_line, sizeof g_dex_line, "%.1f / %.1f MiB · %.100s",
+        (double)bytes/1048576, (double)total/1048576, file ? file : "");
+    else snprintf(g_dex_line, sizeof g_dex_line, "%s", file ? file : "");
+    boot_write_end(&g_dex_seq);
     frame(0);
 }
 int luna_launcher_cancelled(void) { return cancelled; }
 
-static void select_profile(LunaElement *element)
+/* ---- the launcher screen --------------------------------------------------
+ *
+ * Started with no application (a double-clicked .app, a desktop launcher) the
+ * emulator asks which one to run, and where this installation keeps its data:
+ * the one setting that cannot be recreated, because a later run pointed
+ * elsewhere does not find what an earlier one downloaded.  The application is
+ * a path field, Browse (luna-ui's own file dialog, so it is the same on every
+ * host OS) and drag-and-drop. */
+#define PICK_FIELDS 16
+#ifndef LUNARIA_VERSION
+#define LUNARIA_VERSION ""
+#endif
+static const char *pick_version = LUNARIA_VERSION;
+static luna_launcher_setting *pick_settings;
+static size_t pick_count;
+static int pick_chosen;
+static char pick_folder[4096];
+static int pick_folder_for = -1;       /* which field the folder dialog answers */
+
+static void pick_select_label(size_t i)
 {
-    for (size_t i=0; i<choice_count; ++i) {
-        char id[32]; snprintf(id, sizeof id, "profile%zu", i);
-        if (luna_element_at(luna_get_element_by_id(id)) == element) {
-            luna_set_value(luna_get_element_by_id("name"), choices[i]);
-            break;
+    char id[32], label[1100];
+    snprintf(id, sizeof id, "set%zu", i);
+    snprintf(label, sizeof label, "%s v", *pick_settings[i].value ?
+             pick_settings[i].value : "Default (pixel6)");
+    luna_set_text(luna_get_element_by_id(id), label);
+}
+
+static void pick_select_close(int panel)
+{
+    luna_add_class(panel, "hidden");
+    luna_update_element_style(panel);
+    luna_pop_focus_trap(panel);
+    if (pick_select_for >= 0) {
+        char id[32]; snprintf(id, sizeof id, "set%d", pick_select_for);
+        luna_dom_set_attr(luna_get_element_by_id(id), "aria-expanded", "false");
+    }
+    pick_select_for = -1;
+}
+
+static void pick_select_toggle(LunaElement *element)
+{
+    for (size_t i = 0; i < pick_count; ++i) {
+        char id[32]; snprintf(id, sizeof id, "set%zu", i);
+        if (luna_element_at(luna_get_element_by_id(id)) != element) continue;
+        int previous = pick_select_for;
+        if (previous >= 0) {
+            snprintf(id, sizeof id, "select%d", previous);
+            pick_select_close(luna_get_element_by_id(id));
         }
+        if (previous == (int)i) return;
+        pick_select_for = (int)i;
+        snprintf(id, sizeof id, "select%zu", i);
+        int panel = luna_get_element_by_id(id);
+        luna_remove_class(panel, "hidden");
+        luna_update_element_style(panel);
+        snprintf(id, sizeof id, "set%zu", i);
+        luna_dom_set_attr(luna_get_element_by_id(id), "aria-expanded", "true");
+        luna_push_focus_trap(panel, pick_select_close, 0);
+        for (size_t k = 0; pick_settings[i].choices[k]; ++k) {
+            char option_id[48]; snprintf(option_id, sizeof option_id, "option%zu_%zu", i, k);
+            int selected = !strcmp(pick_settings[i].value, pick_settings[i].choices[k]);
+            luna_dom_set_attr(luna_get_element_by_id(option_id), "aria-selected", selected ? "true" : "false");
+            if (selected) luna_focus_element(luna_get_element_by_id(option_id));
+        }
+        return;
     }
 }
-static void continue_profile(LunaElement *element) { (void)element; accepted=1; }
-int luna_launcher_choose(const char *package, const char *const *profiles,
-                         size_t count, char *choice, size_t capacity)
+
+static void pick_select_option(LunaElement *element)
 {
-    if (!ready) return -1;
-    if (count > (SIZE_MAX-1024)/160) return -1;
-    size_t size = 1024 + count*160;
-    char *html = malloc(size);
-    if (!html) return -1;
-    size_t at = (size_t)snprintf(html, size,
-        "<body><div class=\"card\"><h1>Select profile</h1><p id=\"package\"></p><div>");
-    for (size_t i=0; i<count; ++i)
-        at += (size_t)snprintf(html+at, size-at,
-            "<button id=\"profile%zu\">%s</button>", i, profiles[i]);
-    snprintf(html+at, size-at, "</div><p>Profile name</p><input id=\"name\" value=\"default\">"
-        "<p id=\"error\"></p><button id=\"continue\">Continue</button></div></body>");
-    choosing = 1; accepted = 0; choices = profiles; choice_count = count;
-    document(html); free(html);
-    luna_set_text(luna_get_element_by_id("package"), package);
-    for (size_t i=0; i<count; ++i) {
-        char id[32]; snprintf(id, sizeof id, "profile%zu", i);
-        luna_set_on_click(luna_get_element_by_id(id), select_profile);
+    if (pick_select_for < 0) return;
+    size_t i = (size_t)pick_select_for;
+    for (size_t k = 0; pick_settings[i].choices[k]; ++k) {
+        char id[48]; snprintf(id, sizeof id, "option%zu_%zu", i, k);
+        if (luna_element_at(luna_get_element_by_id(id)) != element) continue;
+        snprintf(pick_settings[i].value, sizeof pick_settings[i].value,
+                 "%s", pick_settings[i].choices[k]);
+        pick_select_label(i);
+        snprintf(id, sizeof id, "select%zu", i);
+        pick_select_close(luna_get_element_by_id(id));
+        return;
     }
-    luna_set_on_click(luna_get_element_by_id("continue"), continue_profile);
-    fprintf(stderr, "[apk-ui] profile selection shown for %s\n", package);
+}
+
+static void pick_continue(LunaElement *element) { (void)element; pick_chosen = 1; }
+
+static void pick_dialog_done(const LunaFileDialogResult *result, void *userdata)
+{
+    (void)userdata;
+    if (!result || !result->accepted || result->count < 1 || !result->paths[0] ||
+        strlen(result->paths[0]) >= sizeof dropped) return;
+    if (pick_folder_for >= 0) snprintf(pick_folder, sizeof pick_folder, "%s", result->paths[0]);
+    else snprintf(dropped, sizeof dropped, "%s", result->paths[0]);
+}
+
+static void pick_open_dialog(int field)
+{
+    char start[4096] = "";
+    const char *home = getenv("HOME");
+    if (home) {
+        luna_file_info info;
+        snprintf(start, sizeof start, "%s/Downloads", home);
+        if (luna_file_infoat(LUNA_AT_FDCWD, start, &info, 0))
+            snprintf(start, sizeof start, "%s", home);
+    }
+    pick_folder_for = field;
+    LunaFileDialogConfig config = {0};
+    if (field >= 0) {
+        char id[32]; snprintf(id, sizeof id, "set%d", field);
+        const char *now = luna_get_value(luna_get_element_by_id(id));
+        config.mode = LUNA_FILE_DIALOG_SELECT_FOLDER;
+        config.title = pick_settings[field].label;
+        config.initial_path = now && now[0] ? now : (start[0] ? start : NULL);
+    } else {
+        config.mode = LUNA_FILE_DIALOG_OPEN_FILE;
+        config.title = "Open an application";
+        config.initial_path = start[0] ? start : NULL;
+        config.filter_name = "Android packages";
+        config.filter_patterns = "*.apk *.xapk *.apks *.aab *.so";
+    }
+    if (luna_file_dialog_show(&config, pick_dialog_done, NULL) < 0)
+        luna_set_text(luna_get_element_by_id("error"),
+                      "No file browser here: type the path or drop the file on this window.");
+}
+
+static void pick_browse(LunaElement *element) { (void)element; pick_open_dialog(-1); }
+static void pick_browse_field(LunaElement *element)
+{
+    for (size_t i = 0; i < pick_count; ++i) {
+        char id[32]; snprintf(id, sizeof id, "browse%zu", i);
+        if (luna_element_at(luna_get_element_by_id(id)) == element) { pick_open_dialog((int)i); return; }
+    }
+}
+
+/* What a person types or drags is not always a bare path: quotes from a shell,
+ * a file:// URL from a browser, a leading ~. */
+static int pick_clean(const char *in, char *out, size_t capacity)
+{
+    while (*in == ' ' || *in == '\t') ++in;
+    size_t len = strlen(in);
+    while (len && (in[len-1] == ' ' || in[len-1] == '\t' || in[len-1] == '\n' ||
+                   in[len-1] == '\r')) --len;
+    if (len >= 2 && (in[0] == '"' || in[0] == '\'') && in[len-1] == in[0]) { ++in; len -= 2; }
+    if (len >= 7 && !strncmp(in, "file://", 7)) { in += 7; len -= 7; }
+    const char *home = getenv("HOME");
+    char text[4096];
+    if (in[0] == '~' && (len == 1 || in[1] == '/') && home)
+        snprintf(text, sizeof text, "%s%.*s", home, (int)(len - 1), in + 1);
+    else
+        snprintf(text, sizeof text, "%.*s", (int)len, in);
+    if (!text[0] || strlen(text) >= capacity) return -1;
+    memcpy(out, text, strlen(text) + 1);
+    return 0;
+}
+
+static int pick_acceptable(const char *path)
+{
+    static const char *const kinds[] = { ".apk", ".xapk", ".apks", ".aab", ".so" };
+    const size_t len = strlen(path);
+    luna_file_info info;
+    if (luna_file_infoat(LUNA_AT_FDCWD, path, &info, 0)) return 0;
+    for (size_t i = 0; i < sizeof kinds / sizeof kinds[0]; ++i) {
+        const size_t k = strlen(kinds[i]);
+        if (len > k && !strcasecmp(path + len - k, kinds[i])) return 1;
+    }
+    return 0;
+}
+
+/* A folder is accepted when files can really be made in it. */
+static int pick_folder_usable(const char *dir)
+{
+    char probe[4200];
+    for (const char *p = dir + 1; (p = strchr(p, '/')); ++p) {
+        char part[4096];
+        snprintf(part, sizeof part, "%.*s", (int)(p - dir), dir);
+        luna_file_mkdir(part, 0700);
+    }
+    luna_file_mkdir(dir, 0700);
+    snprintf(probe, sizeof probe, "%s/.lunaria-write-test", dir);
+    FILE *f = fopen(probe, "wb");
+    if (!f) return 0;
+    fclose(f);
+    remove(probe);
+    return 1;
+}
+
+static void pick_set_field(size_t i, const char *value)
+{
+    char id[32]; snprintf(id, sizeof id, "set%zu", i);
+    if (pick_settings[i].choices)
+        pick_select_label(i);
+    else luna_set_value(luna_get_element_by_id(id), value);
+}
+
+static int pick_read_fields(void)
+{
+    for (size_t i = 0; i < pick_count; ++i) {
+        if (pick_settings[i].choices) continue;
+        char id[32]; snprintf(id, sizeof id, "set%zu", i);
+        const char *v = luna_get_value(luna_get_element_by_id(id));
+        char cleaned[1024];
+        if (!v || !*v) { pick_settings[i].value[0] = 0; continue; }
+        if (pick_settings[i].folder) {
+            if (pick_clean(v, cleaned, sizeof cleaned) || cleaned[0] != '/'
+#ifdef _WIN32
+                && !(cleaned[1] == ':')
+#endif
+               ) {
+                char msg[160];
+                snprintf(msg, sizeof msg, "%s must be a full path.", pick_settings[i].label);
+                luna_set_text(luna_get_element_by_id("error"), msg);
+                return -1;
+            }
+            if (!pick_folder_usable(cleaned)) {
+                char msg[200];
+                snprintf(msg, sizeof msg, "Cannot write to %s: %.100s", pick_settings[i].label, cleaned);
+                luna_set_text(luna_get_element_by_id("error"), msg);
+                return -1;
+            }
+            snprintf(pick_settings[i].value, sizeof pick_settings[i].value, "%s", cleaned);
+        } else {
+            snprintf(pick_settings[i].value, sizeof pick_settings[i].value, "%.*s",
+                     (int)sizeof pick_settings[i].value - 1, v);
+        }
+    }
+    return 0;
+}
+
+/* The launcher wears the boot card's clothes -- the same winter sky, snow and
+ * wordmark -- so the first screen and the loading screen read as one thing.
+ * Only what a form needs is added on top of boot_css_base. */
+static const char pick_css_extra[] =
+    /* Flakes start just above the window and fall in ~10-20 s: the boot card's own
+     * minute-long drops begin hundreds of pixels up, and here most of the sky
+     * is behind the card. */
+    ".flake:nth-child(1){width:12px;height:12px;top:-212px;left:21%;opacity:0.62;animation:19s flakes linear infinite;}"
+    ".flake:nth-child(2){width:17px;height:17px;top:-197px;left:14%;opacity:0.62;animation:18s flakes linear infinite;}"
+    ".flake:nth-child(3){width:17px;height:17px;top:-29px;left:29%;opacity:0.75;animation:10s flakes linear infinite;}"
+    ".flake:nth-child(4){width:8px;height:8px;top:-56px;left:32%;opacity:0.75;animation:17s flakes linear infinite;}"
+    ".flake:nth-child(5){width:17px;height:17px;top:-124px;left:17%;opacity:0.82;animation:19s flakes linear infinite;}"
+    ".flake:nth-child(6){width:8px;height:8px;top:-309px;left:75%;opacity:0.62;animation:15s flakes linear infinite;}"
+    ".flake:nth-child(7){width:10px;height:10px;top:-295px;left:7%;opacity:0.7;animation:11s flakes linear infinite;}"
+    ".flake:nth-child(8){width:10px;height:10px;top:-70px;left:71%;opacity:0.71;animation:18s flakes linear infinite;}"
+    ".flake:nth-child(9){width:20px;height:20px;top:-62px;left:25%;opacity:0.8;animation:18s flakes linear infinite;}"
+    ".flake:nth-child(10){width:10px;height:10px;top:-59px;left:49%;opacity:0.85;animation:17s flakes linear infinite;}"
+    ".flake:nth-child(11){width:17px;height:17px;top:-326px;left:9%;opacity:0.77;animation:12s flakes linear infinite;}"
+    ".flake:nth-child(12){width:17px;height:17px;top:-407px;left:56%;opacity:0.76;animation:14s flakes linear infinite;}"
+    ".flake:nth-child(13){width:14px;height:14px;top:-163px;left:48%;opacity:0.88;animation:12s flakes linear infinite;}"
+    ".flake:nth-child(14){width:20px;height:20px;top:-51px;left:33%;opacity:0.71;animation:18s flakes linear infinite;}"
+    ".flake:nth-child(15){width:14px;height:14px;top:-383px;left:45%;opacity:0.7;animation:16s flakes linear infinite;}"
+    ".flake:nth-child(16){width:8px;height:8px;top:-272px;left:17%;opacity:0.66;animation:15s flakes linear infinite;}"
+    ".flake:nth-child(17){width:12px;height:12px;top:-260px;left:21%;opacity:0.61;animation:15s flakes linear infinite;}"
+    ".flake:nth-child(18){width:20px;height:20px;top:-401px;left:11%;opacity:0.8;animation:17s flakes linear infinite;}"
+    ".flake:nth-child(19){width:12px;height:12px;top:-365px;left:45%;opacity:0.81;animation:14s flakes linear infinite;}"
+    ".flake:nth-child(20){width:17px;height:17px;top:-45px;left:60%;opacity:0.93;animation:10s flakes linear infinite;}"
+    ".flake:nth-child(21){width:14px;height:14px;top:-350px;left:91%;opacity:0.62;animation:10s flakes linear infinite;}"
+    ".flake:nth-child(22){width:20px;height:20px;top:-341px;left:41%;opacity:0.95;animation:18s flakes linear infinite;}"
+    ".flake:nth-child(23){width:14px;height:14px;top:-376px;left:38%;opacity:0.91;animation:15s flakes linear infinite;}"
+    ".flake:nth-child(24){width:12px;height:12px;top:-246px;left:4%;opacity:0.66;animation:14s flakes linear infinite;}"
+    ".mark{position:absolute;left:0;right:0;top:20px;text-align:center;font-size:22px;"
+    "font-weight:700;letter-spacing:10px;color:#ffffff;text-shadow:0 2px 16px rgba(0,48,96,0.25);}"
+    "#launcher-card{position:absolute;left:120px;right:120px;top:68px;bottom:28px;"
+    "background:rgba(255,255,255,0.84);border-radius:16px;box-shadow:0 14px 42px rgba(0,48,96,0.28);}"
+    "#launcher-card .main{position:absolute;left:0;right:0;top:0;bottom:68px;padding:24px 32px 8px 32px;overflow-y:auto;color:#12324d;}"
+    "#launcher-card h1{font-size:21px;margin:0 0 4px 0;color:#12324d;}"
+    "#launcher-card h2{font-size:12px;margin:22px 0 2px 0;color:#5c7a92;letter-spacing:2px;}"
+    "#launcher-card .sub{margin:0 0 12px 0;color:#5c7a92;font-size:13px;text-align:left;padding:0;}"
+    "#launcher-card .drop{padding:14px;border:2px dashed #9cc7e4;border-radius:10px;background:#eef7fd;"
+    "text-align:center;color:#3f7fa8;margin-bottom:10px;}"
+    "#launcher-card .row{position:relative;height:42px;margin:0 0 4px 0;}"
+    "#launcher-card .row input{position:absolute;left:0;right:104px;top:0;height:40px;width:auto;padding:0 12px;"
+    "border:1px solid #bcd6e8;border-radius:8px;background:#ffffff;color:#12324d;}"
+    "#launcher-card .row button{position:absolute;right:0;top:0;width:96px;height:42px;margin:0;padding:0;}"
+    "#launcher-card button{background:#e3f1fb;color:#12324d;border:1px solid #bcd6e8;border-radius:8px;}"
+    "#launcher-card .lbl{margin:12px 0 5px 0;font-weight:600;font-size:14px;}"
+    "#launcher-card .trio{position:relative;height:72px;margin:0 0 4px 0;}"
+    "#launcher-card .cell{position:absolute;top:0;height:70px;}"
+    "#launcher-card .cell input{position:absolute;left:0;right:0;top:30px;height:40px;padding:0 12px;border:1px solid #bcd6e8;border-radius:8px;background:#ffffff;color:#12324d;}"
+    "#launcher-card .cell .select-box{box-sizing:border-box;position:absolute;left:0;right:0;top:30px;height:40px;padding:10px 12px;border:1px solid #bcd6e8;border-radius:8px;background:#ffffff;color:#12324d;cursor:pointer;}"
+    "#launcher-card .select-panel{position:absolute;left:0;right:0;bottom:42px;z-index:100;background:#ffffff;border:1px solid #bcd6e8;border-radius:8px;padding:4px;}"
+    "#launcher-card .select_option{box-sizing:border-box;height:34px;padding:8px;cursor:pointer;}"
+    "#launcher-card .select_option:hover,#launcher-card .select_option:focus{background:#e3f1fb;}"
+    "#launcher-card .select-panel.hidden{display:none;}"
+    "#launcher-card .hint{margin:0 0 2px 0;font-size:12px;color:#6f8ca2;}"
+    "#launcher-card #error{color:#c0392b;margin:10px 0 0 0;min-height:18px;font-size:13px;}"
+    "#launcher-card .bar{position:absolute;left:0;right:0;bottom:0;height:68px;"
+    "border-top:1px solid #d6e6f2;border-radius:0 0 16px 16px;background:rgba(255,255,255,0.97);}"
+    "#launcher-card .bar .note{position:absolute;left:32px;top:25px;font-size:12px;color:#6f8ca2;}"
+    "#launcher-card #continue{position:absolute;right:32px;top:13px;width:150px;height:42px;margin:0;"
+    "background:#0b8fe0;color:#ffffff;border:1px solid #0b8fe0;font-weight:700;}";
+
+static int launcher_form(char *path, size_t capacity,
+                         luna_launcher_setting *settings, size_t count,
+                         const char *package)
+{
+    if (!launcher_window_open(960, 680)) return -1;
+    if (count > PICK_FIELDS) count = PICK_FIELDS;
+    pick_settings = settings; pick_count = count;
+    glfwSetWindowTitle(window, "Lunaria");
+    choosing = 1; pick_chosen = 0; dropped[0] = 0; pick_folder[0] = 0; pick_folder_for = -1; pick_select_for = -1;
+
+    /* luna-ui's file dialog is part of the document, hidden until Browse. */
+    const char *dialog_html = luna_file_dialog_overlay_html();
+    const char *dialog_css = luna_file_dialog_css();
+    size_t html_size = 6144 + count * 768 + strlen(dialog_html);
+    for (size_t i = 0; i < count; ++i) {
+        if (!settings[i].choices) continue;
+        for (size_t k = 0; settings[i].choices[k]; ++k) {
+            size_t extra = 160 + strlen(settings[i].choices[k]);
+            if (extra > SIZE_MAX - html_size) return -1;
+            html_size += extra;
+        }
+    }
+    char *html = malloc(html_size);
+    char *css = malloc(sizeof boot_css_base + sizeof pick_css_extra + strlen(dialog_css) + 1);
+    if (!html || !css) { free(html); free(css); return -1; }
+    size_t at = (size_t)snprintf(html, html_size,
+        "<body><div class=\"snow\">"
+        "<div class=\"flake\"></div><div class=\"flake\"></div><div class=\"flake\"></div>"
+        "<div class=\"flake\"></div><div class=\"flake\"></div><div class=\"flake\"></div>"
+        "<div class=\"flake\"></div><div class=\"flake\"></div><div class=\"flake\"></div>"
+        "<div class=\"flake\"></div><div class=\"flake\"></div><div class=\"flake\"></div>"
+        "<div class=\"flake\"></div><div class=\"flake\"></div><div class=\"flake\"></div>"
+        "<div class=\"flake\"></div><div class=\"flake\"></div><div class=\"flake\"></div>"
+        "</div><div class=\"mark\">LUNARIA</div>"
+        "<div class=\"card\" id=\"launcher-card\"><div class=\"main\"><h1 id=\"launcher-title\"></h1>"
+        "<p class=\"sub\" id=\"launcher-sub\"></p>");
+    if (!package) at += (size_t)snprintf(html + at, html_size - at,
+        "<div class=\"drop\" id=\"drop\">Drop a package file here</div>"
+        "<div class=\"row\"><input id=\"path\" value=\"\">"
+        "<button id=\"browse\">Browse…</button></div>");
+    at += (size_t)snprintf(html + at, html_size - at, "<h2>%s</h2>", package ? "PROFILE" : "SETTINGS");
+    for (size_t i = 0; i < count; ++i) {
+        if (settings[i].compact) {
+            /* a run of compact settings is one row of equal columns */
+            size_t run = 0;
+            while (i + run < count && settings[i + run].compact) ++run;
+            at += (size_t)snprintf(html + at, html_size - at, "<div class=\"trio\">");
+            for (size_t k = 0; k < run; ++k) {
+                at += (size_t)snprintf(html + at, html_size - at,
+                    "<div class=\"cell\" style=\"left:%zu%%;width:%zu%%;\">"
+                    "<div class=\"lbl\">%s</div>",
+                    k * 100 / run, 100 / run - 2, settings[i + k].label);
+                size_t field = i + k;
+                if (settings[field].choices) {
+                    at += (size_t)snprintf(html + at, html_size - at,
+                        "<div id=\"set%zu\" class=\"select-box\" role=\"combobox\" tabindex=\"0\" aria-expanded=\"false\"></div>"
+                        "<div id=\"select%zu\" class=\"select-panel hidden\" role=\"listbox\">", field, field);
+                    for (size_t option = 0; settings[field].choices[option]; ++option)
+                        at += (size_t)snprintf(html + at, html_size - at,
+                            "<div id=\"option%zu_%zu\" class=\"select_option\" role=\"option\" tabindex=\"0\">%s</div>",
+                            field, option, *settings[field].choices[option] ? settings[field].choices[option] : "Default (pixel6)");
+                    at += (size_t)snprintf(html + at, html_size - at, "</div>");
+                } else at += (size_t)snprintf(html + at, html_size - at,
+                            "<input id=\"set%zu\" value=\"\">", field);
+                at += (size_t)snprintf(html + at, html_size - at, "</div>");
+            }
+            at += (size_t)snprintf(html + at, html_size - at, "</div>");
+            i += run - 1;
+            continue;
+        }
+        at += (size_t)snprintf(html + at, html_size - at,
+            "<div class=\"lbl\">%s</div><div class=\"row\"><input id=\"set%zu\" value=\"\">",
+            settings[i].label, i);
+        if (settings[i].folder)
+            at += (size_t)snprintf(html + at, html_size - at,
+                "<button id=\"browse%zu\">Browse…</button>", i);
+        at += (size_t)snprintf(html + at, html_size - at, "</div>");
+        if (settings[i].hint && *settings[i].hint)
+            at += (size_t)snprintf(html + at, html_size - at, "<div class=\"hint\">%s</div>", settings[i].hint);
+    }
+    snprintf(html + at, html_size - at,
+        "<div id=\"error\"></div></div>"
+        "<div class=\"bar\"><div class=\"note\">%s %s</div>"
+        "<button id=\"continue\">Open</button></div></div>%s</body>",
+        package ? "Each profile keeps its own app data." : "Changes are saved to lunaria.conf.", pick_version, dialog_html);
+    snprintf(css, sizeof boot_css_base + sizeof pick_css_extra + strlen(dialog_css) + 1,
+             "%s%s%s", boot_css_base, pick_css_extra, dialog_css);
+    luna_reset_document();
+    luna_reset_css();
+    luna_parse_css(css);
+    luna_parse_html(html);
+    free(html); free(css);
+    luna_set_text(luna_get_element_by_id("launcher-title"), package ? "Open a profile" : "Open an application");
+    luna_set_text(luna_get_element_by_id("launcher-sub"), package ? package : "Choose an APK, XAPK, APKS or AAB package.");
+    luna_set_on_click(luna_get_element_by_id("browse"), pick_browse);
+    luna_set_on_click(luna_get_element_by_id("continue"), pick_continue);
+    for (size_t i = 0; i < count; ++i) {
+        char id[32]; snprintf(id, sizeof id, "browse%zu", i);
+        if (settings[i].folder) luna_set_on_click(luna_get_element_by_id(id), pick_browse_field);
+        if (settings[i].choices) {
+            snprintf(id, sizeof id, "set%zu", i);
+            luna_set_on_click(luna_get_element_by_id(id), pick_select_toggle);
+            for (size_t k = 0; settings[i].choices[k]; ++k) {
+                char option_id[48]; snprintf(option_id, sizeof option_id, "option%zu_%zu", i, k);
+                luna_set_on_click(luna_get_element_by_id(option_id), pick_select_option);
+            }
+        }
+        pick_set_field(i, settings[i].value);
+    }
+    luna_file_dialog_prepare();
+    if (package) fprintf(stderr, "[apk-ui] profile selection shown for %s (shared launcher form)\n", package);
+    else fprintf(stderr, "[apk-ui] no application given: asking which to open\n");
+
+    int result = -1;
     while (!cancelled) {
         frame(1);
-        if (accepted) {
-            const char *value = luna_get_value(luna_get_element_by_id("name"));
-            size_t len = value ? strlen(value) : 0;
-            int valid = len && len < capacity && strcmp(value,".") && strcmp(value,"..");
-            if (valid && !((value[0]>='a'&&value[0]<='z') ||
-                (value[0]>='A'&&value[0]<='Z') || (value[0]>='0'&&value[0]<='9') || value[0]=='_')) valid=0;
-            for (size_t i=0; valid && i<len; ++i) {
-                unsigned char c = (unsigned char)value[i];
-                if (!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_'||c=='-'||c=='.')) valid=0;
+        if (pick_folder[0] && pick_folder_for >= 0) {
+            pick_set_field((size_t)pick_folder_for, pick_folder);
+            pick_folder[0] = 0; pick_folder_for = -1;
+        }
+        if (dropped[0]) {
+            luna_set_value(luna_get_element_by_id("path"), dropped);
+            dropped[0] = 0;
+            pick_chosen = 1;
+        }
+        if (pick_chosen) {
+            pick_chosen = 0;
+            if (package) {
+                if (pick_read_fields()) continue;
+                const char *value = settings[1].value[0] ? settings[1].value : settings[0].value;
+                size_t len = strlen(value);
+                int valid = len && len <= 64 && len < capacity;
+                for (size_t i = 0; valid && i < len; ++i) {
+                    unsigned char c = (unsigned char)value[i];
+                    int alnum = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+                    valid = alnum || c == '_' || (i && (c == '-' || c == '.'));
+                }
+                if (valid) { memcpy(path, value, len + 1); result = 0; break; }
+                luna_set_text(luna_get_element_by_id("error"), "Use 1–64 letters, digits, dots, hyphens or underscores.");
+                continue;
             }
-            if (valid) { memcpy(choice, value, len+1); break; }
-            accepted=0;
-            luna_set_text(luna_get_element_by_id("error"), "Use 1–64 letters, digits, dots, hyphens or underscores.");
+            const char *typed = luna_get_value(luna_get_element_by_id("path"));
+            char cleaned[4096];
+            if (!typed || pick_clean(typed, cleaned, sizeof cleaned) ||
+                !pick_acceptable(cleaned) || strlen(cleaned) >= capacity) {
+                luna_set_text(luna_get_element_by_id("error"),
+                              "That is not an existing .apk, .xapk, .apks or .aab file.");
+            } else if (!pick_read_fields()) {
+                memcpy(path, cleaned, strlen(cleaned) + 1);
+                result = 0;
+                break;
+            }
         }
         glfwWaitEventsTimeout(.02);
     }
-    choosing=0; choices=NULL; choice_count=0;
+    choosing = 0;
+    if (pick_select_for >= 0) {
+        char id[32]; snprintf(id, sizeof id, "select%d", pick_select_for);
+        pick_select_close(luna_get_element_by_id(id));
+    }
+    pick_settings = NULL; pick_count = 0;
+    return result;
+}
+
+int luna_launcher_pick(char *path, size_t capacity,
+                       luna_launcher_setting *settings, size_t count)
+{
+    return launcher_form(path, capacity, settings, count, NULL);
+}
+
+int luna_launcher_choose(const char *package, const char *const *profiles,
+                         size_t count, char *choice, size_t capacity)
+{
+    if (!ready || !count || count >= SIZE_MAX / sizeof(char *)) return -1;
+    const char **values = calloc(count + 1, sizeof *values);
+    if (!values) return -1;
+    for (size_t i = 0; i < count; ++i) values[i] = profiles[i];
+    luna_launcher_setting settings[2] = {
+        {.label="Profile", .compact=1, .choices=values},
+        {.label="New profile (optional)", .compact=1}
+    };
+    const char *selected = getenv("LUNARIA_PROFILE");
+    snprintf(settings[0].value, sizeof settings[0].value, "%s", selected && *selected ? selected : profiles[0]);
+    int result = launcher_form(choice, capacity, settings, 2, package);
+    free(values);
     progress_document(); frame(1);
-    return cancelled ? -1 : 0;
+    return result;
 }
 
 void luna_launcher_end(int keep_window)
 {
+    g_installing = false;
+    if (keep_window && ready) {
+        boot_write_begin(&g_jit_seq);
+        snprintf(g_jit_line, sizeof g_jit_line, "Starting application");
+        atomic_store_explicit(&g_jit_pct100, 0, memory_order_relaxed);
+        boot_write_end(&g_jit_seq);
+        boot_write_begin(&g_dex_seq);
+        g_dex_line[0] = 0;
+        boot_write_end(&g_dex_seq);
+        if (boot_ui_wanted()) boot_show();
+    }
     if (window) {
         glfwSetCursorPosCallback(window, NULL);
         glfwSetMouseButtonCallback(window, NULL);

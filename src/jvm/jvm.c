@@ -20,6 +20,7 @@
 #include "trace.h"
 #include "dvm/dvm_jni.h"
 #include "dvm/dvm.h"
+#include "dvm/charset.h"
 #include "arm.h"
 
 _Static_assert(sizeof(jclass) == sizeof(jobject), "We assume jclass and jobject are both same internally for the call methods");
@@ -501,6 +502,26 @@ jvm_ref_object(struct jvm *jvm, jobject object)
    return object;
 }
 
+static void jvm_deref_object(struct jvm *jvm, jobject object);
+
+/* An object array owns one strong reference per occupied element. JNI
+ * locals are independent of these edges, including the local returned by
+ * GetObjectArrayElement. Clear edges before descending into nested arrays. */
+static void jvm_array_release_refs(struct jvm *jvm, struct jvm_object *o)
+{
+   if (o->type != JVM_OBJECT_ARRAY || !o->array.reference_elements) return;
+   jobject *elements = o->array.data;
+   for (size_t i = 0; i < o->array.size; ++i) {
+      jobject element = elements[i];
+      elements[i] = NULL;
+      if (element) {
+         struct jvm_object *child = jvm_get_object(jvm, element);
+         if (child && child->array_refs > 0) --child->array_refs;
+         jvm_deref_object(jvm, element);
+      }
+   }
+}
+
 /* Drop a reference (DeleteLocalRef / DeleteGlobalRef).  Only arrays and
  * strings release their slot: those are the handle types an app allocates per
  * call, and unlike classes, methods and the opaque singleton stubs nothing
@@ -528,6 +549,7 @@ jvm_deref_object(struct jvm *jvm, jobject object)
    }
    uintptr_t idx = (uintptr_t)object - 1;
    jvm_index_remove(jvm, idx);
+   jvm_array_release_refs(jvm, o);
    jvm_object_release(o);
    if (idx < jvm->next_object)
       jvm->next_object = idx;
@@ -541,7 +563,7 @@ jvm_bridge_ref_count(struct jvm *jvm, jobject object)
       return 0;
    jvm_meta_lock();
    struct jvm_object *o = jvm_get_object(jvm, object);
-   int refs = o->type == JVM_OBJECT_NONE ? 0 : o->refs;
+   int refs = o->type == JVM_OBJECT_NONE ? 0 : o->refs - o->array_refs;
    jvm_meta_unlock();
    return refs;
 }
@@ -553,12 +575,18 @@ jvm_release_bridge_local(struct jvm *jvm, jobject object)
       return false;
    jvm_meta_lock();
    struct jvm_object *o = jvm_get_object(jvm, object);
-   if (o->type == JVM_OBJECT_NONE || o->refs != 1) {
+   if (o->type == JVM_OBJECT_NONE || o->refs - o->array_refs != 1) {
+      jvm_meta_unlock();
+      return false;
+   }
+   if (o->array_refs) {
+      --o->refs; /* Release the local; array edges still keep the object live. */
       jvm_meta_unlock();
       return false;
    }
    uintptr_t idx = (uintptr_t)object - 1;
    jvm_index_remove(jvm, idx);
+   jvm_array_release_refs(jvm, o);
    jvm_object_release(o);
    jvm->wrap_cached[idx] = false;
    jvm->wrap_cache[idx] = NULL;
@@ -1101,6 +1129,9 @@ JNIEnv_IsInstanceOf(JNIEnv* p0, jobject p1, jclass p2)
    const char *oc = jvm_get_object(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1)->this_klass)->klass.name.data;
    const char *tc = jvm_get_object(jnienv_get_jvm(p0), p2)->klass.name.data;
    verbose("%s instanceof %s", oc, tc);
+   if (getenv("LUNARIA_TOUCH_DIAG") && (strstr(oc, "Event") || strstr(tc, "Event")))
+      fprintf(stderr, "[motion-jni] instanceof %s -> %s = %d\n", oc, tc,
+              jvm_name_eq(oc, tc) || jvm_name_assignable(oc, tc));
 
    if (jvm_get_object(jnienv_get_jvm(p0), p1)->this_klass == p2 || jvm_name_eq(oc, tc))
       return true;
@@ -1869,12 +1900,34 @@ JNIEnv_GetStaticFieldID(JNIEnv* p0, jclass klass, const char* name, const char* 
    return jvm_make_fieldid(jnienv_get_jvm(p0), klass, name, sig);
 }
 
+jstring jvm_new_string_wtf8(struct jvm *jvm, const char *text, size_t bytes)
+{
+   struct jvm_object o = { .type = JVM_OBJECT_STRING };
+   if (!jvm_string_set_cstr_with_length(&o.string, text, bytes, true)) {
+      jvm_throw_new(jvm, "java/lang/OutOfMemoryError", "Java string");
+      return NULL;
+   }
+   return jvm_add_object_if_not_there(jvm, &o);
+}
+
+const char *jvm_string_wtf8(struct jvm *jvm, jstring string, size_t *bytes)
+{
+   const struct jvm_string *s = &jvm_get_object_of_type(jvm, string, JVM_OBJECT_STRING)->string;
+   if (bytes) *bytes = s->size;
+   return s->data ? s->data : "";
+}
+
 static jstring
 JNIEnv_NewString(JNIEnv* p0, const jchar* p1, jsize p2)
 {
    assert(p0);
+   if (p2 < 0 || (!p1 && p2)) return NULL;
+   char *text = malloc((size_t)p2 * 3 + 1);
+   if (!text) { jvm_throw_new(jnienv_get_jvm(p0), "java/lang/OutOfMemoryError", "NewString"); return NULL; }
+   size_t bytes = jcs_utf16_to_wtf8(p1, (size_t)p2, text);
+   text[bytes] = 0;
    struct jvm_object o = { .type = JVM_OBJECT_STRING };
-   jvm_string_set_cstr_with_length(&o.string, (const char*)p1, p2, true);
+   o.string = (struct jvm_string){ .data = text, .size = bytes, .heap = true };
    return jvm_add_object_if_not_there(jnienv_get_jvm(p0), &o);
 }
 
@@ -1882,22 +1935,29 @@ static jsize
 JNIEnv_GetStringLength(JNIEnv* p0, jstring p1)
 {
    assert(p0 && p1);
-   JVM_UNIMPLEMENTED();
-   return 0;
+   const struct jvm_string *s = &jvm_get_object_of_type(jnienv_get_jvm(p0), p1, JVM_OBJECT_STRING)->string;
+   return (jsize)jcs_wtf8_to_utf16(s->data, s->size, NULL);
 }
 
 static const jchar*
 JNIEnv_GetStringChars(JNIEnv* p0, jstring p1, jboolean* p2)
 {
    assert(p0 && p1);
-   JVM_UNIMPLEMENTED();
-   return NULL;
+   const struct jvm_string *s = &jvm_get_object_of_type(jnienv_get_jvm(p0), p1, JVM_OBJECT_STRING)->string;
+   size_t count = jcs_wtf8_to_utf16(s->data, s->size, NULL);
+   jchar *chars = malloc((count + 1) * sizeof *chars);
+   if (!chars) { jvm_throw_new(jnienv_get_jvm(p0), "java/lang/OutOfMemoryError", "GetStringChars"); return NULL; }
+   jcs_wtf8_to_utf16(s->data, s->size, chars);
+   chars[count] = 0;
+   if (p2) *p2 = JNI_TRUE;
+   return chars;
 }
 
 static void
 JNIEnv_ReleaseStringChars(JNIEnv* p0, jstring p1, const jchar* p2)
 {
    assert(p0 && p1);
+   free((void *)p2);
 }
 
 static jstring
@@ -1905,27 +1965,76 @@ JNIEnv_NewStringUTF(JNIEnv* p0, const char* p1)
 {
    assert(p0);
    verbose("%s", p1);
-   struct jvm_object o = { .type = JVM_OBJECT_STRING };
-   jvm_string_set_cstr(&o.string, p1, true);
-   return jvm_add_object_if_not_there(jnienv_get_jvm(p0), &o);
+   if (!p1) return NULL;
+   size_t bytes = strlen(p1);
+   bool ascii = true;
+   for (size_t i = 0; i < bytes; ++i) if ((unsigned char)p1[i] >= 0x80) { ascii = false; break; }
+   if (ascii) {
+      struct jvm_object o = { .type = JVM_OBJECT_STRING };
+      if (!jvm_string_set_cstr_with_length(&o.string, p1, bytes, true)) {
+         jvm_throw_new(jnienv_get_jvm(p0), "java/lang/OutOfMemoryError", "NewStringUTF");
+         return NULL;
+      }
+      return jvm_add_object_if_not_there(jnienv_get_jvm(p0), &o);
+   }
+   jchar *chars = malloc((bytes + 1) * sizeof *chars);
+   if (!chars) { jvm_throw_new(jnienv_get_jvm(p0), "java/lang/OutOfMemoryError", "NewStringUTF"); return NULL; }
+   size_t count = jcs_wtf8_to_utf16(p1, bytes, chars);
+   jstring result = JNIEnv_NewString(p0, chars, (jsize)count);
+   free(chars);
+   return result;
+}
+
+/* JNI modified UTF-8 encodes each UTF-16 code unit independently, and uses
+ * C0 80 for NUL. Internal strings remain WTF-8 for the Java interpreter. */
+static size_t jvm_mutf8(const jchar *chars, size_t count, char *out)
+{
+   size_t n = 0;
+   for (size_t i = 0; i < count; ++i) {
+      unsigned c = chars[i];
+      unsigned width = c && c < 0x80 ? 1 : c < 0x800 ? 2 : 3;
+      if (out) {
+         if (width == 1) out[n] = (char)c;
+         else if (width == 2) {
+            out[n] = (char)(0xc0 | (c >> 6));
+            out[n + 1] = (char)(0x80 | (c & 63));
+         } else {
+            out[n] = (char)(0xe0 | (c >> 12));
+            out[n + 1] = (char)(0x80 | ((c >> 6) & 63));
+            out[n + 2] = (char)(0x80 | (c & 63));
+         }
+      }
+      n += width;
+   }
+   return n;
 }
 
 static jsize
 JNIEnv_GetStringUTFLength(JNIEnv* p0, jstring p1)
 {
    assert(p0 && p1);
-   return jvm_get_object_of_type(jnienv_get_jvm(p0), p1, JVM_OBJECT_STRING)->string.size;
+   const struct jvm_string *s = &jvm_get_object_of_type(jnienv_get_jvm(p0), p1, JVM_OBJECT_STRING)->string;
+   size_t bytes = s->size;
+   for (size_t i = 0; i < s->size; ++i) {
+      unsigned c = (unsigned char)s->data[i];
+      if (!c) ++bytes; /* NUL becomes C0 80. */
+      else if (c >= 0xf0 && c <= 0xf4) bytes += 2; /* Four bytes become six. */
+   }
+   return (jsize)bytes;
 }
 
 static jobject
 jvm_new_array(struct jvm *jvm, const size_t size, const size_t element_sz, const char *klass)
 {
    assert(jvm && klass);
-   struct jvm_object o = { .array = { .size = size, .element_sz = element_sz }, .type = JVM_OBJECT_ARRAY };
+   struct jvm_object o = { .array = { .size = size, .element_sz = element_sz,
+      .reference_elements = klass[0] == '[' && (klass[1] == 'L' || klass[1] == '[') },
+      .type = JVM_OBJECT_ARRAY };
    o.this_klass = jvm_make_class(jvm, klass);
    o.array.data = calloc(size, element_sz);
    assert(o.array.data);
-   return jvm_add_object_if_not_there(jvm, &o);
+   /* Arrays are mutable objects: equal contents do not imply identity. */
+   return jvm_add_object(jvm, &o);
 }
 
 static jsize
@@ -2031,12 +2140,15 @@ static jobject
 JNIEnv_GetObjectArrayElement(JNIEnv* p0, jobjectArray p1, jsize p2)
 {
    assert(p0 && p1);
-
-   const struct jvm_object *obj = jvm_get_object_of_type(jnienv_get_jvm(p0), p1, JVM_OBJECT_ARRAY);
-   if (!obj || obj->array.size <= (size_t)p2)
-      return NULL;
-
-   return (jobject)((uintptr_t*)obj->array.data)[p2];
+   struct jvm *jvm = jnienv_get_jvm(p0);
+   jvm_meta_lock();
+   const struct jvm_object *obj = jvm_get_object_of_type(jvm, p1, JVM_OBJECT_ARRAY);
+   jobject result = NULL;
+   if (obj && p2 >= 0 && (size_t)p2 < obj->array.size)
+      result = jvm_ref_object(jvm, ((jobject*)obj->array.data)[p2]);
+   else jvm_throw_new(jvm, "java/lang/ArrayIndexOutOfBoundsException", "array index");
+   jvm_meta_unlock();
+   return result;
 }
 
 static void
@@ -2044,11 +2156,24 @@ JNIEnv_SetObjectArrayElement(JNIEnv* p0, jobjectArray p1, jsize p2, jobject p3)
 {
    assert(p0 && p1);
 
-   const struct jvm_object *obj = jvm_get_object_of_type(jnienv_get_jvm(p0), p1, JVM_OBJECT_ARRAY);
-   if (!obj || obj->array.size <= (size_t)p2)
+   struct jvm *jvm = jnienv_get_jvm(p0);
+   jvm_meta_lock();
+   const struct jvm_object *obj = jvm_get_object_of_type(jvm, p1, JVM_OBJECT_ARRAY);
+   if (!obj || p2 < 0 || (size_t)p2 >= obj->array.size) {
+      jvm_throw_new(jvm, "java/lang/ArrayIndexOutOfBoundsException", "array index");
+      jvm_meta_unlock();
       return;
-
-   ((uintptr_t*)obj->array.data)[p2] = (uintptr_t)p3;
+   }
+   jobject *elements = obj->array.data;
+   jobject old = elements[p2];
+   elements[p2] = p3 ? jvm_ref_object(jvm, p3) : NULL;
+   if (p3) ++jvm_get_object(jvm, p3)->array_refs;
+   if (old) {
+      struct jvm_object *child = jvm_get_object(jvm, old);
+      if (child && child->array_refs > 0) --child->array_refs;
+      jvm_deref_object(jvm, old);
+   }
+   jvm_meta_unlock();
 }
 
 static jboolean*
@@ -2363,14 +2488,32 @@ static void
 JNIEnv_GetStringRegion(JNIEnv* p0, jstring p1, jsize p2, jsize p3, jchar* p4)
 {
    assert(p0 && p1);
-   JVM_UNIMPLEMENTED();
+   jsize length = JNIEnv_GetStringLength(p0, p1);
+   if (p2 < 0 || p3 < 0 || p2 > length || p3 > length - p2) {
+      jvm_throw_new(jnienv_get_jvm(p0), "java/lang/StringIndexOutOfBoundsException", "GetStringRegion");
+      return;
+   }
+   if (!p3) return;
+   const jchar *chars = JNIEnv_GetStringChars(p0, p1, NULL);
+   if (!chars) return;
+   memcpy(p4, chars + p2, (size_t)p3 * sizeof *chars);
+   JNIEnv_ReleaseStringChars(p0, p1, chars);
 }
 
 static void
 JNIEnv_GetStringUTFRegion(JNIEnv* p0, jstring p1, jsize p2, jsize p3, char* p4)
 {
    assert(p0 && p1);
-   JVM_UNIMPLEMENTED();
+   jsize length = JNIEnv_GetStringLength(p0, p1);
+   if (p2 < 0 || p3 < 0 || p2 > length || p3 > length - p2) {
+      jvm_throw_new(jnienv_get_jvm(p0), "java/lang/StringIndexOutOfBoundsException", "GetStringUTFRegion");
+      return;
+   }
+   if (!p3) return;
+   const jchar *chars = JNIEnv_GetStringChars(p0, p1, NULL);
+   if (!chars) return;
+   jvm_mutf8(chars + p2, (size_t)p3, p4);
+   JNIEnv_ReleaseStringChars(p0, p1, chars);
 }
 
 static void*
@@ -2389,15 +2532,13 @@ JNIEnv_ReleasePrimitiveArrayCritical(JNIEnv *env, jarray array, void *carray, ji
 static const jchar*
 JNIEnv_GetStringCritical(JNIEnv* p0, jstring p1, jboolean* p2)
 {
-   assert(p0 && p1);
-   JVM_UNIMPLEMENTED();
-   return NULL;
+   return JNIEnv_GetStringChars(p0, p1, p2);
 }
 
 static void
 JNIEnv_ReleaseStringCritical(JNIEnv* p0, jstring p1, const jchar* p2)
 {
-   assert(p0 && p1);
+   JNIEnv_ReleaseStringChars(p0, p1, p2);
 }
 
 static jweak
@@ -2450,18 +2591,28 @@ static const char*
 JNIEnv_GetStringUTFChars(JNIEnv *env, jstring string, jboolean *isCopy)
 {
    assert(env);
-
-   if (isCopy)
-      *isCopy = JNI_FALSE;
-
    if (!string) return NULL;
-   struct jvm_object *o = jvm_get_object_of_type(jnienv_get_jvm(env), string,
-                                                 JVM_OBJECT_STRING);
-   if (!o || o->type != JVM_OBJECT_STRING) return NULL;
-   /* A valid empty Java string has a non-NULL GetStringUTFChars result.
-    * jvm_string_set_cstr_with_length stores no allocation for length zero. */
-   const char *utf = o->string.data ? o->string.data : "";
-   verbose("%s", utf);
+   const struct jvm_string *s = &jvm_get_object_of_type(jnienv_get_jvm(env), string, JVM_OBJECT_STRING)->string;
+   bool same = true;
+   for (size_t i = 0; i < s->size; ++i) {
+      unsigned c = (unsigned char)s->data[i];
+      if (!c || c >= 0xf0) { same = false; break; }
+   }
+   if (same) {
+      if (isCopy) *isCopy = JNI_FALSE;
+      return s->data ? s->data : "";
+   }
+   const jchar *chars = JNIEnv_GetStringChars(env, string, NULL);
+   if (!chars) return NULL;
+   size_t count = (size_t)JNIEnv_GetStringLength(env, string);
+   size_t bytes = jvm_mutf8(chars, count, NULL);
+   char *utf = malloc(bytes + 1);
+   if (utf) {
+      jvm_mutf8(chars, count, utf);
+      utf[bytes] = 0;
+      if (isCopy) *isCopy = JNI_TRUE;
+   } else jvm_throw_new(jnienv_get_jvm(env), "java/lang/OutOfMemoryError", "GetStringUTFChars");
+   JNIEnv_ReleaseStringChars(env, string, chars);
    return utf;
 }
 
@@ -2469,6 +2620,8 @@ static void
 JNIEnv_ReleaseStringUTFChars(JNIEnv *env, jstring string, const char *utf)
 {
    assert(env && string);
+   const struct jvm_string *s = &jvm_get_object_of_type(jnienv_get_jvm(env), string, JVM_OBJECT_STRING)->string;
+   if (utf != s->data && s->size) free((void *)utf);
 }
 
 #define WRAP(x) wrapper_create(#x, x)

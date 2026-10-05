@@ -168,6 +168,7 @@ void arm_set_parallel_engines(bool on);
 #include <shared_mutex>
 #include <string>
 #include "lunaria_os.h"
+#include "luna_guest_vm.h"
 #include <unordered_map>
 #include <vector>
 
@@ -321,11 +322,7 @@ inline GuestVA a64_mapping_va(GuestVA va) {
     return va < A64_GUEST_SIZE ? a64_guest_va((BackingOffset)va) : va;
 }
 // A64: real 64-bit guest address space; outside image window, guest VA == host VA.
-struct A64Mapping {
-    GuestVA  lo = 0, hi = 0; /* guest VA range, page aligned; host VA == guest VA */
-    uint32_t prot = 0;       /* last guest PROT_* (bookkeeping only) */
-    bool     owned = false;  /* we host-mmap'd it and must munmap on release */
-};
+using A64Mapping = luna_guest_mapping;
 // Sorted by lo; disjoint.
 inline std::vector<A64Mapping> g_a64_maps;
 /* Every guest thread reads this table: the JIT's memory callbacks resolve a
@@ -339,6 +336,10 @@ inline std::shared_mutex g_a64_maps_mu;
  * unmapped stops answering "mapped" for it. */
 inline std::atomic<uint64_t> g_a64_maps_gen{1};
 inline void a64_maps_bump() { g_a64_maps_gen.fetch_add(1, std::memory_order_release); }
+inline size_t a64_host_page_size() {
+    static const size_t size = luna_os_page_size();
+    return size;
+}
 /* Bumped only when address space is taken *away*.  A cached answer "[lo,hi)
  * is mapped" stays true across an insert or a protection change (neither
  * unmaps a byte), so validating the cache against g_a64_maps_gen threw it
@@ -407,26 +408,22 @@ inline size_t a64_mapped_span(GuestVA va) {
  * The host reserves the whole A64 arena, so host pointer validity is not a
  * substitute for the guest's mmap table.  Walk adjacent entries as Linux
  * does for an access spanning a page/mapping boundary. */
-inline bool a64_accessible(GuestVA va, size_t len, bool write) {
-    if (!len || va + len < va) return false;
-    va = a64_mapping_va(va);
-    const GuestVA end = va + len;
+inline int a64_access_fault(GuestVA va, size_t len, bool write, GuestVA *fault) {
+    const GuestVA mapped = a64_mapping_va(va);
+    GuestVA bad = mapped;
     std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
-    while (va < end) {
-        const A64Mapping *m = a64_find_locked(va);
-        if (!m || !(m->prot & 1u /* PROT_READ */) ||
-            (write && !(m->prot & 2u /* PROT_WRITE */)))
-            return false;
-        va = m->hi < end ? m->hi : end;
-    }
-    return true;
+    const int code = luna_vm_access_fault(g_a64_maps.data(), g_a64_maps.size(),
+                                         mapped, len, write ? 3u : 1u, &bad);
+    *fault = va + (bad - mapped);
+    return code;
 }
 
-inline void a64_map_insert(GuestVA lo, GuestVA hi, uint32_t prot, bool owned) {
+inline void a64_map_insert(GuestVA lo, GuestVA hi, uint32_t prot, bool owned,
+                           bool file_backed = false) {
     std::unique_lock<std::shared_mutex> lk(g_a64_maps_mu);
     auto it = std::lower_bound(g_a64_maps.begin(), g_a64_maps.end(), lo,
                                [](const A64Mapping &m, GuestVA v) { return m.lo < v; });
-    g_a64_maps.insert(it, A64Mapping{lo, hi, prot, owned});
+    g_a64_maps.insert(it, A64Mapping{lo, hi, prot, owned, file_backed});
     a64_maps_bump();
 }
 
@@ -486,15 +483,27 @@ inline void a64_map_declare_backing(BackingOffset base, uint64_t len,
 // Drop [lo,hi) from the table, splitting/trimming entries as needed.
 inline void a64_map_remove(GuestVA lo, GuestVA hi, bool release) {
     std::unique_lock<std::shared_mutex> lk(g_a64_maps_mu);
+    const GuestVA page = a64_host_page_size();
+    std::vector<std::pair<GuestVA, GuestVA>> released;
     for (size_t i = 0; i < g_a64_maps.size();) {
         A64Mapping &m = g_a64_maps[i];
         if (m.hi <= lo || m.lo >= hi) { ++i; continue; }
         GuestVA clo = std::max(m.lo, lo), chi = std::min(m.hi, hi);
-        if (release && m.owned)
-            luna_os_release((void *)clo, (size_t)(chi - clo));
+        if (release && m.owned) {
+            if (page <= 4096u)
+                luna_os_release((void *)clo, (size_t)(chi - clo));
+            else {
+                const GuestVA begin = clo & ~(page - 1);
+                const GuestVA end = (chi + page - 1) & ~(page - 1);
+                if (!released.empty() && released.back().second >= begin)
+                    released.back().second = std::max(end, released.back().second);
+                else
+                    released.emplace_back(begin, end);
+            }
+        }
         bool head = m.lo < clo, tail = m.hi > chi;
         if (head && tail) {
-            A64Mapping right{chi, m.hi, m.prot, m.owned};
+            A64Mapping right{chi, m.hi, m.prot, m.owned, m.file_backed};
             m.hi = clo;
             g_a64_maps.insert(g_a64_maps.begin() + (long)i + 1, right);
             i += 2;
@@ -506,25 +515,45 @@ inline void a64_map_remove(GuestVA lo, GuestVA hi, bool release) {
             g_a64_maps.erase(g_a64_maps.begin() + (long)i);
         }
     }
+    /* A host page cannot be released while any guest subpage still owns it.
+     * Release contiguous empty host pages in one call, not one syscall per page. */
+    for (const auto &range : released) {
+        luna_vm_release_empty(g_a64_maps.data(), g_a64_maps.size(),
+                              range.first, range.second, page, luna_os_release);
+    }
     g_a64_unmap_gen.fetch_add(1, std::memory_order_release);
     a64_maps_bump();
 }
 
 // Record a guest mprotect over [lo,hi).
-inline void a64_map_set_prot(GuestVA lo, GuestVA hi, uint32_t prot) {
+inline int a64_map_set_prot(GuestVA lo, GuestVA hi, uint32_t prot) {
+    if ((lo & 4095u) || hi <= lo) { errno = EINVAL; return -1; }
+    lo = a64_mapping_va(lo);
+    hi = a64_mapping_va(hi - 1) + 1;
     std::unique_lock<std::shared_mutex> lk(g_a64_maps_mu);
+    for (GuestVA cursor = lo; cursor < hi;) {
+        const A64Mapping *m = a64_find_locked(cursor);
+        if (!m) { errno = ENOMEM; return -1; }
+        cursor = std::min(hi, m->hi);
+    }
+    if (!a64_is_guest_va(lo)) {
+        if (luna_vm_protect_host(g_a64_maps.data(), g_a64_maps.size(), lo, hi,
+                                prot, a64_host_page_size(), luna_os_protect))
+            return -1;
+    }
     for (size_t i = 0; i < g_a64_maps.size(); ++i) {
         A64Mapping &m = g_a64_maps[i];
         if (m.hi <= lo || m.lo >= hi || m.prot == prot) continue;
         GuestVA clo = std::max(m.lo, lo), chi = std::min(m.hi, hi);
         if (m.lo == clo && m.hi == chi) { m.prot = prot; continue; }
-        A64Mapping head{m.lo, clo, m.prot, m.owned};
-        A64Mapping tail{chi, m.hi, m.prot, m.owned};
+        A64Mapping head{m.lo, clo, m.prot, m.owned, m.file_backed};
+        A64Mapping tail{chi, m.hi, m.prot, m.owned, m.file_backed};
         m.lo = clo; m.hi = chi; m.prot = prot;
         if (tail.hi > tail.lo) g_a64_maps.insert(g_a64_maps.begin() + (long)i + 1, tail);
         if (head.hi > head.lo) { g_a64_maps.insert(g_a64_maps.begin() + (long)i, head); ++i; }
     }
     a64_maps_bump();
+    return 0;
 }
 
 // Guest VA is host VA, so a mapping must never land inside the image window.
@@ -544,8 +573,15 @@ inline GuestVA a64_va_map(GuestVA hint, uint64_t len, uint32_t prot,
     len = (len + 4095ull) & ~4095ull;
     if (!len) return 0;
     void *want = nullptr;
-    if (hint && !a64_is_guest_va(hint) && hint >= A64_GUEST_SIZE &&
-        !(hint & 4095ull) && hint + len <= 0x0010000000000000ull)
+    const bool image_fixed = fixed && hint &&
+        (hint < A64_GUEST_SIZE || a64_is_guest_va(hint));
+    if (image_fixed) {
+        const GuestVA canonical = a64_mapping_va(hint);
+        if (!(hint & 4095ull) && len <= A64_GUEST_BASE + A64_GUEST_SIZE - canonical)
+            want = (void *)canonical;
+    } else if (hint && !a64_is_guest_va(hint) && hint >= A64_GUEST_SIZE &&
+               !(hint & 4095ull) && hint + len >= hint &&
+               hint + len <= 0x0010000000000000ull)
         want = (void *)hint;
     if (fixed && !want) { errno = EINVAL; return 0; }
     /* Android exposes 4 KiB pages while Apple Silicon uses 16 KiB host
@@ -554,20 +590,43 @@ inline GuestVA a64_va_map(GuestVA hint, uint64_t len, uint32_t prot,
      * with EINVAL when it is not host-page aligned.  Our anonymous reserve is
      * deliberately host-RW already, so replacing a wholly mapped guest range
      * is represented by zeroing it and changing the guest VMA metadata. */
-    if (fixed && a64_mapped_span((GuestVA)want) >= len) {
+#ifdef __APPLE__
+    bool reuse_anon = false;
+    bool replaces_file_granule = false;
+    if (fixed && a64_host_page_size() > 4096u) {
+        std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
+        reuse_anon = luna_vm_anonymous_span(g_a64_maps.data(), g_a64_maps.size(),
+                                           (GuestVA)want, (GuestVA)want + len);
+        const size_t page = a64_host_page_size();
+        const GuestVA first = (GuestVA)want & ~(page - 1u);
+        const GuestVA end = ((GuestVA)want + len + page - 1u) & ~(page - 1u);
+        for (const A64Mapping &m : g_a64_maps) {
+            if (m.hi <= first) continue;
+            if (m.lo >= end) break;
+            if (m.file_backed) { replaces_file_granule = true; break; }
+        }
+    }
+    if (reuse_anon) {
         memset(want, 0, (size_t)len);
         a64_map_remove((GuestVA)want, (GuestVA)want + len, /*release=*/false);
         a64_map_insert((GuestVA)want, (GuestVA)want + len, prot, /*owned=*/true);
-        return (GuestVA)want;
+        return image_fixed ? hint : (GuestVA)want;
     }
-    if (fixed)
-        a64_map_remove((GuestVA)want, (GuestVA)want + len, /*release=*/false);
+    /* A native fixed replacement must not destroy neighboring guest
+     * subpages. File-backed partial host granules need separate backing
+     * translation; until implemented, leave the old mapping intact. */
+    if (fixed && replaces_file_granule &&
+        (((GuestVA)want | len) & (a64_host_page_size() - 1u))) {
+        errno = EINVAL;
+        return 0;
+    }
+#endif
     void *p = luna_os_map_anon(want, (size_t)len, fixed);
     if (fixed && p != want) {
         if (p) luna_os_release(p, (size_t)len);
         return 0;
     }
-    if (!a64_va_usable(p, len)) {
+    if (!(image_fixed && p == want) && !a64_va_usable(p, len)) {
         if (fixed) {
             if (p) luna_os_release(p, (size_t)len);
             return 0;
@@ -581,8 +640,10 @@ inline GuestVA a64_va_map(GuestVA hint, uint64_t len, uint32_t prot,
             return 0;
         }
     }
+    if (fixed)
+        a64_map_remove((GuestVA)p, (GuestVA)p + len, /*release=*/false);
     a64_map_insert((GuestVA)p, (GuestVA)p + len, prot, /*owned=*/true);
-    return (GuestVA)p;
+    return image_fixed ? hint : (GuestVA)p;
 }
 
 /* File-backed mmap: guest VA == host VA, so this is a real host mmap of the
@@ -606,9 +667,8 @@ inline GuestVA a64_va_mmap_file(GuestVA hint, uint64_t len, uint32_t prot,
     if (hint && !a64_is_guest_va(hint) && hint >= A64_GUEST_SIZE &&
         !(hint & 4095ull) && hint + len <= 0x0010000000000000ull)
         want = (void *)hint;
-    if (fixed && want && !(map_flags & LUNA_MAP_NOREPLACE))
-        a64_map_remove((GuestVA)want, (GuestVA)want + len, /*release=*/true);
-
+    /* Native MAP_FIXED performs replacement after validating the request.
+     * Removing the old mapping first would also remove it on EACCES/error. */
     void *p = luna_os_map_file_flags(want, (size_t)len, host_prot, map_flags, fd, (uint64_t)off);
     if (!a64_va_usable(p, len) || (fixed && want && p != want)) {
         void *bad = p;
@@ -624,7 +684,10 @@ inline GuestVA a64_va_mmap_file(GuestVA hint, uint64_t len, uint32_t prot,
             return 0;
         }
     }
-    a64_map_insert((GuestVA)p, (GuestVA)p + len, prot, /*owned=*/true);
+    if (fixed && !(map_flags & LUNA_MAP_NOREPLACE))
+        a64_map_remove((GuestVA)p, (GuestVA)p + len, /*release=*/false);
+    a64_map_insert((GuestVA)p, (GuestVA)p + len, prot, /*owned=*/true,
+                   /*file_backed=*/true);
     return (GuestVA)p;
 }
 
@@ -991,6 +1054,11 @@ inline uint32_t MJIV_RUNTIME_VER = 0x41014028u;
 inline uint32_t MONO_EMPTY_STR     = 0x4101402cu;
 inline uint32_t LIBC_CTYPE_TAB     = 0x41014300u;
 inline uint32_t LIBC_TOLOWER_TAB   = 0x41014400u;
+inline uint32_t LIBC_TOUPPER_TAB   = 0x41014700u;
+/* LP64 ctype pointer variables (see the table setup in arm_exec.cpp) */
+inline uint32_t LIBC_CTYPE_PTR     = 0x41014200u;
+inline uint32_t LIBC_TOLOWER_PTR   = 0x41014208u;
+inline uint32_t LIBC_TOUPPER_PTR   = 0x41014210u;
 inline uint32_t g_reloc_data_start = 0; /* per-library .data start for data_start/__data_start */
 
 // tiny ARM stub that does nothing and returns r0=0.
@@ -1153,6 +1221,10 @@ inline void guest_va_layout_arm64(void) {
     MONO_EMPTY_STR    = LIBC_DATA + 0x2cu;
     LIBC_CTYPE_TAB    = LIBC_DATA + 0x300u;
     LIBC_TOLOWER_TAB  = LIBC_DATA + 0x400u;
+    LIBC_TOUPPER_TAB  = LIBC_DATA + 0x700u;
+    LIBC_CTYPE_PTR    = LIBC_DATA + 0x200u;
+    LIBC_TOLOWER_PTR  = LIBC_DATA + 0x208u;
+    LIBC_TOUPPER_PTR  = LIBC_DATA + 0x210u;
     NOOP_RET0         = LIBC_DATA + 0x100u;
     // The SL_IID/tzname/stdio page and the OpenSL ES vtable page keep their A32 addresses (0x41014000 / 0x41016000) by.
     MISC_DATA         = 0x0A015000u;

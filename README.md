@@ -542,8 +542,7 @@ F12, and **Take Screenshot** in the host menu, write
   `LUNARIA_SYSLIB_DIR` at that directory when it exists.
 - **Threads:** guest pthreads use cooperative round-robin scheduling with a
   separate JIT context per worker; mutex unlock can hand off directly to a
-  waiter. Guest sleeps park for real wall time (`LUNARIA_GUEST_SLEEP`, on
-  unless set to `0`). Blocking reads stay on the scheduler unless
+  waiter. Guest sleeps park for real wall time. Blocking reads stay on the scheduler unless
   `LUNARIA_FD_PARK` is set.
 - **Java:** when a JNI call has no host stub, `src/dvm/` executes the method
   from the APK's `classes*.dex` (`LUNARIA_DVM=1` by default).
@@ -583,7 +582,7 @@ full diagnostic set.
 | `LUNARIA_A64_SELF_SCHED` | `1` | Launcher default. Engines pull runnable guests freely. Set `0` for barrier-pooled passes. The binary itself stays off until the variable is set |
 | `LUNARIA_A64_FASTMEM` | `1` | Set `0` to route memory through callbacks |
 | `LUNARIA_A64_CODE_CACHE_MB` | `128` | Per-JIT translated-code cache |
-| `LUNARIA_GUEST_SLEEP` / `LUNARIA_FD_PARK` | on / off | Park guest sleeps for real wall time / park blocking reads (`LUNARIA_GUEST_SLEEP=0` is diagnostic only) |
+| `LUNARIA_FD_PARK` | on / off | Park blocking reads |
 | `LUNARIA_SYSLIB_DIR` | `syslib-arm64/` if that directory exists | AArch64 platform libraries that run as guest code. `make syslib` fetches libm, libc and libz; `make guestlib` builds `liblunaria_guest.so` |
 | `LUNARIA_VULKAN` | on when available | Set `0` to disable the Vulkan bridge and device feature. Titles may still choose GLES |
 | `LUNARIA_TOUCH_TEST` | off | Inject taps at `x,y[;x,y…]` (max 8). Bare numbers are framebuffer percentages; `640px` is a guest pixel |
