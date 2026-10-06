@@ -138,6 +138,15 @@ void luna_overlay_wake(void) { if (g_wake_fn) g_wake_fn(); }
  * there is nothing to schedule. */
 void luna_app_request_redraw(void) { }
 
+/* The file-dialog implementation also references the standalone runner.
+ * Lunaria only uses the embedded dialog, so these never start a second window. */
+int luna_app_run(const LunaAppConfig *cfg)
+{
+   (void)cfg;
+   return -1;
+}
+void luna_app_quit(void) { }
+
 /* eglGetProcAddress is only required to resolve *extension* entry points; for
  * core GL/GLES functions it may legally return NULL, and on some drivers it
  * does.  luna-ui keeps every entry point it loads in a pointer it null-checks
