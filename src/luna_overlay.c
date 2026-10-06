@@ -19,9 +19,9 @@
 /* The file dialog the launcher's "Browse" opens is luna-ui's own
  * (luna-window.h): one implementation for every host OS instead of a native
  * chooser per platform.  Its code has to sit in the translation unit that
- * defines the engine. */
+ * defines the engine.  luna-window.h must come first: the file-dialog
+ * implementation raises LUNA_UI_MAX_ELEMENTS before luna-ui.h is included. */
 #define LUNA_UI_IMPLEMENTATION
-#include "luna-ui.h"
 #define LUNA_WINDOW_IMPLEMENTATION
 #if !defined(_WIN32)   /* its directory/volume code is POSIX; Windows falls back */
 #define LUNA_WINDOW_FILE_DIALOG_IMPLEMENTATION
