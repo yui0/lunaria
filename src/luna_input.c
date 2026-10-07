@@ -55,6 +55,7 @@ static int key_code(const char *s)
 {
     if (!strcmp(s, "SPACE")) return 32;
     if (!strcmp(s, "SHIFT")) return 340;
+    if (!strcmp(s, "CTRL")) return 341;
     if (s[0] && !s[1] && ((s[0] >= 'A' && s[0] <= 'Z') || (s[0] >= '0' && s[0] <= '9'))) return s[0];
     return -1;
 }
@@ -74,6 +75,11 @@ int luna_keymap_load(luna_keymap *m, const char *path)
             if (stick || sscanf(line, " %*s %f %f %f %c", &x, &y, &radius, &extra) != 3 ||
                 !unit(x) || !unit(y) || !isfinite(radius) || radius <= 0 || radius > .5f) { ok = 0; break; }
             next.stick_x = x; next.stick_y = y; next.radius = radius; stick = 1;
+        } else if (!strcmp(name, "walk")) {
+            if (next.walk_key || sscanf(line, " %*s %31s %f %c", key, &radius, &extra) != 2 ||
+                key_code(key) < 0 || !isfinite(radius) || radius <= 0 || radius > .5f) { ok = 0; break; }
+            next.walk_key = key_code(key); next.walk_radius = radius;
+            if (strchr("WASD", next.walk_key)) { ok = 0; break; }
         } else if (!strcmp(name, "button")) {
             if (next.count == LUNA_KEYMAP_BUTTONS || sscanf(line, " %*s %31s %f %f %c", key, &x, &y, &extra) != 3 ||
                 key_code(key) < 0 || !unit(x) || !unit(y)) { ok = 0; break; }
@@ -87,6 +93,11 @@ int luna_keymap_load(luna_keymap *m, const char *path)
     if (ferror(f)) ok = 0;
     fclose(f);
     if (!ok || !stick) return 0;
+    if (next.walk_key) {
+        if (next.walk_radius >= next.radius) return 0;
+        for (int i = 0; i < next.count; ++i)
+            if (next.buttons[i].key == next.walk_key) return 0;
+    }
     next.enabled = 1; *m = next; return 1;
 }
 static void stick_event(luna_keymap *m, float w, float h, luna_keymap_emit emit, void *ctx)
@@ -102,7 +113,7 @@ static void stick_event(luna_keymap *m, float w, float h, luna_keymap_emit emit,
     }
     if (!m->stick_down) { emit(ctx, 1, 0, x, y); m->stick_down = 1; }
     float length = sqrtf(dx * dx + dy * dy);
-    if (length > 0) { float r = m->radius * fminf(w, h); x += dx * r / length; y += dy * r / length; }
+    if (length > 0) { float r = (m->walk_held ? m->walk_radius : m->radius) * fminf(w, h); x += dx * r / length; y += dy * r / length; }
     emit(ctx, 1, 2, x, y);
 }
 int luna_keymap_key(luna_keymap *m, int key, int pressed, float w, float h, luna_keymap_emit emit, void *ctx)
@@ -110,6 +121,15 @@ int luna_keymap_key(luna_keymap *m, int key, int pressed, float w, float h, luna
     if (!m->enabled || w <= 0 || h <= 0) return 0;
     int shift_bit = key == 344 ? 2 : 1;
     if (key == 344) key = 340;
+    int ctrl_bit = key == 345 ? 2 : 1;
+    if (key == 345) key = 341;
+    if (m->walk_key && key == m->walk_key) {
+        int bit = key == 340 ? shift_bit : ctrl_bit;
+        int held = key == 340 || key == 341 ? (pressed ? m->walk_held | bit : m->walk_held & ~bit) : !!pressed;
+        if (!!held != !!m->walk_held) { m->walk_held = held; stick_event(m, w, h, emit, ctx); }
+        else m->walk_held = held;
+        return 1;
+    }
     const char *wasd = "WASD";
     for (int i = 0; i < 4; ++i) if (key == wasd[i]) {
         if (m->direction[i] != !!pressed) { m->direction[i] = !!pressed; stick_event(m, w, h, emit, ctx); }
@@ -117,7 +137,8 @@ int luna_keymap_key(luna_keymap *m, int key, int pressed, float w, float h, luna
     }
     for (int i = 0; i < m->count; ++i) if (key == m->buttons[i].key) {
         luna_key_binding *b = &m->buttons[i];
-        int held = b->key == 340 ? (pressed ? b->held | shift_bit : b->held & ~shift_bit) : !!pressed;
+        int bit = key == 340 ? shift_bit : ctrl_bit;
+        int held = key == 340 || key == 341 ? (pressed ? b->held | bit : b->held & ~bit) : !!pressed;
         if (!!held != !!b->held) emit(ctx, i + 2, held ? 0 : 1, b->x * w, b->y * h);
         b->held = held;
         return 1;
@@ -127,6 +148,7 @@ int luna_keymap_key(luna_keymap *m, int key, int pressed, float w, float h, luna
 void luna_keymap_release(luna_keymap *m, float w, float h, luna_keymap_emit emit, void *ctx)
 {
     memset(m->direction, 0, sizeof m->direction);
+    m->walk_held = 0;
     stick_event(m, w, h, emit, ctx);
     for (int i = 0; i < m->count; ++i) if (m->buttons[i].held) {
         m->buttons[i].held = 0;

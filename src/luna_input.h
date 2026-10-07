@@ -33,6 +33,8 @@ typedef struct luna_key_binding { int key, held; float x, y; } luna_key_binding;
 typedef struct luna_keymap {
     int enabled, direction[4], stick_down, count;
     float stick_x, stick_y, radius;
+    int walk_key, walk_held;
+    float walk_radius;
     luna_key_binding buttons[LUNA_KEYMAP_BUTTONS];
 } luna_keymap;
 typedef void (*luna_keymap_emit)(void *, int id, int action, float x, float y);

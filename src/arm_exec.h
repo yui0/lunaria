@@ -420,6 +420,9 @@ int arm_exec_guest_uid(void);
 /* resources.arsc name/value lookup used by android.content.res.Resources. */
 uint32_t arm_exec_apk_resource_id(const char *type, const char *name);
 int arm_exec_apk_resource_value(uint32_t id, int32_t *iv, const char **sv);
+/* String-array bag: 1 success (including empty), 0 missing/invalid, -1 OOM.
+ * Caller frees *values; strings are borrowed from the loaded resource table. */
+int arm_exec_apk_string_array(uint32_t id, const char ***values, size_t *count);
 /* Resolve an attribute from a compiled style bag, following app-resource
  * parents.  Returns the Res_value data type, or 0 when absent. */
 int arm_exec_apk_style_value(uint32_t style_id, uint32_t attr_id,

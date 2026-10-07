@@ -460,18 +460,21 @@ LUNARIA_KEYMAP=crossworlds ./lunaria /path/to/CrossWorlds.apks
 キーボードマッピングを無効にするには `LUNARIA_KEYMAP=off` を指定します。
 
 ```text
-stick 0.15625 0.764 0.09
+stick 0.15625 0.764 0.18
+walk CTRL 0.04
 button SPACE 0.922 0.665
 button F 0.826 0.769
 ```
 
 `stick` は、WASD で操作する仮想スティックの中心 X/Y 座標と半径を定義します。
 `button` は、キーを X/Y のタッチ位置へ割り当てます。
+`walk` は、指定キーを押しながらWASDを操作するときの小さい半径を定義します。
+原神ではWASDで走り、Ctrl＋WASDで歩きます。
 X と Y は画面の幅・高さを基準とした 0〜1 の正規化座標です。
 スティック半径は画面の短辺を基準にしています。
 
 最大 8 個のボタンを割り当てられます。
-対応キーは大文字英字、数字、`SPACE`、`SHIFT` です。
+対応キーは大文字英字、数字、`SPACE`、`SHIFT`、`CTRL` です。
 同梱レイアウトは横画面 HUD 向けに調整されているため、
 HUD の大きさや配置を変更した場合は座標も調整してください。
 

@@ -2742,6 +2742,9 @@ run_dex_activity(struct jvm *jvm, int is_a64)
       pump_run_frame(run_threads);
       if (is_a64) arm64_exec_egl_swap(); else arm_exec_egl_swap();
       arm_exec_glfw_poll();
+      /* LUNARIA_TOUCH_FIFO / LUNARIA_TOUCH_TEST: the other pump loops replay them;
+       * this one drives Unity titles whose entry point is a dex Activity. */
+      touch_test_tick(frame);
       /* The framework input queue feeds Activity/View dispatch, independently
        * of the engine's Java-owned renderer. NativeActivity retains its NDK
        * input queue; Unity's Java path must not bypass its View callbacks. */
@@ -3129,6 +3132,23 @@ raw_start(void *entry, int argc, const char *argv[])
 
 int luna_apk_prepare(int *argc, const char ***argv);
 
+#ifndef _WIN32
+/* A heap check that fails inside libc ("realloc(): invalid next size") aborts with
+ * one line of text and nothing about who was running.  The thread that detects the
+ * corruption is rarely the one that caused it, but its stack still names the
+ * allocation that tripped, which is the first thing needed to find the writer. */
+static void
+host_abort_report(int sig)
+{
+   void *frames[48];
+   int n = luna_os_backtrace(frames, 48);
+   fprintf(stderr, "\n[host-abort] signal %d on a host thread; stack:\n", sig);
+   luna_os_backtrace_print(frames, n);
+   signal(sig, SIG_DFL);
+   raise(sig);
+}
+#endif
+
 #ifdef _WIN32
 static int
 lunaria_main(int argc, const char *argv[])
@@ -3141,6 +3161,9 @@ main(int argc, const char *argv[])
     * redirected to one startup log.  Fully buffered stdout otherwise leaves
     * "loading module" and dependency messages at the end of the file. */
    setvbuf(stdout, NULL, _IOLBF, 0);
+#ifndef _WIN32
+   signal(SIGABRT, host_abort_report);
+#endif
 
    /* Descriptors 0, 1 and 2 are always open in an Android process: zygote
     * hands every app /dev/null on stdin and the logger on stdout/stderr, and

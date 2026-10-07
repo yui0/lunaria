@@ -95,6 +95,12 @@ struct dvm_hooks {
    /* java.lang.System.loadLibrary().  The bytecode VM owns System, while the
     * guest ELF loader owns the APK ABI directory and JNI symbol namespace. */
    bool (*load_library)(void *user, struct dvm *vm, const char *name);
+
+   /* A native method that has just returned.  JNI says a native which returns
+    * with an exception pending raises it in its caller; the host side keeps
+    * that state, so ask it.  Returns the Throwable (and clears the host's
+    * pending state), or 0 when there is none. */
+   dvm_ref (*take_pending_exception)(void *user, struct dvm *vm);
 };
 
 /* --- lifecycle ---------------------------------------------------------- */

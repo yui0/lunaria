@@ -25,6 +25,21 @@
 # include "inc/opensles.c"
 #elif defined(LUNARIA_STUB_GLESV3)
 # include "inc/glesv3.c"
+#elif defined(LUNARIA_STUB_SVC_RUNTIME)
+/* System library identities for hosts using the emulator's guest ABI.
+ * pthread objects, libc calls, FILE objects, errno and libc data symbols are
+ * resolved in arm_exec.cpp. Host CRT wrappers cannot share their layouts or
+ * scheduler. These libraries provide DT_NEEDED identities without exporting
+ * guest functions that could fall through to incompatible native calls.
+ * Built once as libpthread.so and once (with -DLUNARIA_SVC_LIBC) as libc.so. */
+# ifdef LUNARIA_SVC_LIBC
+int lunaria_libc_runtime_is_svc_backed(void)
+# else
+int lunaria_pthread_runtime_is_svc_backed(void)
+# endif
+{
+   return 1;
+}
 #else
 # error "Define one of the LUNARIA_STUB_* runtime modules"
 #endif

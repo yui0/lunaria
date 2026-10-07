@@ -27,10 +27,22 @@ namespace Dynarmic::FP {
 
 // A binary32 product is exact in binary64 (24 + 24 <= 53 bits).  The
 // Boldo--Melquiond approach uses that exact product and a binary64 sum.
-// Its only possible binary32 double-rounding ambiguity is at a binary32
-// midpoint; those cases use the existing exact integer implementation.
-static bool FPMulAdd32Fast(u32 addend, u32 op1, u32 op2, FPCR fpcr,
-                           FPSR& fpsr, u32& result) {
+// Its only possible binary32 double-rounding ambiguity is when the binary64 sum
+// lands on a binary32 midpoint; those cases use the existing exact integer
+// implementation.
+//
+// This runs once per lane of every fused multiply-add the guest executes, and
+// on a host without FMA3 (every pre-Haswell Xeon) that is most of what a
+// numeric workload does, so it is written to be short: no loops, no calls on
+// the common path, and the checks are on the integer representations.
+static inline bool IsNormalOrZero32(u32 bits) {
+    // Exponent field 1..254 (normal), or +-0.  Subnormals, infinities and NaNs
+    // take the exact path.
+    return ((bits >> 23) & 0xffu) - 1u < 254u || (bits << 1) == 0u;
+}
+
+static inline bool FPMulAdd32Fast(u32 addend, u32 op1, u32 op2, FPCR fpcr,
+                                  FPSR& fpsr, u32& result) {
 #if defined(__SSE2__)
     // The guest rounding mode alone does not guarantee the host MXCSR mode.
     if (fpcr.RMode() != RoundingMode::ToNearest_TieEven || fpcr.FZ() ||
@@ -40,53 +52,51 @@ static bool FPMulAdd32Fast(u32 addend, u32 op1, u32 op2, FPCR fpcr,
 #else
     return false;
 #endif
-    constexpr u32 exp_mask = FPInfo<u32>::exponent_mask;
-    for (const u32 bits : {addend, op1, op2}) {
-        // Zero is exact in binary64 and needs no special case; subnormals,
-        // infinities and NaNs take the exact path.
-        const u32 exponent = bits & exp_mask;
-        if (exponent == exp_mask ||
-            (exponent == 0 && (bits & FPInfo<u32>::mantissa_mask) != 0)) {
-            return false;
-        }
+    if (!(IsNormalOrZero32(addend) & IsNormalOrZero32(op1) & IsNormalOrZero32(op2))) {
+        return false;
     }
 
     float a, b, c;
     std::memcpy(&a, &addend, sizeof(a));
     std::memcpy(&b, &op1, sizeof(b));
     std::memcpy(&c, &op2, sizeof(c));
+    const double a64 = static_cast<double>(a);
     const double product = static_cast<double>(b) * static_cast<double>(c);
-    const double sum = product + static_cast<double>(a);
+    const double sum = product + a64;
     const float rounded = static_cast<float>(sum);
     u32 rounded_bits;
     std::memcpy(&rounded_bits, &rounded, sizeof(rounded_bits));
-    // Exclude cancellation, subnormal/zero results, and the boundary where
-    // an exact subnormal can round up to the smallest normal (underflow flag).
-    const u32 result_exponent = rounded_bits & exp_mask;
-    if (result_exponent <= 0x00800000 || result_exponent == exp_mask) {
+    // Exclude cancellation to zero, subnormal results, overflow, and the
+    // boundary where an exact subnormal can round up to the smallest normal
+    // (which raises the underflow flag): the exponent field must be 2..254.
+    if (((rounded_bits >> 23) & 0xffu) - 2u >= 253u) {
         return false;
     }
 
     const double rounded_double = static_cast<double>(rounded);
+    bool inexact;
     if (sum != rounded_double) {
-        const bool toward_positive = sum > rounded_double;
-        const bool positive = (rounded_bits & FPInfo<u32>::sign_mask) == 0;
-        const u32 neighbor_bits = rounded_bits + (toward_positive == positive ? 1u : -1u);
-        float neighbor;
-        std::memcpy(&neighbor, &neighbor_bits, sizeof(neighbor));
-        const double midpoint = (rounded_double + static_cast<double>(neighbor)) * 0.5;
-        if (sum == midpoint) {
+        // The binary64 sum is not a binary32 value.  If it sits exactly halfway
+        // between two binary32 values (low 29 mantissa bits == 1 << 28) the
+        // rounding below may have been decided by a bit the sum has already lost.
+        u64 sum_bits;
+        std::memcpy(&sum_bits, &sum, sizeof(sum_bits));
+        if ((sum_bits & 0x1fffffffull) == 0x10000000ull) {
             return false;
         }
+        inexact = true;
+    } else {
+        // TwoSum's residual is exact: the binary64 product and addend are exact,
+        // and their sum cannot overflow or underflow binary64 for binary32 inputs.
+        const double z = sum - product;
+        const double residual = (product - (sum - z)) + (a64 - z);
+        inexact = residual != 0.0;
     }
-
-    // TwoSum's residual is exact: the binary64 product and addend are exact,
-    // and their sum cannot overflow or underflow binary64 for binary32 inputs.
-    const double a64 = static_cast<double>(a);
-    const double z = sum - product;
-    const double residual = (product - (sum - z)) + (a64 - z);
-    if (sum != rounded_double || residual != 0.0) {
-        FPProcessException(FPExc::Inexact, fpcr, fpsr);
+    if (inexact) {
+        if (fpcr.IXE()) {
+            return false;  // trapping is not implemented; let the exact path say so
+        }
+        fpsr.IXC(true);
     }
     result = rounded_bits;
     return true;

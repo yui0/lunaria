@@ -45,6 +45,7 @@ struct jvm_exception_state {
    struct jvm *owner;
    uint64_t token;
    jthrowable pending_exception;
+   bool pending_owned;
    char pending_exception_class[128];
    char pending_exception_msg[256];
 };
@@ -412,6 +413,8 @@ jvm_assign_default_class(struct jvm *jvm, struct jvm_object *o)
 static struct jvm_object*
 jvm_get_object(struct jvm *jvm, const jobject o);
 
+static jobject jvm_record_local(struct jvm *jvm, jobject object);
+static void jvm_forget_local(struct jvm *jvm, jobject object);
 static jobject
 jvm_add_object(struct jvm *jvm, const struct jvm_object *o)
 {
@@ -442,7 +445,7 @@ jvm_add_object(struct jvm *jvm, const struct jvm_object *o)
       /* Which class the leaked handles belong to.  "65,000 opaque objects"
        * names the symptom; the class names the caller. */
       {
-         struct { const char *name; size_t n; } tally[256] = {0};
+         struct { const char *name; size_t n, bridge, arrays; unsigned long long refs, globals; } tally[256] = {0};
          size_t ntally = 0;
          for (size_t k = 0; k < ARRAY_SIZE(jvm->objects); ++k) {
             if (jvm->objects[k].type != JVM_OBJECT_OPAQUE) continue;
@@ -457,14 +460,19 @@ jvm_add_object(struct jvm *jvm, const struct jvm_object *o)
                tally[ntally++].name = nm;
             }
             ++tally[t].n;
+            tally[t].bridge += jvm->objects[k].bridge_owned;
+            tally[t].arrays += jvm->objects[k].array_refs > 0;
+            tally[t].globals += (unsigned)jvm->objects[k].global_refs;
+            if (jvm->objects[k].refs > 0) tally[t].refs += (unsigned)jvm->objects[k].refs;
          }
          for (size_t shown = 0; shown < 12; ++shown) {
             size_t best = 0;
             for (size_t t = 1; t < ntally; ++t)
                if (tally[t].n > tally[best].n) best = t;
             if (!ntally || !tally[best].n) break;
-            fprintf(stderr, "[jvm]   %8zu  %s\n", tally[best].n,
-                    tally[best].name);
+            fprintf(stderr, "[jvm]   %8zu  %s (bridge=%zu array-owned=%zu total-refs=%llu global-refs=%llu)\n",
+                    tally[best].n, tally[best].name, tally[best].bridge,
+                    tally[best].arrays, tally[best].refs,tally[best].globals);
             tally[best].n = 0;
          }
       }
@@ -484,7 +492,7 @@ jvm_add_object(struct jvm *jvm, const struct jvm_object *o)
    if (!jvm->objects[i].this_klass)
       jvm_assign_default_class(jvm, &jvm->objects[i]);
 
-   jobject result = (jobject)(i + 1);
+   jobject result = jvm_record_local(jvm,(jobject)(i + 1));
    jvm_meta_unlock();
    return result;
 }
@@ -542,7 +550,8 @@ jvm_deref_object(struct jvm *jvm, jobject object)
       return;
    }
    if (o->type != JVM_OBJECT_ARRAY && o->type != JVM_OBJECT_STRING &&
-       o->type != JVM_OBJECT_MOTION) {
+       o->type != JVM_OBJECT_MOTION &&
+       !(o->type == JVM_OBJECT_OPAQUE && o->bridge_owned)) {
       o->refs = 1; /* pinned for the process lifetime */
       jvm_meta_unlock();
       return;
@@ -553,6 +562,20 @@ jvm_deref_object(struct jvm *jvm, jobject object)
    jvm_object_release(o);
    if (idx < jvm->next_object)
       jvm->next_object = idx;
+   jvm_meta_unlock();
+}
+
+/* Mark only newly created bridge handles. Their lifetime follows JNI and
+ * array ownership; stub singleton handles retain their existing policy. */
+void
+jvm_mark_bridge_local(struct jvm *jvm, jobject object)
+{
+   if (!jvm || !object || (uintptr_t)object > ARRAY_SIZE(jvm->objects)) return;
+   jvm_meta_lock();
+   struct jvm_object *o = jvm_get_object(jvm, object);
+   if (o && o->type == JVM_OBJECT_OPAQUE) o->bridge_owned = true;
+   /* The conversion bridge assumes ownership of this local reference. */
+   jvm_forget_local(jvm,object);
    jvm_meta_unlock();
 }
 
@@ -575,10 +598,14 @@ jvm_release_bridge_local(struct jvm *jvm, jobject object)
       return false;
    jvm_meta_lock();
    struct jvm_object *o = jvm_get_object(jvm, object);
-   if (o->type == JVM_OBJECT_NONE || o->refs - o->array_refs != 1) {
+   /* Method and field ids and classes are not locals of a call: JNI keeps them
+    * valid until the class unloads, and native code caches them. */
+   if (o->type == JVM_OBJECT_NONE || o->type == JVM_OBJECT_METHOD ||
+       o->type == JVM_OBJECT_CLASS || o->refs - o->array_refs != 1) {
       jvm_meta_unlock();
       return false;
    }
+   jvm_forget_local(jvm,object);
    if (o->array_refs) {
       --o->refs; /* Release the local; array edges still keep the object live. */
       jvm_meta_unlock();
@@ -604,7 +631,7 @@ jvm_add_object_if_not_there(struct jvm *jvm, struct jvm_object *needle)
    jobject o;
    if ((o = jvm_find_object(jvm, needle))) {
       jvm_object_release(needle);
-      o = jvm_ref_object(jvm, o);
+      o = jvm_record_local(jvm,jvm_ref_object(jvm, o));
       jvm_meta_unlock();
       return o;
    }
@@ -722,12 +749,32 @@ jvm_make_class(struct jvm *jvm, const char *name)
    return jvm_add_object_if_not_there(jvm, &o);
 }
 
+/* LUNARIA_TRACE_JNIEXC=1: each exception that becomes pending, with the
+ * class and message.  The first thing to ask when native code takes its error
+ * path with nothing visibly wrong. */
+static void
+jvm_trace_pending(const char *how, const char *cls, const char *msg)
+{
+   static int on = -1;
+   if (on < 0) on = getenv("LUNARIA_TRACE_JNIEXC") != NULL;
+   if (on)
+      fprintf(stderr, "[jvm-exc] %s %s: %s\n", how, cls ? cls : "?", msg ? msg : "");
+}
+
 static jclass
 JNIEnv_FindClass(JNIEnv* p0, const char* p1)
 {
    assert(p0 && p1);
    verbose("%s", p1);
-   return jvm_make_class(jnienv_get_jvm(p0), p1);
+   struct jvm *jvm = jnienv_get_jvm(p0);
+   if (p1[0] != '[' && !dvm_jni_class_exists(p1)) {
+      static int reported;
+      if (reported++ < 64)
+         fprintf(stderr, "[jvm] FindClass(%s): NoClassDefFoundError\n", p1);
+      jvm_throw_new(jvm, "java/lang/NoClassDefFoundError", p1);
+      return NULL;
+   }
+   return jvm_make_class(jvm, p1);
 }
 
 static jmethodID
@@ -863,13 +910,27 @@ JNIEnv_ToReflectedField(JNIEnv* p0, jclass p1, jfieldID p2, jboolean p3)
    return NULL;
 }
 
+static void jvm_clear_pending(struct jvm *jvm)
+{
+   struct jvm_exception_state *e=jvm_exception_state(jvm);
+   if (e->pending_owned) jvm_deref_object(jvm,e->pending_exception);
+   e->pending_owned=false;
+   e->pending_exception=NULL;
+   e->pending_exception_class[0]='\0';
+   e->pending_exception_msg[0]='\0';
+}
+
 static jint
 JNIEnv_Throw(JNIEnv* p0, jthrowable p1)
 {
    assert(p0 && p1);
    struct jvm *jvm = jnienv_get_jvm(p0);
+   jvm_ref_object(jvm,p1);
+   jvm_clear_pending(jvm);
    jvm_exception_state(jvm)->pending_exception = p1;
+   jvm_exception_state(jvm)->pending_owned = true;
    const char *cls = jvm_get_class_name(jvm, p1);
+   jvm_trace_pending("Throw", cls, "");
    snprintf(jvm_exception_state(jvm)->pending_exception_class, sizeof jvm_exception_state(jvm)->pending_exception_class,
             "%s", cls ? cls : "java/lang/Throwable");
    jvm_exception_state(jvm)->pending_exception_msg[0] = '\0';
@@ -884,8 +945,17 @@ JNIEnv_ThrowNew(JNIEnv* p0, jclass p1, const char* p2)
    jobject e = p0[0]->AllocObject(p0, p1);
    /* AllocObject can only fail if the class handle is bad; the exception
     * still has to become pending, so fall back to the class object itself. */
-   jvm_exception_state(jvm)->pending_exception = e ? e : (jthrowable)p1;
+   jobject root=jvm_ref_object(jvm,e ? e : (jthrowable)p1);
+   jvm_clear_pending(jvm);
+   jvm_exception_state(jvm)->pending_exception = root;
+   jvm_exception_state(jvm)->pending_owned = true;
+   if (e) {
+      jvm_meta_lock();
+      jvm_forget_local(jvm,e); jvm_deref_object(jvm,e);
+      jvm_meta_unlock();
+   }
    const char *cls = jvm_get_class_name(jvm, p1);
+   jvm_trace_pending("ThrowNew", cls, p2);
    snprintf(jvm_exception_state(jvm)->pending_exception_class, sizeof jvm_exception_state(jvm)->pending_exception_class,
             "%s", cls ? cls : "java/lang/Throwable");
    snprintf(jvm_exception_state(jvm)->pending_exception_msg, sizeof jvm_exception_state(jvm)->pending_exception_msg,
@@ -903,6 +973,8 @@ jvm_throw_new(struct jvm *jvm, const char *class_name, const char *msg)
       JNIEnv_ThrowNew(env, cls, msg);
       return;
    }
+   jvm_trace_pending("throw_new", class_name, msg);
+   jvm_clear_pending(jvm);
    jvm_exception_state(jvm)->pending_exception = (jthrowable)(uintptr_t)1;
    snprintf(jvm_exception_state(jvm)->pending_exception_class, sizeof jvm_exception_state(jvm)->pending_exception_class,
             "%s", class_name);
@@ -910,11 +982,36 @@ jvm_throw_new(struct jvm *jvm, const char *class_name, const char *msg)
             "%s", msg ? msg : "");
 }
 
+bool
+jvm_take_pending_exception(struct jvm *jvm, jthrowable *object,
+                           char *cls, size_t cls_cap, char *msg, size_t msg_cap)
+{
+   struct jvm_exception_state *e = jvm_exception_state(jvm);
+   if (!e->pending_exception)
+      return false;
+   if (object) *object = e->pending_owned
+      ? jvm_record_local(jvm,e->pending_exception) : NULL;
+   else if (e->pending_owned) jvm_deref_object(jvm,e->pending_exception);
+   e->pending_owned=false;
+   if (cls && cls_cap) {
+      snprintf(cls, cls_cap, "%s", e->pending_exception_class);
+      for (char *c = cls; *c; ++c) if (*c == '.') *c = '/';
+   }
+   if (msg && msg_cap) snprintf(msg, msg_cap, "%s", e->pending_exception_msg);
+   e->pending_exception = NULL;
+   e->pending_exception_class[0] = '\0';
+   e->pending_exception_msg[0] = '\0';
+   return true;
+}
+
 static jthrowable
 JNIEnv_ExceptionOccurred(JNIEnv* p0)
 {
    assert(p0);
-   return jvm_exception_state(jnienv_get_jvm(p0))->pending_exception;
+   struct jvm *jvm=jnienv_get_jvm(p0);
+   struct jvm_exception_state *e=jvm_exception_state(jvm);
+   return e->pending_owned
+      ? jvm_record_local(jvm,jvm_ref_object(jvm,e->pending_exception)) : NULL;
 }
 
 static void
@@ -933,9 +1030,7 @@ JNIEnv_ExceptionClear(JNIEnv* p0)
 {
    assert(p0);
    struct jvm *jvm = jnienv_get_jvm(p0);
-   jvm_exception_state(jvm)->pending_exception = NULL;
-   jvm_exception_state(jvm)->pending_exception_class[0] = '\0';
-   jvm_exception_state(jvm)->pending_exception_msg[0] = '\0';
+   jvm_clear_pending(jvm);
 }
 
 static void
@@ -945,18 +1040,152 @@ JNIEnv_FatalError(JNIEnv* p0, const char* p1)
    verbose("FatalError: %s", p1);
 }
 
-static jint
-JNIEnv_PushLocalFrame(JNIEnv* p0, jint p1)
+struct jvm_local_frame {
+   struct jvm_local_frame *prev;
+   jobject *items;
+   size_t count, capacity;
+};
+struct jvm_local_state {
+   struct jvm_local_state *next;
+   uint64_t token;
+   pthread_t host;
+   struct jvm_local_frame *top;
+};
+/* Guest tokens include the pthread generation and survive engine migration. */
+static struct jvm_local_state *jvm_local_state(struct jvm *jvm, bool create)
 {
-   assert(p0);
-   return 0;
+   uint64_t token=arm_exec_jni_thread_token ? arm_exec_jni_thread_token() : 0;
+   pthread_t host=pthread_self();
+   struct jvm_local_state *s=jvm->local_states;
+   for (;s;s=s->next)
+      if (s->token==token && (token || pthread_equal(s->host,host))) return s;
+   if (!create) return NULL;
+   s=calloc(1,sizeof *s);
+   if (!s) return NULL;
+   s->token=token; s->host=host; s->next=jvm->local_states; jvm->local_states=s;
+   return s;
+}
+static jobject jvm_record_local(struct jvm *jvm, jobject object)
+{
+   if (!object) return NULL;
+   jvm_meta_lock();
+   struct jvm_object *o=jvm_get_object(jvm,object);
+   struct jvm_local_state *s=jvm_local_state(jvm,false);
+   struct jvm_local_frame *f=s ? s->top : NULL;
+   /* Class definitions and IDs are interned metadata in this compact VM. */
+   if (!f || !o || o->type==JVM_OBJECT_CLASS || o->type==JVM_OBJECT_METHOD) {
+      jvm_meta_unlock(); return object;
+   }
+   if (f->count==f->capacity) {
+      size_t cap=f->capacity ? f->capacity*2 : 16;
+      jobject *items=cap>=f->capacity && cap<=SIZE_MAX/sizeof *items
+         ? realloc(f->items,cap*sizeof *items) : NULL;
+      if (!items) {
+         s->top=NULL; /* ThrowNew itself must not recurse into a failed frame. */
+         jvm_deref_object(jvm,object);
+         jvm_throw_new(jvm,"java/lang/OutOfMemoryError","JNI local references");
+         s->top=f; jvm_meta_unlock(); return NULL;
+      }
+      f->items=items; f->capacity=cap;
+   }
+   f->items[f->count++]=object;
+   if (o->type==JVM_OBJECT_OPAQUE) o->bridge_owned=true;
+   jvm_meta_unlock(); return object;
+}
+static void jvm_forget_local(struct jvm *jvm, jobject object)
+{
+   struct jvm_local_state *s=jvm_local_state(jvm,false);
+   for (struct jvm_local_frame *f=s ? s->top : NULL;f;f=f->prev)
+      for (size_t i=f->count;i>0;--i)
+         if (f->items[i-1]==object) { f->items[i-1]=NULL; return; }
+}
+static jint JNIEnv_PushLocalFrame(JNIEnv *env, jint capacity)
+{
+   struct jvm *jvm=jnienv_get_jvm(env);
+   if (capacity<0) return JNI_ERR;
+   jvm_meta_lock();
+   struct jvm_local_state *s=jvm_local_state(jvm,true);
+   struct jvm_local_frame *f=calloc(1,sizeof *f);
+   size_t n=capacity>16 ? (size_t)capacity : 16;
+   if (f && n<=SIZE_MAX/sizeof *f->items) {
+      f->items=calloc(n,sizeof *f->items); f->capacity=n;
+   }
+   if (!s || !f || !f->items) {
+      if (f) { free(f->items); free(f); }
+      jvm_throw_new(jvm,"java/lang/OutOfMemoryError","JNI local frame");
+      jvm_meta_unlock(); return JNI_ERR;
+   }
+   f->prev=s->top; s->top=f;
+   jvm_meta_unlock(); return JNI_OK;
+}
+static jobject JNIEnv_PopLocalFrame(JNIEnv *env, jobject result)
+{
+   struct jvm *jvm=jnienv_get_jvm(env);
+   jvm_meta_lock();
+   struct jvm_local_state *s=jvm_local_state(jvm,false);
+   struct jvm_local_frame *f=s ? s->top : NULL;
+   if (!f) { jvm_meta_unlock(); return result; }
+   /* Keep result alive before releasing any aliases in the popped frame. */
+   if (result) jvm_ref_object(jvm,result);
+   s->top=f->prev;
+   for (size_t i=f->count;i>0;--i)
+      if (f->items[i-1]) jvm_deref_object(jvm,f->items[i-1]);
+   free(f->items); free(f);
+   result=jvm_record_local(jvm,result);
+   jvm_meta_unlock(); return result;
 }
 
-static jobject
-JNIEnv_PopLocalFrame(JNIEnv* p0, jobject p1)
+/* Enter after the guest thread identity is installed, and leave before it
+ * is restored. The returned reference belongs to the calling Java bridge. */
+void *jvm_native_frame_begin(struct jvm *jvm)
 {
-   assert(p0);
-   return NULL;
+   if (JNIEnv_PushLocalFrame(&jvm->env,16)!=JNI_OK) return NULL;
+   jvm_meta_lock();
+   struct jvm_local_state *s=jvm_local_state(jvm,false);
+   void *frame=s->top;
+   jvm_meta_unlock();
+   return frame;
+}
+jobject jvm_native_frame_end(struct jvm *jvm, void *frame, jobject result)
+{
+   jvm_meta_lock();
+   struct jvm_local_state *s=jvm_local_state(jvm,false);
+   struct jvm_local_frame *f=s ? s->top : NULL;
+   while (f && f!=frame) f=f->prev;
+   if (f) {
+      /* Also unwind explicit frames left open by the native method. */
+      while (s->top!=frame) result=JNIEnv_PopLocalFrame(&jvm->env,result);
+      result=JNIEnv_PopLocalFrame(&jvm->env,result);
+   }
+   jvm_meta_unlock();
+   return result;
+}
+
+/* Bounded, opt-in ownership traces for diagnosing retained bridge locals. */
+static void jvm_trace_bridge_ref(struct jvm *jvm, jobject object, unsigned kind)
+{
+   static _Thread_local int enabled;
+   static _Thread_local unsigned counts[5];
+   static const char *const names[]={"NewGlobalRef","NewLocalRef","GetObjectArrayElement","DeleteGlobalRef","DeleteLocalRef"};
+   if (!enabled) enabled=getenv("LUNARIA_TRACE_JNI_REFS") ? 1 : -1;
+   if (enabled < 0 || !object || kind >= 5 || counts[kind] >= 8) return;
+   jvm_meta_lock();
+   struct jvm_object *o=jvm_get_object(jvm,object);
+   bool trace=o && o->type==JVM_OBJECT_OPAQUE && o->bridge_owned;
+   if (trace) {
+      ++counts[kind];
+      struct jvm_object *c=jvm_get_object(jvm,o->this_klass);
+      fprintf(stderr,"[jni-ref] %s handle=%p class=%s refs=%d array=%d global=%d\n",
+              names[kind],(void *)object,
+              c && c->type==JVM_OBJECT_CLASS ? c->klass.name.data : "?",
+              o->refs,o->array_refs,o->global_refs);
+   }
+   jvm_meta_unlock();
+   if (trace) {
+      void *frames[16];
+      int n=luna_os_backtrace(frames,16);
+      luna_os_backtrace_print(frames,n);
+   }
 }
 
 static jobject
@@ -965,7 +1194,14 @@ JNIEnv_NewGlobalRef(JNIEnv* p0, jobject p1)
    assert(p0);
    if (!p1) return NULL;
    jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
-   return jvm_ref_object(jnienv_get_jvm(p0), p1);
+   jvm_trace_bridge_ref(jnienv_get_jvm(p0),p1,0);
+   struct jvm *jvm=jnienv_get_jvm(p0);
+   jvm_meta_lock();
+   jobject result=jvm_ref_object(jvm,p1);
+   struct jvm_object *o=jvm_get_object(jvm,p1);
+   if (o && o->type != JVM_OBJECT_NONE) ++o->global_refs;
+   jvm_meta_unlock();
+   return result;
 }
 
 static void
@@ -973,7 +1209,13 @@ JNIEnv_DeleteGlobalRef(JNIEnv* p0, jobject p1)
 {
    assert(p0);
    jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
-   jvm_deref_object(jnienv_get_jvm(p0), p1);
+   jvm_trace_bridge_ref(jnienv_get_jvm(p0),p1,3);
+   struct jvm *jvm=jnienv_get_jvm(p0);
+   jvm_meta_lock();
+   struct jvm_object *o=jvm_get_object(jvm,p1);
+   if (o && o->global_refs > 0) --o->global_refs;
+   jvm_deref_object(jvm,p1);
+   jvm_meta_unlock();
 }
 
 static void
@@ -981,7 +1223,11 @@ JNIEnv_DeleteLocalRef(JNIEnv* p0, jobject p1)
 {
    assert(p0);
    jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
+   jvm_trace_bridge_ref(jnienv_get_jvm(p0),p1,4);
+   jvm_meta_lock();
+   jvm_forget_local(jnienv_get_jvm(p0),p1);
    jvm_deref_object(jnienv_get_jvm(p0), p1);
+   jvm_meta_unlock();
 }
 
 static jboolean
@@ -1000,7 +1246,8 @@ JNIEnv_NewLocalRef(JNIEnv* p0, jobject p1)
     * pending, so asserting here aborted the process on a normal code path. */
    if (!p1) return NULL;
    jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
-   return jvm_ref_object(jnienv_get_jvm(p0), p1);
+   jvm_trace_bridge_ref(jnienv_get_jvm(p0),p1,1);
+   return jvm_record_local(jnienv_get_jvm(p0),jvm_ref_object(jnienv_get_jvm(p0), p1));
 }
 
 static jint
@@ -1124,8 +1371,19 @@ JNIEnv_GetObjectClass(JNIEnv* env, jobject p1)
 static jboolean
 JNIEnv_IsInstanceOf(JNIEnv* p0, jobject p1, jclass p2)
 {
-   assert(p0 && p1 && p2);
+   assert(p0 && p2);
+   /* JNI permits a null object: it can be cast to every reference class. */
+   if (!p1) return JNI_TRUE;
    verbose("%u, %u", (uint32_t)(uintptr_t)p1, (uint32_t)(uintptr_t)p2);
+   {
+      struct jvm_object *po = jvm_get_object(jnienv_get_jvm(p0), p1);
+      if (!po || !po->this_klass || po->type == JVM_OBJECT_NONE) {
+         fprintf(stderr, "[jvm] IsInstanceOf: handle %p is %s (type %d, class handle %p); class arg %p\n",
+                 (void *)p1, po && po->type != JVM_OBJECT_NONE ? "classless" : "a released slot",
+                 po ? (int)po->type : -1, po ? (void *)po->this_klass : NULL, (void *)p2);
+         abort();
+      }
+   }
    const char *oc = jvm_get_object(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1)->this_klass)->klass.name.data;
    const char *tc = jvm_get_object(jnienv_get_jvm(p0), p2)->klass.name.data;
    verbose("%s instanceof %s", oc, tc);
@@ -1287,6 +1545,11 @@ static void*
 jvm_wrap_method_uncached(struct jvm *jvm, jmethodID method_id)
 {
    char symbol[255];
+   {
+      struct jvm_object *mo = jvm_get_object(jvm, method_id);
+      if (!mo || mo->type != JVM_OBJECT_METHOD)
+         fprintf(stderr, "[jvm] DIAG method id %p is type %d\n", (void*)method_id, mo ? (int)mo->type : -1);
+   }
    struct jvm_method method = jvm_get_object_of_type(jvm, method_id, JVM_OBJECT_METHOD)->method;
    jvm_form_symbol(jvm, &method, symbol, sizeof(symbol));
 
@@ -1570,8 +1833,18 @@ static void
 JNIEnv_CallNonvirtualVoidMethodV(JNIEnv* p0, jobject p1, jclass p2, jmethodID p3, va_list p4)
 {
    assert(p0 && p1 && p2 && p3);
-   union { jobject (*fun)(JNIEnv*, jobject, jclass, va_list); void *ptr; } f;
-   if ((f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), p2)))
+   union { void (*fun)(JNIEnv*, jobject, jclass, va_list); void *ptr; } f;
+   f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), p3);
+   if (!f.ptr || dvm_jni_mode() == DVM_JNI_PREFER) {
+      jvalue rv;
+      va_list copy;
+      va_copy(copy, p4);
+      bool done = jvm_dvm_try(p0, p1, p3, false, &copy, NULL, &rv);
+      va_end(copy);
+      if (done)
+         return;
+   }
+   if (f.ptr)
       f.fun(p0, p1, p2, p4);
 }
 
@@ -1588,7 +1861,12 @@ static void
 JNIEnv_CallNonvirtualVoidMethodA(JNIEnv* p0, jobject p1, jclass p2, jmethodID p3, jvalue* p4)
 {
    assert(p0 && p1 && p2 && p3);
-   void *fp = jvm_wrap_method(jnienv_get_jvm(p0), p2);
+   void *fp = jvm_wrap_method(jnienv_get_jvm(p0), p3);
+   if (!fp || dvm_jni_mode() == DVM_JNI_PREFER) {
+      jvalue rv;
+      if (jvm_dvm_try(p0, p1, p3, false, NULL, p4, &rv))
+         return;
+   }
    if (fp)
       (void)JVM_CALL_NV_A(fp, jobject, p0, p1, p2, p4);
 }
@@ -1742,7 +2020,10 @@ jvm_set_field_bits(struct jvm *jvm, jobject object, jfieldID field, uint64_t bit
 static void
 jvm_report_field_access(JNIEnv *env, jobject object, jfieldID field, const char *op)
 {
-   if (env && object && field)
+   static int trace = -1;
+   if (trace < 0)
+      trace = getenv("LUNARIA_TRACE_JNIFIELD") != NULL;
+   if (env && object && field && !trace)
       return;
    const char *klass = "?", *name = "?";
    if (env && field) {
@@ -1753,6 +2034,10 @@ jvm_report_field_access(JNIEnv *env, jobject object, jfieldID field, const char 
          struct jvm_object *k = jvm_get_object_of_type(jvm, m->method.klass, JVM_OBJECT_CLASS);
          if (k && k->klass.name.data) klass = k->klass.name.data;
       }
+   }
+   if (env && object && field) {
+      fprintf(stderr, "[jvm] %s %s.%s on %p\n", op, klass, name, (void *)object);
+      return;
    }
    fprintf(stderr, "[jvm] %s %s.%s: %s%s%s is NULL\n", op, klass, name,
            env ? "" : "env ", object ? "" : "object ", field ? "" : "field ");
@@ -1850,6 +2135,45 @@ gen_jnienv_property(Int, jint, 0, 0)
 gen_jnienv_property(Long, jlong, 0, 0)
 gen_jnienv_property(Float, jfloat, 0, 0)
 gen_jnienv_property(Double, jdouble, 0, 0)
+
+/* LUNARIA_TRACE_JNIFIELD also reports what a reference field read produced:
+ * the handle, and the class it carries. */
+static void
+jvm_trace_field_result(JNIEnv *env, jobject holder, jfieldID field, jobject value)
+{
+   static int on = -1;
+   if (on < 0) on = getenv("LUNARIA_TRACE_JNIFIELD") != NULL;
+   if (!on) return;
+   struct jvm *jvm = jnienv_get_jvm(env);
+   const char *cls = "-";
+   if (value) {
+      struct jvm_object *vo = jvm_get_object(jvm, value);
+      struct jvm_object *ko = vo && vo->this_klass ? jvm_get_object(jvm, vo->this_klass) : NULL;
+      if (ko && ko->type == JVM_OBJECT_CLASS && ko->klass.name.data) cls = ko->klass.name.data;
+      if (vo && vo->type == JVM_OBJECT_CLASS && vo->klass.name.data)
+         fprintf(stderr, "[jvm]   -> %p (a Class object for %s)\n", (void *)value, vo->klass.name.data);
+      else
+         fprintf(stderr, "[jvm]   -> %p (instance of %s)\n", (void *)value, cls);
+   } else
+      fprintf(stderr, "[jvm]   -> null\n");
+   (void)holder; (void)field;
+}
+
+static jobject
+JNIEnv_GetObjectField_traced(JNIEnv *p0, jclass p1, jfieldID p2)
+{
+   jobject v = JNIEnv_GetObjectField(p0, p1, p2);
+   jvm_trace_field_result(p0, p1, p2, v);
+   return v;
+}
+
+static jobject
+JNIEnv_GetStaticObjectField_traced(JNIEnv *p0, jclass p1, jfieldID p2)
+{
+   jobject v = JNIEnv_GetStaticObjectField(p0, p1, p2);
+   jvm_trace_field_result(p0, p1, p2, v);
+   return v;
+}
 
 static jmethodID
 jvm_make_method(struct jvm *jvm, jclass klass, const char *name, const char *sig)
@@ -2148,7 +2472,8 @@ JNIEnv_GetObjectArrayElement(JNIEnv* p0, jobjectArray p1, jsize p2)
       result = jvm_ref_object(jvm, ((jobject*)obj->array.data)[p2]);
    else jvm_throw_new(jvm, "java/lang/ArrayIndexOutOfBoundsException", "array index");
    jvm_meta_unlock();
-   return result;
+   if (result) jvm_trace_bridge_ref(jvm,result,2);
+   return jvm_record_local(jvm,result);
 }
 
 static void
@@ -2560,7 +2885,11 @@ static jboolean
 JNIEnv_ExceptionCheck(JNIEnv* p0)
 {
    assert(p0);
-   return jvm_exception_state(jnienv_get_jvm(p0))->pending_exception ? JNI_TRUE : JNI_FALSE;
+   struct jvm_exception_state *e = jvm_exception_state(jnienv_get_jvm(p0));
+   if (e->pending_exception)
+      jvm_trace_pending("ExceptionCheck(pending)", e->pending_exception_class,
+                        e->pending_exception_msg);
+   return e->pending_exception ? JNI_TRUE : JNI_FALSE;
 }
 
 static jobject
@@ -2723,7 +3052,7 @@ env_init(JNIEnv *env, struct JNINativeInterface *native)
    native->CallNonvirtualVoidMethodV = WRAP(JNIEnv_CallNonvirtualVoidMethodV);
    native->CallNonvirtualVoidMethodA = WRAP(JNIEnv_CallNonvirtualVoidMethodA);
    native->GetFieldID = WRAP(JNIEnv_GetFieldID);
-   native->GetObjectField = WRAP(JNIEnv_GetObjectField);
+   native->GetObjectField = WRAP(JNIEnv_GetObjectField_traced);
    native->GetBooleanField = WRAP(JNIEnv_GetBooleanField);
    native->GetByteField = WRAP(JNIEnv_GetByteField);
    native->GetCharField = WRAP(JNIEnv_GetCharField);
@@ -2773,7 +3102,7 @@ env_init(JNIEnv *env, struct JNINativeInterface *native)
    native->CallStaticVoidMethodV = WRAP(JNIEnv_CallStaticVoidMethodV);
    native->CallStaticVoidMethodA = WRAP(JNIEnv_CallStaticVoidMethodA);
    native->GetStaticFieldID = WRAP(JNIEnv_GetStaticFieldID);
-   native->GetStaticObjectField = WRAP(JNIEnv_GetStaticObjectField);
+   native->GetStaticObjectField = WRAP(JNIEnv_GetStaticObjectField_traced);
    native->GetStaticBooleanField = WRAP(JNIEnv_GetStaticBooleanField);
    native->GetStaticByteField = WRAP(JNIEnv_GetStaticByteField);
    native->GetStaticCharField = WRAP(JNIEnv_GetStaticCharField);
@@ -2998,6 +3327,15 @@ jvm_release(struct jvm *jvm)
       return;
 
    dvm_prefs_finish(dvm_jni_vm());
+   while (jvm->local_states) {
+      struct jvm_local_state *s=jvm->local_states; jvm->local_states=s->next;
+      while (s->top) {
+         struct jvm_local_frame *f=s->top; s->top=f->prev;
+         free(f->items); free(f);
+      }
+      free(s);
+   }
+
 
    for (size_t i = 0; i < ARRAY_SIZE(jvm->objects); ++i)
       jvm_object_release(&jvm->objects[i]);

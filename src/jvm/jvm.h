@@ -233,6 +233,8 @@ struct jvm_object {
     * once that native call returns (jvm_release_bridge_local). */
    int refs;
    int array_refs; /* Strong array edges, excluded from JNI-local ownership. */
+   int global_refs; /* JNI global ownership, included in refs. */
+   bool bridge_owned; /* Opaque bridge instances are reclaimable at zero refs. */
 
    /* JNI MonitorEnter/Exit state.  Access is serialized by the bridge's
     * monitor mutex; the small owner token avoids depending on pthread_t's
@@ -246,7 +248,9 @@ struct jvm_native_method {
    void *function;
 };
 
+struct jvm_local_state;
 struct jvm {
+   struct jvm_local_state *local_states;
    // [0] object is created on `jvm_init` and it's a class object for defining the class of a class
    // every class object's `this_class` member points back to [0], causing recursion.
    // Every other object or class definition is created lazily as needed, only [0] is special.
@@ -316,6 +320,11 @@ struct jvm {
 /* Raise a JNI exception of `class_name` ("java/lang/ClassNotFoundException")
  * with `msg`, as ThrowNew would.  Safe to call from the JNI stubs. */
 void jvm_throw_new(struct jvm *jvm, const char *class_name, const char *msg);
+/* The calling thread's pending exception, cleared as it is taken.  False when
+ * nothing is pending.  `cls` is its slash-separated class name. */
+bool jvm_take_pending_exception(struct jvm *jvm, jthrowable *object,
+                                char *cls, size_t cls_cap,
+                                char *msg, size_t msg_cap);
 
 /* Internal Java string transfer. Both VMs use WTF-8 with an explicit byte
  * length; JNI modified UTF-8 is converted only at the native API boundary. */
@@ -353,6 +362,9 @@ jvm_release(struct jvm *jvm);
 /* Drop a JNI local created solely for a Java-to-native bridge call.  The
  * bridge clears its DVM mapping first.  A global reference keeps the handle
  * alive; otherwise even an opaque instance can be reclaimed. */
+void jvm_mark_bridge_local(struct jvm *jvm, jobject object);
+void *jvm_native_frame_begin(struct jvm *jvm);
+jobject jvm_native_frame_end(struct jvm *jvm, void *frame, jobject result);
 bool jvm_release_bridge_local(struct jvm *jvm, jobject object);
 int jvm_bridge_ref_count(struct jvm *jvm, jobject object);
 

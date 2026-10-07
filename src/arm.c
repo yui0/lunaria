@@ -6,6 +6,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 #include "arm.h"
+#include "lunaria_os.h"
 
 #include <pthread.h>
 #include <sched.h>
@@ -33,6 +34,27 @@
  * Recursion depth lives in a thread-local, so the two operations on the hot
  * path that do not change the owner — a recursive acquire and asking whether
  * this thread holds it — need no mutex at all. */
+/* A hand-off to a thread that is already asleep costs a futex wake, a trip
+ * through the kernel scheduler and the wake-up latency of the sleeper: tens of
+ * microseconds, and with several engines asking for the lock thousands of times a
+ * second that was a quarter of the process's CPU.  Most holds are far shorter
+ * than that (an SVC does a few microseconds of work), so a waiter spins on its own
+ * flag for a short while first; the releaser sets the flag and only enters the
+ * kernel for a waiter that really did go to sleep.  The order of the queue, and
+ * so the fairness argument above, is unchanged: the lock still goes to the head
+ * waiter and to nobody else. */
+#define ARM_LOCK_SPIN_NS 15000ull
+static int g_spin_ok = -1;         /* spinning only helps with a core to spare */
+
+static inline void arm_cpu_relax(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+   __builtin_ia32_pause();
+#elif defined(__aarch64__)
+   __asm__ __volatile__("yield");
+#endif
+}
+
 static pthread_mutex_t g_m = PTHREAD_MUTEX_INITIALIZER;
 static bool            g_locked;   /* someone owns it */
 /* Read without the mutex by arm_lock_yield() on the hot path, so it is an
@@ -44,7 +66,8 @@ static __thread unsigned t_depth;  /* this thread's recursion depth */
 struct arm_lock_waiter {
    pthread_cond_t          cv;
    struct arm_lock_waiter *next;
-   bool                    go;     /* the lock has been handed to me */
+   _Atomic bool            go;       /* the lock has been handed to me */
+   bool                    sleeping; /* parked on cv; read and written under g_m */
 };
 static struct arm_lock_waiter *g_head, *g_tail;
 
@@ -130,34 +153,56 @@ void arm_lock_acquire(void)
    if (!g_locked && !g_head) {
       g_locked = true;
       clock_gettime(CLOCK_MONOTONIC, &g_held_since);
+      pthread_mutex_unlock(&g_m);
    } else {
-      /* The releaser only touches the node while holding g_m, and this thread
-       * does not return from the wait until it has been dequeued under the
-       * same mutex, so the node is free again by the time we leave. */
+      /* The releaser only touches the node while holding g_m and only reaches
+       * for the condition variable of a node marked sleeping, and this thread
+       * does not queue again before it has been dequeued, so the node is free
+       * again by the time we leave. */
       struct arm_lock_waiter *w = &t_waiter;
       if (!t_waiter_ready) {
          pthread_cond_init(&w->cv, NULL);
          t_waiter_ready = true;
       }
       w->next = NULL;
-      w->go   = false;
+      atomic_store_explicit(&w->go, false, memory_order_relaxed);
+      w->sleeping = false;
       if (g_tail) g_tail->next = w; else g_head = w;
       g_tail = w;
       atomic_fetch_add_explicit(&g_waiters, 1u, memory_order_relaxed);
+      pthread_mutex_unlock(&g_m);
       const unsigned long long t0 = arm_now_ns();
-      while (!w->go)
-         pthread_cond_wait(&w->cv, &g_m);
+      if (g_spin_ok < 0)
+         g_spin_ok = luna_os_cpu_count() > 2;
+      if (g_spin_ok) {
+         for (unsigned n = 0;
+              !atomic_load_explicit(&w->go, memory_order_acquire); ++n) {
+            arm_cpu_relax();
+            if ((n & 127u) == 127u && arm_now_ns() - t0 > ARM_LOCK_SPIN_NS)
+               break;
+         }
+      }
+      if (!atomic_load_explicit(&w->go, memory_order_acquire)) {
+         pthread_mutex_lock(&g_m);
+         while (!atomic_load_explicit(&w->go, memory_order_acquire)) {
+            w->sleeping = true;
+            pthread_cond_wait(&w->cv, &g_m);
+         }
+         w->sleeping = false;
+         pthread_mutex_unlock(&g_m);
+      }
       const unsigned long long waited = arm_now_ns() - t0;
       atomic_fetch_add_explicit(&g_wait_ns, waited, memory_order_relaxed);
       unsigned long long worst =
          atomic_load_explicit(&g_max_wait_ns, memory_order_relaxed);
-      /* Only g_m holders get here, so a plain compare-and-store is enough. */
-      if (waited > worst)
-         atomic_store_explicit(&g_max_wait_ns, waited, memory_order_relaxed);
+      while (waited > worst &&
+             !atomic_compare_exchange_weak_explicit(
+                 &g_max_wait_ns, &worst, waited,
+                 memory_order_relaxed, memory_order_relaxed))
+         ;
       atomic_fetch_sub_explicit(&g_waiters, 1u, memory_order_relaxed);
       /* g_locked stayed true: the releaser handed ownership straight over. */
    }
-   pthread_mutex_unlock(&g_m);
    /* The label belongs to this acquisition, not to the thread.  It used to
     * persist, so every acquire that never set one -- a scheduler pass, a guest
     * callback, any internal helper that just takes the lock -- was charged to
@@ -207,9 +252,13 @@ void arm_lock_release(void)
    if (w) {
       g_head = w->next;
       if (!g_head) g_tail = NULL;
-      w->go = true;
       g_held_since = now;          /* handed straight over: still held */
-      pthread_cond_signal(&w->cv);
+      /* After the store the waiter may run on without g_m, so everything that
+       * needs the node is done before it. */
+      const bool asleep = w->sleeping;
+      atomic_store_explicit(&w->go, true, memory_order_release);
+      if (asleep)
+         pthread_cond_signal(&w->cv);
    } else {
       g_locked = false;
    }

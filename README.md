@@ -468,7 +468,8 @@ files in `keymaps/*.conf`, adjust the coordinates, and load it with
 `lunaria.conf`. Set `LUNARIA_KEYMAP=off` to disable keyboard mapping.
 
 ```text
-stick 0.15625 0.764 0.09
+stick 0.15625 0.764 0.18
+walk CTRL 0.04
 button SPACE 0.922 0.665
 button F 0.826 0.769
 ```
@@ -477,9 +478,11 @@ button F 0.826 0.769
 by WASD. `button` maps a key to an X/Y touch position. X and Y are normalized
 coordinates from 0 to 1 relative to the screen width and height; the stick radius
 is relative to the shorter screen dimension.
+`walk` selects a smaller stick radius while the named key is held with WASD.
+The Genshin layout uses WASD to run and Ctrl+WASD to walk.
 
 Up to eight buttons can be mapped. Supported keys are uppercase letters, digits,
-`SPACE`, and `SHIFT`. The bundled layouts are tuned for landscape HUDs, so adjust
+`SPACE`, `SHIFT`, and `CTRL`. The bundled layouts are tuned for landscape HUDs, so adjust
 the coordinates if you change the HUD size or placement.
 
 ## Capture frames

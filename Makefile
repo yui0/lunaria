@@ -115,12 +115,13 @@ LUNARIA_LIBDIRS   = -L.
 OPENH264_SO       = runtime/libopenh264.dylib
 OPENH264_ARCH    ?= mac-arm64
 OPENH264_URL      = https://ciscobinary.openh264.org/libopenh264-$(OPENH264_VERSION)-$(OPENH264_ARCH).dylib.bz2
-PTHREAD_SRC       = src/lib/runtime_svc.c
+PTHREAD_SRC       = src/lib/stub.c
+PTHREAD_CPPFLAGS  = -DLUNARIA_STUB_SVC_RUNTIME
 # Android libc calls are handled by arm_exec's guest ABI on macOS too.  The
 # Linux libc shim uses Linux syscalls and signal layouts and cannot be built
 # against the macOS SDK.
-LIBC_SRC          = src/lib/runtime_svc.c
-LIBC_CPPFLAGS     = -DLUNARIA_SVC_LIBC
+LIBC_SRC          = src/lib/stub.c
+LIBC_CPPFLAGS     = -DLUNARIA_STUB_SVC_RUNTIME -DLUNARIA_SVC_LIBC
 LIBC_HEADERS      =
 HOST_AUDIO_LIBS   =
 HOST_BIONIC_LIBC  =
@@ -159,9 +160,10 @@ endif
 
 ifneq (,$(filter src/lunaria_windows.c,$(LUNA_OS_SRC)))
 # Guest synchronization runs in the emulator's SVC scheduler, as on macOS.
-PTHREAD_SRC = src/lib/runtime_svc.c
-LIBC_SRC = src/lib/runtime_svc.c
-LIBC_CPPFLAGS = -DLUNARIA_SVC_LIBC
+PTHREAD_SRC = src/lib/stub.c
+PTHREAD_CPPFLAGS = -DLUNARIA_STUB_SVC_RUNTIME
+LIBC_SRC = src/lib/stub.c
+LIBC_CPPFLAGS = -DLUNARIA_STUB_SVC_RUNTIME -DLUNARIA_SVC_LIBC
 LIBC_HEADERS =
 HOST_LIBC_LIBS =
 HOST_LIBC_LDFLAGS =
@@ -398,7 +400,7 @@ arm64-v8a:
 runtime/libpthread.so: $(PTHREAD_SRC)
 	mkdir -p runtime
 	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE $(LDFLAGS) \
-	    $(HOST_SO_LDFLAGS) -shared $(PTHREAD_SRC) -lpthread $(HOST_RT_LIBS) -o $@
+	    $(HOST_SO_LDFLAGS) -shared $(PTHREAD_CPPFLAGS) $(PTHREAD_SRC) -lpthread $(HOST_RT_LIBS) -o $@
 
 runtime/libdl.so: src/trace.h src/linker/dlfcn.c src/linker/linker.c src/linker/linker_environ.c src/linker/rt.c src/linker/strlcpy.c
 	mkdir -p runtime
@@ -440,7 +442,7 @@ DVM_SRC = src/luna_unicode.c src/dvm/dex.c src/dvm/dvm.c src/dvm/dvm_runtime.c s
           src/webview_cdp.c $(WEBVIEW_CDP_HOST_SRC)
 DVM_HDR = src/luna_unicode.h src/unicode/character_data.h src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
           src/dvm/dvm_net.h src/lunaria_os.h src/dvm/dvm_media.h \
-          src/dvm/regex.h src/dvm/charset.h  \
+          src/dvm/regex.h src/dvm/charset.h src/dvm/locale_names.h \
           src/webview_cdp.h
 
 # The Dalvik bytecode emulator lives in libjvm.so: it is reached from jvm.c
@@ -485,7 +487,7 @@ $(BUILD_DIR)/luna_fnmatch.o: src/lib/musl/fnmatch.c src/lunaria_os.h src/luna_un
 
 # arm_exec.o: compiled with C++20 and dynarmic headers; linked into lunaria
 $(BUILD_DIR)/arm_exec.o: | $(BUILD_DIR)
-$(BUILD_DIR)/arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/lunaria_os.h src/luna_host.h src/luna_boot.h      src/luna_input.h src/arm.h src/luna_guest_vm.h src/svc_ids.h src/lib/guest.c src/jvm/jvm.h src/binary128.h src/linker64.h src/trace.h $(DYNARMIC_LIB)
+$(BUILD_DIR)/arm_exec.o: src/arm_exec.cpp src/arsc_bag.h src/arm_exec.h src/lunaria_os.h src/luna_host.h src/luna_boot.h      src/luna_input.h src/arm.h src/svc_ids.h src/lib/guest.c src/jvm/jvm.h src/binary128.h src/linker64.h src/trace.h $(DYNARMIC_LIB)
 	$(CXX) -std=c++20 $(OPTFLAGS) -fPIC \
 	    $(SANITIZE) \
 	    $(DYNARMIC_INCS) \
@@ -526,7 +528,7 @@ $(BUILD_DIR)/linker64.o: src/linker64.c src/linker64.h
 # the ARM execution lock; anything else neither path owns alone belongs here
 # rather than in a file of its own.
 $(BUILD_DIR)/arm.o: | $(BUILD_DIR)
-$(BUILD_DIR)/arm.o: src/arm.c src/arm.h
+$(BUILD_DIR)/arm.o: src/arm.c src/arm.h src/lunaria_os.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -c src/arm.c -o $@
 
 # Standalone C11 check of the table read by concurrent JIT translators.
@@ -1823,8 +1825,8 @@ test/test_motion_event: test/motion_event_test.c test/dvm_host_fixture.c runtime
 	$(CC) -std=c11 -g -O1 -D_GNU_SOURCE $(CPPFLAGS) -Isrc $(HOST_EXPORT) \
 	    test/motion_event_test.c test/dvm_host_fixture.c runtime/libjvm.so $(LUNA_OS_OBJ) \
 	    -Wl,-rpath,'$$ORIGIN/../runtime' $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_SYSTEM_DL_LIBS) -o $@
-motion-event-test: test/test_motion_event
-	./test/test_motion_event
+motion-event-test: test/test_motion_event test/abi_pkg/classes.dex
+	ANDROID_PACKAGE_CODE_PATH="$(abspath test/abi_pkg)" ./test/test_motion_event
 
 test/libkeymapguest.so: test/keymap_guest_test.c src/jvm/jni.h
 	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) $< -o $@
@@ -1854,7 +1856,7 @@ HOST_MEMORY_TEST = $(BUILD_DIR)/test_host_memory$(HOST_TEST_EXE_SUFFIX)
 ifneq (,$(filter src/lunaria_windows.c,$(LUNA_OS_SRC)))
 HOST_OS_TEST_LIBS = $(HOST_NATIVE_LIBS)
 endif
-$(HOST_MEMORY_TEST): test/host_memory_test.c src/lunaria_os.h src/luna_guest_vm.h $(LUNA_OS_OBJ)
+$(HOST_MEMORY_TEST): test/host_memory_test.c src/lunaria_os.h $(LUNA_OS_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE test/host_memory_test.c $(LUNA_OS_OBJ) \
 	    $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_SYSTEM_DL_LIBS) \
 	    $(HOST_CHARSET_LIBS) $(HOST_OS_TEST_LIBS) -lpthread -o $@
@@ -2032,3 +2034,10 @@ $(BUILD_DIR)/test_ui_lifecycle: test/ui_lifecycle_test.c $(LUNA_UI_DIR)/luna-ui.
 .PHONY: ui-lifecycle-test
 ui-lifecycle-test: $(BUILD_DIR)/test_ui_lifecycle
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/test_ui_lifecycle
+
+.PHONY: arsc-bag-test
+arsc-bag-test: test/test_arsc_bag
+	./test/test_arsc_bag
+
+test/test_arsc_bag: test/arsc_bag_test.c src/arsc_bag.h
+	$(CC) -std=c11 -Wall -Wextra -Werror -Isrc $< -o $@

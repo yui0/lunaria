@@ -205,6 +205,8 @@ static void bridge_record(jobject handle, dvm_ref source, bool direct)
 {
    struct bridge_frame *f = g_bridge_frame;
    if (!f || !handle) return;
+   JNIEnv *env = current_env();
+   if (env) jvm_mark_bridge_local(jnienv_get_jvm(env), handle);
    if (f->count == f->capacity) {
       size_t cap = f->capacity ? f->capacity * 2 : 16;
       struct bridge_local *p = realloc(f->locals, cap * sizeof *p);
@@ -237,22 +239,19 @@ static bool bridge_release_one(struct dvm *vm, JNIEnv *env, struct jvm *jvm,
 static void bridge_end(struct dvm *vm, JNIEnv *env, struct bridge_frame *f)
 {
    struct jvm *jvm = jnienv_get_jvm(env);
-   /* A retained array may still point to any of its converted elements.
-    * Keep the entire group when native code made a global reference. */
-   bool retained = false;
-   for (size_t i = 0; i < f->count; ++i)
-      if (!f->locals[i].direct &&
-          jvm_bridge_ref_count(jvm, f->locals[i].handle) > 1)
-         retained = true;
    size_t released = 0;
-   for (size_t i = f->count; i > 0; --i) {
-      const struct bridge_local *local = &f->locals[i - 1];
-      /* A global object array can retain any converted element.  Direct
-       * buffers are independent and can always release their own local. */
-      if (retained && !local->direct &&
-          jvm_bridge_ref_count(jvm, local->handle) <= 1) continue;
-      if (bridge_release_one(vm, env, jvm, local)) ++released;
-   }
+   /* Every local the frame made is released, newest first.  An object array keeps
+    * its own strong edge to each element (see jvm_array_release_refs), so an
+    * element's local reference is not what keeps it alive, and a handle that
+    * something else still references (a global reference native code took, an
+    * interned object another array holds) only loses this frame's reference
+    * (bridge_release_one).  This used to keep the whole frame whenever any one
+    * handle had more than one reference — which happens for every Long that
+    * interns onto an existing object — and so leaked every handle of such a
+    * call: an Object[]{Long} passed to a native a few hundred thousand times
+    * filled the 65,536-entry object table and the process aborted. */
+   for (size_t i = f->count; i > 0; --i)
+      if (bridge_release_one(vm, env, jvm, &f->locals[i - 1])) ++released;
    if (released) {
       static unsigned long long total;
       unsigned long long before = total;
@@ -386,7 +385,10 @@ static dvm_ref host_array_to_dvm(struct dvm *vm, JNIEnv *env, jobject o)
          if (el) (*env)->DeleteLocalRef(env, el);
       }
       struct dvm_object *ao = r ? dvm__obj(vm, r) : NULL;
-      if (ao) ao->host_handle = (uint32_t)(uintptr_t)o;
+      if (ao) {
+         /* The identity-bound VM array outlives the native return local. */
+         ao->host_handle = (uint32_t)(uintptr_t)(*env)->NewGlobalRef(env,o);
+      }
       return r;
    }
 
@@ -977,10 +979,41 @@ static void dvm_fill_registered_application_info(
    (void)dvm_set_field(vm, ai, "nativeLibraryDir", "Ljava/lang/String;", v);
 }
 
+static bool hook_call_external_inner(void *user, struct dvm *vm, const char *class_name,
+                                     const char *method, const char *sig, dvm_ref self,
+                                     const union dvm_value *args, int nargs,
+                                     union dvm_value *out);
+
+/* A call from bytecode into the host's Java stub layer converts every argument
+ * into a host handle (an Object[] becomes a host array with a handle per element,
+ * a boxed Long a host Long).  Those handles are locals of this call: nothing
+ * released them, so a loop that logs or formats a value (Long in an Object[]) filled
+ * the 65,536-entry object table in a few minutes of play and the process aborted
+ * ("jvm object limit reached").  Collect them in a bridge frame and release them when the call
+ * returns, exactly as a call into guest native code does (hook_call_native). A stub
+ * that keeps an argument beyond the call has to hold its own global reference, which
+ * bridge_end() honours. */
 static bool hook_call_external(void *user, struct dvm *vm, const char *class_name,
                                const char *method, const char *sig, dvm_ref self,
                                const union dvm_value *args, int nargs,
                                union dvm_value *out)
+{
+   JNIEnv *env = current_env();
+   if (!env)
+      return hook_call_external_inner(user, vm, class_name, method, sig, self,
+                                      args, nargs, out);
+   struct bridge_frame frame = { .prev = g_bridge_frame };
+   g_bridge_frame = &frame;
+   const bool ok = hook_call_external_inner(user, vm, class_name, method, sig,
+                                            self, args, nargs, out);
+   bridge_end(vm, env, &frame);
+   return ok;
+}
+
+static bool hook_call_external_inner(void *user, struct dvm *vm, const char *class_name,
+                                     const char *method, const char *sig, dvm_ref self,
+                                     const union dvm_value *args, int nargs,
+                                     union dvm_value *out)
 {
    (void)user;
    /* Activity.runOnUiThread(Runnable) posts to Android's main Looper.  Lunaria
@@ -1416,10 +1449,38 @@ static bool hook_call_native(void *user, struct dvm *vm, const char *class_name,
       case 'J': out->j = ret.j; break;
       case 'F': out->f = ret.f; break;
       case 'D': out->d = ret.d; break;
-      default:  out->l = from_jobject(vm, env, ret.l); break;
+      default:
+         out->l = from_jobject(vm, env, ret.l);
+         /* Native return promotion gives this bridge one local reference.
+          * Wrappers retain their own global; strings/primitive arrays copy. */
+         if (ret.l) (*env)->DeleteLocalRef(env,ret.l);
+         break;
    }
    bridge_end(vm, env, &frame);
    return true;
+}
+
+/* A native method returned with an exception pending: JNI raises it in the
+ * caller.  An exception that began as a VM object (native code caught what a
+ * Java call threw and handed it back with Throw) is that same object; one the
+ * native made itself (ThrowNew) is built here from its class and message. */
+static dvm_ref hook_take_pending_exception(void *user, struct dvm *vm)
+{
+   (void)user;
+   JNIEnv *env = current_env();
+   if (!env) return 0;
+   jthrowable object = NULL;
+   char cls[128], msg[256];
+   if (!jvm_take_pending_exception(jnienv_get_jvm(env), &object, cls, sizeof cls,
+                                   msg, sizeof msg))
+      return 0;
+   dvm_ref ex = object ? find_wrapper((uint32_t)(uintptr_t)object) : 0;
+   if (object) (*env)->DeleteLocalRef(env,object);
+   if (ex) return ex;
+   dvm__throw(vm, cls[0] ? cls : "java/lang/RuntimeException", "%s", msg);
+   ex = vm->exception;
+   dvm_clear_exception(vm);
+   return ex;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -1538,6 +1599,7 @@ static struct dvm *vm_get(void)
       .new_external = hook_new_external,
       .get_external_static = hook_get_external_static,
       .call_native = hook_call_native,
+      .take_pending_exception = hook_take_pending_exception,
       .load_library = hook_load_library,
    };
    g_vm = dvm_create(&hooks);
@@ -1929,6 +1991,54 @@ bool dvm_jni_class_in_dex(const char *class_name)
    struct dvm *vm = vm_get();
    unsigned cookie = dvm_gil_enter_from_guest(vm);
    bool r = dvm_jni_class_in_dex_locked(class_name);
+   dvm_gil_leave_to_guest(vm, cookie);
+   return r;
+}
+
+/* PackageManager.getPackageInfo() asked from native code.  The VM builds the
+ * PackageInfo a device answers with — signing certificates, versions, splits,
+ * permissions — and native code reads those off the handle with the same
+ * Get<Type>Field calls bytecode would use as plain field reads.  Returns NULL
+ * with NameNotFoundException pending when the package is not one this device
+ * has, as the platform does. */
+jobject dvm_jni_package_info(JNIEnv *env, jstring name, jint flags)
+{
+   struct dvm *vm = vm_get();
+   if (!vm || !env) return NULL;
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   JNIEnv *saved = g_env;
+   g_env = env;
+   union dvm_value args[2] = { { .l = from_jobject(vm, env, name) },
+                               { .i = flags } };
+   union dvm_value out = { 0 };
+   jobject result = NULL;
+   /* No bridge frame: the handle returned is the caller's local reference, and
+    * a frame would release it on the way out. */
+   const bool handled = hook_call_external_inner(
+      NULL, vm, "android/content/pm/PackageManager", "getPackageInfo",
+      "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;", 0, args, 2, &out);
+   if (handled && !vm->exception && out.l)
+      result = to_jobject(vm, env, out.l);
+   if (vm->exception) {
+      const char *what = args[0].l ? dvm_string_utf8(vm, args[0].l) : NULL;
+      char message[256];
+      snprintf(message, sizeof message, "%s", what ? what : "");
+      dvm_clear_exception(vm);
+      jvm_throw_new(jnienv_get_jvm(env),
+                    "android/content/pm/PackageManager$NameNotFoundException",
+                    message);
+   }
+   g_env = saved;
+   dvm_gil_leave_to_guest(vm, cookie);
+   return result;
+}
+
+bool dvm_jni_class_exists(const char *class_name)
+{
+   struct dvm *vm = vm_get();
+   if (!vm || !class_name) return false;
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   bool r = dvm_class_exists(vm, class_name);
    dvm_gil_leave_to_guest(vm, cookie);
    return r;
 }

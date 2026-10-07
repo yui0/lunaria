@@ -168,7 +168,6 @@ void arm_set_parallel_engines(bool on);
 #include <shared_mutex>
 #include <string>
 #include "lunaria_os.h"
-#include "luna_guest_vm.h"
 #include <unordered_map>
 #include <vector>
 
@@ -480,8 +479,15 @@ inline void a64_map_declare_backing(BackingOffset base, uint64_t len,
     a64_maps_bump();
 }
 
+/* A mapping that replaces or removes pages of a loaded image (MAP_FIXED over
+ * it, munmap) takes those pages out of the image: /proc/<pid>/maps stops
+ * naming the file for them and the code-hook table stops covering them.
+ * Defined with g_loaded_regions. */
+inline void a64_loaded_regions_unmap(GuestVA lo, GuestVA hi);
+
 // Drop [lo,hi) from the table, splitting/trimming entries as needed.
 inline void a64_map_remove(GuestVA lo, GuestVA hi, bool release) {
+    a64_loaded_regions_unmap(lo, hi);
     std::unique_lock<std::shared_mutex> lk(g_a64_maps_mu);
     const GuestVA page = a64_host_page_size();
     std::vector<std::pair<GuestVA, GuestVA>> released;
@@ -1011,6 +1017,36 @@ inline void guest_rx_bounds_refresh(void) {
         guest_rx_add(&next, r.lo, r.hi);
     }
     guest_rx_publish(&g_rx_pages, &next);
+}
+
+inline void a64_loaded_regions_unmap(GuestVA lo, GuestVA hi) {
+    if (lo < A64_GUEST_BASE || lo >= A64_GUEST_BASE + A64_GUEST_SIZE || hi <= lo)
+        return;
+    const uint64_t cut_lo = lo - A64_GUEST_BASE;
+    const uint64_t cut_hi = std::min<uint64_t>(hi - A64_GUEST_BASE, A64_GUEST_SIZE);
+    bool changed = false;
+    for (size_t i = 0; i < g_loaded_regions.size();) {
+        LoadedRegion r = g_loaded_regions[i];
+        if (r.hi <= cut_lo || r.lo >= cut_hi) { ++i; continue; }
+        changed = true;
+        const bool head = r.lo < cut_lo, tail = r.hi > cut_hi;
+        if (head && tail) {
+            LoadedRegion t = r;
+            t.lo = (uint32_t)cut_hi;
+            t.file_off += t.lo - r.lo;
+            g_loaded_regions[i].hi = (uint32_t)cut_lo;
+            g_loaded_regions.insert(g_loaded_regions.begin() + (long)i + 1, t);
+            i += 2;
+        } else if (head) {
+            g_loaded_regions[i].hi = (uint32_t)cut_lo; ++i;
+        } else if (tail) {
+            g_loaded_regions[i].file_off += cut_hi - r.lo;
+            g_loaded_regions[i].lo = (uint32_t)cut_hi; ++i;
+        } else {
+            g_loaded_regions.erase(g_loaded_regions.begin() + (long)i);
+        }
+    }
+    if (changed) guest_rx_bounds_refresh();
 }
 
 // True if [va, va+n) overlaps any loaded RX (PF_X and not PF_W) segment.

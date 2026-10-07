@@ -18,6 +18,7 @@
 #include <math.h>
 #include <sys/stat.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -617,7 +618,7 @@ bool dvm_class_is_known(struct dvm *vm, const char *name)
 bool dvm_class_exists(struct dvm *vm, const char *name)
 {
    static const char *const framework[] = {
-      "java/", "javax/", "sun/", "jdk/", "libcore/", "dalvik/", "kotlin/",
+      "java/", "javax/", "sun/", "jdk/", "libcore/", "dalvik/",
       "android/", "com/android/", "org/json/", "org/w3c/", "org/xml/",
       "org/apache/http/", "org/xmlpull/",
    };
@@ -1515,7 +1516,17 @@ bool dvm__call_out(struct dvm *vm, struct dvm_class *cls, const char *name,
       bool ok = vm->hooks.call_native(vm->hooks.user, vm, cls->name, name, sig,
                                       is_static, self, args, nargs, out);
       dvm_gil_relock(vm, gil);
-      if (ok) return true;
+      if (ok) {
+         if (vm->hooks.take_pending_exception) {
+            dvm_ref raised = vm->hooks.take_pending_exception(vm->hooks.user, vm);
+            if (raised) {
+               memset(out, 0, sizeof *out);
+               vm->exception = raised;
+               return false;
+            }
+         }
+         return true;
+      }
    }
 
    if (vm->hooks.call_external &&
@@ -2896,7 +2907,7 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          union dvm_value v = { 0 };
          if (f && o->slots && f->slot < (o->cls ? o->cls->islots : 0))
             v = o->slots[f->slot];
-         if (vm->trace && op == 0x54)
+         if (vm->trace && trace_this && op == 0x54)
             fprintf(stderr, "[dvm] %*siget-object @%x.%s:%s -> @%x\n",
                     vm->depth * 2, "", r[B4(u0)], fn ? fn : "?",
                     ft ? ft : "?", v.l);
@@ -2923,7 +2934,7 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          else v.u = r[A4(u0)];
          if (f && o->slots && f->slot < (o->cls ? o->cls->islots : 0))
             o->slots[f->slot] = v;
-         if (vm->trace && op == 0x5b)
+         if (vm->trace && trace_this && op == 0x5b)
             fprintf(stderr, "[dvm] %*siput-object @%x.%s:%s <- @%x\n",
                     vm->depth * 2, "", r[B4(u0)], fn ? fn : "?",
                     ft ? ft : "?", v.l);
@@ -2972,7 +2983,7 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
                goto exception;
             }
          }
-         if (vm->trace && op == 0x62)
+         if (vm->trace && trace_this && op == 0x62)
             fprintf(stderr, "[dvm] %*ssget-object %s.%s:%s -> @%x\n",
                     vm->depth * 2, "", fc ? fc->name : "?", fn ? fn : "?",
                     ft ? ft : "?", v.l);
@@ -2994,7 +3005,7 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             if (f->cls->sslots && f->slot < f->cls->nsslots)
                f->cls->sslots[f->slot] = v;
          }
-         if (vm->trace && op == 0x69)
+         if (vm->trace && trace_this && op == 0x69)
             fprintf(stderr, "[dvm] %*ssput-object %s.%s:%s <- @%x\n",
                     vm->depth * 2, "", fc ? fc->name : "?", fn ? fn : "?",
                     ft ? ft : "?", v.l);
@@ -4013,8 +4024,37 @@ struct dvm_event_waiter {
    struct dvm_event_waiter *next;
    uintptr_t channel;
    bool ready;
+   char where[480];      /* the Java frames the waiter is parked in (diagnostics) */
 };
 static struct dvm_event_waiter *g_event_waiters;
+
+/* LUNARIA_DVM_WAITDUMP=1: SIGUSR2 prints every Java thread parked on a channel and the
+ * Java frames it is parked in.  A stall in which every thread is idle and nothing is
+ * runnable (the process "spins" at 0 Mips) has no other witness: the host stacks show
+ * only the VM's own wait primitive.  Windows has no SIGUSR2, so the dump stays a
+ * POSIX diagnostic. */
+#ifndef _WIN32
+static void dvm_waitdump(int sig)
+{
+   (void)sig;
+   fprintf(stderr, "[waitdump] parked Java threads:\n");
+   for (struct dvm_event_waiter *w = g_event_waiters; w; w = w->next)
+      fprintf(stderr, "[waitdump]   channel=%lu ready=%d  %s\n",
+              (unsigned long)w->channel, (int)w->ready, w->where);
+   if (g_gil_vm) {
+      struct dvm *vm = g_gil_vm;
+      const uint64_t now = dvm__now_ms();
+      fprintf(stderr, "[waitdump] pending Runnables: %d\n", vm->npending);
+      for (int i = 0; i < vm->npending; ++i) {
+         struct dvm_class *c = vm->pending_threads[i] ? dvm_object_class(vm, vm->pending_threads[i]) : NULL;
+         fprintf(stderr, "[waitdump]   #%d %s thread=%d looper=%u due=%+lldms\n", i,
+                 c && c->name ? c->name : "?", (int)vm->pending_is_thread[i],
+                 (unsigned)vm->pending_looper[i],
+                 vm->pending_due_ms[i] ? (long long)vm->pending_due_ms[i] - (long long)now : 0ll);
+      }
+   }
+}
+#endif
 
 void dvm_gil_notify(void)
 {
@@ -4207,6 +4247,27 @@ void dvm_gil_wait_for_ns(struct dvm *vm, uintptr_t channel, uint64_t ns)
    pthread_condattr_destroy(&attr);
    w.channel = channel;
    w.ready = false;
+   {
+      static int dump_on = -1;
+      if (dump_on < 0) {
+         const char *e = getenv("LUNARIA_DVM_WAITDUMP");
+         dump_on = e && *e && *e != '0';
+#ifndef _WIN32
+         if (dump_on) signal(SIGUSR2, dvm_waitdump);
+#endif
+      }
+      w.where[0] = 0;
+      if (dump_on && vm) {
+         size_t n = 0;
+         for (int i = vm->ncallstack - 1, shown = 0; i >= 0 && shown < 5 && n + 2 < sizeof w.where; --i, ++shown) {
+            const struct dvm_method *f = vm->callstack[i];
+            if (!f) continue;
+            n += (size_t)snprintf(w.where + n, sizeof w.where - n, "%s%s.%s", shown ? " <- " : "",
+                                  f->cls && f->cls->name ? f->cls->name : "?", f->name ? f->name : "?");
+            if (n >= sizeof w.where) { n = sizeof w.where - 1; break; }
+         }
+      }
+   }
 
    /* Register before dropping GIL.  A producer cannot change the protected VM
     * state before GIL is released, so it cannot notify in the registration

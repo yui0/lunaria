@@ -55,6 +55,15 @@ void dvm_jni_set_guest_library_loader(dvm_guest_library_fn fn);
  * commits to a code path whose Java half can never run. */
 bool dvm_jni_class_in_dex(const char *class_name);
 
+/* PackageManager.getPackageInfo(name, flags) for native callers: the VM's own
+ * PackageInfo, as a host handle.  NULL with NameNotFoundException pending when
+ * the package is not installed. */
+jobject dvm_jni_package_info(JNIEnv *env, jstring name, jint flags);
+
+/* True when the device we present has the class: the APK's dex or the
+ * platform (see dvm_class_exists()).  What FindClass answers from. */
+bool dvm_jni_class_exists(const char *class_name);
+
 /* True when the APK's dex carries bytecode for this method (`sig` may be NULL
  * to match on the name alone).  A canned answer in the stub layer must never
  * take precedence over Java the APK actually ships: the app's own

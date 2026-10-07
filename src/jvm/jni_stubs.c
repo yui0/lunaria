@@ -2021,28 +2021,17 @@ android_content_Context_getPackageManager(JNIEnv *env, jobject object, va_list a
    return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "android/content/pm/PackageManager"))));
 }
 
-/* PackageManager.getPackageInfo(name, flags) → a PackageInfo for the
- * installed package when the name matches, else null.  Returning a single
- * empty AllocObject for every call meant native Callers saw null
- * packageName/signatures while the Java PackageManager path (DVM) filled
- * them — two views of the same installed app. */
+/* PackageManager.getPackageInfo(name, flags).  The bytecode VM owns the
+ * PackageInfo a device answers with (signing certificates, versions, splits,
+ * permissions); native callers and Java callers must read the same one. */
 jobject
 android_content_pm_PackageManager_getPackageInfo(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
    if (!args) return NULL;
    jstring name = va_arg(args, jstring);
-   (void)va_arg(args, jint); /* flags */
-   if (!name) return NULL;
-   const char *want = (*env)->GetStringUTFChars(env, name, NULL);
-   const char *installed = getenv("ANDROID_PACKAGE_NAME");
-   const int match = want && installed && !strcmp(want, installed);
-   if (want) (*env)->ReleaseStringUTFChars(env, name, want);
-   if (!match) return NULL;
-   static jobject sv;
-   if (!sv)
-      sv = (*env)->AllocObject(env, (*env)->FindClass(env, "android/content/pm/PackageInfo"));
-   return sv;
+   jint flags = va_arg(args, jint);
+   return dvm_jni_package_info(env, name, flags);
 }
 
 /* PackageManager.getApplicationInfo(name, flags).  Native SDKs commonly ask
@@ -2240,19 +2229,19 @@ android_content_res_Configuration_orientation(JNIEnv *env, jobject object)
 /* SCREENLAYOUT_SIZE_NORMAL | SCREENLAYOUT_LONG_NO | SCREENLAYOUT_LAYOUTDIR_LTR */
 jint android_content_res_Configuration_screenLayout(JNIEnv *env, jobject o)
 { (void)env; (void)o; return 0x02 | 0x10 | 0x40; }
-/* fillMetrics() reports mdpi, so dp == px. */
+/* dp = px x 160 / densityDpi, as fillMetrics() reports. */
 jint android_content_res_Configuration_screenWidthDp(JNIEnv *env, jobject o)
-{ (void)env; (void)o; return arm_exec_fb_width(); }
+{ (void)env; (void)o; return (jint)((long)arm_exec_fb_width() * 160 / lunaria_screen()->density); }
 jint android_content_res_Configuration_screenHeightDp(JNIEnv *env, jobject o)
-{ (void)env; (void)o; return arm_exec_fb_height(); }
+{ (void)env; (void)o; return (jint)((long)arm_exec_fb_height() * 160 / lunaria_screen()->density); }
 jint android_content_res_Configuration_smallestScreenWidthDp(JNIEnv *env, jobject o)
 {
    (void)env; (void)o;
    const int w = arm_exec_fb_width(), h = arm_exec_fb_height();
-   return w < h ? w : h;
+   return (jint)((long)(w < h ? w : h) * 160 / lunaria_screen()->density);
 }
 jint android_content_res_Configuration_densityDpi(JNIEnv *env, jobject o)
-{ (void)env; (void)o; return 160; }
+{ (void)env; (void)o; return lunaria_screen()->density; }
 jfloat android_content_res_Configuration_fontScale(JNIEnv *env, jobject o)
 { (void)env; (void)o; return 1.0f; }
 /* UI_MODE_TYPE_NORMAL | UI_MODE_NIGHT_NO */
@@ -3253,10 +3242,10 @@ android_view_Display_fillMetrics(JNIEnv *e, jobject out)
    jclass cls = (*e)->FindClass(e, "android/util/DisplayMetrics");
    if (!cls) return;
    int w = arm_exec_fb_width(), h = arm_exec_fb_height();
-   /* mdpi (1.0): Time Locker's world-space START/tutorial quads were vertically
-    * crushed at density=2.0 (layout in 360dp while meshes assume full pixels). */
-   float density = 1.0f;
-   float dpi = 160.0f * density;
+   /* The density the screen is presented with, the one AConfiguration and the
+    * bytecode VM's DisplayMetrics report too: dp = density x px. */
+   float dpi = (float)lunaria_screen()->density;
+   float density = dpi / 160.0f;
    jfieldID fw = (*e)->GetFieldID(e, cls, "widthPixels",   "I");
    jfieldID fh = (*e)->GetFieldID(e, cls, "heightPixels",  "I");
    jfieldID fd = (*e)->GetFieldID(e, cls, "density",       "F");
