@@ -105,36 +105,67 @@ void luna_os_backtrace_print(void *const *frames, int count)
 #define GLFW_EXPOSE_NATIVE_COCOA
 #include <GLFW/glfw3native.h>
 
-/* Linux reports a broken pipe writer as ERR, rather than Darwin's HUP.
- * Inspect only exceptional descriptors; the usual ready path stays native. */
+/* Darwin's poll loses readiness for repeated descriptors with different
+ * masks. Linux permits them and reports each entry independently. Merge
+ * masks for the host wait, then distribute only requested/exceptional bits.
+ * Small waits stay on the stack; a hash index keeps large waits linear. */
 int luna_socket_poll(struct pollfd *fds, size_t n, int ms)
 {
-   if (n > UINT32_MAX || n > SIZE_MAX / sizeof(struct pollfd)) {
-      errno = EINVAL; return -1;
-   }
+   if (n > INT_MAX) { errno = EINVAL; return -1; }
    if (n && !fds) { errno = EFAULT; return -1; }
+   size_t capacity = 128;
+   while (capacity < n * 2) capacity *= 2;
    struct pollfd small[64];
-   struct pollfd *host = n <= 64 ? small : malloc(n * sizeof *host);
-   if (!host) { errno = ENOMEM; return -1; }
-   for (size_t i = 0; i < n; ++i) {
-      host[i] = fds[i];
-      /* Darwin needs HUP requested even for events=0. Linux always reports it. */
-      host[i].events |= POLLHUP;
+   uint32_t small_map[64], small_index[128];
+   struct pollfd *host = small;
+   uint32_t *map = small_map, *index = small_index;
+   void *allocation = NULL;
+   if (n > 64) {
+      if (n > SIZE_MAX / (sizeof *host + sizeof *map) ||
+          capacity > (SIZE_MAX - n * (sizeof *host + sizeof *map)) / sizeof *index) {
+         errno = ENOMEM; return -1;
+      }
+      allocation = malloc(n * (sizeof *host + sizeof *map) + capacity * sizeof *index);
+      if (!allocation) { errno = ENOMEM; return -1; }
+      host = allocation;
+      map = (uint32_t *)(host + n);
+      index = map + n;
    }
-   int result = poll(host, n, ms);
+   memset(index, 0, capacity * sizeof *index);
+   size_t unique = 0;
+   for (size_t i = 0; i < n; ++i) {
+      if (fds[i].fd < 0) { map[i] = UINT32_MAX; continue; }
+      size_t slot = ((uint32_t)fds[i].fd * 2654435761u) & (capacity - 1);
+      while (index[slot] && host[index[slot] - 1].fd != fds[i].fd)
+         slot = (slot + 1) & (capacity - 1);
+      if (!index[slot]) {
+         index[slot] = (uint32_t)++unique;
+         host[unique - 1] = (struct pollfd){fds[i].fd, 0, 0};
+      }
+      map[i] = index[slot] - 1;
+      /* Darwin requires HUP requested even for events=0. */
+      host[map[i]].events |= fds[i].events | POLLHUP;
+   }
+   int result = poll(host, unique, ms);
    const int saved_errno = errno;
-   if (result >= 0) for (size_t i = 0; i < n; ++i) {
-      short events = host[i].revents;
-      if (events & POLLHUP) {
+   if (result >= 0) {
+      /* Linux reports a broken pipe writer as ERR rather than Darwin's HUP.
+       * Inspect exceptional descriptors only, once per unique descriptor. */
+      for (size_t i = 0; i < unique; ++i) if (host[i].revents & POLLHUP) {
          struct stat info;
          int mode = fcntl(host[i].fd, F_GETFL);
          if (mode >= 0 && (mode & O_ACCMODE) == O_WRONLY &&
              !fstat(host[i].fd, &info) && S_ISFIFO(info.st_mode))
-            events = (events & ~POLLHUP) | POLLERR;
+            host[i].revents = (host[i].revents & ~POLLHUP) | POLLERR;
       }
-      fds[i].revents = events;
+      result = 0;
+      for (size_t i = 0; i < n; ++i) {
+         fds[i].revents = map[i] == UINT32_MAX ? 0 :
+            host[map[i]].revents & (fds[i].events | POLLERR | POLLHUP | POLLNVAL);
+         result += fds[i].revents != 0;
+      }
    }
-   if (host != small) free(host);
+   free(allocation);
    errno = saved_errno;
    return result;
 }

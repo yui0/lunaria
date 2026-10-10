@@ -106,6 +106,9 @@ int luna_overlay_screenshot(const char *path);
 void luna_menu_close(void);
 /* Once per window-thread poll: expires the notice line. */
 void luna_menu_tick(void);
+/* F9 / F10: start or stop recording touch input; replay the last recording. */
+void luna_input_record_toggle(void);
+void luna_input_play_toggle(void);
 
 
 /* Boot / JIT status card.  Shown only when no guest document is up, so a
@@ -179,6 +182,12 @@ void luna_overlay_image_free(unsigned char *pixels);
  * with the overlay's render. */
 float luna_overlay_text_width(const char *text, float px, bool bold);
 float luna_overlay_line_height(float px);
+struct luna_overlay_font_metrics {
+   float top, ascent, descent, bottom, leading;
+};
+/* Face metrics in Android's baseline coordinate system, without GL work. */
+bool luna_overlay_get_font_metrics(float px, bool bold,
+                                  struct luna_overlay_font_metrics *metrics);
 
 
 

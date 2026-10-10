@@ -10,6 +10,7 @@
 #include "dvm/dvm_internal.h"
 #include "jvm/jvm.h"
 #include "arm_exec.h"
+#include "arm.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -65,6 +66,7 @@ static JNIEnv *current_env(void)
 }
 static dvm_guest_native_fn g_guest_native;
 static dvm_guest_library_fn g_guest_library;
+static dvm_guest_activity_fn g_guest_activity;
 static unsigned g_calls, g_native_calls, g_external_calls;
 
 /* Read on first use, not in vm_get(): the mode decides whether a call site
@@ -84,11 +86,25 @@ enum dvm_jni_mode dvm_jni_mode(void)
 
 void dvm_jni_set_guest_native_caller(dvm_guest_native_fn fn) { g_guest_native = fn; }
 void dvm_jni_set_guest_library_loader(dvm_guest_library_fn fn) { g_guest_library = fn; }
+void dvm_jni_set_guest_native_activity(dvm_guest_activity_fn fn) { g_guest_activity = fn; }
 
 static bool hook_load_library(void *user, struct dvm *vm, const char *name)
 {
-   (void)user; (void)vm;
-   return g_guest_library && g_guest_library(name);
+   (void)user;
+   if (!g_guest_library) return false;
+   /* ELF loading and constructors execute native code, just like ordinary
+    * JNI calls. Keep their ARM state serialized without stopping unrelated
+    * bytecode threads. JNI callbacks acquire GIL through the normal bridge.
+    * Copy the VM string before allowing other threads to access its heap. */
+   char *library=strdup(name);
+   if (!library) return false;
+   unsigned gil=dvm_gil_unlock_all(vm);
+   arm_lock_acquire();
+   bool loaded=g_guest_library(library);
+   arm_lock_release();
+   dvm_gil_relock(vm,gil);
+   free(library);
+   return loaded;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -103,6 +119,7 @@ static bool hook_load_library(void *user, struct dvm *vm, const char *name)
 struct dvm_wrapper {
    uint32_t host;
    dvm_ref ref;
+   uint32_t epoch;   /* the handle slot's epoch when it was bound */
 };
 
 /* Host handles are integer keys allocated throughout the process lifetime.
@@ -155,7 +172,12 @@ static bool wrapper_reserve(void)
 static dvm_ref find_wrapper(uint32_t host)
 {
    struct dvm_wrapper *slot = wrapper_slot(g_wrappers, g_wrapper_cap, host);
-   return slot && slot->host == host ? slot->ref : 0;
+   if (!slot || slot->host != host) return 0;
+   /* A wrapper from before the slot was recycled belongs to nothing now. */
+   JNIEnv *env = current_env();
+   if (env && slot->epoch != jvm_handle_epoch(jnienv_get_jvm(env), (jobject)(uintptr_t)host))
+      return 0;
+   return slot->ref;
 }
 
 static void remember_wrapper(uint32_t host, dvm_ref ref)
@@ -171,6 +193,19 @@ static void remember_wrapper(uint32_t host, dvm_ref ref)
    struct dvm_wrapper *slot = wrapper_slot(g_wrappers, g_wrapper_cap, host);
    if (!slot->host) { slot->host = host; ++g_nwrappers; }
    slot->ref = ref;
+   JNIEnv *env = current_env();
+   slot->epoch = env ? jvm_handle_epoch(jnienv_get_jvm(env), (jobject)(uintptr_t)host) : 0;
+}
+
+/* Does `host` still name `ref`?  A released handle slot is recycled for the
+ * next object, and a wrapper left behind would then answer for it.  An object
+ * bound without a wrapper has nothing to compare and is taken as current. */
+static bool wrapper_current(JNIEnv *env, uint32_t host, dvm_ref ref)
+{
+   struct dvm_wrapper *slot = wrapper_slot(g_wrappers, g_wrapper_cap, host);
+   if (!slot || slot->host != host) return true;
+   return slot->ref == ref &&
+          slot->epoch == jvm_handle_epoch(jnienv_get_jvm(env), (jobject)(uintptr_t)host);
 }
 
 /* Remove an entry without breaking the probe chain following it. */
@@ -220,6 +255,18 @@ static void bridge_record(jobject handle, dvm_ref source, bool direct)
 static bool bridge_release_one(struct dvm *vm, JNIEnv *env, struct jvm *jvm,
                                const struct bridge_local *local)
 {
+   if (!jvm_bridge_take_pending(jvm, local->handle)) {
+      /* Native code deleted the incoming local itself.  Only drop the DVM
+       * binding if that was the last reference and the slot is gone. */
+      if (jvm_bridge_ref_count(jvm, local->handle) == 0) {
+         struct dvm_object *o = local->source ? dvm__obj(vm, local->source) : NULL;
+         if (o && o->host_handle == (uint32_t)(uintptr_t)local->handle) {
+            o->host_handle = 0;
+            forget_wrapper((uint32_t)(uintptr_t)local->handle, local->source);
+         }
+      }
+      return false;
+   }
    const int refs = jvm_bridge_ref_count(jvm, local->handle);
    if (refs > 1) {
       (*env)->DeleteLocalRef(env, local->handle);
@@ -493,6 +540,9 @@ static void dvm_direct_buffer_from_host(struct dvm *vm, dvm_ref r)
  * its identity survives the round trip back to the stub layer. */
 static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
 {
+   /* Wrapper identity belongs to the object, not to a weak handle naming it.
+    * A cleared weak reference crosses the Java boundary as null. */
+   o = jvm_resolve_reference(jnienv_get_jvm(env), o);
    if (!o) return 0;
    dvm_ref arr = host_array_to_dvm(vm, env, o);
    if (arr) return arr;
@@ -632,8 +682,21 @@ static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
       uint32_t bb = dvm_direct_buffer_to_host(vm, r);
       if (bb) return (jobject)(uintptr_t)bb;
    }
+   /* Each time a Java object crosses into native code the native side gets a
+    * reference of its own (JNI: every returned or passed object is a new local
+    * reference).  Handing back the existing handle as is let one thread's
+    * DeleteLocalRef free the slot another thread still held.  A handle whose
+    * slot has gone is not reused. */
    uint32_t host = dvm_external_handle(vm, r);
-   if (host) return (jobject)(uintptr_t)host;
+   /*TMP*/{ struct dvm_class *tc = dvm_object_class(vm, r); if (tc && tc->name && strstr(tc->name, "payment/Payment") && !strstr(tc->name, "$")) fprintf(stderr, "[TMP] to_jobject Payment r=0x%x host=0x%x refs=%d cur=%d jclass=%s\n", r, host, host ? jvm_bridge_ref_count(jnienv_get_jvm(env), (jobject)(uintptr_t)host) : -1, host ? (int)wrapper_current(env, host, r) : -1, host ? class_name_of(env, (jobject)(uintptr_t)host) : "-"); }
+   if (host) {
+      if (jvm_bridge_ref_count(jnienv_get_jvm(env), (jobject)(uintptr_t)host) > 0 &&
+          wrapper_current(env, host, r))
+         return (*env)->NewLocalRef(env, (jobject)(uintptr_t)host);
+      struct dvm_object *stale = dvm__obj(vm, r);
+      if (stale) stale->host_handle = 0;
+      forget_wrapper(host, r);
+   }
 
    jobject arr = dvm_array_to_host(vm, env, r);
    if (arr) return arr;
@@ -1155,7 +1218,8 @@ static bool hook_call_external_inner(void *user, struct dvm *vm, const char *cla
       v.l = vname ? dvm_new_string(vm, vname) : 0;
       (void)dvm_set_field(vm, pi, "versionName", "Ljava/lang/String;", v);
       if (self_pkg && !strcmp(self_pkg, record.name))
-         (void)dvm_package_info_add_signatures(vm, pi);
+         (void)dvm_package_info_add_signatures(vm, pi,
+                                               nargs > 1 ? (uint32_t)args[1].i : 0);
       dvm_pin(vm, pi);
       out->l = pi;
       return true;
@@ -1169,7 +1233,7 @@ static bool hook_call_external_inner(void *user, struct dvm *vm, const char *cla
       const char *want = (class_arg && class_arg->kind == DVM_OBJ_CLASS &&
                           class_arg->klass) ? class_arg->klass->name
                                             : dvm_string_utf8(vm, args[0].l);
-      dvm_ref service = dvm_runtime_system_service(vm, want);
+      dvm_ref service = dvm_runtime_system_service(vm, want, self);
       if (service) {
          memset(out, 0, sizeof *out);
          out->l = service;
@@ -1393,6 +1457,25 @@ static bool hook_get_external_static(void *user, struct dvm *vm, const char *cla
    return true;
 }
 
+/* NativeActivity.onCreate/onStart/onResume.  The guest runs without the
+ * interpreter lock and re-enters Java through the ordinary JNI path, exactly
+ * as for any other native call. */
+static bool hook_native_activity(void *user, struct dvm *vm, int stage,
+                                 dvm_ref activity)
+{
+   (void)user;
+   JNIEnv *env = current_env();
+   if (!g_guest_activity || !env) return false;
+   struct bridge_frame frame = { .prev = g_bridge_frame };
+   g_bridge_frame = &frame;
+   jobject self = to_jobject(vm, env, activity);
+   unsigned gil = dvm_gil_unlock_all(vm);
+   bool done = g_guest_activity(stage, self);
+   dvm_gil_relock(vm, gil);
+   bridge_end(vm, env, &frame);
+   return done;
+}
+
 static bool hook_call_native(void *user, struct dvm *vm, const char *class_name,
                              const char *method, const char *sig, bool is_static,
                              dvm_ref self, const union dvm_value *args, int nargs,
@@ -1423,7 +1506,15 @@ static bool hook_call_native(void *user, struct dvm *vm, const char *class_name,
               jargs[0].l, valid, event.action, event.x, event.y,
               event.event_ms, event.down_ms);
    }
-   if (!g_guest_native(class_name, method, sig, is_static, jself, jargs, nargs, &ret)) {
+   /* VM heap and wrapper tables are protected by GIL. Guest code executes
+    * without it and re-enters Java through the ordinary JNI acquisition path.
+    * Restore it before reading back buffers, converting the result or releasing
+    * bridge references; other Java threads can mutate those tables meanwhile. */
+   unsigned gil = dvm_gil_unlock_all(vm);
+   bool called = g_guest_native(class_name, method, sig, is_static, jself,
+                                 jargs, nargs, &ret);
+   dvm_gil_relock(vm, gil);
+   if (!called) {
       bridge_end(vm, env, &frame);
       return false;
    }
@@ -1601,6 +1692,7 @@ static struct dvm *vm_get(void)
       .call_native = hook_call_native,
       .take_pending_exception = hook_take_pending_exception,
       .load_library = hook_load_library,
+      .native_activity = hook_native_activity,
    };
    g_vm = dvm_create(&hooks);
    if (!g_vm) return NULL;
@@ -1748,6 +1840,12 @@ bool dvm_jni_invoke_locked(JNIEnv *env, const char *class_name, const char *meth
    union dvm_value ret;
    ++g_calls;
    bool ok = dvm_call(vm, m, dself, args, nargs, &ret);
+   if (ok && self && !strcmp(method, "<init>") &&
+       (!strcmp(class_name, "java/lang/String") || !strcmp(class_name, "java.lang.String"))) {
+      size_t bytes = dvm_string_utf8_length(vm, dself);
+      const char *text = dvm_string_utf8(vm, dself);
+      if (text) jvm_init_string_wtf8(jnienv_get_jvm(env), self, text, bytes);
+   }
    for (int i = 0; i < nargs; ++i)
       if (host_arrays[i]) array_sync_back(vm, env, host_arrays[i], args[i].l);
    if (!ok) {
@@ -1773,6 +1871,20 @@ void dvm_jni_show_activity(JNIEnv *env, jobject activity)
    dvm_ref ref = from_jobject(vm, env, activity);
    if (ref) dvm__activity_visible(vm, ref);
    dvm_gil_leave_to_guest(vm, cookie);
+}
+
+/* Activity.finish() has been called on it (the activity stack tears it down
+ * on the main thread; the flag is set at the call). */
+bool dvm_jni_activity_finishing(JNIEnv *env, jobject activity)
+{
+   struct dvm *vm = dvm_jni_vm();
+   if (!vm || !env || !activity) return false;
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   dvm_ref ref = from_jobject(vm, env, activity);
+   union dvm_value v = { 0 };
+   const bool r = ref && dvm_get_field(vm, ref, "finishing", "Z", &v) && v.i;
+   dvm_gil_leave_to_guest(vm, cookie);
+   return r;
 }
 
 bool dvm_jni_invoke(JNIEnv *env, const char *class_name, const char *method,
@@ -2036,11 +2148,26 @@ jobject dvm_jni_package_info(JNIEnv *env, jstring name, jint flags)
 bool dvm_jni_class_exists(const char *class_name)
 {
    struct dvm *vm = vm_get();
-   if (!vm || !class_name) return false;
+   if (!class_name) return false;
+   /* Native-only modules have no DEX VM and use the host JNI class table.
+    * Once an APK VM exists, its class loader remains authoritative. */
+   if (!vm) return true;
    unsigned cookie = dvm_gil_enter_from_guest(vm);
    bool r = dvm_class_exists(vm, class_name);
    dvm_gil_leave_to_guest(vm, cookie);
    return r;
+}
+
+void dvm_jni_shutdown(void)
+{
+   /* Do not initialize a VM just to shut the process down. All callbacks must
+    * finish while their JNI table and guest engines are still alive. */
+   if (!g_vm) return;
+   dvm_request_stop(g_vm);
+   dvm_threads_finish(g_vm);
+   dvm_glsurface_finish(g_vm);
+   dvm_nsd_finish(g_vm);
+   dvm_prefs_finish(g_vm);
 }
 
 bool dvm_jni_method_in_dex_locked(const char *class_name, const char *method,

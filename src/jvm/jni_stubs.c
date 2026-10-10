@@ -38,7 +38,7 @@ static jobject g_current_activity;
 void
 jni_set_current_activity(JNIEnv *env, jobject activity)
 {
-   g_current_activity = activity;
+   if (!jvm_cache_reference(env, &g_current_activity, activity)) return;
    /* IronSource (and many other Unity plugins) read the public static field
     * UnityPlayer.currentActivity via sget, not the currentActivity() accessor
     * stub.  Mirror the process Activity into that field whenever it is set,
@@ -360,7 +360,7 @@ java_lang_Class_getClassLoader(JNIEnv *env, jobject object)
 {
    assert(env && object);
    static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/lang/ClassLoader"))));
+   return jvm_cached_object(env, &sv, "java/lang/ClassLoader");
 }
 
 jclass
@@ -443,41 +443,15 @@ java_lang_String_equals(JNIEnv *env, jobject object, va_list args)
    return equal;
 }
 
-jobject
-java_util_Locale_getDefault(JNIEnv *env, jclass clazz)
+/* Locale methods use the VM implementation so Java and JNI observe the
+ * same default, explicit Locale instances and Locale.setDefault changes. */
+static jobject runtime_default_locale(JNIEnv *env)
 {
-   assert(env);
-   static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/util/Locale"))));
-}
-
-jstring
-java_util_Locale_getLanguage(JNIEnv *env, jobject object)
-{
-   assert(env);
-   if (!object) return (*env)->NewStringUTF(env, "en");
-   return (*env)->NewStringUTF(env, "en");
-}
-
-jstring
-java_util_Locale_toString(JNIEnv *env, jobject object)
-{
-   assert(env);
-   return (*env)->NewStringUTF(env, "en_US");
-}
-
-jstring
-java_util_Locale_toLanguageTag(JNIEnv *env, jobject object)
-{
-   assert(env);
-   return (*env)->NewStringUTF(env, "en-US");
-}
-
-jstring
-java_util_Locale_getCountry(JNIEnv *env, jobject object)
-{
-   assert(env && object);
-   return (*env)->NewStringUTF(env, "US");
+   jclass cls=(*env)->FindClass(env,"java/util/Locale");
+   jmethodID method=cls ? (*env)->GetStaticMethodID(env,cls,"getDefault","()Ljava/util/Locale;") : NULL;
+   jobject result=method ? (*env)->CallStaticObjectMethod(env,cls,method) : NULL;
+   if (cls) (*env)->DeleteLocalRef(env,cls);
+   return result;
 }
 
 /* Choreographer.getInstance() → singleton stub.  UnityChoreographer's init
@@ -489,7 +463,7 @@ android_view_Choreographer_getInstance(JNIEnv *env, jclass clazz)
 {
    assert(env);
    static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "android/view/Choreographer"))));
+   return jvm_cached_object(env, &sv, "android/view/Choreographer");
 }
 
 /* Long.longValue() — unboxes the frameTimeNanos argument that doFrame(J)
@@ -593,14 +567,8 @@ java_util_Scanner_close(JNIEnv *env, jobject object)
    (void)env; (void)object;
 }
 
-/* Object.toString() → empty string: avoids wild jumps when Unity stringifies
- * objects whose class has no registered native toString handler. */
-jstring
-java_lang_Object_toString(JNIEnv *env, jobject object)
-{
-   (void)object;
-   return (*env)->NewStringUTF(env, "");
-}
+/* Object.toString and subclass overrides are owned by the VM. A native
+ * fallback here would hide Locale.toString and every other VM override. */
 
 /* Collections are owned by the DVM runtime. JNI calls must reach its Map,
  * Set and Iterator methods so native writes and bytecode reads share state. */
@@ -1320,22 +1288,31 @@ android_content_pm_PackageInfo_versionName(JNIEnv *env, jobject object)
    return (*env)->NewStringUTF(env, name ? name : "1.0");
 }
 
+struct cached_file_spec {
+   const char *environment, *fallback_environment, *fallback;
+   bool make_directory;
+};
+
+static void cached_file_initialize(JNIEnv *env, jobject file, void *data)
+{
+   (void)env;
+   const struct cached_file_spec *spec = data;
+   const char *path = getenv(spec->environment);
+   if ((!path || !*path) && spec->fallback_environment)
+      path = getenv(spec->fallback_environment);
+   if (!path || !*path) path = spec->fallback;
+   jni_file_set_path(file, path);
+   if (spec->make_directory) luna_file_mkdir(path, 0755);
+}
+
 jobject
 android_content_Context_getExternalFilesDir(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
-   /* Do not va_arg(args): Call*MethodA is invoked with nullptr, and a non-null
-    * pointer here is often a host jvalue[] / garbage — not a real va_list. */
    (void)args;
    static jobject sv;
-   if (!sv) {
-      sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"));
-      const char *p = getenv("ANDROID_EXTERNAL_FILES_DIR");
-      jni_file_set_path(sv, (p && *p) ? p : "/tmp");
-      fprintf(stderr, "[jni_file] Context.getExternalFilesDir -> h=0x%lx path=%s\n",
-              (unsigned long)(uintptr_t)sv, jni_file_get_path(sv));
-   }
-   return sv;
+   static struct cached_file_spec spec = {"ANDROID_EXTERNAL_FILES_DIR", NULL, "/tmp", false};
+   return jvm_cached_object_init(env, &sv, "java/io/File", cached_file_initialize, &spec);
 }
 
 jobject
@@ -1344,23 +1321,15 @@ android_content_Context_getFilesDir(JNIEnv *env, jobject object, va_list args)
    assert(env && object);
    (void)args;
    static jobject sv;
-   if (!sv) {
-      sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"));
-      const char *p = getenv("ANDROID_FILES_DIR");
-      if (!p || !*p)
-         p = getenv("ANDROID_EXTERNAL_FILES_DIR");
-      jni_file_set_path(sv, (p && *p) ? p : "/tmp");
-      fprintf(stderr, "[jni_file] Context.getFilesDir -> h=0x%lx path=%s\n",
-              (unsigned long)(uintptr_t)sv, jni_file_get_path(sv));
-   }
-   return sv;
+   static struct cached_file_spec spec = {"ANDROID_FILES_DIR", "ANDROID_EXTERNAL_FILES_DIR", "/tmp", false};
+   return jvm_cached_object_init(env, &sv, "java/io/File", cached_file_initialize, &spec);
 }
 
 static jobject
 lunaria_application_info(JNIEnv *env)
 {
    static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "android/content/pm/ApplicationInfo"))));
+   return jvm_cached_object(env, &sv, "android/content/pm/ApplicationInfo");
 }
 
 jobject
@@ -1523,15 +1492,8 @@ android_content_Context_getCacheDir(JNIEnv *env, jobject object, va_list args)
    assert(env && object);
    (void)args;
    static jobject sv;
-   if (!sv) {
-      sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"));
-      /* libgpg extracts an embedded classes jar under cacheDir; a File
-       * without a path made "Error emptying previous jar directory". */
-      const char *p = getenv("ANDROID_CACHE_DIR");
-      jni_file_set_path(sv, (p && *p) ? p : "/tmp/lunaria-cache");
-      luna_file_mkdir("/tmp/lunaria-cache", 0755);
-   }
-   return sv;
+   static struct cached_file_spec spec = {"ANDROID_CACHE_DIR", NULL, "/tmp/lunaria-cache", true};
+   return jvm_cached_object_init(env, &sv, "java/io/File", cached_file_initialize, &spec);
 }
 
 jobject
@@ -1540,13 +1502,8 @@ android_content_Context_getExternalCacheDir(JNIEnv *env, jobject object, va_list
    assert(env && object);
    (void)args;
    static jobject sv;
-   if (!sv) {
-      sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"));
-      const char *p = getenv("ANDROID_EXTERNAL_CACHE_DIR");
-      jni_file_set_path(sv, (p && *p) ? p : "/tmp/lunaria-ext-cache");
-      luna_file_mkdir("/tmp/lunaria-ext-cache", 0755);
-   }
-   return sv;
+   static struct cached_file_spec spec = {"ANDROID_EXTERNAL_CACHE_DIR", NULL, "/tmp/lunaria-ext-cache", true};
+   return jvm_cached_object_init(env, &sv, "java/io/File", cached_file_initialize, &spec);
 }
 
 /* Context.getDir(name, mode) → File for app_<name> under the files dir.
@@ -1629,8 +1586,7 @@ android_view_InputDevice_getDevice(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
    static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env,
-               (*env)->FindClass(env, "android/view/InputDevice"))));
+   return jvm_cached_object(env, &sv, "android/view/InputDevice");
 }
 
 jint
@@ -1671,8 +1627,7 @@ android_view_KeyCharacterMap_load(JNIEnv *env, jobject object, va_list args)
    assert(env && object);
    motion_trace("load");
    static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env,
-               (*env)->FindClass(env, "android/view/KeyCharacterMap"))));
+   return jvm_cached_object(env, &sv, "android/view/KeyCharacterMap");
 }
 
 jint
@@ -1914,7 +1869,7 @@ android_app_Activity_getIntent(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
    static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "android/content/Intent"))));
+   return jvm_cached_object(env, &sv, "android/content/Intent");
 }
 
 /* Intent.getExtras() → null: this launch carries no extras, so the caller
@@ -1932,7 +1887,7 @@ android_content_Context_getObbDir(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
    static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"))));
+   return jvm_cached_object(env, &sv, "java/io/File");
 }
 
 /* Context.getObbDirs() → an empty File[] (this is a mono APK, no expansion
@@ -1967,6 +1922,21 @@ android_content_Context_getSystemService(JNIEnv *env, jobject object, va_list ar
    if (!args)
       return NULL;
 
+   /* Share the context-owned service and virtual wrapper dispatch with Java.
+    * The legacy table below is only needed when the DVM is disabled. */
+   if (dvm_jni_mode() != DVM_JNI_OFF) {
+      jclass cls = (*env)->GetObjectClass(env, object);
+      const char *name = cls ? jvm_get_class_name(jnienv_get_jvm(env), cls) : NULL;
+      jvalue out = { 0 };
+      va_list copy;
+      va_copy(copy, args);
+      bool handled = name && dvm_jni_invoke(env, name, "getSystemService",
+         "(Ljava/lang/String;)Ljava/lang/Object;", object, false, &copy, NULL, &out);
+      va_end(copy);
+      if (cls) (*env)->DeleteLocalRef(env, cls);
+      if (handled) return out.l;
+   }
+
    jstring service = va_arg(args, jstring);
    const char *name = service ? (*env)->GetStringUTFChars(env, service, NULL) : NULL;
    if (!name)
@@ -2000,12 +1970,8 @@ android_content_Context_getSystemService(JNIEnv *env, jobject object, va_list ar
    for (size_t i = 0; i < sizeof services / sizeof services[0]; ++i) {
       if (strcmp(name, services[i].name))
          continue;
-      if (!services[i].instance) {
-         jclass cls = (*env)->FindClass(env, services[i].class_name);
-         if (cls)
-            services[i].instance = (*env)->AllocObject(env, cls);
-      }
-      result = services[i].instance;
+      result = jvm_cached_object(env, &services[i].instance,
+                                  services[i].class_name);
       break;
    }
    (*env)->ReleaseStringUTFChars(env, service, name);
@@ -2018,7 +1984,7 @@ android_content_Context_getPackageManager(JNIEnv *env, jobject object, va_list a
 {
    assert(env && object);
    static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "android/content/pm/PackageManager"))));
+   return jvm_cached_object(env, &sv, "android/content/pm/PackageManager");
 }
 
 /* PackageManager.getPackageInfo(name, flags).  The bytecode VM owns the
@@ -2149,7 +2115,7 @@ android_os_Looper_getMainLooper(JNIEnv *env, jobject object, va_list args)
 {
    (void)args;
    static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "android/os/Looper"))));
+   return jvm_cached_object(env, &sv, "android/os/Looper");
 }
 
 /* Context.getResources() → Resources → Configuration.
@@ -2164,22 +2130,24 @@ android_content_res_Resources_getConfiguration(JNIEnv *env, jobject object, va_l
 {
    (void)object; (void)args;
    static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env,
-               (*env)->FindClass(env, "android/content/res/Configuration"))));
+   return jvm_cached_object(env, &sv, "android/content/res/Configuration");
 }
 
 void android_view_Display_fillMetrics(JNIEnv *e, jobject out); /* defined below */
+static void cached_metrics_initialize(JNIEnv *env, jobject metrics, void *data)
+{
+   (void)data;
+   android_view_Display_fillMetrics(env, metrics);
+}
+
 
 jobject
 android_content_res_Resources_getDisplayMetrics(JNIEnv *env, jobject object, va_list args)
 {
    (void)object; (void)args;
    static jobject sv;
-   if (!sv) {
-      sv = (*env)->AllocObject(env, (*env)->FindClass(env, "android/util/DisplayMetrics"));
-      android_view_Display_fillMetrics(env, sv);
-   }
-   return sv;
+   return jvm_cached_object_init(env, &sv, "android/util/DisplayMetrics",
+                                 cached_metrics_initialize, NULL);
 }
 
 jobject
@@ -2187,8 +2155,7 @@ android_content_Context_getResources(JNIEnv *env, jobject object, va_list args)
 {
    (void)object; (void)args;
    static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env,
-               (*env)->FindClass(env, "android/content/res/Resources"))));
+   return jvm_cached_object(env, &sv, "android/content/res/Resources");
 }
 
 /* Context.getAssets().
@@ -2204,8 +2171,7 @@ android_content_Context_getAssets(JNIEnv *env, jobject object, va_list args)
 {
    (void)object; (void)args;
    static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env,
-               (*env)->FindClass(env, "android/content/res/AssetManager"))));
+   return jvm_cached_object(env, &sv, "android/content/res/AssetManager");
 }
 
 /* Configuration fields.  These are read through GetObjectField/GetIntField,
@@ -2215,7 +2181,7 @@ jobject
 android_content_res_Configuration_locale(JNIEnv *env, jobject object)
 {
    (void)object;
-   return java_util_Locale_getDefault(env, NULL);
+   return runtime_default_locale(env);
 }
 
 /* Configuration.ORIENTATION_PORTRAIT == 1, ORIENTATION_LANDSCAPE == 2. */
@@ -2308,7 +2274,7 @@ android_app_AlertDialog_Builder_create(JNIEnv *env, jobject object, va_list args
 {
    assert(env && object); (void)args;
    static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "android/app/AlertDialog"))));
+   return jvm_cached_object(env, &sv, "android/app/AlertDialog");
 }
 
 jobject
@@ -2554,8 +2520,7 @@ android_os_PowerManager_newWakeLock(JNIEnv *env, jobject object, va_list args)
       (void)va_arg(args, jstring); /* tag */
    }
    static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env,
-               (*env)->FindClass(env, "android/os/PowerManager$WakeLock"))));
+   return jvm_cached_object(env, &sv, "android/os/PowerManager$WakeLock");
 }
 
 /* ---- android.os.PowerManager$WakeLock methods ---- */
@@ -2927,8 +2892,7 @@ android_content_Context_getContentResolver(JNIEnv *e, jobject o, va_list a)
 {
    (void)a;
    static jobject sv;
-   return (sv ? sv : (sv = (*e)->AllocObject(e,
-      (*e)->FindClass(e, "android/content/ContentResolver"))));
+   return jvm_cached_object(e, &sv, "android/content/ContentResolver");
 }
 jobject java_lang_Object_getContentResolver(JNIEnv *e, jobject o, va_list a)
 { return android_content_Context_getContentResolver(e, o, a); }
@@ -2941,8 +2905,7 @@ android_hardware_display_DisplayManager_getDisplay(JNIEnv *e, jobject o, va_list
 {
    (void)a;
    static jobject sv;
-   return (sv ? sv : (sv = (*e)->AllocObject(e,
-      (*e)->FindClass(e, "android/view/Display"))));
+   return jvm_cached_object(e, &sv, "android/view/Display");
 }
 jobject java_lang_Object_getDisplay(JNIEnv *e, jobject o, va_list a)
 { return android_hardware_display_DisplayManager_getDisplay(e, o, a); }
@@ -2959,14 +2922,7 @@ android_app_Activity_getWindowManager(JNIEnv *env, jobject object, va_list args)
    assert(env && object);
    (void)args;
    static jobject sv;
-   if (!sv) {
-      jclass cls = (*env)->FindClass(env, "android/view/WindowManager");
-      if (!cls)
-         cls = (*env)->FindClass(env, "java/lang/Object");
-      if (cls)
-         sv = (*env)->AllocObject(env, cls);
-   }
-   return sv;
+   return jvm_cached_object(env, &sv, "android/view/WindowManager");
 }
 jobject java_lang_Object_getWindowManager(JNIEnv *env, jobject obj, va_list args)
 { return android_app_Activity_getWindowManager(env, obj, args); }
@@ -2985,14 +2941,7 @@ android_app_Activity_getWindow(JNIEnv *env, jobject object, va_list args)
    assert(env && object);
    (void)args;
    static jobject sv;
-   if (!sv) {
-      jclass cls = (*env)->FindClass(env, "android/view/Window");
-      if (!cls)
-         cls = (*env)->FindClass(env, "java/lang/Object");
-      if (cls)
-         sv = (*env)->AllocObject(env, cls);
-   }
-   return sv;
+   return jvm_cached_object(env, &sv, "android/view/Window");
 }
 jobject java_lang_Object_getWindow(JNIEnv *env, jobject obj, va_list args)
 { return android_app_Activity_getWindow(env, obj, args); }
@@ -3055,9 +3004,7 @@ jboolean java_lang_Object_isFinishing(JNIEnv *e, jobject o, va_list a)
 static jobject lunaria_application_context(JNIEnv *e)
 {
    static jobject application;
-   if (!application)
-      application = (*e)->AllocObject(e, (*e)->FindClass(e, "android/app/Application"));
-   return application;
+   return jvm_cached_object(e, &application, "android/app/Application");
 }
 jobject android_content_Context_getApplicationContext(JNIEnv *e, jobject o, va_list a)
 { (void)o; (void)a; return lunaria_application_context(e); }
@@ -3088,17 +3035,12 @@ jstring java_lang_Object_AndroidThunkJava_GetAndroidId(JNIEnv *e, jobject o, va_
 
 /* GameActivity.AndroidThunkJava_GetNetworkConnectionType() — UE ENetworkConnectionType.
  * WiFi=3 (None=0, Airplane=1, Cell=2, WiFi=3).  Dex bytecode walks
- * ConnectivityManager; stub short-circuits so patch/CDN does not see offline. */
+ * ConnectivityManager; both paths reflect the current guest network state. */
 jint
 com_epicgames_ue4_GameActivity_AndroidThunkJava_GetNetworkConnectionType(JNIEnv *e, jobject o, va_list a)
 {
    (void)e; (void)o; (void)a;
-   static int once;
-   if (!once) {
-      once = 1;
-      fprintf(stderr, "[arm_jni] AndroidThunkJava_GetNetworkConnectionType -> WiFi(3)\n");
-   }
-   return 3; /* ENetworkConnectionType::WiFi */
+   return arm_exec_network_enabled() ? 3 : 0;
 }
 jint java_lang_Object_AndroidThunkJava_GetNetworkConnectionType(JNIEnv *e, jobject o, va_list a)
 { return com_epicgames_ue4_GameActivity_AndroidThunkJava_GetNetworkConnectionType(e, o, a); }
@@ -3108,13 +3050,9 @@ jobject
 android_net_ConnectivityManager_getActiveNetworkInfo(JNIEnv *e, jobject o, va_list a)
 {
    (void)o; (void)a;
+   if (!arm_exec_network_enabled()) return NULL;
    static jobject sv;
-   if (!sv) {
-      jclass cls = (*e)->FindClass(e, "android/net/NetworkInfo");
-      if (!cls) cls = (*e)->FindClass(e, "java/lang/Object");
-      if (cls) sv = (*e)->AllocObject(e, cls);
-   }
-   return sv;
+   return jvm_cached_object(e, &sv, "android/net/NetworkInfo");
 }
 jobject java_lang_Object_getActiveNetworkInfo(JNIEnv *e, jobject o, va_list a)
 { return android_net_ConnectivityManager_getActiveNetworkInfo(e, o, a); }
@@ -3122,10 +3060,10 @@ jobject java_lang_Class_getActiveNetworkInfo(JNIEnv *e, jobject o, va_list a)
 { return android_net_ConnectivityManager_getActiveNetworkInfo(e, o, a); }
 
 jboolean android_net_NetworkInfo_isConnected(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return JNI_TRUE; }
+{ (void)e; (void)o; (void)a; return arm_exec_network_enabled() ? JNI_TRUE : JNI_FALSE; }
 
 jboolean android_net_NetworkInfo_isAvailable(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return JNI_TRUE; }
+{ (void)e; (void)o; (void)a; return arm_exec_network_enabled() ? JNI_TRUE : JNI_FALSE; }
 
 /* android.net.ConnectivityManager.TYPE_WIFI == 1 */
 jint android_net_NetworkInfo_getType(JNIEnv *e, jobject o, va_list a)
@@ -3425,9 +3363,8 @@ com_unity3d_player_UnityPlayer_executeGLThreadJobs(JNIEnv *env, jobject object, 
 jobject
 com_unity3d_player_UnityPlayer_currentActivity(JNIEnv *env, jobject object)
 {
-   (void)env;
    (void)object;
-   return g_current_activity;
+   return (*env)->NewLocalRef(env, g_current_activity);
 }
 
 /* PlayAssetDeliveryUnityWrapper.init(UnityPlayer, Context) — static factory that
@@ -3439,9 +3376,7 @@ com_unity3d_player_PlayAssetDeliveryUnityWrapper_init(JNIEnv *env, jclass clazz,
 {
    (void)args;
    static jobject sv;
-   if (!sv) sv = (*env)->AllocObject(env,
-         (*env)->FindClass(env, "com/unity3d/player/PlayAssetDeliveryUnityWrapper"));
-   return sv;
+   return jvm_cached_object(env, &sv, "com/unity3d/player/PlayAssetDeliveryUnityWrapper");
 }
 
 /* playCoreApiMissing() — return true so Unity skips Play Core and reads assets
@@ -3462,10 +3397,7 @@ com_unity_purchasing_googleplay_GooglePlayPurchasing_instance(JNIEnv *env, jclas
 {
    (void)clazz; (void)values;
    static jobject sv;
-   if (!sv)
-      sv = (*env)->AllocObject(env,
-            (*env)->FindClass(env, "com/unity/purchasing/googleplay/GooglePlayPurchasing"));
-   return sv;
+   return jvm_cached_object(env, &sv, "com/unity/purchasing/googleplay/GooglePlayPurchasing");
 }
 
 jstring

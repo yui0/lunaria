@@ -186,8 +186,16 @@ struct dvm_dex {
 };
 
 struct dvm_attached_thread { uint64_t token; dvm_ref thread; };
+struct dvm_network_callback { dvm_ref callback, network; bool online; };
 struct dvm {
+   _Atomic bool stopping;
+   int io_cancel[2]; /* readable until destruction once process stop is requested */
+   struct bytecode_thread *host_threads; /* joinable Java threads, under GIL */
    struct dvm_hooks hooks;
+   dvm_ref content_providers; /* attached local providers, under GIL */
+   struct dvm_network_callback *network_callbacks;
+   size_t nnetwork_callbacks;
+   bool network_dispatching;
 
    /* Each dex is its own allocation.  Methods and classes keep a
     * `struct dex_file *` into it, and dex_of() resolves that pointer back to
@@ -249,6 +257,7 @@ struct dvm {
    int npending, pending_cap;
    dvm_ref message_pool[50];
    unsigned message_pool_size;
+   dvm_ref resource_bundle_cache; /* per-VM default classpath bundle cache */
    /* The Thread the interpreter is currently inside, or 0 for the main one. */
    dvm_ref cur_thread;
    dvm_ref main_thread;
@@ -359,8 +368,17 @@ bool dvm__monitor_wait(struct dvm *vm, dvm_ref ref, uint64_t timeout_ms,
  * thread's interrupt status; set_wait records the channel it is about to block
  * on (0 when it stops), which is what Thread.interrupt() signals. */
 dvm_ref dvm__current_thread(struct dvm *vm);
+bool dvm__logical_main_thread(struct dvm *vm);
 bool dvm__thread_take_interrupt(struct dvm *vm);
 void dvm__thread_set_wait(struct dvm *vm, uintptr_t channel);
+/* java.lang.Thread.State declaration order. Updated only with the GIL held. */
+enum dvm_thread_state {
+   DVM_THREAD_NEW, DVM_THREAD_RUNNABLE, DVM_THREAD_BLOCKED,
+   DVM_THREAD_WAITING, DVM_THREAD_TIMED_WAITING, DVM_THREAD_TERMINATED
+};
+void dvm__thread_set_state(struct dvm *vm, dvm_ref thread,
+                           enum dvm_thread_state state);
+
 bool dvm__monitor_notify(struct dvm *vm, dvm_ref ref, bool all);
 bool dvm__monitor_state(struct dvm *vm, dvm_ref ref, bool current,
                         uint32_t *depth);
@@ -462,6 +480,7 @@ static inline void dvm__note_io_progress(struct dvm *vm, size_t bytes) {
  * Runs from the pending-queue drain because that is this VM's main looper —
  * the thread every other posted callback already runs on. */
 void dvm__ui_tick(struct dvm *vm);
+void dvm__network_tick(struct dvm *vm);
 
 /* Runs threads queued by Thread.start(); called when the VM returns to JNI. */
 void dvm__run_pending_threads(struct dvm *vm);
@@ -502,7 +521,7 @@ const struct dvm_system_service *dvm_runtime_system_services(size_t *count);
 /* Matches a service key, a class descriptor or a bare class name. */
 const struct dvm_system_service *dvm_runtime_find_system_service(const char *key);
 /* The per-service singleton instance, created on first use. */
-dvm_ref dvm_runtime_system_service(struct dvm *vm, const char *key);
+dvm_ref dvm_runtime_system_service(struct dvm *vm, const char *key, dvm_ref context);
 /* Context.registerReceiver / unregisterReceiver / send*Broadcast on any
  * Context.  True when `method` was one of them (the result, or a pending
  * exception, is then the answer). */

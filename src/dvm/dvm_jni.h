@@ -23,6 +23,7 @@
 #include "jvm/jni.h"
 
 #include <stdarg.h>
+void dvm_jni_shutdown(void);
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -48,6 +49,11 @@ void dvm_jni_set_guest_native_caller(dvm_guest_native_fn fn);
 
 typedef bool (*dvm_guest_library_fn)(const char *name);
 void dvm_jni_set_guest_library_loader(dvm_guest_library_fn fn);
+
+/* android.app.NativeActivity's framework half, run by the guest: stage is a
+ * DVM_NATIVE_ACTIVITY_* value and activity the Activity object. */
+typedef bool (*dvm_guest_activity_fn)(int stage, jobject activity);
+void dvm_jni_set_guest_native_activity(dvm_guest_activity_fn fn);
 
 /* True when the APK's dex declares this class (slash-separated name).  A guest
  * uses ClassLoader.loadClass() to feature-detect optional Java components; the
@@ -115,6 +121,7 @@ struct dvm;
 struct luna_touch_event;
 bool dvm_ui_dispatch_touch(struct dvm *vm, const struct luna_touch_event *sample);
 void dvm_jni_show_activity(JNIEnv *env, jobject activity);
+bool dvm_jni_activity_finishing(JNIEnv *env, jobject activity);
 
 /* Diagnostics for the loader's summary line. */
 void dvm_jni_report(void);

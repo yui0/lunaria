@@ -48,6 +48,7 @@
 
 #include "arm_exec.h"
 #include "luna_compositor.h"
+#include "luna_qfkey.h"
 
 /* ---- the command table -------------------------------------------------- */
 
@@ -1226,6 +1227,9 @@ static void h_queue_present(HostCallArgs *a, uintptr_t idx)
       if (r == VK_SUCCESS) {
          const bool bgra = sc->format == VK_FORMAT_B8G8R8A8_UNORM ||
                            sc->format == VK_FORMAT_B8G8R8A8_SRGB;
+         luna_qfkey_start("lunaria", (int)sc->extent.width, (int)sc->extent.height);
+         luna_qfkey_publish(sc->map, (int)sc->extent.width, (int)sc->extent.height,
+                            (int)sc->extent.width * 4, bgra);
          luna_comp_submit_pixels((int)sc->extent.width, (int)sc->extent.height,
                                  sc->map, (int)sc->extent.width * 4, bgra,
                                  sc->fifo ? 1 : 0);

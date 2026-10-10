@@ -4,7 +4,7 @@
 
 [![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-5b5bd6.svg)](LICENSE)
 [![Guests](https://img.shields.io/badge/guest-ARM32%20%7C%20ARM64-20232a.svg)](#how-it-works)
-[![Engines](https://img.shields.io/badge/engines-Unity%20%7C%20Unreal-20232a.svg)](#compatibility)
+[![Engines](https://img.shields.io/badge/engines-Unity%20%7C%20Unreal%20%7C%20native-20232a.svg)](#compatibility)
 [![Sponsor](https://img.shields.io/badge/sponsor-%E2%99%A5-ea4aaa.svg)](https://github.com/sponsors/yui0)
 
 [日本語](README.ja.md)
@@ -20,6 +20,15 @@ profiles (`src/apk.c`). An Android system image is not required.
 `android.webkit.WebView` is drawn by a host browser over the Chrome DevTools
 pipe — Chrome or Chromium when one is installed, otherwise the built-in
 [luna-browser](luna-browser/) (luna-ui and QuickJS).
+
+**Running today:** Genshin Impact · Ni no Kuni: Cross Worlds · Alchemia Story ·
+Kikyu! Aeronaut (a 2013 `armeabi` APK) · Black Clover: Asta Fight · Between Two
+Worlds · and more in [Compatibility](#compatibility).
+
+Every package starts the way Android starts it: the manifest's `Application`
+and content providers, then the launcher `Activity`, with the APK's own Java
+doing the work. Native-activity engines such as Unreal go through the
+framework's `NativeActivity` like on a device. There is no per-engine loader.
 
 > [!IMPORTANT]
 > Lunaria is a compatibility experiment, and the code is still changing. What
@@ -41,6 +50,14 @@ pipe — Chrome or Chromium when one is installed, otherwise the built-in
 <p align="center"><sub>Over Mondstadt · the lakeshore · the Knights' library · a scene from Ni no Kuni: Cross Worlds<br>
 Genshin Impact 7.1.0, Unity IL2CPP, arm64-v8a. Cross Worlds, Unreal Engine 4, arm64-v8a.<br>
 Guest framebuffer on Linux.</sub></p>
+
+<p align="center">
+  <img src="shots/alchemia-story-title.png" width="48%" alt="Alchemia Story title screen, the cast gathered around the logo, Touch to start">
+  &nbsp;
+  <img src="shots/cross-worlds-lighthouse.png" width="48%" alt="Ni no Kuni: Cross Worlds in the field at sunset beside a lighthouse, full touch HUD">
+</p>
+
+<p align="center"><sub>Alchemia Story 1.0.154 (Unity IL2CPP, arm64-v8a) · Cross Worlds in the field at sunset</sub></p>
 
 ## Why Lunaria
 
@@ -189,6 +206,43 @@ draws through to the game. The framebuffer is **1024×576**.
 Programmatic taps use `LUNARIA_TOUCH_TEST`. A bare `x,y` is a percentage of
 the framebuffer (`50,84` and `50%,84%` are the same point); `640px,606px` is
 a guest pixel. GLFW ignores `xdotool` synthetic clicks.
+
+### Alchemia Story
+
+ASOBIMO's Japanese RPG on Unity IL2CPP, arm64-v8a, framebuffer **1024×576**
+(portrait scenes draw at 576×1024). The title screen, story scenes with
+their Japanese text, and the character-creation room draw. The package is the
+plain `.apk`, version 1.0.154.
+
+<p align="center">
+  <img src="shots/alchemia-story-cave.png" width="48%" alt="Alchemia Story: a black-haired heroine covers her mouth in surprise inside a cave, Japanese dialogue box below">
+  &nbsp;
+  <img src="shots/alchemia-story-neko.png" width="26%" alt="Alchemia Story portrait scene: a white-haired cat-eared girl cheers the player up, Skip and Auto buttons on the right">
+</p>
+
+<p align="center"><sub>A story scene in landscape · the same game in portrait</sub></p>
+
+### Kikyu! Aeronaut
+
+A 2013 `armeabi` APK built around a native `libCatNative.so`, run through the
+ARM32 guest. The title screen draws: moon, skyline, pixel-art heroine, and
+*Press Return to Embark*.
+
+<p align="center">
+  <img src="shots/kikyu-title.png" width="48%" alt="Kikyu! Aeronaut title screen: a crescent moon over a city skyline, the pixel-art heroine on a pile of rubble, Press Return to Embark">
+</p>
+
+<p align="center"><sub>A 2013 binary, unmodified</sub></p>
+
+### More from Cross Worlds
+
+<p align="center">
+  <img src="shots/cross-worlds-portal.png" width="32%" alt="Cross Worlds: two characters before a glowing blue crystal, a flying familiar beside them">
+  &nbsp;
+  <img src="shots/cross-worlds-gatling.png" width="32%" alt="Cross Worlds: a red-haired heroine levels a huge gatling gun against swirling orange flames">
+  &nbsp;
+  <img src="shots/cross-worlds-lighthouse.png" width="32%" alt="Cross Worlds field play at sunset with the HUD, quest list, and skill ring">
+</p>
 
 ### Open-source and smaller titles
 
@@ -379,6 +433,8 @@ Details and launch recipes live in `PROGRESS.md`.
 | **Ni no Kuni: Cross Worlds** | Unreal Engine 4 · AArch64 XAPK | Drawn on Linux through guest login, the village, story dialogue, a voiced cutscene, and in-world play. SharedPreferences persist. On Apple Silicon macOS, package 5.04.12 displays the movie and 3D intro in the window and reaches the Terms of Use dialog. Progress after consent has not been checked |
 | **Blade & Soul Masia** | Unreal Engine 5 · AArch64 APKS | Opening movie reaches EOS; title screen; additional-patch dialog is readable and Agree advances the download |
 | **Genshin Impact 7.1.0** | Unity IL2CPP · AArch64 XAPK | Open world on Linux. Saved login and the Asia server return, then shader compile, the resource download, **TAP TO BEGIN**, and the field. Prologue, the library, and flight over Mondstadt draw in color. Keyboard movement works there; that host measured about 18–22 fps in the field and about 30 fps in settings. A changed music volume survived restart. A host WebView can open the account page. Google Play billing is not implemented |
+| **Alchemia Story 1.0.154** | Unity IL2CPP · AArch64 APK | Title screen, story scenes with Japanese dialogue in landscape and portrait, and the character-creation room draw (2026-10-09) |
+| **Kikyu! Aeronaut** | native `armeabi` · ARM32 APK (2013) | Title screen draws and waits for Return |
 | **Between Two Worlds** | Unity 2023 IL2CPP · ARMv7 | Playable; reaches the main story scene |
 | **Between Two Worlds** | Unity 2023 IL2CPP · AArch64 | Main menu on a recorded run; recent checks reach language selection at about 70 fps |
 | **FPSMobile** | Unreal Engine 4 · ARMv7 | FirstPersonExampleMap renders; 16,000+ swaps observed |
@@ -481,9 +537,31 @@ is relative to the shorter screen dimension.
 `walk` selects a smaller stick radius while the named key is held with WASD.
 The Genshin layout uses WASD to run and Ctrl+WASD to walk.
 
-Up to eight buttons can be mapped. Supported keys are uppercase letters, digits,
+Up to eight buttons and eight macros can be mapped. Supported keys are uppercase letters, digits,
 `SPACE`, `SHIFT`, and `CTRL`. The bundled layouts are tuned for landscape HUDs, so adjust
 the coordinates if you change the HUD size or placement.
+
+### Simultaneous taps, timed input, recording
+
+```text
+button F 0.10 0.20 0.30 0.40 0.50 0.60     # one key, three contacts at once
+button G 0.70 0.70 repeat=100 hold=20      # tap every 100 ms while held, 20 ms each
+macro Z 0.5,0.5|0.6,0.6/40 @100 0.9,0.9    # two taps together for 40 ms, wait 100 ms, tap
+macro X 0.1,0.1 loop                       # keep running while the key is held
+```
+
+A `button` takes up to four X/Y pairs and presses them together. `repeat=MS`
+(10–60000) taps again every MS milliseconds while the key is held; `hold=MS` is
+how long each tap lasts (default 30, or half of `repeat`, whichever is less). A
+`macro` runs its steps once per press: `x,y` taps (add `|x,y` to tap several
+together and `/MS` for the hold time) and `@MS` waits; `loop` repeats it while the
+key is held. Timing follows the frame clock, about 16 ms at 60 fps.
+
+**F9** (or *Record Input* in the right-click menu) records every touch the guest
+receives — mouse, keymap and macros alike — to `~/Documents/Lunaria <date>.rec`
+(or `~/`). **F10** (*Play Recording*) replays the last recording, or the file in
+`LUNARIA_PLAY`; `LUNARIA_PLAY_LOOP=1` loops it. Coordinates are stored as
+fractions of the view, so a recording replays at any window size.
 
 ## Capture frames
 
@@ -549,8 +627,18 @@ F12, and **Take Screenshot** in the host menu, write
   `LUNARIA_FD_PARK` is set.
 - **Java:** when a JNI call has no host stub, `src/dvm/` executes the method
   from the APK's `classes*.dex` (`LUNARIA_DVM=1` by default).
+- **Startup:** the launcher `Activity` runs its real `onCreate`/`onStart`/
+  `onResume` after the manifest's `Application` and providers. A native-activity
+  engine reaches `ANativeActivity_onCreate` through `android.app.NativeActivity`'s
+  own lifecycle; the window and input queue are delivered as `APP_CMD_*`
+  commands on the glue's pipe, in the order the app's Java asks for them.
+- **Libraries:** a `System.loadLibrary` root heads the lookup scope of its own
+  dependencies, as Android's linker does, so an engine's allocator replaces the
+  one inside `libc++_shared.so`.
 - **Assets:** `AssetManager` reads DEFLATE/STORE entries from APKs and OBB
   expansion files.
+- **Audio:** OpenSL ES, AAudio and Java `AudioTrack` feed one mixer and then
+  ALSA. A blocking `AudioTrack.write()` never waits on the frame pump.
 - **Media:** `android.media.MediaCodec` decodes H.264 with openh264 and AAC
   with libavcodec when available (`LUNARIA_OPENH264` / `LUNARIA_LIBAVCODEC`
   override the shared-library paths).
@@ -614,16 +702,14 @@ full diagnostic set.
 | `LUNARIA_JIT_UI` | `1` | Boot card (moon, translation and dex progress); `0` leaves the surface blank until the guest draws |
 | `LUNARIA_DVM` | `1` | Dalvik bytecode emulator: `0` off, `1` run the APK's dex only where no host stub exists, `2` prefer the dex over host stubs |
 | `LUNARIA_DVM_TRACE` | off | Log the methods the emulator declined (`[dvm] miss …`) |
-| `LUNARIA_DEX_START` | on | Run the APK's Activity lifecycle from dex; set to `0` only to compare with the legacy hand-written startup sequence |
 | `LUNARIA_NET` | on | Set `0` to deny all guest sockets |
 | `LUNARIA_CACHE_DIR` | `cache/packages/` under the data root selected at startup | Persistent package cache; independently relocatable |
 | `LUNARIA_NO_CACHE` | off | Force a fresh APK/XAPK/APKS unpack |
 
-An APK with no engine entry point (no `ANativeActivity_onCreate`, no
-`UnityPlayer.initJni`) is now started from its launcher Activity instead of
-being rejected: `lunaria` reads it out of the manifest and passes it as
-`ANDROID_LAUNCH_ACTIVITY`, and the loader runs its `onCreate`/`onStart`/
-`onResume` through the bytecode VM.
+Every package is started from its manifest: `lunaria` passes the launcher
+Activity as `ANDROID_LAUNCH_ACTIVITY` and the `Application` class as
+`ANDROID_APPLICATION_CLASS`, and the loader runs their lifecycles through the
+bytecode VM. A native engine is loaded by the app's own `System.loadLibrary`.
 
 Tick values accept `K`, `M`, and `G` suffixes, for example
 `LUNARIA_ONLOAD_TICKS=5G`.
@@ -635,7 +721,9 @@ Tick values accept `K`, `M`, and `G` suffixes, for example
 | `src/arm_exec.cpp` | dynarmic engines, SVC dispatch, JNI, EGL/GLES and threading |
 | `src/arm.c` / `src/arm.h` | shared ARM execution lock and multi-engine helpers |
 | `src/dvm/` | Dalvik bytecode emulator: runs the APK's own Java from classes*.dex |
-| `src/loader.c` | runtime entry point and Unity render-loop orchestration |
+| `src/loader.c` | runtime entry point: Application, providers, launcher Activity, and the frame pump |
+| `src/dvm/audio_track.c` | Java `AudioTrack` queues shared with the output mixer |
+| `src/dvm/apk_signers.c` | APK signing-block parsing behind `PackageInfo` signatures |
 | `src/linker/` | Android ELF linker adapted for the host |
 | `src/jvm/` | lightweight JVM/JNI object model and stubs |
 | `src/lib/` | host implementations exposed to Android native code; `guest.c` is the in-guest libc |

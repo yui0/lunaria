@@ -755,7 +755,7 @@ static void pick_select_label(size_t i)
 {
     char id[32], label[1100];
     snprintf(id, sizeof id, "set%zu", i);
-    snprintf(label, sizeof label, "%s v", *pick_settings[i].value ?
+    snprintf(label, sizeof label, "%s", *pick_settings[i].value ?
              pick_settings[i].value : "Default (pixel6)");
     luna_set_text(luna_get_element_by_id(id), label);
 }
@@ -786,11 +786,30 @@ static void pick_select_toggle(LunaElement *element)
         pick_select_for = (int)i;
         snprintf(id, sizeof id, "select%zu", i);
         int panel = luna_get_element_by_id(id);
+        size_t options = 0;
+        while (pick_settings[i].choices[options]) ++options;
+        float y = 0, h = 40;
+        snprintf(id, sizeof id, "set%zu", i);
+        luna_element_bounds(luna_get_element_by_id(id), NULL, &y, NULL, &h);
+        float card_y = 0, card_h = luna_window_height;
+        luna_element_bounds(luna_get_element_by_id("launcher-card"), NULL, &card_y, NULL, &card_h);
+        float top = card_y + 8 > 12 ? card_y + 8 : 12;
+        float bottom = card_y + card_h - 76;
+        if (bottom > luna_window_height - 12) bottom = luna_window_height - 12;
+        float below = bottom - y - h;
+        float above = y - top;
+        int upwards = below < options * 34 + 10 && above > below;
+        if (upwards) luna_add_class(panel, "opens-up");
+        else luna_remove_class(panel, "opens-up");
+        char style[96];
+        float available = upwards ? above : below;
+        snprintf(style, sizeof style, "max-height:%.0fpx;overflow:auto;", available > 44 ? available : 44);
+        luna_dom_set_attr(panel, "style", style);
         luna_remove_class(panel, "hidden");
         luna_update_element_style(panel);
         snprintf(id, sizeof id, "set%zu", i);
         luna_dom_set_attr(luna_get_element_by_id(id), "aria-expanded", "true");
-        luna_push_focus_trap(panel, pick_select_close, 0);
+        luna_push_focus_trap(panel, pick_select_close, 2);
         for (size_t k = 0; pick_settings[i].choices[k]; ++k) {
             char option_id[48]; snprintf(option_id, sizeof option_id, "option%zu_%zu", i, k);
             int selected = !strcmp(pick_settings[i].value, pick_settings[i].choices[k]);
@@ -1011,8 +1030,11 @@ static const char pick_css_extra[] =
     "#launcher-card .trio{position:relative;height:72px;margin:0 0 4px 0;}"
     "#launcher-card .cell{position:absolute;top:0;height:70px;}"
     "#launcher-card .cell input{position:absolute;left:0;right:0;top:30px;height:40px;padding:0 12px;border:1px solid #bcd6e8;border-radius:8px;background:#ffffff;color:#12324d;}"
-    "#launcher-card .cell .select-box{box-sizing:border-box;position:absolute;left:0;right:0;top:30px;height:40px;padding:10px 12px;border:1px solid #bcd6e8;border-radius:8px;background:#ffffff;color:#12324d;cursor:pointer;}"
-    "#launcher-card .select-panel{position:absolute;left:0;right:0;bottom:42px;z-index:100;background:#ffffff;border:1px solid #bcd6e8;border-radius:8px;padding:4px;}"
+    "#launcher-card .cell .select-box{box-sizing:border-box;position:absolute;left:0;right:0;top:30px;height:40px;padding:10px 32px 10px 12px;border:1px solid #bcd6e8;border-radius:8px;background:#ffffff;color:#12324d;cursor:pointer;}"
+    "#launcher-card .select-box::after{content:\"\";position:absolute;right:14px;top:14px;width:7px;height:7px;border-right:2px solid #6f8ca2;border-bottom:2px solid #6f8ca2;transform:rotate(45deg);}"
+    "#launcher-card .select-panel{box-sizing:border-box;position:absolute;left:0;right:0;top:74px;z-index:100;background:#ffffff;border:1px solid #bcd6e8;border-radius:8px;padding:4px;}"
+    "#launcher-card .select-panel.opens-up{top:auto;bottom:42px;}"
+    "#launcher-card .select_option[aria-selected=true]{background:#e3f1fb;font-weight:600;}"
     "#launcher-card .select_option{box-sizing:border-box;height:34px;padding:8px;cursor:pointer;}"
     "#launcher-card .select_option:hover,#launcher-card .select_option:focus{background:#e3f1fb;}"
     "#launcher-card .select-panel.hidden{display:none;}"

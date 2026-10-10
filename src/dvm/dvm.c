@@ -13,6 +13,7 @@
 #include "luna_boot.h"
 #include "arm_exec.h"
 #include "arm.h"
+#include "lunaria_os.h"
 
 #include <errno.h>
 #include <math.h>
@@ -156,20 +157,30 @@ bool dvm__sig_param(const char *sig, int idx, char *buf, size_t sz)
 /* JNI form ("com/foo/Bar") into a descriptor ("Lcom/foo/Bar;"). */
 static void name_to_desc(const char *name, char *buf, size_t sz)
 {
-   if (!name) { if (sz) buf[0] = '\0'; return; }
-   if (name[0] == 'L' && name[strlen(name) - 1] == ';') {
-      snprintf(buf, sz, "%s", name);
-   } else if (name[0] == '[') {
-      snprintf(buf, sz, "%s", name);
-   } else if (name[1] == '\0' && strchr("ZBCSIJFDV", name[0])) {
-      snprintf(buf, sz, "%s", name);
+   if (!sz) return;
+   if (!name) { buf[0] = '\0'; return; }
+   const size_t n = strlen(name);
+   const bool wrap = !((name[0] == 'L' && name[n - 1] == ';') || name[0] == '[' ||
+                       (n == 1 && strchr("ZBCSIJFDV", name[0])));
+   const size_t need = n + (wrap ? 2 : 0);
+   if (need >= sz) {   /* truncate the way snprintf did */
+      size_t room = sz - 1, k = 0;
+      if (wrap && room) { buf[k++] = 'L'; --room; }
+      if (room > n) room = n;
+      memcpy(buf + k, name, room);
+      buf[k + room] = '\0';
+   } else if (wrap) {
+      buf[0] = 'L';
+      memcpy(buf + 1, name, n);
+      buf[n + 1] = ';';
+      buf[n + 2] = '\0';
    } else {
-      snprintf(buf, sz, "L%s;", name);
+      memcpy(buf, name, n + 1);
    }
    /* Java's dotted form shows up in Class.forName() and in strings the app
     * hands us; the dex always uses slashes. */
-   for (char *p = buf; *p; ++p)
-      if (*p == '.') *p = '/';
+   for (char *q = buf; *q; ++q)
+      if (*q == '.') *q = '/';
 }
 
 /* ------------------------------------------------------------------------ *
@@ -883,6 +894,24 @@ static void mcache_put(struct dvm_class *c, uint32_t h, const char *name,
    ++c->mcache_len;
 }
 
+struct dvm_method *dvm_find_method_by_params(struct dvm *vm, struct dvm_class *cls,
+                                             const char *name, const char *sig)
+{
+   struct dvm_method *m = dvm_find_method(vm, cls, name, sig);
+   if (m || !cls || !sig) return m;
+   const char *close = strchr(sig, ')');
+   if (!close) return NULL;
+   const size_t plen = (size_t)(close - sig) + 1;
+   for (struct dvm_class *c = cls; c; c = c->super)
+      for (int i = 0; i < c->nmethods; ++i) {
+         const struct dvm_method *cand = &c->methods[i];
+         if (cand->name && cand->sig && !strcmp(cand->name, name) &&
+             !strncmp(cand->sig, sig, plen))
+            return &c->methods[i];
+      }
+   return NULL;
+}
+
 struct dvm_method *dvm_find_method(struct dvm *vm, struct dvm_class *cls,
                                    const char *name, const char *sig)
 {
@@ -927,8 +956,9 @@ struct dvm_method *dvm_lookup(struct dvm *vm, const char *class_name,
    return dvm_find_method(vm, c, method, sig);
 }
 
-static struct dvm_field *class_find_field(struct dvm_class *cls, const char *name,
-                                          const char *type, bool statics)
+static struct dvm_field *class_find_field_slow(struct dvm_class *cls, const char *name,
+                                               const char *type, bool statics,
+                                               struct dvm_class **owner, int *index)
 {
    for (struct dvm_class *c = cls; c; c = c->super) {
       struct dvm_field *list = statics ? c->sfields : c->ifields;
@@ -936,18 +966,45 @@ static struct dvm_field *class_find_field(struct dvm_class *cls, const char *nam
       for (int i = 0; i < n; ++i) {
          if (!list[i].name || strcmp(list[i].name, name)) continue;
          if (type && list[i].type && strcmp(list[i].type, type)) continue;
+         *owner = c; *index = i;
          return &list[i];
       }
       if (statics) {
          /* Interface constants. */
          for (int i = 0; i < c->nifaces; ++i) {
             if (!c->ifaces[i]) continue;
-            struct dvm_field *f = class_find_field(c->ifaces[i], name, type, true);
+            struct dvm_field *f = class_find_field_slow(c->ifaces[i], name, type, true,
+                                                        owner, index);
             if (f) return f;
          }
       }
    }
    return NULL;
+}
+
+/* The runtime stubs look fields up by name on every call, and a view tree walk
+ * does it hundreds of times per frame.  Remember where a hit was found, keyed
+ * by the caller's name pointer (a literal at nearly every call site) and
+ * validated against the field list itself, so a reused pointer or a field list
+ * that grew since can only cost a slow search, never a wrong answer. */
+struct field_hit { struct dvm_class *cls, *owner; const char *name; int index; bool statics; };
+static struct dvm_field *class_find_field(struct dvm_class *cls, const char *name,
+                                          const char *type, bool statics)
+{
+   static _Thread_local struct field_hit cache[2048];
+   const uintptr_t key = ((uintptr_t)cls >> 4) * 2654435761u ^ ((uintptr_t)name >> 3) ^ (statics ? 1u : 0u);
+   struct field_hit *h = &cache[key & 2047u];
+   if (h->cls == cls && h->name == name && h->statics == statics && h->owner) {
+      struct dvm_field *list = statics ? h->owner->sfields : h->owner->ifields;
+      int n = statics ? h->owner->nsfields : h->owner->nifields;
+      if (h->index < n && list[h->index].name && !strcmp(list[h->index].name, name) &&
+          (!type || !list[h->index].type || !strcmp(list[h->index].type, type)))
+         return &list[h->index];
+   }
+   struct dvm_class *owner = NULL; int index = 0;
+   struct dvm_field *f = class_find_field_slow(cls, name, type, statics, &owner, &index);
+   if (f) *h = (struct field_hit){ cls, owner, name, index, statics };
+   return f;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -1497,25 +1554,11 @@ bool dvm__call_out(struct dvm *vm, struct dvm_class *cls, const char *name,
       return !vm->exception;
 
    if (is_native && vm->hooks.call_native) {
-      /* A native implemented in guest code runs without the interpreter lock,
-       * the way a real JNI transition does.
-       *
-       * Lock order in the emulator is: interpreter lock outside, ARM execution
-       * lock (src/arm.h) inside.  Guest native code takes the execution lock
-       * at every SVC, so a thread that carried the interpreter lock in here
-       * would hold the two in the opposite order to the scheduler, which yields
-       * the interpreter lock from inside the execution lock — and the two
-       * deadlock, with the pump inside dvm_gil_acquire() and the Java thread
-       * inside arm_lock_acquire().
-       *
-       * This is the boundary to do it at, not the SVC entry point: by the time
-       * an SVC fires, control is already inside arbitrary native code, and the
-       * dvm's own builtins (which are C and do need the lock) fire SVCs too.
-       * Here the two kinds are still distinguishable. */
-      unsigned gil = dvm_gil_unlock_all(vm);
+      /* The bridge converts VM objects before and after guest execution.
+       * Those conversions require GIL just like bytecode. The bridge drops
+       * it only around actual native execution, preserving GIL -> AEL order. */
       bool ok = vm->hooks.call_native(vm->hooks.user, vm, cls->name, name, sig,
                                       is_static, self, args, nargs, out);
-      dvm_gil_relock(vm, gil);
       if (ok) {
          if (vm->hooks.take_pending_exception) {
             dvm_ref raised = vm->hooks.take_pending_exception(vm->hooks.user, vm);
@@ -2001,11 +2044,15 @@ bool dvm__monitor_try_enter(struct dvm *vm, dvm_ref ref)
 bool dvm__monitor_enter(struct dvm *vm, dvm_ref ref)
 {
    for (;;) {
+      if (dvm_is_stopping(vm)) return false;
       if (dvm__monitor_try_enter(vm, ref)) return true;
       if (vm->exception) return false;
       /* Notification is the mechanism.  The long timeout only permits state
        * validation if a producer disappears; it never grants ownership. */
+      dvm_ref thread = dvm__current_thread(vm);
+      dvm__thread_set_state(vm, thread, DVM_THREAD_BLOCKED);
       dvm_gil_wait_for(vm, monitor_channel(ref, 1), 60000u);
+      dvm__thread_set_state(vm, thread, DVM_THREAD_RUNNABLE);
    }
 }
 
@@ -2047,13 +2094,17 @@ bool dvm__monitor_wait(struct dvm *vm, dvm_ref ref, uint64_t timeout_ms,
 
    bool signalled = false, interrupted = false;
    for (;;) {
+      if (dvm_is_stopping(vm)) return false;
       uint64_t now = monitor_now_ms();
       if (deadline && now >= deadline) break;
       uint64_t left = deadline ? deadline - now : 60000u;
       if (left > 60000u) left = 60000u;
+      dvm_ref thread = dvm__current_thread(vm);
+      dvm__thread_set_state(vm, thread, deadline ? DVM_THREAD_TIMED_WAITING : DVM_THREAD_WAITING);
       dvm__thread_set_wait(vm, monitor_channel(ref, 2));
       dvm_gil_wait_for(vm, monitor_channel(ref, 2), (unsigned)left);
       dvm__thread_set_wait(vm, 0);
+      dvm__thread_set_state(vm, thread, DVM_THREAD_RUNNABLE);
       o = dvm__obj(vm, ref);
       if (!o) {
          dvm__throw(vm, "java/lang/NullPointerException", "waited object freed");
@@ -2134,6 +2185,7 @@ static bool invoke_body(struct dvm *vm, struct dvm_method *m, dvm_ref self,
                         const uint32_t *slots, int nslots, union dvm_value *out)
 {
    memset(out, 0, sizeof *out);
+   if (dvm_is_stopping(vm)) return false;
    if (!m) return true;
 
    /* The return slot is defined before the callee runs.
@@ -2361,7 +2413,10 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
        * runs.  The top of the dispatch loop is the one place in a call where
        * nothing but frames, registers and dex mappings are live, and none of
        * those move when another thread allocates. */
-      if ((vm->steps & (DVM_GIL_YIELD_STEPS - 1)) == 0) dvm_gil_yield(vm);
+      if ((vm->steps & (DVM_GIL_YIELD_STEPS - 1)) == 0) {
+         dvm_gil_yield(vm);
+         if (dvm_is_stopping(vm)) return false;
+      }
       /* And the *execution* lock with it, more often.
        *
        * Java reached from guest native code (dvm_jni_invoke) runs with the ARM
@@ -2579,6 +2634,10 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             fprintf(stderr, "[dvm] check-cast at %s.%s%s pc=%u: %s to %s\n",
                     m->cls->name, m->name, m->sig ? m->sig : "",
                     fr->pc, o->cls ? o->cls->name : "?", t->name);
+            if (getenv("LUNARIA_DVM_CASTVAL") && o->cls && !strcmp(o->cls->name, "java/lang/String")) {
+               const char *sv = dvm_string_utf8(vm, r[AA(u0)]);
+               fprintf(stderr, "[dvm]   value=%.200s\n", sv ? sv : "?");
+            }
             dvm__throw(vm, "java/lang/ClassCastException", "%s to %s",
                        o->cls ? o->cls->name : "?", t->name);
             goto exception;
@@ -3058,6 +3117,13 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             }
          }
 
+         /* invoke-super searches from the calling class's direct superclass,
+          * even when the method reference names a more distant ancestor.
+          * Interface super calls retain their declared interface target. */
+         if (kind == 0x6f && cls && !(cls->access & DEX_ACC_INTERFACE) &&
+             m->cls && m->cls->super)
+            target = dvm_find_method(vm, m->cls->super, name, sigbuf);
+
          /* invoke-virtual / -interface re-dispatch on the receiver. */
          if (target && (kind == 0x6e || kind == 0x72))
             target = virtual_target(vm, self, target);
@@ -3434,6 +3500,9 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
 
 exception:
       {
+         /* Process death is not a Java exception that guest code can catch
+          * and restart.  Unwind to the host thread owner for joining. */
+         if (dvm_is_stopping(vm)) return false;
          if (!vm->exception)
             dvm__throw(vm, "java/lang/Error", "internal: no exception object");
          struct dvm_object *eo = dvm__obj(vm, vm->exception);
@@ -3529,6 +3598,7 @@ bool dvm__sched_trace_for(const char *class_name)
 
 static int drain_pending(struct dvm *vm, bool nested)
 {
+   if (dvm_is_stopping(vm)) return 0;
    dvm_nsd_poll(vm);
    if (!vm->npending) return 0;
    if (!nested && vm->drain_depth) return 0;
@@ -3652,7 +3722,7 @@ static int drain_pending(struct dvm *vm, bool nested)
              * started with Thread.start() runs as itself.  App code asserts on
              * the difference, so Thread.currentThread() has to follow it. */
             dvm_ref saved_thread = vm->cur_thread;
-            vm->cur_thread = is_thread[i] ? list[i] : 0;
+            vm->cur_thread = is_thread[i] ? list[i] : vm->main_thread;
             bool ok;
             if (proxy_run) {
                struct dvm_class *iface =
@@ -3679,6 +3749,11 @@ static int drain_pending(struct dvm *vm, bool nested)
              * it back, so a later drain retries the wait the way the blocked
              * thread would have resumed on a real runtime. */
             const bool parked_here = vm->parked;
+            if (entry_is_thread && !parked_here) {
+               (void)dvm_set_field(vm, entry, "alive", "Z", (union dvm_value){.i = 0});
+               dvm__thread_set_state(vm, entry, DVM_THREAD_TERMINATED);
+               dvm_gil_notify_for(entry);
+            }
             dvm_clear_exception(vm);
             if (parked_here) {
                /* The exception only exists to unwind the wait. It is not a
@@ -3785,6 +3860,7 @@ void dvm_main_looper_tick(struct dvm *vm)
    extern __thread dvm_ref g_current_looper;
    const dvm_ref saved_looper = g_current_looper;
    g_current_looper = 0;
+   dvm__network_tick(vm);
    bool dispatched = false;
    const uint64_t now = dvm__now_ms();
    for (int i = 0; i < vm->npending; ++i)
@@ -3878,7 +3954,10 @@ void dvm__mark_bytecode_thread(void) { g_is_bytecode_thread = true; }
 /* Android's main thread.  See dvm_on_main_thread() in dvm.h. */
 static _Thread_local bool g_is_main_thread;
 
-bool dvm_on_main_thread(void) { return g_is_main_thread; }
+bool dvm_on_main_thread(void)
+{
+   return g_is_main_thread && dvm__logical_main_thread(dvm_current());
+}
 
 void dvm__tstate_reset(struct dvm *vm)
 {
@@ -4064,6 +4143,29 @@ void dvm_gil_notify(void)
    pthread_mutex_unlock(&g_gil.m);
 }
 
+bool dvm_is_stopping(struct dvm *vm)
+{
+   return vm && atomic_load_explicit(&vm->stopping, memory_order_relaxed);
+}
+
+void dvm_request_stop(struct dvm *vm)
+{
+   if (!vm) return;
+   if (!atomic_exchange_explicit(&vm->stopping, true, memory_order_relaxed)) {
+      const char wake = 1;
+      /* One byte, never drained: every concurrent network waiter wakes. */
+      luna_socket_send(vm->io_cancel[1], &wake, 1, LUNA_SEND_NOSIGNAL);
+   }
+   pthread_mutex_lock(&g_gil.m);
+   ++g_gil_change_seq;
+   pthread_cond_broadcast(&g_gil_change);
+   for (struct dvm_event_waiter *w = g_event_waiters; w; w = w->next) {
+      w->ready = true;
+      pthread_cond_signal(&w->cv);
+   }
+   pthread_mutex_unlock(&g_gil.m);
+}
+
 void dvm_gil_notify_for(uintptr_t channel)
 {
    if (!channel) { dvm_gil_notify(); return; }
@@ -4193,6 +4295,7 @@ static void ui_before_platform_wait(struct dvm *vm)
 
 void dvm_gil_wait(struct dvm *vm, unsigned ms)
 {
+   if (dvm_is_stopping(vm)) return;
    ui_before_platform_wait(vm);
    /* Snapshot while still owning GIL.  A producer cannot change a VM
     * condition until this thread releases GIL, so any later condition change
@@ -4217,7 +4320,7 @@ void dvm_gil_wait(struct dvm *vm, unsigned ms)
    ts.tv_nsec += (long)(ms % 1000u) * 1000000L;
    if (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ++ts.tv_sec; }
    pthread_mutex_lock(&g_gil.m);
-   while (g_gil_change_seq == seen) {
+   while (g_gil_change_seq == seen && !dvm_is_stopping(vm)) {
       int rc = pthread_cond_timedwait(&g_gil_change, &g_gil.m, &ts);
       if (rc != 0) break;
    }
@@ -4234,6 +4337,7 @@ void dvm_gil_wait_for(struct dvm *vm, uintptr_t channel, unsigned ms)
 
 void dvm_gil_wait_for_ns(struct dvm *vm, uintptr_t channel, uint64_t ns)
 {
+   if (dvm_is_stopping(vm)) return;
    ui_before_platform_wait(vm);
 
    struct dvm_event_waiter w;
@@ -4290,7 +4394,7 @@ void dvm_gil_wait_for_ns(struct dvm *vm, uintptr_t channel, uint64_t ns)
    }
 
    pthread_mutex_lock(&g_gil.m);
-   while (!w.ready) {
+   while (!w.ready && !dvm_is_stopping(vm)) {
       int rc = ns == UINT64_MAX ? pthread_cond_wait(&w.cv, &g_gil.m)
                                : pthread_cond_timedwait(&w.cv, &g_gil.m, &ts);
       if (rc != 0) break;
@@ -4458,7 +4562,7 @@ bool dvm_call(struct dvm *vm, struct dvm_method *m, dvm_ref self,
    union dvm_value dummy;
    if (!out) out = &dummy;
    memset(out, 0, sizeof *out);
-   if (!m) return false;
+   if (!m || dvm_is_stopping(vm)) return false;
 
    uint32_t slots[256];
    int n = values_to_slots(m->sig, args, nargs, slots, 256);
@@ -4491,7 +4595,10 @@ bool dvm_call(struct dvm *vm, struct dvm_method *m, dvm_ref self,
     * thread happened to call into Java — androidx.sqlite's ProcessLock then
     * re-entered itself from inside Thread.sleep and deadlocked the process on
     * its own file lock, and Play services' checkMainThread() failed. */
-   if (!vm->depth && g_is_main_thread) {
+   /* A failed synchronous call returns its exception to its caller. Handler
+    * dispatch invokes other Java methods, which clear the exception on entry;
+    * it must wait until the caller has handled the pending exception. */
+   if (!vm->depth && dvm_on_main_thread() && !vm->exception) {
       /* vm->parked describes the call that just returned — "this thread is
        * blocked inside the platform", which its caller has to act on.  The
        * drain below runs other Runnables and each clears the flag on its way
@@ -4648,6 +4755,12 @@ struct dvm *dvm_create(const struct dvm_hooks *hooks)
 {
    struct dvm *vm = calloc(1, sizeof *vm);
    if (!vm) return NULL;
+   atomic_init(&vm->stopping, false);
+   vm->io_cancel[0] = vm->io_cancel[1] = -1;
+   if (luna_socket_pair(AF_UNIX, SOCK_STREAM, 0, vm->io_cancel) < 0) {
+      free(vm);
+      return NULL;
+   }
    if (hooks) vm->hooks = *hooks;
    /* The thread that creates the VM is the process's main thread: it goes on
     * to launch the Activity and to drive the frame pump. */
@@ -4686,10 +4799,15 @@ struct dvm *dvm_create(const struct dvm_hooks *hooks)
 void dvm_destroy(struct dvm *vm)
 {
    if (!vm) return;
+   dvm_request_stop(vm);
+   dvm_threads_finish(vm);
+   free(vm->network_callbacks);
    /* A pending apply() must reach the disk before the process goes away. */
    dvm_prefs_finish(vm);
    dvm_nsd_finish(vm);
    dvm_glsurface_finish(vm);
+   luna_fd_close(vm->io_cancel[0]);
+   luna_fd_close(vm->io_cancel[1]);
 
    free(vm->pending_threads);
    free(vm->pending_is_thread);

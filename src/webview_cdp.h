@@ -34,6 +34,7 @@ struct lunaria_cdp_page {
    unsigned next_id;
    char target_id[128];
    unsigned setup_id;
+   unsigned navigation_id; /* latest Page.navigate reply; older loads may be cancelled */
    int stage;
 };
 

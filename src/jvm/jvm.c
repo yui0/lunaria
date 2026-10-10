@@ -203,7 +203,9 @@ jvm_object_release(struct jvm_object *o)
    if (destructor[o->type])
       destructor[o->type](o);
 
+   const uint32_t epoch = o->epoch;
    *o = (struct jvm_object){0};
+   o->epoch = epoch + 1;
 }
 
 static bool
@@ -414,7 +416,7 @@ static struct jvm_object*
 jvm_get_object(struct jvm *jvm, const jobject o);
 
 static jobject jvm_record_local(struct jvm *jvm, jobject object);
-static void jvm_forget_local(struct jvm *jvm, jobject object);
+static bool jvm_forget_local(struct jvm *jvm, jobject object);
 static jobject
 jvm_add_object(struct jvm *jvm, const struct jvm_object *o)
 {
@@ -482,6 +484,7 @@ jvm_add_object(struct jvm *jvm, const struct jvm_object *o)
    }
    jvm->next_object = i + 1;
    jvm->objects[i] = *o;
+   ++jvm->object_generation[i];
    jvm->objects[i].refs = 1;
    /* Slots are recycled, so a stale stub pointer from the previous tenant
     * would otherwise be handed to a different method. */
@@ -503,6 +506,7 @@ static jobject
 jvm_ref_object(struct jvm *jvm, jobject object)
 {
    jvm_meta_lock();
+   object = jvm_resolve_reference(jvm, object);
    struct jvm_object *o = jvm_get_object(jvm, object);
    if (o && o->type != JVM_OBJECT_NONE)
       ++o->refs;
@@ -576,6 +580,7 @@ jvm_mark_bridge_local(struct jvm *jvm, jobject object)
    if (o && o->type == JVM_OBJECT_OPAQUE) o->bridge_owned = true;
    /* The conversion bridge assumes ownership of this local reference. */
    jvm_forget_local(jvm,object);
+   if (o && o->type != JVM_OBJECT_NONE) ++o->bridge_pending;
    jvm_meta_unlock();
 }
 
@@ -589,6 +594,30 @@ jvm_bridge_ref_count(struct jvm *jvm, jobject object)
    int refs = o->type == JVM_OBJECT_NONE ? 0 : o->refs - o->array_refs;
    jvm_meta_unlock();
    return refs;
+}
+
+uint32_t
+jvm_handle_epoch(struct jvm *jvm, jobject object)
+{
+   if (!jvm || !object || (uintptr_t)object > ARRAY_SIZE(jvm->objects))
+      return 0;
+   jvm_meta_lock();
+   const uint32_t epoch = jvm_get_object(jvm, object)->epoch;
+   jvm_meta_unlock();
+   return epoch;
+}
+
+bool
+jvm_bridge_take_pending(struct jvm *jvm, jobject object)
+{
+   if (!jvm || !object || (uintptr_t)object > ARRAY_SIZE(jvm->objects))
+      return false;
+   jvm_meta_lock();
+   struct jvm_object *o = jvm_get_object(jvm, object);
+   bool had = o->type != JVM_OBJECT_NONE && o->bridge_pending > 0;
+   if (had) --o->bridge_pending;
+   jvm_meta_unlock();
+   return had;
 }
 
 bool
@@ -644,8 +673,39 @@ jvm_add_object_if_not_there(struct jvm *jvm, struct jvm_object *needle)
 static struct jvm_object*
 jvm_get_object(struct jvm *jvm, const jobject o)
 {
-   assert(jvm && (uintptr_t)o <= ARRAY_SIZE(jvm->objects));
-   return (o ? &jvm->objects[(uintptr_t)o - 1] : NULL);
+   jobject target = jvm_resolve_reference(jvm, o);
+   return target ? &jvm->objects[(uintptr_t)target - 1] : NULL;
+}
+
+jobject jvm_resolve_reference(struct jvm *jvm, jobject object)
+{
+   assert(jvm);
+   uintptr_t h = (uintptr_t)object;
+   if (h <= ARRAY_SIZE(jvm->objects)) return object;
+   jvm_meta_lock();
+   size_t i = h - ARRAY_SIZE(jvm->objects) - 1;
+   jobject target = NULL;
+   if (i < jvm->weak_capacity && jvm->weak_refs[i].used) {
+      struct jvm_weak_ref *w = &jvm->weak_refs[i];
+      uintptr_t slot = (uintptr_t)w->target;
+      if (slot && slot <= ARRAY_SIZE(jvm->objects) &&
+          jvm->objects[slot - 1].type != JVM_OBJECT_NONE &&
+          jvm->object_generation[slot - 1] == w->generation)
+         target = w->target;
+   }
+   jvm_meta_unlock();
+   return target;
+}
+
+bool jvm_is_weak_reference(struct jvm *jvm, jobject object)
+{
+   uintptr_t h = (uintptr_t)object;
+   if (h <= ARRAY_SIZE(jvm->objects)) return false;
+   jvm_meta_lock();
+   size_t i = h - ARRAY_SIZE(jvm->objects) - 1;
+   bool weak = i < jvm->weak_capacity && jvm->weak_refs[i].used;
+   jvm_meta_unlock();
+   return weak;
 }
 
 static void
@@ -925,7 +985,7 @@ JNIEnv_Throw(JNIEnv* p0, jthrowable p1)
 {
    assert(p0 && p1);
    struct jvm *jvm = jnienv_get_jvm(p0);
-   jvm_ref_object(jvm,p1);
+   p1 = jvm_ref_object(jvm,p1);
    jvm_clear_pending(jvm);
    jvm_exception_state(jvm)->pending_exception = p1;
    jvm_exception_state(jvm)->pending_owned = true;
@@ -968,7 +1028,10 @@ jvm_throw_new(struct jvm *jvm, const char *class_name, const char *msg)
 {
    if (!jvm || !class_name) return;
    JNIEnv *env = &jvm->env;
-   jclass cls = env[0]->FindClass(env, class_name);
+   /* FindClass itself reports resolution failure through this helper.
+    * Do not recursively resolve another missing exception class. */
+   jclass cls = dvm_jni_class_exists(class_name)
+      ? jvm_make_class(jvm, class_name) : NULL;
    if (cls) {
       JNIEnv_ThrowNew(env, cls, msg);
       return;
@@ -1092,12 +1155,13 @@ static jobject jvm_record_local(struct jvm *jvm, jobject object)
    if (o->type==JVM_OBJECT_OPAQUE) o->bridge_owned=true;
    jvm_meta_unlock(); return object;
 }
-static void jvm_forget_local(struct jvm *jvm, jobject object)
+static bool jvm_forget_local(struct jvm *jvm, jobject object)
 {
    struct jvm_local_state *s=jvm_local_state(jvm,false);
    for (struct jvm_local_frame *f=s ? s->top : NULL;f;f=f->prev)
       for (size_t i=f->count;i>0;--i)
-         if (f->items[i-1]==object) { f->items[i-1]=NULL; return; }
+         if (f->items[i-1]==object) { f->items[i-1]=NULL; return true; }
+   return false;
 }
 static jint JNIEnv_PushLocalFrame(JNIEnv *env, jint capacity)
 {
@@ -1126,7 +1190,7 @@ static jobject JNIEnv_PopLocalFrame(JNIEnv *env, jobject result)
    struct jvm_local_frame *f=s ? s->top : NULL;
    if (!f) { jvm_meta_unlock(); return result; }
    /* Keep result alive before releasing any aliases in the popped frame. */
-   if (result) jvm_ref_object(jvm,result);
+   if (result) result=jvm_ref_object(jvm,result);
    s->top=f->prev;
    for (size_t i=f->count;i>0;--i)
       if (f->items[i-1]) jvm_deref_object(jvm,f->items[i-1]);
@@ -1225,7 +1289,13 @@ JNIEnv_DeleteLocalRef(JNIEnv* p0, jobject p1)
    jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
    jvm_trace_bridge_ref(jnienv_get_jvm(p0),p1,4);
    jvm_meta_lock();
-   jvm_forget_local(jnienv_get_jvm(p0),p1);
+   /* A handle native code never recorded is the bridge's incoming local, so
+    * deleting it consumes the bridge's reference (JNI: callee may delete its
+    * argument locals) and the bridge must not release it again. */
+   if (!jvm_forget_local(jnienv_get_jvm(p0),p1) && p1) {
+      struct jvm_object *o = jvm_get_object(jnienv_get_jvm(p0), p1);
+      if (o->type != JVM_OBJECT_NONE && o->bridge_pending > 0) --o->bridge_pending;
+   }
    jvm_deref_object(jnienv_get_jvm(p0), p1);
    jvm_meta_unlock();
 }
@@ -1234,7 +1304,11 @@ static jboolean
 JNIEnv_IsSameObject(JNIEnv* p0, jobject p1, jobject p2)
 {
    assert(p0);
-   return (p1 == p2);
+   jvm_meta_lock();
+   struct jvm *jvm = jnienv_get_jvm(p0);
+   jboolean same = jvm_resolve_reference(jvm,p1) == jvm_resolve_reference(jvm,p2);
+   jvm_meta_unlock();
+   return same;
 }
 
 static jobject
@@ -1283,6 +1357,81 @@ JNIEnv_AllocObject(JNIEnv* p0, jclass p1)
     * interned values; ordinary object instances must never be. */
    struct jvm_object o = { .this_klass = p1, .type = JVM_OBJECT_OPAQUE };
    return jvm_add_object(jnienv_get_jvm(p0), &o);
+}
+
+struct jvm_cached_ref {
+   jobject *slot;
+   struct jvm_cached_ref *next;
+};
+
+/* Called under the metadata lock. Cache slots are host storage, not Java
+ * roots by themselves; remember them for both ownership and JVM teardown. */
+static bool jvm_register_cache(struct jvm *jvm, jobject *slot)
+{
+   for (struct jvm_cached_ref *r = jvm->cached_refs; r; r = r->next)
+      if (r->slot == slot) return true;
+   struct jvm_cached_ref *r = malloc(sizeof *r);
+   if (!r) return false;
+   *r = (struct jvm_cached_ref){ .slot = slot, .next = jvm->cached_refs };
+   jvm->cached_refs = r;
+   return true;
+}
+
+bool jvm_cache_reference(JNIEnv *env, jobject *slot, jobject value)
+{
+   if (!env || !slot) return false;
+   struct jvm *jvm = jnienv_get_jvm(env);
+   jvm_meta_lock();
+   if (!jvm_register_cache(jvm, slot)) {
+      jvm_meta_unlock();
+      jvm_throw_new(jvm, "java/lang/OutOfMemoryError", "framework JNI cache");
+      return false;
+   }
+   jobject owned = value ? JNIEnv_NewGlobalRef(env, value) : NULL;
+   jobject old = *slot;
+   *slot = owned;
+   if (old) JNIEnv_DeleteGlobalRef(env, old);
+   jvm_meta_unlock();
+   return !value || owned != NULL;
+}
+
+jobject jvm_cached_object_init(JNIEnv *env, jobject *slot, const char *class_name,
+                               void (*initialize)(JNIEnv *, jobject, void *), void *data)
+{
+   if (!env || !slot) return NULL;
+   struct jvm *jvm = jnienv_get_jvm(env);
+   jvm_meta_lock();
+   if (*slot) {
+      jobject result = JNIEnv_NewLocalRef(env, *slot);
+      jvm_meta_unlock();
+      return result;
+   }
+   jvm_meta_unlock();
+
+   /* Class resolution may acquire the interpreter lock. Keep it outside the
+    * metadata lock and recheck the cache after allocation for racing callers. */
+   jclass cls = JNIEnv_FindClass(env, class_name);
+   if (!cls) return NULL;
+   jobject created = JNIEnv_AllocObject(env, cls);
+   if (!created) return NULL;
+   if (initialize) initialize(env, created, data);
+   if ((*env)->ExceptionCheck(env)) {
+      JNIEnv_DeleteLocalRef(env, created);
+      return NULL;
+   }
+   jvm_meta_lock();
+   bool good = *slot || jvm_register_cache(jvm, slot);
+   if (good && !*slot) *slot = JNIEnv_NewGlobalRef(env, created);
+   jobject result = good ? JNIEnv_NewLocalRef(env, *slot) : NULL;
+   jvm_meta_unlock();
+   JNIEnv_DeleteLocalRef(env, created);
+   if (!good) jvm_throw_new(jvm, "java/lang/OutOfMemoryError", "framework JNI cache");
+   return result;
+}
+
+jobject jvm_cached_object(JNIEnv *env, jobject *slot, const char *class_name)
+{
+   return jvm_cached_object_init(env, slot, class_name, NULL, NULL);
 }
 
 static bool
@@ -1365,7 +1514,13 @@ JNIEnv_GetObjectClass(JNIEnv* env, jobject p1)
       return jvm_make_class(jnienv_get_jvm(env), "java/lang/Object");
    }
    verbose("%u", (uint32_t)(uintptr_t)p1);
-   return jvm_get_object(jnienv_get_jvm(env), p1)->this_klass;
+   {
+      struct jvm_object *o = jvm_get_object(jnienv_get_jvm(env), p1);
+      if (!o->this_klass)
+         fprintf(stderr, "[jvm] GetObjectClass: handle %p has no class (type %d refs %d global %d bridge_owned %d)\n",
+                 (void *)p1, (int)o->type, o->refs, o->global_refs, (int)o->bridge_owned);
+      return o->this_klass;
+   }
 }
 
 static jboolean
@@ -1588,9 +1743,10 @@ jvm_wrap_method_uncached(struct jvm *jvm, jmethodID method_id)
    if ((sym = wrapper_create(symbol, luna_os_library_symbol(NULL, symbol))))
       return sym;
 
-   method.klass = jvm_make_class(jvm, "java/lang/Class");
-   jvm_form_symbol(jvm, &method, symbol, sizeof(symbol));
-   return wrapper_create(symbol, luna_os_library_symbol(NULL, symbol));
+   /* Class methods belong to Class instances, not arbitrary receivers that
+    * happen to use the same method name. An unrelated getName(), for example
+    * HttpCookie.getName(), must reach its own VM implementation. */
+   return NULL;
 }
 
 /* How much work the cache is saving: resolves that actually ran, the time they
@@ -2241,6 +2397,33 @@ const char *jvm_string_wtf8(struct jvm *jvm, jstring string, size_t *bytes)
    return s->data ? s->data : "";
 }
 
+/* Publish a String constructor's payload on the original JNI identity.
+ * AllocObject(String) starts as an opaque instance; decoding its bytes in
+ * the interpreter alone must not leave native callers with an empty string. */
+bool jvm_init_string_wtf8(struct jvm *jvm, jobject object, const char *text, size_t bytes)
+{
+   struct jvm_string value = {0};
+   if (!jvm_string_set_cstr_with_length(&value, text, bytes, true)) {
+      jvm_throw_new(jvm, "java/lang/OutOfMemoryError", "String constructor");
+      return false;
+   }
+   jvm_meta_lock();
+   struct jvm_object *o = jvm_get_object(jvm, object);
+   if (!o || (o->type != JVM_OBJECT_OPAQUE && o->type != JVM_OBJECT_STRING)) {
+      jvm_meta_unlock();
+      jvm_string_release(&value);
+      return false;
+   }
+   uintptr_t index = (uintptr_t)(o - jvm->objects);
+   jvm_index_remove(jvm, index);
+   if (o->type == JVM_OBJECT_STRING) jvm_string_release(&o->string);
+   o->string = value;
+   o->type = JVM_OBJECT_STRING;
+   jvm_index_add(jvm, index);
+   jvm_meta_unlock();
+   return true;
+}
+
 static jstring
 JNIEnv_NewString(JNIEnv* p0, const jchar* p1, jsize p2)
 {
@@ -2492,7 +2675,7 @@ JNIEnv_SetObjectArrayElement(JNIEnv* p0, jobjectArray p1, jsize p2, jobject p3)
    jobject *elements = obj->array.data;
    jobject old = elements[p2];
    elements[p2] = p3 ? jvm_ref_object(jvm, p3) : NULL;
-   if (p3) ++jvm_get_object(jvm, p3)->array_refs;
+   if (elements[p2]) ++jvm_get_object(jvm, elements[p2])->array_refs;
    if (old) {
       struct jvm_object *child = jvm_get_object(jvm, old);
       if (child && child->array_refs > 0) --child->array_refs;
@@ -2869,16 +3052,48 @@ JNIEnv_ReleaseStringCritical(JNIEnv* p0, jstring p1, const jchar* p2)
 static jweak
 JNIEnv_NewWeakGlobalRef(JNIEnv* p0, jobject p1)
 {
-   assert(p0 && p1);
-   JVM_UNIMPLEMENTED();
-   return NULL;
+   assert(p0);
+   struct jvm *jvm = jnienv_get_jvm(p0);
+   jvm_meta_lock();
+   p1 = jvm_resolve_reference(jvm,p1);
+   if (!p1) { jvm_meta_unlock(); return NULL; }
+   size_t i = jvm->next_weak;
+   while (i < jvm->weak_capacity && jvm->weak_refs[i].used) ++i;
+   if (i == jvm->weak_capacity) {
+      size_t old = jvm->weak_capacity;
+      size_t cap = old ? old * 2 : 64;
+      struct jvm_weak_ref *refs = cap > old &&
+         cap <= UINT32_MAX - ARRAY_SIZE(jvm->objects) &&
+         cap <= SIZE_MAX / sizeof *refs
+         ? realloc(jvm->weak_refs,cap * sizeof *refs) : NULL;
+      if (!refs) {
+         jvm_throw_new(jvm,"java/lang/OutOfMemoryError","JNI weak references");
+         jvm_meta_unlock(); return NULL;
+      }
+      memset(refs + old,0,(cap - old) * sizeof *refs);
+      jvm->weak_refs = refs; jvm->weak_capacity = cap;
+   }
+   jvm->weak_refs[i] = (struct jvm_weak_ref){
+      p1,jvm->object_generation[(uintptr_t)p1 - 1],true
+   };
+   jvm->next_weak = i + 1;
+   jweak result = (jweak)(uintptr_t)(ARRAY_SIZE(jvm->objects) + i + 1);
+   jvm_meta_unlock(); return result;
 }
 
 static void
 JNIEnv_DeleteWeakGlobalRef(JNIEnv* p0, jweak p1)
 {
-   assert(p0 && p1);
-   JVM_UNIMPLEMENTED();
+   assert(p0);
+   if (!p1) return;
+   struct jvm *jvm = jnienv_get_jvm(p0);
+   jvm_meta_lock();
+   size_t i = (uintptr_t)p1 - ARRAY_SIZE(jvm->objects) - 1;
+   if (i < jvm->weak_capacity) {
+      jvm->weak_refs[i] = (struct jvm_weak_ref){0};
+      if (i < jvm->next_weak) jvm->next_weak = i;
+   }
+   jvm_meta_unlock();
 }
 
 static jboolean
@@ -3327,6 +3542,12 @@ jvm_release(struct jvm *jvm)
       return;
 
    dvm_prefs_finish(dvm_jni_vm());
+   while (jvm->cached_refs) {
+      struct jvm_cached_ref *r = jvm->cached_refs;
+      jvm->cached_refs = r->next;
+      *r->slot = NULL;
+      free(r);
+   }
    while (jvm->local_states) {
       struct jvm_local_state *s=jvm->local_states; jvm->local_states=s->next;
       while (s->top) {
@@ -3339,6 +3560,7 @@ jvm_release(struct jvm *jvm)
 
    for (size_t i = 0; i < ARRAY_SIZE(jvm->objects); ++i)
       jvm_object_release(&jvm->objects[i]);
+   free(jvm->weak_refs);
 
    for (size_t i = 0; i < ARRAY_SIZE(jvm->methods); ++i) {
       jvm_string_release(&jvm->methods[i].method.name);

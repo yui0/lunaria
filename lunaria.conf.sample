@@ -22,6 +22,14 @@
 #
 #LUNARIA_DEVICE=pixel6
 
+# GL identity: device (default) keeps the historical ARM / Mali-G78 strings;
+# host reports the real GL driver's vendor and renderer. Capabilities and
+# the advertised GLES level always follow what the bridge can execute.
+# This choice does not guarantee compatibility with an app's anti-cheat.
+# May also be set inside a [package.name] section.
+# Right-click > Graphics API > GL Identity saves a per-app choice for restart.
+#LUNARIA_GL_IDENTITY=device
+
 # Individual fields, if you need a device that is not in the table.  Anything
 # left unset keeps the selected profile's value; the build id, Build.DISPLAY
 # and the fingerprint are assembled from whatever these finally say, so they

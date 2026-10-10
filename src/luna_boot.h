@@ -89,3 +89,10 @@ void *luna_launcher_take_window(void);
 #ifdef __cplusplus
 }
 #endif
+
+/* The running app's profile: what exists, which is in use, a fresh name, and
+ * starting over under another (returns only when it could not). */
+const char *luna_apk_profile_current(void);
+int luna_apk_profile_list(char (*names)[65], int max);
+int luna_apk_profile_new_name(char *out, size_t cap);
+int luna_apk_restart(const char *profile);

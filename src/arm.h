@@ -10,6 +10,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <errno.h>
 
 /* One bit per 4 KiB page in the 32-bit image window. Readers run inside
  * parallel JIT translation; writers hold the ARM execution lock. Build the
@@ -225,7 +226,11 @@ struct ArmLockGuardIf {
 struct ArmLockDropped {
     const unsigned depth;
     ArmLockDropped() : depth(arm_lock_unlock_all()) {}
-    ~ArmLockDropped() { arm_lock_relock(depth); }
+    ~ArmLockDropped() {
+        const int error = errno;
+        arm_lock_relock(depth);
+        errno = error;
+    }
     ArmLockDropped(const ArmLockDropped &) = delete;
     ArmLockDropped &operator=(const ArmLockDropped &) = delete;
 };
@@ -407,14 +412,18 @@ inline size_t a64_mapped_span(GuestVA va) {
  * The host reserves the whole A64 arena, so host pointer validity is not a
  * substitute for the guest's mmap table.  Walk adjacent entries as Linux
  * does for an access spanning a page/mapping boundary. */
-inline int a64_access_fault(GuestVA va, size_t len, bool write, GuestVA *fault) {
+inline int a64_access_fault_for_prot(GuestVA va, size_t len, uint32_t prot, GuestVA *fault) {
     const GuestVA mapped = a64_mapping_va(va);
     GuestVA bad = mapped;
     std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
     const int code = luna_vm_access_fault(g_a64_maps.data(), g_a64_maps.size(),
-                                         mapped, len, write ? 3u : 1u, &bad);
+                                         mapped, len, prot, &bad);
     *fault = va + (bad - mapped);
     return code;
+}
+
+inline int a64_access_fault(GuestVA va, size_t len, bool write, GuestVA *fault) {
+    return a64_access_fault_for_prot(va, len, write ? 3u : 1u, fault);
 }
 
 inline void a64_map_insert(GuestVA lo, GuestVA hi, uint32_t prot, bool owned,

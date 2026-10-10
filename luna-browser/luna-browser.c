@@ -50,6 +50,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -816,10 +817,36 @@ static char *cookie_header(const char *url)
 
 struct conn {
    int fd;
+   struct conn *network_next;
 #ifndef LB_NO_TLS
    SSL *ssl;
 #endif
 };
+
+static _Atomic int g_network_online = 1;
+static pthread_mutex_t g_network_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct conn *g_network_connections;
+
+static void network_set_online(int online)
+{
+   pthread_mutex_lock(&g_network_lock);
+   atomic_store(&g_network_online, online);
+   if (!online)
+      for (struct conn *c = g_network_connections; c; c = c->network_next)
+         shutdown(c->fd, SHUT_RDWR);
+   pthread_mutex_unlock(&g_network_lock);
+}
+
+static void conn_close_fd(struct conn *c)
+{
+   pthread_mutex_lock(&g_network_lock);
+   struct conn **at = &g_network_connections;
+   while (*at && *at != c) at = &(*at)->network_next;
+   if (*at) *at = c->network_next;
+   if (c->fd >= 0) close(c->fd);
+   c->fd = -1;
+   pthread_mutex_unlock(&g_network_lock);
+}
 
 #ifndef LB_NO_TLS
 static SSL_CTX *g_ssl_ctx;
@@ -838,6 +865,7 @@ static SSL_CTX *tls_context(void)
 
 static ptrdiff_t conn_write(struct conn *c, const void *p, size_t n)
 {
+   if (!atomic_load(&g_network_online)) { errno = ENETUNREACH; return -1; }
 #ifndef LB_NO_TLS
    if (c->ssl) return SSL_write(c->ssl, p, (int)n);
 #endif
@@ -846,6 +874,7 @@ static ptrdiff_t conn_write(struct conn *c, const void *p, size_t n)
 
 static ptrdiff_t conn_read(struct conn *c, void *p, size_t n)
 {
+   if (!atomic_load(&g_network_online)) { errno = ENETUNREACH; return -1; }
 #ifndef LB_NO_TLS
    if (c->ssl) {
       int r = SSL_read(c->ssl, p, (int)n);
@@ -862,16 +891,19 @@ static void conn_close(struct conn *c)
 #ifndef LB_NO_TLS
    if (c->ssl) { SSL_shutdown(c->ssl); SSL_free(c->ssl); c->ssl = NULL; }
 #endif
-   if (c->fd >= 0) close(c->fd);
-   c->fd = -1;
+   conn_close_fd(c);
 }
 
 static int conn_open(struct conn *c, const struct url *u, char **error)
 {
    c->fd = -1;
+   c->network_next = NULL;
 #ifndef LB_NO_TLS
    c->ssl = NULL;
 #endif
+   if (!atomic_load(&g_network_online)) {
+      *error = lb_strdup("Network is offline"); errno = ENETUNREACH; return -1;
+   }
    int tls = !strcmp(u->scheme, "https");
    char port[16];
    snprintf(port, sizeof port, "%d", u->port >= 0 ? u->port : tls ? 443 : 80);
@@ -885,8 +917,17 @@ static int conn_open(struct conn *c, const struct url *u, char **error)
    int dead_family = AF_UNSPEC;         /* one timeout per family, not per address */
    for (struct addrinfo *a = res; a; a = a->ai_next) {
       if (a->ai_family == dead_family) continue;
-      c->fd = socket(a->ai_family, a->ai_socktype | SOCK_CLOEXEC, a->ai_protocol);
+      c->fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
       if (c->fd < 0) continue;
+      fcntl(c->fd, F_SETFD, FD_CLOEXEC);
+      pthread_mutex_lock(&g_network_lock);
+      if (!atomic_load(&g_network_online)) {
+         close(c->fd); c->fd = -1;
+         pthread_mutex_unlock(&g_network_lock);
+         break;
+      }
+      c->network_next = g_network_connections; g_network_connections = c;
+      pthread_mutex_unlock(&g_network_lock);
       /* SO_SNDTIMEO also bounds connect(): an unreachable address (a dead
        * IPv6 route, say) costs seconds, not the whole I/O timeout, before the
        * next one is tried. */
@@ -899,8 +940,7 @@ static int conn_open(struct conn *c, const struct url *u, char **error)
       }
       if (errno == EINPROGRESS || errno == EAGAIN || errno == ENETUNREACH || errno == EHOSTUNREACH)
          dead_family = a->ai_family;
-      close(c->fd);
-      c->fd = -1;
+      conn_close_fd(c);
    }
    freeaddrinfo(res);
    if (c->fd < 0) { *error = lb_strdup("connection failed"); return -1; }
@@ -2924,6 +2964,10 @@ static int js_open(void)
    JS_SetPropertyStr(g_page.ctx, global, "__lb", lb);
    JS_FreeValue(g_page.ctx, global);
    if (js_eval(lb_prelude, sizeof lb_prelude - 1, "luna-browser.js", 0) != 0) return -1;
+   if (!atomic_load(&g_network_online)) {
+      const char *code = "Object.defineProperty(navigator,'onLine',{value:false,configurable:true});";
+      if (js_eval(code, strlen(code), "network", 0) != 0) return -1;
+   }
    for (int i = 0; i < g_page.nbindings; ++i) {
       JSValue a = JS_NewString(g_page.ctx, g_page.bindings[i]);
       JS_FreeValue(g_page.ctx, js_hook("__lb_add_binding", 1, &a));
@@ -3773,6 +3817,16 @@ static void cdp_handle(const char *text)
       cdp_reply(id, in_session, res);
       free(res);
       free(code);
+   } else if (!strcmp(method, "Network.emulateNetworkConditions")) {
+      const int online = !jbool(params, "offline");
+      network_set_online(online);
+      if (g_page.ctx) {
+         const char *code = online
+            ? "Object.defineProperty(navigator,'onLine',{value:true,configurable:true});window.dispatchEvent(new Event('online'));"
+            : "Object.defineProperty(navigator,'onLine',{value:false,configurable:true});window.dispatchEvent(new Event('offline'));";
+         (void)js_eval(code, strlen(code), "network", 0);
+      }
+      cdp_reply(id, in_session, "{}");
    } else if (!strcmp(method, "Network.setCookie")) {
       cdp_set_cookie(params);
       cdp_reply(id, in_session, "{\"success\":true}");

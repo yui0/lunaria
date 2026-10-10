@@ -29,6 +29,7 @@
 #include "luna-window.h"
 
 #include "luna_overlay.h"
+#include "luna_boot.h"
 #include <sys/stat.h>
 #include <dirent.h>
 #include "luna_input.h"
@@ -1165,7 +1166,7 @@ bound:
 bool luna_overlay_pointer(double x, double y, int action)
 {
    pthread_mutex_lock(&g_doc_lock);
-   bool guest = g_html != NULL;
+   bool guest = g_html != NULL && !g_native_input_focus;
    bool ime = g_ime_html != NULL;
    bool menu = g_menu_html != NULL && g_menu_modal;
    pthread_mutex_unlock(&g_doc_lock);
@@ -1250,16 +1251,10 @@ float luna_overlay_text_width(const char *text, float px, bool bold)
 {
    if (!text || !*text || px <= 0.f) return 0.f;
    pthread_mutex_lock(&g_present_lock);
-   const bool ready = g_ready;
-   float w = ready ? luna_measure_text(text, px, bold ? 1 : 0) : 0.f;
+   if (!g_ready) luna_overlay_prepare_platform();
+   bool ready=luna_prepare_font_metrics()!=0;
+   float w=ready ? luna_measure_text(text,px,bold ? 1 : 0) : 0.f;
    pthread_mutex_unlock(&g_present_lock);
-   if (ready) return w;
-   /* Before luna-ui has its fonts: Latin at about half an em, the rest a
-    * full em, which is the shape of the bundled faces. */
-   for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
-      if ((*p & 0xc0) == 0x80) continue;
-      w += *p < 0x80 ? px * 0.55f : px;
-   }
    return w;
 }
 
@@ -1268,17 +1263,40 @@ float luna_overlay_line_height(float px)
    return luna_line_height(px > 0.f ? px : 14.f);
 }
 
+bool luna_overlay_get_font_metrics(float px, bool bold,
+                                  struct luna_overlay_font_metrics *metrics)
+{
+   if (!metrics) return false;
+   memset(metrics, 0, sizeof *metrics);
+   pthread_mutex_lock(&g_present_lock);
+   if (!g_ready) luna_overlay_prepare_platform();
+   LunaFontMetrics face;
+   bool ready = luna_prepare_font_metrics() &&
+                luna_get_font_metrics(px, bold ? 1 : 0, &face);
+   if (ready) {
+      metrics->top = face.top;
+      metrics->ascent = face.ascent;
+      metrics->descent = face.descent;
+      metrics->bottom = face.bottom;
+      metrics->leading = face.leading;
+   }
+   pthread_mutex_unlock(&g_present_lock);
+   return ready;
+}
+
 /* ======================================================================== *
  * The emulator's menu (right click)
  * ======================================================================== */
 
-enum { SUB_NONE, SUB_SOUND, SUB_ZOOM, SUB_ENGINE, SUB_KEYMAP, SUB_RESOLUTION, SUB_GRAPHICS };
+/* The right-click menu is a short main list; each group opens one panel beside it. */
+enum { SUB_NONE, SUB_INPUT, SUB_DISPLAY, SUB_GRAPHICS, SUB_SOUND, SUB_LOCALE, SUB_WEBVIEW, SUB_PROFILE, SUB_COUNT };
 
 #define MENU_W 248
 #define ROW_H 24
 #define SEP_H 11
 #define PAD 5
 #define MAX_DEVICES 16
+#define PROFILE_MAX 24
 
 static pthread_mutex_t g_menu_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool   g_menu_open;
@@ -1288,6 +1306,24 @@ static int    g_menu_sub;
 static bool g_settings_open;
 /* Pending API preference; driver state changes only on the next launch. */
 static int g_graphics_choice = -1;
+static int g_gl_identity_choice = -1;
+static int g_locale_choice = -1;
+static const struct { const char *tag, *label; } g_locales[] = {
+   {NULL,"System Default"}, {"ja-JP","日本語 (日本)"},
+   {"en-US","English (United States)"}, {"ko-KR","한국어 (대한민국)"},
+   {"zh-CN","简体中文 (中国)"}, {"zh-TW","繁體中文 (台灣)"},
+   {"de-DE","Deutsch (Deutschland)"}, {"fr-FR","Français (France)"},
+   {"es-ES","Español (España)"}, {"pt-BR","Português (Brasil)"}
+};
+static int locale_choice(void)
+{
+   if (g_locale_choice>=0) return g_locale_choice;
+   const char *tag=getenv("LUNARIA_LOCALE");
+   if (!tag || !*tag) return 0;
+   for (size_t i=1; i<sizeof g_locales/sizeof *g_locales; ++i)
+      if (!strcmp(tag,g_locales[i].tag)) return (int)i;
+   return -1;
+}
 struct resolution { int width, height; };
 static const struct resolution g_resolutions[] = {
    {800, 450}, {1024, 576}, {1280, 720}, {1600, 900}, {1920, 1080}, {1024, 768}
@@ -1490,50 +1526,86 @@ static int menu_header(struct menu_buf *b, const char *label)
 
 static int menu_clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 
-/* The main panel's rows; returns its height and the top of each submenu's
- * parent row. */
-static int menu_main_rows(struct menu_buf *b, int *sound_y, int *zoom_y, int *engine_y, int *keymap_y, int *resolution_y, int *graphics_y)
+/* The main panel's rows; returns its height and records the top of each
+ * group's row in parent_y[], where its panel is anchored. */
+static int menu_main_rows(struct menu_buf *b, int parent_y[SUB_COUNT])
 {
+   static const char arrow[] = "\xe2\x80\xba";
    int y = PAD;
-   char v[64];
    y += menu_item(b, "back", "Back", false, "Esc");
-   y += menu_item(b, "paste", "Paste Clipboard as Typing", false, NULL);
-   *keymap_y = y;
-   y += menu_item(b, "sub-keymap", "Keyboard Controls", false, "\xe2\x80\xba");
    y += menu_sep(b);
-   y += menu_item(b, "shot", "Take Screenshot", false, "F12");
-   y += menu_item(b, "full", arm_exec_is_fullscreen() ? "Exit Full Screen" : "Enter Full Screen", false, NULL);
-   *resolution_y = y;
-   y += menu_item(b, "sub-resolution", "Resolution", false, "\xe2\x80\xba");
-   *graphics_y = y;
-   y += menu_item(b, "sub-graphics", "Graphics API", false, "\xe2\x80\xba");
+   parent_y[SUB_INPUT] = y;
+   y += menu_item(b, "sub-input", "Input", false, arrow);
+   parent_y[SUB_DISPLAY] = y;
+   y += menu_item(b, "sub-display", "Display", false, arrow);
+   parent_y[SUB_GRAPHICS] = y;
+   y += menu_item(b, "sub-graphics", "Graphics API", false, arrow);
+   parent_y[SUB_SOUND] = y;
+   y += menu_item(b, "sub-sound", "Sound", false, arrow);
+   parent_y[SUB_LOCALE] = y;
+   y += menu_item(b, "sub-locale", "Language", false, arrow);
+   const bool network = arm_exec_network_enabled() != 0;
+   y += menu_item(b, "network", "Network", network, network ? "On" : "Off");
    y += menu_sep(b);
-   const int vol = (int)(luna_os_audio_volume() * 100.0f + 0.5f);
-   snprintf(v, sizeof v, "%d%%", vol);
-   y += menu_item(b, "volup", "Volume Up", false, v);
-   y += menu_item(b, "voldown", "Volume Down", false, NULL);
-   y += menu_item(b, "mute", "Mute", luna_os_audio_muted() != 0, NULL);
-   *sound_y = y;
-   y += menu_item(b, "sub-sound", "Sound Output", false, "\xe2\x80\xba");
-   y += menu_sep(b);
-   const float z = dvm_webview_zoom();
-   snprintf(v, sizeof v, "%d%%  \xe2\x80\xba", (int)(z * 100.0f + 0.5f));
-   *zoom_y = y;
-   y += menu_item(b, "sub-zoom", "WebView Zoom", false, v);
-   *engine_y = y;
-   y += menu_item(b, "sub-engine", "WebView Engine", false, "\xe2\x80\xba");
-   y += menu_item(b, dvm_webview_count() ? "reload" : NULL, "Reload WebView", false, NULL);
-   y += menu_sep(b);
+   parent_y[SUB_WEBVIEW] = y;
+   y += menu_item(b, "sub-webview", "WebView", false, arrow);
    y += menu_item(b, "settings", "Settings...", false, NULL);
+   y += menu_sep(b);
+   if (getenv("ANDROID_PACKAGE_NAME")) {
+      parent_y[SUB_PROFILE] = y;
+      y += menu_item(b, "sub-profile", "Profile", false, luna_apk_profile_current());
+      y += menu_item(b, "restart", "Restart", false, NULL);
+   }
    y += menu_item(b, "quit", "Quit Lunaria", false, NULL);
    return y + PAD;
+}
+
+/* One row of the keyboard-layout page size: what fits under the fixed rows. */
+static int menu_keymap_page(void)
+{
+   const int fit = (g_menu_h - 330) / ROW_H;
+   return fit < 4 ? 4 : fit > KEYMAP_PAGE ? KEYMAP_PAGE : fit;
 }
 
 static int menu_sub_rows(struct menu_buf *b)
 {
    int y = PAD;
    char id[32];
-   if (g_menu_sub == SUB_RESOLUTION) {
+   const int page = menu_keymap_page();
+   if (g_menu_sub == SUB_INPUT) {
+      y += menu_item(b, "paste", "Paste Clipboard as Typing", false, NULL);
+      y += menu_item(b, "record", "Record Input", luna_record_active() != 0, "F9");
+      {
+         char last[8];
+         luna_record_last_path(last, sizeof last);
+         y += menu_item(b, last[0] || getenv("LUNARIA_PLAY") || luna_play_active() ? "play" : NULL,
+                        "Play Recording", luna_play_active() != 0, "F10");
+      }
+      y += menu_sep(b);
+      char current[4096]; luna_keymap_current(current, sizeof current);
+      y += menu_header(b, "KEYBOARD CONTROLS");
+      y += menu_item(b, "km-off", "Off", !strcmp(current, "off"), NULL);
+      y += menu_item(b, strcmp(current, "off") ? "km-reload" : NULL, "Reload Current File", false, NULL);
+      y += menu_sep(b);
+      y += menu_item(b, "km-up", "Parent Folder", false, "..");
+      const char *base = strrchr(g_keydir, '/');
+      y += menu_header(b, base && base[1] ? base + 1 : g_keydir);
+      for (int i = g_keypage * page; i < g_nkeyfiles && i < (g_keypage + 1) * page; ++i) {
+         char path[4096]; keyfile_path(path, sizeof path, g_keyfiles[i].name);
+         snprintf(id, sizeof id, "km-file-%d", i);
+         y += menu_item(b, id, g_keyfiles[i].name, !strcmp(current, path), g_keyfiles[i].directory ? "\xe2\x80\xba" : NULL);
+      }
+      if (!g_nkeyfiles) y += menu_item(b, NULL, g_keydir_error ? "Cannot read folder" : "No files", false, NULL);
+      if (g_nkeyfiles > page) {
+         y += menu_sep(b);
+         y += menu_item(b, g_keypage ? "km-prev" : NULL, "Previous Page", false, NULL);
+         y += menu_item(b, (g_keypage + 1) * page < g_nkeyfiles ? "km-next" : NULL, "Next Page", false, NULL);
+      }
+   } else if (g_menu_sub == SUB_DISPLAY) {
+      y += menu_item(b, "full", arm_exec_is_fullscreen() ? "Exit Full Screen" : "Enter Full Screen", false, NULL);
+      y += menu_item(b, "rotate-device", g_menu_h > g_menu_w ? "Switch to Landscape" : "Switch to Portrait", false, NULL);
+      y += menu_item(b, "shot", "Take Screenshot", false, "F12");
+      y += menu_sep(b);
       y += menu_header(b, "RESOLUTION");
       for (size_t i = 0; i < sizeof g_resolutions / sizeof g_resolutions[0]; ++i) {
          int width, height; char label[32]; resolution_values((int)i, &width, &height);
@@ -1541,27 +1613,31 @@ static int menu_sub_rows(struct menu_buf *b)
          snprintf(label, sizeof label, "%d x %d", width, height);
          y += menu_item(b, id, label, width == g_menu_w && height == g_menu_h, NULL);
       }
-   } else if (g_menu_sub == SUB_KEYMAP) {
-      char current[4096]; luna_keymap_current(current, sizeof current);
-      y += menu_header(b, "KEYMAP FILE");
-      y += menu_item(b, "km-off", "Off", !strcmp(current, "off"), NULL);
-      y += menu_item(b, strcmp(current, "off") ? "km-reload" : NULL, "Reload Current File", false, NULL);
+   } else if (g_menu_sub == SUB_GRAPHICS) {
+      if (g_graphics_choice < 0) {
+         const char *env = getenv("LUNARIA_VULKAN");
+         g_graphics_choice = !env || env[0] != '0';
+      }
+      y += menu_header(b, "GRAPHICS API");
+      y += menu_item(b, "gfx-vulkan", "Vulkan (default)", g_graphics_choice == 1, NULL);
+      y += menu_item(b, "gfx-opengl", "OpenGL ES", g_graphics_choice == 0, NULL);
       y += menu_sep(b);
-      y += menu_item(b, "km-up", "Parent Folder", false, "..");
-      const char *base = strrchr(g_keydir, '/');
-      y += menu_header(b, base && base[1] ? base + 1 : g_keydir);
-      for (int i = g_keypage * KEYMAP_PAGE; i < g_nkeyfiles && i < (g_keypage + 1) * KEYMAP_PAGE; ++i) {
-         char path[4096]; keyfile_path(path, sizeof path, g_keyfiles[i].name);
-         snprintf(id, sizeof id, "km-file-%d", i);
-         y += menu_item(b, id, g_keyfiles[i].name, !strcmp(current, path), g_keyfiles[i].directory ? "\xe2\x80\xba" : NULL);
+      if (g_gl_identity_choice < 0) {
+         const char *env = getenv("LUNARIA_GL_IDENTITY");
+         g_gl_identity_choice = env && !strcmp(env, "host");
       }
-      if (!g_nkeyfiles) y += menu_item(b, NULL, g_keydir_error ? "Cannot read folder" : "No files", false, NULL);
-      if (g_nkeyfiles > KEYMAP_PAGE) {
-         y += menu_sep(b);
-         y += menu_item(b, g_keypage ? "km-prev" : NULL, "Previous Page", false, NULL);
-         y += menu_item(b, (g_keypage + 1) * KEYMAP_PAGE < g_nkeyfiles ? "km-next" : NULL, "Next Page", false, NULL);
-      }
+      y += menu_header(b, "GL IDENTITY");
+      y += menu_item(b, "glid-device", "Device: ARM / Mali-G78", g_gl_identity_choice == 0, NULL);
+      y += menu_item(b, "glid-host", "Host driver", g_gl_identity_choice == 1, NULL);
+      y += menu_sep(b);
+      y += menu_item(b, NULL, "Restart the app to apply", false, NULL);
    } else if (g_menu_sub == SUB_SOUND) {
+      char v[16];
+      snprintf(v, sizeof v, "%d%%", (int)(luna_os_audio_volume() * 100.0f + 0.5f));
+      y += menu_item(b, "volup", "Volume Up", false, v);
+      y += menu_item(b, "voldown", "Volume Down", false, NULL);
+      y += menu_item(b, "mute", "Mute", luna_os_audio_muted() != 0, NULL);
+      y += menu_sep(b);
       y += menu_header(b, "SOUND OUTPUT");
       const char *cur = luna_os_audio_device();
       /* "None" closes the playback device so another program can open the
@@ -1573,7 +1649,17 @@ static int menu_sub_rows(struct menu_buf *b)
          y += menu_item(b, id, g_menu_dev_desc[i], cur && !strcmp(cur, g_menu_dev_name[i]), NULL);
       }
       if (!g_menu_ndev) y += menu_item(b, NULL, "No output devices", false, NULL);
-   } else if (g_menu_sub == SUB_ZOOM) {
+   } else if (g_menu_sub == SUB_LOCALE) {
+      y += menu_header(b,"DEVICE LANGUAGE");
+      y += menu_item(b,NULL,"Applies on restart",false,NULL);
+      for (size_t i=0; i<sizeof g_locales/sizeof *g_locales; ++i) {
+         snprintf(id,sizeof id,"locale-%zu",i);
+         y += menu_item(b,id,g_locales[i].label,locale_choice()==(int)i,NULL);
+      }
+   } else if (g_menu_sub == SUB_WEBVIEW) {
+      y += menu_item(b, dvm_webview_count() ? "reload" : NULL, "Reload WebView", false, NULL);
+      y += menu_sep(b);
+      {
       static const int pct[] = { 75, 100, 125, 150, 175, 200, 250, 300 };
       const int cur = (int)(dvm_webview_zoom() * 100.0f + 0.5f);
       y += menu_header(b, "WEBVIEW ZOOM");
@@ -1585,17 +1671,9 @@ static int menu_sub_rows(struct menu_buf *b)
          snprintf(label, sizeof label, "%d%%", pct[i]);
          y += menu_item(b, id, label, cur == pct[i], NULL);
       }
-   } else if (g_menu_sub == SUB_GRAPHICS) {
-      if (g_graphics_choice < 0) {
-         const char *env = getenv("LUNARIA_VULKAN");
-         g_graphics_choice = !env || env[0] != '0';
       }
-      y += menu_header(b, "GRAPHICS API");
-      y += menu_item(b, "gfx-vulkan", "Vulkan (default)", g_graphics_choice == 1, NULL);
-      y += menu_item(b, "gfx-opengl", "OpenGL ES", g_graphics_choice == 0, NULL);
       y += menu_sep(b);
-      y += menu_item(b, NULL, "Restart the app to apply", false, NULL);
-   } else if (g_menu_sub == SUB_ENGINE) {
+      {
       static const char *const names[] = { "auto", "chrome", "luna", "off" };
       static const char *const labels[] = { "Automatic", "Chrome / Chromium",
                                             "luna-browser", "Off" };
@@ -1605,6 +1683,19 @@ static int menu_sub_rows(struct menu_buf *b)
          snprintf(id, sizeof id, "eng-%s", names[i]);
          y += menu_item(b, id, labels[i], cur && !strcmp(cur, names[i]), NULL);
       }
+      }
+   } else if (g_menu_sub == SUB_PROFILE) {
+      char names[PROFILE_MAX][65];
+      const int n = luna_apk_profile_list(names, PROFILE_MAX);
+      const char *cur = luna_apk_profile_current();
+      y += menu_header(b, "PROFILE");
+      y += menu_item(b, "profile-new", "New Profile", false, NULL);
+      y += menu_sep(b);
+      for (int i = 0; i < n; ++i) {
+         snprintf(id, sizeof id, "profile-%d", i);
+         y += menu_item(b, id, names[i], !strcmp(names[i], cur), NULL);
+      }
+      y += menu_item(b, NULL, "Switching restarts the app", false, NULL);
    }
    return y + PAD;
 }
@@ -1655,23 +1746,35 @@ static void menu_publish_locked(void)
       return;
    }
    struct menu_buf rows = { 0 }, sub = { 0 }, doc = { 0 };
-   int sound_y = 0, zoom_y = 0, engine_y = 0, keymap_y = 0, resolution_y = 0, graphics_y = 0;
-   const int h = menu_main_rows(&rows, &sound_y, &zoom_y, &engine_y, &keymap_y, &resolution_y, &graphics_y);
+   int parent_y[SUB_COUNT] = { 0 };
+   const int room = g_menu_h - 8;               /* a panel never outgrows the window */
+   const int natural_h = menu_main_rows(&rows, parent_y);
+   int h = natural_h;
    const int mx = menu_clampi((int)g_menu_x, 4, g_menu_w - MENU_W - 4 > 4 ? g_menu_w - MENU_W - 4 : 4);
+   if (h > room) h = room;
    const int my = menu_clampi((int)g_menu_y, 4, g_menu_h - h - 4 > 4 ? g_menu_h - h - 4 : 4);
    menu_put(&doc, "<div id=\"luna-menu-backdrop\"></div>");
-   menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;\">", mx, my);
+   /* Only a panel that cannot fit is given a height and scrolls; one that
+    * fits is left to size itself, since the rows' sum is a little short of
+    * what the layout makes of them. */
+   if (natural_h > room)
+      menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;max-height:%dpx;overflow-y:auto;\">", mx, my, h - 2 * PAD);
+   else
+      menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;\">", mx, my);
    menu_put(&doc, rows.p ? rows.p : "");
    menu_put(&doc, "</div>");
    if (g_menu_sub != SUB_NONE) {
-      const int parent_y = g_menu_sub == SUB_SOUND ? sound_y : g_menu_sub == SUB_ZOOM ? zoom_y : g_menu_sub == SUB_ENGINE ? engine_y : g_menu_sub == SUB_RESOLUTION ? resolution_y : g_menu_sub == SUB_GRAPHICS ? graphics_y : keymap_y;
-      const int sh = menu_sub_rows(&sub);
+      const int sub_natural = menu_sub_rows(&sub);
+      int sh = sub_natural > room ? room : sub_natural;
       /* To the right of the menu, the parent row at its first item; to the
        * left when that would leave the surface. */
       int sx = mx + MENU_W - 4;
       if (sx + MENU_W > g_menu_w - 4) sx = mx - MENU_W + 4;
-      const int sy = menu_clampi(my + parent_y - PAD - 22, 4, g_menu_h - sh - 4 > 4 ? g_menu_h - sh - 4 : 4);
-      menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;\">", sx, sy);
+      const int sy = menu_clampi(my + parent_y[g_menu_sub] - PAD - 22, 4, g_menu_h - sh - 4 > 4 ? g_menu_h - sh - 4 : 4);
+      if (sub_natural > room)
+         menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;max-height:%dpx;overflow-y:auto;\">", sx, sy, sh - 2 * PAD);
+      else
+         menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;\">", sx, sy);
       menu_put(&doc, sub.p ? sub.p : "");
       menu_put(&doc, "</div>");
    }
@@ -1715,19 +1818,74 @@ static int menu_paste_clipboard(void)
    return typed;
 }
 
-static void menu_screenshot_path(char *out, size_t cap)
+static void menu_stamp_path(char *out, size_t cap, const char *folder, const char *ext)
 {
    const char *home = getenv("HOME");
    char dir[512];
    struct stat st;
-   snprintf(dir, sizeof dir, "%s/Pictures", home && *home ? home : ".");
+   snprintf(dir, sizeof dir, "%s/%s", home && *home ? home : ".", folder);
    if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode))
       snprintf(dir, sizeof dir, "%s", home && *home ? home : ".");
    time_t t = time(NULL);
    struct tm tm = {0};
    luna_localtime(&t, &tm);
-   snprintf(out, cap, "%s/Lunaria %04d-%02d-%02d %02d.%02d.%02d.png", dir,
-            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+   snprintf(out, cap, "%s/Lunaria %04d-%02d-%02d %02d.%02d.%02d.%s", dir,
+            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, ext);
+}
+
+static void menu_screenshot_path(char *out, size_t cap)
+{
+   menu_stamp_path(out, cap, "Pictures", "png");
+}
+
+/* Record / replay of touch input (F9 / F10 and the menu).  The recording is
+ * what the guest was sent, so it replays whatever produced it: mouse, keymap
+ * or a macro.  LUNARIA_PLAY names a recording to replay when none was made. */
+static const char *input_play_path(char *out, size_t cap)
+{
+   luna_record_last_path(out, cap);
+   if (!out[0]) {
+      const char *env = getenv("LUNARIA_PLAY");
+      snprintf(out, cap, "%s", env ? env : "");
+   }
+   return out[0] ? out : NULL;
+}
+
+void luna_input_record_toggle(void)
+{
+   char path[4096], msg[4300];
+   if (luna_record_active()) {
+      luna_record_stop();
+      luna_record_last_path(path, sizeof path);
+      snprintf(msg, sizeof msg, "Recording saved: %s", path);
+   } else {
+      menu_stamp_path(path, sizeof path, "Documents", "rec");
+      if (luna_play_active()) luna_play_stop();
+      snprintf(msg, sizeof msg, luna_record_start(path) ? "Recording input: %s" : "Cannot record to %s", path);
+   }
+   fprintf(stderr, "[input] %s\n", msg);
+   pthread_mutex_lock(&g_menu_lock);
+   menu_notice_locked(msg);
+   pthread_mutex_unlock(&g_menu_lock);
+}
+
+void luna_input_play_toggle(void)
+{
+   char path[4096], msg[4300];
+   if (luna_play_active()) {
+      luna_play_stop();
+      snprintf(msg, sizeof msg, "Replay stopped");
+   } else if (!input_play_path(path, sizeof path)) {
+      snprintf(msg, sizeof msg, "No recording to play (record with F9)");
+   } else {
+      if (luna_record_active()) { luna_record_stop(); }
+      const char *loop = getenv("LUNARIA_PLAY_LOOP");
+      snprintf(msg, sizeof msg, luna_play_start(path, loop && *loop && *loop != '0') ? "Replaying: %s" : "Cannot replay %s", path);
+   }
+   fprintf(stderr, "[input] %s\n", msg);
+   pthread_mutex_lock(&g_menu_lock);
+   menu_notice_locked(msg);
+   pthread_mutex_unlock(&g_menu_lock);
 }
 
 /* The right-click menu writes into the running package's block of
@@ -1917,6 +2075,14 @@ static void menu_clicked(const char *id)
    } else if (!strcmp(id, "settings-resolution")) {
       g_settings_resolution = (g_settings_resolution + 1) % (sizeof g_resolutions / sizeof g_resolutions[0]);
       g_resolution_dirty = true; keep_open = true;
+   } else if (!strncmp(id,"locale-",7)) {
+      char *end=NULL; long i=strtol(id+7,&end,10);
+      if (end!=id+7 && !*end && i>=0 && (size_t)i<sizeof g_locales/sizeof *g_locales) {
+         bool saved=menu_conf_write("LUNARIA_LOCALE",g_locales[i].tag,false);
+         if (saved) g_locale_choice=(int)i;
+         menu_notice_locked(saved ? "言語を保存しました。再起動すると反映されます。" : "言語の設定を保存できません。");
+         keep_open=!saved;
+      }
    } else if (!strncmp(id, "res-", 4)) {
       char *end = NULL; long i = strtol(id + 4, &end, 10);
       if (end != id + 4 && !*end && i >= 0 && (size_t)i < sizeof g_resolutions / sizeof g_resolutions[0]) {
@@ -1961,6 +2127,26 @@ static void menu_clicked(const char *id)
       if (typed <= 0) menu_notice_locked("No text field has the focus");
    } else if (!strcmp(id, "back")) {
       arm_exec_android_key(4 /* AKEYCODE_BACK */);
+   } else if (!strcmp(id, "rotate-device")) {
+      const int width = arm_exec_fb_height(), height = arm_exec_fb_width();
+      char w[16], h[16];
+      snprintf(w, sizeof w, "%d", width);
+      snprintf(h, sizeof h, "%d", height);
+      const bool saved_w = menu_conf_write("LUNARIA_WIDTH", w, false);
+      const bool saved_h = menu_conf_write("LUNARIA_HEIGHT", h, false);
+      arm_exec_request_view_resize(width, height);
+      g_menu_w = width; g_menu_h = height;
+      menu_notice_locked(saved_w && saved_h ? "Device orientation changed and saved."
+                                           : "Device orientation changed; cannot save settings.");
+   } else if (!strcmp(id, "network")) {
+      const int enabled = !arm_exec_network_enabled();
+      pthread_mutex_unlock(&g_menu_lock);
+      arm_exec_set_network_enabled(enabled);
+      pthread_mutex_lock(&g_menu_lock);
+      const bool saved = menu_conf_write("LUNARIA_NET", enabled ? "1" : "0", false);
+      menu_notice_locked(saved ? (enabled ? "Network on" : "Network off")
+                               : "Network changed; cannot save settings");
+      keep_open = true;
    } else if (!strcmp(id, "volup") || !strcmp(id, "voldown")) {
       float v = luna_os_audio_volume() + (id[3] == 'u' ? 0.1f : -0.1f);
       char saved[16];
@@ -1975,10 +2161,16 @@ static void menu_clicked(const char *id)
       menu_conf_set("LUNARIA_AUDIO_MUTE", luna_os_audio_muted() ? "1" : "0");
       menu_notice_locked(luna_os_audio_muted() ? "Sound muted" : "Sound on");
    } else if (!strncmp(id, "sub-", 4)) {
-      const int sub = !strcmp(id + 4, "sound") ? SUB_SOUND : !strcmp(id + 4, "zoom") ? SUB_ZOOM
-                    : !strcmp(id + 4, "keymap") ? SUB_KEYMAP : !strcmp(id + 4, "resolution") ? SUB_RESOLUTION : !strcmp(id + 4, "graphics") ? SUB_GRAPHICS : SUB_ENGINE;
+      static const struct { const char *name; int sub; } groups[] = {
+         { "input", SUB_INPUT }, { "display", SUB_DISPLAY }, { "graphics", SUB_GRAPHICS },
+         { "sound", SUB_SOUND }, { "locale", SUB_LOCALE }, { "webview", SUB_WEBVIEW },
+         { "profile", SUB_PROFILE },
+      };
+      int sub = SUB_NONE;
+      for (size_t i = 0; i < sizeof groups / sizeof groups[0]; ++i)
+         if (!strcmp(id + 4, groups[i].name)) sub = groups[i].sub;
       g_menu_sub = g_menu_sub == sub ? SUB_NONE : sub;
-      if (g_menu_sub == SUB_KEYMAP) keyfiles_read();
+      if (g_menu_sub == SUB_INPUT) { g_keypage = 0; keyfiles_read(); }
       if (g_menu_sub == SUB_SOUND) g_menu_ndev = luna_os_audio_devices(g_menu_dev_name, g_menu_dev_desc, MAX_DEVICES);
       keep_open = true;
    } else if (!strcmp(id, "km-up")) {
@@ -1987,7 +2179,7 @@ static void menu_clicked(const char *id)
       else snprintf(g_keydir, sizeof g_keydir, "..");
       keyfiles_read(); keep_open = true;
    } else if (!strcmp(id, "km-next") || !strcmp(id, "km-prev")) {
-      if (id[3] == 'n' && (g_keypage + 1) * KEYMAP_PAGE < g_nkeyfiles) ++g_keypage;
+      if (id[3] == 'n' && (g_keypage + 1) * menu_keymap_page() < g_nkeyfiles) ++g_keypage;
       else if (id[3] == 'p' && g_keypage) --g_keypage;
       keep_open = true;
    } else if (!strncmp(id, "km-file-", 8)) {
@@ -2044,6 +2236,13 @@ static void menu_clicked(const char *id)
                                   : "OpenGL ES selected: restart the app");
       } else menu_notice_locked("Cannot save graphics settings");
       keep_open = true;
+   } else if (!strcmp(id, "glid-device") || !strcmp(id, "glid-host")) {
+      const int host = !strcmp(id, "glid-host");
+      if (menu_conf_write("LUNARIA_GL_IDENTITY", host ? "host" : "device", false)) {
+         g_gl_identity_choice = host;
+         menu_notice_locked("GL identity saved: restart the app to apply");
+      } else menu_notice_locked("Cannot save GL identity settings");
+      keep_open = true;
    } else if (!strncmp(id, "eng-", 4)) {
       dvm_webview_set_engine(id + 4);
       menu_conf_set("LUNARIA_WEB_ENGINE", id + 4);
@@ -2057,6 +2256,29 @@ static void menu_clicked(const char *id)
        * value to keep is the one the window is on its way to. */
       menu_conf_set("LUNARIA_FULLSCREEN", arm_exec_is_fullscreen() ? "0" : "1");
       arm_exec_toggle_fullscreen();
+   } else if (!strcmp(id, "restart") || !strcmp(id, "profile-new") ||
+              (!strncmp(id, "profile-", 8) && id[8] >= '0' && id[8] <= '9')) {
+      /* Starting over is this command line again under the chosen profile.
+       * A new profile is only a name until the app starts under it. */
+      char names[PROFILE_MAX][65], fresh[65];
+      const char *profile = NULL;
+      if (!strcmp(id, "profile-new")) {
+         if (luna_apk_profile_new_name(fresh, sizeof fresh) == 0) profile = fresh;
+      } else if (id[0] == 'p') {
+         const int i = atoi(id + 8);
+         if (i >= 0 && i < luna_apk_profile_list(names, PROFILE_MAX)) profile = names[i];
+      } else profile = luna_apk_profile_current();
+      if (profile) {
+         pthread_mutex_unlock(&g_menu_lock);
+         luna_apk_restart(profile);
+         pthread_mutex_lock(&g_menu_lock);
+      }
+      menu_notice_locked("Cannot restart");
+      keep_open = true;
+   } else if (!strcmp(id, "record") || !strcmp(id, "play")) {
+      pthread_mutex_unlock(&g_menu_lock);
+      if (id[0] == 'r') luna_input_record_toggle(); else luna_input_play_toggle();
+      pthread_mutex_lock(&g_menu_lock);
    } else if (!strcmp(id, "quit")) {
       arm_exec_request_quit();
    } else keep_open = true;

@@ -18,6 +18,9 @@
 #include <zlib.h>
 #ifndef _WIN32
 #include <unistd.h>
+#ifdef _WIN32
+#include <process.h>
+#endif
 #endif
 #define APK_PATH 4096
 #define APK_META 65536
@@ -1403,8 +1406,15 @@ static int font_defaults(const char *exedir)
    if (!path_join(path, sizeof path, exedir, "syslib-arm64") && directory(path))
       env_default("LUNARIA_SYSLIB_DIR", path);
 #ifdef __APPLE__
-   if (!path_join(path, sizeof path, exedir, ".deps/lib/moltenvk_icd.json") && exists(path))
-      env_default("VK_ICD_FILENAMES", path);
+   static const char *driver_manifests[] = {
+      "lib/moltenvk_icd.json", ".deps/lib/moltenvk_icd.json"
+   };
+   for (size_t i = 0; i < sizeof driver_manifests / sizeof driver_manifests[0]; i++) {
+      if (!path_join(path, sizeof path, exedir, driver_manifests[i]) && exists(path)) {
+         env_default("VK_ICD_FILENAMES", path);
+         break;
+      }
+   }
 #endif
    return 0;
 }
@@ -1813,6 +1823,7 @@ static int launcher_ask(int *argc, const char ***argv)
 }
 
 /* 0: enter the loader, 1: command completed, -1: failure. */
+static void restart_remember(int argc, const char **argv);
 static int apk_prepare_inner(int *argc, const char ***argv)
 {
    if (*argc >= 2 && (!strcmp((*argv)[1], "--apk-process-arm64") || !strcmp((*argv)[1], "--apk-process-arm32")))
@@ -1828,6 +1839,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
          return asked > 0 ? 1 : -1;
       }
    }
+   restart_remember(*argc, *argv);
    bool list = false, prepare = false, install = false, choose = false, profile_requested = false;
    bool launch_ui_ready = false;
    int at = 1;
@@ -2136,21 +2148,11 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       goto done;
    if (env_default("LUNARIA_DEX_START", "1") || env_default("LUNARIA_JIT_UI", "1") || env_default("LUNARIA_A64_SELF_SCHED", "1"))
       goto done;
-   static char main_module[APK_PATH];
+   /* An Android process starts at the launcher Activity in the dex; the app
+    * loads its own engine library from there. */
+   static const char *main_module;
+   main_module = !strcmp(arch, "arm64-v8a") ? "--apk-process-arm64" : "--apk-process-arm32";
    static const char *newargs[3];
-   main_module[0] = 0;
-   static const char *engines[] = {"libunity.so", "libUE4.so", "libUnreal.so", "libmain.so"};
-   for (size_t i = 0; i < sizeof engines / sizeof engines[0]; i++) {
-      char path[APK_PATH];
-      if (path_join(path, sizeof path, libdir, engines[i]))
-         goto done;
-      if (exists(path)) {
-         strcpy(main_module, path);
-         break;
-      }
-   }
-   if (!*main_module)
-      strcpy(main_module, !strcmp(arch, "arm64-v8a") ? "--apk-process-arm64" : "--apk-process-arm32");
    FILE *stamp = open_file(ready, "wb");
    if (!stamp)
       goto done;
@@ -2186,6 +2188,106 @@ done:
    free(m);
    free(split);
    return result;
+}
+
+
+/* Restart and profile switching for the running app (the right-click menu).
+ * A restart is the original command line again with --profile replaced: the
+ * launcher's own choices (the APK it asked for) are part of that line. */
+static char **g_restart_argv;
+static int g_restart_argc;
+
+static void restart_remember(int argc, const char **argv)
+{
+   if (g_restart_argv) return;
+   g_restart_argv = calloc((size_t)argc + 1, sizeof *g_restart_argv);
+   if (!g_restart_argv) return;
+   for (int i = 0; i < argc; ++i) {
+      g_restart_argv[i] = strdup(argv[i]);
+      if (!g_restart_argv[i]) { g_restart_argv = NULL; return; }
+   }
+   g_restart_argc = argc;
+}
+
+const char *luna_apk_profile_current(void)
+{
+   const char *p = getenv("LUNARIA_PROFILE");
+   return p && *p ? p : "default";
+}
+
+int luna_apk_profile_list(char (*names)[65], int max)
+{
+   const char *package = getenv("ANDROID_PACKAGE_NAME");
+   const char *root = getenv("LUNARIA_DATA_ROOT");
+   int n = 0;
+   if (max < 1) return 0;
+   snprintf(names[n++], 65, "default");
+   if (!package || !*package || !root || !*root) return n;
+   char dir[APK_PATH], relative[512];
+   snprintf(relative, sizeof relative, "profiles/%s", package);
+   if (path_join(dir, sizeof dir, root, relative)) return n;
+   luna_directory *d = luna_directory_open(dir);
+   if (!d) return n;
+   luna_directory_entry *e;
+   while (n < max && (e = luna_directory_read(d))) {
+      char path[APK_PATH];
+      if (!profile_valid(e->d_name) || !strcmp(e->d_name, "default")) continue;
+      if (path_join(path, sizeof path, dir, e->d_name) || !directory(path)) continue;
+      snprintf(names[n++], 65, "%s", e->d_name);
+   }
+   luna_directory_close(d);
+   return n;
+}
+
+/* The next unused "profile-N". */
+int luna_apk_profile_new_name(char *out, size_t cap)
+{
+   char names[64][65];
+   const int n = luna_apk_profile_list(names, 64);
+   for (int k = 2; k < 1000; ++k) {
+      char want[65];
+      bool taken = false;
+      snprintf(want, sizeof want, "profile-%d", k);
+      for (int i = 0; i < n; ++i) if (!strcmp(names[i], want)) taken = true;
+      if (!taken) return copy_text(out, cap, want);
+   }
+   return -1;
+}
+
+/* Starts this launch over under `profile` (NULL: the same one).  Returns only
+ * when it could not. */
+int luna_apk_restart(const char *profile)
+{
+   char exe[APK_PATH];
+   if (!g_restart_argv || luna_os_executable_path(exe, sizeof exe)) return -1;
+   if (!profile) profile = luna_apk_profile_current();
+   if (!profile_valid(profile)) return -1;
+   const char **args = calloc((size_t)g_restart_argc + 3, sizeof *args);
+   if (!args) return -1;
+   int n = 0;
+   args[n++] = exe;
+   for (int i = 1; i < g_restart_argc; ++i) {
+      const char *a = g_restart_argv[i];
+      if (!strcmp(a, "--profile")) { ++i; continue; }
+      if (!strncmp(a, "--profile=", 10) || !strcmp(a, "--choose-profile")) continue;
+      args[n++] = a;
+   }
+   /* --profile goes before the archive, which must stay last. */
+   const char *archive = n > 1 ? args[n - 1] : NULL;
+   if (!archive) { free(args); return -1; }
+   args[n - 1] = "--profile";
+   args[n++] = profile;
+   args[n++] = archive;
+   args[n] = NULL;
+   fprintf(stderr, "[apk] restarting under profile %s\n", profile);
+   fflush(NULL);
+#ifdef _WIN32
+   _execv(exe, (char *const *)args);
+#else
+   execv(exe, (char *const *)args);
+#endif
+   free(args);
+   return -1;
 }
 
 int luna_apk_prepare(int *argc, const char ***argv)

@@ -481,6 +481,17 @@ static void *comp_main(void *arg)
       EGLImage take_img = EGL_NO_IMAGE;
       int prev_shown = g_shown;
       if (take >= 0) {
+         /* Retire the old shown slot before publishing a different one.
+          * All draws sampling the old slot were submitted on this context
+          * in earlier iterations. The producer may immediately reuse it
+          * after g_shown changes, so its release fence must already exist. */
+         if (prev_shown >= 0 && prev_shown != take) {
+            EGLSync done = eglCreateSync(g_dpy, EGL_SYNC_FENCE, NULL);
+            glFlush();
+            if (g_release_fence[prev_shown] != EGL_NO_SYNC)
+               eglDestroySync(g_dpy, g_release_fence[prev_shown]);
+            g_release_fence[prev_shown] = done;
+         }
          ready = g_ready_fence[take];
          take_img = g_slot_img[take];
          g_ready_fence[take] = EGL_NO_SYNC;
@@ -561,23 +572,6 @@ static void *comp_main(void *arg)
          luna_overlay_present_boot(w, h);
       else
          luna_overlay_present(w, h);
-
-      /* The slot that stopped being shown is free once this frame's reads of
-       * it are done — the guest waits on that before copying into it.
-       * With no slot to release, eglSwapBuffers below supplies the flush. */
-      const int release_slot = (take >= 0 && prev_shown >= 0 && prev_shown != take)
-                               ? prev_shown : -1;
-      if (release_slot >= 0) {
-         EGLSync done = eglCreateSync(g_dpy, EGL_SYNC_FENCE, NULL);
-         glFlush();
-         pthread_mutex_lock(&g_mu);
-         if (g_release_fence[release_slot] == EGL_NO_SYNC) {
-            g_release_fence[release_slot] = done;
-            done = EGL_NO_SYNC;
-         }
-         pthread_mutex_unlock(&g_mu);
-         if (done != EGL_NO_SYNC) eglDestroySync(g_dpy, done);
-      }
 
       comp_maybe_dump(w, h);
       eglSwapBuffers(g_dpy, g_win);

@@ -121,8 +121,55 @@ bundle_linux() {
 }
 
 
+# A cross-built bundle cannot be asked what it needs: ldd runs the dynamic
+# loader, and the loader on this machine is for another architecture.  Read
+# the NEEDED entries with the target's objdump instead and look each name up
+# in the target's library directories (DIST_LIB_DIRS, colon separated),
+# repeating until nothing new turns up so that the libraries of the libraries
+# travel too.  The same system-owned set as above stays behind.
+bundle_linux_cross() {
+    _keep="$1"
+    _objdump="${OBJDUMP:-objdump}"
+    [ -n "${DIST_LIB_DIRS:-}" ] || err 'cross bundle: set DIST_LIB_DIRS to the target library directories'
+    _again=1
+    while [ "$_again" = 1 ]; do
+        _again=0
+        for _bin in "$stage/lunaria" "$stage"/runtime/*.so "$_keep"/*.so*; do
+            [ -f "$_bin" ] || continue
+            for _name in $("$_objdump" -p "$_bin" 2>/dev/null | awk '/NEEDED/ {print $2}'); do
+                case "$_name" in
+                    libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|librt.so.*| \
+                    ld-linux*|libgcc_s.so.*|libresolv.so.*)
+                        continue ;;
+                    libjvm.so|libdl.so|libpthread.so|libc.so|libEGL.so|libz.so)
+                        continue ;;
+                esac
+                [ -f "$_keep/$_name" ] && continue
+                [ -f "$stage/runtime/$_name" ] && continue
+                _found=
+                _oldifs=$IFS; IFS=:
+                for _dir in $DIST_LIB_DIRS; do
+                    if [ -e "$_dir/$_name" ]; then _found="$_dir/$_name"; break; fi
+                done
+                IFS=$_oldifs
+                if [ -z "$_found" ]; then
+                    msg "warning: $_name (needed by ${_bin##*/}) not found in DIST_LIB_DIRS"
+                    continue
+                fi
+                cp -Lp "$_found" "$_keep/$_name"
+                _again=1
+            done
+        done
+    done
+}
+
 case "$os" in
-    linux) bundle_linux "$stage/lib" ;;
+    linux)
+        if [ "$arch" != "$(uname -m)" ] && [ -n "${DIST_LIB_DIRS:-}" ]; then
+            bundle_linux_cross "$stage/lib"
+        else
+            bundle_linux "$stage/lib"
+        fi ;;
     macos) python3 scripts/bundle-macos.py "$stage" ;;
     windows) python3 scripts/bundle-windows.py "$stage" ;;
     *)     err "unknown os \"$os\"" ;;

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MPL-2.0 */
 /* Host-side services for the emulator core: fd readiness notification and the
  * GL draw inspector.  Neither holds guest state. */
-#include "luna_host.h"
+#include "lunaria_os.h"
 #include <errno.h>
 #include <GLES3/gl3.h>
 #include <EGL/egl.h>
@@ -44,13 +44,25 @@ static void *run(void *unused) {
         struct epoll_event events[16];
         int n = epoll_wait(epfd, events, 16, timeout);
         if (n < 0) { if (errno == EINTR) continue; break; }
-        int ready = n == 0;
+        int ready = 0;
         for (int i = 0; i < n; ++i) {
             if (events[i].data.fd == wakefd) {
                 uint64_t value; while (read(wakefd, &value, sizeof value) > 0) {}
             } else ready = 1;
         }
-        if (ready) on_ready();
+        /* Consume the current deadline under the update lock. The timeout
+         * passed to epoll_wait may belong to a replaced deadline (or be
+         * capped at INT_MAX). Only the current expired deadline may fire.
+         * Disarm before notifying, just as EPOLLONESHOT disarms descriptors;
+         * the scheduler re-arms after inspecting its waiters. */
+        pthread_mutex_lock(&lock);
+        if (deadline != INT64_MAX && deadline <= now_ms()) {
+            deadline = INT64_MAX;
+            ready = 1;
+        }
+        stop = stopping;
+        pthread_mutex_unlock(&lock);
+        if (ready && !stop) on_ready();
     }
     return NULL;
 }

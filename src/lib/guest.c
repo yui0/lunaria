@@ -461,6 +461,18 @@ static inline uint32_t lh_take_top(struct lh_heap *h, uint32_t len, uint32_t ali
    return next;
 }
 
+/* Android/Linux fixed clocks with no nanosleep operation must fail before
+ * accessing rqtp. Clock 10 is unused. Keep these ABI errors independent of
+ * host errno values; both the guest provider and host dispatcher use this. */
+static inline int lunaria_sleep_clock_error(int clockid)
+{
+   if (clockid == 4 || clockid == 5 || clockid == 6)
+      return 95; /* EOPNOTSUPP: RAW and the two COARSE clocks */
+   if (clockid == 10 || clockid >= 12)
+      return 22; /* EINVAL: no such Android clock */
+   return 0;
+}
+
 #ifndef LUNARIA_GUEST_SHARED
 /* ---- guest-only: the libc entry points --------------------------------- */
 
@@ -743,9 +755,13 @@ int clock_nanosleep(clockid_t clockid, int flags, const struct timespec *req,
                     struct timespec *rem)
 {
    long rc;
+   const int clock_error = lunaria_sleep_clock_error((int)clockid);
+   if (clock_error) return clock_error;
    if (!req) return EFAULT;
    if (!timespec_ok(req)) return EINVAL;
-   if ((flags & TIMER_ABSTIME) == 0 && req->tv_sec == 0 && req->tv_nsec == 0)
+   if ((clockid == CLOCK_REALTIME || clockid == CLOCK_MONOTONIC ||
+        clockid == CLOCK_BOOTTIME) && (flags & TIMER_ABSTIME) == 0 &&
+       req->tv_sec == 0 && req->tv_nsec == 0)
       return 0;
    /* Like bionic's ErrnoRestorer: a delivered signal handler may change
     * errno while the raw wait is suspended. Restore the caller's value. */
@@ -1110,6 +1126,108 @@ char *__strncat_chk(char *dst, const char *src, size_t n, size_t dst_len)
    memcpy(dst + have, src, add);
    dst[have + add] = '\0';
    return dst;
+}
+
+/* ---- gettimeofday -------------------------------------------------------
+ *
+ * The vDSO does this on a device: the architected counter and a published
+ * offset, no kernel entry.  Unity polls it at the start and end of nearly every
+ * engine job, which came to ten thousand JIT exits a second in the Genshin
+ * world.  The emulator publishes whether CNTVCT_EL0 is the wall clock in
+ * CNTFRQ ticks (it is not under LUNARIA_A64_CNTVCT=ticks) and the offset that
+ * turns the monotonic clock the counter is derived from into CLOCK_REALTIME.
+ * Anything it cannot answer from those goes to the kernel call, so the result
+ * and the errno are the handler's. */
+__attribute__((visibility("default"))) uint64_t lunaria_wall_counter = 0;
+__attribute__((visibility("default"))) int64_t lunaria_realtime_offset_ns = 0;
+
+#include <sys/time.h>
+
+static long lun_syscall2(long nr, long a, long b)
+{
+   register long x0 __asm__("x0") = a;
+   register long x1 __asm__("x1") = b;
+   register long x8 __asm__("x8") = nr;
+   __asm__ volatile("svc #0" : "+r"(x0) : "r"(x1), "r"(x8) : "memory", "cc");
+   return x0;
+}
+
+__attribute__((visibility("default")))
+int gettimeofday(struct timeval *tv, struct timezone *tz)
+{
+   if (__builtin_expect(!lunaria_wall_counter || tz || !tv, 0)) {
+      const long r = lun_syscall2(169 /* __NR_gettimeofday */, (long)tv, (long)tz);
+      if (r < 0) { *__errno() = (int)-r; return -1; }
+      return 0;
+   }
+   uint64_t c;
+   __asm__ volatile("mrs %0, cntvct_el0" : "=r"(c));
+   /* 1e9 / 19.2e6 == 625 / 12; split so ns * freq cannot overflow. */
+   const uint64_t freq = 19200000u;
+   const int64_t ns = (int64_t)((c / freq) * 1000000000ull + (c % freq) * 625u / 12u) +
+                      lunaria_realtime_offset_ns;
+   int64_t *out = (int64_t *)tv;   /* struct timeval { time_t; suseconds_t; } on LP64 */
+   out[0] = ns / 1000000000;
+   out[1] = (ns % 1000000000) / 1000;
+   return 0;
+}
+
+/* ---- thread-safe static initialisation ---------------------------------
+ *
+ * The Itanium C++ ABI's guard: the compiler's inline test reads byte 0 ("1"
+ * means initialised) and calls these only when it is clear.  The first thread
+ * through takes the right to run the initialiser; every other thread that
+ * arrives meanwhile waits for it to finish (or give up) and then sees the
+ * finished object.
+ *
+ * The whole protocol lives in the guard's low 32-bit word, so it needs
+ * nothing beyond the bytes the ABI already reserves:
+ *   0      not initialised
+ *   0x100  being initialised (byte 1, as libc++abi marks it)
+ *   0x200  being initialised, with sleepers
+ *   1      initialised
+ * One compare-and-swap to take it, one exchange to publish; sleepers wait on
+ * the word with futex and the publish wakes them.
+ */
+#define GUARD_BUSY      0x100u
+#define GUARD_BUSY_WAIT 0x200u
+
+__attribute__((visibility("default")))
+int __cxa_guard_acquire(uint64_t *guard)
+{
+   uint32_t *g = (uint32_t *)guard;
+   uint32_t v = __atomic_load_n(g, __ATOMIC_ACQUIRE);
+   for (;;) {
+      if (v & 0xffu) return 0;
+      if (v == 0u) {
+         if (__atomic_compare_exchange_n(g, &v, GUARD_BUSY, 0,
+                                         __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE))
+            return 1;
+         continue;
+      }
+      if (v == GUARD_BUSY &&
+          !__atomic_compare_exchange_n(g, &v, GUARD_BUSY_WAIT, 0,
+                                       __ATOMIC_RELAXED, __ATOMIC_ACQUIRE))
+         continue;
+      raw_futex(g, FUTEX_WAIT_PRIVATE, GUARD_BUSY_WAIT);
+      v = __atomic_load_n(g, __ATOMIC_ACQUIRE);
+   }
+}
+
+__attribute__((visibility("default")))
+void __cxa_guard_release(uint64_t *guard)
+{
+   uint32_t *g = (uint32_t *)guard;
+   if (__atomic_exchange_n(g, 1u, __ATOMIC_RELEASE) == GUARD_BUSY_WAIT)
+      raw_futex(g, FUTEX_WAKE_PRIVATE, 0x7fffffff);
+}
+
+__attribute__((visibility("default")))
+void __cxa_guard_abort(uint64_t *guard)
+{
+   uint32_t *g = (uint32_t *)guard;
+   if (__atomic_exchange_n(g, 0u, __ATOMIC_RELEASE) == GUARD_BUSY_WAIT)
+      raw_futex(g, FUTEX_WAKE_PRIVATE, 0x7fffffff);
 }
 
 #endif /* !LUNARIA_GUEST_SHARED */

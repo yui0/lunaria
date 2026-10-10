@@ -452,11 +452,13 @@ int lunaria_cdp_page_navigate(struct lunaria_cdp_page *page, const char *url)
    size_t length = strlen(quoted) + strlen(page->session_id) + 128;
    char *command = malloc(length);
    if (!command) { free(quoted); return -1; }
+   unsigned id = page->next_id++;
    snprintf(command, length,
       "{\"id\":%u,\"sessionId\":\"%s\",\"method\":\"Page.navigate\","
       "\"params\":{\"url\":%s}}",
-      page->next_id++, page->session_id, quoted);
+      id, page->session_id, quoted);
    int status = lunaria_cdp_send(page->transport, command);
+   if (!status) page->navigation_id = id;
    free(command);
    free(quoted);
    return status;

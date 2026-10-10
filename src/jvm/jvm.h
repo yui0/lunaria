@@ -235,6 +235,12 @@ struct jvm_object {
    int array_refs; /* Strong array edges, excluded from JNI-local ownership. */
    int global_refs; /* JNI global ownership, included in refs. */
    bool bridge_owned; /* Opaque bridge instances are reclaimable at zero refs. */
+   /* Counts how many times this slot has been released.  A handle is recycled
+    * for whatever is allocated next, so anything that remembers a handle (the
+    * DVM bridge does) records this with it to tell the object it named from
+    * whatever occupies the slot now.  Survives jvm_object_release(). */
+   uint32_t epoch;
+   int bridge_pending; /* Bridge-held local refs not yet released or deleted by native code. */
 
    /* JNI MonitorEnter/Exit state.  Access is serialized by the bridge's
     * monitor mutex; the small owner token avoids depending on pthread_t's
@@ -250,12 +256,22 @@ struct jvm_native_method {
 
 struct jvm_local_state;
 struct jvm {
+   struct jvm_cached_ref *cached_refs;
    struct jvm_local_state *local_states;
    // [0] object is created on `jvm_init` and it's a class object for defining the class of a class
    // every class object's `this_class` member points back to [0], causing recursion.
    // Every other object or class definition is created lazily as needed, only [0] is special.
    // `jobject`'s we return through JNI are actually (index+1) to this array, not pointers.
    struct jvm_object objects[65536];
+   /* Weak handles occupy a disjoint, guest-pointer-width-safe namespace.
+    * A generation prevents a recycled object slot from reviving a weak ref. */
+   uint64_t object_generation[65536];
+   struct jvm_weak_ref {
+      jobject target;
+      uint64_t generation;
+      bool used;
+   } *weak_refs;
+   size_t weak_capacity, next_weak;
 
    // Rotating free-slot hint for jvm_add_object(): allocation resumes here
    // instead of rescanning the whole table from index 0 on every call.
@@ -330,6 +346,7 @@ bool jvm_take_pending_exception(struct jvm *jvm, jthrowable *object,
  * length; JNI modified UTF-8 is converted only at the native API boundary. */
 jstring jvm_new_string_wtf8(struct jvm *jvm, const char *text, size_t bytes);
 const char *jvm_string_wtf8(struct jvm *jvm, jstring string, size_t *bytes);
+bool jvm_init_string_wtf8(struct jvm *jvm, jobject object, const char *text, size_t bytes);
 
 const char*
 jvm_get_class_name(struct jvm *jvm, jobject object);
@@ -363,10 +380,15 @@ jvm_release(struct jvm *jvm);
  * bridge clears its DVM mapping first.  A global reference keeps the handle
  * alive; otherwise even an opaque instance can be reclaimed. */
 void jvm_mark_bridge_local(struct jvm *jvm, jobject object);
+jobject jvm_resolve_reference(struct jvm *jvm, jobject object);
+bool jvm_is_weak_reference(struct jvm *jvm, jobject object);
 void *jvm_native_frame_begin(struct jvm *jvm);
 jobject jvm_native_frame_end(struct jvm *jvm, void *frame, jobject result);
 bool jvm_release_bridge_local(struct jvm *jvm, jobject object);
 int jvm_bridge_ref_count(struct jvm *jvm, jobject object);
+uint32_t jvm_handle_epoch(struct jvm *jvm, jobject object);
+/* Consume the bridge's own local reference; false if native code already deleted it. */
+bool jvm_bridge_take_pending(struct jvm *jvm, jobject object);
 
 void
 jvm_init(struct jvm *jvm);
@@ -390,6 +412,12 @@ jnienv_get_jvm(JNIEnv *env);
 void jni_file_set_path(jobject file, const char *path);
 const char *jni_file_get_path(jobject file);
 void jni_set_current_activity(JNIEnv *env, jobject activity);
+/* Host framework caches own strong JNI globals; every outward result is a
+ * fresh local. Slots are cleared when this JVM is released. */
+jobject jvm_cached_object(JNIEnv *env, jobject *slot, const char *class_name);
+jobject jvm_cached_object_init(JNIEnv *env, jobject *slot, const char *class_name,
+                              void (*initialize)(JNIEnv *, jobject, void *), void *data);
+bool jvm_cache_reference(JNIEnv *env, jobject *slot, jobject value);
 jobject jni_get_current_activity(void);
 void jni_file_bind_ctor(JNIEnv *env, jobject file, jmethodID ctor, va_list ap);
 void jni_file_bind_ctor_a(JNIEnv *env, jobject file, jmethodID ctor, const jvalue *args);

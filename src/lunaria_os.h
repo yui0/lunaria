@@ -150,6 +150,13 @@ static inline int luna_socket_inet_aton(const char *text, struct in_addr *addres
 #ifdef __cplusplus
 extern "C" {
 #endif
+/* Host readiness callback executes without the monitor lock. */
+int luna_fd_monitor_start(void (*ready)(void));
+int luna_fd_monitor_update(const struct pollfd *fds, size_t count, int64_t deadline_ms);
+void luna_fd_monitor_stop(void);
+/* Diagnostic GL state dump around draws; implemented in luna_host.c. */
+void luna_gl_inspect_draw(uint64_t frame);
+
 #ifdef MSG_NOSIGNAL
 #define LUNA_SEND_NOSIGNAL MSG_NOSIGNAL
 #else

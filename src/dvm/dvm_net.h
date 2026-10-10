@@ -17,6 +17,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Shared by native sockets, Java networking and the emulator menu. */
+bool dvm_network_enabled(void);
+void dvm_network_set_enabled(bool enabled);
+int dvm_sock_close(int fd);
+
+/* Establish TCP/TLS without sending an HTTP request. The connected perform
+ * consumes and clears the transport; close also accepts NULL. */
+void *dvm_http_connect(const char *url, int timeout_ms, char *error, size_t error_size);
+void dvm_http_transport_close(void *transport);
+
 struct dvm_http_header {
    char *name;
    char *value;
@@ -51,6 +61,12 @@ struct dvm_http_response {
    uint8_t *ra;
    size_t ra_len, ra_pos, ra_cap;
 };
+
+bool dvm_http_perform_connected(void **transport, const char *method,
+                      const char *url, const struct dvm_http_header *headers,
+                      int nheaders, const uint8_t *body, size_t body_len,
+                      int timeout_ms, bool follow_redirects,
+                      struct dvm_http_response *out);
 
 /* Performs one exchange.  `headers` are sent as given, minus the ones this
  * layer owns (Host, Content-Length, Connection).  Returns false and fills
@@ -174,3 +190,25 @@ int nsd_host_cancel(struct nsd_host *, uint64_t id);
 int nsd_host_poll(struct nsd_host *);
 int nsd_host_next(struct nsd_host *, struct nsd_event *out);
 void nsd_event_clear(struct nsd_event *);
+
+/* Readiness wait with a process cancellation descriptor.  Cancellation is
+ * persistent (the descriptor is never drained); -2 means timeout. */
+int dvm_socket_wait(int fd, short events, int timeout_ms, int cancel_fd);
+long dvm_tls_read_cancel(struct dvm_tls *t, void *buf, size_t n,
+                         int timeout_ms, int cancel_fd);
+long dvm_tls_write_cancel(struct dvm_tls *t, const void *buf, size_t n,
+                          int cancel_fd);
+
+/* Per-call error text: safe when a reader and writer share one session.
+ * error_size == 0 permits a NULL error buffer. */
+long dvm_tls_read_error_cancel(struct dvm_tls *t, void *buf, size_t n,
+                         int timeout_ms, int cancel_fd, char *error, size_t error_size);
+long dvm_tls_write_error_cancel(struct dvm_tls *t, const void *buf, size_t n,
+                         int cancel_fd, char *error, size_t error_size);
+
+struct dvm_tls *dvm_tls_connect_cancel(int fd, const char *host, int verify,
+                                const uint8_t *alpn, size_t alpn_len,
+                                int min_version, int max_version,
+                                const char *const *ciphers, int nciphers,
+                                bool *verify_failed, char *err, size_t errsz,
+                                int timeout_ms, int cancel_fd);

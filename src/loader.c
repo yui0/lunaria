@@ -37,6 +37,7 @@
 #include "linker/linker.h"
 #include "jvm/jvm.h"
 #include "arm_exec.h"
+#include "luna_compositor.h"
 #include "dvm/dvm_jni.h"
 
 #ifdef _WIN32
@@ -560,7 +561,7 @@ static void perf_tick(void)
 {
    static double every = -1.0;      /* -1: not configured, 0: disabled */
    static double t0, last;
-   static uint64_t last_frames, last_presents, last_ticks, last_xlat;
+   static uint64_t last_frames, last_presents, last_composites, last_ticks, last_xlat;
    static uint64_t frames;
 
    struct timespec ts;
@@ -577,16 +578,18 @@ static void perf_tick(void)
    if (!(every > 0.0) || now - last < every) return;
 
    const uint64_t presents = arm_exec_guest_swap_count();
+   const uint64_t composites = luna_comp_frames();
    const uint64_t gticks   = arm_exec_sched_ticks();
    const uint64_t xlat     = arm_exec_translated_insn();
    const double   dt       = now - last;
 
    fprintf(stderr,
-           "[perf] t=%.0fs pump=%llu (%.1f/s) present=%llu (%.1f/s) "
+           "[perf] t=%.0fs pump=%llu (%.1f/s) present=%llu (%.1f/s) composite=%llu (%.1f/s) "
            "guest=%.0fM insn (%.1f Mips) xlat=%.1fM (%.1f M/s)\n",
            now - t0,
            (unsigned long long)frames, (double)(frames - last_frames) / dt,
            (unsigned long long)presents, (double)(presents - last_presents) / dt,
+           (unsigned long long)composites, (double)(composites - last_composites) / dt,
            (double)gticks / 1e6, (double)(gticks - last_ticks) / dt / 1e6,
            (double)xlat / 1e6, (double)(xlat - last_xlat) / dt / 1e6);
 
@@ -596,6 +599,7 @@ static void perf_tick(void)
    last = now;
    last_frames = frames;
    last_presents = presents;
+   last_composites = composites;
    last_ticks = gticks;
    last_xlat = xlat;
 }
@@ -753,400 +757,6 @@ static void dump_mono_defaults(const char *when)
            when, corlib_fn, object_fn, root_fn, corlib_asm);
 }
 
-/* -------------------------------------------------------------------------
- * Minimal .dex reader: look up a method's JNI signature
- *
- * UE's GameActivity natives are not registered through RegisterNatives, so the
- * bridge binds them by their exported Java_… name and learns nothing about
- * their parameters.  Their signatures do change across engine versions —
- * nativeSetGlobalActivity is (ZLjava/lang/String;Ljava/lang/String;ZLjava/lang/String;)V
- * in UE4.20 and (ZZ…) from UE4.21 on, and nativeSetAndroidVersionInformation
- * gained a TargetSDK int and a build-number string along the way.  Calling one
- * version's layout on another shifts every later argument: the engine reads an
- * empty APK path, opens "" for the in-APK OBB and stops at "Failed to open
- * descriptor file <project>.uproject".
- *
- * The APK is already extracted for the AssetManager bridge, so read the real
- * signature out of classes*.dex and marshal against that instead of hardcoding
- * one engine version.
- * ---------------------------------------------------------------------- */
-
-struct dex_view {
-   const uint8_t *p;
-   size_t         len;
-};
-
-static uint32_t dex_u32(const struct dex_view *d, size_t off)
-{
-   uint32_t v = 0;
-   if (off + 4 <= d->len) memcpy(&v, d->p + off, 4);
-   return v;
-}
-
-static uint16_t dex_u16(const struct dex_view *d, size_t off)
-{
-   uint16_t v = 0;
-   if (off + 2 <= d->len) memcpy(&v, d->p + off, 2);
-   return v;
-}
-
-static size_t dex_uleb(const struct dex_view *d, size_t off, uint32_t *out)
-{
-   uint32_t r = 0;
-   int shift = 0;
-   while (off < d->len && shift <= 28) {
-      uint8_t b = d->p[off++];
-      r |= (uint32_t)(b & 0x7f) << shift;
-      if (!(b & 0x80)) break;
-      shift += 7;
-   }
-   *out = r;
-   return off;
-}
-
-/* MUTF-8 string by string_id index.  Returns a pointer into the mapping (the
- * bytes are NUL-terminated inside the file) or NULL. */
-static const char *dex_string(const struct dex_view *d, uint32_t ids_off,
-                              uint32_t ids_size, uint32_t idx)
-{
-   if (idx >= ids_size) return NULL;
-   uint32_t off = dex_u32(d, ids_off + idx * 4u);
-   uint32_t utf16_len;
-   size_t p = dex_uleb(d, off, &utf16_len);
-   if (p >= d->len) return NULL;
-   if (!memchr(d->p + p, '\0', d->len - p)) return NULL;
-   return (const char *)(d->p + p);
-}
-
-static int dex_find_sig(const struct dex_view *d, const char *class_desc,
-                        const char *method, char *out, size_t out_sz)
-{
-   if (d->len < 112 || memcmp(d->p, "dex\n", 4) != 0) return 0;
-   uint32_t str_size = dex_u32(d, 56), str_off = dex_u32(d, 60);
-   uint32_t type_size = dex_u32(d, 64), type_off = dex_u32(d, 68);
-   uint32_t proto_size = dex_u32(d, 72), proto_off = dex_u32(d, 76);
-   uint32_t meth_size = dex_u32(d, 88), meth_off = dex_u32(d, 92);
-
-#define DEX_TYPE(i) (((i) < type_size) \
-      ? dex_string(d, str_off, str_size, dex_u32(d, type_off + (i) * 4u)) : NULL)
-
-   for (uint32_t i = 0; i < meth_size; ++i) {
-      size_t e = meth_off + (size_t)i * 8u;
-      uint16_t cls_idx = dex_u16(d, e);
-      uint16_t proto_idx = dex_u16(d, e + 2);
-      uint32_t name_idx = dex_u32(d, e + 4);
-      const char *name = dex_string(d, str_off, str_size, name_idx);
-      if (!name || strcmp(name, method) != 0) continue;
-      const char *cls = DEX_TYPE(cls_idx);
-      if (!cls || strcmp(cls, class_desc) != 0) continue;
-      if (proto_idx >= proto_size) return 0;
-
-      size_t pe = proto_off + (size_t)proto_idx * 12u;
-      uint32_t ret_idx = dex_u32(d, pe + 4);
-      uint32_t params_off = dex_u32(d, pe + 8);
-      size_t n = 0;
-      if (n + 1 >= out_sz) return 0;
-      out[n++] = '(';
-      if (params_off) {
-         uint32_t cnt = dex_u32(d, params_off);
-         for (uint32_t k = 0; k < cnt; ++k) {
-            const char *t = DEX_TYPE(dex_u16(d, params_off + 4u + k * 2u));
-            if (!t) return 0;
-            size_t tl = strlen(t);
-            if (n + tl + 2 >= out_sz) return 0;
-            memcpy(out + n, t, tl);
-            n += tl;
-         }
-      }
-      out[n++] = ')';
-      const char *rt = DEX_TYPE(ret_idx);
-      if (!rt) return 0;
-      size_t rl = strlen(rt);
-      if (n + rl + 1 >= out_sz) return 0;
-      memcpy(out + n, rt, rl);
-      n += rl;
-      out[n] = '\0';
-      return 1;
-   }
-#undef DEX_TYPE
-   return 0;
-}
-
-/* Look a method up in every classes*.dex of the installed-package view.
- * `klass` is dotted or slashed ("com.epicgames.ue4.GameActivity"). */
-static int
-apk_method_signature(const char *klass, const char *method,
-                     char *out, size_t out_sz)
-{
-   const char *dir = getenv("ANDROID_PACKAGE_CODE_PATH");
-   if (!dir || !*dir || !klass || !method) return 0;
-
-   char desc[256];
-   size_t n = 0;
-   desc[n++] = 'L';
-   for (const char *c = klass; *c && n + 3 < sizeof desc; ++c)
-      desc[n++] = (*c == '.') ? '/' : *c;
-   desc[n++] = ';';
-   desc[n] = '\0';
-
-   /* Standard APK: <root>/classes*.dex.  App Bundle split (XAPK): the base
-    * module's dex lives under base/. */
-   static const char *const dex_dirs[] = { "", "base/" };
-   for (size_t d = 0; d < sizeof dex_dirs / sizeof dex_dirs[0]; ++d)
-   for (int i = 0; i < 32; ++i) {
-      char path[PATH_MAX];
-      if (i == 0) snprintf(path, sizeof path, "%s/%sclasses.dex", dir, dex_dirs[d]);
-      else        snprintf(path, sizeof path, "%s/%sclasses%d.dex", dir,
-                           dex_dirs[d], i + 1);
-      FILE *f = fopen(path, "rb");
-      if (!f) {
-         if (i == 0) continue; /* the first file may be classes2.dex */
-         break;
-      }
-      struct stat st;
-      if (fstat(fileno(f), &st) != 0 || st.st_size < 112) { fclose(f); continue; }
-      uint8_t *buf = malloc((size_t)st.st_size);
-      if (!buf) { fclose(f); continue; }
-      size_t got = fread(buf, 1, (size_t)st.st_size, f);
-      fclose(f);
-      struct dex_view d = { buf, got };
-      int ok = dex_find_sig(&d, desc, method, out, out_sz);
-      free(buf);
-      if (ok) {
-         fprintf(stderr, "[dex] %s.%s %s\n", klass, method, out);
-         return 1;
-      }
-   }
-   return 0;
-}
-
-/* Write one type letter per parameter of a JNI signature into `types`.
- * Returns the parameter count, or -1 if the signature is malformed. */
-static int
-jni_sig_params(const char *sig, char *types, int max)
-{
-   if (!sig || *sig != '(') return -1;
-   int n = 0;
-   for (const char *p = sig + 1; *p && *p != ')'; ) {
-      if (n >= max) return -1;
-      char t = *p;
-      if (t == 'L') {
-         const char *semi = strchr(p, ';');
-         if (!semi) return -1;
-         p = semi + 1;
-      } else if (t == '[') {
-         ++p;
-         continue; /* array of the following type — same slot */
-      } else {
-         ++p;
-      }
-      types[n++] = t;
-   }
-   return n;
-}
-
-/* Parameter types of a GameActivity native.  Returns the count, or -1 when the
- * method is unknown (then the caller falls back to the layout it knows).
- *
- * The signature handed to RegisterNatives comes from the engine binary that is
- * about to be called, so it is the only description of the frame the callee
- * actually reads; take it whenever the library registered the method.  The dex
- * is a fallback for implicitly-bound natives (no RegisterNatives entry) and it
- * cannot be trusted on its own: a title may still ship a stale
- * com.epicgames.ue4.GameActivity next to the UE5 com.epicgames.unreal one, and
- * its older declaration then shifts every argument by a slot — Blade & Soul
- * Masia declares nativeSetGlobalActivity(Z,L,L,Z,L) in the dex while libUnreal
- * registers (Z,Z,L,L,Z,L), so APKFilename fell off the end and the engine
- * mounted no expansion at all. */
-static int
-ue_native_params(const char *method, char *types, int max)
-{
-   static const char *const classes[] = { "com.epicgames.unreal.GameActivity",
-                                          "com.epicgames.ue4.GameActivity" };
-   char sig[512];
-   for (size_t i = 0; i < sizeof classes / sizeof classes[0]; ++i) {
-      sig[0] = '\0';
-      if ((arm64_exec_lookup_native_sig(classes[i], method, sig, (int)sizeof sig) ||
-           arm_exec_lookup_native_sig(classes[i], method, sig, (int)sizeof sig)) &&
-          sig[0] == '(') {
-         fprintf(stderr, "[loader] %s.%s%s (registered)\n", classes[i], method, sig);
-         return jni_sig_params(sig, types, max);
-      }
-   }
-   for (size_t i = 0; i < sizeof classes / sizeof classes[0]; ++i)
-      if (apk_method_signature(classes[i], method, sig, sizeof sig))
-         return jni_sig_params(sig, types, max);
-   return -1;
-}
-
-/* UE mounts its expansion file one of two ways, and bOBBinAPK is what selects
- * between them:
- *   1 — "package data inside APK": the OBB zip is stored (uncompressed, hence
- *       the .png suffix) as the APK entry assets/main.obb.png, and the engine
- *       opens APKFilename itself to mount it;
- *   0 — a standalone expansion file: the engine looks for
- *       <obbdir>/main.<version>.<package>.obb, or uses the absolute paths
- *       given to nativeSetObbFilePaths.
- * FAndroidPlatformFile::Initialize takes one branch and never falls back to
- * the other — it logs "OBB not found in APK" (or finds no .obb) and mounts no
- * content at all, and the game dies on the first missing .uproject.  So this
- * has to be an observation of the package we hand the guest, not an inference
- * from which env vars the launcher happened to set: a title whose expansion
- * lives in the APK still has ANDROID_OBB_MAIN pointing at the extracted copy,
- * and an XAPK's base APK does not contain the split's OBB. */
-static uint32_t
-ue_obb_in_apk(void)
-{
-   return arm_exec_apk_has_entry("assets/main.obb.png") ? 1u : 0u;
-}
-
-/* FAndroidPlatformFile roots the loose project tree at
- *   <externalFilesDir>/UE4Game/<Project>/     (UE4 and earlier)
- *   <externalFilesDir>/UnrealGame/<Project>/  (UE5 on)
- * The engine picks one; the emulator has to recognise whichever the staging
- * step produced, so keep both in one table. */
-static const char *const ue_files_roots[] = { "UE4Game", "UnrealGame", NULL };
-
-/* UE's ProjectName — the "TSProject" in <EngineDir>/TSProject/TSProject.uproject.
- * nativeSetObbInfo hands it to the engine, which then builds GFilePathBase-
- * relative content paths and the OBB names from it.  It is *not* derivable
- * from the package id: Blade & Soul ships com.netmarble.bnsmasia around a
- * project called TSProject, so the last package component sends every
- * subsequent lookup to UE4Game/bnsmasia/… while the expansion staged the tree
- * under UE4Game/TSProject/.
- *
- * UnrealBuildTool bakes the name into GameActivity.java as the ProjectName
- * field, but it is also right there in the package: assets/UE4CommandLine.txt
- * is the engine's own command line and starts with the .uproject path.  Read
- * the name from the same place the engine does, and only fall back to the
- * package id when a package ships no command line at all. */
-static const char *
-ue_project_name(const char *pkg)
-{
-   static char name[LUNA_GUEST_NAME_MAX + 1];
-   if (*name) return name;
-
-   const char *dir = getenv("ANDROID_PACKAGE_CODE_PATH");
-   char line[512];
-   line[0] = '\0';
-   if (dir && *dir) {
-      /* UE4 stages assets/UE4CommandLine.txt; UE5 renamed it to
-       * assets/UECommandLine.txt.  Look for both — otherwise a UE5 package
-       * falls through to the staged-tree scan (or the package id) and the
-       * engine is handed the wrong ProjectName. */
-      static const char *const cmdline_names[] = {
-         "UE4CommandLine.txt", "UECommandLine.txt", NULL
-      };
-      for (int i = 0; cmdline_names[i] && !line[0]; ++i) {
-         char path[PATH_MAX];
-         snprintf(path, sizeof path, "%s/assets/%s", dir, cmdline_names[i]);
-         FILE *f = fopen(path, "rb");
-         if (!f) continue;
-         if (!fgets(line, sizeof line, f)) line[0] = '\0';
-         fclose(f);
-      }
-   }
-   /* "../../../TSProject/TSProject.uproject Map_Start -faketouches …" — take
-    * the first whitespace-delimited token and keep the .uproject basename. */
-   char *sp = line;
-   while (*sp && !isspace((unsigned char)*sp)) ++sp;
-   *sp = '\0';
-   const char *ext = strstr(line, ".uproject");
-   if (ext) {
-      const char *base = line;
-      for (const char *c = line; c < ext; ++c)
-         if (*c == '/' || *c == '\\') base = c + 1;
-      size_t n = (size_t)(ext - base);
-      if (n > 0 && n < sizeof name) {
-         memcpy(name, base, n);
-         name[n] = '\0';
-         fprintf(stderr, "[loader] UE project name %s (from UE4CommandLine.txt)\n", name);
-         return name;
-      }
-   }
-
-   /* No command line in the package: the staged expansion tree names the
-    * project too (<EngineDir>/<P>/<P>/Content/Paks). */
-   const char *ext_files = getenv("ANDROID_EXTERNAL_FILES_DIR");
-   for (int r = 0; ext_files && *ext_files && ue_files_roots[r]; ++r) {
-      char ue[PATH_MAX];
-      snprintf(ue, sizeof ue, "%s/%s", ext_files, ue_files_roots[r]);
-      DIR *d = opendir(ue);
-      if (!d) continue;
-      struct dirent *de;
-      while ((de = readdir(d))) {
-         if (de->d_name[0] == '.') continue;
-         char paks[PATH_MAX + LUNA_GUEST_NAME_MAX + LUNA_GUEST_NAME_MAX + 32];
-         struct stat sb;
-         if (snprintf(paks, sizeof paks, "%s/%s/%s/Content/Paks",
-                      ue, de->d_name, de->d_name) >= (int)sizeof paks)
-            continue;
-         if (stat(paks, &sb) == 0 && S_ISDIR(sb.st_mode)) {
-            if (snprintf(name, sizeof name, "%s", de->d_name) >= (int)sizeof name)
-               name[sizeof name - 1] = '\0';
-            closedir(d);
-            fprintf(stderr, "[loader] UE project name %s (from staged %s)\n",
-                    name, ue_files_roots[r]);
-            return name;
-         }
-      }
-      closedir(d);
-   }
-
-   const char *last = pkg ? strrchr(pkg, '.') : NULL;
-   snprintf(name, sizeof name, "%s", last ? last + 1 : (pkg ? pkg : "Game"));
-   fprintf(stderr, "[loader] UE project name %s (guessed from package id)\n", name);
-   return name;
-}
-
-/* Fill `out` with (env, thiz, …) for one of the UE startup natives, matching
- * whatever parameter list this engine version declares.  Ordered value lists
- * are bound per type: the position of a parameter among the parameters of its
- * own type is stable even when a version adds or drops one. */
-static int
-ue_build_startup_args(const char *method, const char *types, int np,
-                      uint64_t env, uint64_t ctx,
-                      const uint64_t *strs, int nstr_avail,
-                      const uint64_t *ints, int nint_avail,
-                      uint64_t obb_in_apk,
-                      uint64_t *out, int max)
-{
-   int n = 0;
-   if (max < 2 + np) return -1;
-   out[n++] = env;
-   out[n++] = ctx;
-
-   int tb = 0, ts = 0;
-   for (int i = 0; i < np; ++i) {
-      if (types[i] == 'Z') ++tb;
-      else if (types[i] == 'L') ++ts;
-   }
-   int nb = 0, ns = 0, ni = 0;
-   for (int i = 0; i < np; ++i) {
-      switch (types[i]) {
-      case 'Z':
-         /* bOBBinAPK is the last boolean, and only exists in the versions
-          * that also take an APKFilename (the third string).  Everything
-          * else here — bUseExternalFilesDir, bPublicLogFiles — is true. */
-         if (!strcmp(method, "nativeSetGlobalActivity") && ts >= 3 && nb == tb - 1)
-            out[n++] = obb_in_apk;
-         else
-            out[n++] = 1u;
-         ++nb;
-         break;
-      case 'L':
-         out[n++] = ns < nstr_avail ? strs[ns] : 0u;
-         ++ns;
-         break;
-      default: /* I, J, F, D — integers in declaration order */
-         out[n++] = ni < nint_avail ? ints[ni] : 0u;
-         ++ni;
-         break;
-      }
-   }
-   return n;
-}
-
 static int
 run_jni_game(struct jvm *jvm)
 {
@@ -1254,8 +864,10 @@ run_jni_game(struct jvm *jvm)
    unity.native_forward_events_to_dalvik.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeForwardEventsToDalvik");
    unity.native_inject_event.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeInjectEvent");
 
-   if (!unity.native_init_jni.ptr)
-      errx(EXIT_FAILURE, "not a unity jni lib");
+   if (!unity.native_init_jni.ptr) {
+      warnx("not a unity jni lib");
+      return EXIT_FAILURE;
+   }
 
    const jobject context = jvm->native.AllocObject(&jvm->env, jvm->native.FindClass(&jvm->env, "android/app/Activity"));
 
@@ -1388,394 +1000,16 @@ pump_run_frame(void (*run_threads)(void))
    pump_java_frame();
 }
 
-static int
-run_ue4_game_arm(struct jvm *jvm)
-{
-   /* UE4 GameActivity is a NativeActivity: entry is ANativeActivity_onCreate,
-    * then the engine's android_main / looper thread drives the frame loop. */
-   uint32_t va_oncreate = arm_exec_lookup_export("ANativeActivity_onCreate");
-   if (!va_oncreate)
-      errx(EXIT_FAILURE, "UE4: ANativeActivity_onCreate not found");
-
-   if (!arm_exec_host_egl_init())
-      fprintf(stderr, "[loader] host EGL re-init failed\n");
-
-   jobject activity = jvm->native.AllocObject(&jvm->env,
-         jvm->native.FindClass(&jvm->env, "com/epicgames/ue4/GameActivity"));
-   if (!activity)
-      activity = jvm->native.AllocObject(&jvm->env,
-            jvm->native.FindClass(&jvm->env, "android/app/NativeActivity"));
-   uint32_t act_va = arm_exec_native_activity_create(
-         (uint32_t)(uintptr_t)activity);
-   if (!act_va)
-      errx(EXIT_FAILURE, "UE4: failed to allocate ANativeActivity");
-
-   /* JNI hooks GameActivity.java calls before/during native startup.  These
-    * are declared `native` in Java and exported from libUE4.so under the JNI
-    * implicit-binding name (Java_com_epicgames_ue4_GameActivity_nativeXxx) —
-    * they never go through RegisterNatives, so arm_exec_lookup_native must
-    * fall back to the mangled export (it does).  Signatures come straight
-    * from classes2.dex:
-    *   nativeSetGlobalActivity (ZZLjava/lang/String;Ljava/lang/String;ZLjava/lang/String;)V
-    *   nativeSetAndroidVersionInformation (Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V
-    *   nativeSetObbInfo (Ljava/lang/String;Ljava/lang/String;IILjava/lang/String;)V
-    *   nativeSetWindowInfo (ZI)V          <- (bIsPortrait, DepthBufferPreference)
-    *   nativeSetSurfaceViewInfo (II)V     <- (width, height)
-    *   nativeSetAndroidStartupState (Z)V
-    *   nativeResumeMainInit ()V
-    * AndroidMain() spins on `while (!GResumeMainInit) Sleep(0.01f)` right after
-    * "Controller interface supported"; without nativeResumeMainInit the engine
-    * never initialises and every frame presents an empty surface. */
-   uint32_t va_config_rules = arm_exec_lookup_native(
-         "com.epicgames.ue4.GameActivity", "nativeSetConfigRulesVariables");
-   uint32_t va_set_global = arm_exec_lookup_native(
-         "com.epicgames.ue4.GameActivity", "nativeSetGlobalActivity");
-   uint32_t va_set_ver = arm_exec_lookup_native(
-         "com.epicgames.ue4.GameActivity", "nativeSetAndroidVersionInformation");
-   uint32_t va_set_obb = arm_exec_lookup_native(
-         "com.epicgames.ue4.GameActivity", "nativeSetObbInfo");
-   uint32_t va_set_obb_paths = arm_exec_lookup_native(
-         "com.epicgames.ue4.GameActivity", "nativeSetObbFilePaths");
-   uint32_t va_set_win = arm_exec_lookup_native(
-         "com.epicgames.ue4.GameActivity", "nativeSetWindowInfo");
-   uint32_t va_set_surf = arm_exec_lookup_native(
-         "com.epicgames.ue4.GameActivity", "nativeSetSurfaceViewInfo");
-   uint32_t va_startup_state = arm_exec_lookup_native(
-         "com.epicgames.ue4.GameActivity", "nativeSetAndroidStartupState");
-   uint32_t va_resume_init = arm_exec_lookup_native(
-         "com.epicgames.ue4.GameActivity", "nativeResumeMainInit");
-   uint32_t env = arm_exec_env_va();
-   uint32_t ctx = (uint32_t)(uintptr_t)activity;
-
-   const char *apk = getenv("ANDROID_APK_FILE");
-   const char *pkg = getenv("ANDROID_PACKAGE_NAME");
-   const char *ext = getenv("ANDROID_EXTERNAL_FILES_DIR");
-   const char *obb_main = getenv("ANDROID_OBB_MAIN");
-   const char *obb_patch = getenv("ANDROID_OBB_PATCH");
-   if (!apk) apk = "";
-   if (!pkg) pkg = "com.lunaria.app";
-   if (!ext) ext = "/tmp";
-   if (!obb_main) obb_main = "";
-   if (!obb_patch) obb_patch = "";
-   uint32_t obb_in_apk = ue_obb_in_apk();
-   if (obb_in_apk)
-      fprintf(stderr, "[loader] expansion is in the APK (assets/main.obb.png)\n");
-
-   if (va_config_rules) {
-      /* (env, thiz, String[] KeyValuePairs) — see the arm64 path: FAndroidMisc
-       * parks every thread that needs a config-rules variable until this
-       * arrives, so omitting it deadlocks UE before PreInit. */
-      jclass str_cls = jvm->native.FindClass(&jvm->env, "java/lang/String");
-      jobjectArray kv = jvm->native.NewObjectArray(&jvm->env, 0, str_cls, NULL);
-      uint32_t a[3] = { env, ctx, (uint32_t)(uintptr_t)kv };
-      fprintf(stderr, "[loader] UE4 nativeSetConfigRulesVariables (0 pairs)\n");
-      arm_exec_calln(va_config_rules, a, 3);
-   }
-   if (va_set_global) {
-      /* (env, thiz, bUseExternalFilesDir, bPublicLogFiles,
-       *  internalFilePath, externalFilePath, bOBBinAPK, APKFilename) */
-      jobject s_int = jvm->native.NewStringUTF(&jvm->env, ext);
-      jobject s_ext = jvm->native.NewStringUTF(&jvm->env, ext);
-      jobject s_apk = jvm->native.NewStringUTF(&jvm->env, apk);
-      uint32_t a[8] = { env, ctx, 1u, 1u,
-                        (uint32_t)(uintptr_t)s_int, (uint32_t)(uintptr_t)s_ext,
-                        obb_in_apk, (uint32_t)(uintptr_t)s_apk };
-      fprintf(stderr, "[loader] UE4 nativeSetGlobalActivity apk=%s files=%s obbInAPK=%u\n",
-              apk, ext, obb_in_apk);
-      arm_exec_calln(va_set_global, a, 8);
-   }
-   if (va_set_obb_paths && *obb_main && !obb_in_apk) {
-      /* (env, thiz, OBBMainFilePath, OBBPatchFilePath,
-       *  OBBOverflow1FilePath, OBBOverflow2FilePath) — absolute paths, which
-       * take priority over the /sdcard/Android/obb/<pkg> search.  Skipped
-       * when the expansion is in the APK: the engine mounts that itself and
-       * these paths would send it looking for a file that is not there. */
-      jobject s_main  = jvm->native.NewStringUTF(&jvm->env, obb_main);
-      jobject s_patch = jvm->native.NewStringUTF(&jvm->env, obb_patch);
-      jobject s_none  = jvm->native.NewStringUTF(&jvm->env, "");
-      uint32_t a[6] = { env, ctx, (uint32_t)(uintptr_t)s_main,
-                        (uint32_t)(uintptr_t)s_patch,
-                        (uint32_t)(uintptr_t)s_none,
-                        (uint32_t)(uintptr_t)s_none };
-      fprintf(stderr, "[loader] UE4 nativeSetObbFilePaths main=%s\n", obb_main);
-      arm_exec_calln(va_set_obb_paths, a, 6);
-   }
-   if (va_set_ver) {
-      /* (env, thiz, AndroidVersion, TargetSDKversion, PhoneMake, PhoneModel,
-       *  PhoneBuildNumber, OSLanguage) */
-      /* UE asks for the same facts android.os.Build reports, so they come
-       * from the same table.  Hardcoding a second set here was the defect the
-       * property table's own comment warns about: the engine told the game
-       * "Lunaria Emulator / Android 12" while Build told it whatever the
-       * device profile said, and a guest that asks both ways has to get one
-       * answer. */
-      jobject s_rel   = jvm->native.NewStringUTF(&jvm->env,
-                           lunaria_android_release());
-      jobject s_make  = jvm->native.NewStringUTF(&jvm->env,
-                           lunaria_android_property("ro.product.manufacturer"));
-      jobject s_model = jvm->native.NewStringUTF(&jvm->env,
-                           lunaria_android_property("ro.product.model"));
-      jobject s_build = jvm->native.NewStringUTF(&jvm->env,
-                           lunaria_android_property("ro.build.display.id"));
-      jobject s_lang  = jvm->native.NewStringUTF(&jvm->env, "en");
-      uint32_t a[8] = { env, ctx, (uint32_t)(uintptr_t)s_rel,
-                        (uint32_t)lunaria_sdk_int(),
-                        (uint32_t)(uintptr_t)s_make, (uint32_t)(uintptr_t)s_model,
-                        (uint32_t)(uintptr_t)s_build, (uint32_t)(uintptr_t)s_lang };
-      fprintf(stderr, "[loader] UE4 nativeSetAndroidVersionInformation\n");
-      arm_exec_calln(va_set_ver, a, 8);
-   }
-   if (va_set_obb) {
-      /* (env, thiz, ProjectName, PackageName, Version, PatchVersion, AppType) */
-      const char *proj = ue_project_name(pkg);
-      jobject s_proj = jvm->native.NewStringUTF(&jvm->env, proj);
-      jobject s_pkg  = jvm->native.NewStringUTF(&jvm->env, pkg);
-      jobject s_type = jvm->native.NewStringUTF(&jvm->env, "");
-      uint32_t a[7] = { env, ctx, (uint32_t)(uintptr_t)s_proj,
-                        (uint32_t)(uintptr_t)s_pkg, 1u, 0u,
-                        (uint32_t)(uintptr_t)s_type };
-      fprintf(stderr, "[loader] UE4 nativeSetObbInfo project=%s package=%s\n", proj, pkg);
-      arm_exec_calln(va_set_obb, a, 7);
-   }
-
-   fprintf(stderr, "[loader] UE4 ANativeActivity_onCreate @0x%08x act=0x%08x\n",
-           va_oncreate, act_va);
-   arm_exec_call_unlimited(va_oncreate, act_va, 0, 0, 0);
-   arm_exec_run_pending_threads();
-   fprintf(stderr, "[loader] UE4 onCreate returned\n");
-
-   /* Do NOT call activity->callbacks->onStart/onResume/onNativeWindowCreated
-    * synchronously: the NDK glue's onNativeWindowCreated waits on a cond until
-    * android_main processes APP_CMD_INIT_WINDOW, which deadlocks if we hold the
-    * main JIT.  Instead write APP_CMD_* into the android_app command pipe and
-    * let the event thread drain them while we pump. */
-   {
-      uint32_t instance = arm_exec_read32(act_va + 28); /* ANativeActivity.instance */
-      uint32_t win = arm_exec_native_window_va();
-      fprintf(stderr, "[loader] UE4 android_app instance=0x%08x win=0x%08x\n",
-              instance, win);
-      if (instance) {
-         /* Scan android_app for the command pipe's fd pair.  Observed NDK
-          * layout (32-bit bionic): msgread @+0x48.  Validate candidates
-          * against the guest-pipe registry: filesystem identity cannot do
-          * this portably because Darwin gives the two pipe ends different
-          * inode numbers. */
-         int msgwrite = -1;
-         uint32_t pipe_off = 0;
-         for (uint32_t off = 64; off < 256; off += 4) {
-            int a = (int)arm_exec_read32(instance + off);
-            int b = (int)arm_exec_read32(instance + off + 4);
-            struct stat sa, sb;
-            if (a < 0 || b < 0 || a >= 1024 || b >= 1024 || a == b)
-               continue;
-            if (fstat(a, &sa) != 0 || fstat(b, &sb) != 0)
-               continue;
-            if (!S_ISFIFO(sa.st_mode) || !S_ISFIFO(sb.st_mode))
-               continue;
-            if (!arm_exec_guest_pipe_pair(a, b))
-               continue;
-            msgwrite = b;
-            pipe_off = off;
-            fprintf(stderr, "[loader] UE4 cmd pipe @+0x%x read=%d write=%d\n",
-                    off, a, b);
-            break;
-         }
-         if (msgwrite < 0)
-            fprintf(stderr, "[loader] UE4 android_app has no command pipe — "
-                    "APP_CMD_INIT_WINDOW cannot be delivered\n");
-         if (win) {
-            /* Public window @36; pendingWindow sits after mutex/cond/pipe/
-             * thread/poll_sources/flags — typically msgread+0x38 (=0x80 when
-             * msgread is 0x48).  process_cmd copies pendingWindow -> window. */
-            arm_exec_write32(instance + 36, win);
-            uint32_t pend = pipe_off ? pipe_off + 0x38u : 0x80u;
-            arm_exec_write32(instance + pend, win);
-            fprintf(stderr, "[loader] UE4 set window@36 pendingWindow@+0x%x = 0x%08x\n",
-                    pend, win);
-         }
-         /* The input queue reaches the glue the same way the window does:
-          * pendingInputQueue (msgread+0x34 on ILP32) plus APP_CMD_INPUT_CHANGED,
-          * which makes the glue attach it to its looper.  Without it the engine
-          * has no touchscreen at all — AInputQueue_getEvent is the only path a
-          * NativeActivity has for touches. */
-         uint32_t inq = arm_exec_input_queue_handle();
-         if (inq && pipe_off) {
-            arm_exec_write32(instance + pipe_off + 0x34u, inq);
-            fprintf(stderr, "[loader] UE4 pendingInputQueue@+0x%x = 0x%08x\n",
-                    pipe_off + 0x34u, inq);
-         }
-         if (msgwrite >= 0) {
-            /* APP_CMD_INPUT_CHANGED=0, START=10, RESUME=11, INIT_WINDOW=1,
-             * GAINED_FOCUS=6 */
-            static const int8_t cmds[] = { 0, 10, 11, 1, 6 };
-            for (size_t i = 0; i < sizeof cmds; ++i) {
-               int8_t c = cmds[i];
-               if (write(msgwrite, &c, 1) != 1)
-                  fprintf(stderr, "[loader] UE4 write APP_CMD %d failed\n", c);
-               else
-                  fprintf(stderr, "[loader] UE4 wrote APP_CMD %d\n", c);
-               arm_exec_run_pending_threads();
-            }
-         }
-      }
-   }
-
-   int w = arm_exec_fb_width(), h = arm_exec_fb_height();
-   if (va_set_win) {
-      /* (env, thiz, jboolean bIsPortrait, jint DepthBufferPreference).
-       * NOT (width, height): passing the width here made every landscape
-       * window report "portrait" and fed the height in as a depth-buffer
-       * preference enum. */
-      uint32_t portrait = (h > w) ? 1u : 0u;
-      fprintf(stderr, "[loader] UE4 nativeSetWindowInfo portrait=%u depth=0\n", portrait);
-      arm_exec_call(va_set_win, env, ctx, portrait, 0);
-   }
-   if (va_set_surf) {
-      fprintf(stderr, "[loader] UE4 nativeSetSurfaceViewInfo %dx%d\n", w, h);
-      arm_exec_call(va_set_surf, env, ctx, (uint32_t)w, (uint32_t)h);
-   }
-   if (va_startup_state) {
-      /* (env, thiz, jboolean bDebuggerAttached) */
-      fprintf(stderr, "[loader] UE4 nativeSetAndroidStartupState\n");
-      arm_exec_call(va_startup_state, env, ctx, 0, 0);
-   }
-   if (va_resume_init) {
-      /* Releases AndroidMain()'s `while (!GResumeMainInit)` spin so
-       * FEngineLoop::PreInit + the game thread finally start. */
-      fprintf(stderr, "[loader] UE4 nativeResumeMainInit\n");
-      arm_exec_call(va_resume_init, env, ctx, 0, 0);
-      arm_exec_run_pending_threads();
-   }
-
-#ifndef _WIN32
-   signal(SIGUSR1, svc_dump_handler);
-#endif
-   schedule_unsafe_alarm_dump();
-
-   int max_frames = 0;
-   {
-      const char *mf = getenv("LUNARIA_MAX_FRAMES");
-      if (mf && *mf) max_frames = atoi(mf);
-   }
-   /* No default cap.  300 frames was a bring-up aid — about five seconds,
-    * which UE spends mounting content and starting the task graph, so the
-    * engine looked permanently stuck before its first frame.  The loop still
-    * exits on guest abort and on the window close button, and
-    * LUNARIA_MAX_FRAMES caps it for scripted runs. */
-
-   fprintf(stderr, "[loader] UE4 entering pump loop (max_frames=%d)\n", max_frames);
-   for (int frame = 0; max_frames <= 0 || frame < max_frames; ++frame) {
-      if (arm_exec_guest_exit_count() > 0 || arm_exec_guest_abort_count() > 0) {
-         fprintf(stderr, "[loader] guest process terminated — stopping UE4 loop (frame %d)\n", frame);
-         break;
-      }
-      pump_run_frame(arm_exec_run_pending_threads);
-      arm_exec_egl_swap();
-      arm_exec_glfw_poll();
-      perf_tick();
-      if (frame < 5 || frame % 50 == 0)
-         fprintf(stderr, "[loader] UE4 pump frame %d\n", frame);
-      if (arm_exec_glfw_should_close()) break;
-   }
-   return EXIT_SUCCESS;
-}
-
-/* -------------------------------------------------------------------------
- * ARM64 UE NativeActivity pump
- * ---------------------------------------------------------------------- */
-/* UE ships the same GameActivity under two packages: com.epicgames.ue4 for
- * UE4 and com.epicgames.unreal for UE5.  Look a native method up in both. */
-/* --- dex-driven startup -------------------------------------------------
+/* --- dex startup --------------------------------------------------------
  *
- * The per-engine startup sequences below exist because there was no bytecode
- * VM: the loader called, by hand, the `native` methods that the app's own
- * Activity.onCreate() would have called — in the order we believed they came
- * in, with arguments reconstructed from the environment.  That is a
- * transcription of one engine's Java, and it only covers the calls we knew to
- * transcribe.
- *
- * With a dex interpreter the app can make those calls itself, which is both
- * shorter and engine-agnostic: whatever Activity the APK ships runs its real
- * onCreate.  This is the default; LUNARIA_DEX_START=0 selects the legacy
- * hand-written sequence for comparison.  Everything Android itself would
- * do — creating the ANativeActivity, the window, the APP_CMD_* deliveries —
- * stays with the loader either way; that is the platform's job, not the app's.
- */
-static int
-dex_start_requested(void)
-{
-   const char *e = getenv("LUNARIA_DEX_START");
-   return !e || !*e || strcmp(e, "0") != 0;
-}
-
-/* First of `cands` that the APK's dex actually defines, or NULL. */
-static const char *
-dex_first_defined_class(const char *const *cands)
-{
-   for (int i = 0; cands[i]; ++i)
-      if (dvm_jni_class_in_dex(cands[i]))
-         return cands[i];
-   return NULL;
-}
-
-/* Epic renamed the package at UE5 (com.epicgames.ue4 -> com.epicgames.unreal). */
-static const char *
-ue_activity_dex_class(void)
-{
-   static const char *const cands[] = {
-      "com/epicgames/unreal/GameActivity",
-      "com/epicgames/ue4/GameActivity",
-      NULL
-   };
-   return dex_first_defined_class(cands);
-}
-
+ * An Android process starts at the manifest's Application and launcher
+ * Activity and runs their real bytecode; whatever the app needs from the
+ * platform (an engine's NativeActivity glue, its window, its lifecycle) is the
+ * framework's job and is provided behind the framework classes, not here. */
 static int dex_call_lifecycle(struct jvm *jvm, jobject self, const char *cls,
                               const char *method, const char *sig,
                               int takes_null_arg);
 static int start_manifest_providers(struct jvm *jvm, jobject context);
-
-static jobject
-ue_start_dex_application(struct jvm *jvm)
-{
-   static const char *const cands[] = {
-      "com/epicgames/unreal/GameApplication",
-      "com/epicgames/ue4/GameApplication",
-      NULL
-   };
-   const char *cls = dex_first_defined_class(cands);
-   if (!cls) return NULL;
-
-   jclass k = jvm->native.FindClass(&jvm->env, cls);
-   jmethodID ctor = k ? jvm->native.GetMethodID(&jvm->env, k, "<init>", "()V")
-                      : NULL;
-   jobject app = (k && ctor)
-      ? jvm->native.NewObjectA(&jvm->env, k, ctor, NULL) : NULL;
-   if (!app) {
-      fprintf(stderr, "[loader] dex startup: cannot construct %s\n", cls);
-      return NULL;
-   }
-
-   /* ActivityThread attaches an application Context before onCreate.  The
-    * framework Context is intentionally plain; the Application wrapper keeps
-    * it as its base and obtains package services through it. */
-   jclass ck = jvm->native.FindClass(&jvm->env, "android/content/Context");
-   jobject context = ck ? jvm->native.AllocObject(&jvm->env, ck) : NULL;
-   jmethodID attach = jvm->native.GetMethodID(
-      &jvm->env, k, "attachBaseContext", "(Landroid/content/Context;)V");
-   if (attach && context) {
-      jvalue a = { .l = context };
-      fprintf(stderr, "[loader] dex startup: %s.attachBaseContext(Context)\n",
-              cls);
-      jvm->native.CallVoidMethodA(&jvm->env, app, attach, &a);
-   }
-   /* ActivityThread installs ContentProviders after attachBaseContext and
-    * before Application.onCreate.  FirebaseInitProvider.initializeApp lives
-    * here — skipping it left FirebaseApp.getInstance() throwing later. */
-   start_manifest_providers(jvm, app);
-   (void)dex_call_lifecycle(jvm, app, cls, "onCreate", "()V", 0);
-   return app;
-}
 
 /* Calls one no-argument (or single-null-argument) lifecycle method through the
  * ordinary JNI entry points, which route into the bytecode VM whenever the dex
@@ -1798,446 +1032,6 @@ dex_call_lifecycle(struct jvm *jvm, jobject self, const char *cls,
    return 1;
 }
 
-static uint64_t
-ue4_native64(const char *method)
-{
-   uint64_t va = arm64_exec_lookup_native("com.epicgames.ue4.GameActivity", method);
-   if (!va)
-      va = arm64_exec_lookup_native("com.epicgames.unreal.GameActivity", method);
-   return va;
-}
-
-static int
-run_ue4_game_arm64(struct jvm *jvm)
-{
-   uint64_t va_oncreate = arm64_exec_lookup_export("ANativeActivity_onCreate");
-   if (!va_oncreate)
-      errx(EXIT_FAILURE, "UE arm64: ANativeActivity_onCreate not found");
-
-   /* android_native_app_glue runs AndroidMain — and therefore FEngineLoop and
-    * the whole game — on a guest pthread, so the scheduler's slices are the
-    * engine's entire CPU budget rather than background maintenance. */
-   arm64_exec_threads_run_engine(1);
-
-   if (!arm64_exec_host_egl_init())
-      fprintf(stderr, "[loader] arm64 host EGL init failed\n");
-
-   const char *dex_cls = dex_start_requested() ? ue_activity_dex_class() : NULL;
-   jobject activity = NULL;
-   jobject application = NULL;
-   if (dex_cls) {
-      /* Android creates and starts the manifest Application before it
-       * instantiates the first Activity. */
-      application = ue_start_dex_application(jvm);
-      /* ActivityThread instantiates an Activity by running its no-argument
-       * constructor before delivering onCreate.  AllocObject alone skips all
-       * instance field initialisers and produces an object Android can never
-       * produce; in UE that leaves ProcessSystemInfoLock null. */
-      jclass activity_class = jvm->native.FindClass(&jvm->env, dex_cls);
-      jmethodID ctor = activity_class
-         ? jvm->native.GetMethodID(&jvm->env, activity_class, "<init>", "()V")
-         : NULL;
-      if (activity_class && ctor)
-         activity = jvm->native.NewObjectA(&jvm->env, activity_class, ctor, NULL);
-      if (!activity)
-         errx(EXIT_FAILURE, "dex startup: cannot construct %s", dex_cls);
-      if (application) {
-         jclass ac = jvm->native.FindClass(&jvm->env, "android/app/Activity");
-         jfieldID af = ac ? jvm->native.GetFieldID(
-            &jvm->env, ac, "application", "Landroid/app/Application;") : NULL;
-         if (af)
-            jvm->native.SetObjectField(&jvm->env, activity, af, application);
-      }
-   }
-   if (!activity)
-      activity = jvm->native.AllocObject(&jvm->env,
-            jvm->native.FindClass(&jvm->env, "com/epicgames/ue4/GameActivity"));
-   if (!activity)
-      activity = jvm->native.AllocObject(&jvm->env,
-            jvm->native.FindClass(&jvm->env, "com/epicgames/unreal/GameActivity"));
-   if (!activity)
-      activity = jvm->native.AllocObject(&jvm->env,
-            jvm->native.FindClass(&jvm->env, "android/app/NativeActivity"));
-   jni_set_current_activity(&jvm->env, activity);
-   uint64_t act_va = arm64_exec_native_activity_create((uint64_t)(uintptr_t)activity);
-   if (!act_va)
-      errx(EXIT_FAILURE, "UE arm64: failed to allocate ANativeActivity");
-
-   /* GameActivity.java calls these `native` methods before and around native
-    * startup.  They are exported under the JNI implicit-binding name rather
-    * than registered through RegisterNatives, which arm64_exec_lookup_native
-    * already falls back to.  Their parameters, whose *presence* varies by
-    * engine version (the actual list comes from the APK's dex — see
-    * ue_native_params):
-    *   nativeSetGlobalActivity   bUseExternalFilesDir, [bPublicLogFiles],
-    *                             internalFilePath, externalFilePath,
-    *                             bOBBinAPK, APKFilename
-    *   nativeSetAndroidVersionInformation
-    *                             AndroidVersion, [TargetSDKversion],
-    *                             PhoneMake, PhoneModel, [PhoneBuildNumber],
-    *                             OSLanguage
-    *   nativeSetObbInfo          ProjectName, PackageName, Version,
-    *                             PatchVersion, AppType
-    *   nativeSetObbFilePaths     main, patch, overflow1, overflow2
-    *   nativeSetWindowInfo       bIsPortrait, DepthBufferPreference
-    *   nativeSetSurfaceViewInfo  width, height
-    *   nativeSetAndroidStartupState  bDebuggerAttached
-    *   nativeResumeMainInit      ()
-    * AndroidMain() spins on `while (!GResumeMainInit) Sleep(0.01f)` right
-    * after "Controller interface supported"; without nativeResumeMainInit
-    * FEngineLoop::PreInit never runs and every frame presents an empty
-    * surface.  The A32 path has always done this — the A64 path went straight
-    * from onCreate to the pump loop, so the engine never initialised. */
-   uint64_t va_config_rules   = ue4_native64("nativeSetConfigRulesVariables");
-   uint64_t va_set_global     = ue4_native64("nativeSetGlobalActivity");
-   uint64_t va_set_ver        = ue4_native64("nativeSetAndroidVersionInformation");
-   uint64_t va_set_obb        = ue4_native64("nativeSetObbInfo");
-   uint64_t va_set_obb_paths  = ue4_native64("nativeSetObbFilePaths");
-   uint64_t va_set_win        = ue4_native64("nativeSetWindowInfo");
-   uint64_t va_set_surf       = ue4_native64("nativeSetSurfaceViewInfo");
-   uint64_t va_startup_state  = ue4_native64("nativeSetAndroidStartupState");
-   uint64_t va_resume_init    = ue4_native64("nativeResumeMainInit");
-   uint64_t env = arm64_exec_env_va();
-   uint64_t ctx = (uint64_t)(uintptr_t)activity;
-
-   const char *apk = getenv("ANDROID_APK_FILE");
-   const char *pkg = getenv("ANDROID_PACKAGE_NAME");
-   const char *ext = getenv("ANDROID_EXTERNAL_FILES_DIR");
-   const char *obb_main = getenv("ANDROID_OBB_MAIN");
-   const char *obb_patch = getenv("ANDROID_OBB_PATCH");
-   if (!apk) apk = "";
-   if (!pkg) pkg = "com.lunaria.app";
-   if (!ext) ext = "/tmp";
-   if (!obb_main) obb_main = "";
-   if (!obb_patch) obb_patch = "";
-   /* LUNARIA_DEX_START: let GameActivity.onCreate() issue these calls itself,
-    * from the APK's own bytecode, instead of the transcription below.  The
-    * transcription only runs for the entry points onCreate did not reach. */
-   if (dex_start_requested()) {
-      if (!dex_cls) {
-         fprintf(stderr, "[loader] dex startup: no GameActivity in the dex — "
-                         "using the built-in startup sequence\n");
-      } else if (dex_call_lifecycle(jvm, activity, dex_cls, "onCreate",
-                                    "(Landroid/os/Bundle;)V", 1)) {
-         va_config_rules = va_set_global = va_set_ver = 0;
-         va_set_obb = va_set_obb_paths = 0;
-         arm64_exec_run_pending_threads();
-      }
-   }
-
-   uint64_t obb_in_apk = ue_obb_in_apk();
-   if (obb_in_apk)
-      fprintf(stderr, "[loader] expansion is in the APK (assets/main.obb.png)\n");
-
-   if (va_config_rules) {
-      /* (env, thiz, String[] KeyValuePairs) — GameActivity evaluates
-       * configrules.txt in onCreate and hands the result to the engine.
-       * FAndroidMisc blocks every thread that needs a config-rules variable
-       * until this lands ("thread waiting for configrules to be set"), so
-       * skipping it deadlocks UE before PreInit.  A device whose APK has no
-       * matching rules passes an empty array; do the same. */
-      jclass str_cls = jvm->native.FindClass(&jvm->env, "java/lang/String");
-      jobjectArray kv = jvm->native.NewObjectArray(&jvm->env, 0, str_cls, NULL);
-      uint64_t a[3] = { env, ctx, (uint64_t)(uintptr_t)kv };
-      fprintf(stderr, "[loader] UE arm64 nativeSetConfigRulesVariables (0 pairs)\n");
-      arm64_exec_call8(va_config_rules, a, 3);
-   }
-   if (va_set_global) {
-      /* (env, thiz, [bUseExternalFilesDir], [bPublicLogFiles],
-       *  internalFilePath, externalFilePath, [bOBBinAPK], [APKFilename]). */
-      uint64_t strs[3] = {
-         (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env, ext),
-         (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env, ext),
-         (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env, apk),
-      };
-      char types[16] = "ZZLLZL"; /* UE4.21+ default when there is no dex */
-      int np = ue_native_params("nativeSetGlobalActivity", types, (int)sizeof types);
-      if (np < 0) np = 6;
-      uint64_t a[16];
-      int na = ue_build_startup_args("nativeSetGlobalActivity", types, np,
-                                     env, ctx, strs, 3, NULL, 0, obb_in_apk,
-                                     a, (int)(sizeof a / sizeof a[0]));
-      fprintf(stderr, "[loader] UE arm64 nativeSetGlobalActivity apk=%s files=%s obbInAPK=%llu (%d args)\n",
-              apk, ext, (unsigned long long)obb_in_apk, na);
-      if (na > 0) arm64_exec_call8(va_set_global, a, na);
-   }
-   if (va_set_obb_paths && *obb_main && !obb_in_apk) {
-      /* (env, thiz, OBBMainFilePath, OBBPatchFilePath,
-       *  OBBOverflow1FilePath, OBBOverflow2FilePath) — absolute paths, which
-       * take priority over the /sdcard/Android/obb/<pkg> search.  Skipped
-       * when the expansion is in the APK: the engine mounts that itself and
-       * these paths would send it looking for a file that is not there. */
-      jobject s_main  = jvm->native.NewStringUTF(&jvm->env, obb_main);
-      jobject s_patch = jvm->native.NewStringUTF(&jvm->env, obb_patch);
-      jobject s_none  = jvm->native.NewStringUTF(&jvm->env, "");
-      uint64_t a[6] = { env, ctx, (uint64_t)(uintptr_t)s_main,
-                        (uint64_t)(uintptr_t)s_patch,
-                        (uint64_t)(uintptr_t)s_none,
-                        (uint64_t)(uintptr_t)s_none };
-      fprintf(stderr, "[loader] UE arm64 nativeSetObbFilePaths main=%s\n", obb_main);
-      arm64_exec_call8(va_set_obb_paths, a, 6);
-   }
-   if (va_set_ver) {
-      /* (env, thiz, AndroidVersion, [TargetSDKversion], PhoneMake, PhoneModel,
-       *  [PhoneBuildNumber], OSLanguage) — the SDK int and the build-number
-       * string only exist from UE4.25 on. */
-      char types[16] = "LILLLL"; /* UE4.25+ default when there is no dex */
-      int np = ue_native_params("nativeSetAndroidVersionInformation",
-                                types, (int)sizeof types);
-      if (np < 0) np = 6;
-      int nstr = 0;
-      for (int i = 0; i < np; ++i) if (types[i] == 'L') ++nstr;
-      uint64_t strs[5];
-      int k = 0;
-      strs[k++] = (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env,
-                     lunaria_android_release());
-      strs[k++] = (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env,
-                     lunaria_android_property("ro.product.manufacturer"));
-      strs[k++] = (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env,
-                     lunaria_android_property("ro.product.model"));
-      if (nstr >= 5) /* PhoneBuildNumber only in the longer form */
-         strs[k++] = (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env,
-                        lunaria_android_property("ro.build.display.id"));
-      strs[k++] = (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env, "en");
-      uint64_t ints[1] = { (uint64_t)lunaria_sdk_int() }; /* matches Build.VERSION */
-      uint64_t a[16];
-      int na = ue_build_startup_args("nativeSetAndroidVersionInformation", types, np,
-                                     env, ctx, strs, k, ints, 1, 0, a,
-                                     (int)(sizeof a / sizeof a[0]));
-      fprintf(stderr, "[loader] UE arm64 nativeSetAndroidVersionInformation (%d args)\n", na);
-      if (na > 0) arm64_exec_call8(va_set_ver, a, na);
-   }
-   if (va_set_obb) {
-      /* (env, thiz, ProjectName, PackageName, Version, PatchVersion, AppType) */
-      const char *proj = ue_project_name(pkg);
-      uint64_t strs[3] = {
-         (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env, proj),
-         (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env, pkg),
-         (uint64_t)(uintptr_t)jvm->native.NewStringUTF(&jvm->env, ""),
-      };
-      uint64_t ints[2] = { 1u, 0u }; /* Version, PatchVersion */
-      char types[16] = "LLIIL";
-      int np = ue_native_params("nativeSetObbInfo", types, (int)sizeof types);
-      if (np < 0) np = 5;
-      uint64_t a[16];
-      int na = ue_build_startup_args("nativeSetObbInfo", types, np,
-                                     env, ctx, strs, 3, ints, 2, 0, a,
-                                     (int)(sizeof a / sizeof a[0]));
-      fprintf(stderr, "[loader] UE arm64 nativeSetObbInfo project=%s package=%s (%d args)\n",
-              proj, pkg, na);
-      if (na > 0) arm64_exec_call8(va_set_obb, a, na);
-   }
-
-   fprintf(stderr, "[loader] UE arm64 ANativeActivity_onCreate @0x%llx act=0x%llx\n",
-           (unsigned long long)va_oncreate, (unsigned long long)act_va);
-   arm64_exec_call_unlimited(va_oncreate, act_va, 0, 0, 0);
-   arm64_exec_run_pending_threads();
-   fprintf(stderr, "[loader] UE arm64 onCreate returned\n");
-
-   /* Deliver APP_CMD_* via the android_app command pipe.  Calling
-    * activity->callbacks->onNativeWindowCreated directly would block on the
-    * glue's condition variable until android_main drains the command, which
-    * cannot happen while we hold the JIT. */
-   {
-      uint64_t instance_va = arm64_exec_read64(act_va + 56); /* ANativeActivity.instance */
-      uint64_t win_va      = arm64_exec_native_window_va();
-      fprintf(stderr, "[loader] UE arm64 android_app instance=0x%llx win=0x%llx\n",
-              (unsigned long long)instance_va, (unsigned long long)win_va);
-      if (instance_va) {
-         int msgwrite = -1;
-         uint32_t pipe_off = 0;
-         /* Scan android_app for the command pipe's fd pair.  On LP64 bionic
-          * (pthread_mutex_t 40 B, pthread_cond_t 48 B) msgread lands at
-          * +0xC0; the scan keeps this working if the glue struct shifts.
-          *
-          * Validate candidates against the guest-pipe registry.  fstat inode
-          * identity is not portable (Darwin assigns a different inode to
-          * each end), while accepting any two FIFOs can select unrelated
-          * pipes.  The registry records the pair at pipe()/pipe2() time and
-          * forgets it when either descriptor closes. */
-         for (uint32_t off = 64; off < 512; off += 4) {
-            int a = (int)arm64_exec_read32(instance_va + off);
-            int b = (int)arm64_exec_read32(instance_va + off + 4);
-            struct stat sa, sb;
-            if (a < 0 || b < 0 || a >= 1024 || b >= 1024 || a == b)
-               continue;
-            if (fstat(a, &sa) != 0 || fstat(b, &sb) != 0)
-               continue;
-            if (!S_ISFIFO(sa.st_mode) || !S_ISFIFO(sb.st_mode))
-               continue;
-            if (!arm_exec_guest_pipe_pair(a, b))
-               continue;
-            msgwrite = b; pipe_off = off;
-            fprintf(stderr, "[loader] UE arm64 cmd pipe @+0x%x read=%d write=%d\n",
-                    off, a, b);
-            break;
-         }
-         if (msgwrite < 0)
-            fprintf(stderr, "[loader] UE arm64 android_app has no command pipe "
-                    "— APP_CMD_INIT_WINDOW cannot be delivered and the engine "
-                    "will never start rendering\n");
-         if (win_va) {
-            /* LP64 android_app: window @+0x48 (it precedes the mutex, so its
-             * offset does not depend on the pthread type sizes), and
-             * pendingWindow @ msgread+0x58:
-             *   msgread +0x00, msgwrite +0x04, thread +0x08,
-             *   inputPollSource +0x10 (24 B), cmdPollSource +0x28 (24 B),
-             *   running/stateSaved/destroyed/redrawNeeded +0x40..+0x4C,
-             *   pendingInputQueue +0x50, pendingWindow +0x58.
-             * The A32 numbers (window@36, pendingWindow@msgread+0x38) were
-             * carried over unchanged and wrote the window pointer over
-             * savedState/savedStateSize instead. */
-            arm64_exec_write64(instance_va + 0x48, win_va);
-            uint64_t pend = pipe_off ? (uint64_t)pipe_off + 0x58u : 0x118u;
-            arm64_exec_write64(instance_va + pend, win_va);
-            fprintf(stderr, "[loader] UE arm64 window@+0x48 pendingWindow@+0x%llx = 0x%llx\n",
-                    (unsigned long long)pend, (unsigned long long)win_va);
-         }
-         /* Same for the input queue: pendingInputQueue (msgread+0x50 on LP64)
-          * plus APP_CMD_INPUT_CHANGED makes the glue attach it to its looper.
-          * A NativeActivity has no other path for touches. */
-         uint32_t inq = arm_exec_input_queue_handle();
-         if (inq && pipe_off) {
-            arm64_exec_write64(instance_va + pipe_off + 0x50u, (uint64_t)inq);
-            fprintf(stderr, "[loader] UE arm64 pendingInputQueue@+0x%x = 0x%08x\n",
-                    pipe_off + 0x50u, inq);
-         }
-         if (msgwrite >= 0) {
-            /* APP_CMD_INPUT_CHANGED=0, START=10, RESUME=11, INIT_WINDOW=1,
-             * GAINED_FOCUS=6 */
-            static const int8_t cmds[] = { 0, 10, 11, 1, 6 };
-            for (size_t i = 0; i < sizeof cmds; ++i) {
-               int8_t c = cmds[i];
-               if (write(msgwrite, &c, 1) != 1)
-                  fprintf(stderr, "[loader] UE arm64 write APP_CMD %d failed\n", c);
-               arm64_exec_run_pending_threads();
-            }
-         }
-      }
-   }
-
-   /* NativeActivity's real superclass methods deliver the native START and
-    * RESUME callbacks while the Java lifecycle call is on the stack, and its
-    * SurfaceView can deliver INIT_WINDOW before GameActivity.onResume reaches
-    * nativeResumeMainInit().  Our bytecode-side NativeActivity methods are
-    * framework stubs, so the command block above is that missing superclass /
-    * window-manager work and must precede the app's lifecycle continuation.
-    *
-    * Doing this afterwards creates a circular wait which no Android device
-    * has: Cross Worlds' nativeResumeMainInit sets GResumeMainInit and waits
-    * for AndroidMain to finish its first phase, while AndroidMain is waiting
-    * for INIT_WINDOW which the loader planned to send only after onResume
-    * returned.  The callback's 120-second safety limit eventually broke the
-    * cycle, making every title-to-game transition look like slow emulation.
-    * Preserve the causal order instead of shortening or bypassing the wait. */
-   if (dex_cls) {
-      dex_call_lifecycle(jvm, activity, dex_cls, "onStart",  "()V", 0);
-      dex_call_lifecycle(jvm, activity, dex_cls, "onResume", "()V", 0);
-      arm64_exec_run_pending_threads();
-   }
-
-   int w = arm64_exec_fb_width(), h = arm64_exec_fb_height();
-   if (va_set_win) {
-      /* (env, thiz, jboolean bIsPortrait, jint DepthBufferPreference).
-       * NOT (width, height): passing the width here makes every landscape
-       * window report "portrait" and feeds the height in as a depth-buffer
-       * preference enum. */
-      uint64_t portrait = (h > w) ? 1u : 0u;
-      fprintf(stderr, "[loader] UE arm64 nativeSetWindowInfo portrait=%llu depth=0\n",
-              (unsigned long long)portrait);
-      arm64_exec_call(va_set_win, env, ctx, portrait, 0);
-   }
-   if (va_set_surf) {
-      fprintf(stderr, "[loader] UE arm64 nativeSetSurfaceViewInfo %dx%d\n", w, h);
-      arm64_exec_call(va_set_surf, env, ctx, (uint64_t)w, (uint64_t)h);
-   }
-   if (va_startup_state) {
-      /* (env, thiz, jboolean bDebuggerAttached) */
-      fprintf(stderr, "[loader] UE arm64 nativeSetAndroidStartupState\n");
-      arm64_exec_call(va_startup_state, env, ctx, 0, 0);
-   }
-   if (va_resume_init) {
-      /* Releases AndroidMain()'s `while (!GResumeMainInit)` spin so
-       * FEngineLoop::PreInit + the game thread finally start. */
-      fprintf(stderr, "[loader] UE arm64 nativeResumeMainInit\n");
-      arm64_exec_call(va_resume_init, env, ctx, 0, 0);
-      arm64_exec_run_pending_threads();
-   }
-
-   g_dump_arm64 = 1;
-#ifndef _WIN32
-   signal(SIGUSR1, svc_dump_handler);
-#endif
-   schedule_unsafe_alarm_dump();
-
-   int max_frames = 0;
-   { const char *mf = getenv("LUNARIA_MAX_FRAMES"); if (mf && *mf) max_frames = atoi(mf); }
-   /* No default cap — see the A32 pump loop. */
-
-   fprintf(stderr, "[loader] UE arm64 entering pump loop (max_frames=%d)\n", max_frames);
-   for (int frame = 0; max_frames <= 0 || frame < max_frames; ++frame) {
-      if (arm_exec_guest_exit_count() > 0 || arm_exec_guest_abort_count() > 0) {
-         fprintf(stderr, "[loader] guest process terminated — stopping UE arm64 loop (frame %d)\n", frame);
-         break;
-      }
-      touch_test_tick(frame);
-      /* SetDesiredViewSize resized the surface.  Deliver the surfaceChanged
-       * the engine would have got on a device, or it keeps mapping input
-       * against the size it was told at startup. */
-      {
-         int nw = 0, nh = 0;
-         if (arm_exec_take_view_resize(&nw, &nh) && nw > 0 && nh > 0) {
-            if (va_set_win)
-               arm64_exec_call(va_set_win, env, ctx, (nh > nw) ? 1u : 0u, 0);
-            if (va_set_surf) {
-               fprintf(stderr, "[loader] UE arm64 nativeSetSurfaceViewInfo "
-                       "%dx%d (view resized)\n", nw, nh);
-               arm64_exec_call(va_set_surf, env, ctx, (uint64_t)nw,
-                               (uint64_t)nh);
-            }
-         }
-      }
-      pump_run_frame(arm64_exec_run_pending_threads);
-      /* The engine renders on its own thread and swaps through the EGL
-       * bridge; present here too so a frame reaches the window even when the
-       * guest's swap goes through the Java surface path. */
-      {
-         const uint64_t t_swap = frame_now_ns();
-         arm64_exec_egl_swap();
-         frame_stage_add(FRAME_STAGE_SWAP, t_swap);
-         const uint64_t t_input = frame_now_ns();
-         arm64_exec_glfw_poll();
-         frame_stage_add(FRAME_STAGE_INPUT, t_input);
-      }
-      /* The frame is presented and nothing is half-done: hand the interpreter
-       * lock to any bytecode thread waiting for it before starting the next
-       * one.  This is the pump's share of keeping the lock fair. */
-      dvm_gil_yield(dvm_current());
-      stall_watch_tick();
-      perf_tick();
-      if (frame < 5 || frame % 50 == 0)
-         fprintf(stderr, "[loader] UE arm64 pump frame %d\n", frame);
-      if (arm64_exec_glfw_should_close()) break;
-   }
-   return EXIT_SUCCESS;
-}
-
-static uint64_t
-arm64_lookup_native_two(const char *primary, const char *fallback,
-                        const char *name)
-{
-   uint64_t va = arm64_exec_lookup_native(primary, name);
-   return va ? va : arm64_exec_lookup_native(fallback, name);
-}
-
-static uint64_t
-arm64_lookup_native_sig_two(const char *primary, const char *fallback,
-                            const char *name, char *sig, size_t sig_size)
-{
-   uint64_t va = arm64_exec_lookup_native_sig(primary, name, sig, sig_size);
-   return va ? va : arm64_exec_lookup_native_sig(fallback, name, sig, sig_size);
-}
-
 static uint32_t
 arm_lookup_native_two(const char *primary, const char *fallback,
                       const char *name)
@@ -2254,225 +1048,27 @@ arm_lookup_native_sig_two(const char *primary, const char *fallback,
    return va ? va : arm_exec_lookup_native_sig(fallback, name, sig, sig_size);
 }
 
-static int
-run_unity_game_arm64(struct jvm *jvm, jobject existing_context,
-                     int call_init_jni)
+/* Activity.attach() gives every Activity a base Context before any native
+ * code can ask it for a system service.  A bare AllocObject() Activity has
+ * none, so getSystemService() failed with "unattached ContextWrapper" and the
+ * engine went on to dereference the null result. */
+static jobject
+alloc_attached_activity(struct jvm *jvm)
 {
-   static const char *cls     = "com.unity3d.player.UnityPlayer";
-   static const char *cls_svc = "com.unity3d.player.UnityPlayerForActivityOrService";
-
-#define LOOKUP2(name) arm64_lookup_native_two(cls, cls_svc, name)
-#define LOOKUP2_SIG(name, sig_buf) \
-   arm64_lookup_native_sig_two(cls, cls_svc, name, sig_buf, sizeof(sig_buf))
-
-   uint64_t va_init_jni = arm64_exec_lookup_native(cls, "initJni");
-   uint64_t va_done     = LOOKUP2("nativeDone");
-   uint64_t va_render   = LOOKUP2("nativeRender");
-   uint64_t va_resume   = LOOKUP2("nativeResume");
-   uint64_t va_focus    = LOOKUP2("nativeFocusChanged");
-   char recreate_sig[128] = {0};
-   uint64_t va_recreate = LOOKUP2_SIG("nativeRecreateGfxState", recreate_sig);
-   uint64_t va_inject   = arm64_exec_lookup_native(cls, "nativeInjectEvent");
-   uint64_t va_file     = arm64_exec_lookup_native(cls, "nativeFile");
-   uint64_t va_resize   = LOOKUP2("nativeResize");
-   uint64_t va_fwd_dalv = LOOKUP2("nativeForwardEventsToDalvik");
-
-#undef LOOKUP2
-#undef LOOKUP2_SIG
-
-   if (!va_init_jni || !va_render)
-      errx(EXIT_FAILURE, "not a unity jni lib (arm64)");
-   const int touch_diag = getenv("LUNARIA_TOUCH_DIAG") != NULL;
-   uint64_t touch_queue_va = 0;
-   const char *lifecycle_diag = getenv("LUNARIA_LIFECYCLE_DIAG_FILE");
-   if (touch_diag) {
-      const char *q = getenv("LUNARIA_TOUCH_QUEUE_VA");
-      if (q && *q) touch_queue_va = strtoull(q, NULL, 0);
+   jobject activity = jvm->native.AllocObject(&jvm->env,
+      jvm->native.FindClass(&jvm->env, "android/app/Activity"));
+   jclass context_class = jvm->native.FindClass(&jvm->env,
+                                                "android/content/Context");
+   jobject base = context_class
+      ? jvm->native.AllocObject(&jvm->env, context_class) : NULL;
+   jclass ac = jvm->native.FindClass(&jvm->env, "android/app/Activity");
+   jmethodID attach = ac ? jvm->native.GetMethodID(&jvm->env, ac,
+      "attachBaseContext", "(Landroid/content/Context;)V") : NULL;
+   if (activity && base && attach) {
+      jvalue arg = { .l = base };
+      jvm->native.CallVoidMethodA(&jvm->env, activity, attach, &arg);
    }
-   if (touch_diag)
-      fprintf(stderr, "[loader] arm64 nativeInjectEvent=%#llx\n",
-              (unsigned long long)va_inject);
-
-   uint64_t env = arm64_exec_env_va();
-   const jobject context = existing_context ? existing_context
-      : jvm->native.AllocObject(&jvm->env,
-            jvm->native.FindClass(&jvm->env, "android/app/Activity"));
-   uint64_t ctx = (uint64_t)(uintptr_t)context;
-   jni_set_current_activity(&jvm->env, context);
-
-   if (va_file) {
-      const char *apk = lunaria_apk_mount_path();
-      if (apk && *apk) {
-         fprintf(stderr, "[loader] arm64 calling nativeFile (%s)...\n", apk);
-         jobject str = jvm->native.NewStringUTF(&jvm->env, apk);
-         arm64_exec_call(va_file, env, ctx, (uint64_t)(uintptr_t)str, 0);
-         arm64_exec_run_pending_threads();
-      }
-   }
-
-   if (call_init_jni) {
-      fprintf(stderr, "[loader] arm64 calling initJni (va=0x%llx)...\n",
-              (unsigned long long)va_init_jni);
-      arm64_exec_call(va_init_jni, env, ctx, ctx, 0);
-      arm64_exec_run_pending_threads();
-      fprintf(stderr, "[loader] arm64 initJni done\n");
-   } else {
-      fprintf(stderr, "[loader] arm64 Unity was initialized by the Activity\n");
-   }
-
-   if (!arm64_exec_host_egl_init())
-      fprintf(stderr, "[loader] arm64 host EGL re-init failed\n");
-
-   if (va_recreate && call_init_jni) {
-      const jobject fake_surf = jvm->native.AllocObject(&jvm->env,
-            jvm->native.FindClass(&jvm->env, "android/view/Surface"));
-      int unity4_sig = (recreate_sig[0] == '(' && recreate_sig[1] == 'L');
-      if (unity4_sig) {
-         fprintf(stderr, "[loader] arm64 nativeRecreateGfxState (Unity4)...\n");
-         arm64_exec_call(va_recreate, env, ctx, (uint64_t)(uintptr_t)fake_surf, 0);
-      } else {
-         fprintf(stderr, "[loader] arm64 nativeRecreateGfxState (displayId=0)...\n");
-         arm64_exec_call(va_recreate, env, ctx, 0, (uint64_t)(uintptr_t)fake_surf);
-      }
-      arm64_exec_run_pending_threads();
-   }
-
-   if (va_resize) {
-      int w = arm64_exec_fb_width(), h = arm64_exec_fb_height();
-      fprintf(stderr, "[loader] arm64 nativeResize(%d,%d)...\n", w, h);
-      arm64_exec_call6(va_resize, env, ctx, (uint64_t)w, (uint64_t)h,
-                       (uint64_t)w, (uint64_t)h);
-   }
-   if (va_focus)
-      arm64_exec_call(va_focus, env, ctx, 1, 0);
-   if (va_fwd_dalv)
-      arm64_exec_call(va_fwd_dalv, env, ctx, 0, 0);
-   if (va_resume)
-      arm64_exec_call(va_resume, env, ctx, 0, 0);
-   arm64_exec_run_pending_threads();
-
-   fprintf(stderr, "[loader] arm64 entering Unity render loop\n");
-   g_dump_arm64 = 1;
-#ifndef _WIN32
-   signal(SIGUSR1, svc_dump_handler);
-#endif
-   schedule_unsafe_alarm_dump();
-
-   int frame_count = 0, fail_streak = 0, last_ok = -1, resized_after_init = 0;
-   int max_frames = 0;
-   {
-      const char *mf = getenv("LUNARIA_MAX_FRAMES");
-      if (mf && *mf) max_frames = atoi(mf);
-   }
-   /* No default cap — same as the A32 render loop below.  The 300-frame limit
-    * here was a bring-up aid, but Unity's splash runs on real time and the
-    * game only reaches its first scene well past that, so it made arm64 look
-    * permanently stuck on the splash screen. */
-
-   for (;;) {
-      if (arm_exec_guest_exit_count() > 0 || arm_exec_guest_abort_count() > 0) {
-         fprintf(stderr, "[loader] guest process terminated — stopping Unity loop "
-                         "(frame %d)\n", frame_count);
-         break;
-      }
-      if (max_frames > 0 && frame_count >= max_frames) {
-         fprintf(stderr, "[loader] LUNARIA_MAX_FRAMES=%d reached\n", max_frames);
-         break;
-      }
-      if (lifecycle_diag && *lifecycle_diag && (frame_count % 50) == 0) {
-         FILE *command = fopen(lifecycle_diag, "r");
-         if (command) {
-            char action[32] = {0};
-            if (!fgets(action, sizeof action, command)) action[0] = '\0';
-            fclose(command);
-            unlink(lifecycle_diag);
-            if (!strncmp(action, "resume", 6) && va_resume) {
-               fprintf(stderr, "[loader] diagnostic nativeResume at frame %d\n", frame_count);
-               arm64_exec_call(va_resume, env, ctx, 0, 0);
-            } else if (!strncmp(action, "focus", 5) && va_focus) {
-               fprintf(stderr, "[loader] diagnostic nativeFocusChanged(1) at frame %d\n", frame_count);
-               arm64_exec_call(va_focus, env, ctx, 1, 0);
-            } else if (!strncmp(action, "recreate", 8) && va_recreate) {
-               jobject surface = jvm->native.AllocObject(&jvm->env,
-                     jvm->native.FindClass(&jvm->env, "android/view/Surface"));
-               fprintf(stderr, "[loader] diagnostic nativeRecreateGfxState at frame %d\n", frame_count);
-               if (recreate_sig[0] == '(' && recreate_sig[1] == 'L')
-                  arm64_exec_call(va_recreate, env, ctx,
-                                  (uint64_t)(uintptr_t)surface, 0);
-               else
-                  arm64_exec_call(va_recreate, env, ctx, 0,
-                                  (uint64_t)(uintptr_t)surface);
-            }
-         }
-      }
-      touch_test_tick(frame_count);
-      ArmExecTouchEvent te;
-      if (va_inject && arm_exec_touch_next(&te)) {
-         if (va_fwd_dalv)
-            arm64_exec_call(va_fwd_dalv, env, ctx, 0, 0);
-         lunaria_touch_event lev = touch_to_lunaria(&te);
-         jobject motion_ev = jvm_new_motion_event(jvm, &lev);
-         uint64_t queue_before = touch_queue_va ? arm64_exec_read64(touch_queue_va + 8) : 0;
-         int handled = (int)arm64_exec_call(va_inject, env, ctx,
-                                            (uint64_t)(uintptr_t)motion_ev, 0);
-         if (touch_diag)
-            fprintf(stderr, "[loader] arm64 injectEvent action=%d x=%.0f y=%.0f -> %d queue_end=%#llx->%#llx\n",
-                    te.action, te.x, te.y, handled,
-                    (unsigned long long)queue_before,
-                    (unsigned long long)(touch_queue_va ? arm64_exec_read64(touch_queue_va + 8) : 0));
-      }
-
-      arm_exec_drain_gl_thread_jobs();
-      const uint64_t render_start = frame_now_ns();
-      int ok = (int)arm64_exec_call_unlimited(va_render, env, ctx, 0, 0);
-      frame_stage_add(FRAME_STAGE_SCHED, render_start);
-      if (arm_exec_guest_exit_count() > 0 || arm_exec_guest_abort_count() > 0) {
-         fprintf(stderr, "[loader] guest process terminated during nativeRender "
-                         "(frame %d)\n", frame_count);
-         break;
-      }
-
-      int resized_w = 0, resized_h = 0;
-      if (arm_exec_take_view_resize(&resized_w, &resized_h) && va_resize) {
-         arm64_exec_call6(va_resize, env, ctx, (uint64_t)resized_w, (uint64_t)resized_h,
-                          (uint64_t)resized_w, (uint64_t)resized_h);
-         fprintf(stderr, "[loader] nativeResize(%d,%d) — view resized\n",
-                 resized_w, resized_h);
-      }
-      if (!resized_after_init && frame_count >= 1 && va_resize) {
-         int w = arm64_exec_fb_width(), h = arm64_exec_fb_height();
-         arm64_exec_call6(va_resize, env, ctx, (uint64_t)w, (uint64_t)h,
-                          (uint64_t)w, (uint64_t)h);
-         resized_after_init = 1;
-      }
-
-      const uint64_t sched_start = frame_now_ns();
-      arm64_exec_run_pending_threads();
-      frame_stage_add(FRAME_STAGE_SCHED, sched_start);
-      pump_java_frame();
-      const uint64_t swap_start = frame_now_ns();
-      arm64_exec_egl_swap();
-      frame_stage_add(FRAME_STAGE_SWAP, swap_start);
-      const uint64_t input_start = frame_now_ns();
-      arm64_exec_glfw_poll();
-      frame_stage_add(FRAME_STAGE_INPUT, input_start);
-      perf_tick();
-      ++frame_count;
-      if (ok != last_ok || frame_count <= 5 || (frame_count % 50 == 0)) {
-         fprintf(stderr, "[loader] arm64 nativeRender -> %d (frame %d)\n",
-                 ok, frame_count);
-         last_ok = ok;
-      }
-      fail_streak = ok ? 0 : fail_streak + 1;
-      if (fail_streak > 3)
-         usleep(16000);
-      if (arm64_exec_glfw_should_close()) break;
-   }
-
-   if (va_done && !arm_exec_guest_exit_count() &&
-       !arm_exec_guest_abort_count())
-      arm64_exec_call(va_done, env, ctx, 0, 0);
-   return EXIT_SUCCESS;
+   return activity;
 }
 
 /* Start the package the way Android does: construct the launcher Activity and
@@ -2720,14 +1316,22 @@ run_dex_activity(struct jvm *jvm, int is_a64)
    run_threads();
    /* onStart/onResume are what make an Activity visible and running; an app
     * that starts its render thread in onResume never starts without them. */
-   dex_call_lifecycle(jvm, activity, cls, "onStart",  "()V", 0);
-   dex_call_lifecycle(jvm, activity, cls, "onResume", "()V", 0);
-   run_threads();
+   /* A launcher that called finish() from onCreate (a splash that starts the
+    * real activity) goes straight to onDestroy, which the activity stack has
+    * already delivered.  Starting, resuming or showing it again would put its
+    * window back on top of the activity that replaced it, and that window
+    * would take the input focus. */
+   const int launcher_finished = dvm_jni_activity_finishing(&jvm->env, activity);
+   if (!launcher_finished) {
+      dex_call_lifecycle(jvm, activity, cls, "onStart",  "()V", 0);
+      dex_call_lifecycle(jvm, activity, cls, "onResume", "()V", 0);
+      run_threads();
 
-   /* Attach the resumed Activity to its window before running its renderer.
-    * SurfaceView dispatches its lifecycle callbacks through the main Looper;
-    * the app's callback owns connecting its native renderer to that Surface. */
-   dvm_jni_show_activity(&jvm->env, activity);
+      /* Attach the resumed Activity to its window before running its renderer.
+       * SurfaceView dispatches its lifecycle callbacks through the main Looper;
+       * the app's callback owns connecting its native renderer to that Surface. */
+      dvm_jni_show_activity(&jvm->env, activity);
+   }
    pump_java_frame();
 
    int max_frames = 0;
@@ -2752,6 +1356,7 @@ run_dex_activity(struct jvm *jvm, int is_a64)
       struct dvm *input_vm=dvm_jni_vm();
       for (int n=0;input_vm && n<64 && arm_exec_touch_next(&touch);++n)
          (void)dvm_ui_dispatch_touch(input_vm,&touch);
+      stall_watch_tick();
       perf_tick();
       if (frame < 5 || frame % 50 == 0)
          fprintf(stderr, "[loader] dex pump frame %d\n", frame);
@@ -2763,12 +1368,6 @@ run_dex_activity(struct jvm *jvm, int is_a64)
 static int
 run_jni_game_arm64(struct jvm *jvm)
 {
-   /* UE NativeActivity path */
-   if (arm64_exec_lookup_export("ANativeActivity_onCreate"))
-      return run_ue4_game_arm64(jvm);
-   /* UnityPlayer.initJni path (IL2CPP / Mono) */
-   if (arm64_exec_lookup_native("com.unity3d.player.UnityPlayer", "initJni"))
-      return run_unity_game_arm64(jvm, NULL, 1);
    /* Neither engine's native entry point is exported.  An ordinary Android
     * app has none: its entry point is the launcher Activity, in the dex.  With
     * a bytecode VM that is runnable, so start it the way Android does instead
@@ -2782,10 +1381,6 @@ run_jni_game_arm64(struct jvm *jvm)
 static int
 run_jni_game_arm(struct jvm *jvm)
 {
-   /* UE4 NativeActivity path (no UnityPlayer.initJni) */
-   if (arm_exec_lookup_export("ANativeActivity_onCreate") &&
-       !arm_exec_lookup_native("com.unity3d.player.UnityPlayer", "initJni"))
-      return run_ue4_game_arm(jvm);
 
    /* Unity <= 2019: all methods on UnityPlayer.
     * Unity 2020+:  render/lifecycle moved to UnityPlayerForActivityOrService. */
@@ -2813,11 +1408,13 @@ run_jni_game_arm(struct jvm *jvm)
 #undef LOOKUP2
 #undef LOOKUP2_SIG
 
-   if (!va_init_jni || !va_render)
-      errx(EXIT_FAILURE, "not a unity jni lib");
+   if (!va_init_jni || !va_render) {
+      warnx("not a unity jni lib");
+      return EXIT_FAILURE;
+   }
 
    uint32_t env = arm_exec_env_va();
-   const jobject context = jvm->native.AllocObject(&jvm->env, jvm->native.FindClass(&jvm->env, "android/app/Activity"));
+   const jobject context = alloc_attached_activity(jvm);
    uint32_t ctx = (uint32_t)(uintptr_t)context;
    jni_set_current_activity(&jvm->env, context);
    uint32_t mono_root = mono_export_call("mono_get_root_domain");
@@ -3009,27 +1606,13 @@ run_jni_game_arm(struct jvm *jvm)
        * "PlayerLoop called recursively!".  Use the unlimited variant. */
       arm_exec_drain_gl_thread_jobs();
       int ok = arm_exec_call_unlimited(va_render, env, ctx, 0, 0);
-      /* Guest abort() (e.g. mono g_assert after mmap OOM) leaves PlayerLoop
-       * inconsistent; clearing a hardcoded guard VA then re-entering floods
-       * "PlayerLoop called recursively".  Stop the loop after the first abort. */
-      if (arm_exec_guest_abort_count() > 0) {
-         fprintf(stderr, "[loader] guest abort seen — stopping render loop (frame %d)\n",
-                 frame_count);
+      /* A guest process termination ends its GL thread as well.  Preserve
+       * guest memory: nativeRender's return value does not identify a fault
+       * and cannot authorize resetting engine state at a fixed address. */
+      if (arm_exec_guest_exit_count() > 0 || arm_exec_guest_abort_count() > 0) {
+         fprintf(stderr, "[loader] guest process terminated during nativeRender "
+                         "(frame %d)\n", frame_count);
          break;
-      }
-      /* If nativeRender was cut short by a guest fault (NULL call, NoExecuteFault),
-       * PlayerLoop's re-entry guard byte at 0x20f1ac90 may still be set to 1,
-       * causing every subsequent frame to bail with "PlayerLoop called recursively!".
-       * Reset it so the next frame can enter PlayerLoop normally. */
-      if (!ok) {
-         static const uint32_t PLAYERLOOP_GUARD_VA = 0x20f1ac90u;
-         uint32_t guard_word = arm_exec_read32(PLAYERLOOP_GUARD_VA & ~3u);
-         if (guard_word & 0xffu) {
-            arm_exec_write32(PLAYERLOOP_GUARD_VA & ~3u,
-                             guard_word & ~0xffu);
-            fprintf(stderr, "[loader] nativeRender fault: cleared PlayerLoop guard (frame %d)\n",
-                    frame_count);
-         }
       }
       /* Android では surfaceChanged -> nativeResize がエンジン初期化後にも
        * 届く。ループ前の nativeResize はエンジン未初期化で無視されるため
@@ -3246,9 +1829,10 @@ main(int argc, const char *argv[])
          a64_preload_platform_libs();
 
       int ret = run_dex_activity(&jvm, is_a64);
-      jvm_release(&jvm);
-      /* The guest is done; stop the engines before anything static goes away. */
+      arm_exec_begin_shutdown();
+      dvm_jni_shutdown();
       arm_exec_shutdown_engines();
+      jvm_release(&jvm);
       printf("exiting\n");
       return ret;
    }
@@ -3331,12 +1915,12 @@ main(int argc, const char *argv[])
          fprintf(stderr, "[loader] early arm64 host EGL init failed\n");
 
       int jni_ver = arm64_exec_jni_onload(argv[1], &jvm);
-      if (jni_ver < 0)
-         errx(EXIT_FAILURE, "arm64_exec_jni_onload failed");
-      int ret = run_jni_game_arm64(&jvm);
-      jvm_release(&jvm);
-      /* The guest is done; stop the engines before anything static goes away. */
+      if (jni_ver < 0) warnx("arm64_exec_jni_onload failed");
+      int ret = jni_ver < 0 ? EXIT_FAILURE : run_jni_game_arm64(&jvm);
+      arm_exec_begin_shutdown();
+      dvm_jni_shutdown();
       arm_exec_shutdown_engines();
+      jvm_release(&jvm);
       printf("exiting\n");
       return ret;
    }
@@ -3440,12 +2024,12 @@ main(int argc, const char *argv[])
 
       /* メインライブラリ (libunity.so) をロード & JNI_OnLoad 実行 */
       int jni_ver = arm_exec_jni_onload(argv[1], &jvm);
-      if (jni_ver < 0)
-         errx(EXIT_FAILURE, "arm_exec_jni_onload failed");
-      int ret = run_jni_game_arm(&jvm);
-      jvm_release(&jvm);
-      /* The guest is done; stop the engines before anything static goes away. */
+      if (jni_ver < 0) warnx("arm_exec_jni_onload failed");
+      int ret = jni_ver < 0 ? EXIT_FAILURE : run_jni_game_arm(&jvm);
+      arm_exec_begin_shutdown();
+      dvm_jni_shutdown();
       arm_exec_shutdown_engines();
+      jvm_release(&jvm);
       printf("exiting\n");
       return ret;
    }
@@ -3503,6 +2087,9 @@ main(int argc, const char *argv[])
       jvm_init(&jvm);
       entry.JNI_OnLoad.fun(&jvm.vm, NULL);
       ret = run_jni_game(&jvm);
+      arm_exec_begin_shutdown();
+      dvm_jni_shutdown();
+      arm_exec_shutdown_engines();
       jvm_release(&jvm);
    } else {
       warnx("no entrypoint found in %s", argv[1]);

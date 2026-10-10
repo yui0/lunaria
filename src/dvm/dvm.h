@@ -86,7 +86,8 @@ struct dvm_hooks {
 
    /* A method declared `native` in the dex: resolve it to the guest's
     * implementation and call it.  Returns false when the guest has not
-    * registered or exported it. */
+    * registered or exported it. Called with the interpreter lock held for
+    * VM argument/result conversion; release it around actual guest execution. */
    bool (*call_native)(void *user, struct dvm *vm, const char *class_name,
                        const char *method, const char *sig, bool is_static,
                        dvm_ref self, const union dvm_value *args, int nargs,
@@ -101,6 +102,20 @@ struct dvm_hooks {
     * that state, so ask it.  Returns the Throwable (and clears the host's
     * pending state), or 0 when there is none. */
    dvm_ref (*take_pending_exception)(void *user, struct dvm *vm);
+
+   /* android.app.NativeActivity lifecycle (DVM_NATIVE_ACTIVITY_*).  The
+    * framework half of a NativeActivity — loading the app's native library,
+    * calling ANativeActivity_onCreate and delivering the activity's native
+    * callbacks — lives with the guest, not in bytecode.  Returns false when
+    * the process has no native activity entry point (a pure-Java app). */
+   bool (*native_activity)(void *user, struct dvm *vm, int stage,
+                           dvm_ref activity);
+};
+
+enum {
+   DVM_NATIVE_ACTIVITY_CREATE = 0,   /* NativeActivity.onCreate  */
+   DVM_NATIVE_ACTIVITY_START  = 1,   /* NativeActivity.onStart   */
+   DVM_NATIVE_ACTIVITY_RESUME = 2,   /* NativeActivity.onResume  */
 };
 
 /* --- lifecycle ---------------------------------------------------------- */
@@ -109,6 +124,11 @@ struct dvm *dvm_create(const struct dvm_hooks *hooks);
 void dvm_destroy(struct dvm *vm);
 void dvm_glsurface_tick(struct dvm *vm);
 void dvm_glsurface_finish(struct dvm *vm);
+/* Process teardown: stop admission and wake platform waits, then join Java
+ * host threads before releasing the JNI table or execution engines. */
+bool dvm_is_stopping(struct dvm *vm);
+void dvm_request_stop(struct dvm *vm);
+void dvm_threads_finish(struct dvm *vm);
 
 /* Adds one classes*.dex.  Later files do not override classes already
  * defined, which matches the multidex lookup order. */
@@ -149,6 +169,11 @@ bool dvm_class_exists(struct dvm *vm, const char *name);
  * superclasses and interfaces. */
 struct dvm_method *dvm_find_method(struct dvm *vm, struct dvm_class *cls,
                                    const char *name, const char *sig);
+/* Like dvm_find_method(), but the return type is not part of the match: only
+ * the name and the parameter list are.  For callers that name a framework
+ * method whose return type is a class an obfuscated app has renamed. */
+struct dvm_method *dvm_find_method_by_params(struct dvm *vm, struct dvm_class *cls,
+                                             const char *name, const char *sig);
 /* Convenience: class name + method name + signature in one go. */
 struct dvm_method *dvm_lookup(struct dvm *vm, const char *class_name,
                               const char *method, const char *sig);
@@ -352,14 +377,13 @@ struct dvm *dvm_current(void);
 /* Populate PackageInfo.signatures/signingInfo from the certificate carried by
  * the installed APK.  This is shared by the bytecode PackageManager paths in
  * dvm_runtime.c and dvm_jni.c. */
-bool dvm_package_info_add_signatures(struct dvm *vm, dvm_ref package_info);
+bool dvm_package_info_add_signatures(struct dvm *vm, dvm_ref package_info,
+                                     uint32_t flags);
 
 /* True on a host thread started for bytecode, false on the one that drives the
  * frame pump and the guest CPU.  A wait on the latter has to stay short. */
 bool dvm_on_bytecode_thread(void);
 
-/* True on Android's main thread: the host thread that created the VM and
- * drives the frame pump, whose turn runs the main Looper.  Engine workers that
- * execute other guest threads' native code, and bytecode threads, are not it —
- * main-Looper messages run here and nowhere else, as on a device. */
+/* True in Android's main-thread context. Guest native threads sharing the
+ * frame-pump host thread retain their own Android thread identity. */
 bool dvm_on_main_thread(void);

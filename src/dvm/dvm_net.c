@@ -21,6 +21,7 @@
 #endif
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +36,62 @@
 #include <openssl/ssl.h>
 
 #define HTTP_MAX_REDIRECTS 5
+
+static pthread_once_t network_once = PTHREAD_ONCE_INIT;
+static _Atomic bool network_enabled;
+static pthread_mutex_t network_lock = PTHREAD_MUTEX_INITIALIZER;
+struct network_socket { int fd; struct network_socket *next; };
+static struct network_socket *network_sockets;
+
+static void network_init(void)
+{
+   const char *v = getenv("LUNARIA_NET");
+   atomic_store(&network_enabled, !v || (*v != '0' && *v != 'n' && *v != 'N'));
+}
+
+bool dvm_network_enabled(void)
+{
+   pthread_once(&network_once, network_init);
+   return atomic_load_explicit(&network_enabled, memory_order_acquire);
+}
+
+void dvm_network_set_enabled(bool enabled)
+{
+   pthread_once(&network_once, network_init);
+   pthread_mutex_lock(&network_lock);
+   atomic_store_explicit(&network_enabled, enabled, memory_order_release);
+   if (!enabled)
+      for (struct network_socket *s = network_sockets; s; s = s->next)
+         luna_socket_shutdown(s->fd, SHUT_RDWR);
+   pthread_mutex_unlock(&network_lock);
+}
+
+static int network_track(int fd)
+{
+   struct network_socket *s = malloc(sizeof *s);
+   if (!s) { errno = ENOMEM; return -1; }
+   pthread_mutex_lock(&network_lock);
+   if (!dvm_network_enabled()) {
+      pthread_mutex_unlock(&network_lock);
+      free(s); errno = ENETUNREACH; return -1;
+   }
+   s->fd = fd; s->next = network_sockets; network_sockets = s;
+   pthread_mutex_unlock(&network_lock);
+   return 0;
+}
+
+int dvm_sock_close(int fd)
+{
+   pthread_mutex_lock(&network_lock);
+   struct network_socket **at = &network_sockets;
+   while (*at && (*at)->fd != fd) at = &(*at)->next;
+   if (*at) { struct network_socket *s = *at; *at = s->next; free(s); }
+   const int rc = luna_fd_close(fd);
+   const int error = errno;
+   pthread_mutex_unlock(&network_lock);
+   errno = error;
+   return rc;
+}
 
 static const char *http_case_find(const char *text, const char *part)
 {
@@ -82,7 +139,7 @@ static void stream_close(struct stream *s)
       s->ctx = NULL;
    }
    if (s->fd >= 0) {
-      luna_fd_close(s->fd);
+      dvm_sock_close(s->fd);
       s->fd = -1;
    }
 }
@@ -91,6 +148,7 @@ static ssize_t stream_write(struct stream *s, const void *buf, size_t len)
 {
    size_t done = 0;
    while (done < len) {
+      if (!dvm_network_enabled()) { errno = ENETUNREACH; return -1; }
       ssize_t n;
       if (s->ssl)
          n = SSL_write(s->ssl, (const char *)buf + done, (int)(len - done));
@@ -114,6 +172,7 @@ static ssize_t stream_read(struct stream *s, void *buf, size_t len)
 {
    long waited_ms = 0;
    for (;;) {
+      if (!dvm_network_enabled()) { errno = ENETUNREACH; return -1; }
       ssize_t n;
       if (s->ssl) {
          ERR_clear_error();
@@ -284,6 +343,11 @@ static bool connect_to(const struct url *u, int timeout_ms, struct stream *s,
    s->fd = -1;
    s->ctx = NULL;
    s->ssl = NULL;
+
+   if (!dvm_network_enabled()) {
+      snprintf(err, errsz, "Network is offline");
+      errno = ENETUNREACH; return false;
+   }
 
    struct addrinfo hints = { 0 }, *res = NULL;
    hints.ai_family = AF_UNSPEC;
@@ -471,13 +535,17 @@ static int dechunk(const uint8_t *src, size_t len, struct buf *out,
 
 static void http_stream_done(struct dvm_http_response *r);
 
-static bool exchange(const char *method, const struct url *u,
+static bool exchange(void **transport, const char *method, const struct url *u,
                      const struct dvm_http_header *headers, int nheaders,
                      const uint8_t *body, size_t body_len, int timeout_ms,
                      struct dvm_http_response *out)
 {
    struct stream s;
-   if (!connect_to(u, timeout_ms, &s, out->error, sizeof out->error))
+   if (transport && *transport) {
+      s = *(struct stream *)*transport;
+      free(*transport);
+      *transport = NULL;
+   } else if (!connect_to(u, timeout_ms, &s, out->error, sizeof out->error))
       return false;
 
    struct buf req = { 0 };
@@ -528,6 +596,32 @@ static bool exchange(const char *method, const struct url *u,
    const char *hdr_end = NULL;
    size_t sep = 4;
    for (;;) {
+      /* Informational responses have no body and precede the final reply.
+       * They may share a socket read with that reply, or arrive separately.
+       * 101 terminates the HTTP exchange because it switches protocols. */
+      if (raw.p) {
+         hdr_end = strstr((const char *)raw.p, "\r\n\r\n");
+         sep = 4;
+         if (!hdr_end) {
+            hdr_end = strstr((const char *)raw.p, "\n\n");
+            sep = 2;
+         }
+         if (hdr_end) {
+            const char *start = (const char *)raw.p;
+            const char *end = memchr(start, '\n', (size_t)(hdr_end - start) + sep);
+            const char *space = end ? memchr(start, ' ', (size_t)(end - start)) : NULL;
+            int status = space && !strncmp(start, "HTTP/", 5) ? atoi(space + 1) : 0;
+            if (status >= 100 && status < 200 && status != 101) {
+               size_t consumed = (size_t)(hdr_end - start) + sep;
+               memmove(raw.p, raw.p + consumed, raw.len - consumed);
+               raw.len -= consumed;
+               raw.p[raw.len] = '\0';
+               hdr_end = NULL;
+               continue;
+            }
+            break;
+         }
+      }
       ssize_t n = stream_read(&s, chunk, sizeof chunk);
       if (n < 0) {
          snprintf(out->error, sizeof out->error, "read from %s failed: %s",
@@ -536,23 +630,13 @@ static bool exchange(const char *method, const struct url *u,
          stream_close(&s);
          return false;
       }
-      if (n > 0 && !buf_add(&raw, chunk, (size_t)n)) {
+      if (n == 0) break;
+      if (!buf_add(&raw, chunk, (size_t)n)) {
          snprintf(out->error, sizeof out->error, "out of memory");
          free(raw.p);
          stream_close(&s);
          return false;
       }
-      /* buf_add keeps the buffer NUL-terminated, so the searches below stay
-       * inside it even before the whole response has arrived. */
-      if (raw.p) {
-         hdr_end = strstr((const char *)raw.p, "\r\n\r\n");
-         sep = 4;
-         if (!hdr_end) {
-            hdr_end = strstr((const char *)raw.p, "\n\n");
-            sep = 2;
-         }
-      }
-      if (hdr_end || n == 0) break;
    }
 
    /* Status line */
@@ -860,7 +944,43 @@ bool dvm_http_slurp(struct dvm_http_response *r)
  * Entry point
  * ------------------------------------------------------------------------ */
 
+void dvm_http_transport_close(void *transport)
+{
+   if (!transport) return;
+   stream_close(transport);
+   free(transport);
+}
+
+void *dvm_http_connect(const char *url, int timeout_ms, char *error, size_t error_size)
+{
+   struct url parsed;
+   (void)pthread_once(&host_sigpipe_once, ignore_host_sigpipe);
+   if (!url || !url_parse(url, &parsed)) {
+      snprintf(error, error_size, "unsupported URL");
+      return NULL;
+   }
+   struct stream *stream = malloc(sizeof *stream);
+   if (!stream) {
+      snprintf(error, error_size, "out of memory");
+      return NULL;
+   }
+   if (!connect_to(&parsed, timeout_ms, stream, error, error_size)) {
+      free(stream);
+      return NULL;
+   }
+   return stream;
+}
+
 bool dvm_http_perform(const char *method, const char *url,
+                      const struct dvm_http_header *headers, int nheaders,
+                      const uint8_t *body, size_t body_len, int timeout_ms,
+                      bool follow_redirects, struct dvm_http_response *out)
+{
+   return dvm_http_perform_connected(NULL, method, url, headers, nheaders,
+                                    body, body_len, timeout_ms, follow_redirects, out);
+}
+
+bool dvm_http_perform_connected(void **transport, const char *method, const char *url,
                       const struct dvm_http_header *headers, int nheaders,
                       const uint8_t *body, size_t body_len, int timeout_ms,
                       bool follow_redirects, struct dvm_http_response *out)
@@ -871,6 +991,7 @@ bool dvm_http_perform(const char *method, const char *url,
 
    char cur[16896];
    if (strlen(url) >= sizeof cur) {
+      if (transport) { dvm_http_transport_close(*transport); *transport = NULL; }
       snprintf(out->error, sizeof out->error, "URL too long");
       return false;
    }
@@ -881,6 +1002,7 @@ bool dvm_http_perform(const char *method, const char *url,
    for (int hop = 0; hop <= HTTP_MAX_REDIRECTS; ++hop) {
       struct url u;
       if (!url_parse(cur, &u)) {
+         if (transport) { dvm_http_transport_close(*transport); *transport = NULL; }
          snprintf(out->error, sizeof out->error, "unsupported URL: %.400s",
                   cur);
          return false;
@@ -888,7 +1010,7 @@ bool dvm_http_perform(const char *method, const char *url,
       struct dvm_http_response r;
       memset(&r, 0, sizeof r);
       r.status = -1;
-      if (!exchange(cur_method, &u, headers, nheaders, body, body_len,
+      if (!exchange(transport, cur_method, &u, headers, nheaders, body, body_len,
                     timeout_ms, &r)) {
          snprintf(out->error, sizeof out->error, "%s", r.error);
          dvm_http_response_free(&r);
@@ -997,23 +1119,26 @@ static int connect_one(const struct addrinfo *a, const char *local_addr,
 {
    int fd = luna_socket_open(a->ai_family, a->ai_socktype, a->ai_protocol);
    if (fd < 0) return -1;
+   if (network_track(fd) < 0) {
+      int error = errno; dvm_sock_close(fd); errno = error; return -1;
+   }
    if (bind_local(fd, a->ai_family, local_addr, local_port) < 0) {
       int e = errno;
-      luna_fd_close(fd);
+      dvm_sock_close(fd);
       errno = e;
       return -1;
    }
    if (timeout_ms <= 0) {
       if (!luna_socket_connect(fd, a->ai_addr, a->ai_addrlen)) return fd;
       int e = errno;
-      luna_fd_close(fd);
+      dvm_sock_close(fd);
       errno = e;
       return -1;
    }
    int nonblock = luna_socket_get_nonblock(fd);
    if (nonblock < 0 || luna_socket_nonblock(fd, 1) != 0) {
       int error = errno;
-      luna_fd_close(fd); errno = error; return -1;
+      dvm_sock_close(fd); errno = error; return -1;
    }
    int rc = luna_socket_connect(fd, a->ai_addr, a->ai_addrlen);
    if (rc < 0 && errno == EINPROGRESS) {
@@ -1021,7 +1146,7 @@ static int connect_one(const struct addrinfo *a, const char *local_addr,
       int pr;
       do pr = luna_socket_poll(&p, 1, timeout_ms); while (pr < 0 && errno == EINTR);
       if (pr == 0) {
-         luna_fd_close(fd);
+         dvm_sock_close(fd);
          errno = ETIMEDOUT;
          return -1;
       }
@@ -1029,7 +1154,7 @@ static int connect_one(const struct addrinfo *a, const char *local_addr,
       socklen_t sl = sizeof soerr;
       if (pr < 0 || luna_socket_get_option(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) < 0 ||
           soerr) {
-         luna_fd_close(fd);
+         dvm_sock_close(fd);
          errno = soerr ? soerr : errno;
          return -1;
       }
@@ -1037,13 +1162,13 @@ static int connect_one(const struct addrinfo *a, const char *local_addr,
    }
    if (rc < 0) {
       int e = errno;
-      luna_fd_close(fd);
+      dvm_sock_close(fd);
       errno = e;
       return -1;
    }
    if (luna_socket_nonblock(fd, nonblock) != 0) {
       int error = errno;
-      luna_fd_close(fd); errno = error; return -1;
+      dvm_sock_close(fd); errno = error; return -1;
    }
    return fd;
 }
@@ -1051,6 +1176,10 @@ static int connect_one(const struct addrinfo *a, const char *local_addr,
 int dvm_sock_connect(const char *host, int port, const char *local_addr,
                      int local_port, int timeout_ms, char *err, size_t errsz)
 {
+   if (!dvm_network_enabled()) {
+      snprintf(err, errsz, "Network is offline");
+      errno = ENETUNREACH; return -1;
+   }
    char portstr[8];
    snprintf(portstr, sizeof portstr, "%d", port);
    struct addrinfo hints = { 0 }, *res = NULL;
@@ -1155,11 +1284,12 @@ static void tls_apply_ciphers(SSL *ssl, const char *const *want, int nwant)
    if (l13[0]) SSL_set_ciphersuites(ssl, l13);
 }
 
-struct dvm_tls *dvm_tls_connect(int fd, const char *host, int verify,
+struct dvm_tls *dvm_tls_connect_cancel(int fd, const char *host, int verify,
                                 const uint8_t *alpn, size_t alpn_len,
                                 int min_version, int max_version,
                                 const char *const *ciphers, int nciphers,
-                                bool *verify_failed, char *err, size_t errsz)
+                                bool *verify_failed, char *err, size_t errsz,
+                                int timeout_ms, int cancel_fd)
 {
    (void)pthread_once(&host_sigpipe_once, ignore_host_sigpipe);
    if (verify_failed) *verify_failed = false;
@@ -1203,8 +1333,28 @@ struct dvm_tls *dvm_tls_connect(int fd, const char *host, int verify,
          else X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(t->ssl), host);
       }
    }
-   ERR_clear_error();
-   if (SSL_connect(t->ssl) != 1) {
+   if (luna_socket_nonblock(fd, 1) != 0) {
+      snprintf(err, errsz, "TLS nonblocking mode: %s", strerror(errno));
+      dvm_tls_free(t);
+      return NULL;
+   }
+   int connected;
+   for (;;) {
+      ERR_clear_error();
+      connected = SSL_connect(t->ssl);
+      if (connected == 1) break;
+      int want = SSL_get_error(t->ssl, connected);
+      if (want != SSL_ERROR_WANT_READ && want != SSL_ERROR_WANT_WRITE) break;
+      int w = dvm_socket_wait(fd, (short)(want == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN),
+                              timeout_ms, cancel_fd);
+      if (w) {
+         snprintf(err, errsz, "TLS handshake with %s: %s", host ? host : "?",
+                  w == -2 ? "timed out" : strerror(errno));
+         dvm_tls_free(t);
+         return NULL;
+      }
+   }
+   if (connected != 1) {
       unsigned long e = ERR_get_error();
       char ebuf[160] = "";
       if (e) ERR_error_string_n(e, ebuf, sizeof ebuf);
@@ -1219,79 +1369,168 @@ struct dvm_tls *dvm_tls_connect(int fd, const char *host, int verify,
    }
    SSL_set_mode(t->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE |
                         SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-   if (luna_socket_nonblock(fd, 1) != 0) {
-      snprintf(err, errsz, "TLS nonblocking mode: %s", strerror(errno));
-      dvm_tls_free(t);
-      return NULL;
-   }
    return t;
+}
+
+struct dvm_tls *dvm_tls_connect(int fd, const char *host, int verify,
+                                const uint8_t *alpn, size_t alpn_len,
+                                int min_version, int max_version,
+                                const char *const *ciphers, int nciphers,
+                                bool *verify_failed, char *err, size_t errsz)
+{
+   return dvm_tls_connect_cancel(fd, host, verify, alpn, alpn_len,
+          min_version, max_version, ciphers, nciphers, verify_failed, err, errsz,
+          0, -1);
 }
 
 /* Sleeps until the fd can do what the session asked for.  0 = ready,
  * -2 = timed out, -1 = error. */
-static int tls_wait(int fd, int want, int timeout_ms)
+int dvm_socket_wait(int fd, short events, int timeout_ms, int cancel_fd)
 {
-   struct pollfd p = {
-      .fd = fd,
-      .events = (short)(want == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN),
+   struct pollfd p[2] = {
+      { .fd = fd, .events = events },
+      { .fd = cancel_fd, .events = POLLIN },
    };
    int r;
-   do r = luna_socket_poll(&p, 1, timeout_ms > 0 ? timeout_ms : -1);
+   do r = luna_socket_poll(p, cancel_fd >= 0 ? 2 : 1,
+                           timeout_ms > 0 ? timeout_ms : -1);
    while (r < 0 && errno == EINTR);
    if (r == 0) return -2;
    if (r < 0) return -1;
-   return 0;   /* POLLHUP/POLLERR: the next SSL call reports it */
+   if (cancel_fd >= 0 && p[1].revents) {
+      errno = ECANCELED;
+      return -1;
+   }
+   return 0; /* HUP/ERR: the next socket operation reports it. */
 }
 
-long dvm_tls_read(struct dvm_tls *t, void *buf, size_t n, int timeout_ms)
+static int tls_wait(int fd, int want, int timeout_ms, int cancel_fd)
 {
-   if (!t || !t->ssl) return -1;
+   return dvm_socket_wait(fd,
+          (short)(want == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN),
+          timeout_ms, cancel_fd);
+}
+
+long dvm_tls_read_error_cancel(struct dvm_tls *t, void *buf, size_t n,
+                         int timeout_ms, int cancel_fd, char *error, size_t error_size)
+{
+   if (error_size) error[0] = 0;
+   if (!t || !t->ssl) {
+      if (error_size) snprintf(error, error_size, "TLS session unavailable");
+      errno = EINVAL;
+      return -1;
+   }
    const int want_n = (int)(n > 0x7fffffff ? 0x7fffffff : n);
    for (;;) {
       pthread_mutex_lock(&t->mu);
+      if (error_size) error[0] = 0;
       ERR_clear_error();
       errno = 0;
       int r = SSL_read(t->ssl, buf, want_n);
       int e = r > 0 ? SSL_ERROR_NONE : SSL_get_error(t->ssl, r);
       const int err = errno;
+      unsigned long code = ERR_peek_last_error();
+      bool transport_eof = e == SSL_ERROR_SYSCALL && r == 0 && err == 0;
+#ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+      /* Android 12 Conscrypt's socket SSL_read maps BoringSSL transport EOF
+       * to end-of-stream. OpenSSL 3 moved that same condition from SYSCALL
+       * to SSL_ERROR_SSL; map only its specific reason, never other TLS errors.
+       * HTTP framing and truncated-body detection remain the caller's job. */
+      transport_eof |= e == SSL_ERROR_SSL &&
+                       ERR_GET_LIB(code) == ERR_LIB_SSL &&
+                       ERR_GET_REASON(code) == SSL_R_UNEXPECTED_EOF_WHILE_READING;
+#endif
+      /* OpenSSL errors belong to this calling thread. Copy them before
+       * releasing the session and before a retry clears the queue. */
+      if (e != SSL_ERROR_NONE && e != SSL_ERROR_ZERO_RETURN &&
+          e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE && error_size) {
+         if (code) ERR_error_string_n(code, error, error_size);
+         else snprintf(error, error_size, "%s", strerror(err ? err : EIO));
+      }
       pthread_mutex_unlock(&t->mu);
       if (r > 0) return r;
-      if (e == SSL_ERROR_ZERO_RETURN) return 0;
+      if (e == SSL_ERROR_ZERO_RETURN || transport_eof) {
+         if (error_size) error[0] = 0;
+         return 0;
+      }
       if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
-         int w = tls_wait(t->fd, e, timeout_ms);
-         if (w) return w;
+         int w = tls_wait(t->fd, e, timeout_ms, cancel_fd);
+         if (w) {
+            if (error_size) snprintf(error, error_size, "%s",
+                     w == -2 ? "Read timed out" : strerror(errno));
+            return w;
+         }
          continue;
       }
       if (e == SSL_ERROR_SYSCALL && err == EINTR) continue;
-      /* A peer that just went away without close_notify: end of stream, as
-       * the plain socket reports it. */
-      if (e == SSL_ERROR_SYSCALL && err == 0) return 0;
+      errno = err ? err : EIO;
       return -1;
    }
 }
 
-long dvm_tls_write(struct dvm_tls *t, const void *buf, size_t n)
+long dvm_tls_read(struct dvm_tls *t, void *buf, size_t n, int timeout_ms)
 {
-   if (!t || !t->ssl) return -1;
+   return dvm_tls_read_cancel(t, buf, n, timeout_ms, -1);
+}
+
+long dvm_tls_write_error_cancel(struct dvm_tls *t, const void *buf, size_t n,
+                          int cancel_fd, char *error, size_t error_size)
+{
+   if (error_size) error[0] = 0;
+   if (!t || !t->ssl) {
+      if (error_size) snprintf(error, error_size, "TLS session unavailable");
+      errno = EINVAL;
+      return -1;
+   }
    size_t done = 0;
    while (done < n) {
       pthread_mutex_lock(&t->mu);
+      if (error_size) error[0] = 0;
       ERR_clear_error();
       errno = 0;
       int w = SSL_write(t->ssl, (const char *)buf + done,
                         (int)((n - done) > 0x7fffffff ? 0x7fffffff : n - done));
       int e = w > 0 ? SSL_ERROR_NONE : SSL_get_error(t->ssl, w);
       const int err = errno;
+      /* OpenSSL errors belong to this calling thread. Copy them before
+       * releasing the session and before a retry clears the queue. */
+      if (e != SSL_ERROR_NONE && e != SSL_ERROR_ZERO_RETURN &&
+          e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE && error_size) {
+         unsigned long code = ERR_peek_last_error();
+         if (code) ERR_error_string_n(code, error, error_size);
+         else snprintf(error, error_size, "%s", strerror(err ? err : EIO));
+      }
       pthread_mutex_unlock(&t->mu);
       if (w > 0) { done += (size_t)w; continue; }
       if (e == SSL_ERROR_WANT_WRITE || e == SSL_ERROR_WANT_READ) {
-         if (tls_wait(t->fd, e, 0) < 0) return -1;
+         if (tls_wait(t->fd, e, 0, cancel_fd) < 0) {
+            if (error_size) snprintf(error, error_size, "%s", strerror(errno));
+            return -1;
+         }
          continue;
       }
       if (e == SSL_ERROR_SYSCALL && err == EINTR) continue;
+      errno = err ? err : EIO;
       return -1;
    }
    return (long)done;
+}
+
+long dvm_tls_write(struct dvm_tls *t, const void *buf, size_t n)
+{
+   return dvm_tls_write_cancel(t, buf, n, -1);
+}
+
+long dvm_tls_read_cancel(struct dvm_tls *t, void *buf, size_t n,
+                         int timeout_ms, int cancel_fd)
+{
+   return dvm_tls_read_error_cancel(t, buf, n, timeout_ms, cancel_fd, NULL, 0);
+}
+
+long dvm_tls_write_cancel(struct dvm_tls *t, const void *buf, size_t n,
+                          int cancel_fd)
+{
+   return dvm_tls_write_error_cancel(t, buf, n, cancel_fd, NULL, 0);
 }
 
 size_t dvm_tls_pending(struct dvm_tls *t)
