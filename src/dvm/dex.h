@@ -232,6 +232,8 @@ int dex_proto_params(struct dex_file *d, uint32_t proto_idx,
 
 /* Builds "(Ljava/lang/String;I)V" into `buf`.  Returns false when it does not
  * fit or the proto is invalid. */
+/* Allocated full descriptor; caller owns the returned string. */
+char *dex_proto_signature_alloc(struct dex_file *d, uint32_t proto_idx);
 bool dex_proto_signature(struct dex_file *d, uint32_t proto_idx,
                          char *buf, size_t buf_sz);
 

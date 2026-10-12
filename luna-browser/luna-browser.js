@@ -14,6 +14,21 @@
 const L = __lb;
 delete g.__lb;
 
+/* Bumped by every change to the tree, so what was computed from it (child
+ * lists, sibling positions) can be reused until the next change.  Page scripts
+ * walk siblings in loops; recomputing the list per step made that quadratic. */
+let domVer = 0;
+for (const k of ['create', 'createText', 'insert', 'remove', 'setText', 'setHTML']) {
+   const f = L[k];
+   L[k] = function (...a) { domVer++; return f.apply(this, a); };
+}
+const indexIn = (lst, node) => {
+   let m = lst._ix;
+   if (!m) { m = new Map(); for (let i = 0; i < lst.length; i++) m.set(lst[i], i); Object.defineProperty(lst, '_ix', { value: m, configurable: true }); }
+   const i = m.get(node);
+   return i === undefined ? -1 : i;
+};
+
 const T0 = L.now();
 /* The engine's own Promise: a page may replace the global one with a
  * polyfill built on queueMicrotask, which must not come back here. */
@@ -126,6 +141,7 @@ class TouchEvent extends UIEvent {
 }
 class MessageEvent extends Event { constructor(t, i = {}) { super(t, i); this.data = i.data; this.origin = i.origin || ''; this.source = i.source || null; this.ports = []; } }
 class ProgressEvent extends Event { constructor(t, i = {}) { super(t, i); this.loaded = i.loaded || 0; this.total = i.total || 0; this.lengthComputable = !!i.lengthComputable; } }
+class PromiseRejectionEvent extends Event { constructor(t, i = {}) { super(t, i); this.promise = i.promise; this.reason = i.reason; } }
 class ErrorEvent extends Event { constructor(t, i = {}) { super(t, i); this.message = i.message || ''; this.error = i.error || null; } }
 class PopStateEvent extends Event { constructor(t, i = {}) { super(t, i); this.state = i.state === undefined ? null : i.state; } }
 
@@ -251,8 +267,8 @@ class Node extends EventTarget {
    get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
    get firstChild() { return this.childNodes[0] || null; }
    get lastChild() { const c = this.childNodes; return c[c.length - 1] || null; }
-   get nextSibling() { const p = this.parentNode; if (!p) return null; const c = p.childNodes; return c[c.indexOf(this) + 1] || null; }
-   get previousSibling() { const p = this.parentNode; if (!p) return null; const c = p.childNodes; const i = c.indexOf(this); return i > 0 ? c[i - 1] : null; }
+   get nextSibling() { const p = this.parentNode; if (!p) return null; const c = p.childNodes; const i = indexIn(c, this); return i < 0 ? null : c[i + 1] || null; }
+   get previousSibling() { const p = this.parentNode; if (!p) return null; const c = p.childNodes; const i = indexIn(c, this); return i > 0 ? c[i - 1] : null; }
    hasChildNodes() { return this.childNodes.length > 0; }
    contains(n) { for (; n; n = n.parentNode) if (n === this) return true; return false; }
    getRootNode() { let n = this; while (n.parentNode) n = n.parentNode; return n; }
@@ -307,6 +323,7 @@ class Node extends EventTarget {
          L.insert(this._uid, c._uid, before);
       } else {
          /* A virtual parent, or a virtual child of a rendered parent. */
+         domVer++;
          if (!this._vkids) hide(this, '_vkids', []);
          const i = ref ? this._vkids.indexOf(ref) : -1;
          if (i >= 0) this._vkids.splice(i, 0, c); else this._vkids.push(c);
@@ -341,6 +358,7 @@ Node.DOCUMENT_POSITION_CONTAINS = 8; Node.DOCUMENT_POSITION_CONTAINED_BY = 16;
 
 function detach(c) {
    if (c._vparent) {
+      domVer++;
       const k = c._vparent._vkids, i = k ? k.indexOf(c) : -1;
       if (i >= 0) k.splice(i, 1);
       c._vparent = null;
@@ -361,12 +379,20 @@ function connected(n) {
       if (type && !/^(text|application)\/(x-)?(java|ecma)script$/.test(type) && type !== 'module') return;
       const src = n.getAttribute('src');
       if (src) {
-         setTimeout(() => {
+         const run = ok0 => {
             const prev = document._current;
             document._current = n;
-            const ok = L.evalURL(src, type === 'module');
+            const ok = ok0();
             document._current = prev;
             n.dispatchEvent(new Event(ok ? 'load' : 'error'));
+         };
+         setTimeout(() => {
+            if (L.isCached(src)) return run(() => L.evalURL(src, type === 'module'));
+            /* a script the page adds is async: fetched off the main thread, run when it arrives */
+            httpAsync('GET', src, '', '', false, r => {
+               if (!r || r.error || r.status < 200 || r.status >= 300) return run(() => false);
+               run(() => L.evalCode(r.body, src, type === 'module'));
+            });
          }, 0);
       } else if (n.textContent) {
          const prev = document._current;
@@ -378,11 +404,14 @@ function connected(n) {
       L.css(n.textContent || '');
    } else if (n.localName === 'link' && !n._uid && /stylesheet/i.test(n.getAttribute('rel') || '')) {
       const href = n.getAttribute('href');
-      setTimeout(() => {
-         const r = href ? L.http('GET', href, '', null, false) : { status: 0 };
-         if (r.status >= 200 && r.status < 300) L.css(r.body);
-         n.dispatchEvent(new Event(r.status >= 200 && r.status < 300 ? 'load' : 'error'));
-      }, 0);
+      /* off the main thread: a slow stylesheet must not freeze the page */
+      const done = r => {
+         const ok = r && !r.error && r.status >= 200 && r.status < 300;
+         if (ok) L.css(r.body);
+         n.dispatchEvent(new Event(ok ? 'load' : 'error'));
+      };
+      if (href) setTimeout(() => httpAsync('GET', href, '', '', false, done), 0);
+      else setTimeout(() => done(null), 0);
    }
    if (n._vkids) for (const k of n._vkids) connected(k);
 }
@@ -505,6 +534,13 @@ function datasetProxy(el) {
    });
 }
 
+class DOMPointReadOnly {
+   constructor(x = 0, y = 0, z = 0, w = 1) { this.x = x; this.y = y; this.z = z; this.w = w; }
+   static fromPoint(p = {}) { return new this(p.x, p.y, p.z, p.w); }
+   matrixTransform() { return new DOMPointReadOnly(this.x, this.y, this.z, this.w); }
+   toJSON() { return { x: this.x, y: this.y, z: this.z, w: this.w }; }
+}
+class DOMPoint extends DOMPointReadOnly {}
 class DOMRect {
    constructor(x = 0, y = 0, w = 0, h = 0) { this.x = x; this.y = y; this.width = w; this.height = h; }
    get left() { return this.x; } get top() { return this.y; }
@@ -531,6 +567,13 @@ class Element extends Node {
       return null;
    }
    get childNodes() {
+      if (this._cnv === domVer && this._cn) return this._cn;
+      const res = this._childNodes();
+      Object.defineProperty(this, '_cn', { value: res, writable: true, configurable: true });
+      Object.defineProperty(this, '_cnv', { value: domVer, writable: true, configurable: true });
+      return res;
+   }
+   _childNodes() {
       if (!this._uid && this === document.documentElement)
          return list([document.head, document.body].filter(Boolean));
       const out = this._uid ? L.children(this._uid).map(W) : [];
@@ -541,12 +584,18 @@ class Element extends Node {
       if (this._vkids) out.push(...this._vkids);
       return list(out);
    }
-   get children() { return list(this.childNodes.filter(n => n.nodeType === 1)); }
+   get children() {
+      if (this._chv === domVer && this._ch) return this._ch;
+      const res = list(this.childNodes.filter(n => n.nodeType === 1));
+      Object.defineProperty(this, '_ch', { value: res, writable: true, configurable: true });
+      Object.defineProperty(this, '_chv', { value: domVer, writable: true, configurable: true });
+      return res;
+   }
    get childElementCount() { return this.children.length; }
    get firstElementChild() { return this.children[0] || null; }
    get lastElementChild() { const c = this.children; return c[c.length - 1] || null; }
-   get nextElementSibling() { const p = this.parentNode; if (!p) return null; const c = p.children; return c[c.indexOf(this) + 1] || null; }
-   get previousElementSibling() { const p = this.parentNode; if (!p) return null; const c = p.children; const i = c.indexOf(this); return i > 0 ? c[i - 1] : null; }
+   get nextElementSibling() { const p = this.parentNode; if (!p) return null; const c = p.children; const i = indexIn(c, this); return i < 0 ? null : c[i + 1] || null; }
+   get previousElementSibling() { const p = this.parentNode; if (!p) return null; const c = p.children; const i = indexIn(c, this); return i > 0 ? c[i - 1] : null; }
 
    getAttribute(n) {
       n = String(n).toLowerCase();
@@ -563,6 +612,16 @@ class Element extends Node {
       if (this._uid) L.removeAttr(this._uid, n); else if (this._attrs) this._attrs.delete(n);
    }
    hasAttribute(n) { return this.getAttribute(n) !== null; }
+   getAttributeNode(n) {
+      const v = this.getAttribute(n);
+      if (v === null) return null;
+      const el = this;
+      n = String(n).toLowerCase();
+      return { name: n, nodeName: n, localName: n, nodeType: 2, specified: true, ownerElement: el,
+               get value() { return el.getAttribute(n); }, set value(x) { el.setAttribute(n, x); },
+               get nodeValue() { return el.getAttribute(n); }, set nodeValue(x) { el.setAttribute(n, x); } };
+   }
+   hasAttributes() { return this.getAttributeNames().length > 0; }
    toggleAttribute(n, f) { const h = this.hasAttribute(n); if (f === true || (f === undefined && !h)) { this.setAttribute(n, ''); return true; } this.removeAttribute(n); return false; }
    getAttributeNames() { return this._uid ? L.attrNames(this._uid) : this._attrs ? [...this._attrs.keys()] : []; }
    hasAttributes() { return this.getAttributeNames().length > 0; }
@@ -588,8 +647,8 @@ class Element extends Node {
    }
    set textContent(v) {
       v = v === null || v === undefined ? '' : String(v);
-      if (this._uid) { this._vkids = null; L.setText(this._uid, v); }
-      else { this._vkids = null; this._text = v; if (this.localName === 'style' && this.isConnected) L.css(v); }
+      if (this._uid) { this._vkids = null; domVer++; L.setText(this._uid, v); }
+      else { this._vkids = null; domVer++; this._text = v; if (this.localName === 'style' && this.isConnected) L.css(v); }
    }
    get innerText() { return this.textContent; } set innerText(v) { this.textContent = v; }
    get outerText() { return this.textContent; }
@@ -600,13 +659,13 @@ class Element extends Node {
    }
    set innerHTML(v) {
       v = v === null || v === undefined ? '' : String(v);
-      if (this._uid) { this._vkids = null; L.setHTML(this._uid, v); }
+      if (this._uid) { this._vkids = null; domVer++; L.setHTML(this._uid, v); }
       else if (/^(script|style|title|textarea)$/.test(this.localName)) this._text = v;
       else {
          /* Parse through a rendered holder, then move the nodes here. */
          const holder = document.createElement('div');
          L.setHTML(holder._uid, v);
-         this._vkids = null;
+         this._vkids = null; domVer++;
          for (const k of holder.childNodes) this.appendChild(k);
       }
    }
@@ -771,6 +830,9 @@ class HTMLInputElement extends HTMLElement {
    get checked() { return this._checked !== undefined ? this._checked : this.hasAttribute('checked'); }
    set checked(v) { hide(this, '_checked', !!v); if (this._uid) L.setChecked(this._uid, !!v); }
    get defaultValue() { return this.getAttribute('value') || ''; }
+   set defaultValue(v) { this.setAttribute('value', v); }
+   get defaultChecked() { return this.hasAttribute('checked'); }
+   set defaultChecked(v) { this.toggleAttribute('checked', !!v); }
    get form() { return this.closest('form'); }
    select() { this.focus(); }
    setSelectionRange() {}
@@ -829,12 +891,25 @@ class HTMLImageElement extends HTMLElement {
       const src = this.getAttribute('src');
       hide(this, '_pending', true);
       const token = (this._tok = (this._tok || 0) + 1);
+      const finish = sz => {
+         if (token !== this._tok) return;
+         hide(this, '_pending', false);
+         if (sz) { hide(this, '_nw', sz[0]); hide(this, '_nh', sz[1]); this.dispatchEvent(new Event('load')); L.redraw(); }
+         else this.dispatchEvent(new Event('error'));
+      };
       setTimeout(() => {
          if (token !== this._tok) return;
-         const sz = src ? L.imageSize(src) : null;
-         hide(this, '_pending', false);
-         if (sz) { hide(this, '_nw', sz[0]); hide(this, '_nh', sz[1]); this.dispatchEvent(new Event('load')); }
-         else this.dispatchEvent(new Event('error'));
+         if (!src) return finish(null);
+         const have = L.imageSize(src, 1);
+         if (have !== undefined) return finish(have);
+         if (/^(data|blob):/i.test(src)) return finish(L.imageSize(src));
+         /* off the network, so a slow picture or a tracking pixel never stalls the page */
+         httpAsync('GET', src, '', '', true, r => {
+            if (token !== this._tok) return;
+            if (r.error || r.status < 200 || r.status >= 300 || !r.body) return finish(null);
+            L.cachePut(src, r.body);
+            finish(L.imageSize(src, 1) || null);
+         });
       }, 0);
    }
 }
@@ -1064,9 +1139,20 @@ g.document = document;
 
 g.window = g; g.self = g; g.top = g; g.parent = g; g.frames = g; g.opener = null;
 for (const k of ['onload', 'onerror', 'onresize', 'onfocus', 'onblur', 'onscroll', 'onbeforeunload', 'onunload']) g[k] = null;
+/* `'onkeydown' in element` must be true: frameworks (preact) pick the event's name from it.
+ * invoke() reads the property when an event is dispatched. */
+for (const n of ['abort', 'animationend', 'animationstart', 'beforeinput', 'blur', 'cancel', 'change', 'click', 'close', 'contextmenu',
+                 'copy', 'cut', 'dblclick', 'drag', 'dragend', 'dragenter', 'dragleave', 'dragover', 'dragstart', 'drop', 'error',
+                 'focus', 'focusin', 'focusout', 'input', 'invalid', 'keydown', 'keypress', 'keyup', 'load', 'mousedown', 'mouseenter',
+                 'mouseleave', 'mousemove', 'mouseout', 'mouseover', 'mouseup', 'paste', 'pointercancel', 'pointerdown', 'pointerenter',
+                 'pointerleave', 'pointermove', 'pointerout', 'pointerover', 'pointerup', 'reset', 'resize', 'scroll', 'select',
+                 'selectstart', 'submit', 'toggle', 'touchcancel', 'touchend', 'touchmove', 'touchstart', 'transitionend', 'wheel']) {
+   if (!(('on' + n) in Node.prototype)) Object.defineProperty(Node.prototype, 'on' + n, { value: null, writable: true, configurable: true });
+   if (!(('on' + n) in g)) g['on' + n] = null;
+}
 g.name = ''; g.closed = false; g.length = 0; g.frameElement = null;
 for (const k of ['addEventListener', 'removeEventListener', 'dispatchEvent'])
-   g[k] = EventTarget.prototype[k];
+   g[k] = EventTarget.prototype[k].bind(g);      /* callable as a bare function, as in a browser */
 Object.defineProperties(g, {
    innerWidth: { get: () => L.viewport()[0], configurable: true },
    innerHeight: { get: () => L.viewport()[1], configurable: true },
@@ -1267,6 +1353,8 @@ g.navigator = {
    maxTouchPoints: 5, hardwareConcurrency: 8, deviceMemory: 4,
    plugins: [], mimeTypes: [],
    connection: { effectiveType: '4g', downlink: 10, rtt: 50, saveData: false, type: 'wifi', addEventListener() {} },
+   userAgentData: { brands: [], mobile: /Mobile/.test(L.userAgent), platform: /Android/.test(L.userAgent) ? 'Android' : 'Linux',
+                    getHighEntropyValues: () => Promise.resolve({}), toJSON() { return {}; } },
    clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
    permissions: { query: () => Promise.resolve({ state: 'prompt', addEventListener() {} }) },
    sendBeacon(u, d) { setTimeout(() => L.http('POST', String(u), '', d === undefined ? null : String(d), false), 0); return true; },
@@ -1335,17 +1423,19 @@ g.__lb_tick = function (now) {
    for (const [id, t] of due) {
       if (!timers.has(id)) continue;
       if (t.ms) t.due = now + t.ms; else timers.delete(id);
+      const t0 = L.verbose ? L.now() : 0;
       try {
          if (typeof t.fn === 'function') t.fn.apply(g, t.args);
          else (0, eval)(String(t.fn));
       } catch (e) { reportError(e); }
+      if (L.verbose && L.now() - t0 > 150) L.log('warn', 'slow timer ' + Math.round(L.now() - t0) + 'ms: ' + String(t.fn).replace(/\s+/g, ' ').slice(0, 160));
    }
    if (rafs.size && now - lastFrame >= 16) {
       lastFrame = now;
       const cbs = [...rafs.values()];
       rafs.clear();
       const ts = now - T0;
-      for (const f of cbs) { try { f(ts); } catch (e) { reportError(e); } }
+      for (const f of cbs) { const t0 = L.verbose ? L.now() : 0; try { f(ts); } catch (e) { reportError(e); } if (L.verbose && L.now() - t0 > 150) L.log('warn', 'slow raf ' + Math.round(L.now() - t0) + 'ms: ' + String(f).replace(/\s+/g, ' ').slice(0, 160)); }
       L.redraw();
    }
    let next = rafs.size ? Math.max(0, 16 - (L.now() - lastFrame)) : -1;
@@ -1736,9 +1826,9 @@ g.CSS = CSS;
 /* Constructors pages test for or instantiate. */
 Object.assign(g, {
    Event, CustomEvent, UIEvent, MouseEvent, PointerEvent, WheelEvent, KeyboardEvent, FocusEvent, InputEvent,
-   TouchEvent, Touch, MessageEvent, ProgressEvent, ErrorEvent, PopStateEvent, EventTarget,
+   TouchEvent, Touch, MessageEvent, ProgressEvent, ErrorEvent, PromiseRejectionEvent, PopStateEvent, EventTarget,
    Node, Element, HTMLElement, Text, Comment, CharacterData, Document, HTMLDocument: Document, DocumentFragment,
-   NodeList, HTMLCollection: NodeList, DOMTokenList, DOMRect, DOMException,
+   DOMPoint, DOMPointReadOnly, NodeList, HTMLCollection: NodeList, DOMTokenList, DOMRect, DOMException,
    HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLButtonElement,
    HTMLAnchorElement, HTMLImageElement, HTMLFormElement, HTMLScriptElement, HTMLStyleElement, HTMLLinkElement,
    HTMLMetaElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, HTMLIFrameElement,
@@ -1855,11 +1945,26 @@ g.__lb_key = function (type, key, code) {
    const t = W(L.focus()) || document.body || document;
    const ev = new KeyboardEvent(type, { bubbles: true, cancelable: true, key, code: key.length === 1 ? 'Key' + key.toUpperCase() : key, keyCode: code });
    const ok = dispatch(t, ev);
-   if (ok && type === 'keydown' && key === 'Enter' && t.localName === 'input') {
+   /* keypress follows an unprevented keydown for Enter, as in a browser; many sites listen for it */
+   const pressed = ok && type === 'keydown' && key === 'Enter'
+      ? dispatch(t, new KeyboardEvent('keypress', { bubbles: true, cancelable: true, key, code: key, keyCode: 13, charCode: 13 })) : ok;
+   if (ok && pressed && type === 'keydown' && key === 'Enter' && t.localName === 'input') {
       const f = t.closest('form');
       if (f) f.requestSubmit();
    }
-   return !ok;
+   return !(ok && pressed);
+};
+/* A character typed (it arrives as text): the key events a browser sends around it.
+ * phase 0: keydown + keypress, true when a handler cancelled them; phase 1: keyup. */
+g.__lb_typed = function (ch, phase) {
+   const t = W(L.focus()) || document.body || document;
+   const up = ch.toUpperCase();
+   const code = /^[A-Za-z0-9]$/.test(ch) ? up.charCodeAt(0) : 0;
+   const init = { bubbles: true, cancelable: true, key: ch, code: /^[A-Za-z]$/.test(ch) ? 'Key' + up : /^[0-9]$/.test(ch) ? 'Digit' + ch : '', keyCode: code };
+   if (phase === 1) { dispatch(t, new KeyboardEvent('keyup', init)); return false; }
+   const kd = dispatch(t, new KeyboardEvent('keydown', init));
+   const kp = kd && dispatch(t, new KeyboardEvent('keypress', Object.assign({ charCode: ch.charCodeAt(0), keyCode: ch.charCodeAt(0) }, init, { keyCode: ch.charCodeAt(0) })));
+   return !(kd && kp);
 };
 g.__lb_resize = function () { dispatch(g, new UIEvent('resize')); };
 let parserScripts = [];

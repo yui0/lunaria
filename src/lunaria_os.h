@@ -1130,6 +1130,12 @@ struct tm;
 /* Local conversions use the installed TZ; UTC conversions ignore it. */
 int luna_os_time_break(int64_t seconds, int local, struct tm *result, int64_t *offset);
 int luna_os_time_make(struct tm *value, int64_t *seconds, int64_t *offset);
+/* UTC conversion normalizes value and ignores the installed timezone. */
+int luna_os_time_make_utc(struct tm *value, int64_t *seconds);
+/* strptime(): fields the format does not mention keep their value.  The UTC
+ * offset is passed separately (*gmtoff in and out) because struct tm has no
+ * tm_gmtoff on every host.  Returns the first unparsed byte, or NULL. */
+char *luna_os_strptime(const char *input, const char *format, struct tm *value, long *gmtoff);
 
 /* Android's single C.UTF-8 locale, with C as a host fallback.
  * A NULL use() argument restores the host global locale. */

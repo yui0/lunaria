@@ -1859,6 +1859,19 @@ enum SvcId : uint32_t {
     SVC_FWRITE_CHK,
     SVC_PREAD_CHK,
     SVC_PTHREAD_COND_TIMEDWAIT_RELATIVE_NP,
+    SVC_NICE,
+    SVC_LIBC_FSTATAT,
+    SVC_DIRFD,
+    SVC_SETTIMEOFDAY,
+    SVC_SYSPROP_FIND_NTH,
+    SVC_CACHEFLUSH,
+    SVC_EGL_QUERYCTX,
+    SVC_TIMEGM,
+    SVC_SETSID,
+    SVC_GETSID,
+    SVC_GETPGID,
+    SVC_GETPGRP,
+    SVC_SETPGID,
     /* Add new SVCs above this line.  One past the highest SVC: build_jni_tables()
      * builds a trampoline for every number below it, and the unknown-symbol pool
      * starts here. */

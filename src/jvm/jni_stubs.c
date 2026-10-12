@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include "jvm/jni.h"
 #include "jvm.h"
+#include "java_type.h"
 #include "arm_exec.h"
 #include "dvm/dvm_jni.h"
 
@@ -393,7 +394,9 @@ java_lang_Class_getName(JNIEnv *env, jobject object)
 
       if ((jvm.jnienv_get_jvm.ptr = luna_os_library_symbol(NULL, "jnienv_get_jvm")) && (jvm.jvm_get_class_name.ptr = luna_os_library_symbol(NULL, "jvm_get_class_name"))) {
          struct jvm *jvm_ = jvm.jnienv_get_jvm.fun(env);
-         return (*env)->NewStringUTF(env, jvm.jvm_get_class_name.fun(jvm_, object));
+         const char *name = jvm.jvm_get_class_name.fun(jvm_, object);
+         const char *primitive = luna_java_primitive_name(name);
+         return (*env)->NewStringUTF(env, primitive ? primitive : name);
       }
    }
 

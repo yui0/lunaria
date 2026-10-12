@@ -2282,11 +2282,28 @@ int luna_apk_restart(const char *profile)
    fprintf(stderr, "[apk] restarting under profile %s\n", profile);
    fflush(NULL);
 #ifdef _WIN32
-   _execv(exe, (char *const *)args);
+   _execv(exe, args);   /* the CRT takes const char *const * */
 #else
    execv(exe, (char *const *)args);
 #endif
    free(args);
+   return -1;
+}
+
+/* Starts over with no arguments: the screen a launch without an APK shows,
+ * where another one can be chosen.  Returns only when it could not. */
+int luna_apk_restart_launcher(void)
+{
+   char exe[APK_PATH];
+   if (luna_os_executable_path(exe, sizeof exe)) return -1;
+   const char *args[2] = { exe, NULL };
+   fprintf(stderr, "[apk] returning to the launcher\n");
+   fflush(NULL);
+#ifdef _WIN32
+   _execv(exe, args);
+#else
+   execv(exe, (char *const *)args);
+#endif
    return -1;
 }
 

@@ -108,6 +108,8 @@ struct dvm_class {
    struct dvm_class *elem;     /* arrays */
 
    dvm_ref class_object;       /* the java.lang.Class instance, made lazily */
+   dvm_ref defining_loader;    /* generated classes retain their loader */
+   bool generated_proxy;
    struct dvm_class *hash_next;
 
    /* Methods already looked up on this class — see dvm_find_method(). */
@@ -141,6 +143,9 @@ struct dvm_object {
    /* Builtin payloads may own nested allocations. The callback releases
     * those allocations and the payload itself; plain arrays use free(). */
    void (*data_destroy)(void *);
+   /* Optional owner passed to data_destroy when data is an interior pointer
+    * (for example an unaligned window into a file mapping). */
+   void *data_owner;
 
    /* java.lang.Class */
    struct dvm_class *klass;
@@ -181,6 +186,7 @@ struct dvm_dex {
     * own file, so the caches live here rather than in the VM. */
    struct dvm_class **type_cache;
    struct dvm_method **method_cache;
+   char **proto_cache;
    struct dvm_field **field_cache;
    dvm_ref *string_cache;
 };
@@ -216,6 +222,7 @@ struct dvm {
    uint32_t free_head;
 
    dvm_ref exception;
+   dvm_ref content_observers; /* process ContentResolver registrations */
    /* Frames the current exception unwound through, innermost first.  A bare
     * "NullPointerException: String.length" says nothing about which of the
     * app's methods hit it; this makes an uncaught throw locatable without
@@ -348,6 +355,9 @@ struct dvm_class *dvm__register_builtin(struct dvm *vm, const char *desc);
 struct dvm_class *dvm__define_primitive(struct dvm *vm, const char *desc);
 struct dvm_class *dvm__class_by_desc(struct dvm *vm, const char *desc);
 void dvm__activity_visible(struct dvm *vm, dvm_ref activity);
+/* Activity.dispatchActivity{Pre,Post}<step>(): see dvm_runtime.c. */
+void dvm__activity_dispatch(struct dvm *vm, dvm_ref activity, const char *step,
+                            bool post, dvm_ref bundle);
 void dvm__main_queue_idle(struct dvm *vm, bool dispatched);
 
 bool dvm__class_assignable(struct dvm *vm, struct dvm_class *from,

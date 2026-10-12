@@ -1448,7 +1448,19 @@ long dvm_tls_read_error_cancel(struct dvm_tls *t, void *buf, size_t n,
          else snprintf(error, error_size, "%s", strerror(err ? err : EIO));
       }
       pthread_mutex_unlock(&t->mu);
-      if (r > 0) return r;
+      if (r > 0) {
+         if (getenv("LUNARIA_TRACE_TLS")) {
+            char shown[4097];
+            size_t count = (size_t)r < sizeof shown - 1 ? (size_t)r : sizeof shown - 1;
+            for (size_t i = 0; i < count; ++i) {
+               unsigned char c = ((const unsigned char *)buf)[i];
+               shown[i] = c >= 0x20 && c < 0x7f ? (char)c : '.';
+            }
+            shown[count] = '\0';
+            fprintf(stderr, "[tls] read %d: %s\n", r, shown);
+         }
+         return r;
+      }
       if (e == SSL_ERROR_ZERO_RETURN || transport_eof) {
          if (error_size) error[0] = 0;
          return 0;
@@ -1483,6 +1495,18 @@ long dvm_tls_write_error_cancel(struct dvm_tls *t, const void *buf, size_t n,
       return -1;
    }
    size_t done = 0;
+   if (getenv("LUNARIA_TRACE_TLS")) {
+      /* What the app sends over TLS, printable bytes only (HTTP/2 frame
+       * headers and HPACK show as dots; a JSON body reads as it is). */
+      char shown[401];
+      size_t k = 0;
+      for (; k < n && k < sizeof shown - 1; ++k) {
+         unsigned char c = ((const unsigned char *)buf)[k];
+         shown[k] = c >= 0x20 && c < 0x7f ? (char)c : '.';
+      }
+      shown[k] = '\0';
+      fprintf(stderr, "[tls] write %zu: %s\n", n, shown);
+   }
    while (done < n) {
       pthread_mutex_lock(&t->mu);
       if (error_size) error[0] = 0;

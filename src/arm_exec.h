@@ -289,6 +289,8 @@ uint32_t arm_exec_env_va(void);
 
 /* Poll GLFW events (call from the render loop). */
 void arm_exec_glfw_poll(void);
+/* Host input only, and only on the window owner, while execution is paused. */
+void arm_exec_pause_poll(void);
 int arm_exec_host_ui_thread(void);
 void arm_exec_service_host_ui(void);
 
@@ -339,6 +341,9 @@ void     arm_exec_upload_texture_rgba(int tex, const uint8_t *rgba, int w, int h
  * asset.  This is the same lookup the native AAsset path uses — APK, split
  * APKs, OBB and the staged files tree. */
 unsigned char *arm_exec_asset_read(const char *name, size_t *len);
+/* Immediate asset children (files and directories), sorted and deduplicated.
+ * Both the array and its names are allocated with malloc; caller frees them. */
+char **arm_exec_asset_list(const char *name, size_t *count);
 /* Read a named member from a guest-visible zip/jar/apk.  Unlike the asset
  * helper this honours the archive argument and does not add assets/ prefixes. */
 unsigned char *arm_exec_zip_read(const char *archive, const char *name,
@@ -429,9 +434,10 @@ static inline uint32_t arsc_u32(const uint8_t *p)
 { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 struct arsc_bag_view { const uint8_t *maps; uint32_t count, parent; };
 typedef int (*arsc_score_fn)(const uint8_t *, size_t, uint8_t);
-static inline int arsc_find_bag(const uint8_t *b, size_t n, uint32_t id,
+struct arsc_entry_view { const uint8_t *entry; size_t available; int score; };
+static inline int arsc_find_entry(const uint8_t *b, size_t n, uint32_t id,
                          uint8_t orientation, arsc_score_fn score_config,
-                         struct arsc_bag_view *out)
+                         struct arsc_entry_view *out)
 {
    if (!b || n < 12 || arsc_u16(b) != 2) return 0;
    uint32_t table_size = arsc_u32(b + 4);
@@ -478,19 +484,12 @@ static inline int arsc_find_bag(const uint8_t *b, size_t n, uint32_t id,
                   if (off > ts-start || ts-start-off < 8) return 0;
                   const uint8_t *e=b+j+start+off;
                   size_t available=ts-start-off;
-                  uint16_t eh=arsc_u16(e), ef=arsc_u16(e+2);
+                  uint16_t eh=arsc_u16(e);
                   if (eh < 8 || eh > available) return 0;
                   int score=score_config ? score_config(b+j+20,th-20,orientation) : 0;
                   if (score >= 0 && score >= best) {
-                     best=score; found=0;
-                     if ((ef & 1) && eh >= 16) {
-                        uint32_t maps=arsc_u32(e+12);
-                        if (maps > (available-eh)/12) return 0;
-                        for (uint32_t k=0;k<maps;++k)
-                           if (arsc_u16(e+eh+k*12+4) != 8) return 0;
-                        out->maps=e+eh; out->count=maps; out->parent=arsc_u32(e+8);
-                        found=1;
-                     }
+                     best=score; found=1;
+                     out->entry=e; out->available=available; out->score=score;
                   }
                }
             }
@@ -502,14 +501,46 @@ static inline int arsc_find_bag(const uint8_t *b, size_t n, uint32_t id,
    return found;
 }
 
+static inline int arsc_find_bag(const uint8_t *b, size_t n, uint32_t id,
+                         uint8_t orientation, arsc_score_fn score_config,
+                         struct arsc_bag_view *out)
+{
+   struct arsc_entry_view view;
+   if (!arsc_find_entry(b,n,id,orientation,score_config,&view)) return 0;
+   const uint8_t *e=view.entry;
+   uint16_t eh=arsc_u16(e), ef=arsc_u16(e+2);
+   if (!(ef & 1) || eh < 16) return 0;
+   uint32_t maps=arsc_u32(e+12);
+   if (maps > (view.available-eh)/12) return 0;
+   for (uint32_t k=0;k<maps;++k)
+      if (arsc_u16(e+eh+k*12+4) != 8) return 0;
+   out->maps=e+eh; out->count=maps; out->parent=arsc_u32(e+8);
+   return 1;
+}
+
 /* resources.arsc name/value lookup used by android.content.res.Resources. */
 uint32_t arm_exec_apk_resource_id(const char *type, const char *name);
+/* The type and entry name of a resource id (1), or 0 when it has none here. */
+int arm_exec_apk_resource_name(uint32_t id, char *type, size_t type_cap,
+                               char *entry, size_t entry_cap);
 /* Value lookup returns the Res_value type, 'L' for a borrowed UTF-8 string,
  * or 0 if absent.  Preserve the type: dimensions are not integer literals. */
 int arm_exec_apk_resource_value(uint32_t id, int32_t *iv, const char **sv);
+/* Compiled string style, inclusive UTF-16 bounds. tag is borrowed; 1 span,
+ * 0 end/unstyled, -1 malformed. No text or APK modification. */
+int arm_exec_apk_resource_span(uint32_t id, size_t index, const char **tag,
+                              uint32_t *first, uint32_t *last);
 /* String-array bag: 1 success (including empty), 0 missing/invalid, -1 OOM.
  * Caller frees *values; strings are borrowed from the loaded resource table. */
 int arm_exec_apk_string_array(uint32_t id, const char ***values, size_t *count);
+/* Sorted bag entries, including inherited values and unresolved reference IDs.
+ * The caller frees entries; text is borrowed from the resource string pool. */
+typedef struct {
+    uint32_t key, data;
+    int type;
+    const char *text;
+} ArmExecResourceValue;
+int arm_exec_apk_resource_bag(uint32_t id, ArmExecResourceValue **entries, size_t *count);
 /* Resolve an attribute from a compiled style bag, following app-resource
  * parents.  Returns the Res_value data type, or 0 when absent. */
 int arm_exec_apk_style_value(uint32_t style_id, uint32_t attr_id,
@@ -707,6 +738,9 @@ int arm64_exec_load_library(const char *path, uint64_t base_addr);
  * arm64_exec_load_library runs it for every load — the main library,
  * System.loadLibrary, System.load and dlopen alike. */
 void arm64_loader_load_needed(const char *path);
+bool arm_loader_load_needed(const char *path, bool elf64);
+/* Dynamic-linker load: constructors, without Java's JNI_OnLoad notification. */
+int arm_exec_link_library(const char *path);
 
 /* The theme an Activity class starts with (its manifest android:theme, else
  * the application's), and whether a theme makes a floating window. */

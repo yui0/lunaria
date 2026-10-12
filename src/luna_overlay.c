@@ -20,6 +20,7 @@
  * (luna-window.h): one implementation for every host OS instead of a native
  * chooser per platform.  Its code has to sit in the translation unit that
  * defines the engine. */
+#define LUNA_UI_NANOSVG   /* vector drawables are handed over as SVG; nanosvg lives beside luna-ui */
 #define LUNA_UI_IMPLEMENTATION
 #include "luna-ui.h"
 #define LUNA_WINDOW_IMPLEMENTATION
@@ -70,6 +71,130 @@ static bool  g_from_files;   /* LUNARIA_UI_TEST names an HTML file */
 static int   g_w, g_h;
 static double g_last_time;
 
+/* SurfaceView CLEAR belongs to its window's buffer, never to the guest's
+ * surface or to another Android window. Reuse one transparent GPU layer for
+ * windows that need it; ordinary View windows keep the direct paint path. */
+static bool g_surface_holes;
+static GLuint g_window_fbo, g_window_tex, g_window_program;
+static GLint g_window_sampler;
+static int g_window_w, g_window_h;
+
+static void overlay_window_objects_forget(void)
+{
+   g_window_fbo = g_window_tex = g_window_program = 0;
+   g_window_w = g_window_h = 0;
+}
+
+static bool overlay_window_buffer(int w, int h)
+{
+   if (!g_window_program) {
+      g_window_program = create_shader_program(
+         "layout(location=0) in vec2 pos; out vec2 uv;"
+         "void main(){uv=pos;gl_Position=vec4(pos*2.0-1.0,0.0,1.0);}",
+         "in vec2 uv; uniform sampler2D image; out vec4 color;"
+         "void main(){color=texture(image,uv);}", "Android window composite");
+      if (!g_window_program) return false;
+      g_window_sampler = glGetUniformLocation(g_window_program, "image");
+   }
+   if (!g_window_tex) glGenTextures(1, &g_window_tex);
+   if (!g_window_fbo) glGenFramebuffers(1, &g_window_fbo);
+   glActiveTexture(GL_TEXTURE0);
+   glBindTexture(GL_TEXTURE_2D, g_window_tex);
+   if (g_window_w != w || g_window_h != h) {
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
+                   GL_UNSIGNED_BYTE, NULL);
+      g_window_w = w; g_window_h = h;
+   }
+   glBindFramebuffer(GL_FRAMEBUFFER, g_window_fbo);
+   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                         GL_TEXTURE_2D, g_window_tex, 0);
+   return glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+}
+
+static bool overlay_document_wrapper(const LunaElement *e)
+{
+   return !strcmp(e->type, "body") || !strcmp(e->type, "html") ||
+          !strcmp(e->type, "head");
+}
+
+/* Only a background-filled rectangle followed by a coincident CLEAR and no
+ * later paint can be discarded. This is the common SurfaceView-only Activity;
+ * input/lifecycle still use its View tree and its parsed overlay document. */
+static bool overlay_plain_box(const LunaElement *e)
+{
+   return !e->text[0] && !e->is_input && !e->has_shadow && !e->has_outline &&
+          !e->has_gradient && !e->has_bg_image && !e->has_border_image &&
+          !e->bg_layer_count && !e->has_backdrop_blur && !e->has_filter &&
+          !e->border_width && !e->has_border_top && !e->has_border_right &&
+          !e->has_border_bottom && !e->has_border_left && !e->mix_blend_mode &&
+          !e->border_radius && !e->transform_rotate && e->cur_scale == 1 &&
+          !e->overflow_x && !e->overflow_y && !e->anim_name[0];
+}
+
+static bool overlay_window_erased(int root)
+{
+   LunaElement *window = luna_element_at(root), *hole = NULL;
+   if (!element_has_class(window, "root") || !overlay_plain_box(window)) return false;
+   for (int i = root + 1; i < luna_element_count(); ++i) {
+      if (!elem_is_self_or_descendant(i, root)) continue;
+      if (hole) return false;
+      hole = luna_element_at(i);
+   }
+   if (!hole || !hole->clear_before_paint || !luna_element_visible(hole->id_idx) ||
+       hole->visibility_hidden || !overlay_plain_box(hole) || hole->cur_a != 0 ||
+       hole->opacity != 1) return false;
+   float wx, wy, ww, wh, hx, hy, hw, hh;
+   if (!luna_element_bounds(root, &wx, &wy, &ww, &wh) ||
+       !luna_element_bounds(hole->id_idx, &hx, &hy, &hw, &hh)) return false;
+   return ww > 0 && wh > 0 && wx == hx && wy == hy && ww == hw && wh == hh;
+}
+
+static void overlay_render_windows(int w, int h)
+{
+   if (!g_surface_holes) { luna_render(w, h); return; }
+   build_render_order();
+   for (int ri = 0; ri < luna_element_count(); ++ri) {
+      int root = render_order[ri];
+      LunaElement *e = luna_element_at(root);
+      if (overlay_document_wrapper(e)) continue;
+      int parent = e->parent_idx;
+      if (parent >= 0 && !overlay_document_wrapper(luna_element_at(parent))) continue;
+      if (!luna_element_visible(root) || overlay_window_erased(root)) continue;
+      bool hole = false;
+      for (int i = 0; i < luna_element_count() && !hole; ++i)
+         hole = luna_element_at(i)->clear_before_paint && elem_is_self_or_descendant(i, root);
+      if (!hole) { luna_render_region(root, w, h, 0, 0, w, h); continue; }
+      if (!overlay_window_buffer(w, h)) {
+         fprintf(stderr, "[overlay] cannot allocate Android window buffer %dx%d\n", w, h);
+         glBindFramebuffer(GL_FRAMEBUFFER, 0);
+         continue;
+      }
+      glDisable(GL_SCISSOR_TEST);
+      glClearColor(0, 0, 0, 0);
+      glClear(GL_COLOR_BUFFER_BIT);
+      luna_render_region(root, w, h, 0, 0, w, h);
+      glBindFramebuffer(GL_FRAMEBUFFER, 0);
+      glViewport(0, 0, w, h);
+      glDisable(GL_SCISSOR_TEST);
+      glEnable(GL_BLEND);
+      /* The window texture contains premultiplied RGB, including the alpha
+       * accumulated by multiple translucent Views. Composite it exactly once. */
+      glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+      luna_use_program(g_window_program);
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_2D, g_window_tex);
+      glUniform1i(g_window_sampler, 0);
+      luna_bind_vao(g_rect_vao);
+      glDrawArrays(GL_TRIANGLES, 0, 6);
+      luna_bind_vao(0);
+      glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+   }
+}
+
 /* The document is published by whichever guest thread runs the widget layer,
  * and consumed by the guest thread that swaps.  Those are different threads —
  * luna-ui has no locking of its own, so the handoff is a copied string under a
@@ -100,6 +225,7 @@ static int g_ptr_count;
 static pthread_mutex_t g_ptr_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static luna_overlay_click_fn g_click_fn;
+static luna_overlay_scroll_fn g_scroll_fn;
 static luna_overlay_web_pointer_fn g_web_pointer_fn;
 static luna_overlay_web_char_fn g_web_char_fn;
 static luna_overlay_web_key_fn g_web_key_fn;
@@ -376,6 +502,7 @@ static bool overlay_context_rebind(void)
       g_ov_ctx = EGL_NO_CONTEXT;
    }
    g_ready = false;
+   overlay_window_objects_forget();
    g_w = g_h = 0;
    if (!overlay_context_create()) return false;
    pthread_mutex_lock(&g_doc_lock);
@@ -673,6 +800,11 @@ void luna_overlay_set_click_handler(luna_overlay_click_fn fn)
    g_click_fn = fn;
 }
 
+void luna_overlay_set_scroll_handler(luna_overlay_scroll_fn fn)
+{
+   g_scroll_fn = fn;
+}
+
 void luna_overlay_set_web_pointer_handler(luna_overlay_web_pointer_fn fn)
 {
    g_web_pointer_fn = fn;
@@ -687,6 +819,7 @@ void luna_overlay_set_web_text_handlers(luna_overlay_web_char_fn char_fn,
 
 bool luna_overlay_web_char(uint32_t codepoint)
 {
+   if (luna_guest_paused()) return true;
    char id[sizeof g_web_focus];
    pthread_mutex_lock(&g_ptr_lock);
    memcpy(id, g_web_focus, sizeof id);
@@ -698,6 +831,7 @@ bool luna_overlay_web_char(uint32_t codepoint)
 
 bool luna_overlay_web_key(int key, int action)
 {
+   if (luna_guest_paused()) return true;
    char id[sizeof g_web_focus];
    pthread_mutex_lock(&g_ptr_lock);
    memcpy(id, g_web_focus, sizeof id);
@@ -721,6 +855,7 @@ static void overlay_element_clicked(LunaElement *e)
       if (g_menu_fn) g_menu_fn(e->id);
       return;
    }
+   if (luna_guest_paused()) return;
    if (luna_ime_click(e->id)) return;
    if (g_click_fn) g_click_fn(e->id);
 }
@@ -755,7 +890,8 @@ static void overlay_drain_pointer(void)
    g_ptr_count = 0;
    pthread_mutex_unlock(&g_ptr_lock);
    for (int i = 0; i < n; ++i) {
-      if (g_web_pointer_fn) {
+      bool framework_touch = false;
+      if (g_web_pointer_fn && !luna_guest_paused()) {
          int hit = g_web_pointer_capture[0]
             ? luna_get_element_by_id(g_web_pointer_capture)
             : luna_element_at_point(batch[i].x, batch[i].y);
@@ -767,6 +903,7 @@ static void overlay_drain_pointer(void)
                 (strstr(e->class_name, "lunaria-webview") ||
                  strstr(e->class_name, "lunaria-touchview"))) {
                web_hit = true;
+               framework_touch = strstr(e->class_name, "lunaria-gestureview") != NULL;
                if (batch[i].action == 1)
                   snprintf(g_web_pointer_capture,
                            sizeof g_web_pointer_capture, "%s", e->id);
@@ -793,6 +930,41 @@ static void overlay_drain_pointer(void)
             pthread_mutex_unlock(&g_ptr_lock);
          }
          if (batch[i].action == 0) g_web_pointer_capture[0] = 0;
+      }
+      /* A framework touch target owns the entire gesture. Sending the same
+       * release through host click detection would also call performClick. */
+      if (framework_touch) continue;
+      /* A press is held back until it is known not to be a drag: dragged past
+       * the slop it scrolls (and never reaches the element or selects text),
+       * released in place it is the click it always was. */
+      static bool pressed, dragging;
+      static double last_x, last_y, start_x, start_y;
+      if (g_scroll_fn && !luna_guest_paused()) {
+         if (batch[i].action == 1) {
+            pressed = true; dragging = false;
+            start_x = last_x = batch[i].x; start_y = last_y = batch[i].y;
+            continue;
+         }
+         if (batch[i].action < 0 && pressed) {
+            const double slop = 8.0;
+            if (!dragging && (fabs(batch[i].x - start_x) > slop || fabs(batch[i].y - start_y) > slop))
+               dragging = true;
+            if (dragging) {
+               g_scroll_fn(batch[i].x, batch[i].y, last_x - batch[i].x, last_y - batch[i].y);
+               last_x = batch[i].x; last_y = batch[i].y;
+            }
+            continue;
+         }
+         if (batch[i].action == 0 && pressed) {
+            const bool was_drag = dragging;
+            pressed = dragging = false;
+            if (was_drag) continue;
+            luna_mouse_move(start_x, start_y);
+            luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT, LUNA_PRESS, 0, start_x, start_y);
+            luna_mouse_move(batch[i].x, batch[i].y);
+            luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT, LUNA_RELEASE, 0, batch[i].x, batch[i].y);
+            continue;
+         }
       }
       if (batch[i].action < 0) {
          luna_mouse_move(batch[i].x, batch[i].y);
@@ -1045,6 +1217,12 @@ bound:
             luna_parse_html(g_menu_html);
          }
          luna_resize((float)w, (float)h);
+         g_surface_holes = false;
+         for (int i = 0; i < luna_element_count(); ++i) {
+            if (!element_has_class(luna_element_at(i), "lunaria-surface-hole")) continue;
+            luna_set_clear_before_paint(i, 1);
+            g_surface_holes = true;
+         }
          overlay_wire_clicks();
          /* One layout pass so a dump of element boxes is meaningful. */
          luna_update(overlay_now(), 0.0);
@@ -1089,7 +1267,7 @@ bound:
       /* Keystrokes go in and the field's contents come back out here: the
        * document is parsed and luna-ui is live, which is the only state its
        * element API may be called in. */
-      luna_ime_frame(reparsed);
+      if (!luna_guest_paused()) luna_ime_frame(reparsed);
       if (prof) { const uint64_t n = overlay_ns();
                   g_prof.ime_ns += n - t_mark; t_mark = n; }
 
@@ -1097,7 +1275,7 @@ bound:
        * only moment a caller may mutate it.  The boot card pushes its stage
        * line and its progress through this instead of republishing the page:
        * a reparse restarts every @keyframes timeline on it. */
-      if (g_frame_fn) g_frame_fn();
+      if (g_frame_fn && !luna_guest_paused()) g_frame_fn();
 
       /* Composited over the guest's finished frame: no clear, and the
        * document's own background is whatever its CSS paints.  The status
@@ -1135,7 +1313,7 @@ bound:
       double dt = now - g_last_time;
       g_last_time = now;
       luna_update(now, dt);
-      luna_render(w, h);
+      overlay_render_windows(w, h);
       overlay_maybe_dump_boot(w, h, status_only);
       overlay_report_gl_errors("render");
       if (prof) { const uint64_t n = overlay_ns();
@@ -1172,6 +1350,7 @@ bool luna_overlay_pointer(double x, double y, int action)
    pthread_mutex_unlock(&g_doc_lock);
    if (g_failed) return false;
    if (menu) goto consume;    /* the emulator's menu is modal */
+   if (luna_guest_paused()) return true;
    if (guest) goto consume;   /* a dialog is modal: it takes every touch */
    if (!ime) return false;
    /* The input method is not modal — the application below it keeps working,
@@ -1211,7 +1390,13 @@ void luna_overlay_shutdown(void)
    /* Blocking, unlike a present: tearing luna-ui down under a thread that is
     * inside it is the race this lock exists for. */
    pthread_mutex_lock(&g_present_lock);
-   if (g_ready) luna_shutdown();
+   if (g_ready) {
+      if (g_window_fbo) glDeleteFramebuffers(1, &g_window_fbo);
+      if (g_window_tex) glDeleteTextures(1, &g_window_tex);
+      if (g_window_program) glDeleteProgram(g_window_program);
+      luna_shutdown();
+   }
+   overlay_window_objects_forget();
    g_ready = false;
    free(g_html);
    free(g_css);
@@ -1299,6 +1484,15 @@ enum { SUB_NONE, SUB_INPUT, SUB_DISPLAY, SUB_GRAPHICS, SUB_SOUND, SUB_LOCALE, SU
 #define PROFILE_MAX 24
 
 static pthread_mutex_t g_menu_lock = PTHREAD_MUTEX_INITIALIZER;
+static atomic_bool g_guest_paused;
+bool luna_guest_paused(void)
+{
+   return atomic_load_explicit(&g_guest_paused, memory_order_relaxed);
+}
+void luna_guest_set_paused(bool paused)
+{
+   atomic_store_explicit(&g_guest_paused, paused, memory_order_relaxed);
+}
 static bool   g_menu_open;
 static double g_menu_x, g_menu_y;
 static int    g_menu_w, g_menu_h;
@@ -1533,6 +1727,7 @@ static int menu_main_rows(struct menu_buf *b, int parent_y[SUB_COUNT])
    static const char arrow[] = "\xe2\x80\xba";
    int y = PAD;
    y += menu_item(b, "back", "Back", false, "Esc");
+   y += menu_item(b, "pause", luna_guest_paused() ? "Resume" : "Pause", false, NULL);
    y += menu_sep(b);
    parent_y[SUB_INPUT] = y;
    y += menu_item(b, "sub-input", "Input", false, arrow);
@@ -1555,6 +1750,7 @@ static int menu_main_rows(struct menu_buf *b, int parent_y[SUB_COUNT])
       parent_y[SUB_PROFILE] = y;
       y += menu_item(b, "sub-profile", "Profile", false, luna_apk_profile_current());
       y += menu_item(b, "restart", "Restart", false, NULL);
+      y += menu_item(b, "launcher", "Back to launcher", false, NULL);
    }
    y += menu_item(b, "quit", "Quit Lunaria", false, NULL);
    return y + PAD;
@@ -2061,7 +2257,11 @@ static void menu_clicked(const char *id)
    if (*id == '-') ++id;
    pthread_mutex_lock(&g_menu_lock);
    bool keep_open = false;
-   if (!strcmp(id, "settings")) {
+   if (!strcmp(id, "pause")) {
+      const bool paused = !luna_guest_paused();
+      luna_guest_set_paused(paused);
+      menu_notice_locked(paused ? "Paused" : "Resumed");
+   } else if (!strcmp(id, "settings")) {
       settings_load(); g_settings_open = true; g_menu_sub = SUB_NONE; keep_open = true;
    } else if (!strncmp(id, "setting-", 8)) {
       char *end = NULL; long i = strtol(id + 8, &end, 10);
@@ -2274,6 +2474,12 @@ static void menu_clicked(const char *id)
          pthread_mutex_lock(&g_menu_lock);
       }
       menu_notice_locked("Cannot restart");
+      keep_open = true;
+   } else if (!strcmp(id, "launcher")) {
+      pthread_mutex_unlock(&g_menu_lock);
+      luna_apk_restart_launcher();
+      pthread_mutex_lock(&g_menu_lock);
+      menu_notice_locked("Cannot return to the launcher");
       keep_open = true;
    } else if (!strcmp(id, "record") || !strcmp(id, "play")) {
       pthread_mutex_unlock(&g_menu_lock);

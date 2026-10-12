@@ -12,6 +12,7 @@ char *luna_unicode_normalize(const char *utf8, int form);
 char *luna_idn_convert(const char *utf8, unsigned flags, bool to_ascii);
 int32_t luna_uc_compose(int32_t first, int32_t second);
 int luna_uc_type(int32_t cp);
+int32_t luna_uc_numeric_value(int32_t cp);
 int32_t luna_uc_upper(int32_t cp);
 int32_t luna_uc_lower(int32_t cp);
 enum { LUNA_UC_ALPHABETIC, LUNA_UC_IDEOGRAPHIC, LUNA_UC_LOWERCASE, LUNA_UC_UPPERCASE, LUNA_UC_ALNUM };

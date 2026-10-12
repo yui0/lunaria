@@ -3366,6 +3366,98 @@ int luna_os_time_break(int64_t seconds, int local, struct tm *result, int64_t *o
    *offset = zone_offset;
    return 0;
 }
+/* Windows has no strptime().  This is the subset an Android program relies on,
+ * with glibc's habits: blanks in the format match any run of blanks, numbers
+ * may be preceded by blanks, names match in full or abbreviated, any case. */
+static int strptime_number(const char **p, int low, int high, int digits, int *out)
+{
+   const char *s = *p;
+   while (*s == ' ' || *s == '\t' || *s == '\n') ++s;
+   if (*s < '0' || *s > '9') return 0;
+   int value = 0, n = 0;
+   while (n < digits && *s >= '0' && *s <= '9') { value = value * 10 + (*s++ - '0'); ++n; }
+   if (value < low || value > high) return 0;
+   *out = value; *p = s;
+   return 1;
+}
+static int strptime_name(const char **p, const char *const *full, const char *const *abbr, int count, int *out)
+{
+   for (int i = 0; i < count; ++i) {
+      const char *const forms[2] = { full[i], abbr[i] };
+      for (int k = 0; k < 2; ++k) {
+         size_t n = strlen(forms[k]);
+         if (!_strnicmp(*p, forms[k], n)) { *p += n; *out = i; return 1; }
+      }
+   }
+   return 0;
+}
+static const char *strptime_walk(const char *s, const char *f, struct tm *t, long *gmtoff, int *pm)
+{
+   static const char *const days[] = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
+   static const char *const days3[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+   static const char *const months[] = { "January", "February", "March", "April", "May", "June", "July",
+                                         "August", "September", "October", "November", "December" };
+   static const char *const months3[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+   while (*f) {
+      if (*f == ' ' || *f == '\t' || *f == '\n') {
+         while (*s == ' ' || *s == '\t' || *s == '\n') ++s;
+         ++f; continue;
+      }
+      if (*f != '%') { if (*s++ != *f++) return NULL; continue; }
+      ++f;
+      while (*f == 'E' || *f == 'O' || *f == '-' || *f == '_' || *f == '0' || *f == '^' || *f == '#') ++f;
+      int v = 0;
+      switch (*f++) {
+      case '%': if (*s++ != '%') return NULL; break;
+      case 'n': case 't': while (*s == ' ' || *s == '\t' || *s == '\n') ++s; break;
+      case 'a': case 'A': if (!strptime_name(&s, days, days3, 7, &t->tm_wday)) return NULL; break;
+      case 'b': case 'B': case 'h': if (!strptime_name(&s, months, months3, 12, &t->tm_mon)) return NULL; break;
+      case 'd': case 'e': if (!strptime_number(&s, 1, 31, 2, &t->tm_mday)) return NULL; break;
+      case 'H': case 'k': if (!strptime_number(&s, 0, 23, 2, &t->tm_hour)) return NULL; *pm = -1; break;
+      case 'I': case 'l': if (!strptime_number(&s, 1, 12, 2, &v)) return NULL; t->tm_hour = v % 12; if (*pm < 0) *pm = 0; break;
+      case 'j': if (!strptime_number(&s, 1, 366, 3, &v)) return NULL; t->tm_yday = v - 1; break;
+      case 'm': if (!strptime_number(&s, 1, 12, 2, &v)) return NULL; t->tm_mon = v - 1; break;
+      case 'M': if (!strptime_number(&s, 0, 59, 2, &t->tm_min)) return NULL; break;
+      case 'S': if (!strptime_number(&s, 0, 61, 2, &t->tm_sec)) return NULL; break;
+      case 'y': if (!strptime_number(&s, 0, 99, 2, &v)) return NULL; t->tm_year = v < 69 ? v + 100 : v; break;
+      case 'Y': if (!strptime_number(&s, 0, 9999, 4, &v)) return NULL; t->tm_year = v - 1900; break;
+      case 'p': case 'P':
+         if (!_strnicmp(s, "AM", 2)) { *pm = 1; s += 2; }
+         else if (!_strnicmp(s, "PM", 2)) { *pm = 2; s += 2; }
+         else return NULL;
+         break;
+      case 'D': s = strptime_walk(s, "%m/%d/%y", t, gmtoff, pm); if (!s) return NULL; break;
+      case 'F': s = strptime_walk(s, "%Y-%m-%d", t, gmtoff, pm); if (!s) return NULL; break;
+      case 'R': s = strptime_walk(s, "%H:%M", t, gmtoff, pm); if (!s) return NULL; break;
+      case 'T': s = strptime_walk(s, "%H:%M:%S", t, gmtoff, pm); if (!s) return NULL; break;
+      case 'r': s = strptime_walk(s, "%I:%M:%S %p", t, gmtoff, pm); if (!s) return NULL; break;
+      case 'z': {
+         if (*s == 'Z' || *s == 'z') { *gmtoff = 0; ++s; break; }
+         int sign = *s == '-' ? -1 : 1, hh = 0, mm = 0;
+         if (*s != '+' && *s != '-') return NULL;
+         ++s;
+         if (!(s[0] >= '0' && s[0] <= '9' && s[1] >= '0' && s[1] <= '9')) return NULL;
+         hh = (s[0] - '0') * 10 + (s[1] - '0'); s += 2;
+         if (*s == ':') ++s;
+         if (s[0] >= '0' && s[0] <= '9' && s[1] >= '0' && s[1] <= '9') { mm = (s[0] - '0') * 10 + (s[1] - '0'); s += 2; }
+         if (hh > 14 || mm > 59) return NULL;
+         *gmtoff = sign * (hh * 3600L + mm * 60L);
+         break;
+      }
+      case 'Z': while ((*s >= 'A' && *s <= 'Z') || (*s >= 'a' && *s <= 'z')) ++s; break;
+      default: return NULL;
+      }
+   }
+   return s;
+}
+char *luna_os_strptime(const char *input, const char *format, struct tm *value, long *gmtoff)
+{
+   int pm = -1;   /* -1: no 12-hour clock in play, 0: hour read, 1: AM, 2: PM */
+   const char *end = strptime_walk(input, format, value, gmtoff, &pm);
+   if (end && pm == 2) value->tm_hour += 12;
+   return (char *)end;
+}
+
 int luna_os_time_make(struct tm *value, int64_t *seconds, int64_t *offset)
 {
    const char *zone = getenv("TZ");
@@ -3375,6 +3467,19 @@ int luna_os_time_make(struct tm *value, int64_t *seconds, int64_t *offset)
    *seconds = ms / 1000;
    return luna_os_time_break(*seconds, 1, value, offset);
 }
+
+int luna_os_time_make_utc(struct tm *value, int64_t *seconds)
+{
+   int saved = errno;
+   int64_t milliseconds, offset;
+   value->tm_isdst = 0;
+   if (luna_calendar_assemble(value, "UTC", 0, &milliseconds)) { errno = EOVERFLOW; return -1; }
+   *seconds = milliseconds / 1000;
+   if (luna_os_time_break(*seconds, 0, value, &offset)) return -1;
+   errno = saved;
+   return 0;
+}
+
 
 int luna_os_unsetenv(const char *name)
 {

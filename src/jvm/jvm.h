@@ -155,6 +155,10 @@ struct lunaria_android_package {
    int uid;
    int flags;
    int target_sdk;
+   /* PackageInfo.versionName/versionCode of a ledger package.  NULL for the
+    * running app, whose version comes from its own manifest. */
+   const char *version_name;
+   int version_code;
 };
 
 /* Device-owned unknown-source trust, separate from app-owned preferences.
@@ -235,11 +239,6 @@ struct jvm_object {
    int array_refs; /* Strong array edges, excluded from JNI-local ownership. */
    int global_refs; /* JNI global ownership, included in refs. */
    bool bridge_owned; /* Opaque bridge instances are reclaimable at zero refs. */
-   /* Counts how many times this slot has been released.  A handle is recycled
-    * for whatever is allocated next, so anything that remembers a handle (the
-    * DVM bridge does) records this with it to tell the object it named from
-    * whatever occupies the slot now.  Survives jvm_object_release(). */
-   uint32_t epoch;
    int bridge_pending; /* Bridge-held local refs not yet released or deleted by native code. */
 
    /* JNI MonitorEnter/Exit state.  Access is serialized by the bridge's

@@ -121,6 +121,8 @@ struct dvm;
 struct luna_touch_event;
 bool dvm_ui_dispatch_touch(struct dvm *vm, const struct luna_touch_event *sample);
 void dvm_jni_show_activity(JNIEnv *env, jobject activity);
+void dvm_jni_activity_dispatch(JNIEnv *env, jobject activity, const char *step,
+                               int post);
 bool dvm_jni_activity_finishing(JNIEnv *env, jobject activity);
 
 /* Diagnostics for the loader's summary line. */

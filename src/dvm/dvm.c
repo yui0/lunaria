@@ -11,6 +11,7 @@
 
 #include "dvm/dvm_internal.h"
 #include "luna_boot.h"
+#include "luna_overlay.h"
 #include "arm_exec.h"
 #include "arm.h"
 #include "lunaria_os.h"
@@ -259,10 +260,11 @@ void dvm_unpin(struct dvm *vm, dvm_ref ref)
  * builtin. */
 static void object_data_destroy(struct dvm_object *o)
 {
-   if (o->data_destroy) o->data_destroy(o->data);
+   if (o->data_destroy) o->data_destroy(o->data_owner ? o->data_owner : o->data);
    else free(o->data);
    o->data = NULL;
    o->data_destroy = NULL;
+   o->data_owner = NULL;
 }
 
 static void heap_free(struct dvm *vm, dvm_ref ref)
@@ -505,6 +507,18 @@ static bool class_load_from_dex(struct dvm *vm, struct dvm_class *c,
  * whose methods route to the host stub layer. */
 static void note_missing(struct dvm *vm, const char *what);
 
+/* Descriptors the boot class loader defines: java/, javax/, android/ and the
+ * runtime's own dalvik/ and libcore/.  androidx/ is application code. */
+static bool desc_is_boot_class(const char *desc)
+{
+   static const char *const ns[] = {
+      "Ljava/", "Ljavax/", "Landroid/", "Ldalvik/", "Llibcore/",
+   };
+   for (size_t i = 0; i < sizeof ns / sizeof ns[0]; ++i)
+      if (!strncmp(desc, ns[i], strlen(ns[i]))) return true;
+   return false;
+}
+
 struct dvm_class *dvm__class_by_desc(struct dvm *vm, const char *desc)
 {
    if (!desc || !*desc) return NULL;
@@ -525,7 +539,18 @@ struct dvm_class *dvm__class_by_desc(struct dvm *vm, const char *desc)
    if (desc[1] == '\0' && strchr("ZBCSIJFDV", desc[0]))
       return dvm__define_primitive(vm, desc);
 
-   /* A dex definition wins; then a built-in; then a host-backed stub. */
+   /* The boot classpath wins for the namespaces the platform owns: ART's
+    * application loader asks its parent first, and java.* may not be defined
+    * by an app at all.  APKs do carry android.* classes (R8 API-modelling
+    * stubs for APIs newer than minSdk, e.g. android.os.LocaleList) that must
+    * never shadow the real class, which this device has.  A platform class
+    * the runtime does not model yet falls through to the dex definition, then
+    * to the host-backed stub below. */
+   if (desc_is_boot_class(desc)) {
+      c = dvm_runtime_define(vm, desc);
+      if (c) return c;
+   }
+   /* Otherwise a dex definition wins; then a built-in; then a host stub. */
    for (int i = 0; i < vm->ndexes; ++i) {
       int idx = dex_find_class(&vm->dexes[i]->file, desc);
       if (idx < 0) continue;
@@ -690,17 +715,23 @@ static bool class_load_from_dex(struct dvm *vm, struct dvm_class *c,
          c->super = dvm__class_by_desc(vm, sd);
    }
 
-   uint16_t ifaces[64];
-   int ni = dex_interfaces(d, cd.interfaces_off, ifaces, 64);
-   if (ni > 64) ni = 64;
+   int ni = dex_interfaces(d, cd.interfaces_off, NULL, 0);
    if (ni > 0) {
+      uint16_t *ifaces = malloc((size_t)ni * sizeof *ifaces);
       c->ifaces = calloc((size_t)ni, sizeof *c->ifaces);
-      if (c->ifaces) {
-         for (int i = 0; i < ni; ++i) {
-            const char *t = dex_type(d, ifaces[i]);
-            if (t) c->ifaces[c->nifaces++] = dvm__class_by_desc(vm, t);
-         }
+      if (!ifaces || !c->ifaces) {
+         free(ifaces);
+         free(c->ifaces);
+         c->ifaces = NULL;
+         dvm__throw(vm, "java/lang/OutOfMemoryError", "class interfaces");
+         return false;
       }
+      (void)dex_interfaces(d, cd.interfaces_off, ifaces, ni);
+      for (int i = 0; i < ni; ++i) {
+         const char *t = dex_type(d, ifaces[i]);
+         if (t) c->ifaces[c->nifaces++] = dvm__class_by_desc(vm, t);
+      }
+      free(ifaces);
    }
 
    struct dex_class_data data;
@@ -763,9 +794,7 @@ static bool class_load_from_dex(struct dvm *vm, struct dvm_class *c,
          m->shorty = dex_proto_shorty(d, mid.proto_idx);
          m->access = list[i].access_flags;
          m->dex = d;
-         char sig[1024];
-         if (!dex_proto_signature(d, mid.proto_idx, sig, sizeof sig)) continue;
-         m->sig = strdup(sig);
+         m->sig = dex_proto_signature_alloc(d, mid.proto_idx);
          if (!m->sig) continue;
          if (list[i].code_off && dex_code(d, list[i].code_off, &m->code))
             m->has_code = true;
@@ -936,12 +965,24 @@ struct dvm_method *dvm_find_method(struct dvm *vm, struct dvm_class *cls,
       if (m) { mcache_put(cls, h, name, sig, m); return m; }
    }
    /* Default methods live on the interface. */
+   struct dvm_method *declaration = NULL;
    for (struct dvm_class *c = cls; c; c = c->super) {
       for (int i = 0; i < c->nifaces; ++i) {
          if (!c->ifaces[i]) continue;
          struct dvm_method *m = dvm_find_method(vm, c->ifaces[i], name, sig);
-         if (m && m->has_code) { mcache_put(cls, h, name, sig, m); return m; }
+         if (m && (m->has_code || m->builtin)) {
+            mcache_put(cls, h, name, sig, m);
+            return m;
+         }
+         if (m && !declaration) declaration = m;
       }
+   }
+   /* An inherited abstract declaration still resolves. Invocation decides
+    * whether the receiver implements it; generated proxies dispatch it to
+    * InvocationHandler. Prefer a concrete default above when one exists. */
+   if (declaration) {
+      mcache_put(cls, h, name, sig, declaration);
+      return declaration;
    }
    return NULL;
 }
@@ -1720,8 +1761,7 @@ static struct dvm_dex *dex_of(struct dvm *vm, struct dex_file *f)
 
 static struct dvm_method *resolve_method(struct dvm *vm, struct dvm_dex *dd,
                                          uint32_t idx, struct dvm_class **out_cls,
-                                         const char **out_name, char *sigbuf,
-                                         size_t sigsz)
+                                         const char **out_name, const char **out_sig)
 {
    /* The cache is consulted first, because everything below it is the
     * expensive half: dex_proto_signature() builds the descriptor string out of
@@ -1740,16 +1780,7 @@ static struct dvm_method *resolve_method(struct dvm *vm, struct dvm_dex *dd,
       struct dvm_method *m = dd->method_cache[idx];
       *out_cls  = m->cls;
       *out_name = m->name;
-      if (sigbuf && sigsz) {
-         if (m->sig) {
-            size_t n = strlen(m->sig);
-            if (n >= sigsz) n = sigsz - 1u;
-            memcpy(sigbuf, m->sig, n);
-            sigbuf[n] = '\0';
-         } else {
-            sigbuf[0] = '\0';
-         }
-      }
+      *out_sig = m->sig ? m->sig : "";
       return m;
    }
 
@@ -1758,14 +1789,25 @@ static struct dvm_method *resolve_method(struct dvm *vm, struct dvm_dex *dd,
    const char *cd = dex_type(&dd->file, mid.class_idx);
    const char *name = dex_string(&dd->file, mid.name_idx);
    if (!cd || !name) return NULL;
-   if (!dex_proto_signature(&dd->file, mid.proto_idx, sigbuf, sigsz)) return NULL;
+   if (!dd->proto_cache || mid.proto_idx >= dd->file.proto_ids_size) {
+      dvm__throw(vm, "java/lang/VerifyError", "invalid method prototype");
+      return NULL;
+   }
+   if (!dd->proto_cache[mid.proto_idx])
+      dd->proto_cache[mid.proto_idx] = dex_proto_signature_alloc(&dd->file, mid.proto_idx);
+   *out_sig = dd->proto_cache[mid.proto_idx];
+   if (!*out_sig) {
+      *out_sig = "";
+      dvm__throw(vm, "java/lang/VerifyError", "cannot read method descriptor");
+      return NULL;
+   }
 
    struct dvm_class *cls = dvm__class_by_desc(vm, cd);
    *out_cls = cls;
    *out_name = name;
    if (!cls) return NULL;
 
-   struct dvm_method *m = dvm_find_method(vm, cls, name, sigbuf);
+   struct dvm_method *m = dvm_find_method(vm, cls, name, *out_sig);
    if (m && dd->method_cache && idx < dd->file.method_ids_size)
       dd->method_cache[idx] = m;
    return m;
@@ -2175,9 +2217,15 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
                    const uint32_t *slots, int nslots, union dvm_value *out)
 {
    struct dvm_call_frame frame = { .method = m, .previous = vm->invoke_frame };
+   struct dvm_method *caller = vm->cur_method;
+   const uint32_t caller_pc = vm->cur_pc;
    vm->invoke_frame = &frame;
    bool ok = invoke_body(vm, m, self, slots, nslots, out);
    vm->invoke_frame = frame.previous;
+   /* A returned bytecode frame is no longer the current frame. Retaining it
+    * misattributes later builtin exceptions and can outlive the method. */
+   vm->cur_method = caller;
+   vm->cur_pc = caller_pc;
    return ok;
 }
 
@@ -2224,7 +2272,13 @@ static bool invoke_body(struct dvm *vm, struct dvm_method *m, dvm_ref self,
       return false;
    }
 
-   if (is_static && m->cls) dvm_init_class(vm, m->cls);
+   /* A class is initialised by its first static call or its first
+    * construction.  A host that builds an object through JNI (AllocObject +
+    * constructor, as the process Application is) never executes new-instance,
+    * so its <clinit> -- System.loadLibrary of the app's own natives, say --
+    * has to run here, before the constructor. */
+   if (m->cls && (is_static || (m->name && !strcmp(m->name, "<init>"))))
+      dvm_init_class(vm, m->cls);
 
    const bool synchronized = (m->access & DEX_ACC_SYNCHRONIZED) != 0;
    dvm_ref monitor = 0;
@@ -2389,7 +2443,7 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
                  "cannot be resolved\n", m->cls ? m->cls->name : "?", m->name);
       }
    }
-   char sigbuf[1024];
+   const char *sigbuf = "";
 
    memset(out, 0, sizeof *out);
 
@@ -2414,6 +2468,17 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
        * nothing but frames, registers and dex mappings are live, and none of
        * those move when another thread allocates. */
       if ((vm->steps & (DVM_GIL_YIELD_STEPS - 1)) == 0) {
+         if (luna_guest_paused()) {
+            unsigned ael = arm_lock_unlock_all();
+            unsigned gil = dvm_gil_unlock_all(vm);
+            const struct timespec interval = {0, 10000000};
+            while (luna_guest_paused() && !dvm_is_stopping(vm)) {
+               arm_exec_pause_poll();
+               nanosleep(&interval, NULL);
+            }
+            dvm_gil_relock(vm, gil);
+            arm_lock_relock(ael);
+         }
          dvm_gil_yield(vm);
          if (dvm_is_stopping(vm)) return false;
       }
@@ -3082,7 +3147,7 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          struct dvm_class *cls = NULL;
          const char *name = NULL;
          struct dvm_method *target =
-            dd ? resolve_method(vm, dd, midx, &cls, &name, sigbuf, sizeof sigbuf) : NULL;
+            dd ? resolve_method(vm, dd, midx, &cls, &name, &sigbuf) : NULL;
 
          if (vm->trace >= 2 && trace_this)
             fprintf(stderr, "[dvm]     invoke %s.%s%s\n",
@@ -4845,6 +4910,10 @@ void dvm_destroy(struct dvm *vm)
    for (int i = 0; i < vm->ndexes; ++i) {
       free(vm->dexes[i]->type_cache);
       free(vm->dexes[i]->method_cache);
+      if (vm->dexes[i]->proto_cache)
+         for (uint32_t j = 0; j < vm->dexes[i]->file.proto_ids_size; ++j)
+            free(vm->dexes[i]->proto_cache[j]);
+      free(vm->dexes[i]->proto_cache);
       free(vm->dexes[i]->field_cache);
       free(vm->dexes[i]->string_cache);
       dex_close(&vm->dexes[i]->file);
@@ -4880,6 +4949,7 @@ bool dvm_add_dex(struct dvm *vm, const char *path)
 
    dd->type_cache   = calloc(dd->file.type_ids_size + 1u, sizeof *dd->type_cache);
    dd->method_cache = calloc(dd->file.method_ids_size + 1u, sizeof *dd->method_cache);
+   dd->proto_cache = calloc(dd->file.proto_ids_size + 1u, sizeof *dd->proto_cache);
    dd->field_cache  = calloc(dd->file.field_ids_size + 1u, sizeof *dd->field_cache);
    dd->string_cache = calloc(dd->file.string_ids_size + 1u, sizeof *dd->string_cache);
 
@@ -4930,6 +5000,7 @@ bool dvm_add_dex_memory(struct dvm *vm, const void *data, size_t len,
 
    dd->type_cache   = calloc(dd->file.type_ids_size + 1u, sizeof *dd->type_cache);
    dd->method_cache = calloc(dd->file.method_ids_size + 1u, sizeof *dd->method_cache);
+   dd->proto_cache = calloc(dd->file.proto_ids_size + 1u, sizeof *dd->proto_cache);
    dd->field_cache  = calloc(dd->file.field_ids_size + 1u, sizeof *dd->field_cache);
    dd->string_cache = calloc(dd->file.string_ids_size + 1u, sizeof *dd->string_cache);
 

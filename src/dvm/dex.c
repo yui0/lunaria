@@ -324,6 +324,27 @@ bool dex_proto_signature(struct dex_file *d, uint32_t proto_idx,
    return true;
 }
 
+char *dex_proto_signature_alloc(struct dex_file *d, uint32_t proto_idx)
+{
+   const char *params[256];
+   int n = dex_proto_params(d, proto_idx, params, 256);
+   const char *ret = dex_proto_return(d, proto_idx);
+   if (n < 0 || n > 256 || !ret) return NULL;
+   size_t size = strlen(ret) + 3u;
+   for (int i = 0; i < n; ++i) {
+      if (!params[i]) return NULL;
+      size_t len = strlen(params[i]);
+      if (len > SIZE_MAX - size) return NULL;
+      size += len;
+   }
+   char *sig = malloc(size);
+   if (sig && !dex_proto_signature(d, proto_idx, sig, size)) {
+      free(sig);
+      return NULL;
+   }
+   return sig;
+}
+
 static uint32_t dex_desc_hash(const char *s)
 {
    uint32_t h = 2166136261u;                 /* FNV-1a */
@@ -662,9 +683,10 @@ static bool dex_method_is(struct dex_file *d, uint32_t method_idx,
    const char *n = dex_string(d, mid.name_idx);
    if (!n || strcmp(n, name)) return false;
    if (!sig) return true;
-   char buf[1024];
-   return dex_proto_signature(d, mid.proto_idx, buf, sizeof buf) &&
-          !strcmp(buf, sig);
+   char *buf = dex_proto_signature_alloc(d, mid.proto_idx);
+   bool matches = buf && !strcmp(buf, sig);
+   free(buf);
+   return matches;
 }
 
 /* The annotations_off of the method's (table 1) or its parameters' (table 2)

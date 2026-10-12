@@ -341,6 +341,11 @@ ICU installation.
 
 ### 2. Build
 
+WebP bitmap decoding uses the bundled C header
+[simplewebp](https://github.com/MikuAuahDark/simplewebp/blob/main/simplewebp.h)
+(version 20260718) and requires no additional installed codec package.
+Its BSD license and patent grant are retained in `LICENSE.simplewebp`.
+
 ```bash
 make dynarmic-build
 make x86_64 -j"$(nproc)"   # host is x86_64; plain `make` builds the 32-bit x86 ABI
@@ -430,7 +435,7 @@ Details and launch recipes live in `PROGRESS.md`.
 
 | Title | Engine / ABI | Current result |
 |---|---|---|
-| **Ni no Kuni: Cross Worlds** | Unreal Engine 4 · AArch64 XAPK | Drawn on Linux through guest login, the village, story dialogue, a voiced cutscene, and in-world play. SharedPreferences persist. On Apple Silicon macOS, package 5.04.12 displays the movie and 3D intro in the window and reaches the Terms of Use dialog. Progress after consent has not been checked |
+| **Ni no Kuni: Cross Worlds** | Unreal Engine 4 · AArch64 XAPK | Drawn guest login, the village, story dialogue, a voiced cutscene, and in-world play. |
 | **Blade & Soul Masia** | Unreal Engine 5 · AArch64 APKS | Opening movie reaches EOS; title screen; additional-patch dialog is readable and Agree advances the download |
 | **Genshin Impact 7.1.0** | Unity IL2CPP · AArch64 XAPK | Open world on Linux. Saved login and the Asia server return, then shader compile, the resource download, **TAP TO BEGIN**, and the field. Prologue, the library, and flight over Mondstadt draw in color. Keyboard movement works there; that host measured about 18–22 fps in the field and about 30 fps in settings. A changed music volume survived restart. A host WebView can open the account page. Google Play billing is not implemented |
 | **Alchemia Story 1.0.154** | Unity IL2CPP · AArch64 APK | Title screen, story scenes with Japanese dialogue in landscape and portrait, and the character-creation room draw (2026-10-09) |
@@ -565,6 +570,11 @@ fractions of the view, so a recording replays at any window size.
 
 ## Capture frames
 
+Right-click and choose **Pause** to suspend guest execution. Open the menu
+again and choose **Resume** to continue. The host menu remains usable while
+paused; guest pointer and keyboard input are suppressed. This setting applies
+only to the current session.
+
 Capture selected swap indices:
 
 ```bash
@@ -677,7 +687,7 @@ full diagnostic set.
 | `LUNARIA_SYSLIB_DIR` | `syslib-arm64/` if that directory exists | AArch64 platform libraries that run as guest code. `make syslib` fetches libm, libc and libz; `make guestlib` builds `liblunaria_guest.so` |
 | `LUNARIA_VULKAN` | on when available | Set `0` to disable the Vulkan bridge and device feature. Titles may still choose GLES |
 | `LUNARIA_TOUCH_TEST` | off | Inject taps at `x,y[;x,y…]` (max 8). Bare numbers are framebuffer percentages; `640px` is a guest pixel |
-| `LUNARIA_TOUCH_FIFO` | off | Same taps while running: `echo 'x,y[,hold]' > $LUNARIA_TOUCH_FIFO` Windows: `\\.\pipe\lunaria-touch` (named pipe). |
+| `LUNARIA_TOUCH_FIFO` | off | Taps: `x,y[,hold]`; explicit drag samples: `down x,y`, `move x,y`, `up x,y`. Coordinates accept percentages or `px`. Windows: `\\.\pipe\lunaria-touch` (named pipe). |
 | `LUNARIA_KEYMAP` | off | `genshin`, `crossworlds`, `off`, or a path to a keymap file. The host menu can change it live |
 | `LUNARIA_DEVICE` | `pixel6` | Device profile: `pixel6`, `pixel7`, `galaxys21`, `lunaria`. Prefer `lunaria.conf` |
 | `LUNARIA_DATA_ROOT` | Startup working directory | Guest `/data` and `/storage`. Also selectable with `--data-root DIR` |
@@ -820,26 +830,7 @@ real GLFW window. Right-click opens the host menu and does not go to the guest.
 
 ## Project status
 
-Lunaria is research software. Linux is the host where the window and the
-framebuffer agree. `make dist` there produces
-`lunaria-<version>-linux-x86_64.tar.gz`. `make dist-mac` produces a
-`Lunaria.app` and a `.dmg`; on the Macs tried so far the framebuffer fills
-while the window stays black. Windows `make dist` produces a ZIP of about
-35 MiB. That archive passed ARM32 and ARM64 ABI tests and EGL/GLES
-initialization under Wine. Display and audio on a physical Windows PC are
-still untested. A `lunaria-v*` tag publishes the Linux and macOS packages
-from GitHub Actions. Windows is not in that workflow yet: the OS layer is
-ported, and the core still calls POSIX directly.
-
-`make dist` packs a tree that does not depend on the build directory.
-Distribution builds use `-O3`, `-DNDEBUG`, and LTO, with Dynarmic rebuilt as
-Release + IPO in its own directory. They do not use `-march=native`.
-Unicode classification, normalization, and IDNA live in small compiled
-tables, so ICU is neither built nor shipped.
-
-Expect missing Android APIs, title-specific gaps, noisy diagnostics, and
-breaking changes. A useful report names the title, ABI, engine version, the
-last milestone that worked, a log, and a captured frame.
+Lunaria is research software.
 
 Licensed under the [Mozilla Public License 2.0](LICENSE).
 

@@ -8,7 +8,7 @@
 #ifndef LUNARIA_LINKER64_H
 #define LUNARIA_LINKER64_H
 
-/* Symbol scope for AArch64 guest images, as the Android dynamic linker
+/* Symbol scope for ELF32 and ELF64 guest images, as the Android dynamic linker
  * defines it.
  *
  * The emulator used to answer every relocation from one flat name -> address
@@ -48,7 +48,8 @@ extern "C" {
 struct ln64_module;
 
 /* Guest memory access.  `off` is the 32-bit backing offset the emulator uses
- * for an AArch64 guest address (guest VA == 0x700000000000 | off); the call
+ * for either guest class (ARM32 VA == off, AArch64 VA ==
+ * 0x700000000000 | off); the call
  * returns a host pointer to at least `len` readable bytes, or NULL.  Every
  * table this module walks lives inside a mapped image, exactly as it does on
  * a device -- nothing is read out of the on-disk file. */
@@ -56,7 +57,7 @@ typedef void *(*ln64_ptr_fn)(uint32_t off, size_t len, void *user);
 
 void ln64_init(ln64_ptr_fn ptr, void *user);
 
-/* Register an image the loader has just mapped.  `dynamic_off` is the backing
+/* Compatibility entry point for ELF64. Register an image the loader has just mapped.  `dynamic_off` is the backing
  * offset of its PT_DYNAMIC contents (load_bias + p_vaddr).  `is_global` puts
  * the image in the global group -- true for the executable and everything
  * reachable from it, as the linker does for the main namespace.
@@ -66,6 +67,11 @@ void ln64_init(ln64_ptr_fn ptr, void *user);
 struct ln64_module *ln64_add(const char *path, uint32_t load_bias,
                              uint32_t dynamic_off, bool is_global,
                              bool is_main);
+
+/* Shared parser: elf_class is ELFCLASS32 or ELFCLASS64 from the ELF header. */
+struct ln64_module *ln64_add_elf(const char *path, uint32_t load_bias,
+                                uint32_t dynamic_off, unsigned elf_class,
+                                bool is_global, bool is_main);
 
 /* Resolve the DT_NEEDED names of every registered image against the images
  * registered so far, building the dependency graph the local groups are
@@ -111,6 +117,17 @@ struct ln64_module *ln64_module_by_path(const char *path);
 struct ln64_module *ln64_module_by_address(uint32_t address);
 bool ln64_lookup_next(struct ln64_module *caller, const char *name, struct ln64_sym *out);
 bool ln64_depends_on(struct ln64_module *module, const char *soname);
+
+/* Execute mapped constructor pointers in Android order; callback handles the ISA. */
+typedef bool (*ln64_init_fn)(uint32_t function_offset, void *user);
+bool ln64_call_init(struct ln64_module *module, ln64_init_fn call, void *user);
+/* Host-initialized platform providers must also be complete during dependency traversal. */
+void ln64_mark_initialized(struct ln64_module *module);
+
+/* Java loader notification is distinct from dlopen/DT_NEEDED mapping.
+ * Calls are serialized by the loader/interpreter execution locks. */
+bool ln64_java_load_begin(struct ln64_module *module, int *cached_version);
+void ln64_java_load_end(struct ln64_module *module, int version);
 
 /* Diagnostics: one line per image with what was found in it. */
 void ln64_dump(void);

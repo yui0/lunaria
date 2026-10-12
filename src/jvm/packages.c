@@ -75,6 +75,7 @@ struct ledger_row {
    char *source_dir;
    char *data_dir;
    char *lib_dir;
+   char *version_name;
    int force_queryable;   /* <application android:forceQueryable="true"> */
 };
 
@@ -92,6 +93,8 @@ static int current_package(struct lunaria_android_package *out)
 
    if (!out || !name || !*name) return 0;
    out->name = name;
+   out->version_name = NULL;       /* the running app reads its manifest */
+   out->version_code = 0;
    out->source_dir = lunaria_android_apk_path();
    out->data_dir = lunaria_android_data_path();
    out->lib_dir = lunaria_android_native_lib_path();
@@ -119,18 +122,18 @@ static int current_package(struct lunaria_android_package *out)
  * an installation's own ledger cannot drift apart in format.
  */
 static const char kDefaultLedger[] =
-"# <package>                        <uid>  <flags>            <sourceDir>\n"
+"# <package>                        <uid>  <flags>            <sourceDir> [<versionName>/<versionCode>]\n"
 "android                            1000   system,queryable   /system/framework/framework-res.apk\n"
 "com.android.shell                  2000   system             /system/priv-app/Shell/Shell.apk\n"
 "com.android.settings               1000   system             /system/priv-app/Settings/Settings.apk\n"
 "com.android.systemui               10035  system             /system_ext/priv-app/SystemUI/SystemUI.apk\n"
 "com.android.providers.settings     1000   system             /system/priv-app/SettingsProvider/SettingsProvider.apk\n"
 "com.android.providers.media.module 10062  system             /apex/com.android.mediaprovider/priv-app/MediaProvider/MediaProvider.apk\n"
-"com.android.vending                10108  system,queryable,updated /product/priv-app/Phonesky/Phonesky.apk\n"
-"com.google.android.gms             10109  system,queryable,updated /product/priv-app/PrebuiltGmsCore/PrebuiltGmsCore.apk\n"
+"com.android.vending                10108  system,queryable,updated /product/priv-app/Phonesky/Phonesky.apk 38.5.21-31/83852130\n"
+"com.google.android.gms             10109  system,queryable,updated /product/priv-app/PrebuiltGmsCore/PrebuiltGmsCore.apk 23.50.13/235013000\n"
 "com.google.android.gsf             10109  system,queryable   /product/priv-app/GoogleServicesFramework/GoogleServicesFramework.apk\n"
-"com.google.android.webview         10088  system,queryable   /product/app/WebViewGoogle/WebViewGoogle.apk\n"
-"com.android.chrome                 10091  system,updated     /product/app/Chrome/Chrome.apk\n"
+"com.google.android.webview         10088  system,queryable   /product/app/WebViewGoogle/WebViewGoogle.apk 120.0.6099.230/609923033\n"
+"com.android.chrome                 10091  system,updated     /product/app/Chrome/Chrome.apk 120.0.6099.230/609923033\n"
 "com.google.android.googlequicksearchbox 10092 system         /product/priv-app/Velvet/Velvet.apk\n"
 "com.google.android.inputmethod.latin    10093 system         /product/app/LatinIMEGooglePrebuilt/LatinIMEGooglePrebuilt.apk\n"
 "com.google.android.apps.photos     10094  system             /product/priv-app/Photos/Photos.apk\n"
@@ -245,12 +248,12 @@ static int row_exists(const char *name)
  * LUNARIA_PACKAGES_EXTRA means. */
 static void ledger_add_line(const char *line, size_t len)
 {
-   const char *tok[4] = { NULL, NULL, NULL, NULL };
-   size_t toklen[4] = { 0, 0, 0, 0 };
+   const char *tok[5] = { NULL, NULL, NULL, NULL, NULL };
+   size_t toklen[5] = { 0, 0, 0, 0, 0 };
    int ntok = 0;
    const char *p = line, *end = line + len;
 
-   while (p < end && ntok < 4) {
+   while (p < end && ntok < 5) {
       while (p < end && (*p == ' ' || *p == '\t')) ++p;
       if (p >= end) break;
       const char *s = p;
@@ -298,6 +301,20 @@ static void ledger_add_line(const char *line, size_t len)
       snprintf(apk, sizeof apk, "/data/app/%s-1/base.apk", name);
    }
 
+   /* The fifth column is "<versionName>/<versionCode>".  A package on a device
+    * always has a version name, so an entry that gives none gets 1.0. */
+   char version[64] = "1.0";
+   int version_code = 1;
+   if (ntok > 4 && toklen[4] < sizeof version) {
+      memcpy(version, tok[4], toklen[4]);
+      version[toklen[4]] = '\0';
+      char *slash = strchr(version, '/');
+      if (slash) {
+         *slash = '\0';
+         version_code = (int)strtol(slash + 1, NULL, 10);
+      }
+   }
+
    char data[PATH_MAX], lib[PATH_MAX];
    snprintf(data, sizeof data, "/data/user/0/%s", name);
    /* Never empty: an app that builds nativeLibraryDir + "/lib<x>.so" out of
@@ -315,9 +332,11 @@ static void ledger_add_line(const char *line, size_t len)
    row->source_dir = dup_range(apk, strlen(apk));
    row->data_dir = dup_range(data, strlen(data));
    row->lib_dir = dup_range(lib, strlen(lib));
-   if (!row->name || !row->source_dir || !row->data_dir || !row->lib_dir) {
+   row->version_name = dup_range(version, strlen(version));
+   if (!row->name || !row->source_dir || !row->data_dir || !row->lib_dir ||
+       !row->version_name) {
       free(row->name); free(row->source_dir);
-      free(row->data_dir); free(row->lib_dir);
+      free(row->data_dir); free(row->lib_dir); free(row->version_name);
       return;
    }
    row->force_queryable = queryable;
@@ -327,6 +346,8 @@ static void ledger_add_line(const char *line, size_t len)
    row->record.lib_dir = row->lib_dir;
    row->record.uid = uid;
    row->record.flags = flags;
+   row->record.version_name = row->version_name;
+   row->record.version_code = version_code;
    /* A platform package targets the platform it shipped with. */
    row->record.target_sdk = lunaria_sdk_int();
    ++g_nrows;

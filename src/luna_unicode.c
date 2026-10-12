@@ -6,6 +6,7 @@
 #include <strings.h>
 #include <limits.h>
 #include "unicode/character_data.h"
+#include "unicode/numeric_data.h"
 #define COUNT(a) (sizeof(a)/sizeof((a)[0]))
 static const struct uc_range *property(int32_t cp)
 {
@@ -22,6 +23,24 @@ static const struct uc_range *property(int32_t cp)
    }
    return lo < COUNT(uc_ranges) && uc_ranges[lo].first <= (uint32_t)cp ? uc_ranges + lo : NULL;
 }
+int32_t luna_uc_numeric_value(int32_t cp)
+{
+   if (cp >= '0' && cp <= '9') return cp - '0';
+   if (cp >= 'A' && cp <= 'Z') return cp - 'A' + 10;
+   if (cp >= 'a' && cp <= 'z') return cp - 'a' + 10;
+   if (cp >= 0xff21 && cp <= 0xff3a) return cp - 0xff21 + 10;
+   if (cp >= 0xff41 && cp <= 0xff5a) return cp - 0xff41 + 10;
+   if (cp < 0 || cp > 0x10ffff) return -1;
+   size_t lo = 0, hi = COUNT(uc_numeric_values);
+   while (lo < hi) {
+      size_t mid = lo + (hi - lo) / 2;
+      if (uc_numeric_values[mid].cp < (uint32_t)cp) lo = mid + 1;
+      else hi = mid;
+   }
+   return lo < COUNT(uc_numeric_values) && uc_numeric_values[lo].cp == (uint32_t)cp
+      ? uc_numeric_values[lo].value : -1;
+}
+
 int luna_uc_type(int32_t cp)
 {
    const struct uc_range *r = property(cp);

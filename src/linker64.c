@@ -6,7 +6,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-/* Android-linker symbol scope for AArch64 guest images.  See linker64.h for
+/* Android-linker symbol scope for ELF32 and ELF64 guest images.  See linker64.h for
  * why the flat "one name -> one address" map this replaces is not equivalent.
  *
  * Everything here is read out of the *mapped* image through the dynamic
@@ -41,11 +41,17 @@ struct ln64_module {
    uint32_t    bias;           /* backing offset the image was mapped at */
    bool        is_global;      /* member of the global group */
    bool        is_main;        /* executable/main object: global-scope head */
+   bool        elf32;         /* table layout; lookup rules are shared */
    bool        symbolic;       /* DF_SYMBOLIC / DF_1_SYMBOLIC */
 
    const Elf64_Sym *symtab;
    const char      *strtab;
    uint64_t         strsz;
+   uint32_t init_fn, init_array;
+   bool init_called;
+   unsigned char java_load_state;
+   int java_version;
+   uint64_t init_array_size;
 
    /* DT_HASH */
    const uint32_t *bucket, *chain;
@@ -194,6 +200,18 @@ static bool version_ok(const struct ln64_module *m, uint32_t idx,
 
 /* ----------------------------------------------------------- per-image find */
 
+/* Normalize only the ELF32 layout; ELF64 entries remain zero-copy. */
+static const Elf64_Sym *symbol_at(const struct ln64_module *m, uint32_t index,
+                                 Elf64_Sym *converted)
+{
+   if (!m->elf32) return &m->symtab[index];
+   const Elf32_Sym *s = &((const Elf32_Sym *)m->symtab)[index];
+   *converted = (Elf64_Sym){ .st_name = s->st_name, .st_info = s->st_info,
+      .st_other = s->st_other, .st_shndx = s->st_shndx,
+      .st_value = s->st_value, .st_size = s->st_size };
+   return converted;
+}
+
 static bool sym_usable(const Elf64_Sym *s)
 {
    const unsigned char bind = ELF64_ST_BIND(s->st_info);
@@ -206,12 +224,14 @@ static bool sym_usable(const Elf64_Sym *s)
 }
 
 static const Elf64_Sym *find_gnu(const struct ln64_module *m, const char *name,
-                                 uint32_t h, const char *want, uint32_t *idx_out)
+                                 uint32_t h, const char *want, uint32_t *idx_out, Elf64_Sym *converted)
 {
-   const uint32_t word = (h / 64u) % m->gnu_bloom_size;
-   const uint32_t b1 = h % 64u;
-   const uint32_t b2 = (h >> m->gnu_bloom_shift) % 64u;
-   const uint64_t bits = m->gnu_bloom[word];
+   const uint32_t width = m->elf32 ? 32u : 64u;
+   const uint32_t word = (h / width) % m->gnu_bloom_size;
+   const uint32_t b1 = h % width;
+   const uint32_t b2 = (h >> m->gnu_bloom_shift) % width;
+   const uint64_t bits = m->elf32 ? ((const uint32_t *)m->gnu_bloom)[word]
+                                  : m->gnu_bloom[word];
    if (!((bits >> b1) & (bits >> b2) & 1u)) return NULL;
 
    uint32_t n = m->gnu_bucket[h % m->gnu_nbucket];
@@ -220,7 +240,7 @@ static const Elf64_Sym *find_gnu(const struct ln64_module *m, const char *name,
    for (;;) {
       const uint32_t c = chain[n - m->gnu_symoffset];
       if ((c | 1u) == (h | 1u)) {
-         const Elf64_Sym *s = &m->symtab[n];
+         const Elf64_Sym *s = symbol_at(m, n, converted);
          if (strcmp(m->strtab + s->st_name, name) == 0 &&
              sym_usable(s) && version_ok(m, n, want)) {
             if (idx_out) *idx_out = n;
@@ -234,11 +254,11 @@ static const Elf64_Sym *find_gnu(const struct ln64_module *m, const char *name,
 }
 
 static const Elf64_Sym *find_sysv(const struct ln64_module *m, const char *name,
-                                  uint32_t h, const char *want, uint32_t *idx_out)
+                                  uint32_t h, const char *want, uint32_t *idx_out, Elf64_Sym *converted)
 {
    for (uint32_t n = m->bucket[h % m->nbucket]; n != 0 && n < m->nchain;
         n = m->chain[n]) {
-      const Elf64_Sym *s = &m->symtab[n];
+      const Elf64_Sym *s = symbol_at(m, n, converted);
       if (strcmp(m->strtab + s->st_name, name) != 0) continue;
       if (!sym_usable(s) || !version_ok(m, n, want)) continue;
       if (idx_out) *idx_out = n;
@@ -249,16 +269,16 @@ static const Elf64_Sym *find_sysv(const struct ln64_module *m, const char *name,
 
 static const Elf64_Sym *mod_find(const struct ln64_module *m, const char *name,
                                  uint32_t gh, uint32_t sh, const char *want,
-                                 uint32_t *idx_out)
+                                 uint32_t *idx_out, Elf64_Sym *converted)
 {
    if (!m->symtab || !m->strtab) return NULL;
    /* Prefer DT_GNU_HASH where both exist: it is the table the linker that
     * produced the image intended to be used, and the only one a modern
     * platform library has. */
    if (m->gnu_bucket && m->gnu_nbucket)
-      return find_gnu(m, name, gh, want, idx_out);
+      return find_gnu(m, name, gh, want, idx_out, converted);
    if (m->bucket && m->nbucket)
-      return find_sysv(m, name, sh, want, idx_out);
+      return find_sysv(m, name, sh, want, idx_out, converted);
    return NULL;
 }
 
@@ -283,21 +303,22 @@ static const char *basename_of(const char *path)
    return s ? s + 1 : path;
 }
 
-struct ln64_module *ln64_add(const char *path, uint32_t load_bias,
-                             uint32_t dynamic_off, bool is_global,
+struct ln64_module *ln64_add_elf(const char *path, uint32_t load_bias,
+                             uint32_t dynamic_off, unsigned elf_class, bool is_global,
                              bool is_main)
 {
    if (!path || !dynamic_off) return NULL;
 
-   /* The dynamic array is NUL-terminated by a DT_NULL entry; ask for a
-    * generous window and stop at DT_NULL. */
-   const Elf64_Dyn *dyn = host(dynamic_off, sizeof(Elf64_Dyn));
-   if (!dyn) return NULL;
+   if (elf_class != ELFCLASS32 && elf_class != ELFCLASS64) return NULL;
+   const bool elf32 = elf_class == ELFCLASS32;
+   const size_t dyn_size = elf32 ? sizeof(Elf32_Dyn) : sizeof(Elf64_Dyn);
+   if (!host(dynamic_off, dyn_size)) return NULL;
 
    struct ln64_module *m = calloc(1, sizeof *m);
    if (!m) return NULL;
    m->path = strdup(path);
    m->bias = load_bias;
+   m->elf32 = elf32;
    m->is_global = is_global;
    m->is_main = is_main;
 
@@ -307,13 +328,24 @@ struct ln64_module *ln64_add(const char *path, uint32_t load_bias,
    uint64_t flags = 0;
    size_t   needed_cap = 0;
 
-   for (const Elf64_Dyn *d = dyn; ; ++d) {
-      const Elf64_Dyn *e = host(dynamic_off + (uint32_t)((const uint8_t *)d -
-                                                         (const uint8_t *)dyn),
-                                sizeof *e);
-      if (!e) break;
+   for (uint64_t offset = dynamic_off; offset <= UINT32_MAX; offset += dyn_size) {
+      const void *entry = host((uint32_t)offset, dyn_size);
+      if (!entry) break;
+      Elf64_Dyn normalized;
+      if (elf32) {
+         const Elf32_Dyn *d = entry;
+         normalized.d_tag = d->d_tag;
+         normalized.d_un.d_val = d->d_un.d_val;
+      } else normalized = *(const Elf64_Dyn *)entry;
+      const Elf64_Dyn *e = &normalized;
       if (e->d_tag == DT_NULL) break;
       switch (e->d_tag) {
+      case DT_INIT:
+         if (e->d_un.d_ptr && e->d_un.d_ptr != (elf32 ? UINT32_MAX : UINT64_MAX))
+            m->init_fn = (uint32_t)(load_bias + e->d_un.d_ptr);
+         break;
+      case DT_INIT_ARRAY: m->init_array = (uint32_t)(load_bias + e->d_un.d_ptr); break;
+      case DT_INIT_ARRAYSZ: m->init_array_size = e->d_un.d_val; break;
       case DT_SYMTAB:   symtab_off  = (uint32_t)(load_bias + e->d_un.d_ptr); break;
       case DT_STRTAB:   strtab_off  = (uint32_t)(load_bias + e->d_un.d_ptr); break;
       case DT_STRSZ:    m->strsz    = e->d_un.d_val; break;
@@ -342,7 +374,7 @@ struct ln64_module *ln64_add(const char *path, uint32_t load_bias,
    }
 
    m->symbolic = (flags & DF_SYMBOLIC) != 0;
-   m->symtab = host(symtab_off, sizeof(Elf64_Sym));
+   m->symtab = host(symtab_off, elf32 ? sizeof(Elf32_Sym) : sizeof(Elf64_Sym));
    m->strtab = host(strtab_off, 1);
    m->soname = (soname_off && m->strtab) ? m->strtab + soname_off
                                          : basename_of(m->path);
@@ -366,8 +398,8 @@ struct ln64_module *ln64_add(const char *path, uint32_t load_bias,
          m->gnu_bloom_shift = h[3];
          if (m->gnu_nbucket && m->gnu_bloom_size) {
             m->gnu_bloom  = host(gnu_off + 16u,
-                                 (size_t)m->gnu_bloom_size * 8u);
-            uint32_t bo = gnu_off + 16u + m->gnu_bloom_size * 8u;
+                                 (size_t)m->gnu_bloom_size * (elf32 ? 4u : 8u));
+            uint32_t bo = gnu_off + 16u + m->gnu_bloom_size * (elf32 ? 4u : 8u);
             m->gnu_bucket = host(bo, (size_t)m->gnu_nbucket * 4u);
             m->gnu_chain  = host(bo + m->gnu_nbucket * 4u, 4u);
          }
@@ -400,6 +432,12 @@ struct ln64_module *ln64_add(const char *path, uint32_t load_bias,
       return NULL;
    }
    return m;
+}
+
+struct ln64_module *ln64_add(const char *path, uint32_t load_bias,
+                             uint32_t dynamic_off, bool is_global, bool is_main)
+{
+   return ln64_add_elf(path, load_bias, dynamic_off, ELFCLASS64, is_global, is_main);
 }
 
 void ln64_link_deps(void)
@@ -474,6 +512,7 @@ static bool bfs_reserve(size_t n)
 bool ln64_lookup(struct ln64_module *ref, const char *name,
                  uint32_t ref_sym_idx, struct ln64_sym *out)
 {
+   Elf64_Sym converted;
    if (!name || !*name || !out) return false;
    const uint32_t gh = gnu_hash(name), sh = sysv_hash(name);
    const char *want = ref ? ref_version(ref, ref_sym_idx) : NULL;
@@ -481,7 +520,7 @@ bool ln64_lookup(struct ln64_module *ref, const char *name,
 
    /* 1. -Bsymbolic: the object asked to bind its own definitions locally. */
    if (ref && ref->symbolic) {
-      const Elf64_Sym *s = mod_find(ref, name, gh, sh, want, &idx);
+      const Elf64_Sym *s = mod_find(ref, name, gh, sh, want, &idx, &converted);
       if (s) return take(ref, s, name, out);
    }
 
@@ -491,7 +530,7 @@ bool ln64_lookup(struct ln64_module *ref, const char *name,
       for (size_t i = 0; i < g_mods_n; ++i) {
          if (!g_mods[i]->is_global || g_mods[i]->is_main != (main_pass != 0))
             continue;
-         const Elf64_Sym *s = mod_find(g_mods[i], name, gh, sh, want, &idx);
+         const Elf64_Sym *s = mod_find(g_mods[i], name, gh, sh, want, &idx, &converted);
          if (s) return take(g_mods[i], s, name, out);
       }
 
@@ -502,7 +541,7 @@ bool ln64_lookup(struct ln64_module *ref, const char *name,
       while (head < tail) {
          struct ln64_module *m = g_bfs[head++];
          if (!m->is_global) {   /* globals were searched above */
-            const Elf64_Sym *s = mod_find(m, name, gh, sh, want, &idx);
+            const Elf64_Sym *s = mod_find(m, name, gh, sh, want, &idx, &converted);
             if (s) return take(m, s, name, out);
          }
          for (size_t k = 0; k < m->deps_n; ++k) {
@@ -520,6 +559,7 @@ bool ln64_lookup(struct ln64_module *ref, const char *name,
 bool ln64_lookup_in(struct ln64_module *mod, const char *name,
                     struct ln64_sym *out)
 {
+   Elf64_Sym converted;
    if (!mod || !name || !out) return false;
    const uint32_t gh = gnu_hash(name), sh = sysv_hash(name);
    if (!bfs_reserve(g_mods_n + 1)) return false;
@@ -528,7 +568,7 @@ bool ln64_lookup_in(struct ln64_module *mod, const char *name,
    while (head < tail) {
       struct ln64_module *m = g_bfs[head++];
       uint32_t idx;
-      const Elf64_Sym *s = mod_find(m, name, gh, sh, NULL, &idx);
+      const Elf64_Sym *s = mod_find(m, name, gh, sh, NULL, &idx, &converted);
       if (s) return take(m, s, name, out);
       for (size_t k = 0; k < m->deps_n; ++k) {
          struct ln64_module *d = m->deps[k];
@@ -543,6 +583,7 @@ bool ln64_lookup_in(struct ln64_module *mod, const char *name,
 
 bool ln64_lookup_global(const char *name, struct ln64_sym *out)
 {
+   Elf64_Sym converted;
    if (!name || !out) return false;
    const uint32_t gh = gnu_hash(name), sh = sysv_hash(name);
    uint32_t idx;
@@ -551,7 +592,7 @@ bool ln64_lookup_global(const char *name, struct ln64_sym *out)
          const bool wanted = pass < 2;
          if (g_mods[i]->is_global != wanted) continue;
          if (wanted && g_mods[i]->is_main != (pass == 0)) continue;
-         const Elf64_Sym *s = mod_find(g_mods[i], name, gh, sh, NULL, &idx);
+         const Elf64_Sym *s = mod_find(g_mods[i], name, gh, sh, NULL, &idx, &converted);
          if (s) return take(g_mods[i], s, name, out);
       }
    return false;
@@ -589,13 +630,14 @@ struct ln64_module *ln64_module_by_address(uint32_t address)
 
 bool ln64_lookup_next(struct ln64_module *caller, const char *name, struct ln64_sym *out)
 {
+   Elf64_Sym converted;
    bool after = false;
    if (!caller || !name || !out) return false;
    const uint32_t gh = gnu_hash(name), sh = sysv_hash(name);
    for (size_t i = 0; i < g_mods_n; ++i) {
       uint32_t index;
       if (after) {
-         const Elf64_Sym *symbol = mod_find(g_mods[i], name, gh, sh, NULL, &index);
+         const Elf64_Sym *symbol = mod_find(g_mods[i], name, gh, sh, NULL, &index, &converted);
          if (symbol) return take(g_mods[i], symbol, name, out);
       }
       if (g_mods[i] == caller) after = true;
@@ -634,4 +676,51 @@ void ln64_dump(void)
               m->bucket ? "sysv" : "",
               m->versym ? "yes" : "no", m->needed_n);
    }
+}
+
+/* DT_INIT precedes DT_INIT_ARRAY for both ELF classes (bionic call_constructors). */
+void ln64_mark_initialized(struct ln64_module *m)
+{
+   if (m) m->init_called = true;
+}
+
+bool ln64_call_init(struct ln64_module *m, ln64_init_fn call, void *user)
+{
+   if (!m || !call) return false;
+   if (m->init_called) return true;
+   m->init_called = true; /* guard recursive dlopen/constructor dependencies */
+   for (size_t i = 0; i < m->deps_n; ++i)
+      if (!ln64_call_init(m->deps[i], call, user)) return false;
+   if (m->init_fn && !call(m->init_fn, user)) return false;
+   const size_t stride = m->elf32 ? 4u : 8u;
+   if (!m->init_array) return true;
+   for (uint64_t offset = 0; offset + stride <= m->init_array_size; offset += stride) {
+      if (offset > UINT32_MAX - m->init_array) return false;
+      const void *p = host(m->init_array + (uint32_t)offset, stride);
+      if (!p) return false;
+      uint64_t fn = 0;
+      memcpy(&fn, p, stride);
+      if (!fn || fn == (m->elf32 ? UINT32_MAX : UINT64_MAX)) continue;
+      if (!call((uint32_t)fn, user)) return false;
+   }
+   return true;
+}
+
+/* ELF mapping and the Java VM's JNI_OnLoad notification are separate lifetimes. */
+bool ln64_java_load_begin(struct ln64_module *module, int *version)
+{
+   if (!module) return true;
+   if (module->java_load_state) {
+      if (version) *version = module->java_version;
+      return false;
+   }
+   module->java_load_state = 1; /* prevents same-loader recursive notification */
+   module->java_version = 0;
+   return true;
+}
+void ln64_java_load_end(struct ln64_module *module, int version)
+{
+   if (!module) return;
+   module->java_version = version;
+   module->java_load_state = 2;
 }

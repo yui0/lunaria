@@ -96,3 +96,5 @@ const char *luna_apk_profile_current(void);
 int luna_apk_profile_list(char (*names)[65], int max);
 int luna_apk_profile_new_name(char *out, size_t cap);
 int luna_apk_restart(const char *profile);
+/* Starts over with no APK, showing the launcher screen. */
+int luna_apk_restart_launcher(void);

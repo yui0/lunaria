@@ -104,6 +104,9 @@ void luna_overlay_set_menu_handler(luna_overlay_menu_fn fn);
 void luna_menu_open(double x, double y, int w, int h);
 int luna_overlay_screenshot(const char *path);
 void luna_menu_close(void);
+/* Session-only execution control. The host compositor keeps running. */
+bool luna_guest_paused(void);
+void luna_guest_set_paused(bool paused);
 /* Once per window-thread poll: expires the notice line. */
 void luna_menu_tick(void);
 /* F9 / F10: start or stop recording touch input; replay the last recording. */
@@ -126,6 +129,13 @@ bool luna_overlay_status_showing(void);
  * View the element stands for. */
 typedef void (*luna_overlay_click_fn)(const char *id);
 void luna_overlay_set_click_handler(luna_overlay_click_fn fn);
+/* Called on the presenting thread while a press is dragged past the touch slop:
+ * (x, y) is where the finger is and (dx, dy) how far the *content* should move
+ * (the opposite of the finger), since the last call.  The press then never
+ * becomes a click.  The widget layer scrolls whatever scrollable view is under
+ * the finger. */
+typedef void (*luna_overlay_scroll_fn)(double x, double y, double dx, double dy);
+void luna_overlay_set_scroll_handler(luna_overlay_scroll_fn fn);
 /* Called on the presenting thread for pointer events within a WebView DOM
  * element. x/y are local image pixels; the receiver queues them for the
  * Android main looper. */

@@ -203,9 +203,7 @@ jvm_object_release(struct jvm_object *o)
    if (destructor[o->type])
       destructor[o->type](o);
 
-   const uint32_t epoch = o->epoch;
    *o = (struct jvm_object){0};
-   o->epoch = epoch + 1;
 }
 
 static bool
@@ -388,7 +386,11 @@ jvm_assign_default_class(struct jvm *jvm, struct jvm_object *o)
 
    switch (o->type) {
       case JVM_OBJECT_METHOD:
-         o->this_klass = jvm_make_class(jvm, "java/lang/reflect/Method");
+         o->this_klass = jvm_make_class(jvm,
+            o->method.signature.data && o->method.signature.data[0] != '('
+               ? "java/lang/reflect/Field"
+               : o->method.name.data && !strcmp(o->method.name.data, "<init>")
+                  ? "java/lang/reflect/Constructor" : "java/lang/reflect/Method");
          break;
 
       case JVM_OBJECT_STRING:
@@ -596,15 +598,19 @@ jvm_bridge_ref_count(struct jvm *jvm, jobject object)
    return refs;
 }
 
+/* Which tenant of a handle slot this is: the slot's allocation count.  A
+ * handle is recycled for whatever is allocated next, so anything that remembers
+ * a handle (the DVM bridge does) records this with it to tell the object it
+ * named from whatever occupies the slot now. */
 uint32_t
 jvm_handle_epoch(struct jvm *jvm, jobject object)
 {
    if (!jvm || !object || (uintptr_t)object > ARRAY_SIZE(jvm->objects))
       return 0;
    jvm_meta_lock();
-   const uint32_t epoch = jvm_get_object(jvm, object)->epoch;
+   const uint32_t generation = jvm->object_generation[(uintptr_t)object - 1];
    jvm_meta_unlock();
-   return epoch;
+   return generation;
 }
 
 bool
@@ -862,8 +868,8 @@ static jobject
 JNIEnv_ToReflectedMethod(JNIEnv* p0, jclass p1, jmethodID p2, jboolean p3)
 {
    assert(p0 && p1 && p2);
-   JVM_UNIMPLEMENTED();
-   return NULL;
+   (void)p3;
+   return (*p0)->NewLocalRef(p0, (jobject)p2);
 }
 
 static const char *jvm_framework_super(const char *name);
@@ -966,8 +972,8 @@ static jobject
 JNIEnv_ToReflectedField(JNIEnv* p0, jclass p1, jfieldID p2, jboolean p3)
 {
    assert(p0 && p1 && p2);
-   JVM_UNIMPLEMENTED();
-   return NULL;
+   (void)p3;
+   return (*p0)->NewLocalRef(p0, (jobject)p2);
 }
 
 static void jvm_clear_pending(struct jvm *jvm)
@@ -1706,6 +1712,14 @@ jvm_wrap_method_uncached(struct jvm *jvm, jmethodID method_id)
          fprintf(stderr, "[jvm] DIAG method id %p is type %d\n", (void*)method_id, mo ? (int)mo->type : -1);
    }
    struct jvm_method method = jvm_get_object_of_type(jvm, method_id, JVM_OBJECT_METHOD)->method;
+   struct jvm_object *owner = jvm_get_object_of_type(jvm, method.klass, JVM_OBJECT_CLASS);
+   /* A host fallback must not replace Java supplied by the application.
+    * Cache this decision with the DEX epoch, including the NULL result, so
+    * JNI dispatch reaches bytecode without repeating hierarchy searches. */
+   if (owner && method.name.data && method.signature.data &&
+       dvm_jni_method_in_dex(owner->klass.name.data, method.name.data,
+                             method.signature.data))
+      return NULL;
    jvm_form_symbol(jvm, &method, symbol, sizeof(symbol));
 
    void *sym;

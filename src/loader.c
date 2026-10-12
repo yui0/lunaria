@@ -38,6 +38,7 @@
 #include "jvm/jvm.h"
 #include "arm_exec.h"
 #include "luna_compositor.h"
+#include "luna_overlay.h"
 #include "dvm/dvm_jni.h"
 
 #ifdef _WIN32
@@ -81,14 +82,14 @@ extern void arm64_exec_svc_ring_dump(void);
  * dependency such as libunity.so -> libmain.so was silently left unresolved.
  * Android system libraries are provided by Lunaria's SVC/runtime bridge and
  * therefore deliberately have no guest ELF beside the APK libraries. */
-static int a64_dep_seen(const char *name, char seen[][LUNA_GUEST_NAME_MAX + 1], size_t n)
+static int elf_dep_seen(const char *name, char seen[][LUNA_GUEST_NAME_MAX + 1], size_t n)
 {
    for (size_t i = 0; i < n; ++i)
       if (!strcmp(name, seen[i])) return 1;
    return 0;
 }
 
-static int a64_vaddr_to_offset(const Elf64_Phdr *ph, size_t n,
+static int elf_vaddr_to_offset(const Elf64_Phdr *ph, size_t n,
                                Elf64_Addr va, Elf64_Off *off)
 {
    for (size_t i = 0; i < n; ++i) {
@@ -101,40 +102,69 @@ static int a64_vaddr_to_offset(const Elf64_Phdr *ph, size_t n,
    return 0;
 }
 
-static size_t a64_read_needed(const char *path,
+static size_t elf_read_needed(const char *path,
                               char names[][LUNA_GUEST_NAME_MAX + 1], size_t cap)
 {
    FILE *f = fopen(path, "rb");
-   Elf64_Ehdr eh;
+   Elf64_Ehdr eh = {0};
    Elf64_Phdr *ph = NULL;
    size_t count = 0;
-   if (!f || fread(&eh, sizeof eh, 1, f) != 1 ||
-       memcmp(eh.e_ident, ELFMAG, SELFMAG) ||
-       eh.e_ident[EI_CLASS] != ELFCLASS64 || eh.e_machine != EM_AARCH64 ||
-       !eh.e_phnum || eh.e_phentsize != sizeof(Elf64_Phdr))
+   unsigned char ident[EI_NIDENT];
+   if (!f || fread(ident, sizeof ident, 1, f) != 1 ||
+       memcmp(ident, ELFMAG, SELFMAG) || ident[EI_DATA] != ELFDATA2LSB)
       goto out;
+   const bool elf32 = ident[EI_CLASS] == ELFCLASS32;
+   if (ident[EI_CLASS] != ELFCLASS32 && ident[EI_CLASS] != ELFCLASS64) goto out;
+   rewind(f);
+   if (elf32) {
+      Elf32_Ehdr h;
+      if (fread(&h, sizeof h, 1, f) != 1 || h.e_machine != EM_ARM ||
+          h.e_phentsize != sizeof(Elf32_Phdr)) goto out;
+      eh.e_phnum = h.e_phnum;
+      eh.e_phoff = h.e_phoff;
+   } else {
+      if (fread(&eh, sizeof eh, 1, f) != 1 || eh.e_machine != EM_AARCH64 ||
+          eh.e_phentsize != sizeof(Elf64_Phdr)) goto out;
+   }
+   if (!eh.e_phnum) goto out;
    ph = calloc(eh.e_phnum, sizeof *ph);
-   if (!ph || fseeko(f, (off_t)eh.e_phoff, SEEK_SET) ||
-       fread(ph, sizeof *ph, eh.e_phnum, f) != eh.e_phnum)
-      goto out;
+   if (!ph || fseeko(f, (off_t)eh.e_phoff, SEEK_SET)) goto out;
+   for (size_t i = 0; i < eh.e_phnum; ++i) {
+      if (elf32) {
+         Elf32_Phdr h;
+         if (fread(&h, sizeof h, 1, f) != 1) goto out;
+         ph[i] = (Elf64_Phdr){ .p_type=h.p_type, .p_flags=h.p_flags,
+            .p_offset=h.p_offset, .p_vaddr=h.p_vaddr, .p_paddr=h.p_paddr,
+            .p_filesz=h.p_filesz, .p_memsz=h.p_memsz, .p_align=h.p_align };
+      } else if (fread(&ph[i], sizeof ph[i], 1, f) != 1) goto out;
+   }
 
    const Elf64_Phdr *dynamic = NULL;
    for (size_t i = 0; i < eh.e_phnum; ++i)
       if (ph[i].p_type == PT_DYNAMIC) { dynamic = &ph[i]; break; }
    if (!dynamic || !dynamic->p_filesz) goto out;
 
-   size_t ndyn = dynamic->p_filesz / sizeof(Elf64_Dyn);
+   const size_t dyn_size = elf32 ? sizeof(Elf32_Dyn) : sizeof(Elf64_Dyn);
+   size_t ndyn = dynamic->p_filesz / dyn_size;
    Elf64_Dyn *dyn = calloc(ndyn, sizeof *dyn);
-   if (!dyn || fseeko(f, (off_t)dynamic->p_offset, SEEK_SET) ||
-       fread(dyn, sizeof *dyn, ndyn, f) != ndyn) {
-      free(dyn);
-      goto out;
+   if (!dyn || fseeko(f, (off_t)dynamic->p_offset, SEEK_SET)) {
+      free(dyn); goto out;
+   }
+   for (size_t i = 0; i < ndyn; ++i) {
+      if (elf32) {
+         Elf32_Dyn d;
+         if (fread(&d, sizeof d, 1, f) != 1) { free(dyn); goto out; }
+         dyn[i].d_tag = d.d_tag;
+         dyn[i].d_un.d_val = d.d_un.d_val;
+      } else if (fread(&dyn[i], sizeof dyn[i], 1, f) != 1) {
+         free(dyn); goto out;
+      }
    }
    Elf64_Addr strtab_va = 0;
    for (size_t i = 0; i < ndyn && dyn[i].d_tag != DT_NULL; ++i)
       if (dyn[i].d_tag == DT_STRTAB) strtab_va = dyn[i].d_un.d_ptr;
    Elf64_Off strtab_off;
-   if (!strtab_va || !a64_vaddr_to_offset(ph, eh.e_phnum,
+   if (!strtab_va || !elf_vaddr_to_offset(ph, eh.e_phnum,
                                            strtab_va, &strtab_off)) {
       free(dyn);
       goto out;
@@ -227,15 +257,30 @@ static void a64_preload_platform_libs(void)
    }
 }
 
-static void a64_preload_needed(const char *path, const char *dir,
-                               char seen[][LUNA_GUEST_NAME_MAX + 1], size_t *seen_n)
+static bool elf_matches(const char *path, bool elf64)
+{
+   unsigned char ident[EI_NIDENT];
+   uint16_t type, machine;
+   FILE *f = fopen(path, "rb");
+   if (!f) return false;
+   bool ok = fread(ident, sizeof ident, 1, f) == 1 &&
+      fread(&type, sizeof type, 1, f) == 1 && fread(&machine, sizeof machine, 1, f) == 1 &&
+      !memcmp(ident, ELFMAG, SELFMAG) && ident[EI_DATA] == ELFDATA2LSB &&
+      ident[EI_CLASS] == (elf64 ? ELFCLASS64 : ELFCLASS32) &&
+      machine == (elf64 ? EM_AARCH64 : EM_ARM);
+   fclose(f);
+   return ok;
+}
+
+static bool elf_preload_needed(const char *path, const char *dir,
+                               char seen[][LUNA_GUEST_NAME_MAX + 1], size_t *seen_n, bool elf64)
 {
    char needed[64][LUNA_GUEST_NAME_MAX + 1];
-   size_t n = a64_read_needed(path, needed, 64);
+   size_t n = elf_read_needed(path, needed, 64);
    for (size_t i = 0; i < n; ++i) {
       char dep_path[PATH_MAX];
       struct stat st;
-      if (a64_dep_seen(needed[i], seen, *seen_n)) continue;
+      if (elf_dep_seen(needed[i], seen, *seen_n)) continue;
       if (*seen_n < 128) {
          memcpy(seen[*seen_n], needed[i], LUNA_GUEST_NAME_MAX + 1);
          seen[*seen_n][LUNA_GUEST_NAME_MAX] = '\0';
@@ -248,10 +293,10 @@ static void a64_preload_needed(const char *path, const char *dir,
       }
       memcpy(dep_path, dir, dir_len);
       memcpy(dep_path + dir_len, needed[i], name_len + 1);
-      if (stat(dep_path, &st) != 0 || !arm64_elf_is_arm64(dep_path)) {
+      if (stat(dep_path, &st) != 0 || !elf_matches(dep_path, elf64)) {
          /* Not beside the APK's libraries.  Before handing it to the SVC
           * bridge, look for the real thing among the platform libraries. */
-         const char *sys = a64_syslib_dir();
+         const char *sys = elf64 ? a64_syslib_dir() : NULL;
          int found = 0;
          if (sys) {
             char cand[PATH_MAX];
@@ -263,9 +308,9 @@ static void a64_preload_needed(const char *path, const char *dir,
             if (strcmp(needed[i], "libc.so") != 0 &&
                 (size_t)snprintf(cand, sizeof cand, "%s/%s", sys, needed[i])
                 < sizeof cand &&
-                stat(cand, &st) == 0 && arm64_elf_is_arm64(cand)) {
+                stat(cand, &st) == 0 && elf_matches(cand, elf64)) {
                printf("preloading arm64 platform library: %s\n", cand);
-               if (arm64_exec_load_library(cand, 0) < 0)
+               if (arm_exec_link_library(cand) < 0)
                   warnx("failed to load platform library %s", cand);
                else
                   found = 1;
@@ -275,24 +320,41 @@ static void a64_preload_needed(const char *path, const char *dir,
             continue; /* Android platform library: handled by the emulator. */
          continue;    /* loaded from the platform directory, not from `dir` */
       }
-      a64_preload_needed(dep_path, dir, seen, seen_n);
-      printf("preloading arm64 DT_NEEDED: %s\n", dep_path);
-      if (arm64_exec_load_library(dep_path, 0) < 0)
-         warnx("failed to preload AArch64 dependency %s", dep_path);
+      if (!elf_preload_needed(dep_path, dir, seen, seen_n, elf64)) return false;
+      printf("loading ELF%u DT_NEEDED: %s\n", elf64 ? 64u : 32u, dep_path);
+      if (arm_exec_link_library(dep_path) < 0) {
+         warnx("failed to load ELF dependency %s", dep_path);
+         return false;
+      }
    }
+   return true;
 }
 
-void arm64_loader_load_needed(const char *path)
+bool arm_loader_load_needed(const char *path, bool elf64)
 {
    char dir[PATH_MAX];
    char seen[128][LUNA_GUEST_NAME_MAX + 1];
    size_t seen_n = 0;
    const char *slash = path ? strrchr(path, '/') : NULL;
    size_t n = slash ? (size_t)(slash - path) + 1u : 0u;
-   if (!path || n >= sizeof dir) return;
+   if (!path || n >= sizeof dir) return false;
    memcpy(dir, path, n);
    dir[n] = '\0';
-   a64_preload_needed(path, dir, seen, &seen_n);
+   /* Do not revisit the root through a dependency cycle. */
+   const char *leaf = slash ? slash + 1 : path;
+   snprintf(seen[seen_n++], sizeof seen[0], "%s", leaf);
+   return elf_preload_needed(path, dir, seen, &seen_n, elf64);
+}
+
+void arm64_loader_load_needed(const char *path)
+{
+   (void)arm_loader_load_needed(path, true);
+}
+
+static void a64_preload_needed(const char *path, const char *dir,
+                              char seen[][LUNA_GUEST_NAME_MAX + 1], size_t *seen_n)
+{
+   (void)elf_preload_needed(path, dir, seen, seen_n, true);
 }
 
 /* LUNARIA_TOUCH_FIFO — taps arriving while the emulator is already running.
@@ -375,6 +437,20 @@ static void touch_fifo_line(const char *line, int frame_count)
    float x = -1, y = -1;
    int hold = 6;
    const char *rest = NULL;
+   /* Explicit samples use the same host input route as a physical drag. */
+   static const char *const commands[] = { "down ", "up ", "move " };
+   for (int action = 0; action < 3; ++action) {
+      const size_t n = strlen(commands[action]);
+      if (!strncmp(line, commands[action], n)) {
+         if (!touch_parse_xy(line + n, &x, &y, &rest)) return;
+         while (*rest == ' ' || *rest == '\t') ++rest;
+         if (*rest) return;
+         arm_exec_touch_push(action, x, y);
+         fprintf(stderr, "[loader] TOUCH_FIFO sample action=%d (%.0f,%.0f) frame %d\n",
+                 action, x, y, frame_count);
+         return;
+      }
+   }
    if (!touch_parse_xy(line, &x, &y, &rest)) return;
    while (*rest == ' ' || *rest == '\t') ++rest;
    if (*rest == ',') hold = atoi(rest + 1);
@@ -709,7 +785,7 @@ static void schedule_unsafe_alarm_dump(void)
    if (!value || !*value) return;
    errno = 0;
    seconds = strtol(value, &end, 10);
-   if (errno || end == value || *end || seconds <= 0 || seconds > UINT_MAX) {
+   if (errno || end == value || *end || seconds <= 0 || (unsigned long)seconds > UINT_MAX) {
       fprintf(stderr, "[loader] ignoring invalid "
               "LUNARIA_UNSAFE_ALARM_DUMP_S=%s\n", value);
       return;
@@ -949,6 +1025,7 @@ pump_now_us(void)
 static void
 pump_java_frame(void)
 {
+   if (luna_guest_paused()) return;
    thread_dump_request_tick();
    const uint64_t t_media = frame_now_ns();
    struct dvm *vm = dvm_jni_vm();
@@ -1308,11 +1385,13 @@ run_dex_activity(struct jvm *jvm, int is_a64)
          jvm->native.SetObjectField(&jvm->env, activity, app_field, application);
    }
 
+   dvm_jni_activity_dispatch(&jvm->env, activity, "Created", 0);
    if (!dex_call_lifecycle(jvm, activity, cls, "onCreate",
                            "(Landroid/os/Bundle;)V", 1)) {
       fprintf(stderr, "[loader] dex startup: %s has no onCreate\n", cls);
       return EXIT_FAILURE;
    }
+   dvm_jni_activity_dispatch(&jvm->env, activity, "Created", 1);
    run_threads();
    /* onStart/onResume are what make an Activity visible and running; an app
     * that starts its render thread in onResume never starts without them. */
@@ -1323,8 +1402,15 @@ run_dex_activity(struct jvm *jvm, int is_a64)
     * would take the input focus. */
    const int launcher_finished = dvm_jni_activity_finishing(&jvm->env, activity);
    if (!launcher_finished) {
+      dvm_jni_activity_dispatch(&jvm->env, activity, "Started", 0);
       dex_call_lifecycle(jvm, activity, cls, "onStart",  "()V", 0);
+      dvm_jni_activity_dispatch(&jvm->env, activity, "Started", 1);
+      dex_call_lifecycle(jvm, activity, cls, "onPostCreate",
+                         "(Landroid/os/Bundle;)V", 1);
+      dvm_jni_activity_dispatch(&jvm->env, activity, "Resumed", 0);
       dex_call_lifecycle(jvm, activity, cls, "onResume", "()V", 0);
+      dex_call_lifecycle(jvm, activity, cls, "onPostResume", "()V", 0);
+      dvm_jni_activity_dispatch(&jvm->env, activity, "Resumed", 1);
       run_threads();
 
       /* Attach the resumed Activity to its window before running its renderer.

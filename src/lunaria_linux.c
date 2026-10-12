@@ -1125,6 +1125,14 @@ int luna_os_time_break(int64_t seconds, int local, struct tm *result, int64_t *o
    *offset = (int64_t)result->tm_gmtoff;
    return 0;
 }
+char *luna_os_strptime(const char *input, const char *format, struct tm *value, long *gmtoff)
+{
+   value->tm_gmtoff = *gmtoff;
+   char *end = strptime(input, format, value);
+   *gmtoff = value->tm_gmtoff;
+   return end;
+}
+
 int luna_os_time_make(struct tm *value, int64_t *seconds, int64_t *offset)
 {
    int saved = errno;
@@ -1136,6 +1144,19 @@ int luna_os_time_make(struct tm *value, int64_t *seconds, int64_t *offset)
    errno = saved;
    return 0;
 }
+
+int luna_os_time_make_utc(struct tm *value, int64_t *seconds)
+{
+   int saved = errno;
+   errno = 0;
+   value->tm_isdst = 0;
+   time_t result = timegm(value);
+   if (result == (time_t)-1 && errno) return -1;
+   *seconds = (int64_t)result;
+   errno = saved;
+   return 0;
+}
+
 
 int luna_os_unsetenv(const char *name) { return unsetenv(name); }
 intptr_t luna_os_command_pipe_open(const char *path)

@@ -481,7 +481,8 @@ static bool dvm_buffer_is_direct(struct dvm *vm, dvm_ref r)
    /* The class check is not belt-and-braces: `direct` is an ordinary field
     * name and a dex class of the app's own may well have one. */
    struct dvm_class *c = dvm_object_class(vm, r);
-   if (!c || !c->name || strcmp(c->name, "java/nio/ByteBuffer")) return false;
+   struct dvm_class *bytebuffer = dvm_find_class(vm, "java/nio/ByteBuffer");
+   if (!c || !bytebuffer || !dvm__class_assignable(vm, c, bytebuffer)) return false;
    union dvm_value d = { 0 };
    return dvm_get_field(vm, r, "direct", "Z", &d) && d.i != 0;
 }
@@ -524,6 +525,9 @@ static uint32_t dvm_direct_buffer_to_host(struct dvm *vm, dvm_ref r)
 /* The other direction, once the native has written into the region. */
 static void dvm_direct_buffer_from_host(struct dvm *vm, dvm_ref r)
 {
+   union dvm_value readonly = {0};
+   (void)dvm_get_field(vm, r, "readOnly", "Z", &readonly);
+   if (readonly.i) return;
    uint32_t len = 0;
    uint8_t *dst = dvm_buffer_bytes(vm, r, &len);
    const uint32_t handle = dvm_external_handle(vm, r);
@@ -546,6 +550,48 @@ static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
    if (!o) return 0;
    dvm_ref arr = host_array_to_dvm(vm, env, o);
    if (arr) return arr;
+   /* A JNI member id carries the same metadata as its reflected object.
+    * Re-import it after a native frame has released the original VM wrapper;
+    * an empty wrapper loses Field.getType and Method.getReturnType. */
+   {
+      const char *owner = NULL, *name = NULL, *signature = NULL;
+      if (jvm_field_info(jnienv_get_jvm(env), (jfieldID)o,
+                         &owner, &name, &signature)) {
+         const bool field = signature[0] != '(';
+         const char *kind = field ? "java/lang/reflect/Field"
+            : !strcmp(name, "<init>") ? "java/lang/reflect/Constructor"
+            : "java/lang/reflect/Method";
+         dvm_ref member = wrapper_for(vm, env, kind, (uint32_t)(uintptr_t)o);
+         if (!member) return 0;
+         struct dvm_class *c = dvm_find_class(vm, owner);
+         union dvm_value v = { .l = c ? dvm_class_object(vm, c) : 0 };
+         (void)dvm_set_field(vm, member, "owner", "Ljava/lang/Class;", v);
+         v.l = dvm_new_string(vm, name);
+         (void)dvm_set_field(vm, member, "name", "Ljava/lang/String;", v);
+         v.l = dvm_new_string(vm, signature);
+         (void)dvm_set_field(vm, member, "sig", "Ljava/lang/String;", v);
+         v.i = 0;
+         if (field) {
+            for (struct dvm_class *k = c; k; k = k->super) {
+               bool found = false;
+               for (int i = 0; i < k->nifields; ++i)
+                  if (!strcmp(k->ifields[i].name, name) && !strcmp(k->ifields[i].type, signature)) {
+                     v.i = (int32_t)k->ifields[i].access; found = true; break;
+                  }
+               for (int i = 0; !found && i < k->nsfields; ++i)
+                  if (!strcmp(k->sfields[i].name, name) && !strcmp(k->sfields[i].type, signature)) {
+                     v.i = (int32_t)k->sfields[i].access; found = true; break;
+                  }
+               if (found) break;
+            }
+         } else if (c) {
+            struct dvm_method *method = dvm_find_method(vm, c, name, signature);
+            if (method) v.i = (int32_t)method->access;
+         }
+         (void)dvm_set_field(vm, member, "access", "I", v);
+         return member;
+      }
+   }
    /* Class arguments (FindClass / GetObjectClass results) must stay Class
     * objects in the VM.  Wrapping them as instances of java.lang.Class made
     * ReflectionHelper.getMethodID walk Class's own methods and miss every
@@ -569,6 +615,8 @@ static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
             if (r) dvm_pin(vm, r);
             return r;
          }
+         if (getenv("LUNARIA_TRACE_CLASS_FLOW"))
+            fprintf(stderr, "[classflow] host Class %s lacks a VM definition\n", described);
       }
    }
    /* Both VM interiors use WTF-8 with an explicit byte length. Avoid JNI's
@@ -688,7 +736,6 @@ static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
     * DeleteLocalRef free the slot another thread still held.  A handle whose
     * slot has gone is not reused. */
    uint32_t host = dvm_external_handle(vm, r);
-   /*TMP*/{ struct dvm_class *tc = dvm_object_class(vm, r); if (tc && tc->name && strstr(tc->name, "payment/Payment") && !strstr(tc->name, "$")) fprintf(stderr, "[TMP] to_jobject Payment r=0x%x host=0x%x refs=%d cur=%d jclass=%s\n", r, host, host ? jvm_bridge_ref_count(jnienv_get_jvm(env), (jobject)(uintptr_t)host) : -1, host ? (int)wrapper_current(env, host, r) : -1, host ? class_name_of(env, (jobject)(uintptr_t)host) : "-"); }
    if (host) {
       if (jvm_bridge_ref_count(jnienv_get_jvm(env), (jobject)(uintptr_t)host) > 0 &&
           wrapper_current(env, host, r))
@@ -1211,8 +1258,12 @@ static bool hook_call_external_inner(void *user, struct dvm *vm, const char *cla
        * CRCs every value, and died on String.getBytes of null). */
       int32_t vcode = 1;
       const char *vname = NULL;
-      if (self_pkg && !strcmp(self_pkg, record.name))
+      if (self_pkg && !strcmp(self_pkg, record.name)) {
          arm_exec_apk_version(&vcode, &vname);
+      } else {
+         vcode = record.version_code;
+         vname = record.version_name;
+      }
       v.i = vcode;
       (void)dvm_set_field(vm, pi, "versionCode", "I", v);
       v.l = vname ? dvm_new_string(vm, vname) : 0;
@@ -1870,6 +1921,19 @@ void dvm_jni_show_activity(JNIEnv *env, jobject activity)
    unsigned cookie = dvm_gil_enter_from_guest(vm);
    dvm_ref ref = from_jobject(vm, env, activity);
    if (ref) dvm__activity_visible(vm, ref);
+   dvm_gil_leave_to_guest(vm, cookie);
+}
+
+/* The Pre/Post lifecycle callbacks a framework Activity dispatches around its
+ * perform*() step, for the launcher the loader drives itself. */
+void dvm_jni_activity_dispatch(JNIEnv *env, jobject activity, const char *step,
+                               int post)
+{
+   struct dvm *vm = dvm_jni_vm();
+   if (!vm || !env || !activity) return;
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   dvm_ref ref = from_jobject(vm, env, activity);
+   if (ref) dvm__activity_dispatch(vm, ref, step, post != 0, 0);
    dvm_gil_leave_to_guest(vm, cookie);
 }
 

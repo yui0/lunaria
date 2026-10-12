@@ -449,10 +449,10 @@ runtime/libOpenSLES.so: src/trace.h
 # IMPORTANT: The user requires ICU-independent number formatting. Do not add
 # ICU compile/link flags or an ICU package dependency to implement DVM APIs.
 DVM_SRC = src/luna_unicode.c src/dvm/dex.c src/dvm/dvm.c src/dvm/dvm_runtime.c src/dvm/dvm_jni.c \
-          src/dvm/dvm_net.c src/dvm/dvm_media.c src/dvm/regex.c src/dvm/charset.c src/dvm/audio_track.c src/dvm/apk_signers.c \
+          src/dvm/dvm_net.c src/dvm/dvm_media.c src/dvm/regex.c src/dvm/charset.c src/dvm/audio_track.c src/dvm/apk_signers.c src/dvm/dvm_sqlite.c \
           src/webview_cdp.c $(WEBVIEW_CDP_HOST_SRC)
-DVM_HDR = src/luna_unicode.h src/unicode/character_data.h src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
-          src/dvm/dvm_net.h src/lunaria_os.h src/dvm/dvm_media.h src/dvm/apk_signers.h \
+DVM_HDR = src/dvm/dvm_object_stream.h src/dvm/dvm_bitmap_drawable.h src/dvm/dvm_drawable_layer.h src/jvm/java_type.h src/simplewebp.h src/luna_unicode.h src/unicode/character_data.h src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
+          src/dvm/dvm_net.h src/lunaria_os.h src/dvm/dvm_media.h src/dvm/apk_signers.h src/dvm/dvm_sqlite.h \
           src/dvm/regex.h src/dvm/charset.h src/dvm/locale_names.h src/dvm/audio_track.h src/dvm/date_symbols_data.h src/dvm/framework_strings.h \
           src/webview_cdp.h
 
@@ -498,7 +498,7 @@ $(BUILD_DIR)/luna_fnmatch.o: src/lib/musl/fnmatch.c src/lunaria_os.h src/luna_un
 
 # arm_exec.o: compiled with C++20 and dynarmic headers; linked into lunaria
 $(BUILD_DIR)/arm_exec.o: | $(BUILD_DIR)
-$(BUILD_DIR)/arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/lunaria_os.h src/luna_boot.h      src/luna_input.h src/arm.h src/svc_ids.h src/lib/guest.c src/jvm/jvm.h src/binary128.h src/linker64.h src/trace.h $(DYNARMIC_LIB)
+$(BUILD_DIR)/arm_exec.o: src/arm_exec.cpp src/jvm/java_type.h src/arm_exec.h src/lunaria_os.h src/luna_boot.h      src/luna_input.h src/arm.h src/svc_ids.h src/lib/guest.c src/jvm/jvm.h src/binary128.h src/linker64.h src/trace.h $(DYNARMIC_LIB)
 	$(CXX) -std=c++20 $(OPTFLAGS) -fPIC \
 	    $(SANITIZE) \
 	    $(DYNARMIC_INCS) \
@@ -781,6 +781,9 @@ boot-card-test: test/test_boot_card
 	mkdir -p /tmp/lunaria-boot
 	./test/test_boot_card 18 /tmp/lunaria-boot
 
+surface-window-test: test/test_boot_card
+	./test/test_boot_card --surface-test
+
 test/test_regex: test/regex_test.c src/dvm/regex.c src/dvm/regex.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc/dvm -o $@ test/regex_test.c src/dvm/regex.c -lpthread
 
@@ -967,7 +970,7 @@ jit-speed: lunaria test/libjitspeed.so
 # symbol (which must load and read as NULL).  See test/dlopen_test.c.
 test/libdlfixture.so: test/dlopen_fixture.c
 	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
-	    -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libdlfixture.so -o $@ $<
+	    -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libdlfixture.so -Wl,-init,fixture_init -o $@ $<
 
 test/libdlmissing.so: test/dlopen_fixture.c
 	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
@@ -980,13 +983,15 @@ test/libdlweak.so: test/dlopen_fixture.c
 	    -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libdlweak.so -o $@ $<
 
 test/libdltest.so: test/dlopen_test.c
-	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 \
 	    '-DDL_FIXTURE_DIR="$(PWD)/test"' \
 	    -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libdltest.so -o $@ $<
 
-dl-test: lunaria test/libdltest.so test/libdlfixture.so test/libdlmissing.so \
+dl-test: lunaria test/dvm_test.dex test/libdltest.so test/libdlunrelated.so test/libdldependent.so test/libdlfixture.so test/libdlmissing.so \
          test/libdlweak.so
-	@LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" ./lunaria test/libdltest.so 2>&1 \
+	@mkdir -p $(BUILD_DIR)/dltest-vm
+	@cp test/dvm_test.dex $(BUILD_DIR)/dltest-vm/classes.dex
+	@ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/dltest-vm" LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" ./lunaria test/libdltest.so 2>&1 \
 	    | tee .dltest.out | grep -E 'dltest|cannot locate'; \
 	grep -q 'RESULT PASS' .dltest.out; rc=$$?; rm -f .dltest.out; exit $$rc
 
@@ -1864,7 +1869,7 @@ dist-clean:
 
 .PHONY: primary-mutex-test gl-map-test luna-browser luna-browser-test vulkan-test dist dist-stage dist-stage-build dist-mac dist-clean all pixels-test dl-test jit-speed syslib guestlib syslib-clean host-all macos-deps x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
 	        clean install install-bin install-lib test net-test dvm-test http-chunked-test regex-test charset-test abi-test \
-	        posix-test boot-card-test binary128-test fd-callback-test \
+	        posix-test boot-card-test surface-window-test binary128-test fd-callback-test \
 	        thread-start-test mutex-test heap-test heap-core-test icache-sync-test guestmem-test lock-test \
         gil-test \
         fetch fetch-libunity fetch-btw fetch-blade-soul fetch-openh264 \
@@ -1898,11 +1903,35 @@ $(BUILD_DIR)/libc-pages-test.so: test/libc_pages_test.c | $(BUILD_DIR)
 libc-pages-test: lunaria $(BUILD_DIR)/libc-pages-test.so
 	@rc=0; timeout 30s env ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)" ANDROID_APK_FILE="$(BUILD_DIR)/libc-pages-test.so" ./lunaria $(BUILD_DIR)/libc-pages-test.so > $(BUILD_DIR)/libc-pages-test.log 2>&1 || rc=$$?; test $$rc -le 1
 	grep 'RESULT PASS' $(BUILD_DIR)/libc-pages-test.log
+test/libtimegm64.so: test/timegm_test.c src/jvm/jni.h
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) $< -o $@
+test/libtimegm32.so: test/timegm_test.c src/jvm/jni.h
+	clang -target armv7-linux-gnueabi $(ABI_TEST_CFLAGS) $< -o $@
+timegm-test: lunaria test/libtimegm64.so test/libtimegm32.so
+	@set -e; for so in test/libtimegm64.so test/libtimegm32.so; do \
+	    log="$(BUILD_DIR)/timegm-$${so##*/}.log"; rc=0; \
+	    ./lunaria $$so > "$$log" 2>&1 || rc=$$?; test $$rc -le 1; \
+	    grep 'RESULT PASS' "$$log"; \
+	    ! grep 'FAIL:' "$$log"; done
+.PHONY: timegm-test
+test/libsession64.so: test/session_test.c src/jvm/jni.h
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) $< -o $@
+test/libsession32.so: test/session_test.c src/jvm/jni.h
+	clang -target armv7-linux-gnueabi $(ABI_TEST_CFLAGS) -fomit-frame-pointer $< -o $@
+session-test: lunaria test/libsession64.so test/libsession32.so
+	@set -e; for so in test/libsession64.so test/libsession32.so; do \
+	    log="$(BUILD_DIR)/session-$${so##*/}.log"; rc=0; \
+	    ./lunaria $$so > "$$log" 2>&1 || rc=$$?; test $$rc -le 1; \
+	    grep 'RESULT PASS' "$$log"; ! grep 'FAIL:' "$$log"; done
+.PHONY: session-test
 test/test_motion_event: test/motion_event_test.c test/dvm_host_fixture.c runtime/libjvm.so $(LUNA_OS_OBJ)
 	$(CC) -std=c11 -g -O1 -D_GNU_SOURCE $(CPPFLAGS) -Isrc $(HOST_EXPORT) \
 	    test/motion_event_test.c test/dvm_host_fixture.c runtime/libjvm.so $(LUNA_OS_OBJ) \
 	    -Wl,-rpath,'$$ORIGIN/../runtime' $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_SYSTEM_DL_LIBS) -o $@
-motion-event-test: test/test_motion_event test/abi_pkg/classes.dex
+test/abi_pkg/classes2.dex: test/dvm_test.dex
+	@mkdir -p test/abi_pkg
+	cp $< $@
+motion-event-test: test/test_motion_event test/abi_pkg/classes.dex test/abi_pkg/classes2.dex
 	ANDROID_PACKAGE_CODE_PATH="$(abspath test/abi_pkg)" ./test/test_motion_event
 
 test/libkeymapguest.so: test/keymap_guest_test.c src/jvm/jni.h
@@ -2144,3 +2173,69 @@ arsc-bag-test: test/test_arsc_bag
 
 test/test_arsc_bag: test/arsc_bag_test.c src/arm_exec.h
 	$(CC) -std=c11 -Wall -Wextra -Werror -Isrc $< -o $@
+
+# The same scope tests cover both ELF classes and both dynamic hash formats.
+.PHONY: linker-scope-test
+linker-scope-test:
+	$(CC) -std=c11 -Wall -Wextra -Werror test/linker_scope_test.c src/linker64.c -o /tmp/lunaria-linker-scope-test
+	/tmp/lunaria-linker-scope-test
+
+# ARM32 runs the same dlopen suite and constructor-order fixture as ARM64.
+test/dl32/libdlfixture.so: test/dlopen_fixture.c
+	@mkdir -p test/dl32
+	clang -target armv7a-linux-gnueabi -fPIC -shared -nostdlib -O1 -fuse-ld=lld -Wl,-soname,libdlfixture.so -Wl,-init,fixture_init -o $@ $<
+test/dl32/libdlmissing.so: test/dlopen_fixture.c
+	@mkdir -p test/dl32
+	clang -target armv7a-linux-gnueabi -fPIC -shared -nostdlib -O1 -fuse-ld=lld -DREQUIRE_MISSING -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libdlmissing.so -o $@ $<
+test/dl32/libdlweak.so: test/dlopen_fixture.c
+	@mkdir -p test/dl32
+	clang -target armv7a-linux-gnueabi -fPIC -shared -nostdlib -O1 -fuse-ld=lld -DREQUIRE_WEAK -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libdlweak.so -o $@ $<
+test/libdltest32.so: test/dlopen_test.c
+	clang -target armv7a-linux-gnueabi $(ABI_TEST_CFLAGS) -std=c11 '-DDL_FIXTURE_DIR="$(PWD)/test/dl32"' -Wl,--unresolved-symbols=ignore-all -Wl,-soname,libdltest32.so -o $@ $<
+.PHONY: dl-test32
+dl-test32: lunaria test/dvm_test.dex test/libdltest32.so test/dl32/libdlunrelated.so test/dl32/libdldependent.so test/dl32/libdlfixture.so test/dl32/libdlmissing.so test/dl32/libdlweak.so
+	@mkdir -p $(BUILD_DIR)/dltest-vm
+	@cp test/dvm_test.dex $(BUILD_DIR)/dltest-vm/classes.dex
+	@ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/dltest-vm" LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" ./lunaria test/libdltest32.so 2>&1 | tee /tmp/lunaria-dltest32.log | rg 'dltest|cannot locate'
+	@rg -q 'RESULT PASS' /tmp/lunaria-dltest32.log
+
+# Run the same JNI reflection metadata regression on both guest ABIs.
+test/libjnireflection64.so: test/jni_reflection_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -Wl,-soname,libjnireflection64.so -o $@ $<
+test/libjnireflection32.so: test/jni_reflection_test.c
+	clang -target armv7a-linux-gnueabi $(ABI_TEST_CFLAGS) -std=c11 -Wl,-soname,libjnireflection32.so -o $@ $<
+.PHONY: jni-reflection-test
+jni-reflection-test: lunaria test/libjnireflection64.so test/libjnireflection32.so test/dvm_test.dex
+	@mkdir -p $(BUILD_DIR)/jni-reflection
+	@cp test/dvm_test.dex $(BUILD_DIR)/jni-reflection/classes.dex
+	@LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/jni-reflection" ./lunaria test/libjnireflection64.so > /tmp/lunaria-jnireflection64.log 2>&1 || test $$? -eq 1
+	@rg 'jnireflection.*RESULT|jnireflection.*FAIL' /tmp/lunaria-jnireflection64.log
+	@rg -q 'RESULT PASS' /tmp/lunaria-jnireflection64.log && ! rg -q 'RESULT FAIL' /tmp/lunaria-jnireflection64.log
+	@LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/jni-reflection" ./lunaria test/libjnireflection32.so > /tmp/lunaria-jnireflection32.log 2>&1 || test $$? -eq 1
+	@rg 'jnireflection.*RESULT|jnireflection.*FAIL' /tmp/lunaria-jnireflection32.log
+	@rg -q 'RESULT PASS' /tmp/lunaria-jnireflection32.log && ! rg -q 'RESULT FAIL' /tmp/lunaria-jnireflection32.log
+
+# Build the same dependency/addend fixture for both ELF classes.
+test/libdldependent.so: test/dlopen_dependency.c test/libdlfixture.so
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld -Wl,-soname,libdldependent.so -Ltest -o $@ $< -ldlfixture
+test/dl32/libdldependent.so: test/dlopen_dependency.c test/dl32/libdlfixture.so
+	clang -target armv7a-linux-gnueabi -fPIC -shared -nostdlib -O1 -fuse-ld=lld -Wl,-soname,libdldependent.so -Ltest/dl32 -o $@ $< -ldlfixture
+
+test/libeglquery64.so: test/egl_query_context_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -Wl,-soname,libeglquery64.so -o $@ $<
+test/libglesformat64.so: test/gles_format_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -Wl,-soname,libglesformat64.so -o $@ $<
+test/libeglquery32.so: test/egl_query_context_test.c
+	clang -target armv7a-linux-gnueabi $(ABI_TEST_CFLAGS) -std=c11 -Wl,-soname,libeglquery32.so -o $@ $<
+.PHONY: egl-query-test
+egl-query-test: lunaria test/libeglquery64.so test/libeglquery32.so
+	@LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" ./lunaria test/libeglquery64.so 2>&1 | tee /tmp/lunaria-eglquery64.log | rg 'eglquery|cannot locate'
+	@rg -q 'RESULT PASS' /tmp/lunaria-eglquery64.log && ! rg -q 'RESULT FAIL' /tmp/lunaria-eglquery64.log
+	@LD_LIBRARY_PATH="$(PWD):$(PWD)/runtime" ./lunaria test/libeglquery32.so 2>&1 | tee /tmp/lunaria-eglquery32.log | rg 'eglquery|cannot locate'
+	@rg -q 'RESULT PASS' /tmp/lunaria-eglquery32.log && ! rg -q 'RESULT FAIL' /tmp/lunaria-eglquery32.log
+
+test/libdlunrelated.so: test/dlopen_unrelated.c
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld -Wl,-soname,libdlunrelated.so -o $@ $<
+test/dl32/libdlunrelated.so: test/dlopen_unrelated.c
+	@mkdir -p test/dl32
+	clang -target armv7a-linux-gnueabi -fPIC -shared -nostdlib -O1 -fuse-ld=lld -Wl,-soname,libdlunrelated.so -o $@ $<

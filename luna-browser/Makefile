@@ -4,6 +4,7 @@
 #                        headless modes (CDP pipe, --screenshot, --dump-dom)
 #   make LB_WINDOW=0     headless only
 #   make LB_NO_TLS=1     without OpenSSL (no https)
+#   make LB_NO_ZLIB=1    without zlib (no gzip/deflate bodies)
 #   make test            headless self-tests
 
 CC       ?= cc
@@ -27,6 +28,12 @@ else
 LIBS     += $(shell pkg-config --libs openssl 2>/dev/null || echo -lssl -lcrypto)
 endif
 
+ifeq ($(LB_NO_ZLIB),1)
+CFLAGS   += -DLB_NO_ZLIB
+else
+LIBS     += -lz
+endif
+
 QJS_SRC  := $(QJS)/quickjs.c $(QJS)/libregexp.c $(QJS)/libunicode.c \
             $(QJS)/cutils.c $(QJS)/dtoa.c
 QJS_OBJ  := $(patsubst $(QJS)/%.c,build/qjs/%.o,$(QJS_SRC))
@@ -43,8 +50,13 @@ build/luna-browser.js.h: luna-browser.js
 	@mkdir -p build
 	sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/' $< > $@
 
-build/luna-browser.o: luna-browser.c build/luna-browser.js.h $(wildcard $(LUNA_UI)/*.h)
-	$(CC) $(CFLAGS) $(WARN) -Ibuild -I$(QJS) -I$(LUNA_UI) -c $< -o $@
+# The loading animation (a 4-frame sprite sheet), as a C initialiser.
+build/run_cat.png.h: run_cat.png
+	@mkdir -p build
+	od -An -v -tx1 $< | sed -e 's/ \([0-9a-f][0-9a-f]\)/0x\1,/g' > $@
+
+build/luna-browser.o: luna-browser.c build/luna-browser.js.h build/run_cat.png.h $(wildcard $(LUNA_UI)/*.h)
+	$(CC) $(CFLAGS) $(WARN) -Ibuild -I$(QJS) -I../src -I$(LUNA_UI) -c $< -o $@
 
 luna-browser: build/luna-browser.o $(QJS_OBJ)
 	$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
