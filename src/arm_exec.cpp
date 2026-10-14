@@ -17697,123 +17697,113 @@ static uint32_t arsc_style_parent(uint32_t style) {
 /* Resolve a Resources.getIdentifier(type/name) through the package's type and
  * key string pools.  Resource entry names are not in the global value pool;
  * Android keeps them in per-package pools referenced by each ResTable_entry. */
-static uint32_t arsc_identifier(const char *want_type, const char *want_name) {
-    arsc_ensure_loaded();
-    if (!want_type || !want_name || g_arsc.size() < 12) return 0;
-    const uint8_t *b = g_arsc.data();
-    size_t n = g_arsc.size();
-    uint16_t table_hs;
-    memcpy(&table_hs, b + 2, 2);
-    for (size_t i = table_hs; i + 8 <= n;) {
-        uint16_t ct, hs;
-        uint32_t cs;
-        memcpy(&ct, b + i, 2); memcpy(&hs, b + i + 2, 2);
-        memcpy(&cs, b + i + 4, 4);
-        if (cs < 8 || i + cs > n) break;
-        if (ct != 0x0200 || hs < 284) { i += cs; continue; }
+/* Build the resource name index once.  The old getIdentifier/getResourceName
+ * path decoded both package string pools, then scanned every type chunk on
+ * EVERY lookup.  Games resolving thousands of names repeated this work for
+ * the same immutable resources.arsc table.  Keep the first matching entry in
+ * archive order, as the original scan did (including configuration variants).
+ * Name resolution is deliberately scoped to the base APK just as before. */
+static std::once_flag g_arsc_names_once;
+static std::unordered_map<std::string, uint32_t> g_arsc_names_to_ids;
+static std::unordered_map<uint32_t, std::pair<std::string, std::string>> g_arsc_ids_to_names;
 
-        uint32_t pkg_id, type_pool_off, key_pool_off;
-        memcpy(&pkg_id, b + i + 8, 4);
-        memcpy(&type_pool_off, b + i + 268, 4);
-        memcpy(&key_pool_off, b + i + 276, 4);
+static void arsc_index_names() {
+    if (g_arsc.size() < 12) return;
+    const uint8_t *b = g_arsc.data();
+    const size_t n = g_arsc.size();
+    const size_t table_hs = arsc_u16(b + 2);
+    if (table_hs > n) return;
+
+    for (size_t i = table_hs; i + 8 <= n;) {
+        const uint16_t ct = arsc_u16(b + i), hs = arsc_u16(b + i + 2);
+        const uint32_t cs = arsc_u32(b + i + 4);
+        if (cs < 8 || cs > n - i) break;
+        if (ct != 0x0200 || hs < 284 || hs > cs) {
+            i += cs;
+            continue;
+        }
+
+        const uint32_t pkg_id = arsc_u32(b + i + 8);
+        const uint32_t type_pool_off = arsc_u32(b + i + 268);
+        const uint32_t key_pool_off = arsc_u32(b + i + 276);
         std::vector<std::string> types, keys;
         if (type_pool_off < cs)
             arsc_read_pool(b + i + type_pool_off, cs - type_pool_off, types);
         if (key_pool_off < cs)
             arsc_read_pool(b + i + key_pool_off, cs - key_pool_off, keys);
 
-        for (size_t j = i + hs; j + 8 <= i + cs;) {
-            uint16_t t2, h2;
-            uint32_t s2;
-            memcpy(&t2, b + j, 2); memcpy(&h2, b + j + 2, 2);
-            memcpy(&s2, b + j + 4, 4);
-            if (s2 < 8 || j + s2 > i + cs) break;
-            if (t2 != 0x0201) { j += s2; continue; }
-            uint8_t type_id = b[j + 8];
-            if (!type_id || type_id > types.size() ||
-                types[type_id - 1] != want_type) { j += s2; continue; }
-            uint32_t entry_count, entries_start;
-            memcpy(&entry_count, b + j + 12, 4);
-            memcpy(&entries_start, b + j + 16, 4);
-            for (uint32_t entry = 0; entry < entry_count; ++entry) {
-                size_t oo = j + h2 + (size_t)entry * 4u;
-                if (oo + 4 > j + s2) break;
-                uint32_t eoff;
-                memcpy(&eoff, b + oo, 4);
-                if (eoff == 0xffffffffu) continue;
-                size_t e = j + entries_start + eoff;
-                if (e + 8 > j + s2) continue;
-                uint32_t key_index;
-                memcpy(&key_index, b + e + 4, 4);
-                if (key_index < keys.size() && keys[key_index] == want_name)
-                    return ((pkg_id & 0xffu) << 24) |
-                           ((uint32_t)type_id << 16) | entry;
+        for (size_t j = i + hs; j + 20 <= i + cs;) {
+            const uint16_t t2 = arsc_u16(b + j), h2 = arsc_u16(b + j + 2);
+            const uint32_t s2 = arsc_u32(b + j + 4);
+            if (s2 < 8 || s2 > i + cs - j) break;
+            if (t2 != 0x0201 || s2 < 20 || h2 < 20 || h2 > s2) {
+                j += s2;
+                continue;
+            }
+            const uint8_t type_id = b[j + 8];
+            if (!type_id || type_id > types.size()) {
+                j += s2;
+                continue;
+            }
+            const uint32_t entry_count = arsc_u32(b + j + 12);
+            const uint32_t entries_start = arsc_u32(b + j + 16);
+            if (entries_start > s2) {
+                j += s2;
+                continue;
+            }
+            const size_t available_offsets = (s2 - h2) / 4u;
+            const size_t count = std::min((size_t)entry_count, available_offsets);
+            for (size_t entry = 0; entry < count; ++entry) {
+                const uint32_t eoff = arsc_u32(b + j + h2 + entry * 4u);
+                if (eoff == UINT32_MAX || eoff > s2 - entries_start ||
+                    s2 - entries_start - eoff < 8) continue;
+                const size_t e = j + entries_start + eoff;
+                const uint32_t key_index = arsc_u32(b + e + 4);
+                if (key_index >= keys.size()) continue;
+                const uint32_t id = ((pkg_id & 0xffu) << 24) |
+                                    ((uint32_t)type_id << 16) | (uint32_t)entry;
+                const std::string &type = types[type_id - 1];
+                const std::string &name = keys[key_index];
+                std::string key;
+                key.reserve(type.size() + name.size() + 1);
+                key.append(type);
+                key.push_back('\0');
+                key.append(name);
+                g_arsc_names_to_ids.emplace(std::move(key), id);
+                g_arsc_ids_to_names.emplace(id, std::make_pair(type, name));
             }
             j += s2;
         }
         i += cs;
     }
-    return 0;
+}
+
+static uint32_t arsc_identifier(const char *want_type, const char *want_name) {
+    arsc_ensure_loaded();
+    if (!want_type || !want_name || g_arsc.size() < 12) return 0;
+    std::call_once(g_arsc_names_once, arsc_index_names);
+    std::string key(want_type);
+    key.push_back('\0');
+    key.append(want_name);
+    const auto it = g_arsc_names_to_ids.find(key);
+    return it == g_arsc_names_to_ids.end() ? 0 : it->second;
 }
 
 extern "C" uint32_t arm_exec_apk_resource_id(const char *type,
-                                                const char *name) {
+                                               const char *name) {
     return arsc_identifier(type, name);
 }
 
-/* The reverse of arsc_identifier(): the type ("id", "layout", ...) and entry
- * name of a resource id, read from the package's type and key pools. */
 extern "C" int arm_exec_apk_resource_name(uint32_t id, char *type, size_t type_cap,
                                           char *entry, size_t entry_cap) {
     arsc_ensure_loaded();
     if (g_arsc.size() < 12) return 0;
-    const uint8_t *b = g_arsc.data();
-    const size_t n = g_arsc.size();
-    const uint32_t want_pkg = id >> 24, want_type = (id >> 16) & 0xffu, want_entry = id & 0xffffu;
-    uint16_t table_hs;
-    memcpy(&table_hs, b + 2, 2);
-    for (size_t i = table_hs; i + 8 <= n;) {
-        uint16_t ct, hs;
-        uint32_t cs;
-        memcpy(&ct, b + i, 2); memcpy(&hs, b + i + 2, 2);
-        memcpy(&cs, b + i + 4, 4);
-        if (cs < 8 || i + cs > n) break;
-        uint32_t pkg_id = 0;
-        if (ct == 0x0200 && hs >= 284) memcpy(&pkg_id, b + i + 8, 4);
-        if (ct != 0x0200 || hs < 284 || (pkg_id & 0xffu) != want_pkg) { i += cs; continue; }
-        uint32_t type_pool_off, key_pool_off;
-        memcpy(&type_pool_off, b + i + 268, 4);
-        memcpy(&key_pool_off, b + i + 276, 4);
-        std::vector<std::string> types, keys;
-        if (type_pool_off < cs) arsc_read_pool(b + i + type_pool_off, cs - type_pool_off, types);
-        if (key_pool_off < cs) arsc_read_pool(b + i + key_pool_off, cs - key_pool_off, keys);
-        if (!want_type || want_type > types.size()) return 0;
-        for (size_t j = i + hs; j + 8 <= i + cs;) {
-            uint16_t t2, h2;
-            uint32_t s2;
-            memcpy(&t2, b + j, 2); memcpy(&h2, b + j + 2, 2);
-            memcpy(&s2, b + j + 4, 4);
-            if (s2 < 8 || j + s2 > i + cs) break;
-            if (t2 != 0x0201 || b[j + 8] != want_type) { j += s2; continue; }
-            uint32_t entry_count, entries_start;
-            memcpy(&entry_count, b + j + 12, 4);
-            memcpy(&entries_start, b + j + 16, 4);
-            if (want_entry >= entry_count) { j += s2; continue; }
-            uint32_t eoff;
-            memcpy(&eoff, b + j + h2 + (size_t)want_entry * 4u, 4);
-            if (eoff == 0xffffffffu) { j += s2; continue; }
-            const size_t e = j + entries_start + eoff;
-            if (e + 8 > j + s2) { j += s2; continue; }
-            uint32_t key_index;
-            memcpy(&key_index, b + e + 4, 4);
-            if (key_index >= keys.size()) return 0;
-            snprintf(type, type_cap, "%s", types[want_type - 1].c_str());
-            snprintf(entry, entry_cap, "%s", keys[key_index].c_str());
-            return 1;
-        }
-        return 0;
-    }
-    return 0;
+    std::call_once(g_arsc_names_once, arsc_index_names);
+    const auto it = g_arsc_ids_to_names.find(id);
+    if (it == g_arsc_ids_to_names.end()) return 0;
+    snprintf(type, type_cap, "%s", it->second.first.c_str());
+    snprintf(entry, entry_cap, "%s", it->second.second.c_str());
+    return 1;
 }
 
 extern "C" int arm_exec_apk_resource_value(uint32_t id, int32_t *iv,
@@ -19010,6 +19000,20 @@ struct GuestAsset {
 };
 static std::map<uint32_t, GuestAsset> g_assets;
 static uint32_t g_next_asset_handle = 0xA55E7000u;
+static bool aasset_trace_enabled() {
+    static const bool enabled = [] {
+        const char *v = lunaria_env("LUNARIA_TRACE_ASSET");
+        return v && *v && strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+static bool aasset_profile_enabled() {
+    static const bool enabled = [] {
+        const char *v = lunaria_env("LUNARIA_ASSET_PROFILE");
+        return v && *v && strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
 /* Defer buffering past this size when a host path is known (shader archives). */
 static constexpr uint64_t kAAssetDeferBytes = 64u * 1024u;
 
@@ -20718,7 +20722,7 @@ static uint64_t aasset_length(const GuestAsset &a) {
 
 /* Ensure data[] + buf_va exist (getBuffer / bytewise read). */
 static bool aasset_materialize(ArmExecCtx &ctx, GuestAsset &a) {
-    if (a.buf_va && !a.data.empty()) return true;
+    if (a.buf_va) return true;
     if (a.data.empty()) {
         if (a.host_path.empty()) {
             if (a.length == 0) {
@@ -48868,7 +48872,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             asset.length = asset.data.size();
             asset.pos = 0;
             asset.host_path = have_host ? std::move(host) : std::string();
-            if (!aasset_materialize(ctx, asset)) { ret32(0); break; }
+            /* Retain the host-side bytes; only getBuffer() needs a guest copy. */
         }
 
         /* Record the package span when there is one, so
@@ -48889,8 +48893,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         const size_t reported = (size_t)asset.length;
         const char *how = asset.data.empty() ? "fd-defer" : "buffered";
         g_assets[handle] = std::move(asset);
-        fprintf(stderr, "[AAsset] open %s via %s -> handle 0x%x (%zu bytes, %s)\n",
-                namebuf, via ? via : "?", handle, reported, how);
+        if (aasset_trace_enabled())
+            fprintf(stderr, "[AAsset] open %s via %s -> handle 0x%x (%zu bytes, %s)\n",
+                    namebuf, via ? via : "?", handle, reported, how);
         ret32(handle);
         break;
     }
@@ -48940,15 +48945,17 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 if (fd < 0) { arm_set_errno(ctx, errno ? errno : EIO); ret32((uint32_t)-1); break; }
                 ssize_t got;
                 int e;
-                const uint64_t t0 = host_mono_ns();
+                const uint64_t t0 = aasset_profile_enabled() ? host_mono_ns() : 0;
                 got = (ssize_t)luna_read_cache_read(&a.read_cache, aasset_cache_pread,
                     (void *)&fd, a.pos, alen, p, (size_t)n);
                 e = errno;
-                a.read_ns += host_mono_ns() - t0;
+                if (t0) a.read_ns += host_mono_ns() - t0;
                 if (got < 0) { arm_set_errno(ctx, e); ret32((uint32_t)-1); break; }
                 n = (uint64_t)got;
             } else {
-                if (!aasset_materialize(ctx, a)) { ret32((uint32_t)-1); break; }
+                /* Streaming reads use the already-loaded host vector directly.
+                 * Only AAsset_getBuffer requires a guest-addressable copy. */
+                if (a.data.empty()) { ret32((uint32_t)-1); break; }
                 uint8_t *p = ctx.mem.try_ptr(dst, (size_t)n);
                 if (!p) { arm_set_errno(ctx, EFAULT); ret32((uint32_t)-1); break; }
                 memcpy(p, a.data.data() + a.pos, (size_t)n);
@@ -49022,14 +49029,15 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
          * host-backed assets are not allocated until materialize. */
         {
             auto it = g_assets.find(r0);
-            ret32(it != g_assets.end() && it->second.buf_va ? 1u : 0u);
+            ret32(it != g_assets.end() &&
+                  (it->second.buf_va || !it->second.data.empty()) ? 1u : 0u);
         }
         break;
     case SVC_AASSET_CLOSE: {
         auto it = g_assets.find(r0);
         if (it != g_assets.end()) {
             const GuestAsset &a = it->second;
-            if (a.n_reads)
+            if (aasset_profile_enabled() && a.n_reads)
                 fprintf(stderr, "[asset-prof] %s reads=%llu bytes=%.1fMB "
                         "avg=%.1fKB max=%.1fKB read_ms=%.1f\n",
                         a.name.empty() ? "?" : a.name.c_str(),
@@ -49066,8 +49074,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         for (auto &k : kids)
             if (!k.second) dir.names.push_back(k.first); /* files only, like NDK */
         g_asset_dirs[handle] = std::move(dir);
-        fprintf(stderr, "[AAsset] openDir %s -> 0x%x (%zu files)\n",
-                dname, handle, g_asset_dirs[handle].names.size());
+        if (aasset_trace_enabled())
+            fprintf(stderr, "[AAsset] openDir %s -> 0x%x (%zu files)\n",
+                    dname, handle, g_asset_dirs[handle].names.size());
         ret32(handle);
         break;
     }
