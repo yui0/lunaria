@@ -619,3 +619,5 @@ char *luna_idn_convert(const char *input, unsigned flags, bool ascii)
    free(s);
    return out;
 }
+
+#include "unicode/breaks.h"

@@ -1,6 +1,22 @@
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include "log_assert.h"
+
+_Noreturn void
+__android_log_assert(const char *condition, const char *tag, const char *fmt, ...)
+{
+   char message[1024];
+   if (fmt) {
+      va_list args;
+      va_start(args, fmt);
+      vsnprintf(message, sizeof message, fmt, args);
+      va_end(args);
+   }
+   luna_log_assert_write(condition, tag, fmt ? message : NULL);
+   abort();
+}
 
 int
 __android_log_vprint(int prio, const char *tag,  const char *fmt, va_list ap)

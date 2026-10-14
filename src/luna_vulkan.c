@@ -37,6 +37,27 @@
 #define VK_USE_PLATFORM_ANDROID_KHR
 #include <vulkan/vulkan.h>
 
+/* vkMapMemory2 / VkMemoryMapInfo landed in Vulkan 1.4 (from VK_KHR_map_memory2).
+ * Distro headers on older hosts (e.g. Ubuntu 22.04 / Orange Pi images) stop at
+ * 1.3 and lack the core names; provide a layout-compatible stand-in so this
+ * file still builds.  The trampoline only needs memory/offset/size. */
+#if !defined(VK_VERSION_1_4) && !defined(VK_KHR_map_memory2)
+typedef struct VkMemoryMapInfo {
+   VkStructureType sType;
+   const void *pNext;
+   VkMemoryMapFlags flags;
+   VkDeviceMemory memory;
+   VkDeviceSize offset;
+   VkDeviceSize size;
+} VkMemoryMapInfo;
+typedef VkResult(VKAPI_PTR *PFN_vkMapMemory2)(VkDevice device,
+                                              const VkMemoryMapInfo *pMemoryMapInfo,
+                                              void **ppData);
+#elif !defined(VK_VERSION_1_4) && defined(VK_KHR_map_memory2)
+typedef VkMemoryMapInfoKHR VkMemoryMapInfo;
+typedef PFN_vkMapMemory2KHR PFN_vkMapMemory2;
+#endif
+
 #include "lunaria_os.h"
 #include <pthread.h>
 #include <stdatomic.h>

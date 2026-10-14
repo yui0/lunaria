@@ -10,8 +10,26 @@
 
 #include "jni.h"
 #include "../luna_input.h"
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
+
+/* Host stubs take `va_list` and treat a null/empty list as "no arguments".
+ * Darwin and x86_64 Linux expose va_list as a pointer (or an array that decays
+ * to one), so `!ap` works.  AArch64 Linux uses a five-field struct, so the
+ * Call*MethodA bridge passes a zeroed va_list instead of a null pointer. */
+#if defined(__aarch64__) && !defined(__APPLE__)
+static inline int jvm_va_has_args(va_list ap)
+{
+   va_list empty;
+   memset(&empty, 0, sizeof empty);
+   return memcmp(&ap, &empty, sizeof(va_list)) != 0;
+}
+#define JVM_VA_HAS_ARGS(ap) jvm_va_has_args(ap)
+#else
+#define JVM_VA_HAS_ARGS(ap) (!!(ap))
+#endif
 
 /* Android 実機の getPackageCodePath() / ApplicationInfo.sourceDir は APK ファイル
  * パスを返す。the native APK launcher は展開先を ANDROID_PACKAGE_CODE_PATH に置くので、

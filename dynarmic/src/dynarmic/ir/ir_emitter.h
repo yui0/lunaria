@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <vector>
+
 #include <mcl/stdint.hpp>
 
 #include "dynarmic/ir/acc_type.h"

@@ -48,6 +48,13 @@ int luna_fnmatch(const char *pattern, const char *string, int flags);
 #include <stddef.h>
 #include <stdint.h>
 #ifdef _WIN32
+/* Windows 10+ host APIs (stack limits, POSIX delete, dynamic TZ enum). */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+#ifndef WINVER
+#define WINVER _WIN32_WINNT
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <afunix.h>
@@ -985,6 +992,18 @@ static inline uint16_t luna_poll_events_to_android(short events, uint16_t reques
 #endif
    return result & (uint16_t)(requested | 0x0038);
 }
+/* fd is a signed Lunaria/CRT descriptor, not a native Winsock SOCKET.
+ * Windows' pollfd stores it in SOCKET width until luna_socket_poll unwraps
+ * it. Sign extension preserves negative descriptors, which poll ignores. */
+static inline struct pollfd luna_pollfd_make(int fd, short events)
+{
+   struct pollfd result;
+   result.fd = (intptr_t)fd;
+   result.events = events;
+   result.revents = 0;
+   return result;
+}
+
 static inline void luna_poll_load_android(struct pollfd *host, const void *guest, size_t count,
                                           uint16_t *requests)
 {
@@ -994,9 +1013,7 @@ static inline void luna_poll_load_android(struct pollfd *host, const void *guest
       memcpy(&fd, bytes + i * 8, sizeof fd);
       memcpy(&events, bytes + i * 8 + 4, sizeof events);
       requests[i] = events;
-      host[i].fd = (intptr_t)fd;
-      host[i].events = luna_poll_events_from_android(events);
-      host[i].revents = 0;
+      host[i] = luna_pollfd_make(fd, luna_poll_events_from_android(events));
    }
 }
 static inline void luna_poll_store_android(void *guest, const struct pollfd *host, size_t count,
@@ -1272,6 +1289,10 @@ void *luna_os_library_symbol(void *handle, const char *name);
 void *luna_os_library_loaded_symbol(const char *module, const char *name);
 
 void luna_os_library_close(void *handle);
+
+/* Remaining bytes on the current downward-growing native thread stack.
+ * SIZE_MAX means the host could not determine its boundary. */
+size_t luna_os_stack_remaining(void);
 
 /* Fatal-error diagnostics for the host stack.  Capture returns the number
  * of addresses written; print writes them to stderr (symbolized where the
@@ -1571,4 +1592,29 @@ static inline void luna_vm_release_empty(const struct luna_guest_mapping *maps,
     }
 }
 
+/* Host-backed guest files share the same link representation across C and
+ * native guests. Backend implementations and scratch cleanup use raw APIs. */
+#ifndef LUNARIA_SYMLINK_NATIVE
+#include "lunaria_file.h"
+#define luna_file_open luna_symlink_open
+#define luna_file_openat luna_symlink_openat
+#define luna_file_fopen luna_symlink_fopen
+#define luna_file_infoat luna_symlink_infoat
+#define luna_file_unlink luna_symlink_unlink
+#define luna_file_unlinkat luna_symlink_unlinkat
+#define luna_file_rename luna_symlink_rename
+#define luna_file_readlink luna_symlink_readlink
+#define luna_file_access luna_symlink_access
+#define luna_file_accessat luna_symlink_accessat
+#define luna_file_realpath luna_symlink_realpath
+#define luna_file_mkdir luna_symlink_mkdir
+#define luna_file_link luna_symlink_link
+#define luna_file_chmodat luna_symlink_chmodat
+#define luna_file_timesat luna_symlink_timesat
+#define luna_file_set_modified luna_symlink_set_modified
+#define luna_directory_open luna_symlink_directory_open
+#define luna_directory_open_fd luna_symlink_directory_open_fd
+#define luna_directory_read luna_symlink_directory_read
+#define luna_directory_close luna_symlink_directory_close
+#endif
 #endif /* LUNARIA_OS_H */

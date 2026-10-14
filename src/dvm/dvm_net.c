@@ -573,7 +573,7 @@ static bool exchange(void **transport, const char *method, const struct url *u,
    }
    if (!have_accept_encoding) buf_str(&req, "Accept-Encoding: identity\r\n");
    if (!have_ua) buf_str(&req, "User-Agent: Dalvik/2.1.0 (Linux; Android 11)\r\n");
-   if (body && body_len) {
+   if (body) {
       snprintf(line, sizeof line, "Content-Length: %zu\r\n", body_len);
       buf_str(&req, line);
    }

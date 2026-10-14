@@ -23,6 +23,7 @@
  *     when the range ahead is occupied.
  */
 
+#define LUNARIA_SYMLINK_NATIVE
 #include "lunaria_os.h"
 #include <locale.h>
 #include <direct.h>
@@ -33,6 +34,14 @@
 #include <limits.h>
 #include <mmsystem.h>
 #include <stdatomic.h>
+
+size_t luna_os_stack_remaining(void)
+{
+   ULONG_PTR low, high;
+   GetCurrentThreadStackLimits(&low, &high);
+   uintptr_t current = (uintptr_t)__builtin_frame_address(0);
+   return current >= low && current < high ? (size_t)(current - low) : SIZE_MAX;
+}
 
 static wchar_t *luna_file_wide(const char *path);
 static SOCKET lookup(int fd);

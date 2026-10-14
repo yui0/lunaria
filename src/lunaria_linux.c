@@ -10,12 +10,14 @@
  */
 
 #define _GNU_SOURCE
+#define LUNARIA_SYMLINK_NATIVE
 #include "lunaria_os.h"
 
 #include <locale.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,6 +44,24 @@
 #include <GLFW/glfw3native.h>
 
 /* ---- virtual memory ---------------------------------------------------- */
+
+size_t luna_os_stack_remaining(void)
+{
+   static _Thread_local uintptr_t low, high;
+   if (!high) {
+      pthread_attr_t attr;
+      if (pthread_getattr_np(pthread_self(), &attr)) return SIZE_MAX;
+      void *base = NULL;
+      size_t size = 0;
+      int rc = pthread_attr_getstack(&attr, &base, &size);
+      pthread_attr_destroy(&attr);
+      if (rc || !size) return SIZE_MAX;
+      low = (uintptr_t)base;
+      high = low + size;
+   }
+   uintptr_t current = (uintptr_t)__builtin_frame_address(0);
+   return current >= low && current < high ? (size_t)(current - low) : SIZE_MAX;
+}
 
 int luna_os_setenv(const char *name, const char *value, int overwrite)
 {

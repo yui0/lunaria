@@ -1385,6 +1385,19 @@ run_dex_activity(struct jvm *jvm, int is_a64)
          jvm->native.SetObjectField(&jvm->env, activity, app_field, application);
    }
 
+   /* ActivityThread applies the manifest theme through the virtual method
+    * before onCreate; AppCompat also keeps theme state in its delegate. */
+   const uint32_t theme_resource = arm_exec_activity_theme(cls);
+   if (theme_resource) {
+      jmethodID set_theme = jvm->native.GetMethodID(
+         &jvm->env, activity_class, "setTheme", "(I)V");
+      if (set_theme) {
+         jvalue arg = { .i = (jint)theme_resource };
+         jvm->native.CallVoidMethodA(&jvm->env, activity, set_theme, &arg);
+         if (jvm->native.ExceptionCheck(&jvm->env)) return EXIT_FAILURE;
+      }
+   }
+
    dvm_jni_activity_dispatch(&jvm->env, activity, "Created", 0);
    if (!dex_call_lifecycle(jvm, activity, cls, "onCreate",
                            "(Landroid/os/Bundle;)V", 1)) {
@@ -1405,10 +1418,18 @@ run_dex_activity(struct jvm *jvm, int is_a64)
       dvm_jni_activity_dispatch(&jvm->env, activity, "Started", 0);
       dex_call_lifecycle(jvm, activity, cls, "onStart",  "()V", 0);
       dvm_jni_activity_dispatch(&jvm->env, activity, "Started", 1);
+   }
+   if (!dvm_jni_activity_finishing(&jvm->env, activity)) {
       dex_call_lifecycle(jvm, activity, cls, "onPostCreate",
                          "(Landroid/os/Bundle;)V", 1);
+   }
+   if (!dvm_jni_activity_finishing(&jvm->env, activity)) {
       dvm_jni_activity_dispatch(&jvm->env, activity, "Resumed", 0);
+   }
+   if (!dvm_jni_activity_finishing(&jvm->env, activity)) {
       dex_call_lifecycle(jvm, activity, cls, "onResume", "()V", 0);
+   }
+   if (!dvm_jni_activity_finishing(&jvm->env, activity)) {
       dex_call_lifecycle(jvm, activity, cls, "onPostResume", "()V", 0);
       dvm_jni_activity_dispatch(&jvm->env, activity, "Resumed", 1);
       run_threads();
@@ -1416,7 +1437,8 @@ run_dex_activity(struct jvm *jvm, int is_a64)
       /* Attach the resumed Activity to its window before running its renderer.
        * SurfaceView dispatches its lifecycle callbacks through the main Looper;
        * the app's callback owns connecting its native renderer to that Surface. */
-      dvm_jni_show_activity(&jvm->env, activity);
+      if (!dvm_jni_activity_finishing(&jvm->env, activity))
+         dvm_jni_show_activity(&jvm->env, activity);
    }
    pump_java_frame();
 
@@ -1424,10 +1446,11 @@ run_dex_activity(struct jvm *jvm, int is_a64)
    { const char *mf = getenv("LUNARIA_MAX_FRAMES"); if (mf && *mf) max_frames = atoi(mf); }
    fprintf(stderr, "[loader] dex startup: entering pump loop (max_frames=%d)\n",
            max_frames);
-   for (int frame = 0; max_frames <= 0 || frame < max_frames; ++frame) {
+   int frame = 0;
+   for (; max_frames <= 0 || frame < max_frames; ++frame) {
       if (arm_exec_guest_abort_count() > 0) {
          fprintf(stderr, "[loader] guest abort — stopping dex loop (frame %d)\n", frame);
-         break;
+         return EXIT_FAILURE;
       }
       pump_run_frame(run_threads);
       if (is_a64) arm64_exec_egl_swap(); else arm_exec_egl_swap();
@@ -1446,8 +1469,13 @@ run_dex_activity(struct jvm *jvm, int is_a64)
       perf_tick();
       if (frame < 5 || frame % 50 == 0)
          fprintf(stderr, "[loader] dex pump frame %d\n", frame);
-      if (arm_exec_glfw_should_close()) break;
+      if (arm_exec_glfw_should_close()) {
+         fprintf(stderr, "[loader] window closed — stopping dex loop (frame %d)\n", frame);
+         break;
+      }
    }
+   if (max_frames > 0 && frame == max_frames)
+      fprintf(stderr, "[loader] LUNARIA_MAX_FRAMES=%d reached — exiting dex loop\n", max_frames);
    return EXIT_SUCCESS;
 }
 

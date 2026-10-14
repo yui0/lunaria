@@ -1,0 +1,212 @@
+name: Rust Release & Deploy
+
+on:
+  push:
+    tags:
+      - '*-*-*'  # git tag v1.2.3 && git push --tags でトリガー
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Linux (x86_64)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # The oldest distribution the build supports is the one it is built on:
+      # the bundle uses the running system's C library, so a newer build host
+      # would refuse to start on an older machine.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential nasm cmake clang libclang-dev \
+            pkg-config libboost-dev libssl-dev libglfw3-dev libgles2-mesa-dev \
+            libegl1-mesa-dev libasound2-dev libbsd-dev libunwind-dev zlib1g-dev \
+            libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
+
+      - name: Build dynarmic
+        run: make dynarmic-build
+
+      - name: Build
+        run: make -j"$(nproc)" lunaria
+
+      # The guest-side AArch64 libm, which the launcher picks up by name.  A
+      # build without it runs every pow()/sincosf() as an SVC thunk.
+      - name: Build guest system libraries
+        run: make syslib || echo "syslib unavailable on this runner; shipping without it"
+
+      - name: Package
+        run: make dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lunaria-linux-x86_64
+          path: lunaria-*-linux-*.tar.gz
+
+  macos:
+    name: macOS (arm64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # OpenSSL is the only remaining Homebrew dependency; macos-deps fetches
+      # cmake, boost, GLFW and ANGLE into .deps/ without Homebrew bottles.
+      - name: Install OpenSSL
+        run: brew install openssl@3
+
+      # make macos-deps fetches cmake, boost, GLFW and ANGLE into .deps/ so the
+      # build does not depend on what Homebrew happens to have installed.
+      - name: Fetch macOS dependencies
+        run: make macos-deps
+
+      - name: Build dynarmic
+        run: make dynarmic-build
+
+      - name: Build
+        run: make -j"$(sysctl -n hw.ncpu)" lunaria
+
+      - name: Build guest system libraries
+        run: make syslib || echo "syslib unavailable on this runner; shipping without it"
+
+      - name: Package
+        run: make dist-mac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lunaria-macos-arm64
+          path: lunaria-*.dmg
+
+  windows:
+    name: Windows (x86_64, cross)
+    # Ubuntu apt MinGW is GCC 13 without -mcrtdll=ucrt. Use llvm-mingw (UCRT).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install cross-build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential nasm cmake ninja-build \
+            python3 curl zip bzip2 zstd unzip xz-utils
+          ver=20261006
+          archive="llvm-mingw-${ver}-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          curl -fsSL -o "/tmp/${archive}" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${ver}/${archive}"
+          sudo tar -xJf "/tmp/${archive}" -C /opt
+          sudo ln -sfn "/opt/llvm-mingw-${ver}-ucrt-ubuntu-22.04-x86_64" /opt/llvm-mingw
+          rm -f "/tmp/${archive}"
+          echo /opt/llvm-mingw/bin >> "$GITHUB_PATH"
+          export PATH="/opt/llvm-mingw/bin:$PATH"
+          x86_64-w64-mingw32-gcc --version
+          # Confirm the toolchain links UCRT (api-ms-win-crt-*), not msvcrt.dll.
+          printf 'int main(void){return 0;}\n' > /tmp/ucrt-probe.c
+          x86_64-w64-mingw32-gcc /tmp/ucrt-probe.c -o /tmp/ucrt-probe.exe
+          x86_64-w64-mingw32-objdump -p /tmp/ucrt-probe.exe \
+            | grep -Eiq 'ucrtbase|api-ms-win-crt-'
+
+      # Guest libm/libc come from the SDK build-tools renderscript intermediates.
+      - name: Fetch Android build-tools (guest syslib)
+        run: |
+          sdk="$HOME/Android/Sdk"
+          mkdir -p "$sdk"
+          curl -fsSL -o /tmp/build-tools.zip \
+            https://dl.google.com/android/repository/build-tools_r34-linux.zip
+          unzip -q /tmp/build-tools.zip -d "$sdk"
+          rm -f /tmp/build-tools.zip
+          test -n "$(find "$sdk" -path '*/renderscript/lib/intermediates/arm64-v8a/libm.so' | head -1)"
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$sdk" >> "$GITHUB_ENV"
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+
+      - name: Export NDK path
+        run: echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: /tmp/lunaria-windows-deps
+          key: windows-deps-${{ hashFiles('scripts/fetch-windows-deps.py') }}
+
+      - name: Cross-build Windows ZIP
+        run: make -j"$(nproc)" dist-cross-win
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lunaria-windows-x86_64
+          path: lunaria-*-windows.zip
+
+  release:
+    name: Publish
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/lunaria-v') || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect
+        id: pack
+        run: |
+          mkdir -p out
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.dmg' -o -name '*.zip' \) -exec cp {} out/ \;
+          ls -la out
+          if [[ "${GITHUB_REF}" == refs/tags/lunaria-v* ]]; then
+            echo "name=Lunaria ${GITHUB_REF_NAME#lunaria-v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=Lunaria (manual build)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ steps.pack.outputs.name }}
+          draft: ${{ github.event_name == 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/') }}
+          files: out/*
+          body: |
+            ## Lunaria
+
+            An Android runtime that runs an APK on the desktop: AArch64 and
+            ARM32 guest code on dynarmic, the platform's Java on its own
+            bytecode interpreter, and GLES straight through to the host.
+
+            ### Linux (x86_64)
+            ```bash
+            tar -xzf lunaria-*-linux-x86_64.tar.gz
+            cd lunaria-*-linux-x86_64
+            ./lunaria /path/to/app.apk      # or .xapk / .apks
+            ```
+            The archive carries its own shim libraries, the host libraries it
+            was built against and its fonts; it uses the running system's C
+            library, so it needs a distribution no older than Ubuntu 22.04.
+
+            ### macOS (Apple silicon)
+            Open the .dmg and drag `Lunaria.app` where you like, then:
+            ```bash
+            /Applications/Lunaria.app/Contents/MacOS/Lunaria /path/to/app.apk
+            ```
+
+            ### Windows (x86_64)
+            ```powershell
+            Expand-Archive lunaria-*-windows.zip -DestinationPath .
+            cd lunaria-*-windows
+            .\lunaria.exe C:\path\to\app.apk
+            ```
+            Or drag an APK onto `lunaria.exe`. No MSYS2, Python, or ICU install
+            is required at runtime.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

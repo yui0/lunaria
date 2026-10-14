@@ -67,6 +67,13 @@ static luna_overlay_menu_fn g_menu_fn;
 static bool g_menu_modal;
 static bool  g_doc_dirty;
 static char *g_changed_image_path;
+struct overlay_image_update {
+ struct overlay_image_update *next;
+ char key[64];
+ int width,height;
+ unsigned char *rgba;
+};
+static struct overlay_image_update *g_image_updates;
 static bool  g_from_files;   /* LUNARIA_UI_TEST names an HTML file */
 static int   g_w, g_h;
 static double g_last_time;
@@ -201,6 +208,46 @@ static void overlay_render_windows(int w, int h)
  * mutex and every luna_* call stays on the presenting thread. */
 static pthread_mutex_t g_doc_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_native_input_focus;
+
+static bool overlay_queue_image(const char *key,int width,int height,unsigned char *rgba)
+{
+ if(!key || !*key || strlen(key)>=sizeof ((struct overlay_image_update *)0)->key) {free(rgba);return false;}
+ pthread_mutex_lock(&g_doc_lock);
+ struct overlay_image_update *entry=g_image_updates;
+ while(entry && strcmp(entry->key,key)) entry=entry->next;
+ if(!entry) {
+  entry=calloc(1,sizeof *entry);
+  if(!entry) {pthread_mutex_unlock(&g_doc_lock);free(rgba);return false;}
+  strcpy(entry->key,key);entry->next=g_image_updates;g_image_updates=entry;
+ }
+ free(entry->rgba);entry->rgba=rgba;entry->width=width;entry->height=height;
+ pthread_mutex_unlock(&g_doc_lock);luna_overlay_wake();return true;
+}
+bool luna_overlay_image_argb(const char *key,int width,int height,const uint32_t *pixels)
+{
+ if(width<=0 || height<=0 || !pixels || (size_t)width>SIZE_MAX/4/(size_t)height) return false;
+ unsigned char *rgba=malloc((size_t)width*height*4);if(!rgba) return false;
+ for(int y=0;y<height;++y) for(int x=0;x<width;++x) {
+  uint32_t p=pixels[(size_t)y*width+x];
+  unsigned char *q=rgba+4*((size_t)(height-1-y)*width+x);
+  q[0]=(unsigned char)(p>>16);q[1]=(unsigned char)(p>>8);q[2]=(unsigned char)p;q[3]=(unsigned char)(p>>24);
+ }
+ return overlay_queue_image(key,width,height,rgba);
+}
+void luna_overlay_image_forget(const char *key)
+{if(key && *key) (void)overlay_queue_image(key,0,0,NULL);}
+
+static void overlay_upload_images(void)
+{
+ /* Called with doc_lock and the GL context current. Coalesced entries never
+  * keep a borrowed VM pointer across either a draw or object destruction. */
+ while(g_image_updates) {
+  struct overlay_image_update *entry=g_image_updates;g_image_updates=entry->next;
+  if(entry->rgba) (void)luna_update_texture_rgba(entry->key,entry->width,entry->height,entry->rgba);
+  else luna_invalidate_texture(entry->key);
+  free(entry->rgba);free(entry);
+ }
+}
 
 void luna_overlay_image_changed(const char *path)
 {
@@ -903,7 +950,7 @@ static void overlay_drain_pointer(void)
                 (strstr(e->class_name, "lunaria-webview") ||
                  strstr(e->class_name, "lunaria-touchview"))) {
                web_hit = true;
-               framework_touch = strstr(e->class_name, "lunaria-gestureview") != NULL;
+               framework_touch = strstr(e->class_name, "lunaria-touchview") != NULL;
                if (batch[i].action == 1)
                   snprintf(g_web_pointer_capture,
                            sizeof g_web_pointer_capture, "%s", e->id);
@@ -1259,6 +1306,7 @@ bound:
          free(g_changed_image_path);
          g_changed_image_path = NULL;
       }
+      overlay_upload_images();
       pthread_mutex_unlock(&g_doc_lock);
       if (prof) { const uint64_t n = overlay_ns();
                   g_prof.parse_ns += n - t_mark; t_mark = n; }
@@ -1411,6 +1459,10 @@ void luna_overlay_shutdown(void)
    pthread_mutex_lock(&g_doc_lock);
    free(g_changed_image_path);
    g_changed_image_path = NULL;
+   while(g_image_updates) {
+      struct overlay_image_update *entry=g_image_updates;g_image_updates=entry->next;
+      free(entry->rgba);free(entry);
+   }
    pthread_mutex_unlock(&g_doc_lock);
    g_toast_html = g_toast_css = NULL;
    g_menu_html = g_menu_css = NULL;
@@ -1431,6 +1483,179 @@ void luna_overlay_image_free(unsigned char *pixels)
 {
    stbi_image_free(pixels);
 }
+
+/* Private C HarfBuzz adapter. Loaded through the OS bridge, using the same
+ * fonts and stb_truetype rasterizer as luna-ui. Caller holds g_present_lock.
+ * Stable public HarfBuzz ABI types; no build-time or FreeType dependency. */
+struct text_hb_info {uint32_t glyph,mask,cluster,var1,var2;};
+struct text_hb_position {int32_t x_advance,y_advance,x_offset,y_offset;uint32_t var;};
+_Static_assert(sizeof(struct text_hb_info)==20,"HarfBuzz glyph info ABI");
+_Static_assert(sizeof(struct text_hb_position)==20,"HarfBuzz glyph position ABI");
+struct text_hb_api {
+ void *library;
+ void *(*blob_create)(const char *,unsigned,int,void *,void (*)(void *));
+ void *(*face_create_for_tables)(void *(*)(void *,uint32_t,void *),void *,void (*)(void *));
+ void (*face_destroy)(void *);
+ void *(*font_create)(void *);
+ void (*font_destroy)(void *);
+ void (*ot_font_set_funcs)(void *);
+ void (*font_set_scale)(void *,int,int);
+ void *(*buffer_create)(void);
+ void (*buffer_destroy)(void *);
+ void (*buffer_add_utf16)(void *,const uint16_t *,int,unsigned,int);
+ void (*buffer_guess_segment_properties)(void *);
+ void (*shape)(void *,void *,const void *,unsigned);
+ struct text_hb_info *(*buffer_get_glyph_infos)(void *,unsigned *);
+ struct text_hb_position *(*buffer_get_glyph_positions)(void *,unsigned *);
+ int (*buffer_allocation_successful)(void *);
+};
+static struct text_hb_api text_hb;
+struct text_hb_face {stbtt_fontinfo *info;const unsigned char *data;long size;int offset;void *font;};
+static struct text_hb_face text_hb_faces[6];
+static void text_hb_shutdown(void)
+{
+ for(size_t i=0;i<6;++i) if(text_hb_faces[i].font) {text_hb.font_destroy(text_hb_faces[i].font);text_hb_faces[i].font=NULL;}
+ if(text_hb.library) {luna_os_library_close(text_hb.library);text_hb.library=NULL;}
+}
+static bool text_hb_load(void)
+{
+ if(text_hb.library) return true;
+ const char *names[]={
+#if defined(_WIN32)
+ "libharfbuzz-0.dll","harfbuzz.dll",
+#elif defined(__APPLE__)
+ "libharfbuzz.0.dylib","/opt/homebrew/lib/libharfbuzz.0.dylib","/usr/local/lib/libharfbuzz.0.dylib",
+#else
+ "libharfbuzz.so.0","libharfbuzz.so",
+#endif
+ NULL};
+ void *library=NULL;for(int i=0;names[i] && !library;++i) library=luna_os_library_open_local(names[i]);
+ if(!library) return false;
+#define TEXT_HB_BIND(name) do {void *symbol=luna_os_library_symbol(library,"hb_" #name); \
+ if(!symbol) {luna_os_library_close(library);memset(&text_hb,0,sizeof text_hb);return false;} \
+ _Static_assert(sizeof text_hb.name==sizeof symbol,"host function pointer size");memcpy(&text_hb.name,&symbol,sizeof symbol);} while(0)
+ TEXT_HB_BIND(blob_create);TEXT_HB_BIND(face_create_for_tables);TEXT_HB_BIND(face_destroy);
+ TEXT_HB_BIND(font_create);TEXT_HB_BIND(font_destroy);TEXT_HB_BIND(ot_font_set_funcs);TEXT_HB_BIND(font_set_scale);
+ TEXT_HB_BIND(buffer_create);TEXT_HB_BIND(buffer_destroy);TEXT_HB_BIND(buffer_add_utf16);
+ TEXT_HB_BIND(buffer_guess_segment_properties);TEXT_HB_BIND(shape);
+ TEXT_HB_BIND(buffer_get_glyph_infos);TEXT_HB_BIND(buffer_get_glyph_positions);TEXT_HB_BIND(buffer_allocation_successful);
+#undef TEXT_HB_BIND
+ text_hb.library=library;atexit(text_hb_shutdown);return true;
+}
+static uint32_t text_be32(const unsigned char *p)
+{return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];}
+static void *text_hb_table(void *face,uint32_t tag,void *data)
+{
+ (void)face;const struct text_hb_face *source=data;
+ if(source->size<12 || source->offset<0 || (size_t)source->offset>(size_t)source->size-12) return NULL;
+ const unsigned char *dir=source->data+source->offset;unsigned count=((unsigned)dir[4]<<8)|dir[5];
+ if(count>((size_t)source->size-source->offset-12)/16) return NULL;
+ for(unsigned i=0;i<count;++i) {
+  const unsigned char *table=dir+12+16*i;if(text_be32(table)!=tag) continue;
+  uint32_t offset=text_be32(table+8),length=text_be32(table+12);
+  if(offset>(size_t)source->size || length>(size_t)source->size-offset) return NULL;
+  /* Duplicate tables: font reload/shutdown may release luna-ui's backing file. */
+  return text_hb.blob_create((const char *)source->data+offset,length,0,NULL,NULL);
+ }
+ return NULL;
+}
+static void *text_hb_font(stbtt_fontinfo *info)
+{
+ stbtt_fontinfo *fonts[]={&g_font_info,&g_bold_font_info,&g_cjk_font_info,&g_mono_font_info,&g_icon_font_info,&g_brand_font_info};
+ size_t slot=0;while(slot<6 && fonts[slot]!=info) ++slot;if(slot==6) return NULL;
+ struct text_hb_face *source=&text_hb_faces[slot];
+ if(source->font && (source->data!=info->data || source->offset!=info->fontstart)) {
+  text_hb.font_destroy(source->font);source->font=NULL;
+ }
+ if(!source->font) {
+  source->info=info;source->data=info->data;source->offset=info->fontstart;source->size=g_font_blob_sizes[slot];
+  void *face=text_hb.face_create_for_tables(text_hb_table,source,NULL);if(!face) return NULL;
+  source->font=text_hb.font_create(face);text_hb.face_destroy(face);if(!source->font) return NULL;
+  text_hb.ot_font_set_funcs(source->font);
+ }
+ return source->font;
+}
+static uint32_t text_codepoint(const uint16_t *text,size_t length,size_t *offset)
+{
+ uint32_t cp=text[(*offset)++];
+ if(cp>=0xd800 && cp<=0xdbff && *offset<length && text[*offset]>=0xdc00 && text[*offset]<=0xdfff)
+  cp=0x10000+((cp-0xd800)<<10)+(text[(*offset)++]-0xdc00);
+ else if(cp>=0xd800 && cp<=0xdfff) cp=0xfffd;
+ return cp;
+}
+static bool text_shape_locked(const uint16_t *text,size_t length,float px,bool bold,struct luna_text_run *out)
+{
+ memset(out,0,sizeof *out);
+ if(length>INT_MAX || !isfinite(px) || px<0 || px>32768 || (!text && length)) return false;
+ if(!length || px==0) return true;
+ if(!text_hb_load()) return false;
+ int previous_bold=g_font_bold_hint;g_font_bold_hint=bold ? 1 : 0;
+ bool good=true;size_t begin=0,capacity=0;
+ while(begin<length && good) {
+  size_t end=begin;uint32_t cp=text_codepoint(text,length,&end);stbtt_fontinfo *info=font_for_codepoint((int)cp);
+  if(!info) {good=false;break;}
+  while(end<length) {size_t next=end;cp=text_codepoint(text,length,&next);if(font_for_codepoint((int)cp)!=info) break;end=next;}
+  void *font=text_hb_font(info),*buffer=text_hb.buffer_create();
+  if(!font || !buffer) {if(buffer) text_hb.buffer_destroy(buffer);good=false;break;}
+  int scale=(int)floorf(px*64+.5f);text_hb.font_set_scale(font,scale,scale);
+  text_hb.buffer_add_utf16(buffer,text,(int)length,(unsigned)begin,(int)(end-begin));
+  text_hb.buffer_guess_segment_properties(buffer);text_hb.shape(font,buffer,NULL,0);
+  unsigned count=0,positions_count=0;
+  struct text_hb_info *glyphs=text_hb.buffer_get_glyph_infos(buffer,&count);
+  struct text_hb_position *positions=text_hb.buffer_get_glyph_positions(buffer,&positions_count);
+  if(!text_hb.buffer_allocation_successful(buffer) || positions_count!=count || count>SIZE_MAX/sizeof *out->glyphs-out->count) good=false;
+  if(good && out->count+count>capacity) {
+   capacity=out->count+count;struct luna_text_glyph *grown=realloc(out->glyphs,capacity*sizeof *grown);
+   if(!grown) good=false;else out->glyphs=grown;
+  }
+  for(unsigned i=0;good && i<count;++i) {
+   struct luna_text_glyph *g=&out->glyphs[out->count++];
+   *g=(struct luna_text_glyph){.font=info,.font_data=info->data,.glyph=glyphs[i].glyph,.cluster=glyphs[i].cluster,
+      .x=out->width+positions[i].x_offset/64.f,.y=-positions[i].y_offset/64.f,.advance=positions[i].x_advance/64.f};
+   out->width+=g->advance;out->missing=out->missing || !g->glyph;
+  }
+  text_hb.buffer_destroy(buffer);begin=end;
+ }
+ g_font_bold_hint=previous_bold;
+ if(!good) {free(out->glyphs);memset(out,0,sizeof *out);}
+ return good;
+}
+#include "luna_unicode.h"
+
+bool luna_overlay_text_breaks(const uint16_t *text,size_t length,const char *locale,unsigned char *breaks)
+{
+ (void)locale;
+ return luna_uc_breaks_utf16(text,length,breaks);
+}
+
+bool luna_overlay_shape_text(const uint16_t *text,size_t length,float px,bool bold,struct luna_text_run *run)
+{
+ if(!run) return false;
+ pthread_mutex_lock(&g_present_lock);
+ if(!g_ready) luna_overlay_prepare_platform();
+ bool good=luna_prepare_font_metrics() && text_shape_locked(text,length,px,bold,run);
+ if(!good) memset(run,0,sizeof *run);
+ pthread_mutex_unlock(&g_present_lock);return good;
+}
+bool luna_overlay_raster_glyph(const struct luna_text_glyph *glyph,float px,struct luna_text_bitmap *bitmap)
+{
+ if(!glyph || !bitmap || !isfinite(px) || px<0 || px>32768) return false;
+ memset(bitmap,0,sizeof *bitmap);pthread_mutex_lock(&g_present_lock);
+ const stbtt_fontinfo *info=glyph->font;
+ bool good=info && info->data==glyph->font_data && glyph->glyph<(uint32_t)info->numGlyphs;
+ if(good && px>0) {
+  float scale=stbtt_ScaleForMappingEmToPixels(info,px);int x0,y0,x1,y1;
+  stbtt_GetGlyphBitmapBox(info,(int)glyph->glyph,scale,scale,&x0,&y0,&x1,&y1);
+  if(x1-x0>8192 || y1-y0>8192 || x1<x0 || y1<y0) good=false;
+  else if(x1>x0 && y1>y0) {
+   bitmap->coverage=stbtt_GetGlyphBitmap(info,scale,scale,(int)glyph->glyph,&bitmap->width,&bitmap->height,&bitmap->left,&bitmap->top);
+   good=bitmap->coverage!=NULL;
+  }
+ }
+ pthread_mutex_unlock(&g_present_lock);return good;
+}
+void luna_overlay_free_glyph(struct luna_text_bitmap *bitmap)
+{if(bitmap) {stbtt_FreeBitmap(bitmap->coverage,NULL);memset(bitmap,0,sizeof *bitmap);}}
 
 float luna_overlay_text_width(const char *text, float px, bool bold)
 {

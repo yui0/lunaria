@@ -1,6 +1,6 @@
 # Lunaria
 
-### Android games, on the computer you already have.
+### Android games on your desktop. No Android system image required.
 
 [![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-5b5bd6.svg)](LICENSE)
 [![Guests](https://img.shields.io/badge/guest-ARM32%20%7C%20ARM64-20232a.svg)](#how-it-works)
@@ -9,47 +9,42 @@
 
 [日本語](README.ja.md)
 
-Lunaria is an Android translation layer for the desktop. Point it at an `.apk`,
-`.xapk`, or `.apks`. It runs the ARM32 or ARM64 code with
-[dynarmic](https://github.com/merryhime/dynarmic), and answers JNI, EGL,
-OpenGL ES, and MediaCodec on the host. The package's own Java runs in a
-built-in Dalvik interpreter. The same binary unpacks the archive, reads the
-manifest, overlays split APKs, and keeps the install cache and account
-profiles (`src/apk.c`). An Android system image is not required.
+**Lunaria brings Android applications and games to the desktop without running a full Android OS.**
+Instead of booting a virtual device, it loads the app's own package, executes its ARM32 or ARM64 code with
+[dynarmic](https://github.com/merryhime/dynarmic), and bridges Android services such as JNI, EGL, OpenGL ES,
+and MediaCodec to the host. A built-in Dalvik interpreter handles Java bytecode from the app's `classes*.dex`.
 
-`android.webkit.WebView` is drawn by a host browser over the Chrome DevTools
-pipe — Chrome or Chromium when one is installed, otherwise the built-in
-[luna-browser](luna-browser/) (luna-ui and QuickJS).
+Open an `.apk`, `.xapk`, `.apks`, or `.aab` directly. Lunaria takes care of extraction, manifests,
+split APKs, package caching, and separate account profiles. For WebView content, it uses an installed
+Chrome/Chromium browser or the included [luna-browser](luna-browser/) through the Chrome DevTools protocol.
 
-**Running today:** Genshin Impact · Ni no Kuni: Cross Worlds · Alchemia Story ·
-Kikyu! Aeronaut (a 2013 `armeabi` APK) · Black Clover: Asta Fight · Between Two
-Worlds · and more in [Compatibility](#compatibility).
+**Already demonstrated:** Genshin Impact, Ni no Kuni: Cross Worlds, Alchemia Story,
+Kikyu! Aeronaut (a 2013 ARM32 APK), Black Clover: Asta Fight, and other Unity and Unreal Engine titles.
+See [Compatibility](#compatibility) for exactly how far each game has been tested.
 
-Every package starts the way Android starts it: the manifest's `Application`
-and content providers, then the launcher `Activity`, with the APK's own Java
-doing the work. Native-activity engines such as Unreal go through the
-framework's `NativeActivity` like on a device. There is no per-engine loader.
+Lunaria follows the app's normal Android startup sequence: its `Application` and content providers initialize
+before the launcher `Activity`. Engines using `NativeActivity`, including Unreal Engine titles,
+follow the corresponding Android lifecycle. There's no game-specific loader to write.
 
 > [!IMPORTANT]
-> Lunaria is a compatibility experiment, and the code is still changing. What
-> reaches the screen depends on the title and the engine version. The frames
-> below come from runs that actually got there.
+> **Experimental software.** Lunaria is an actively developed compatibility layer, not a complete
+> Android emulator. Some titles reach gameplay; others stop at menus or fail to render.
+> The screenshots below are from actual Lunaria guest frames, not footage from a separate emulator.
 
 <p align="center">
-  <img src="shots/genshin-mondstadt.png" width="100%" alt="Genshin Impact: Lumine gliding over Mondstadt, twin tornadoes beside the cathedral">
+  <img src="shots/genshin-mondstadt-night.png" width="100%" alt="Genshin Impact: Lumine gliding through Mondstadt at night, windmills lit below, full touch HUD">
 </p>
 
 <p align="center">
-  <img src="shots/genshin-lakeshore.png" width="32%" alt="Genshin Impact open world: the Traveler at a lakeshore, autumn trees, full HUD">
+  <img src="shots/genshin-glide-coast.png" width="32%" alt="Genshin Impact: Lumine gliding over turquoise water toward a green coast at sunset">
   &nbsp;
-  <img src="shots/genshin-jean.png" width="32%" alt="Genshin Impact: Jean in the Knights' library, Lisa at the desk behind her">
+  <img src="shots/genshin-lisa.png" width="32%" alt="Genshin Impact: Lisa recounting the Four Winds in Japanese dialogue">
   &nbsp;
-  <img src="shots/cross-worlds-cutscene.png" width="32%" alt="Ni no Kuni: Cross Worlds, a voiced cutscene against a bright sky">
+  <img src="shots/cross-worlds-crystal.png" width="32%" alt="Ni no Kuni: Cross Worlds, a glowing blue crystal in an ornate hall">
 </p>
 
-<p align="center"><sub>Over Mondstadt · the lakeshore · the Knights' library · a scene from Ni no Kuni: Cross Worlds<br>
-Genshin Impact 7.1.0, Unity IL2CPP, arm64-v8a. Cross Worlds, Unreal Engine 4, arm64-v8a.<br>
-Guest framebuffer on Linux.</sub></p>
+<p align="center"><sub>Flying over Mondstadt at night · Gliding along the coast · Meeting Lisa · The crystal chamber in Cross Worlds<br>
+Genshin Impact 7.1.0 (Unity IL2CPP, arm64-v8a) · Ni no Kuni: Cross Worlds (Unreal Engine 4, arm64-v8a)</sub></p>
 
 <p align="center">
   <img src="shots/alchemia-story-title.png" width="48%" alt="Alchemia Story title screen, the cast gathered around the logo, Touch to start">
@@ -59,45 +54,41 @@ Guest framebuffer on Linux.</sub></p>
 
 <p align="center"><sub>Alchemia Story 1.0.154 (Unity IL2CPP, arm64-v8a) · Cross Worlds in the field at sunset</sub></p>
 
-## Why Lunaria
+<p align="center">
+  <img src="shots/launcher.png" width="72%" alt="Lunaria launcher: drop an APK, XAPK, APKS or AAB, pick data folder and device profile">
+</p>
 
-| | What it means |
+<p align="center"><sub>Drop a package into the launcher or choose a file. Save the data location, cache settings, and device profile in <code>lunaria.conf</code>.</sub></p>
+
+## What makes Lunaria different
+
+| Feature | What it does |
 |---|---|
-| **Two guest architectures** | ARMv7 and AArch64, compiled as they run by dynarmic |
-| **The package is the whole install** | `.apk`, `.xapk`, and `.apks` launch from the binary itself |
-| **The host GPU** | EGL and OpenGL ES 3 go straight through. Vulkan is advertised by default when the host bridge is available |
-| **The pieces engines expect** | JNI, AssetManager, OBB, pthread, OpenSL ES, and Android API stubs |
-| **The APK's own Java** | `classes*.dex` runs in `src/dvm/` wherever a host stub is missing |
-| **Movies that can finish** | H.264 through openh264, AAC through libavcodec |
-| **A real browser for WebView** | Chrome, Chromium, or luna-browser, composited into the guest view |
-| **A named phone** | `lunaria.conf` reports a retail profile. Pixel 6 is the default |
-| **More than one JIT** | `LUNARIA_A64_ENGINES` spreads AArch64 workers across host threads |
-| **A keyboard on a touch HUD** | Bundled maps for Genshin and Cross Worlds: WASD, skills, and mouse-look together |
-| **Settings that come back** | Login, server, and a changed music volume are still there after a restart |
-| **More than one account** | `--profile` keeps preferences and login apart. The installed package stays shared |
-| **A window, or none** | With no X11 display, Lunaria falls back to a surfaceless EGL pbuffer |
-| **A way to see why** | Frame capture, JIT profiles, SVC traces, and guest-memory watchpoints |
+| **No Android system image** | Launch `.apk`, `.xapk`, `.apks`, and `.aab` packages without booting Android in a VM. |
+| **ARM32 and ARM64 support** | Run ARMv7 and AArch64 instructions through dynarmic's JIT compiler. |
+| **Host-side graphics** | Forward EGL and OpenGL ES 3 to the host GPU; expose Vulkan when the host bridge is available. |
+| **Android services, without the full OS** | Provide JNI, AssetManager, OBB, pthread, OpenSL ES, and compatibility implementations of Android APIs. |
+| **Java from the original APK** | Execute methods from `classes*.dex` with the built-in Dalvik interpreter when no host-side stub is available. |
+| **Video and audio** | Decode supported H.264 streams with OpenH264 and AAC with libavcodec when available. |
+| **WebView integration** | Render web content through Chrome/Chromium or the included luna-browser. |
+| **Configurable device identity** | Choose a device profile in `lunaria.conf`; the default emulates the identity of a Pixel 6. |
+| **Parallel AArch64 execution** | Distribute guest execution across host threads using `LUNARIA_A64_ENGINES`. |
+| **Keyboard and mouse controls** | Map keyboard input to touch controls, including movement, abilities, and camera control; support macros and input replay. |
+| **Persistent settings and profiles** | Preserve app preferences between launches and isolate account data with `--profile` while sharing installed files. |
+| **Headless rendering and diagnostics** | Render through EGL without an X11 window, capture frames, and inspect JIT profiles, SVC traces, and guest memory. |
 
 ## Gallery
 
-Every picture is Lunaria's guest framebuffer, taken from the GLFW window or
-from headless EGL.
+These images were captured directly from Lunaria's guest framebuffer, either in its GLFW window or through headless EGL. They are not screenshots of an Android emulator.
 
 ### Genshin Impact 7.1.0
 
-Unity IL2CPP on arm64-v8a, framebuffer **1024×576**. On 1 October 2026 a
-saved login and the Asia server came back, shader compile and the resource
-download finished, and the open world drew. The prologue, the Knights'
-library, and flight over Mondstadt are in color. Keyboard movement works in
-the field. On the machine used for that measurement, a Xeon E5-2697 v2, the
-field held about 18–22 fps and the settings menu about 30 fps. A music-volume
-change was still there after a restart. The account page can open in the
-host WebView. Google Play billing is not implemented.
+Genshin Impact 7.1.0 runs through Unity IL2CPP on `arm64-v8a`. These captures use a **1024 × 576** framebuffer. Google Play billing is not currently supported.
 
 <p align="center">
   <img src="shots/genshin-wings.png" width="48%" alt="Genshin Impact: Lumine with glider wings open against a blue sky">
   &nbsp;
-  <img src="shots/genshin-lumine.png" width="48%" alt="Genshin Impact close-up: Lumine, asking whether you are a new ally or a new storm">
+  <img src="shots/genshin-lisa-obtained.png" width="48%" alt="Genshin Impact: new character screen for Lisa, four stars, Japanese copy">
 </p>
 
 <p align="center">
@@ -109,6 +100,12 @@ host WebView. Google Play billing is not implemented.
 <p align="center">
   <img src="shots/genshin-knights.png" width="48%" alt="Genshin Impact: the Traveler at the Knights of Favonius gate, Kaeya and Amber nearby">
   &nbsp;
+  <img src="shots/genshin-jean.png" width="48%" alt="Genshin Impact: Jean in the Knights' library, Lisa at the desk behind her">
+</p>
+
+<p align="center">
+  <img src="shots/genshin-lakeshore.png" width="48%" alt="Genshin Impact open world: the Traveler at a lakeshore, autumn trees, full HUD">
+  &nbsp;
   <img src="shots/genshin-shore.png" width="48%" alt="Genshin Impact: the Traveler standing in the water outside Mondstadt at dusk">
 </p>
 
@@ -116,7 +113,7 @@ host WebView. Google Play billing is not implemented.
   <img src="shots/genshin-swim.png" width="100%" alt="Genshin Impact: swimming at sunset outside Mondstadt, the quest marker still pointing toward the city">
 </p>
 
-<p align="center"><sub>Wings open · the question · the prologue · the gate · the shore · the swim at dusk</sub></p>
+<p align="center"><sub>Wings · Lisa joins · the prologue · the Knights · lakeshore · the swim at dusk</sub></p>
 
 <details>
 <summary>Login, download, and settings</summary>
@@ -145,7 +142,9 @@ host WebView. Google Play billing is not implemented.
 
 <p align="center"><sub>Shader compile · TAP TO BEGIN · download · login · server · library · language</sub></p>
 
-Earlier frames from the same path are kept beside these:
+Other frames are kept beside these:
+[`genshin-mondstadt.png`](shots/genshin-mondstadt.png),
+[`genshin-lumine.png`](shots/genshin-lumine.png),
 [`genshin-compile.png`](shots/genshin-compile.png),
 [`genshin-compile-early.png`](shots/genshin-compile-early.png),
 [`genshin-loading.png`](shots/genshin-loading.png),
@@ -154,17 +153,20 @@ Earlier frames from the same path are kept beside these:
 [`genshin-splash.png`](shots/genshin-splash.png),
 [`genshin-mail.png`](shots/genshin-mail.png),
 [`genshin-chat.png`](shots/genshin-chat.png),
-[`genshin-field.png`](shots/genshin-field.png).
+[`genshin-field.png`](shots/genshin-field.png),
+[`genshin-library.png`](shots/genshin-library.png).
 
 </details>
 
 ### Ni no Kuni: Cross Worlds
 
-A commercial Unreal Engine 4 game on arm64-v8a. The run that produced these
-frames went through guest login, server select, character select, the
-starting village, story dialogue with Chloe, a voiced cutscene, and play in
-the field. The title on screen is 5.03.04. A later package, 5.04.12, still
-draws through to the game. The framebuffer is **1024×576**.
+This commercial Unreal Engine 4 title progressed from login and server selection through character creation, the starting village, story dialogue, voiced cutscenes, and gameplay in the field. Captured at **1024 × 576** on `arm64-v8a`.
+
+<p align="center">
+  <img src="shots/cross-worlds-crystal.png" width="48%" alt="Cross Worlds: glowing blue crystal in an ornate hall, three characters around it">
+  &nbsp;
+  <img src="shots/cross-worlds-peek.png" width="48%" alt="Cross Worlds: orange-haired girl and familiar peeking from behind a bush at night">
+</p>
 
 <p align="center">
   <img src="shots/cross-worlds-village.png" width="48%" alt="Cross Worlds starting village, a teal-roofed house under a broad tree">
@@ -178,7 +180,11 @@ draws through to the game. The framebuffer is **1024×576**.
   <img src="shots/cross-worlds-characters.png" width="48%" alt="Cross Worlds character select">
 </p>
 
-<p align="center"><sub>The first village · the field · Chloe · character select</sub></p>
+<p align="center">
+  <img src="shots/cross-worlds-cutscene.png" width="72%" alt="Cross Worlds, a voiced cutscene against a bright sky">
+</p>
+
+<p align="center"><sub>Crystal chamber · a peek at night · the first village · the field · Chloe · character select · cutscene</sub></p>
 
 <details>
 <summary>Title, servers, and the road in</summary>
@@ -209,10 +215,7 @@ a guest pixel. GLFW ignores `xdotool` synthetic clicks.
 
 ### Alchemia Story
 
-ASOBIMO's Japanese RPG on Unity IL2CPP, arm64-v8a, framebuffer **1024×576**
-(portrait scenes draw at 576×1024). The title screen, story scenes with
-their Japanese text, and the character-creation room draw. The package is the
-plain `.apk`, version 1.0.154.
+ASOBIMO's Japanese RPG runs on Unity IL2CPP (`arm64-v8a`). Lunaria renders its title screen, Japanese story dialogue, and character-creation scenes. The framebuffer is **1024 × 576** in landscape and **576 × 1024** in portrait.
 
 <p align="center">
   <img src="shots/alchemia-story-cave.png" width="48%" alt="Alchemia Story: a black-haired heroine covers her mouth in surprise inside a cave, Japanese dialogue box below">
@@ -222,11 +225,9 @@ plain `.apk`, version 1.0.154.
 
 <p align="center"><sub>A story scene in landscape · the same game in portrait</sub></p>
 
-### Kikyu! Aeronaut
+### [Kikyu! Aeronaut](https://github.com/yui0/Kikyu)
 
-A 2013 `armeabi` APK built around a native `libCatNative.so`, run through the
-ARM32 guest. The title screen draws: moon, skyline, pixel-art heroine, and
-*Press Return to Embark*.
+Even this 2013 `armeabi` APK runs through Lunaria’s ARM32 path. Its original `libCatNative.so` renders the moonlit skyline, pixel-art protagonist, and *Press Return to Embark* title screen.
 
 <p align="center">
   <img src="shots/kikyu-title.png" width="48%" alt="Kikyu! Aeronaut title screen: a crescent moon over a city skyline, the pixel-art heroine on a pile of rubble, Press Return to Embark">
@@ -249,46 +250,56 @@ ARM32 guest. The title screen draws: moon, skyline, pixel-art heroine, and
 <p align="center">
   <img src="shots/between-two-worlds.png" width="48%" alt="Between Two Worlds main menu, Continue, New Game, Load, Exit">
   &nbsp;
-  <img src="shots/unreal-first-person.png" width="48%" alt="Unreal Engine 4 First Person map, a pistol and grey blocks">
+  <img src="shots/fpsmobile.png" width="48%" alt="FPSMobile Unreal first-person template, rifle aimed at a white cube, virtual sticks">
 </p>
 
-<p align="center"><sub>Between Two Worlds · Unity 2023 IL2CPP · 1280×720 &nbsp;·&nbsp; the Unreal first-person sample · armeabi-v7a · Mesa llvmpipe</sub></p>
+<p align="center"><sub>Between Two Worlds · Unity 2023 IL2CPP · 1280×720 &nbsp;·&nbsp; FPSMobile · Unreal Engine 4 · armeabi-v7a</sub></p>
 
 <p align="center">
   <img src="shots/unity-sample.png" width="48%" alt="Unity sample game, 3D gameplay">
   &nbsp;
+  <img src="shots/black-clover.png" width="48%" alt="Black Clover: Asta Fight, side-scrolling stage with touch controls">
+</p>
+
+<p align="center"><sub>UnitySampleGame · Start opens the 3D scene, 1280×720 &nbsp;·&nbsp; Black Clover: Asta Fight · gameplay, 1024×576</sub></p>
+
+<p align="center">
+  <img src="shots/demo-project-light.png" width="48%" alt="Demo Project Light title, TAP THE SCREEN over a wizard study">
+  &nbsp;
+  <img src="shots/unreal-first-person.png" width="48%" alt="Unreal Engine 4 First Person map, a pistol and grey blocks">
+</p>
+
+<p align="center">
   <img src="shots/time-locker.png" width="28%" alt="TIME LOCKER portrait tutorial">
 </p>
 
-<p align="center"><sub>An earlier Unity sample run that reached the playable scene, 1280×720. Current builds stop before this. &nbsp;·&nbsp; TIME LOCKER tutorial, 720×1280</sub></p>
-
-<p align="center">
-  <img src="shots/black-clover.png" width="360" alt="Black Clover: Asta Fight, the Unity splash">
-</p>
-
-<p align="center"><sub>Black Clover: Asta Fight · the Unity splash, headless</sub></p>
+<p align="center"><sub>Demo Project Light · Unreal first-person sample · Mesa llvmpipe &nbsp;·&nbsp; TIME LOCKER · 720×1280</sub></p>
 
 ### Lunaria itself
 
-A large title spends a long time linking, translating, and compiling dex
-before the first guest frame. The boot card is Lunaria's own surface for
-that wait. Once the guest draws, right-click opens the host menu over the
-frame: screenshot (also F12), paste-on-type, Back, volume and mute, ALSA
-output, the keyboard map, WebView zoom and engine, reload, full screen, quit.
+Launch Lunaria without arguments to open its graphical launcher. Drop an `.apk`, `.xapk`, `.apks`, or `.aab` onto the window, choose the data directory and device profile, and save your preferences in `lunaria.conf`. Large games may need time to load libraries, translate ARM instructions, and compile dex bytecode; a startup screen displays progress until the first guest frame appears.
+
+Once a game is running, **right-click to open the host menu**. From there you can take screenshots (also **F12**), paste text, send Back, adjust audio, choose keyboard mappings and WebView settings, record or replay input, switch profiles, restart, toggle fullscreen, or quit.
 
 <p align="center">
-  <img src="shots/boot.png" width="48%" alt="Lunaria boot card, a progress ring at 95 percent over a blue sky, the word LUNARIA below">
+  <img src="shots/launcher.png" width="56%" alt="Lunaria launcher card on a blue sky, Open an application drop zone">
   &nbsp;
-  <img src="shots/host-menu.png" width="42%" alt="Lunaria host menu, WebView engine set to luna-browser, zoom 200 percent, mute on">
+  <img src="shots/boot.png" width="40%" alt="Lunaria boot card: moon wordmark, ARM translation and dex compile progress">
 </p>
 
-<p align="center"><sub>The boot card · the host menu</sub></p>
+<p align="center">
+  <img src="shots/host-menu-kikyu.png" width="56%" alt="Host menu over Kikyu! Aeronaut: Input, Keyboard Controls, genshin.conf and crossworlds.conf">
+  &nbsp;
+  <img src="shots/host-menu.png" width="40%" alt="Host menu WebView engine submenu, luna-browser selected">
+</p>
+
+<p align="center"><sub>Launcher · boot card · host menu on a 2013 APK · WebView engine picker</sub></p>
 
 ## Quick start
 
-### 1. Install build dependencies
+### 1. Install dependencies
 
-On Ubuntu or Debian:
+**Ubuntu / Debian**
 
 ```bash
 sudo apt install \
@@ -299,105 +310,79 @@ sudo apt install \
   libasound2-dev libvulkan-dev
 ```
 
-`libvulkan-dev` supplies the headers for the bridge. The bridge loads the
-host's Vulkan library by default; `LUNARIA_VULKAN=0` disables it.
+`libvulkan-dev` provides headers for the optional Vulkan bridge. When a host Vulkan library is available, Lunaria enables the bridge by default. Set `LUNARIA_VULKAN=0` to disable it.
 
-On Apple Silicon macOS, run `make` in this directory to fetch the pinned
-ANGLE, MoltenVK, and OpenH264 dependencies and build. Launch an XAPK with
-`./lunaria-apk.sh /path/to/game.xapk`.
+**macOS (Apple Silicon)**
 
-For Windows x86_64, use the [MSYS2 UCRT64 shell](https://www.msys2.org/docs/environments/):
+Run `make` from this directory to download the pinned ANGLE, MoltenVK, and OpenH264 dependencies and build Lunaria. To open an XAPK, use `./lunaria-apk.sh /path/to/game.xapk`. See [Project status](#project-status) for current macOS display limitations.
+
+**Windows (x86_64)**
+
+Open the [MSYS2 UCRT64 shell](https://www.msys2.org/docs/environments/) and install:
 
 ```bash
 pacman -S --needed git make zip unzip bzip2 \
   mingw-w64-ucrt-x86_64-{gcc,cmake,ninja,pkgconf,python,boost,glfw,angleproject,openssl,zlib,libgnurx,vulkan-headers}
 ```
 
-Set `ANDROID_HOME` to an Android SDK containing Build Tools' RenderScript
-arm64 libraries, and `ANDROID_NDK_HOME` to its NDK directory. Then:
+Set `ANDROID_HOME` to the Android SDK directory (including the Build Tools' ARM64 RenderScript libraries) and `ANDROID_NDK_HOME` to the NDK directory. Then build the distributable:
 
 ```bash
 make -j4 dist CC=gcc CXX=g++ DYNARMIC_JOBS=4
 ```
 
-Windows links the JVM, Dalvik, UI and Android host APIs into `lunaria.exe`.
-On Linux, run `make -j4 dist-cross-win` to build the same Windows ZIP.
-The first run downloads MSYS2 UCRT64 dependencies and their runtime DLL closure,
-plus Boost headers, into `/tmp/lunaria-windows-deps`; subsequent runs reuse them.
-Install a UCRT-capable `x86_64-w64-mingw32-gcc/g++`, CMake, Ninja, Python 3.11+,
-curl, tar with zstd support, and zip, and provide the Android SDK/NDK above.
-Intermediate files live in `/tmp/lunaria-cross-win` and
-`/tmp/lunaria-dist-build/cross-windows-x86_64`; the ZIP is written here.
-Use `WIN_DEPS=/path/to/deps make dist-cross-win` to reuse another environment.
-Environment overrides also include `WIN_CROSS_PREFIX`, `WIN_ANGLE`,
-`WIN_GLFW_LIB`, `WIN_BOOST_INCLUDE`, `WIN_BUILD_DIR`, and `WIN_DIST_BUILD_DIR`.
-The ZIP carries the host DLLs and OpenH264, plus real AArch64 libraries in
-`syslib-arm64/` for the guest JIT paths. It does not carry ICU, a shell
-launcher, or host `runtime/*.so` shims. A current archive is about 35 MiB.
-The process turns the UTF-16 command line into UTF-8, so an APK can be passed
-with no shell in between. Run `.\lunaria.exe game.apk` from PowerShell, or
-drop a package onto the executable. The runtime needs no MSYS2, Python, or
-ICU installation.
+The Windows build combines the JVM, Dalvik interpreter, UI, and Android compatibility APIs into `lunaria.exe`. Run `.\lunaria.exe game.apk` from PowerShell after extracting the archive, or drag an APK onto the executable. The resulting application does **not** require MSYS2, Python, a separate shell, or ICU at runtime.
+
+You can also cross-compile a Windows ZIP from Linux with `make -j4 dist-cross-win`. On its first run, this downloads MSYS2 UCRT64 dependencies, runtime DLLs, and Boost headers to `/tmp/lunaria-windows-deps`. Subsequent builds reuse the cache.
+
+Cross-compilation requires UCRT-capable `x86_64-w64-mingw32-gcc/g++`, CMake, Ninja, Python 3.11 or newer, curl, tar with zstd support, zip, and the Android SDK/NDK described above. Intermediate files are stored under `/tmp/lunaria-cross-win` and `/tmp/lunaria-dist-build/cross-windows-x86_64`; the ZIP is written to this directory.
+
+Set `WIN_DEPS=/path/to/deps` to reuse an existing dependency directory. Other overrides are `WIN_CROSS_PREFIX`, `WIN_ANGLE`, `WIN_GLFW_LIB`, `WIN_BOOST_INCLUDE`, `WIN_BUILD_DIR`, and `WIN_DIST_BUILD_DIR`. The ZIP includes required host DLLs, OpenH264, and the guest AArch64 libraries in `syslib-arm64/`; it omits ICU and host `runtime/*.so` shims. One recorded build produced an archive of approximately 35 MiB. Windows command-line arguments are converted from UTF-16 to UTF-8.
 
 ### 2. Build
 
-WebP bitmap decoding uses the bundled C header
-[simplewebp](https://github.com/MikuAuahDark/simplewebp/blob/main/simplewebp.h)
-(version 20260718) and requires no additional installed codec package.
-Its BSD license and patent grant are retained in `LICENSE.simplewebp`.
+WebP decoding uses the bundled [simplewebp](https://github.com/MikuAuahDark/simplewebp/blob/main/simplewebp.h) single-header C library (version 20260718), so no separate WebP codec package is needed. Its BSD license and patent grant are included in `LICENSE.simplewebp`.
 
 ```bash
 make dynarmic-build
 make x86_64 -j"$(nproc)"   # host is x86_64; plain `make` builds the 32-bit x86 ABI
 ```
 
-`make` / `make x86_64` already pulls Cisco's openh264 shared library into
-`runtime/` (required for MediaCodec H.264). Re-run explicitly with
-`make fetch-openh264` if you need to refresh it.
+`make` and `make x86_64` automatically fetch Cisco's OpenH264 shared library into `runtime/` for MediaCodec H.264 support. Run `make fetch-openh264` to refresh the library manually.
 
-`make syslib` fills `syslib-arm64/` with an AArch64 libm, a bionic libc, and
-libz. The launcher points `LUNARIA_SYSLIB_DIR` at that directory when it
-exists, so audited pure arithmetic (`pow`, `sincosf`) and memory routines
-stay inside the guest JIT. Platform zlib calls use the host through SVC:
-existing profiles show native decompression is faster than guest JIT execution. `make guestlib` builds `liblunaria_guest.so` from `src/lib/guest.c`
-(a zero-duration `nanosleep` returns without leaving the JIT).
+Run `make syslib` to populate `syslib-arm64/` with AArch64 `libm`, bionic `libc`, and `libz`. When the directory exists, the launcher points `LUNARIA_SYSLIB_DIR` to it. Audited arithmetic routines such as `pow` and `sincosf`, as well as memory routines, can then execute directly inside the guest JIT. System zlib calls use the host implementation through SVC, which has been faster in existing measurements.
 
-Unicode classification, normalization and IDN use the compiled Unicode tables.
-Legacy charsets use Windows code pages or Linux/macOS iconv; Windows calendars
-use its timezone rules with a compact CLDR mapping. ICU is not a build or runtime dependency.
+`make guestlib` builds `liblunaria_guest.so` from `src/lib/guest.c`. It currently handles zero-duration `nanosleep` calls without returning to the host.
+
+Lunaria embeds Unicode classification, normalization, and IDN tables. Legacy character encodings use Windows code pages or `iconv` on Linux/macOS; Windows date handling uses OS timezone rules and a compact CLDR mapping. **ICU is not required** for building or running Lunaria.
 
 ### 3. Launch a package
 
 ```bash
+./lunaria                         # open the launcher UI
 ./lunaria path/to/game.apk
 ./lunaria path/to/game.xapk
 ./lunaria path/to/game.apks
-LUNARIA_ALSA_DEVICE="hw:7,0" ./lunaria Cross+Worlds_5.03.04_APKPure.xapk
+./lunaria path/to/game.aab
+LUNARIA_ALSA_DEVICE="hw:7,0" ./lunaria Cross+Worlds_5.04.12_APKPure.xapk
 ```
 
-The binary reads the package itself: ZIP and ZIP64, the binary manifest,
-signature blocks, split overlays, OBB, and the unpack cache. It detects
-`arm64-v8a` or `armeabi-v7a`, finds the main native library, and starts the
-runtime. An XAPK or APKS keeps the base APK intact and lays the splits over
-that view. Unpacked trees are cached under `cache/packages/` in the data root
-chosen at startup, keyed on the package identity. `LUNARIA_NO_CACHE=1` forces
-a fresh unpack. `LUNARIA_CACHE_DIR` selects a different cache location.
+To create a distributable package that does not depend on the build directory:
 
-Unpacking reports the percentage, MiB processed, file count and current filename,
-including progress within a large file. Cache checks and large fallback copies
-also report their progress. OBB aliases share the original archive by hard link
-or symbolic link to avoid copying gigabytes again on each launch.
+```bash
+make dist        # lunaria-<version>-linux-x86_64.tar.gz
+make dist-mac    # Lunaria.app + .dmg (Darwin only)
+```
 
-Settings that belong to the installation, not to one launch, live in
-`lunaria.conf` (see `lunaria.conf.sample`): which device to report, where the
-guest's `/data` lives (`LUNARIA_DATA_ROOT`), and which WebView engine to use.
-A variable already set in the environment wins for that run.
+Lunaria handles package installation internally, including ZIP/ZIP64 archives, binary manifests, signature blocks, split APKs, OBB files, and extraction caches. It detects `arm64-v8a` or `armeabi-v7a`, locates the entry-point native library, and starts the Android compatibility runtime.
 
-Both the settings file (`lunaria.conf`) and the data root default to the working
-directory at startup. Select another settings file with `--config FILE` or
-`LUNARIA_CONF`, and another data volume with `--data-root DIR` or
-`LUNARIA_DATA_ROOT` in the settings file. Relative paths start at the working
-directory; paths with spaces are supported.
+For XAPK and APKS files, Lunaria combines split APKs into its runtime view without modifying the base APK. For AAB files, it reads the protobuf `BundleConfig` and loads the base module and available asset packs. Extracted content is cached under `cache/packages/` in the selected data directory. Set `LUNARIA_CACHE_DIR` to move the cache or `LUNARIA_NO_CACHE=1` to unpack the package on every launch.
+
+Extraction progress includes the percentage completed, MiB processed, file count, and current filename—even while copying individual large files. OBB aliases use hard links or symbolic links where possible, avoiding repeated multi-gigabyte copies.
+
+Save persistent settings in `lunaria.conf` (see `lunaria.conf.sample`): device identity, guest data directory (`LUNARIA_DATA_ROOT`), WebView engine, and more. Environment variables override configuration-file values for the current run.
+
+By default, Lunaria looks for `lunaria.conf` in its startup working directory and also stores guest data there. To choose another configuration file, use `--config FILE` or `LUNARIA_CONF`; to choose another data directory, use `--data-root DIR` or `LUNARIA_DATA_ROOT`. Relative paths are resolved from the startup directory, and paths containing spaces are supported.
 
 ```bash
 ./lunaria --config ./lunaria.conf --data-root "/mnt/games/Lunaria data" game.xapk
@@ -405,9 +390,7 @@ directory; paths with spaces are supported.
 # Windows shell: --data-root D:/Games/Lunaria
 ```
 
-Account profiles share the installed APK and configured game resource paths,
-while keeping preferences, databases, login files and other external files
-separate. `default` keeps the existing account's directories.
+**Multiple accounts, one installation.** Profiles share the installed package and designated game resources, but keep preferences, databases, login files, and other personal data separate. The `default` profile continues to use the existing data directories.
 
 ```bash
 ./lunaria --choose-profile game.xapk
@@ -415,13 +398,9 @@ separate. `default` keeps the existing account's directories.
 ./lunaria --list-profiles game.xapk
 ```
 
-`LUNARIA_PROFILE_PROMPT=1` enables selection on each launch. Configure
-`LUNARIA_SHARED_ASSETS` as colon-separated resource names and
-`LUNARIA_PROFILE_SEED_FILES` as resource manifest files to copy once into a
-new profile. The sample contains the Genshin resource layout. A new profile
-starts with its own login state.
+Set `LUNARIA_PROFILE_PROMPT=1` to select a profile at every launch. `LUNARIA_SHARED_ASSETS` accepts colon-separated shared resource names; `LUNARIA_PROFILE_SEED_FILES` lists resource files to copy once into a new profile. The sample configuration includes the Genshin Impact resource layout. Each new profile starts with its own login state.
 
-Force a guest architecture when a package contains both:
+If a package contains multiple ABIs, select one explicitly:
 
 ```bash
 LUNARIA_ARCH=armeabi-v7a ./lunaria game.apk
@@ -430,24 +409,23 @@ LUNARIA_ARCH=arm64-v8a  ./lunaria game.apk
 
 ## Compatibility
 
-These are observed milestones, not a general compatibility guarantee.
-Details and launch recipes live in `PROGRESS.md`.
+These results describe **what was actually observed**, not a promise that every feature of a title works. Support varies by version, platform, graphics driver, and game engine. For detailed logs and launch instructions, see `PROGRESS.md`.
 
 | Title | Engine / ABI | Current result |
 |---|---|---|
-| **Ni no Kuni: Cross Worlds** | Unreal Engine 4 · AArch64 XAPK | Drawn guest login, the village, story dialogue, a voiced cutscene, and in-world play. |
-| **Blade & Soul Masia** | Unreal Engine 5 · AArch64 APKS | Opening movie reaches EOS; title screen; additional-patch dialog is readable and Agree advances the download |
-| **Genshin Impact 7.1.0** | Unity IL2CPP · AArch64 XAPK | Open world on Linux. Saved login and the Asia server return, then shader compile, the resource download, **TAP TO BEGIN**, and the field. Prologue, the library, and flight over Mondstadt draw in color. Keyboard movement works there; that host measured about 18–22 fps in the field and about 30 fps in settings. A changed music volume survived restart. A host WebView can open the account page. Google Play billing is not implemented |
+| **Ni no Kuni: Cross Worlds** | Unreal Engine 4 · AArch64 XAPK | On Linux: login, server and character selection, the starting village, dialogue, voiced cutscenes, and gameplay in the field; SharedPreferences persist. On Apple Silicon macOS, version 5.04.12 displayed the opening movie, 3D intro, and terms dialog; behavior after accepting the terms has not been verified. |
+| **Blade & Soul Masia** | Unreal Engine 5 · AArch64 APKS | Opening video completes, the title screen appears, and accepting the additional-patch prompt starts the download. |
+| **Genshin Impact 7.1.0** | Unity IL2CPP · AArch64 XAPK | Reached the open world on Linux, including the prologue, Mondstadt, and gliding. Login, server selection, and audio settings survived restart. Keyboard movement worked; one test host measured approximately 18–22 fps in the field and 30 fps in menus. Account WebView opened; Google Play billing is not supported. |
 | **Alchemia Story 1.0.154** | Unity IL2CPP · AArch64 APK | Title screen, story scenes with Japanese dialogue in landscape and portrait, and the character-creation room draw (2026-10-09) |
 | **Kikyu! Aeronaut** | native `armeabi` · ARM32 APK (2013) | Title screen draws and waits for Return |
 | **Between Two Worlds** | Unity 2023 IL2CPP · ARMv7 | Playable; reaches the main story scene |
 | **Between Two Worlds** | Unity 2023 IL2CPP · AArch64 | Main menu on a recorded run; recent checks reach language selection at about 70 fps |
 | **FPSMobile** | Unreal Engine 4 · ARMv7 | FirstPersonExampleMap renders; 16,000+ swaps observed |
-| **UnitySampleGame** | Unity · ARMv7 | Start opens the 3D gameplay scene; rendering continues (verified 2026-10-02) |
+| **UnitySampleGame** | Unity · ARMv7 | Start opens the 3D gameplay scene; rendering continues |
 | **TIME LOCKER** | Unity · ARMv7 | Reaches the portrait tutorial gameplay scene |
 | **Black Clover: Asta Fight** | Unity IL2CPP · AArch64 XAPK | Base + split load; title menu, stage selection and gameplay render headlessly |
 | **Blade & Soul Revolution** | Unreal Engine 4 · AArch64 | Boots through dex / SDK setup into the game's own dialog; without a route to the patch server the client asks to reconnect |
-| **Daggerfall Unity** | Unity Mono · ARMv7 | Mono runtime boots; rendering remains blocked |
+| **Daggerfall Unity** | Unity Mono · ARMv7 | Mono starts, but rendering is not yet working. |
 
 <details>
 <summary><strong>Run the open-source test titles</strong></summary>
@@ -497,36 +475,22 @@ make fetch-libunity
 
 ## Keyboard controls
 
-Hold **Ctrl** and scroll the mouse wheel over the game to pinch: scroll up
-spreads two fingers, scroll down brings them together. The cursor is the
-gesture center. Release other mouse/keymap contacts before pinching.
+Lunaria translates keyboard and mouse input into touchscreen gestures, making games with on-screen controls easier to use on a desktop.
 
-Touch-driven games can be controlled from the keyboard by mapping keys to touch
-positions on the screen. Open **Keyboard Controls** from the right-click menu and
-select a keymap file to switch layouts while the game is running. You can also
-browse to another folder and load your own keymap. Choose **Off** to disable
-keyboard mapping, or **Reload Current File** to reload a keymap after editing it.
-If a keymap fails to load, Lunaria keeps the current settings unchanged. A keymap
-can also be selected at startup.
+Open **Keyboard Controls** from the right-click menu to select a bundled layout or load your own configuration file. You can switch layouts without restarting the game. Choose **Off** to disable mapping, or **Reload Current File** to apply your edits. If a configuration fails to load, the current mapping remains active.
+
+For pinch gestures, hold **Ctrl** and scroll over the game: scroll up to spread two fingers, down to bring them together. The cursor marks the center of the gesture. Release other mouse and keymap touches before pinching.
 
 ```sh
 LUNARIA_KEYMAP=genshin ./lunaria /path/to/Genshin.xapk
 LUNARIA_KEYMAP=crossworlds ./lunaria /path/to/CrossWorlds.apks
 ```
 
-The bundled layouts use **WASD** for movement, **F** for the normal attack,
-**E/Q/1/2/3** for skills or character selection, **Space** for jump, and
-**Shift** for dash. In Cross Worlds, **Space** and **Shift** are mapped to dodge
-actions instead. Drag with the left mouse button to control the camera. Movement,
-mapped buttons, and mouse input can all be used at the same time.
+The included Genshin Impact and Cross Worlds layouts use **WASD** for movement, **F** for attacks, **E/Q/1/2/3** for abilities or character selection, and **Space** and **Shift** for jumping, dashing, or dodging depending on the game. Drag with the left mouse button to move the camera. Keyboard movement, mapped touch buttons, and mouse controls work simultaneously.
 
-When a text field has focus, text input takes priority over game controls. If the
-window loses focus, any keys currently held down are released automatically.
+Text fields take precedence over game mappings, so you can type normally. When the window loses focus, Lunaria automatically releases held keys to prevent stuck input.
 
-To adapt the controls for another game or a different HUD layout, copy one of the
-files in `keymaps/*.conf`, adjust the coordinates, and load it with
-`LUNARIA_KEYMAP=/path/to/my.conf`. The setting can also be saved in
-`lunaria.conf`. Set `LUNARIA_KEYMAP=off` to disable keyboard mapping.
+To create a custom layout, copy a file from `keymaps/*.conf`, edit its touch coordinates, then set `LUNARIA_KEYMAP=/path/to/my.conf`. You can also save this setting in `lunaria.conf`, or use `LUNARIA_KEYMAP=off` to disable it.
 
 ```text
 stick 0.15625 0.764 0.18
@@ -535,16 +499,9 @@ button SPACE 0.922 0.665
 button F 0.826 0.769
 ```
 
-`stick` defines the center X/Y position and radius of the virtual stick controlled
-by WASD. `button` maps a key to an X/Y touch position. X and Y are normalized
-coordinates from 0 to 1 relative to the screen width and height; the stick radius
-is relative to the shorter screen dimension.
-`walk` selects a smaller stick radius while the named key is held with WASD.
-The Genshin layout uses WASD to run and Ctrl+WASD to walk.
+`stick` defines the virtual joystick center and radius, controlled by **WASD**. `button` assigns a key to a touch position. X/Y coordinates range from **0 to 1** relative to the screen width and height; joystick radius is measured against the shorter side. `walk` reduces the joystick radius while the specified modifier key is held. In the Genshin layout, **WASD** runs and **Ctrl + WASD** walks.
 
-Up to eight buttons and eight macros can be mapped. Supported keys are uppercase letters, digits,
-`SPACE`, `SHIFT`, and `CTRL`. The bundled layouts are tuned for landscape HUDs, so adjust
-the coordinates if you change the HUD size or placement.
+You can define up to **eight buttons and eight macros**. Supported key names are uppercase letters, digits, `SPACE`, `SHIFT`, and `CTRL`. The bundled maps assume a landscape HUD; adjust the coordinates if you change the on-screen layout.
 
 ### Simultaneous taps, timed input, recording
 
@@ -555,25 +512,13 @@ macro Z 0.5,0.5|0.6,0.6/40 @100 0.9,0.9    # two taps together for 40 ms, wait 1
 macro X 0.1,0.1 loop                       # keep running while the key is held
 ```
 
-A `button` takes up to four X/Y pairs and presses them together. `repeat=MS`
-(10–60000) taps again every MS milliseconds while the key is held; `hold=MS` is
-how long each tap lasts (default 30, or half of `repeat`, whichever is less). A
-`macro` runs its steps once per press: `x,y` taps (add `|x,y` to tap several
-together and `/MS` for the hold time) and `@MS` waits; `loop` repeats it while the
-key is held. Timing follows the frame clock, about 16 ms at 60 fps.
+A `button` supports up to four simultaneous touch points. `repeat=MS` repeats a tap every 10–60,000 ms while a key is held; `hold=MS` controls its duration (30 ms by default, or half the repeat interval if shorter). A `macro` combines taps (`x,y`), simultaneous contacts (`|x,y`), hold times (`/MS`), and delays (`@MS`). Add `loop` to repeat while the key is held. Timing is tied to the frame clock, approximately 16 ms per frame at 60 fps.
 
-**F9** (or *Record Input* in the right-click menu) records every touch the guest
-receives — mouse, keymap and macros alike — to `~/Documents/Lunaria <date>.rec`
-(or `~/`). **F10** (*Play Recording*) replays the last recording, or the file in
-`LUNARIA_PLAY`; `LUNARIA_PLAY_LOOP=1` loops it. Coordinates are stored as
-fractions of the view, so a recording replays at any window size.
+Press **F9** (or choose **Record Input**) to record touchscreen input from the mouse, keymaps, and macros. Recordings are saved as `~/Documents/Lunaria <date>.rec` (falling back to `~/`). Press **F10** (**Play Recording**) to replay the latest recording, or select a file with `LUNARIA_PLAY`. Set `LUNARIA_PLAY_LOOP=1` to repeat it. Positions are stored relative to the view, so recordings work at different window sizes.
 
 ## Capture frames
 
-Right-click and choose **Pause** to suspend guest execution. Open the menu
-again and choose **Resume** to continue. The host menu remains usable while
-paused; guest pointer and keyboard input are suppressed. This setting applies
-only to the current session.
+To freeze the game for inspection, right-click and choose **Pause**; choose **Resume** to continue. The host menu remains available, but input is not forwarded to the paused guest. Pause state is not saved between sessions.
 
 Capture selected swap indices:
 
@@ -592,16 +537,13 @@ LUNARIA_SCREENSHOT_EVERY=60 \
 ./lunaria game.xapk
 ```
 
-Frames are written as PNG (`lunaria_0000.png` in that directory). Creating
-`$LUNARIA_SHOT_TRIGGER` (default `/tmp/lunaria-shot`) dumps one more frame.
-F12, and **Take Screenshot** in the host menu, write
-`~/Pictures/Lunaria YYYY-MM-DD HH.MM.SS.png` instead.
+Captured frames are saved as PNG files such as `lunaria_0000.png`. Creating the file named by `$LUNARIA_SHOT_TRIGGER` (default `/tmp/lunaria-shot`) requests one additional capture. **F12** and **Take Screenshot** from the host menu instead save to `~/Pictures/Lunaria YYYY-MM-DD HH.MM.SS.png`.
 
 ## How it works
 
 ```text
- APK / XAPK / APKS
-     │  extract base, splits, native libraries, assets and OBB
+ APK / XAPK / APKS / AAB
+     │  extract base modules, splits, native libraries, assets and OBB
      ▼
  Android ELF loader ─── relocations and dependency resolution
      │
@@ -615,15 +557,7 @@ F12, and **Take Screenshot** in the host menu, write
 ```
 
 - **ARM32:** a flat 4 GiB guest memory window with fastmem.
-- **ARM64:** guest virtual addresses map one-to-one to host addresses; a
-  high-address image window holds loaded ELFs, trampolines, JNI tables and
-  stacks, enabling dynarmic fastmem. `LUNARIA_A64_ENGINES` (1–8; defaults from
-  host core count) can run multiple JIT engines on host threads.
-  `lunaria` sets `LUNARIA_A64_SELF_SCHED=1`, so those engines pull
-  runnable guests continuously. `LUNARIA_A64_SELF_SCHED=0` puts a barrier
-  back at each frame-pump pass. Free-running engines match a device and
-  raise throughput a lot. Cross Worlds' security module has aborted about
-  twenty-five seconds in under that mode.
+- **ARM64:** guest virtual addresses map directly to host addresses. Loaded ELF images, trampolines, JNI tables, and stacks occupy a high-address region so dynarmic can use fastmem. Set `LUNARIA_A64_ENGINES` (1–8, chosen automatically from host core count by default) to run multiple guest workers on host threads. The launcher enables `LUNARIA_A64_SELF_SCHED=1`, allowing engines to schedule runnable guests independently; set it to `0` to synchronize at each frame-pump pass. This can improve throughput, although a Cross Worlds security module has been observed to abort after approximately 25 seconds with self-scheduling enabled.
 - **Native calls:** guest libc, EGL, GLES and JNI calls cross generated
   `SVC #n` trampolines into host implementations.
 - **Guest libraries:** `make syslib` fills `syslib-arm64/` with AArch64 libm,
@@ -631,24 +565,16 @@ F12, and **Take Screenshot** in the host menu, write
   `liblunaria_guest.so` for routines that should not trap on every call
   (a zero-time `nanosleep` is the current one). The launcher points
   `LUNARIA_SYSLIB_DIR` at that directory when it exists.
-- **Threads:** guest pthreads use cooperative round-robin scheduling with a
-  separate JIT context per worker; mutex unlock can hand off directly to a
-  waiter. Guest sleeps park for real wall time. Blocking reads stay on the scheduler unless
-  `LUNARIA_FD_PARK` is set.
+- **Threads:** guest pthreads use cooperative round-robin scheduling, with a separate JIT context for each worker. Unlocking a mutex can hand execution directly to a waiting thread. Guest sleeps follow wall-clock time; blocking reads can be parked with `LUNARIA_FD_PARK`.
 - **Java:** when a JNI call has no host stub, `src/dvm/` executes the method
   from the APK's `classes*.dex` (`LUNARIA_DVM=1` by default).
-- **Startup:** the launcher `Activity` runs its real `onCreate`/`onStart`/
-  `onResume` after the manifest's `Application` and providers. A native-activity
-  engine reaches `ANativeActivity_onCreate` through `android.app.NativeActivity`'s
-  own lifecycle; the window and input queue are delivered as `APP_CMD_*`
-  commands on the glue's pipe, in the order the app's Java asks for them.
+- **App lifecycle:** Lunaria starts the manifest-defined `Application` and content providers before calling the launcher `Activity`’s `onCreate`, `onStart`, and `onResume`. Native-activity engines reach `ANativeActivity_onCreate` through `android.app.NativeActivity`, with window and input events delivered through the usual `APP_CMD_*` commands.
 - **Libraries:** a `System.loadLibrary` root heads the lookup scope of its own
   dependencies, as Android's linker does, so an engine's allocator replaces the
   one inside `libc++_shared.so`.
 - **Assets:** `AssetManager` reads DEFLATE/STORE entries from APKs and OBB
   expansion files.
-- **Audio:** OpenSL ES, AAudio and Java `AudioTrack` feed one mixer and then
-  ALSA. A blocking `AudioTrack.write()` never waits on the frame pump.
+- **Audio:** OpenSL ES, AAudio, and Java `AudioTrack` share a mixer that outputs through ALSA. Blocking `AudioTrack.write()` calls do not stall the frame pump.
 - **Media:** `android.media.MediaCodec` decodes H.264 with openh264 and AAC
   with libavcodec when available (`LUNARIA_OPENH264` / `LUNARIA_LIBAVCODEC`
   override the shared-library paths).
@@ -658,16 +584,11 @@ F12, and **Take Screenshot** in the host menu, write
   `LUNARIA_WEB_BROWSER` names a binary directly. The page is shown as an image
   inside the view; touch and text go back over the same pipe. Build the
   fallback with `make luna-browser`.
-- **Vulkan:** on when the host bridge is available. Guest `vk*` calls go to the
-  host loader; Android surfaces and swapchains are emulated and the presented
-  image is handed to the compositor. A title that does not see Vulkan stays
-  on GLES, which is the path the titles above actually use.
+- **Vulkan:** when supported by the host bridge, guest `vk*` calls reach the host Vulkan loader. Lunaria emulates Android surfaces and swapchains and forwards the presented image to its compositor. Games that do not use Vulkan continue through GLES—the rendering path used for the demonstrated games above.
 
 ## Runtime controls
 
-Common controls are listed here; the source contains additional narrow
-diagnostic switches used during compatibility work. See `PROGRESS.md` for the
-full diagnostic set.
+The following options cover everyday use and common diagnostics. Additional development-only switches are documented in the source and `PROGRESS.md`.
 
 | Variable | Default | Purpose |
 |---|---:|---|
@@ -712,17 +633,14 @@ full diagnostic set.
 | `LUNARIA_JIT_UI` | `1` | Boot card (moon, translation and dex progress); `0` leaves the surface blank until the guest draws |
 | `LUNARIA_DVM` | `1` | Dalvik bytecode emulator: `0` off, `1` run the APK's dex only where no host stub exists, `2` prefer the dex over host stubs |
 | `LUNARIA_DVM_TRACE` | off | Log the methods the emulator declined (`[dvm] miss …`) |
+| `LUNARIA_DEX_START` | on | Start the APK’s Activity lifecycle from dex; set `0` only when comparing the legacy hand-written launch sequence |
 | `LUNARIA_NET` | on | Set `0` to deny all guest sockets |
 | `LUNARIA_CACHE_DIR` | `cache/packages/` under the data root selected at startup | Persistent package cache; independently relocatable |
 | `LUNARIA_NO_CACHE` | off | Force a fresh APK/XAPK/APKS unpack |
 
-Every package is started from its manifest: `lunaria` passes the launcher
-Activity as `ANDROID_LAUNCH_ACTIVITY` and the `Application` class as
-`ANDROID_APPLICATION_CLASS`, and the loader runs their lifecycles through the
-bytecode VM. A native engine is loaded by the app's own `System.loadLibrary`.
+Lunaria launches apps from their manifests, passing the launcher activity as `ANDROID_LAUNCH_ACTIVITY` and the application class as `ANDROID_APPLICATION_CLASS`. Their lifecycles run through the bytecode VM, and native engines are loaded by the app’s own `System.loadLibrary`.
 
-Tick values accept `K`, `M`, and `G` suffixes, for example
-`LUNARIA_ONLOAD_TICKS=5G`.
+Tick values accept `K`, `M`, and `G` suffixes—for example, `LUNARIA_ONLOAD_TICKS=5G`.
 
 ## Repository map
 
@@ -730,7 +648,7 @@ Tick values accept `K`, `M`, and `G` suffixes, for example
 |---|---|
 | `src/arm_exec.cpp` | dynarmic engines, SVC dispatch, JNI, EGL/GLES and threading |
 | `src/arm.c` / `src/arm.h` | shared ARM execution lock and multi-engine helpers |
-| `src/dvm/` | Dalvik bytecode emulator: runs the APK's own Java from classes*.dex |
+| `src/dvm/` | Dalvik bytecode interpreter for the APK’s original `classes*.dex` |
 | `src/loader.c` | runtime entry point: Application, providers, launcher Activity, and the frame pump |
 | `src/dvm/audio_track.c` | Java `AudioTrack` queues shared with the output mixer |
 | `src/dvm/apk_signers.c` | APK signing-block parsing behind `PackageInfo` signatures |
@@ -738,7 +656,7 @@ Tick values accept `K`, `M`, and `G` suffixes, for example
 | `src/jvm/` | lightweight JVM/JNI object model and stubs |
 | `src/lib/` | host implementations exposed to Android native code; `guest.c` is the in-guest libc |
 | `src/luna_vulkan.c` | Vulkan bridge, enabled when a host driver is available |
-| `src/luna_overlay.c` | the emulator's own UI surface: boot card, host menu, and compositing over the guest frame |
+| `src/luna_overlay.c` | Launcher overlays, startup display, host menu, and guest-frame compositing |
 | `src/luna_boot.c` | the boot card: sky, snow, progress ring, wordmark, translation and dex lines |
 | `src/luna_ime.c` | host IME bridge into guest text input |
 | `src/webview_cdp.c` | DevTools pipe client shared by Chrome and luna-browser |
@@ -746,7 +664,7 @@ Tick values accept `K`, `M`, and `G` suffixes, for example
 | `keymaps/` | bundled touch maps (`genshin.conf`, `crossworlds.conf`) |
 | `lunaria.conf.sample` | device profile, data root, screen scale, package ledger, WebView engine |
 | `runtime/` | generated Android-compatible host shared libraries |
-| `src/apk.c` | in-process APK/XAPK/APKS install cache, manifest parsing and launch |
+| `src/apk.c` | Package extraction, APK/XAPK/APKS/AAB handling, manifest parsing, caching, and launch |
 | `src/luna_unicode.c` | compiled Unicode classification, normalization and IDNA2003 |
 | `PROGRESS.md` | detailed compatibility notes and current engineering work |
 
@@ -755,28 +673,18 @@ Tick values accept `K`, `M`, and `G` suffixes, for example
 <details>
 <summary><strong>The startup movie does not play</strong></summary>
 
-Lunaria decodes H.264 with openh264, which reads Constrained Baseline. A
-title's splash movies are routinely Main or High profile with CABAC and
-B-frames — Blade & Soul Revolution's are — and those cannot be decoded here.
+Lunaria uses OpenH264 for H.264 decoding. The supported Constrained Baseline profile does not cover every game's videos: many startup movies use Main or High profile features such as CABAC and B-frames. This is the case for Blade & Soul Revolution.
 
-The emulator detects that (sixteen access units with no picture) and reports
-`MEDIA_ERROR_UNSUPPORTED` to the guest, so the engine skips the movie and
-carries on booting. It used to go on "playing" a movie that would never
-produce a frame, and a title waiting on that movie waited for ever behind a
-white screen.
+If Lunaria processes 16 access units without producing a decoded frame, it reports `MEDIA_ERROR_UNSUPPORTED` to the guest. This lets a compatible game engine skip the video rather than waiting indefinitely on a blank screen.
 
-Titles whose streams *are* Constrained Baseline (for example Blade & Soul
-Masia's opening) reach `BUFFER_FLAG_END_OF_STREAM` when openh264 is present
-(`make fetch-openh264`). AAC audio uses libavcodec when that library is
-available on the host. Use `LUNARIA_TRACE_MEDIA=1` to watch codec state.
+Streams using the supported profile, including the opening video of Blade & Soul Masia, can reach `BUFFER_FLAG_END_OF_STREAM` when OpenH264 is installed (`make fetch-openh264`). AAC decoding uses the host's libavcodec when available. Set `LUNARIA_TRACE_MEDIA=1` to inspect codec activity.
 
 </details>
 
 <details>
 <summary><strong>The game reports “project file not found”</strong></summary>
 
-The title probably expects an OBB expansion file. Put it beside the APK using
-its original name.
+The app may require an OBB expansion file. Place it beside the APK and keep its original filename.
 
 </details>
 
@@ -794,43 +702,42 @@ make runtime/libmediandk.so runtime/libGLESv3.so
 <details>
 <summary><strong>The screen is black or startup stalls</strong></summary>
 
-Check the OBB/split files first, then collect a focused trace:
+First verify that all split APKs and required OBB files are present. If the app still stalls, capture a focused trace:
 
 ```bash
 LUNARIA_TRACE_EXC=1 LUNARIA_DUMP_LAST_SVC=1 \
 ./lunaria game.apk 2>&1 | tee lunaria.log
 ```
 
-For UE5 titles, prefer a hardware GL driver. `LIBGL_ALWAYS_SOFTWARE=1`
-(llvmpipe) can make the same boot path an order of magnitude slower and look
-like an emulator hang when it is only the software rasterizer.
+For Unreal Engine 5 titles, use a hardware-accelerated OpenGL driver when possible. `LIBGL_ALWAYS_SOFTWARE=1` forces llvmpipe software rendering, which can make startup dramatically slower and resemble a hang.
 
 </details>
 
 <details>
 <summary><strong>Rendering is slow</strong></summary>
 
-Mesa llvmpipe is a software renderer and is useful for headless validation,
-not performance testing. Use a GPU-accelerated host EGL/OpenGL stack for
-real-time rendering. For AArch64 titles, try `LUNARIA_A64_ENGINES=4` once
-the single-engine path is stable; leave `LUNARIA_SLICE_DETAIL` /
-`LUNARIA_SVC_HISTO` unset when measuring speed.
+Mesa llvmpipe is useful for headless rendering tests, but its software rasterization is not representative of GPU performance. For interactive use, enable hardware-accelerated EGL/OpenGL. On AArch64, test `LUNARIA_A64_ENGINES=4` after confirming the single-engine configuration is stable. Leave `LUNARIA_SLICE_DETAIL` and `LUNARIA_SVC_HISTO` disabled during benchmarks.
 
 </details>
 
 <details>
 <summary><strong>Clicks do nothing</strong></summary>
 
-GLFW ignores `xdotool` / `XSendEvent` synthetic clicks. Use
-`LUNARIA_TOUCH_TEST='50,84;…'` (percent of the framebuffer; add `px` for
-guest pixels), `LUNARIA_TOUCH_FIFO` once the title is up, or click inside the
-real GLFW window. Right-click opens the host menu and does not go to the guest.
+GLFW ignores synthetic clicks from `xdotool` and `XSendEvent`. Click in the actual GLFW window, inject taps with `LUNARIA_TOUCH_TEST='50,84;…'` (framebuffer percentages, or append `px` for guest pixels), or use `LUNARIA_TOUCH_FIFO` after startup. Right-click is reserved for Lunaria’s host menu.
 
 </details>
 
 ## Project status
 
-Lunaria is research software.
+Lunaria is **research software under active development**. It has known API gaps, title-specific failures, diagnostic output, and breaking changes. Test results are snapshots of particular builds and machines—not guarantees of compatibility.
+
+- **Linux:** Captured guest framebuffer output matches the GLFW window in the tested configuration.
+- **Apple Silicon macOS:** A distributable build is available through `make dist-mac`, but the visible window may remain black even when guest frames are being rendered. Some test runs, including Cross Worlds 5.04.12, reached the opening movie, 3D intro, and terms dialog.
+- **Windows:** `make dist` produces a ZIP with a bundled executable and dependencies. Extracted builds have passed ARM32/ARM64 ABI and EGL/GLES initialization checks under Wine; display and audio on native Windows hardware have not yet been verified.
+
+Distribution builds use `-O3`, `-DNDEBUG`, and LTO. Dynarmic is rebuilt separately in Release mode with IPO, without `-march=native`, so the binaries are not tied to the build machine's CPU.
+
+**Contributions and reproducible reports are welcome.** For compatibility issues, please include the title, engine version, guest ABI, last working screen or stage, relevant logs, and—if possible—a captured framebuffer image.
 
 Licensed under the [Mozilla Public License 2.0](LICENSE).
 

@@ -15,6 +15,8 @@
 #endif
 
 #include "lunaria_os.h"
+#include "lunaria_file.h"
+#include "lib/inc/log_assert.h"
 #include "luna_boot.h"
 #include <algorithm>
 #include <chrono>
@@ -522,6 +524,7 @@ static int shm_max_prot_for_fd(int fd) {
 }
 
 static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
+    {"__android_log_assert", SVC_LOG_ASSERT},
     {"__android_log_print",  SVC_LOG_PRINT},
     {"__android_log_write",  SVC_LOG_WRITE},
     {"dlopen",               SVC_DLOPEN},
@@ -811,6 +814,9 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"glGetActiveUniform",      SVC_GL_GetActiveUniform},
     {"glBindAttribLocation",    SVC_GL_BindAttribLocation},
     {"glUniform1i",             SVC_GL_Uniform1i},
+    {"glUniform2i",             SVC_GL_Uniform2i},
+    {"glUniform3i",             SVC_GL_Uniform3i},
+    {"glUniform4i",             SVC_GL_Uniform4i},
     {"glUniform1iv",            SVC_GL_Uniform1iv},
     {"glUniform2iv",            SVC_GL_Uniform2iv},
     {"glUniform3iv",            SVC_GL_Uniform3iv},
@@ -1818,6 +1824,7 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"AKeyEvent_getFlags",           SVC_AKEY_FLAGS},
     {"AInputQueue_detachLooper",     SVC_AINPUTQ_DETACH},
     {"ANativeActivity_setWindowFormat", SVC_ANA_SET_WINDOW_FORMAT},
+    {"ANativeActivity_setWindowFlags", SVC_ANA_SET_WINDOW_FLAGS},
     {"_MotionEvent_getAxisValue",    SVC_AMOTION_AXISVALUE},
     {"AMotionEvent_getAxisValue",    SVC_AMOTION_AXISVALUE},
 
@@ -4400,7 +4407,7 @@ static uint64_t g_step_after_mark = 0; /* LUNARIA_STEP_AFTER: halt Run() once cr
 static bool     g_stepa_requested = false;
 
 /* Host FILE* table for ARM fopen/fclose/fread/fwrite/fseek/ftell. A C stream
- * is an object with identity: two threads that each fopen() a file get two
+ * is an object with identity: two threads that each luna_file_fopen() a file get two
  * streams, and one thread's fclose() never turns another thread's stream
  * into someone else's file. A table of 256 slots handed to the guest by
  * index gives neither guarantee for free, so:
@@ -4771,7 +4778,7 @@ static uint32_t register_file(ArmExecCtx &ctx, FILE *f, bool reader = false) {
             ctx.mem.write32(shim + GFILE_GEN, gen);
             ctx.mem.write32(shim + GFILE_FD, (uint32_t)fileno(f));
             /* Readable streams get their guest buffer on the first read, not here:
-             * fopen(3) on a device reads nothing, and a title that opens a file, asks
+             * luna_file_fopen(3) on a device reads nothing, and a title that opens a file, asks
              * one question about it and closes it again (Cross Worlds does so 180,000
              * times during a load) should not pay a full-file read plus a guest
              * allocation per open. */
@@ -4790,7 +4797,7 @@ static uint32_t register_file(ArmExecCtx &ctx, FILE *f, bool reader = false) {
     return idx; /* arm_malloc failed: bare index fallback */
 }
 
-/* Where the fopen(3) calls come from. "fopen is expensive" is never the
+/* Where the luna_file_fopen(3) calls come from. "fopen is expensive" is never the
  * useful statement; "this call site opens this path 40,000 times" is.
  * LUNARIA_FOPEN_PROF=<seconds> prints the top paths and the top return
  * addresses every <seconds>, with the host time split between translating
@@ -5206,7 +5213,7 @@ static const char *synthetic_proc_path(const char *path) {
                 char buf[64];
                 snprintf(buf, sizeof buf, "/tmp/lunaria-proc-zygote-%s-XXXXXX",
                          slot == parent_status ? "status" : "cmdline");
-                int fd = luna_file_mkstemp(buf);
+                int fd = luna_temp_mkstemp(buf, sizeof buf);
                 if (fd >= 0) {
                     if (slot == parent_status) {
                         static const char body[] =
@@ -5310,7 +5317,7 @@ static const char *synthetic_proc_path(const char *path) {
             if (!mountinfo_f[0]) {
                 char buf[64];
                 strcpy(buf, "/tmp/lunaria-proc-mountinfo-XXXXXX");
-                int fd = luna_file_mkstemp(buf);
+                int fd = luna_temp_mkstemp(buf, sizeof buf);
                 if (fd >= 0) {
                     static const char body[] =
                         "20 1 0:20 / / ro,seclabel,relatime - rootfs rootfs ro\n"
@@ -5349,7 +5356,7 @@ static const char *synthetic_proc_path(const char *path) {
                 char buf[64];
                 snprintf(buf, sizeof buf, "/tmp/lunaria-proc-%s-XXXXXX",
                          slash + 1);
-                int fd = luna_file_mkstemp(buf);
+                int fd = luna_temp_mkstemp(buf, sizeof buf);
                 if (fd >= 0) {
                     if (!strcmp(slash, "/cmdline")) {
                         const char *pkg = lunaria_env("ANDROID_PACKAGE_NAME");
@@ -5383,7 +5390,7 @@ static const char *synthetic_proc_path(const char *path) {
                 char buf[64];
                 snprintf(buf, sizeof buf, "/tmp/lunaria-proc-%s-XXXXXX",
                          dom ? "domainname" : "hostname");
-                int fd = luna_file_mkstemp(buf);
+                int fd = luna_temp_mkstemp(buf, sizeof buf);
                 if (fd < 0) return nullptr;
                 const char *v = dom ? "localdomain\n" : "localhost\n";
                 if (luna_fd_write(fd, v, strlen(v)) < 0) { }
@@ -5397,7 +5404,7 @@ static const char *synthetic_proc_path(const char *path) {
             static char uuid_f[64] = "";
             uint8_t b[16];
             bool have = false;
-            if (FILE *ur = fopen("/dev/urandom", "rb")) {
+            if (FILE *ur = luna_file_fopen("/dev/urandom", "rb")) {
                 have = (fread(b, 1, 16, ur) == 16);
                 fclose(ur);
             }
@@ -5405,7 +5412,7 @@ static const char *synthetic_proc_path(const char *path) {
             b[6] = (uint8_t)((b[6] & 0x0f) | 0x40);   /* version 4 */
             b[8] = (uint8_t)((b[8] & 0x3f) | 0x80);   /* variant 1 */
             char buf[64]; strcpy(buf, "/tmp/lunaria-proc-uuid-XXXXXX");
-            int fd = luna_file_mkstemp(buf);
+            int fd = luna_temp_mkstemp(buf, sizeof buf);
             if (fd < 0) return nullptr;
             char u[40];
             snprintf(u, sizeof u,
@@ -5416,7 +5423,7 @@ static const char *synthetic_proc_path(const char *path) {
             if (luna_fd_write(fd, u, strlen(u)) < 0) { /* best effort */ }
             luna_fd_close(fd);
             // Best-effort unlink of the previous one to avoid unbounded temp files.
-            if (uuid_f[0]) unlink(uuid_f);
+            if (uuid_f[0]) luna_file_unlink(uuid_f);
             strncpy(uuid_f, buf, sizeof uuid_f - 1);
             uuid_f[sizeof uuid_f - 1] = '\0';
             return uuid_f;
@@ -5425,7 +5432,7 @@ static const char *synthetic_proc_path(const char *path) {
             static char ver_f[64] = "";
             if (!ver_f[0]) {
                 char buf[64]; strcpy(buf, "/tmp/lunaria-proc-version-XXXXXX");
-                int fd = luna_file_mkstemp(buf);
+                int fd = luna_temp_mkstemp(buf, sizeof buf);
                 if (fd >= 0) {
                     static const char v[] =
                         "Linux version 4.19.0-lunaria (lunaria@host) "
@@ -5442,7 +5449,7 @@ static const char *synthetic_proc_path(const char *path) {
     static char file[64] = "";
     if (!file[0]) {
         char buf[64]; strcpy(buf, "/tmp/lunaria-meminfo-XXXXXX");
-        int fd = luna_file_mkstemp(buf);
+        int fd = luna_temp_mkstemp(buf, sizeof buf);
         if (fd >= 0) {
             char content[512];
             int n = snprintf(content, sizeof content,
@@ -6296,7 +6303,7 @@ static void maps_device_id(const char *host_path, const char *guest_path,
     *maj = 0; *min = 0; *ino = 0;
     if (!guest_path || !*guest_path) return;
     struct stat st;
-    if (host_path && *host_path && stat(host_path, &st) == 0)
+    if (host_path && *host_path && luna_file_stat_follow(host_path, &st) == 0)
         *ino = (unsigned long long)st.st_ino;
     else
         *ino = (unsigned long long)saved_inode;
@@ -6311,7 +6318,7 @@ static void maps_device_id(const char *host_path, const char *guest_path,
 /* Everything /proc/<pid>/maps says about this process, as one number. An
  * anti-tamper library reads the file in a closed loop (Cross Worlds': open,
  * read a few lines, close, open again, for the whole run), and rendering the
- * answer costs a stat(2) per loaded ELF region plus a temporary file, paid
+ * answer costs a luna_file_stat_follow(2) per loaded ELF region plus a temporary file, paid
  * on every open while holding the ARM execution lock (fopen was the largest
  * holder of that lock during the post-title load, 16-18% of the wall clock).
  * A kernel re-renders the file per read because it is reading state that may
@@ -6351,7 +6358,7 @@ static const char *synth_guest_maps(void) {
     static thread_local char file[64] = "";
     /* Re-render only when an input changed -- and, so that a change this
      * process did not make (a backing file deleted underneath a mapping, which
-     * only the stat(2) below can see) still shows up, at least once a second
+     * only the luna_file_stat_follow(2) below can see) still shows up, at least once a second
      * regardless.  See guest_maps_key(). */
     static thread_local uint64_t cached_key = 0;
     static thread_local uint64_t cached_ms  = 0;
@@ -6361,7 +6368,7 @@ static const char *synth_guest_maps(void) {
         return file;
     char buf[64];
     strcpy(buf, "/tmp/lunaria-maps-XXXXXX");
-    int fd = luna_file_mkstemp(buf);
+    int fd = luna_temp_mkstemp(buf, sizeof buf);
     if (fd < 0) return file[0] ? file : nullptr;
     cached_key = key;
     cached_ms  = now_ms;
@@ -6416,7 +6423,7 @@ static const char *synth_guest_maps(void) {
         const char *nm = maps_device_path(r.path.c_str(), dev, sizeof dev);
         char deleted_name[PATH_MAX + 16];
         struct stat backing_st;
-        if (nm && *nm && stat(r.path.c_str(), &backing_st) != 0 && r.backing_inode) {
+        if (nm && *nm && luna_file_stat_follow(r.path.c_str(), &backing_st) != 0 && r.backing_inode) {
             snprintf(deleted_name, sizeof deleted_name, "%s (deleted)", nm);
             nm = deleted_name;
         }
@@ -6548,7 +6555,7 @@ static const char *synth_guest_maps(void) {
         fprintf(stderr, "[maps] tid=%u rendered:\n%s", g_current_tid, out.c_str());
     if (luna_fd_write(fd, out.data(), out.size()) < 0) { /* best effort */ }
     luna_fd_close(fd);
-    if (file[0]) unlink(file);
+    if (file[0]) luna_file_unlink(file);
     strncpy(file, buf, sizeof file - 1);
     file[sizeof file - 1] = '\0';
     return file;
@@ -6614,7 +6621,7 @@ static const char *synth_guest_proc_root(void)
         if (luna_file_temp_directory(directory, sizeof directory) != 0) return nullptr;
         if ((size_t)snprintf(tmpl, sizeof tmpl, "%s/lunaria-proc-root-XXXXXX", directory) >= sizeof tmpl)
             return nullptr;
-        if (!luna_file_mkdtemp(tmpl)) return nullptr;
+        if (!luna_temp_mkdtemp(tmpl, sizeof tmpl)) return nullptr;
         snprintf(root, sizeof root, "%s", tmpl);
     }
 
@@ -6684,7 +6691,7 @@ enum SynthTaskFile { SYNTH_TASK_COMM, SYNTH_TASK_STAT, SYNTH_TASK_STATUS };
  *
  * The bytes are the same whether they end up in a file under the synthetic
  * task directory (for opendir/openat, which need a path) or in a memory
- * stream handed straight to the guest's fopen().  One generator so the two
+ * stream handed straight to the guest's luna_file_fopen().  One generator so the two
  * cannot drift: a reader that opens /proc/<pid>/task/<tid>/status through
  * stdio and the same reader using openat must not see different answers for
  * the same thread at the same moment.
@@ -6793,7 +6800,7 @@ static void synth_guest_task_write_entry(const char *root, uint32_t target_pid,
     for (const auto &e : kFiles) {
         char f[PATH_MAX + 16];
         snprintf(f, sizeof f, "%s/%s", dir, e.name);
-        if (FILE *fp = fopen(f, "w")) {
+        if (FILE *fp = luna_file_fopen(f, "w")) {
             (void)synth_guest_task_emit(fp, target_pid, i, live, e.which);
             fclose(fp);
         }
@@ -6810,9 +6817,9 @@ static void synth_guest_task_refresh(const char *root, uint32_t target_pid) {
             char victim[PATH_MAX];
             snprintf(victim, sizeof victim, "%s/%s", root, e->d_name);
             char f[PATH_MAX + 16];
-            snprintf(f, sizeof f, "%s/stat", victim);   unlink(f);
-            snprintf(f, sizeof f, "%s/comm", victim);   unlink(f);
-            snprintf(f, sizeof f, "%s/status", victim); unlink(f);
+            snprintf(f, sizeof f, "%s/stat", victim);   luna_file_unlink(f);
+            snprintf(f, sizeof f, "%s/comm", victim);   luna_file_unlink(f);
+            snprintf(f, sizeof f, "%s/status", victim); luna_file_unlink(f);
             rmdir(victim);
         }
         luna_directory_close(d);
@@ -6836,12 +6843,12 @@ static const char *synth_guest_task_dir(uint32_t pid, const char *tail) {
         char directory[4096], tmpl[4096];
         if (luna_file_temp_directory(directory, sizeof directory) != 0 ||
             (size_t)snprintf(tmpl, sizeof tmpl, "%s/lunaria-proc-task-XXXXXX", directory) >= sizeof tmpl ||
-            !luna_file_mkdtemp(tmpl)) { roots.erase(pid); return nullptr; }
+            !luna_temp_mkdtemp(tmpl, sizeof tmpl)) { roots.erase(pid); return nullptr; }
         root = tmpl;
     }
     /* Path mapping is called concurrently by guest pthreads.  A process-wide
      * scratch buffer lets one thread replace another thread's /proc path
-     * between synthetic_proc_path() and fopen(), which cannot happen in the
+     * between synthetic_proc_path() and luna_file_fopen(), which cannot happen in the
      * kernel pathname lookup.  Keep only the returned spelling thread-local;
      * the per-process task snapshot itself remains shared. */
     static thread_local char out[PATH_MAX];
@@ -6898,9 +6905,9 @@ static const char *synth_guest_task_dir(uint32_t pid, const char *tail) {
         char stale[PATH_MAX];
         char leaf[PATH_MAX + 16];
         snprintf(stale, sizeof stale, "%s/%u", root.c_str(), want_tid);
-        snprintf(leaf, sizeof leaf, "%s/stat", stale);   unlink(leaf);
-        snprintf(leaf, sizeof leaf, "%s/comm", stale);   unlink(leaf);
-        snprintf(leaf, sizeof leaf, "%s/status", stale); unlink(leaf);
+        snprintf(leaf, sizeof leaf, "%s/stat", stale);   luna_file_unlink(leaf);
+        snprintf(leaf, sizeof leaf, "%s/comm", stale);   luna_file_unlink(leaf);
+        snprintf(leaf, sizeof leaf, "%s/status", stale); luna_file_unlink(leaf);
         rmdir(stale);
         return nullptr;
     }
@@ -6922,7 +6929,7 @@ static unsigned guest_live_threads(void) {
  * procfs has no backing store: the kernel formats the answer while the
  * caller is inside open(2), in the caller's own context, and nothing is
  * written anywhere. Serving these through the synthetic task directory meant
- * every guest fopen() of one thread's status first created a directory and
+ * every guest luna_file_fopen() of one thread's status first created a directory and
  * wrote three host files (comm, stat, status), all while holding the ARM
  * execution lock. Cross Worlds' security module polls
  * /proc/<pid>/task/<tid>/status for every thread in the process,
@@ -7159,7 +7166,7 @@ static void guest_vm_pages(unsigned long long *vsize_pages,
                            unsigned long long *rss_pages) {
     *vsize_pages = 0;
     *rss_pages = 0;
-    if (FILE *f = fopen("/proc/self/statm", "r")) {
+    if (FILE *f = luna_file_fopen("/proc/self/statm", "r")) {
         if (fscanf(f, "%llu %llu", vsize_pages, rss_pages) != 2) {
             *vsize_pages = 0;
             *rss_pages = 0;
@@ -7186,14 +7193,14 @@ static const char *synth_guest_stat(void) {
     static thread_local char file[64] = "";
     if (!file[0]) {
         char buf[64]; strcpy(buf, "/tmp/lunaria-stat-XXXXXX");
-        int fd = luna_file_mkstemp(buf);
+        int fd = luna_temp_mkstemp(buf, sizeof buf);
         if (fd < 0) return nullptr;
         luna_fd_close(fd);
         snprintf(file, sizeof file, "%s", buf);
     }
     /* Rewritten on every open, never cached: the CPU time and the thread
      * count are the two things a reader opens this file twice to compare. */
-    FILE *fp = fopen(file, "w");
+    FILE *fp = luna_file_fopen(file, "w");
     if (!fp) return nullptr;
     const unsigned long long stack_top = g_guest_proc_arm64
         ? (unsigned long long)a64_guest_va(STACK_BASE + STACK_SIZE)
@@ -7355,12 +7362,12 @@ static const char *synth_guest_status(void) {
     static thread_local char file[64] = "";
     if (!file[0]) {
         char buf[64]; strcpy(buf, "/tmp/lunaria-proc-status-XXXXXX");
-        int fd = luna_file_mkstemp(buf);
+        int fd = luna_temp_mkstemp(buf, sizeof buf);
         if (fd < 0) return nullptr;
         luna_fd_close(fd);
         snprintf(file, sizeof file, "%s", buf);
     }
-    FILE *fp = fopen(file, "w");
+    FILE *fp = luna_file_fopen(file, "w");
     if (!fp) return nullptr;
     /* Uid is in the 10000+ range an installed app has, which is what getuid()
      * says; a process cannot disagree with itself about who it is. */
@@ -10811,10 +10818,73 @@ static void cb_drain_inval_self(void) {
 }
 /* This thread's A64 callback JIT at `depth`, or null. */
 
-/* Host zlib streams keyed by guest z_stream VA.  A64 z_stream lives on the
- * 64-bit heap, so a 32-bit key aliases unrelated streams onto each other. */
+/* Host zlib streams keyed by their opaque guest state handles. */
 static std::map<GuestVA, z_stream*> *g_zstreams = nullptr;  /* inflate */
 static std::map<GuestVA, z_stream*> *g_dstreams = nullptr;  /* deflate */
+
+/* Public z_stream output fields must describe the same stream as host zlib.
+ * In particular Reset resets the totals immediately, before the next inflate:
+ * minizip uses total_out to decide whether a seek needs another read. */
+static void zstream_publish_stats(ArmExecCtx &ctx, GuestVA address,
+                                  const z_stream *stream) {
+    if (ctx.is_arm64) {
+        ctx.mem.write64(address + 16, stream->total_in);
+        ctx.mem.write64(address + 40, stream->total_out);
+        ctx.mem.write32(address + 88, (uint32_t)stream->data_type);
+        ctx.mem.write64(address + 96, stream->adler);
+    } else {
+        ctx.mem.write32(address + 8, (uint32_t)stream->total_in);
+        ctx.mem.write32(address + 20, (uint32_t)stream->total_out);
+        ctx.mem.write32(address + 44, (uint32_t)stream->data_type);
+        ctx.mem.write32(address + 48, (uint32_t)stream->adler);
+    }
+}
+
+/* The counters are public fields, not host-only state. Callers such as ZIP
+ * readers zero total_out between reads to count the bytes in that read. */
+static void zstream_import_totals(ArmExecCtx &ctx, GuestVA address,
+                                  z_stream *stream) {
+    const uLong input = ctx.is_arm64 ? ctx.mem.read64(address + 16)
+                                    : ctx.mem.read32(address + 8);
+    const uLong output = ctx.is_arm64 ? ctx.mem.read64(address + 40)
+                                     : ctx.mem.read32(address + 20);
+    if (lunaria_env("LUNARIA_TRACE_READ") &&
+        (input != stream->total_in || output != stream->total_out)) {
+        static unsigned reports = 0;
+        if (reports++ < 16)
+            fprintf(stderr, "[zstream] counters changed by guest @%llx: "
+                    "in %lu->%lu out %lu->%lu\n", (unsigned long long)address,
+                    stream->total_in, input, stream->total_out, output);
+    }
+    stream->total_in = input;
+    stream->total_out = output;
+}
+
+/* z_stream.state is an opaque library-owned guest handle. The table follows
+ * that handle rather than the address of the caller's public struct. */
+static GuestVA zstream_handle(ArmExecCtx &ctx, GuestVA address) {
+    if (!address) return 0;
+    return ctx.is_arm64 ? ctx.mem.read64(address + 56)
+                       : ctx.mem.read32(address + 28);
+}
+static int zstream_register(ArmExecCtx &ctx, GuestVA address, z_stream *stream,
+                            std::map<GuestVA, z_stream*> *table,
+                            int (*end)(z_stream *)) {
+    uint32_t token = address ? arm_malloc(ctx, 4) : 0;
+    if (!token) { end(stream); delete stream; return address ? Z_MEM_ERROR : Z_STREAM_ERROR; }
+    ctx.mem.write32(token, 0);
+    const GuestVA handle = ctx.is_arm64 ? a64_guest_va(token) : token;
+    (*table)[handle] = stream;
+    if (ctx.is_arm64) { ctx.mem.write64(address + 56, handle); ctx.mem.write64(address + 48, 0); }
+    else { ctx.mem.write32(address + 28, token); ctx.mem.write32(address + 24, 0); }
+    zstream_publish_stats(ctx, address, stream);
+    return Z_OK;
+}
+static void zstream_release(ArmExecCtx &ctx, GuestVA address, GuestVA handle) {
+    if (ctx.is_arm64) ctx.mem.write64(address + 56, 0);
+    else ctx.mem.write32(address + 28, 0);
+    arm_free(ctx, (uint32_t)handle);
+}
 
 // EGL / GLFW state for ARM guest rendering.
 static GLFWwindow *g_glfw     = nullptr;
@@ -11097,7 +11167,7 @@ static int dump_framebuffer_ppm(const char *path_hint, char *path_out, size_t pa
         static uint32_t shot_n = 0;
         snprintf(path, sizeof path, "%s/lunaria_%04u.png", dir, shot_n++);
     }
-    FILE *fp = fopen(path, "wb");
+    FILE *fp = luna_file_fopen(path, "wb");
     if (!fp) return 0;
     const size_t plen = strlen(path);
     const bool as_png = plen > 4 && !strcmp(path + plen - 4, ".png");
@@ -11218,9 +11288,9 @@ static void maybe_dump_screenshot(uint64_t swap_index, bool from_swap) {
     if (!want) {
         const char *trig = lunaria_env("LUNARIA_SHOT_TRIGGER");
         if (!trig || !trig[0]) trig = "/tmp/lunaria-shot";
-        if (access(trig, F_OK) == 0) {
+        if (luna_file_access(trig, F_OK) == 0) {
             want = true;
-            unlink(trig);
+            luna_file_unlink(trig);
         }
     }
 
@@ -14179,7 +14249,7 @@ static void gl_dump_textures(uint64_t swap_index) {
         }
         char path[512];
         snprintf(path, sizeof path, "%s/lunaria_tex%03u_%dx%d.ppm", dir, tex, w, h);
-        if (FILE *fp = fopen(path, "wb")) {
+        if (FILE *fp = luna_file_fopen(path, "wb")) {
             fprintf(fp, "P6\n%d %d\n255\n", w, h);
             for (int y = h - 1; y >= 0; --y)
                 for (int x = 0; x < w; ++x)
@@ -14266,8 +14336,15 @@ static bool gl_trace_draw_window(GLint *fbo_out) {
     static long want_w = 0, want_h = 0;
     static uint64_t lo = 0, hi = 0;
     static bool init = false;
+    static bool enabled = false;
     if (!init) {
         init = true;
+        const char *options[] = { "LUNARIA_TRACE_FBO", "LUNARIA_TRACE_SWAP_LO",
+            "LUNARIA_TRACE_SWAP_HI", "LUNARIA_TRACE_DRAWS", "LUNARIA_TRACE_GLDRAW" };
+        for (unsigned i = 0; i < sizeof options / sizeof options[0]; ++i) {
+            const char *value = lunaria_env(options[i]);
+            if (value && *value) enabled = true;
+        }
         const char *e = lunaria_env("LUNARIA_TRACE_FBO");
         if (e && *e) {
             long a = 0, b = 0;
@@ -14279,7 +14356,7 @@ static bool gl_trace_draw_window(GLint *fbo_out) {
         e = lunaria_env("LUNARIA_TRACE_SWAP_HI");
         hi = e ? strtoull(e, nullptr, 0) : 3;
     }
-    if (g_guest_egl_swap_count < lo || g_guest_egl_swap_count > hi) return false;
+    if (!enabled || g_guest_egl_swap_count < lo || g_guest_egl_swap_count > hi) return false;
     GLint fbo = -1;
     pfn_glGetIntegerv(0x8CA6, &fbo);
     if (want_w) {
@@ -17274,7 +17351,7 @@ static void arsc_ensure_loaded() {
     if (dir && *dir) {
         char path[PATH_MAX];
         snprintf(path, sizeof path, "%s/resources.arsc", dir);
-        FILE *fp = fopen(path, "rb");
+        FILE *fp = luna_file_fopen(path, "rb");
         if (fp) {
             fseek(fp, 0, SEEK_END);
             long sz = ftell(fp);
@@ -17807,6 +17884,14 @@ extern "C" int arm_exec_apk_resource_span(uint32_t id, size_t index,
 }
 
 struct arsc_bag_item { uint32_t key, data; uint8_t type; };
+extern "C" int arm_exec_apk_resource_is_bag(uint32_t id)
+{
+    arsc_ensure_loaded();
+    struct arsc_bag_view bag;
+    return arsc_find_bag(g_arsc.data(), g_arsc.size(), id,
+                         arsc_device_orientation(), arsc_config_score, &bag);
+}
+
 static int arsc_bag_item_compare(const void *a, const void *b)
 {
     uint32_t x=((const struct arsc_bag_item *)a)->key;
@@ -17949,7 +18034,7 @@ static void apk_meta_ensure_loaded() {
     std::vector<uint8_t> buf;
     auto try_file = [&](const char *path) -> bool {
         if (!path || !*path) return false;
-        FILE *fp = fopen(path, "rb");
+        FILE *fp = luna_file_fopen(path, "rb");
         if (!fp) return false;
         fseek(fp, 0, SEEK_END);
         long sz = ftell(fp);
@@ -17968,7 +18053,7 @@ static void apk_meta_ensure_loaded() {
     }
     if (!got && apk && *apk) {
         // Zip local-file fallback: scan for AndroidManifest.xml entry.
-        FILE *fp = fopen(apk, "rb");
+        FILE *fp = luna_file_fopen(apk, "rb");
         if (fp) {
             fseek(fp, 0, SEEK_END);
             long fsz = ftell(fp);
@@ -18242,7 +18327,7 @@ static void window_take_app_identity(GLFWwindow *win)
     std::vector<uint8_t> file;
     if (const char *dir = lunaria_env("ANDROID_PACKAGE_CODE_PATH")) {
         std::string p = std::string(dir) + "/" + path;
-        if (FILE *fp = fopen(p.c_str(), "rb")) {
+        if (FILE *fp = luna_file_fopen(p.c_str(), "rb")) {
             uint8_t chunk[65536];
             size_t got;
             while ((got = fread(chunk, 1, sizeof chunk, fp)) > 0)
@@ -18421,7 +18506,7 @@ static bool apk_open() {
     if (!path) { fprintf(stderr, "[asset] ANDROID_PACKAGE_CODE_PATH unset\n"); return false; }
     // Directory mode: the APK was already unzipped to <path>/.
     struct stat sb;
-    if (stat(path, &sb) == 0 && S_ISDIR(sb.st_mode)) {
+    if (luna_file_stat_follow(path, &sb) == 0 && S_ISDIR(sb.st_mode)) {
         g_apk_dir = path;
         fprintf(stderr, "[asset] APK code path is a directory: %s (disk mode)\n", path);
         // The launcher intentionally extracts only startup-critical files.
@@ -18429,7 +18514,7 @@ static bool apk_open() {
         if (!apk || !*apk) return true;
         path = apk;
     }
-    if (!(g_fp = fopen(path, "rb"))) {
+    if (!(g_fp = luna_file_fopen(path, "rb"))) {
         fprintf(stderr, "[asset] cannot open APK %s\n", path);
         return !g_apk_dir.empty();
     }
@@ -18525,8 +18610,8 @@ static bool apk_read(const std::string &name, std::vector<uint8_t> &out) {
     if (!g_apk_dir.empty()) {
         std::string fp = g_apk_dir + "/" + name;
         struct stat sb;
-        if (stat(fp.c_str(), &sb) == 0 && S_ISREG(sb.st_mode)) {
-            FILE *f = fopen(fp.c_str(), "rb");
+        if (luna_file_stat_follow(fp.c_str(), &sb) == 0 && S_ISREG(sb.st_mode)) {
+            FILE *f = luna_file_fopen(fp.c_str(), "rb");
             if (!f) return false;
             fseek(f, 0, SEEK_END);
             long sz = ftell(f);
@@ -18573,7 +18658,7 @@ static bool apk_is_dir(const std::string &name) {
     if (!g_apk_dir.empty()) {
         struct stat sb;
         std::string fp = g_apk_dir + "/" + name;
-        return stat(fp.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode);
+        return luna_file_stat_follow(fp.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode);
     }
     std::string pfx = name;
     if (pfx.back() != '/') pfx.push_back('/');
@@ -18594,7 +18679,7 @@ static void apk_list_dir(const std::string &name,
             if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
             struct stat sb;
             std::string fp = dp + "/" + de->d_name;
-            bool is_dir = (stat(fp.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode));
+            bool is_dir = (luna_file_stat_follow(fp.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode));
             out.emplace_back(de->d_name, is_dir);
         }
         luna_directory_close(d);
@@ -18691,7 +18776,7 @@ static bool obb_open() {
     g_obb_tried = true;
     const char *path = lunaria_env("ANDROID_OBB_MAIN");
     if (!path || !*path) return false;
-    if (!(g_obb_fp = fopen(path, "rb"))) {
+    if (!(g_obb_fp = luna_file_fopen(path, "rb"))) {
         fprintf(stderr, "[asset] cannot open OBB %s\n", path);
         return false;
     }
@@ -18713,7 +18798,7 @@ static bool obb_read(const std::string &name, std::vector<uint8_t> &out) {
 
 static bool host_regular_stat(const std::string &fp, uint64_t &len_out) {
     struct stat sb;
-    if (stat(fp.c_str(), &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_size < 0)
+    if (luna_file_stat_follow(fp.c_str(), &sb) != 0 || !S_ISREG(sb.st_mode) || sb.st_size < 0)
         return false;
     len_out = (uint64_t)sb.st_size;
     return true;
@@ -18721,8 +18806,8 @@ static bool host_regular_stat(const std::string &fp, uint64_t &len_out) {
 
 static bool read_host_regular(const std::string &fp, std::vector<uint8_t> &out) {
     struct stat sb;
-    if (stat(fp.c_str(), &sb) != 0 || !S_ISREG(sb.st_mode)) return false;
-    FILE *f = fopen(fp.c_str(), "rb");
+    if (luna_file_stat_follow(fp.c_str(), &sb) != 0 || !S_ISREG(sb.st_mode)) return false;
+    FILE *f = luna_file_fopen(fp.c_str(), "rb");
     if (!f) return false;
     if (sb.st_size < 0) { fclose(f); return false; }
     out.resize((size_t)sb.st_size);
@@ -18762,7 +18847,7 @@ static void files_roots_scan(void)
                 snprintf(nested, sizeof nested, "%s/%s/%s",
                          ue, de->d_name, de->d_name);
                 struct stat sb;
-                if (stat(nested, &sb) == 0 && S_ISDIR(sb.st_mode) &&
+                if (luna_file_stat_follow(nested, &sb) == 0 && S_ISDIR(sb.st_mode) &&
                     g_files_nroots < 8) {
                     snprintf(g_files_roots[g_files_nroots], PATH_MAX, "%s", nested);
                     ++g_files_nroots;
@@ -18840,7 +18925,7 @@ extern "C" const char *arm_exec_apk_entry_path(const char *name) {
     static std::string path;
     path = asset_bridge::g_apk_dir + "/" + name;
     struct stat sb;
-    if (stat(path.c_str(), &sb) != 0 || !S_ISREG(sb.st_mode)) return nullptr;
+    if (luna_file_stat_follow(path.c_str(), &sb) != 0 || !S_ISREG(sb.st_mode)) return nullptr;
     return path.c_str();
 }
 
@@ -19001,7 +19086,7 @@ static bool apk_concat_splits_to_cache(const std::string &base_inner,
         if (!asset_bridge::g_apk_dir.empty()) {
             std::string fp0 = asset_bridge::g_apk_dir + "/" + part0;
             struct stat sb;
-            if (stat(fp0.c_str(), &sb) == 0 && S_ISREG(sb.st_mode))
+            if (luna_file_stat_follow(fp0.c_str(), &sb) == 0 && S_ISREG(sb.st_mode))
                 have0 = true;
         } else {
             have0 = asset_bridge::apk_read(part0, first);
@@ -19021,7 +19106,7 @@ static bool apk_concat_splits_to_cache(const std::string &base_inner,
             if (!asset_bridge::g_apk_dir.empty()) {
                 std::string fp = asset_bridge::g_apk_dir + "/" + part;
                 struct stat sb;
-                if (stat(fp.c_str(), &sb) != 0 || !S_ISREG(sb.st_mode)) break;
+                if (luna_file_stat_follow(fp.c_str(), &sb) != 0 || !S_ISREG(sb.st_mode)) break;
                 total += (uint64_t)sb.st_size;
                 parts.push_back(std::move(fp));
             } else {
@@ -19035,19 +19120,19 @@ static bool apk_concat_splits_to_cache(const std::string &base_inner,
         if (parts.empty()) continue;
 
         struct stat st;
-        if (stat(out, &st) == 0 && (uint64_t)st.st_size == total && S_ISREG(st.st_mode))
+        if (luna_file_stat_follow(out, &st) == 0 && (uint64_t)st.st_size == total && S_ISREG(st.st_mode))
             return true;
 
         luna_file_mkdir(cache_root, 0755);
         for (char *p = out + sizeof(cache_root); *p; ++p)
             if (*p == '/') { *p = '\0'; luna_file_mkdir(out, 0755); *p = '/'; }
 
-        FILE *wf = fopen(out, "wb");
+        FILE *wf = luna_file_fopen(out, "wb");
         if (!wf) return false;
         bool ok = true;
         if (!asset_bridge::g_apk_dir.empty()) {
             for (const auto &fp : parts) {
-                FILE *rf = fopen(fp.c_str(), "rb");
+                FILE *rf = luna_file_fopen(fp.c_str(), "rb");
                 if (!rf) { ok = false; break; }
                 char buf[1 << 16];
                 size_t n;
@@ -19067,7 +19152,7 @@ static bool apk_concat_splits_to_cache(const std::string &base_inner,
             }
         }
         fclose(wf);
-        if (!ok) { unlink(out); return false; }
+        if (!ok) { luna_file_unlink(out); return false; }
         fprintf(stderr, "[asset] concatenated %zu splits -> %s (%llu bytes)\n",
                 parts.size(), out, (unsigned long long)total);
         return true;
@@ -19090,7 +19175,7 @@ static bool apk_extract_to_cache(const char *path, char *out, size_t outsz) {
             std::string fp = asset_bridge::g_apk_dir + "/" +
                              std::string(cache_prefixes[pi]) + inner;
             struct stat sb;
-            if (stat(fp.c_str(), &sb) == 0 && S_ISREG(sb.st_mode)) {
+            if (luna_file_stat_follow(fp.c_str(), &sb) == 0 && S_ISREG(sb.st_mode)) {
                 if ((size_t)snprintf(out, outsz, "%s", fp.c_str()) < outsz)
                     return true;
             }
@@ -19113,16 +19198,16 @@ static bool apk_extract_to_cache(const char *path, char *out, size_t outsz) {
         return false;
     // reuse cache if already populated
     struct stat st;
-    if (stat(out, &st) == 0 && (uint64_t)st.st_size == data.size()) return true;
+    if (luna_file_stat_follow(out, &st) == 0 && (uint64_t)st.st_size == data.size()) return true;
     // mkdir -p
     luna_file_mkdir(cache_root, 0755);
     for (char *p = out + sizeof(cache_root); *p; ++p)
         if (*p == '/') { *p = '\0'; luna_file_mkdir(out, 0755); *p = '/'; }
-    FILE *f = fopen(out, "wb");
+    FILE *f = luna_file_fopen(out, "wb");
     if (!f) return false;
     size_t n = fwrite(data.data(), 1, data.size(), f);
     fclose(f);
-    if (n != data.size()) { unlink(out); return false; }
+    if (n != data.size()) { luna_file_unlink(out); return false; }
     fprintf(stderr, "[asset] extracted %s (%zu bytes) -> %s\n", inner, data.size(), out);
     return true;
 }
@@ -19157,7 +19242,7 @@ static bool apk_path_list_dir(const char *path,
  *
  * A package entry is named in the package namespace, not on any filesystem
  * this machine has: "<apk>/assets/…", "jar:…!/assets/…", and the bare
- * "assets/…" spelling Unity's own file layer hands straight to stat()/open()
+ * "assets/…" spelling Unity's own file layer hands straight to luna_file_stat_follow()/open()
  * when its mount lookup falls through to posix.  None of those is a host path
  * and none of them is the guest's own tree either.
  *
@@ -19179,7 +19264,7 @@ static int apk_path_locate(const char *path, char *buf, size_t bufsz,
         if (!asset_bridge::g_apk_dir.empty()) {
             std::string fp = asset_bridge::g_apk_dir + "/" + full;
             struct stat sb;
-            if (stat(fp.c_str(), &sb) == 0) {
+            if (luna_file_stat_follow(fp.c_str(), &sb) == 0) {
                 if ((size_t)snprintf(buf, bufsz, "%s", fp.c_str()) >= bufsz)
                     return 0;
                 if (host) *host = buf;
@@ -19204,8 +19289,9 @@ static const char *guest_sys_cpu_file(const char *tag, const char *content) {
     else if (strcmp(tag, "freq") == 0) slot = freq;
     else return nullptr;
     if (!slot[0]) {
-        snprintf(slot, 64, "/tmp/lunaria-syscpu-%s", tag);
-        if (FILE *f = fopen(slot, "w")) {
+        char name[32]; snprintf(name, sizeof name, "syscpu-%s", tag);
+        if (luna_temp_path(slot, 64, name)) return nullptr;
+        if (FILE *f = luna_file_fopen(slot, "w")) {
             fputs(content, f);
             fclose(f);
         }
@@ -19233,14 +19319,14 @@ static const char *guest_android_cacerts_dir(void) {
         nullptr
     };
     FILE *src = nullptr;
-    for (int i = 0; bundles[i] && !src; ++i) src = fopen(bundles[i], "rb");
+    for (int i = 0; bundles[i] && !src; ++i) src = luna_file_fopen(bundles[i], "rb");
     if (!src) {
         fprintf(stderr, "[cacerts] no host CA bundle found — guest TLS will "
                         "fail certificate verification\n");
         return nullptr;
     }
 
-    snprintf(root, sizeof root, "/tmp/lunaria-cacerts");
+    if (luna_temp_path(root, sizeof root, "cacerts")) { fclose(src); return nullptr; }
     luna_file_mkdir(root, 0755);
 
     char line[512];
@@ -19250,7 +19336,7 @@ static const char *guest_android_cacerts_dir(void) {
         if (!out && strncmp(line, "-----BEGIN CERTIFICATE-----", 27) == 0) {
             char p[128];
             snprintf(p, sizeof p, "%s/%d.0", root, n);
-            out = fopen(p, "wb");
+            out = luna_file_fopen(p, "wb");
             if (!out) break;
             ++n;
         }
@@ -19276,7 +19362,7 @@ static const char *guest_android_cacerts_dir(void) {
  * which is a correctness hole with the host filesystem on the other side of
  * it (the game's patcher installs a staged directory by renaming it into
  * place, and with its root resolving to "" the emulator would run
- * rename("/etc", "/etc_temp") against the host's /etc; reads would be wrong
+ * luna_file_rename("/etc", "/etc_temp") against the host's /etc; reads would be wrong
  * in the same way).
  * So the Android roots resolve inside the guest. The ones lunaria-apk.sh
  * actually stages point at their staging directory; the rest resolve under a
@@ -19398,6 +19484,7 @@ static void guest_path_normalize(char *p) {
 }
 
 static const char *map_guest_path(const char *path, char *buf, size_t bufsz);
+static const char *map_guest_path_raw(const char *path, char *buf, size_t bufsz);
 
 /* statfs::f_type, the magic number for the filesystem behind a guest path.
  * statvfs(3), which is what this emulator asks the host, has no field for
@@ -19452,7 +19539,7 @@ static void guest_abs_path(const char *path, char *out, size_t outsz) {
     guest_path_normalize(out);
 }
 
-static const char *map_guest_path(const char *path, char *buf, size_t bufsz) {
+static const char *map_guest_path_raw(const char *path, char *buf, size_t bufsz) {
     if (!path) return path;
     /* An entry of the installed package comes first, because both rewrites below
      * are wrong for it: resolving "assets/bin/Data/Managed" against the guest
@@ -19550,7 +19637,7 @@ static const char *map_guest_path(const char *path, char *buf, size_t bufsz) {
         char abs[PATH_MAX];
         guest_abs_path(path, abs, sizeof abs);
         char inner[PATH_MAX];
-        const char *m = map_guest_path(abs, inner, sizeof inner);
+        const char *m = map_guest_path_raw(abs, inner, sizeof inner);
         snprintf(buf, bufsz, "%s", m ? m : abs);
         return buf;
     }
@@ -19594,9 +19681,10 @@ static const char *map_guest_path(const char *path, char *buf, size_t bufsz) {
         static const char *synth32 = nullptr, *synth64 = nullptr;
         const char **pp = arm64 ? &synth64 : &synth32;
         if (!*pp) {
-            const char *p = arm64 ? "/tmp/lunaria-proc-cpuinfo64"
-                                  : "/tmp/lunaria-proc-cpuinfo";
-            if (FILE *f = fopen(p, "w")) {
+            static char cpu32[64], cpu64[64];
+            char *p = arm64 ? cpu64 : cpu32;
+            if (luna_temp_path(p, 64, arm64 ? "proc-cpuinfo64" : "proc-cpuinfo")) return nullptr;
+            if (FILE *f = luna_file_fopen(p, "w")) {
                 if (arm64) {
                     const char *platform =
                         lunaria_android_property("ro.board.platform");
@@ -19785,6 +19873,41 @@ extern "C" void arm_exec_note_destructive(const char *what, const char *host_pat
                     dest ? " -> " : "", dest ? dest : "");
         return;
     }
+}
+
+static const char *unmap_guest_file(const char *path,char *buf,size_t capacity)
+{
+    const char *pkg=lunaria_env("ANDROID_PACKAGE_NAME");if (!pkg || !*pkg) pkg="com.lunaria.app";
+    const char *external=lunaria_env("ANDROID_EXTERNAL_FILES_DIR");
+    const char *extcache=lunaria_env("ANDROID_EXTERNAL_CACHE_DIR");
+    const char *obb=lunaria_env("ANDROID_EXTERNAL_OBB_DIR");
+    const char *app=guest_app_data_dir();
+    const char *roots[]={external,extcache,obb,app,guest_root_dir()};
+    for (unsigned i=0;i<5;++i) {
+        const char *root=roots[i];if (!root || !*root || !path_under(path,root,strlen(root))) continue;
+        const char *tail=path+strlen(root);int n;
+        if (i<2) n=snprintf(buf,capacity,"/storage/emulated/0/Android/data/%s/%s%s",pkg,i==0 ? "files" : "cache",tail);
+        else if (i==2) n=snprintf(buf,capacity,"/storage/emulated/0/Android/obb/%s%s",pkg,tail);
+        else if (i==3) n=snprintf(buf,capacity,"/data/data/%s%s",pkg,tail);
+        else n=snprintf(buf,capacity,"%s",*tail ? tail : "/");
+        if (n<0 || (size_t)n>=capacity) {errno=ENAMETOOLONG;return nullptr;}
+        return buf;
+    }
+    return path;
+}
+
+static const char *map_guest_path(const char *path,char *buf,size_t capacity)
+{
+    static const bool registered=[] {luna_symlink_set_mapper(map_guest_path,unmap_guest_file);return true;}();
+    (void)registered;
+    if (!path || !*path || path_is_host_staging(path)) return map_guest_path_raw(path,buf,capacity);
+    char apk_host[PATH_MAX];const char *apk_inner=nullptr;
+    if (apk_path_locate(path,apk_host,sizeof apk_host,&apk_inner)) return map_guest_path_raw(path,buf,capacity);
+    char absolute[PATH_MAX],resolved[PATH_MAX];
+    if (path[0]=='/') snprintf(absolute,sizeof absolute,"%s",path);
+    else snprintf(absolute,sizeof absolute,"%s/%s",g_guest_cwd.load(std::memory_order_acquire),path);
+    if (luna_symlink_namespace(absolute,resolved,sizeof resolved,map_guest_path_raw)) return nullptr;
+    return map_guest_path_raw(resolved,buf,capacity);
 }
 
 extern "C" const char *arm_exec_map_guest_path(const char *path, char *buf,
@@ -20112,7 +20235,7 @@ static int device_run_command(const std::vector<std::string> &words,
         char hostbuf[PATH_MAX];
         const char *host = map_guest_path(argv[0], hostbuf, sizeof hostbuf);
         struct stat st {};
-        if (host && stat(host, &st) == 0 && S_ISREG(st.st_mode)) {
+        if (host && luna_file_stat_follow(host, &st) == 0 && S_ISREG(st.st_mode)) {
             uint32_t child = 0;
             if (guest_program_spawn(words, g_current_tid, &child) == 0) {
                 /* `prog &`: the shell reports the job and returns.  A daemon
@@ -20390,7 +20513,7 @@ static int guest_open_path(const char *path, int flags, mode_t mode) {
 #else
         char tmpl[] = "/tmp/lunaria-mono-config-XXXXXX";
         fd = luna_file_mkstemp(tmpl);
-        if (fd >= 0) unlink(tmpl);
+        if (fd >= 0) luna_file_unlink(tmpl);
 #endif
     }
     if (path && strstr(path, "Managed") && (strstr(path, ".dll") || strstr(path, ".config")))
@@ -20761,12 +20884,12 @@ extern "C" unsigned char *arm_exec_zip_read(const char *archive,
         char mapped[PATH_MAX];
         const char *host = map_guest_path(archive, mapped, sizeof mapped);
         struct stat sb;
-        if (stat(host, &sb) != 0) return nullptr;
+        if (luna_file_stat_follow(host, &sb) != 0) return nullptr;
         if (S_ISDIR(sb.st_mode)) {
             std::string path = std::string(host) + "/" + name;
             if (!asset_bridge::read_host_regular(path, data)) return nullptr;
         } else {
-            FILE *fp = fopen(host, "rb");
+            FILE *fp = luna_file_fopen(host, "rb");
             if (!fp) return nullptr;
             std::map<std::string, asset_bridge::ZipEntry> dir;
             bool ok = asset_bridge::zip_index_file(fp, dir);
@@ -22436,7 +22559,7 @@ static std::string unix_socket_dir() {
     std::string path = base + dir;
     if (path.size() + 18 >= sizeof(((struct sockaddr_un *)0)->sun_path))
         path = std::string("/tmp") + dir;
-    mkdir(path.c_str(), 0700);
+    luna_file_mkdir(path.c_str(), 0700);
     return path;
 }
 static void map_unix_socket_path(struct sockaddr_storage &ss, socklen_t &alen) {
@@ -22475,13 +22598,13 @@ static void clear_stale_unix_socket(const struct sockaddr_storage &ss, socklen_t
     if (ss.ss_family != AF_UNIX) return;
     const auto &un = *(const struct sockaddr_un *)&ss;
     struct stat st;
-    if (stat(un.sun_path, &st) != 0 || !S_ISSOCK(st.st_mode)) return;
+    if (luna_file_stat_follow(un.sun_path, &st) != 0 || !S_ISSOCK(st.st_mode)) return;
     const int probe = socket(AF_UNIX, SOCK_STREAM, 0);
     if (probe < 0) return;
     const int rc = connect(probe, (const struct sockaddr *)&ss, alen);
     const int err = errno;
     close(probe);
-    if (rc != 0 && err == ECONNREFUSED) unlink(un.sun_path);
+    if (rc != 0 && err == ECONNREFUSED) luna_file_unlink(un.sun_path);
 }
 
 /* Marshal a Darwin sockaddr back to the Linux/Android wire layout.  Darwin
@@ -22993,7 +23116,7 @@ static void fd_wait_free_epoll(void *vp) { delete static_cast<FdWaitEpollCtx *>(
 struct FdWaitReadCtx { int fd; };
 static int fd_wait_read_ready(void *vp) {
     auto *c = static_cast<FdWaitReadCtx *>(vp);
-    struct pollfd p = { c->fd, POLLIN, 0 };
+    struct pollfd p = luna_pollfd_make(c->fd, POLLIN);
     if (luna_socket_poll(&p, 1, 0) > 0) return 1;
     // See fd_wait_poll_ready and SockState::sync_connect_failed just above.
     const SockState *s = state(c->fd);
@@ -23006,7 +23129,7 @@ static void fd_wait_free_read(void *vp) { delete static_cast<FdWaitReadCtx *>(vp
 struct FdWaitWriteCtx { int fd; };
 static int fd_wait_write_ready(void *vp) {
     auto *c = static_cast<FdWaitWriteCtx *>(vp);
-    struct pollfd p = { c->fd, POLLOUT, 0 };
+    struct pollfd p = luna_pollfd_make(c->fd, POLLOUT);
     if (luna_socket_poll(&p, 1, 0) > 0) return 1;
     const SockState *s = state(c->fd);
     return (s && s->sync_connect_failed) ? 1 : 0;
@@ -23233,7 +23356,7 @@ static int fd_wait_alooper_ready(void *vp) {
         const ALooperFd &e = g_alooper_fds[i];
         if (e.fd < 0) continue;
         if (e.looper && e.looper != my_looper) continue;
-        pfds[np] = { e.fd, (short)(e.events & 0xffffu), 0 };
+        pfds[np] = luna_pollfd_make(e.fd, (short)(e.events & 0xffffu));
         idx[np] = (int)i;
         ++np;
     }
@@ -23369,7 +23492,7 @@ static bool wait_deadline_is_ceiling(long want_ms, bool parkable) {
 static int wait_ready(int fd, short events, long budget_ms) {
     const int64_t deadline = budget_ms < 0 ? INT64_MAX : now_ms() + budget_ms;
     for (;;) {
-        struct pollfd pfd { fd, events, 0 };
+        struct pollfd pfd = luna_pollfd_make(fd, events);
         int rc = ::luna_socket_poll(&pfd, 1, 0);
         if (rc < 0 && errno == EINTR) continue;
         if (rc < 0) return -1;
@@ -23512,11 +23635,11 @@ static void fd_deadline_republish(void)
             const int fd = w.ready == guest_net::fd_wait_read_ready
                          ? ((const guest_net::FdWaitReadCtx *)w.ctx)->fd
                          : ((const guest_net::FdWaitWriteCtx *)w.ctx)->fd;
-            struct pollfd p = {fd, (short)(w.ready == guest_net::fd_wait_read_ready ? POLLIN : POLLOUT), 0};
+            struct pollfd p = luna_pollfd_make(fd, (short)(w.ready == guest_net::fd_wait_read_ready ? POLLIN : POLLOUT));
             if (!fd_monitor_append(&fds, &count, &capacity, &p, 1)) collected = false;
         } else if (w.ready == guest_net::fd_wait_epoll_ready) {
             const guest_net::FdWaitEpollCtx *c = (const guest_net::FdWaitEpollCtx *)w.ctx;
-            struct pollfd p = {c->epfd, POLLIN, 0};
+            struct pollfd p = luna_pollfd_make(c->epfd, POLLIN);
             if (!fd_monitor_append(&fds, &count, &capacity, &p, 1)) collected = false;
         } else if (w.ready == guest_net::fd_wait_select_ready) {
             const guest_net::FdWaitSelectCtx *c = (const guest_net::FdWaitSelectCtx *)w.ctx;
@@ -23528,7 +23651,7 @@ static void fd_deadline_republish(void)
                                (v && FD_ISSET(fd, v) ? POLLOUT : 0) |
                                (e && FD_ISSET(fd, e) ? POLLPRI : 0);
                 if (!events) continue;
-                struct pollfd p = {fd, events, 0};
+                struct pollfd p = luna_pollfd_make(fd, events);
                 if (!fd_monitor_append(&fds, &count, &capacity, &p, 1)) collected = false;
             }
         } else { w.monitored = false; ++polled; } /* virtual Looper events still use their deadline checks */
@@ -25876,8 +25999,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         static int nbr = 0;
         if (nbr++ < 24) {
             uint32_t sp = regs[13];
-            fprintf(stderr, "[badret] svc=%u lr=0x%08x r0=%08lx r1=%08lx r2=%08lx r3=%08lx sp=0x%08x tid=%u\n",
-                    svc_no, lr, r0, r1, r2, r3, sp, g_current_tid);
+            fprintf(stderr, "[badret] svc=%u lr=0x%08x r0=%08llx r1=%08llx r2=%08llx r3=%08llx sp=0x%08x tid=%u\n",
+                    svc_no, lr, (unsigned long long)r0, (unsigned long long)r1,
+                    (unsigned long long)r2, (unsigned long long)r3, sp, g_current_tid);
             for (int o = 0; o < 0x30 && ctx.mem.ptr(sp + (uint32_t)o); o += 16)
                 fprintf(stderr, "[badret]   [sp+0x%02x]=%08x %08x %08x %08x\n", o,
                         ctx.mem.read32(sp+o), ctx.mem.read32(sp+o+4),
@@ -25896,7 +26020,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }();
         bool verbose = h < max_hits;  /* rate-limit (LUNARIA_DETOUR_MAX) */
         if (verbose)
-        fprintf(stderr, "[detour] >>> %s #%llu r0=%08lx r1=%08lx r2=%08lx r3=%08lx lr=%08x tid=%u\n",
+        fprintf(stderr, "[detour] >>> %s #%llu r0=%08llx r1=%08llx r2=%08llx r3=%08llx lr=%08x tid=%u\n",
                 nm, (unsigned long long)h, r0, r1, r2, r3, lr, g_current_tid);
         // LUNARIA_DETOUR_REGS=1: full register file plus a short dump behind every register that looks like a guest pointer.
         if (verbose && lunaria_env("LUNARIA_DETOUR_REGS")) {
@@ -26526,7 +26650,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     (unsigned long long)egl_gl_count);
         ++egl_gl_count;
     }
-    // Trace SVCs immediately after a mscorlib access() success
+    // Trace SVCs immediately after a mscorlib luna_file_access() success
     {
         static int g_trace_after_mscorlib = 0;
         static int g_mscorlib_trace_limit = 0;
@@ -26534,7 +26658,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             const char *_p = ctx.mem.cstr(r0);
             if (_p && strstr(_p, "mscorlib")) {
                 // will be traced in SVC_ACCESS handler; arm host access result
-                if (::access(_p, (int)r1) == 0) {
+                if (::luna_file_access(_p, (int)r1) == 0) {
                     g_trace_after_mscorlib = 20;
                     g_mscorlib_trace_limit = 0;
                 }
@@ -26653,7 +26777,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             case 4:  mapped_nr = 64; break;   /* write */
             case 6:  mapped_nr = 57; break;   /* close */
             case 19: mapped_nr = 62; break;   /* lseek (32-bit offset) */
-            case 33: mapped_nr = 48; break;   /* access(path, mode) = faccessat(AT_FDCWD, ...) */
+            case 33: mapped_nr = 48; break;   /* luna_file_access(path, mode) = faccessat(AT_FDCWD, ...) */
             case 78: mapped_nr = 169; break;  /* gettimeofday */
             case 197: mapped_nr = 80; break;  /* fstat64 */
             case 263: mapped_nr = 113; break; /* clock_gettime */
@@ -26877,7 +27001,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             if (buf && a64_read_unmapped(ctx.is_arm64, fd, buf_va, count, &rc)) {
                 /* answered above */
             } else if (buf) {
-                struct pollfd pfd = { fd, POLLIN, 0 };
+                struct pollfd pfd = luna_pollfd_make(fd, POLLIN);
                 const int ready = luna_socket_poll(&pfd, 1, 0);
                 /* Only a read that would have to *wait* cares whether the descriptor blocks,
                  * and a regular file is always ready. Querying fcntl(F_GETFL) on every read
@@ -28714,7 +28838,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                                                          sizeof hostbuf)
                                         : nullptr;
                 struct stat est {};
-                if (!host || stat(host, &est) != 0) {
+                if (!host || luna_file_stat_follow(host, &est) != 0) {
                     fprintf(stderr, "[exec] execve(\"%s\") tid=%u: no such "
                             "program on this device\n",
                             path ? path : "(null)", g_current_tid);
@@ -28722,7 +28846,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     break;
                 }
                 unsigned char eh[64] = {};
-                if (FILE *f = fopen(host, "rb")) {
+                if (FILE *f = luna_file_fopen(host, "rb")) {
                     if (fread(eh, 1, sizeof eh, f) != sizeof eh) { }
                     fclose(f);
                 }
@@ -28744,8 +28868,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     const char *leaf = strrchr(host, '/');
                     snprintf(save, sizeof save, "%s/lunaria-exec-%s", dump,
                              leaf ? leaf + 1 : "image");
-                    FILE *in = fopen(host, "rb");
-                    FILE *out = in ? fopen(save, "wb") : nullptr;
+                    FILE *in = luna_file_fopen(host, "rb");
+                    FILE *out = in ? luna_file_fopen(save, "wb") : nullptr;
                     if (in && out) {
                         char chunk[65536];
                         size_t n;
@@ -29084,7 +29208,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             // Android ClassLoader.
             char lpath[4096]; lpath[0] = 0;
             auto try_path = [&](const char *cand) -> bool {
-                if (!cand || !*cand || access(cand, F_OK) != 0) return false;
+                if (!cand || !*cand || luna_file_access(cand, F_OK) != 0) return false;
                 snprintf(lpath, sizeof(lpath), "%s", cand);
                 return true;
             };
@@ -29096,7 +29220,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                         if (n + 4 < sizeof(lpath) &&
                             (n < 3 || strcmp(lname + n - 3, ".so") != 0)) {
                             snprintf(lpath, sizeof(lpath), "%s.so", lname);
-                            if (access(lpath, F_OK) != 0) lpath[0] = 0;
+                            if (luna_file_access(lpath, F_OK) != 0) lpath[0] = 0;
                         }
                     }
                 } else if (!g_main_lib_dir.empty()) {
@@ -30812,6 +30936,19 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
 
     // ---- Android/POSIX stubs ----
 
+    case SVC_LOG_ASSERT: {
+        const char *condition = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[0]) : ARM_STR(r0);
+        const char *tag = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[1]) : ARM_STR(r1);
+        const char *fmt = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[2]) : ARM_STR(r2);
+        std::string message;
+        if (fmt) {
+            ArmVarArgs ap = make_arm_varargs(ctx, regs, 3, 13, false);
+            message = arm_vformat(ctx, fmt, ap);
+        }
+        luna_log_assert_write(condition, tag, fmt ? message.c_str() : NULL);
+        dispatch_svc(ctx, SVC_ABORT, regs);
+        break;
+    }
     case SVC_LOG_PRINT: {
         const char *tag = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[1]) : ARM_STR(r1);
         ArmVarArgs ap = make_arm_varargs(ctx, regs, 3, 13, false);
@@ -30881,7 +31018,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         // Missing host files -> NULL so mono falls back to JIT.
         char lib_real[4096]; lib_real[0] = 0;
-        if (dpath && access(dpath, F_OK) != 0) {
+        if (dpath && luna_file_access(dpath, F_OK) != 0) {
             // Bare soname (no '/') e.
             bool resolved = false;
             auto take = [&](const char *cand) {
@@ -30895,7 +31032,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     (dl < 3 || strcmp(dpath + dl - 3, ".so") != 0)) {
                     char cand[4096];
                     snprintf(cand, sizeof(cand), "%s.so", dpath);
-                    if (access(cand, F_OK) == 0) take(cand);
+                    if (luna_file_access(cand, F_OK) == 0) take(cand);
                 }
             } else if (!g_main_lib_dir.empty()) {
                 const char *dir = g_main_lib_dir.c_str();
@@ -30909,7 +31046,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 for (const char *f : fmts) {
                     char cand[4096];
                     snprintf(cand, sizeof(cand), f, dir, dpath);
-                    if (access(cand, F_OK) == 0) { take(cand); break; }
+                    if (luna_file_access(cand, F_OK) == 0) { take(cand); break; }
                 }
             }
             if (!resolved) {
@@ -31405,6 +31542,17 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                                 w == live_x23 ? " (matches x23)" :
                                 off == 0x48u ? " (canary slot)" : " (near)");
                 }
+            }
+            if (first && !ctx.is_arm64) {
+                fprintf(stderr,"[arm_exec] abort a32 guard=0x%08x\n",ctx.mem.read32(misc_stack_guard()));
+                for (unsigned i=0;i<16;i+=4)
+                    fprintf(stderr,"[arm_exec] r%u..r%u=%08x %08x %08x %08x\n",
+                        i,i+3,regs[i],regs[i+1],regs[i+2],regs[i+3]);
+                if (lunaria_env("LUNARIA_TRACE_SIG"))
+                    for (uint32_t off=0;off<0x800;off+=16)
+                        fprintf(stderr,"[arm_exec] sp+%03x: %08x %08x %08x %08x\n",off,
+                            ctx.mem.read32(regs[13]+off),ctx.mem.read32(regs[13]+off+4),
+                            ctx.mem.read32(regs[13]+off+8),ctx.mem.read32(regs[13]+off+12));
             }
             /* What this thread did on its way here.  An anti-tamper module
              * kills the app from a thread of its own, and the checks that
@@ -32544,7 +32692,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 if (e.looper && e.looper != my_looper) continue;
                 /* ALOOPER_EVENT_* are the poll(2) bits, so the mask goes
                  * straight through; ERROR and HANGUP always report. */
-                struct pollfd pfd = { e.fd, (short)(e.events & 0xffffu), 0 };
+                struct pollfd pfd = luna_pollfd_make(e.fd, (short)(e.events & 0xffffu));
                 if (luna_socket_poll(&pfd, 1, 0) <= 0 || !pfd.revents) continue;
                 const uint32_t revents = (uint32_t)(unsigned short)pfd.revents;
                 if (e.callback) {
@@ -34411,7 +34559,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 if (!dir || !dir[0]) dir = "/tmp";
                 char path[512];
                 snprintf(path, sizeof path, "%s/lunaria_sh%lu.glsl", dir, r0);
-                if (FILE *fp = fopen(path, "w")) {
+                if (FILE *fp = luna_file_fopen(path, "w")) {
                     fwrite(src.data(), 1, src.size(), fp);
                     fclose(fp);
                 }
@@ -34478,6 +34626,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
          * pump thread, so no other guest thread can enter this context while
          * it runs; the other engines must be allowed to continue. */
         if (pfn_glCompileShader) {
+            if (lunaria_env("LUNARIA_TRACE_GLSHADER"))
+                fprintf(stderr, "[glsh] CompileShader(%u) tid=%u context=%p\n",
+                        (unsigned)r0, g_current_tid, (void *)eglGetCurrentContext());
             ArmLockDropped gl_unlocked; /* see SVC_GL_Flush */
             pfn_glCompileShader((GLuint)r0);
         }
@@ -34492,6 +34643,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             GLint *value = (GLint*)ctx.mem.ptr(r2);
             ArmLockDropped gl_unlocked;
             pfn_glGetShaderiv((GLuint)r0, (GLenum)r1, value);
+            if (lunaria_env("LUNARIA_TRACE_GLSHADER") && value)
+                fprintf(stderr, "[glsh] GetShaderiv(%u,0x%x)=%d tid=%u context=%p\n",
+                        (unsigned)r0, (unsigned)r1, (int)*value,
+                        g_current_tid, (void *)eglGetCurrentContext());
         }
         break;
     case SVC_GL_GetShaderInfoLog: {
@@ -34568,7 +34723,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     // Write full source — composite FS is small but VS is large.
                     char path[128];
                     snprintf(path, sizeof path, "/tmp/lunaria_prog%lu_sh%u.glsl", r0, sh[i]);
-                    if (FILE *fp = fopen(path, "w")) {
+                    if (FILE *fp = luna_file_fopen(path, "w")) {
                         fwrite(src.data(), 1, (size_t)out, fp);
                         fclose(fp);
                         fprintf(stderr, "[gl]   dumped %s\n", path);
@@ -34645,6 +34800,21 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     
     case SVC_GL_Uniform1i:
         if (pfn_glUniform1i) pfn_glUniform1i((GLint)r0,(GLint)r1); break;
+    case SVC_GL_Uniform2i: {
+        const GLint values[2] = { (GLint)r1, (GLint)r2 };
+        if (pfn_glUniform2iv) pfn_glUniform2iv((GLint)r0, 1, values);
+        break;
+    }
+    case SVC_GL_Uniform3i: {
+        const GLint values[3] = { (GLint)r1, (GLint)r2, (GLint)r3 };
+        if (pfn_glUniform3iv) pfn_glUniform3iv((GLint)r0, 1, values);
+        break;
+    }
+    case SVC_GL_Uniform4i: {
+        const GLint values[4] = { (GLint)r1, (GLint)r2, (GLint)r3, (GLint)arg32(4) };
+        if (pfn_glUniform4iv) pfn_glUniform4iv((GLint)r0, 1, values);
+        break;
+    }
     case SVC_GL_Uniform1iv:
         if (pfn_glUniform1iv && r2) pfn_glUniform1iv((GLint)r0,(GLsizei)r1,(const GLint*)ctx.mem.ptr(r2)); break;
     case SVC_GL_Uniform2iv:
@@ -36175,7 +36345,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     if (trace()) {
                         static int np = 0;
                         if (np++ < 20000) {
-                            struct pollfd pp = { fd, POLLIN, 0 };
+                            struct pollfd pp = luna_pollfd_make(fd, POLLIN);
                             (void)::luna_socket_poll(&pp, 1, 0);
                             fprintf(stderr, "[net] %s fd=%d park: errno=%d revents=0x%x "
                                     "deadline=%lld tid=%u\n", w.what, fd,
@@ -37099,7 +37269,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         /* Reads that can block: pipes and sockets, which is how the guest's
          * own threads hand work to each other. */
         {
-            struct pollfd pfd = { fd, POLLIN, 0 };
+            struct pollfd pfd = luna_pollfd_make(fd, POLLIN);
             int poll0 = luna_socket_poll(&pfd, 1, 0);
             /* A read that finds no data yet is the normal state of every
              * idle message pipe, so this fires forever on a healthy run and
@@ -37401,7 +37571,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         fopen_prof_note(path, lr, fo_map_ns, host_mono_ns() - fo_t1);
         /* A C stream is byte-oriented; a directory is consumed through
-         * opendir/readdir. Darwin permits fopen(3) on a directory but its first
+         * opendir/readdir. Darwin permits luna_file_fopen(3) on a directory but its first
          * fgets(3) fails with EISDIR without setting EOF, and Android's callers
          * commonly use `while (!feof()) fgets(...)`, so exposing that Darwin-only
          * half-open stream would spin forever. Reject the stream here, as bionic
@@ -37707,11 +37877,11 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             ret32(0); break;
         }
         if (!path || !mode) { ret32(0); break; }
-        FILE *f = old ? freopen(path, mode, old) : fopen(path, mode);
+        FILE *f = old ? freopen(path, mode, old) : luna_file_fopen(path, mode);
         if (!f) {
             char cache[PATH_MAX];
             if (apk_extract_to_cache(path, cache, sizeof cache))
-                f = old ? freopen(cache, mode, old) : fopen(cache, mode);
+                f = old ? freopen(cache, mode, old) : luna_file_fopen(cache, mode);
         }
         if (!f) { ret32(0); break; }
         // freopen() reuses the caller's FILE*, so the guest handle stays valid; only a fresh stream needs a new shim.
@@ -37761,14 +37931,14 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_LIBC_STAT:
     case SVC_LIBC_LSTAT: {
-        /* lstat() answers about the link itself; sharing the stat() case (following
+        /* luna_file_stat_nofollow() answers about the link itself; sharing the luna_file_stat_follow() case (following
          * the link) would make a file manager, an APK unpacker or a tamper check
          * read "there are no symlinks here". */
         const bool nofollow = svc_no == SVC_LIBC_LSTAT;
         luna_file_info st;
         const char *path = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[0])
                                         : ctx.mem.cstr(r0);
-        // Same order as open()/fopen(): map first (that is what turns.
+        // Same order as open()/luna_file_fopen(): map first (that is what turns.
         char mapped[PATH_MAX];
         path = map_guest_path(path, mapped, sizeof mapped);
         if (const char *subst = synthetic_proc_path(path)) path = subst;
@@ -37817,7 +37987,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             st.links = 2;
             rc = 0;
         }
-        /* A failing stat has to leave the reason behind: `if (stat(p, &st) <
+        /* A failing stat has to leave the reason behind: `if (luna_file_stat_follow(p, &st) <
          * 0 && errno == ENOENT)` is how a guest tells "no such file" from
          * "no permission", and with errno untouched it reads whatever the
          * last failed call left there. */
@@ -37854,7 +38024,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     case SVC_LIBC_FSTATAT: {
         /* fstatat(dirfd, path, struct stat *, flags): the same question as
-         * stat()/lstat() relative to a directory descriptor (AT_FDCWD for the
+         * luna_file_stat_follow()/luna_file_stat_nofollow() relative to a directory descriptor (AT_FDCWD for the
          * working directory) with AT_SYMLINK_NOFOLLOW in flags. */
         const int dfd = ctx.is_arm64 ? (int)(int64_t)g_svc_args64[0] : (int)(int32_t)r0;
         const char *guest_path = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[1]) : ctx.mem.cstr(r1);
@@ -38101,7 +38271,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         guest_abs_path(path, want, sizeof want);
         const char *hp = map_guest_path(want, host, sizeof host);
         struct stat st;
-        if (!hp || stat(hp, &st) != 0) {
+        if (!hp || luna_file_stat_follow(hp, &st) != 0) {
             arm_set_errno(ctx, ENOENT);
             ret32(~0u);
             break;
@@ -38136,8 +38306,15 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         if (svc_no == SVC_LIBC_MMAP2) off <<= 12;
         if (lunaria_env("LUNARIA_TRACE_MMAP"))
-            fprintf(stderr, "[mmap] addr=%#lx len=%lu prot=%lu flags=%#lx fd=%d off=%llu\n",
-                    r0, r1, r2, r3, (int32_t)fd, (unsigned long long)off);
+            fprintf(stderr, "[mmap] addr=%#lx len=%lu prot=%lu flags=%#lx fd=%d off=%llu svc=%u lr=%#x sp=%#x\n",
+                    r0, r1, r2, r3, (int32_t)fd, (unsigned long long)off,
+                    svc_no, lr, regs[13]);
+        if (!ctx.is_arm64 && lunaria_env("LUNARIA_TRACE_MMAP") && regs[13]) {
+            fprintf(stderr, "[mmap-args] stack:");
+            for (unsigned index = 0; index < 4; ++index)
+                fprintf(stderr, " %08x", ctx.mem.read32(regs[13] + index * 4));
+            fputc('\n', stderr);
+        }
         /* An ASharedMemory region that has been restricted with
          * ASharedMemory_setProt() cannot be mapped back up.  The A64 path
          * checks this inside a64_guest_mmap(); the A32 path had no check at
@@ -43361,7 +43538,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         z_stream *zs = new z_stream();
         memset(zs, 0, sizeof(*zs));
         int rc = inflateInit2(zs, (int)r1);
-        if (rc == Z_OK) (*g_zstreams)[argp(0)] = zs;
+        if (rc == Z_OK) rc = zstream_register(ctx, argp(0), zs, g_zstreams, inflateEnd);
         else delete zs;
         ret32((uint32_t)rc);
         break;
@@ -43369,17 +43546,19 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_Z_INFLATE: {
         if (!g_zstreams) { ret32((uint32_t)Z_STREAM_ERROR); break; }
         GuestVA sva = argp(0);
-        auto it = g_zstreams->find(sva);
+        auto it = g_zstreams->find(zstream_handle(ctx, sva));
         if (it == g_zstreams->end()) { ret32((uint32_t)Z_STREAM_ERROR); break; }
         z_stream *zs = it->second;
         GuestVA next_in   = ctx.is_arm64 ? ctx.mem.read64(sva + 0)  : ctx.mem.read32(sva + 0);
         uint32_t avail_in = ctx.is_arm64 ? ctx.mem.read32(sva + 8)  : ctx.mem.read32(sva + 4);
         GuestVA next_out  = ctx.is_arm64 ? ctx.mem.read64(sva + 24) : ctx.mem.read32(sva + 12);
         uint32_t avail_out= ctx.is_arm64 ? ctx.mem.read32(sva + 32) : ctx.mem.read32(sva + 16);
+        zstream_import_totals(ctx, sva, zs);
         zs->next_in   = next_in  ? ctx.mem.ptr(next_in)  : nullptr;
         zs->avail_in  = avail_in;
         zs->next_out  = next_out ? ctx.mem.ptr(next_out) : nullptr;
         zs->avail_out = avail_out;
+        const uLong total_before = zs->total_out;
         /* The decode is the long half and it touches nothing shared: this
          * z_stream belongs to the guest object that owns it, and the buffers
          * are the guest's own memory.  Only the lookup above needs the lock. */
@@ -43391,32 +43570,37 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         uint32_t consumed = avail_in  - zs->avail_in;
         uint32_t produced = avail_out - zs->avail_out;
+        if (lunaria_env("LUNARIA_TRACE_READ")) {
+            static unsigned reports = 0;
+            if (reports++ < 256)
+                fprintf(stderr, "[inflate] stream=%llx out=%llx input=%u used=%u "
+                        "output=%u produced=%u total=%lu->%lu crc=%08lx rc=%d\n",
+                        (unsigned long long)sva, (unsigned long long)next_out,
+                        avail_in, consumed, avail_out, produced, total_before,
+                        zs->total_out, crc32(0, produced ? ctx.mem.ptr(next_out) : nullptr, produced), rc);
+        }
         if (ctx.is_arm64) {
             ctx.mem.write64(sva + 0,  next_in + consumed);
             ctx.mem.write32(sva + 8,  zs->avail_in);
-            ctx.mem.write64(sva + 16, zs->total_in);
             ctx.mem.write64(sva + 24, next_out + produced);
             ctx.mem.write32(sva + 32, zs->avail_out);
-            ctx.mem.write64(sva + 40, zs->total_out);
-            ctx.mem.write64(sva + 96, zs->adler);
         } else {
             ctx.mem.write32(sva + 0,  (uint32_t)next_in + consumed);
             ctx.mem.write32(sva + 4,  zs->avail_in);
-            ctx.mem.write32(sva + 8,  (uint32_t)zs->total_in);
             ctx.mem.write32(sva + 12, (uint32_t)next_out + produced);
             ctx.mem.write32(sva + 16, zs->avail_out);
-            ctx.mem.write32(sva + 20, (uint32_t)zs->total_out);
-            ctx.mem.write32(sva + 48, (uint32_t)zs->adler);
         }
+        zstream_publish_stats(ctx, sva, zs);
         ret32((uint32_t)rc);
         break;
     }
     case SVC_Z_INFLATEEND: {
         int rc = Z_STREAM_ERROR;
         if (g_zstreams) {
-            auto it = g_zstreams->find(argp(0));
+            auto it = g_zstreams->find(zstream_handle(ctx, argp(0)));
             if (it != g_zstreams->end()) {
                 rc = inflateEnd(it->second);
+                zstream_release(ctx, argp(0), it->first);
                 delete it->second;
                 g_zstreams->erase(it);
             }
@@ -43427,8 +43611,15 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_Z_INFLATERESET: {
         int rc = Z_STREAM_ERROR;
         if (g_zstreams) {
-            auto it = g_zstreams->find(argp(0));
-            if (it != g_zstreams->end()) rc = inflateReset(it->second);
+            auto it = g_zstreams->find(zstream_handle(ctx, argp(0)));
+            if (it != g_zstreams->end()) {
+                rc = inflateReset(it->second);
+                if (rc == Z_OK) {
+                    zstream_publish_stats(ctx, argp(0), it->second);
+                    if (ctx.is_arm64) ctx.mem.write64(argp(0) + 48, 0);
+                    else ctx.mem.write32(argp(0) + 24, 0);
+                }
+            }
         }
         ret32((uint32_t)rc);
         break;
@@ -43480,7 +43671,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         memset(zs, 0, sizeof(*zs));
 
         int rc = inflateInit(zs);
-        if (rc == Z_OK) (*g_zstreams)[argp(0)] = zs;
+        if (rc == Z_OK) rc = zstream_register(ctx, argp(0), zs, g_zstreams, inflateEnd);
         else { delete zs; }
         ret32((uint32_t)rc);
         break;
@@ -43491,7 +43682,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         z_stream *zs = new z_stream();
         memset(zs, 0, sizeof(*zs));
         int rc = deflateInit(zs, (int)(int32_t)r1);
-        if (rc == Z_OK) (*g_dstreams)[argp(0)] = zs;
+        if (rc == Z_OK) rc = zstream_register(ctx, argp(0), zs, g_dstreams, deflateEnd);
         else { delete zs; }
         ret32((uint32_t)rc);
         break;
@@ -43509,7 +43700,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         z_stream *zs = new z_stream();
         memset(zs, 0, sizeof(*zs));
         int rc = deflateInit2(zs, level, method, wbits, memlevel, strategy);
-        if (rc == Z_OK) (*g_dstreams)[argp(0)] = zs;
+        if (rc == Z_OK) rc = zstream_register(ctx, argp(0), zs, g_dstreams, deflateEnd);
         else { delete zs; }
         ret32((uint32_t)rc);
         break;
@@ -43517,13 +43708,14 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_Z_DEFLATE: {
         if (!g_dstreams) { ret32((uint32_t)Z_STREAM_ERROR); break; }
         GuestVA sva = argp(0);
-        auto it = g_dstreams->find(sva);
+        auto it = g_dstreams->find(zstream_handle(ctx, sva));
         if (it == g_dstreams->end()) { ret32((uint32_t)Z_STREAM_ERROR); break; }
         z_stream *zs = it->second;
         GuestVA next_in   = ctx.is_arm64 ? ctx.mem.read64(sva + 0)  : ctx.mem.read32(sva + 0);
         uint32_t avail_in = ctx.is_arm64 ? ctx.mem.read32(sva + 8)  : ctx.mem.read32(sva + 4);
         GuestVA next_out  = ctx.is_arm64 ? ctx.mem.read64(sva + 24) : ctx.mem.read32(sva + 12);
         uint32_t avail_out= ctx.is_arm64 ? ctx.mem.read32(sva + 32) : ctx.mem.read32(sva + 16);
+        zstream_import_totals(ctx, sva, zs);
         zs->next_in   = next_in  ? ctx.mem.ptr(next_in)  : nullptr;
         zs->avail_in  = avail_in;
         zs->next_out  = next_out ? ctx.mem.ptr(next_out) : nullptr;
@@ -43539,29 +43731,25 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (ctx.is_arm64) {
             ctx.mem.write64(sva + 0,  next_in + consumed);
             ctx.mem.write32(sva + 8,  zs->avail_in);
-            ctx.mem.write64(sva + 16, zs->total_in);
             ctx.mem.write64(sva + 24, next_out + produced);
             ctx.mem.write32(sva + 32, zs->avail_out);
-            ctx.mem.write64(sva + 40, zs->total_out);
-            ctx.mem.write64(sva + 96, zs->adler);
         } else {
             ctx.mem.write32(sva + 0,  (uint32_t)next_in + consumed);
             ctx.mem.write32(sva + 4,  zs->avail_in);
-            ctx.mem.write32(sva + 8,  (uint32_t)zs->total_in);
             ctx.mem.write32(sva + 12, (uint32_t)next_out + produced);
             ctx.mem.write32(sva + 16, zs->avail_out);
-            ctx.mem.write32(sva + 20, (uint32_t)zs->total_out);
-            ctx.mem.write32(sva + 48, (uint32_t)zs->adler);
         }
+        zstream_publish_stats(ctx, sva, zs);
         ret32((uint32_t)rc);
         break;
     }
     case SVC_Z_DEFLATEEND: {
         int rc = Z_STREAM_ERROR;
         if (g_dstreams) {
-            auto it = g_dstreams->find(argp(0));
+            auto it = g_dstreams->find(zstream_handle(ctx, argp(0)));
             if (it != g_dstreams->end()) {
                 rc = deflateEnd(it->second);
+                zstream_release(ctx, argp(0), it->first);
                 delete it->second;
                 g_dstreams->erase(it);
             }
@@ -43572,8 +43760,15 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_Z_DEFLATERESET: {
         int rc = Z_STREAM_ERROR;
         if (g_dstreams) {
-            auto it = g_dstreams->find(argp(0));
-            if (it != g_dstreams->end()) rc = deflateReset(it->second);
+            auto it = g_dstreams->find(zstream_handle(ctx, argp(0)));
+            if (it != g_dstreams->end()) {
+                rc = deflateReset(it->second);
+                if (rc == Z_OK) {
+                    zstream_publish_stats(ctx, argp(0), it->second);
+                    if (ctx.is_arm64) ctx.mem.write64(argp(0) + 48, 0);
+                    else ctx.mem.write32(argp(0) + 24, 0);
+                }
+            }
         }
         ret32((uint32_t)rc);
         break;
@@ -43590,7 +43785,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         uLong srclen = (uLong)(ctx.is_arm64 ? argp(1) : (GuestVA)r1);
         uLong bound = 0;
         if (g_dstreams) {
-            auto it = g_dstreams->find(argp(0));
+            auto it = g_dstreams->find(zstream_handle(ctx, argp(0)));
             if (it != g_dstreams->end()) bound = deflateBound(it->second, srclen);
         }
         if (!bound) bound = compressBound(srclen);
@@ -43933,8 +44128,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_ASSERT2: {
         const char *file = ctx.mem.cstr(r0), *fn = ctx.mem.cstr(r2),
                    *msg = ctx.mem.cstr(r3);
-        fprintf(stderr, "[arm_exec] __assert2: %s:%lu %s: %s\n",
-                file ? file : "?", r1, fn ? fn : "?", msg ? msg : "?");
+        fprintf(stderr, "[arm_exec] __assert2: %s:%lu %s: %s (lr=0x%08x)\n",
+                file ? file : "?", r1, fn ? fn : "?", msg ? msg : "?", lr);
         ret32(0); break;
     }
     case SVC_LOG_VPRINT: {
@@ -44020,14 +44215,14 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         if (lunaria_env("LUNARIA_TRACE_OPEN"))
             fprintf(stderr, "[access] %s mode=%d -> %d\n", path ? path : "(null)", (int)r1,
-                    path ? access(path, (int)r1) : -1);
+                    path ? luna_file_access(path, (int)r1) : -1);
         if (path && strstr(path, "Managed") && strstr(path, ".dll"))
             fprintf(stderr, "[access_dll] %s mode=%d -> %d lr=0x%08x\n", path, (int)r1,
-                    access(path,(int)r1), lr);
-        if (path && access(path, (int)r1) == 0) { ret32(0); break; }
+                    luna_file_access(path,(int)r1), lr);
+        if (path && luna_file_access(path, (int)r1) == 0) { ret32(0); break; }
         char cache[PATH_MAX];
         if (path && apk_extract_to_cache(path, cache, sizeof cache) &&
-            access(cache, (int)r1) == 0) { ret32(0); break; }
+            luna_file_access(cache, (int)r1) == 0) { ret32(0); break; }
         ret32(~0u);
         break;
     }
@@ -45789,7 +45984,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         char ul_mapped[PATH_MAX];
         path = map_guest_path(path, ul_mapped, sizeof ul_mapped);
         if (path) arm_exec_note_destructive("unlink", path, nullptr);
-        ret32(path ? (uint32_t)unlink(path) : ~0u);
+        ret32(path ? (uint32_t)luna_file_unlink(path) : ~0u);
         break;
     }
     case SVC_UNLINKAT: {
@@ -45810,7 +46005,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         a = map_guest_path(a, rn_ma, sizeof rn_ma);
         b = map_guest_path(b, rn_mb, sizeof rn_mb);
         if (a) arm_exec_note_destructive("rename", a, b);
-        int rc = (a && b) ? rename(a, b) : -1;
+        int rc = (a && b) ? luna_file_rename(a, b) : -1;
         if (rc != 0) {
             fprintf(stderr, "[rename] FAILED %s -> %s errno=%d (%s) lr=0x%08x tid=%u\n",
                     a ? a : "?", b ? b : "?", a && b ? errno : 0,
@@ -46583,7 +46778,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_UMASK: {
         /* umask(mode): set the calling process's file-creation mask and
          * answer the previous one.  The guest process *is* this process —
-         * its open() and mkdir() end up as host calls — so the mask has to
+         * its open() and luna_file_mkdir() end up as host calls — so the mask has to
          * be the host's, or a file the guest creates gets permissions it did
          * not ask for.  __umask_chk arrives here too, once the FORTIFY block
          * above has checked the mask. */
@@ -46653,7 +46848,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         const char *hlink = map_guest_path(linkp, l_mapped, sizeof l_mapped);
         if (!htarget || !hlink) { arm_set_errno(ctx, ENOENT); ret32(~0u); break; }
         int rc = (svc_no == SVC_LINK) ? luna_file_link(htarget, hlink)
-                                      : luna_file_symlink(htarget, hlink);
+                                      : luna_symlink_create(htarget, hlink);
         if (rc != 0) arm_set_errno(ctx, errno);
         ret32((uint32_t)rc);
         break;
@@ -47216,6 +47411,18 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
 
+    case SVC_ANA_SET_WINDOW_FLAGS: {
+        const uint64_t clazz = ctx.is_arm64 ? ctx.mem.read64(r0 + 24u)
+                                            : ctx.mem.read32(r0 + 12u);
+        jobject activity = AS_OBJ(clazz);
+        jclass cls = jvm->native.GetObjectClass(env, activity);
+        jmethodID method = jvm->native.GetMethodID(env, cls, "setWindowFlags", "(II)V");
+        jvalue args[2] = {};
+        args[0].i = (jint)(uint32_t)r1;
+        args[1].i = (jint)((uint32_t)r1 | (uint32_t)r2);
+        jvm->native.CallVoidMethodA(env, activity, method, args);
+        break;
+    }
     case SVC_ANA_SET_WINDOW_FORMAT: {
         /* ANativeActivity_setWindowFormat(activity, format).  A request, not
          * a command, even on a device: the window keeps whatever the surface
@@ -49045,7 +49252,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         static uint64_t s_unk_count = 0;
         uint64_t n = s_unk_count++;
         if (n < 30 || (n & 0xfff) == 0)
-            fprintf(stderr, "[unresolved] stub called #%llu lr=0x%08x r0=%08lx r1=%08lx r2=%08lx r3=%08lx\n",
+            fprintf(stderr, "[unresolved] stub called #%llu lr=0x%08x r0=%08llx r1=%08llx r2=%08llx r3=%08llx\n",
                     (unsigned long long)n, lr, r0, r1, r2, r3);
         ret32(0);
         break;
@@ -49643,18 +49850,18 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 open_name = corlib_path;
             }
         }
-        FILE *file = fopen(open_name, "rb");
+        FILE *file = luna_file_fopen(open_name, "rb");
         if (!file) {
             char cache[PATH_MAX];
             if (apk_extract_to_cache(open_name, cache, sizeof cache))
-                file = fopen(cache, "rb");
+                file = luna_file_fopen(cache, "rb");
         }
         if (!file && open_name != name) {
-            file = fopen(name, "rb");
+            file = luna_file_fopen(name, "rb");
             if (!file) {
                 char cache[PATH_MAX];
                 if (apk_extract_to_cache(name, cache, sizeof cache))
-                    file = fopen(cache, "rb");
+                    file = luna_file_fopen(cache, "rb");
             }
         }
         if (!file) {
@@ -50582,6 +50789,31 @@ public:
                         va, (uint32_t)r[14], (uint32_t)r[0], (uint32_t)r[1],
                         (uint32_t)r[2], (uint32_t)r[3], (uint32_t)r[4],
                         (uint32_t)r[11], (uint32_t)r[13]);
+                if (lunaria_env("LUNARIA_WATCH_EXEC_MEM")) {
+                    const unsigned slots[] = {0u, 4u, 13u};
+                    for (unsigned index = 0; index < 3; ++index) {
+                        const unsigned slot = slots[index];
+                        const uint32_t address = (uint32_t)r[slot];
+                        if (!address || !ctx->mem.ptr(address)) continue;
+                        fprintf(stderr, "[watch-exec-mem] r%u=%08x:", slot, address);
+                        for (unsigned offset = 0; offset < 64; offset += 4)
+                            fprintf(stderr, " %08x", ctx->mem.read32(address + offset));
+                        fprintf(stderr, "\n");
+                        /* Bounded indirect payload for by-reference ABI objects. */
+                        const uint32_t payload = ctx->mem.read32(address + 8);
+                        if (payload >= 0x10000000u && payload < 0x60000000u &&
+                            ctx->mem.ptr(payload)) {
+                            fprintf(stderr, "[watch-exec-payload] r%u+8=%08x:",
+                                    slot, payload);
+                            for (unsigned offset = 0; offset < 128; ++offset) {
+                                const unsigned char ch = *ctx->mem.ptr(payload + offset);
+                                if (!ch) break;
+                                fputc(ch >= 32 && ch < 127 ? ch : '.', stderr);
+                            }
+                            fputc('\n', stderr);
+                        }
+                    }
+                }
             } else {
                 fprintf(stderr, "[watch-exec] reached va=0x%08x\n", va);
             }
@@ -51099,7 +51331,7 @@ public:
         // Progress log every ~1B ticks so long inits are visible
         if ((prev >> 30) != (ticks >> 30) && jit) {
             long rss_pages = 0;
-            if (FILE *f = fopen("/proc/self/statm", "r")) {
+            if (FILE *f = luna_file_fopen("/proc/self/statm", "r")) {
                 long dummy; if (fscanf(f, "%ld %ld", &dummy, &rss_pages) != 2) rss_pages = 0;
                 fclose(f);
             }
@@ -51499,6 +51731,10 @@ static void schedule_threads(uint64_t slice) {
                 thread_sched_update(t);
             return;
         }
+        /* A signal queued while the thread ran must be delivered before its
+         * next slice, including when a timer moved it straight to ready. */
+        if (t.pending_signals) (void)a32_deliver_pending_signal(ctx,t);
+        if (t.finished) return;
         /* Create the A32 engine only for an A32 thread.  Constructing it on
          * an A64-only launch delays all ready threads while holding the
          * execution lock, although none of them can use this engine. */
@@ -51532,6 +51768,10 @@ static void schedule_threads(uint64_t slice) {
         jit.ExtRegs() = t.ext;
         jit.SetCpsr(t.cpsr);
         jit.SetFpscr(t.fpscr);
+        /* While the JIT owns the registers, the saved SP in t is stale.
+         * Signal senders may queue signals but must not build a frame from
+         * that stale SP or write into the live thread's stack. */
+        t.running = true;
         set_cur_tid(ctx, t.id);
         {
             static uint32_t sched_count = 0;
@@ -51620,7 +51860,10 @@ static void schedule_threads(uint64_t slice) {
         } else {
             tw.stuck_count = 0;
         }
-        if (!tw.finished && !tw.running)
+        /* Publish the saved register state before permitting signal delivery
+         * or requeueing this thread. */
+        tw.running = false;
+        if (!tw.finished)
             thread_sched_update(tw);
         else if (tw.finished)
             thread_sched_forget(tw.id);
@@ -54631,7 +54874,7 @@ extern "C" void arm_exec_prepare_mono_config(void) {
             snprintf(dir, sizeof dir, "%s/mono/%s", cfg_dir, ver);
             luna_file_mkdir(dir, 0755);
             snprintf(path, sizeof path, "%s/machine.config", dir);
-            if (FILE *f = fopen(path, "wb")) {
+            if (FILE *f = luna_file_fopen(path, "wb")) {
                 fwrite(g_unity_machine_config.data(), 1, g_unity_machine_config.size(), f);
                 fclose(f);
             }
@@ -55005,6 +55248,38 @@ static bool guest_window_present_frame(void)
 extern "C" int arm_exec_host_ui_thread(void) {
     return g_egl_ctx != EGL_NO_CONTEXT &&
            std::this_thread::get_id() == g_host_ui_thread;
+}
+struct MainLooperNativeScope {
+    uint32_t tid, tls32, dvm_tid;
+    uint64_t tls64, tlsro;
+    bool active;
+};
+static thread_local MainLooperNativeScope g_main_looper_native_scope;
+extern "C" int arm_exec_main_looper_enter(void) {
+    if (!g_ctx || !arm_exec_host_ui_thread() || g_main_looper_native_scope.active)
+        return 0;
+    ArmLockGuard lock;
+    MainLooperNativeScope *s = &g_main_looper_native_scope;
+    s->tid = g_current_tid;
+    s->tls32 = g_tpidr32_val;
+    s->tls64 = g_tpidr_el0_val;
+    s->tlsro = g_tpidrro_el0_val;
+    s->dvm_tid = g_dvm_guest_tid;
+    s->active = true;
+    g_dvm_guest_tid = 0;
+    set_cur_tid(*g_ctx, 0);
+    return 1;
+}
+extern "C" void arm_exec_main_looper_leave(void) {
+    MainLooperNativeScope *s = &g_main_looper_native_scope;
+    if (!s->active || !g_ctx) return;
+    ArmLockGuard lock;
+    set_cur_tid(*g_ctx, s->tid);
+    g_tpidr32_val = s->tls32;
+    g_tpidr_el0_val = s->tls64;
+    g_tpidrro_el0_val = s->tlsro;
+    g_dvm_guest_tid = s->dvm_tid;
+    s->active = false;
 }
 extern "C" void arm_exec_service_host_ui(void) {
     if (!arm_exec_host_ui_thread() || !luna_overlay_guest_window_up()) return;
@@ -55651,7 +55926,7 @@ public:
         if (!pages.insert(va >> 12).second) return;
         char where[160];
         snprintf(where, sizeof where, "%s", "no host mapping");
-        if (FILE *f = fopen("/proc/self/maps", "r")) {
+        if (FILE *f = luna_file_fopen("/proc/self/maps", "r")) {
             char line[512];
             while (fgets(line, sizeof line, f)) {
                 unsigned long long lo = 0, hi = 0;
@@ -58342,7 +58617,7 @@ public:
     void stack_sample(void) {
         static FILE *out = [] {
             const char *p = lunaria_env("LUNARIA_GUEST_STACKS");
-            FILE *f = (p && *p) ? fopen(p, "w") : nullptr;
+            FILE *f = (p && *p) ? luna_file_fopen(p, "w") : nullptr;
             if (f) setvbuf(f, nullptr, _IOFBF, 1 << 16);
             return f;
         }();
@@ -58959,7 +59234,7 @@ static void pc_histo_report(void) {
     }
     if (!total) return;
     if (const char *path = pc_histo_file()) {
-        if (FILE *f = fopen(path, "a")) {
+        if (FILE *f = luna_file_fopen(path, "a")) {
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
             fprintf(f, "# block t=%lld.%03ld samples=%llu\n",
@@ -60632,9 +60907,13 @@ static bool cb_lock_wait_try_grant(ArmExecCtx &ctx) {
          * for it. (Asking a host-side waiter list whether anyone had signalled is
          * not the condvar's contract and has a window at each end of it.) */
         const GuestVA cva = g_cb_lock_wait.cond_va;
+        /* A changed generation and its WAKE token are the same notification.
+         * Keep the token until the mutex is regained, then consume it exactly
+         * once. Consuming in this test either loses it while mutex acquisition
+         * fails or leaves it behind when the generation test short-circuits. */
         const bool woke = cva &&
             (cond_state_load(ctx.mem, cva) != g_cb_lock_wait.futex_expected ||
-             futex_token_consume(cva));
+             futex_token_count(cva) != 0u);
         const bool expired = g_cb_lock_wait.timed &&
                              host_mono_ns() >= g_cb_lock_wait.deadline_ns;
         if (!woke && !expired) return false;
@@ -60655,6 +60934,7 @@ static bool cb_lock_wait_try_grant(ArmExecCtx &ctx) {
                             (w & ~0xffu) + 0x100u, "cond");
         }
         if (cva) {
+            if (woke) (void)futex_token_consume(cva);
             futex_wait_addr_remove(cva);
             cond_waiters_add(ctx, cva, -1);
         }
@@ -61783,7 +62063,7 @@ static void build_fast_rwlock_stubs64(ArmExecCtx &ctx) {
     /* feof / fgets: Android stdio in guest code. A phone never traps on a
      * line-oriented walk of a FILE that already has its buffer filled; as SVCs
      * against a host FILE*, every fgets/feof was a JIT exit (Cross Worlds'
-     * post-title kit parse spent ~18% of JIT exits on those two alone). fopen()
+     * post-title kit parse spent ~18% of JIT exits on those two alone). luna_file_fopen()
      * preloads readable files into a guest buffer and stamps the shim (see
      * GFILE_*); these stubs are the C operations over that buffer. base == 0
      * falls through to the SVC for write streams and anything too large to
@@ -62171,7 +62451,7 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
         char out[PATH_MAX];
         if ((size_t)snprintf(out, sizeof out, "%s/%s.so", dumpdir,
                              slash ? slash + 1 : path) < sizeof out) {
-            FILE *f = fopen(out, "wb");
+            FILE *f = luna_file_fopen(out, "wb");
             if (f) {
                 fwrite(buf.data(), 1, buf.size(), f);
                 fclose(f);
@@ -63373,30 +63653,14 @@ static bool dvm_call_guest_native(const char *klass, const char *method,
     return true;
 }
 
-/* android.app.NativeActivity, the framework half.
- *
- * NativeActivity.onCreate loads the app's native library and calls its
- * ANativeActivity_onCreate; onStart and onResume deliver the activity's native
- * callbacks; the window arrives with the first resume.  android_native_app_glue
- * implements those callbacks as commands written to a pipe that its own
- * android_main thread drains, so delivering one is a one-byte write.  (Calling
- * onNativeWindowCreated directly instead waits on a condition variable until
- * android_main has handled the command, which nothing can do while this
- * thread is the one being waited for.)
- *
- * The app's Java reaches this through super.onCreate()/onStart()/onResume(),
- * so the order is the app's own and no loader has to know which engine it is.
- * Everything here is plain data and C-callable operations on guest memory. */
-enum { NA_APP_CMD_INPUT_CHANGED = 0, NA_APP_CMD_INIT_WINDOW = 1,
-       NA_APP_CMD_GAINED_FOCUS = 6, NA_APP_CMD_START = 10,
-       NA_APP_CMD_RESUME = 11 };
-
+/* NativeActivity delivers the public NDK callbacks. The app's instance is
+ * opaque: android_native_app_glue owns its command pipe and synchronization. */
 struct NativeActivityLink {
-    bool     created;
-    int      msgwrite;      /* write end of the glue's command pipe, or -1 */
-    uint64_t window_handed; /* nonzero once the window has been delivered  */
+    bool created;
+    uint64_t activity;
+    uint64_t window_handed;
 };
-static NativeActivityLink g_native_activity = { false, -1, 0 };
+static NativeActivityLink g_native_activity = { false, 0, 0 };
 
 /* A Java -> native call made from a host thread that is not running guest
  * code.  Such a thread is an ART thread of its own with its own Linux
@@ -63426,62 +63690,20 @@ static int64_t native_activity_call(GuestVA fn, const GuestArg *args, int nargs)
     return (int64_t)rv.u;
 }
 
-static void native_activity_command(int8_t command)
+static void native_activity_callback(unsigned slot, uint64_t value, bool has_value,
+                                     bool integer_value)
 {
-    if (g_native_activity.msgwrite < 0) return;
-    if (write(g_native_activity.msgwrite, &command, 1) != 1)
-        fprintf(stderr, "[nativeactivity] APP_CMD %d not delivered: %s\n",
-                command, strerror(errno));
-}
-
-/* ANativeActivity.instance is the glue's android_app.  Its layout is the NDK's
- * and differs only in pointer width: the command pipe's two descriptors, the
- * public window pointer ahead of them, and the pending window / input queue
- * after them.  The pipe is found by asking the guest-pipe registry which
- * adjacent descriptor pair it created; no host file-identity test can tell
- * (Darwin gives a pipe's two ends different inodes). */
-static void native_activity_attach_glue(uint64_t instance, bool a64)
-{
-    if (!instance) return;
-    const uint32_t scan_end = a64 ? 512u : 256u;
-    uint32_t pipe_off = 0;
-    for (uint32_t off = 64; off < scan_end; off += 4) {
-        const int rd = (int)(a64 ? arm64_exec_read32(instance + off)
-                                 : arm_exec_read32((uint32_t)instance + off));
-        const int wr = (int)(a64 ? arm64_exec_read32(instance + off + 4)
-                                 : arm_exec_read32((uint32_t)instance + off + 4));
-        if (rd < 0 || wr < 0 || rd >= 1024 || wr >= 1024 || rd == wr) continue;
-        if (!arm_exec_guest_pipe_pair(rd, wr)) continue;
-        g_native_activity.msgwrite = wr;
-        pipe_off = off;
-        break;
-    }
-    if (g_native_activity.msgwrite < 0) {
-        fprintf(stderr, "[nativeactivity] android_app has no command pipe; the "
-                "window and lifecycle cannot reach the engine\n");
-        return;
-    }
-    /* Public window (before the pipe), pendingWindow and pendingInputQueue
-     * (after it).  process_cmd copies pendingWindow to window on INIT_WINDOW
-     * and attaches pendingInputQueue to the looper on INPUT_CHANGED. */
-    const uint32_t window_off = a64 ? 0x48u : 36u;
-    const uint32_t pend_win   = pipe_off + (a64 ? 0x58u : 0x38u);
-    const uint32_t pend_queue = pipe_off + (a64 ? 0x50u : 0x34u);
-    const uint32_t queue = arm_exec_input_queue_handle();
-    if (a64) {
-        const uint64_t win = arm64_exec_native_window_va();
-        arm64_exec_write64(instance + window_off, win);
-        arm64_exec_write64(instance + pend_win, win);
-        if (queue) arm64_exec_write64(instance + pend_queue, queue);
-        g_native_activity.window_handed = win;
-    } else {
-        const uint32_t win = arm_exec_native_window_va();
-        arm_exec_write32((uint32_t)instance + window_off, win);
-        arm_exec_write32((uint32_t)instance + pend_win, win);
-        if (queue) arm_exec_write32((uint32_t)instance + pend_queue, queue);
-        g_native_activity.window_handed = win;
-    }
-    if (queue) native_activity_command(NA_APP_CMD_INPUT_CHANGED);
+    const bool a64 = g_ctx->is_arm64;
+    const uint64_t act = g_native_activity.activity;
+    const uint64_t table = a64 ? arm64_exec_read64(act) : arm_exec_read32((uint32_t)act);
+    if (!table) return;
+    const GuestVA fn = a64 ? arm64_exec_read64(table + slot * 8u)
+                          : arm_exec_read32((uint32_t)table + slot * 4u);
+    if (!fn) return;
+    GuestArg args[2];
+    args[0] = a64 ? guest_arg_j(act) : guest_arg_i((uint32_t)act);
+    args[1] = a64 && !integer_value ? guest_arg_j(value) : guest_arg_i((uint32_t)value);
+    native_activity_call(fn, args, has_value ? 2 : 1);
 }
 
 static bool dvm_native_activity_stage(int stage, jobject activity)
@@ -63491,10 +63713,13 @@ static bool dvm_native_activity_stage(int stage, jobject activity)
     switch (stage) {
     case 0: { /* DVM_NATIVE_ACTIVITY_CREATE */
         if (g_native_activity.created) return true;
-        const GuestVA entry = a64 ? (GuestVA)arm64_exec_lookup_export("ANativeActivity_onCreate")
-                                  : (GuestVA)arm_exec_lookup_export("ANativeActivity_onCreate");
-        if (!entry) return false;   /* not a native app */
-        g_native_activity.created = true;
+        const char *name = "ANativeActivity_onCreate";
+        const char *configured = NULL;
+        if (arm_exec_apk_meta("android.app.func_name", NULL, &configured) == 'L' && configured)
+            name = configured;
+        const GuestVA entry = a64 ? (GuestVA)arm64_exec_lookup_export(name)
+                                  : (GuestVA)arm_exec_lookup_export(name);
+        if (!entry) return false;
         const uint64_t act = a64
             ? arm64_exec_native_activity_create((uint64_t)(uintptr_t)activity)
             : (uint64_t)arm_exec_native_activity_create((uint32_t)(uintptr_t)activity);
@@ -63511,21 +63736,24 @@ static bool dvm_native_activity_stage(int stage, jobject activity)
         fprintf(stderr, "[nativeactivity] ANativeActivity_onCreate @0x%llx act=0x%llx\n",
                 (unsigned long long)entry, (unsigned long long)act);
         native_activity_call(entry, args, 3);
-        const uint64_t instance = a64 ? arm64_exec_read64(act + 56)
-                                      : arm_exec_read32((uint32_t)act + 28);
-        native_activity_attach_glue(instance, a64);
+        g_native_activity.activity = act;
+        g_native_activity.created = true;
         return true;
     }
     case 1: /* DVM_NATIVE_ACTIVITY_START */
         if (!g_native_activity.created) return false;
-        native_activity_command(NA_APP_CMD_START);
+        native_activity_callback(0, 0, false, false);
         return true;
     case 2: /* DVM_NATIVE_ACTIVITY_RESUME */
         if (!g_native_activity.created) return false;
-        native_activity_command(NA_APP_CMD_RESUME);
-        if (g_native_activity.window_handed) {
-            native_activity_command(NA_APP_CMD_INIT_WINDOW);
-            native_activity_command(NA_APP_CMD_GAINED_FOCUS);
+        native_activity_callback(1, 0, false, false);
+        if (!g_native_activity.window_handed) {
+            const uint64_t window = a64 ? arm64_exec_native_window_va() : arm_exec_native_window_va();
+            native_activity_callback(7, window, true, false);
+            g_native_activity.window_handed = window;
+            const uint32_t queue = arm_exec_input_queue_handle();
+            if (queue) native_activity_callback(11, queue, true, false);
+            native_activity_callback(6, 1, true, true);
         }
         return true;
     }
@@ -63542,7 +63770,7 @@ static bool dvm_load_guest_library(const char *name) {
     std::string path;
     if (strchr(name, '/') || strchr(name, '\\')) {
         path = name;
-        if (access(path.c_str(), R_OK) != 0) {
+        if (luna_file_access(path.c_str(), R_OK) != 0) {
             fprintf(stderr, "[dvm] System.load(%s): not readable\n", name);
             return false;
         }
@@ -63554,7 +63782,7 @@ static bool dvm_load_guest_library(const char *name) {
               soname.compare(soname.size() - 3, 3, ".so") == 0))
             soname = "lib" + soname + ".so";
         path = g_main_lib_dir + "/" + soname;
-        if (access(path.c_str(), R_OK) != 0) {
+        if (luna_file_access(path.c_str(), R_OK) != 0) {
             fprintf(stderr, "[dvm] System.loadLibrary(%s): %s not found\n",
                     name, path.c_str());
             return false;
@@ -63577,7 +63805,7 @@ extern "C" int arm_exec_system_load(const char *path) {
         fprintf(stderr, "[dvm] System.load(%s): no guest context\n", path);
         return -1;
     }
-    if (access(path, R_OK) != 0) {
+    if (luna_file_access(path, R_OK) != 0) {
         fprintf(stderr, "[dvm] System.load(%s): not readable\n", path);
         return -1;
     }
@@ -63707,7 +63935,7 @@ static bool guest_program_header(const char *host_path, uint64_t &entry,
                                  uint64_t &phoff, uint16_t &phent,
                                  uint16_t &phnum)
 {
-    FILE *f = fopen(host_path, "rb");
+    FILE *f = luna_file_fopen(host_path, "rb");
     if (!f) return false;
     unsigned char eh[64] = {};
     const size_t got = fread(eh, 1, sizeof eh, f);
@@ -63842,8 +64070,8 @@ static bool guest_program_load(ArmExecCtx &ctx,
         const char *leaf = strrchr(host, '/');
         snprintf(save, sizeof save, "%s/lunaria-exec-%s", dump,
                  leaf ? leaf + 1 : "image");
-        FILE *in = fopen(host, "rb");
-        FILE *out = in ? fopen(save, "wb") : nullptr;
+        FILE *in = luna_file_fopen(host, "rb");
+        FILE *out = in ? luna_file_fopen(save, "wb") : nullptr;
         if (in && out) {
             char chunk[65536];
             size_t n;

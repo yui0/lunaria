@@ -272,6 +272,7 @@ static void heap_free(struct dvm *vm, dvm_ref ref)
    struct dvm_object *o = dvm__obj(vm, ref);
    if (!o || o->pins) return;
    free(o->utf8);
+   free(o->string_units);
    object_data_destroy(o);
    free(o->slots);
    memset(o, 0, sizeof *o);
@@ -1291,26 +1292,40 @@ static void log_forwarded_uncaught(struct dvm *vm, dvm_ref exc,
  * Fields
  * ------------------------------------------------------------------------ */
 
-bool dvm_get_field(struct dvm *vm, dvm_ref obj, const char *name,
-                   const char *type, union dvm_value *out)
+bool dvm__get_field_from(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
+                         const char *name, const char *type,
+                         union dvm_value *out)
 {
    struct dvm_object *o = dvm__obj(vm, obj);
    if (!o || !o->cls) return false;
-   struct dvm_field *f = class_find_field(o->cls, name, type, false);
+   struct dvm_field *f = class_find_field(owner ? owner : o->cls, name, type, false);
    if (!f || !o->slots || f->slot >= o->cls->islots) return false;
    *out = o->slots[f->slot];
    return true;
 }
 
-bool dvm_set_field(struct dvm *vm, dvm_ref obj, const char *name,
-                   const char *type, union dvm_value val)
+bool dvm__set_field_from(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
+                         const char *name, const char *type,
+                         union dvm_value val)
 {
    struct dvm_object *o = dvm__obj(vm, obj);
    if (!o || !o->cls) return false;
-   struct dvm_field *f = class_find_field(o->cls, name, type, false);
+   struct dvm_field *f = class_find_field(owner ? owner : o->cls, name, type, false);
    if (!f || !o->slots || f->slot >= o->cls->islots) return false;
    o->slots[f->slot] = val;
    return true;
+}
+
+bool dvm_get_field(struct dvm *vm, dvm_ref obj, const char *name,
+                   const char *type, union dvm_value *out)
+{
+   return dvm__get_field_from(vm, obj, NULL, name, type, out);
+}
+
+bool dvm_set_field(struct dvm *vm, dvm_ref obj, const char *name,
+                   const char *type, union dvm_value val)
+{
+   return dvm__set_field_from(vm, obj, NULL, name, type, val);
 }
 
 bool dvm_get_static(struct dvm *vm, struct dvm_class *cls, const char *name,
@@ -1905,8 +1920,6 @@ static bool array_check(struct dvm *vm, struct dvm_object *a, uint32_t idx)
 
 static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out);
 static _Thread_local struct dvm_method *g_builtin_method;
-static _Thread_local uint64_t g_monitor_thread_token;
-static _Atomic uint64_t g_next_monitor_thread_token = 1;
 
 static bool annotation_value_to_dvm(struct dvm *vm, struct dex_file *dex,
                                     const struct dex_value *value,
@@ -2049,12 +2062,11 @@ static bool annotation_element_builtin(struct dvm *vm, dvm_ref self,
    return true;
 }
 
-static uint64_t monitor_thread_token(void)
+static uint64_t monitor_thread_token(struct dvm *vm)
 {
-   if (!g_monitor_thread_token)
-      g_monitor_thread_token = atomic_fetch_add_explicit(
-         &g_next_monitor_thread_token, 1, memory_order_relaxed);
-   return g_monitor_thread_token;
+   /* Guest threads can share a host executor or migrate between executors.
+    * Ownership belongs to the Java Thread identity, never the host TLS. */
+   return dvm__current_thread_id(vm);
 }
 
 static uintptr_t monitor_channel(dvm_ref ref, unsigned kind)
@@ -2076,7 +2088,11 @@ bool dvm__monitor_try_enter(struct dvm *vm, dvm_ref ref)
       dvm__throw(vm, "java/lang/NullPointerException", "monitor-enter null");
       return false;
    }
-   const uint64_t me = monitor_thread_token();
+   const uint64_t me = monitor_thread_token(vm);
+   if (!me) {
+      dvm__throw(vm, "java/lang/OutOfMemoryError", "monitor thread identity");
+      return false;
+   }
    if (o->monitor_owner && o->monitor_owner != me) return false;
    o->monitor_owner = me;
    ++o->monitor_depth;
@@ -2101,7 +2117,7 @@ bool dvm__monitor_enter(struct dvm *vm, dvm_ref ref)
 bool dvm__monitor_exit(struct dvm *vm, dvm_ref ref)
 {
    struct dvm_object *o = dvm__obj(vm, ref);
-   const uint64_t me = monitor_thread_token();
+   const uint64_t me = monitor_thread_token(vm);
    if (!o || o->monitor_owner != me || !o->monitor_depth) {
       dvm__throw(vm, "java/lang/IllegalMonitorStateException",
                  "monitor-exit without ownership");
@@ -2117,7 +2133,7 @@ bool dvm__monitor_wait(struct dvm *vm, dvm_ref ref, uint64_t timeout_ms,
                        bool *notified)
 {
    struct dvm_object *o = dvm__obj(vm, ref);
-   const uint64_t me = monitor_thread_token();
+   const uint64_t me = monitor_thread_token(vm);
    if (!o || o->monitor_owner != me || !o->monitor_depth) {
       dvm__throw(vm, "java/lang/IllegalMonitorStateException",
                  "wait without monitor ownership");
@@ -2171,7 +2187,7 @@ bool dvm__monitor_wait(struct dvm *vm, dvm_ref ref, uint64_t timeout_ms,
 bool dvm__monitor_notify(struct dvm *vm, dvm_ref ref, bool all)
 {
    struct dvm_object *o = dvm__obj(vm, ref);
-   if (!o || o->monitor_owner != monitor_thread_token() || !o->monitor_depth) {
+   if (!o || o->monitor_owner != monitor_thread_token(vm) || !o->monitor_depth) {
       dvm__throw(vm, "java/lang/IllegalMonitorStateException",
                  "notify without monitor ownership");
       return false;
@@ -2188,7 +2204,7 @@ bool dvm__monitor_state(struct dvm *vm, dvm_ref ref, bool current,
    struct dvm_object *o = dvm__obj(vm, ref);
    if (depth) *depth = o ? o->monitor_depth : 0;
    if (!o || !o->monitor_owner) return false;
-   return !current || o->monitor_owner == monitor_thread_token();
+   return !current || o->monitor_owner == monitor_thread_token(vm);
 }
 
 struct dvm_method *dvm__builtin_method(void) { return g_builtin_method; }
@@ -2212,6 +2228,19 @@ void dvm__warn_placeholder(struct dvm *vm)
 
 static bool invoke_body(struct dvm *vm, struct dvm_method *m, dvm_ref self,
                         const uint32_t *slots, int nslots, union dvm_value *out);
+static void trace_return(struct dvm *, const struct dvm_method *, char,
+                          const union dvm_value *);
+
+static bool trace_call_enabled(struct dvm *vm, const struct dvm_method *m,
+                                const struct dvm_call_frame *caller)
+{
+   if (!vm->trace) return false;
+   const char *filter = dvm__env_trace_class();
+   if (!filter) return true;
+   if (m && m->cls && m->cls->name && strstr(m->cls->name, filter)) return true;
+   return caller && caller->method && caller->method->cls &&
+      caller->method->cls->name && strstr(caller->method->cls->name, filter);
+}
 
 static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
                    const uint32_t *slots, int nslots, union dvm_value *out)
@@ -2221,6 +2250,8 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
    const uint32_t caller_pc = vm->cur_pc;
    vm->invoke_frame = &frame;
    bool ok = invoke_body(vm, m, self, slots, nslots, out);
+   if (ok && m && trace_call_enabled(vm, m, frame.previous))
+      trace_return(vm, m, m->ret_kind, out);
    vm->invoke_frame = frame.previous;
    /* A returned bytecode frame is no longer the current frame. Retaining it
     * misattributes later builtin exceptions and can outlive the method. */
@@ -2253,7 +2284,21 @@ static bool invoke_body(struct dvm *vm, struct dvm_method *m, dvm_ref self,
     * it here covers every callee kind at the one point they share. */
    memset(out, 0, sizeof *out);
 
-   if (vm->depth >= DVM_MAX_FRAMES) {
+   /* Java and native calls share this host thread's stack. Leave room to
+    * construct the exception and unwind rather than limiting Java depth. */
+   size_t stack_remaining = luna_os_stack_remaining();
+   if (stack_remaining < 64u * 1024u ||
+       (stack_remaining == SIZE_MAX && vm->depth >= DVM_MAX_FRAMES)) {
+      if (getenv("LUNARIA_DVM_STACK")) {
+         unsigned depth = 0;
+         for (const struct dvm_call_frame *f = vm->invoke_frame;
+              f && depth <= (unsigned)vm->depth + 1u; f = f->previous, ++depth) {
+            const struct dvm_method *method = f->method;
+            fprintf(stderr, "[dvm-stack] %u %s.%s%s\n", depth,
+               method && method->cls ? method->cls->name : "?",
+               method ? method->name : "?", method && method->sig ? method->sig : "");
+         }
+      }
       dvm__throw(vm, "java/lang/StackOverflowError", "%d frames", vm->depth);
       return false;
    }
@@ -2287,9 +2332,8 @@ static bool invoke_body(struct dvm *vm, struct dvm_method *m, dvm_ref self,
       if (!dvm__monitor_enter(vm, monitor)) return false;
    }
 
-   const char *trace_class = dvm__env_trace_class();
-   bool trace_this = !trace_class ||
-      (m->cls && m->cls->name && strstr(m->cls->name, trace_class));
+   bool trace_this = trace_call_enabled(vm, m,
+      vm->invoke_frame ? vm->invoke_frame->previous : NULL);
    if (vm->trace && trace_this) {
       fprintf(stderr, "[dvm] %*scall %s.%s%s\n", vm->depth * 2, "",
               m->cls ? m->cls->name : "?", m->name, m->sig ? m->sig : "");
@@ -2314,6 +2358,18 @@ static bool invoke_body(struct dvm *vm, struct dvm_method *m, dvm_ref self,
                     o && o->kind == DVM_OBJ_STRING ? "\"" : "");
             if (desc[0] && (strstr(desc, "Exception") || strstr(desc, "Error")))
                fprintf(stderr, "[dvm] %*s    (%s)\n", vm->depth * 2, "", desc);
+         } else if (one[0] != 'L' && one[0] != '[') {
+            union dvm_value value = {0};
+            value.ju = slots[slot];
+            if (wide && slot + 1 < nslots) value.ju |= (uint64_t)slots[slot + 1] << 32;
+            if (one[0] == 'F')
+               fprintf(stderr, "[dvm] %*s  arg%d = %.9g (float)\n", vm->depth * 2, "", i, (double)value.f);
+            else if (one[0] == 'D')
+               fprintf(stderr, "[dvm] %*s  arg%d = %.17g (double)\n", vm->depth * 2, "", i, value.d);
+            else if (one[0] == 'J')
+               fprintf(stderr, "[dvm] %*s  arg%d = %lld (wide)\n", vm->depth * 2, "", i, (long long)value.j);
+            else
+               fprintf(stderr, "[dvm] %*s  arg%d = %d\n", vm->depth * 2, "", i, value.i);
          }
          slot += wide ? 2 : 1;
       }
@@ -2400,9 +2456,15 @@ static void trace_return(struct dvm *vm, const struct dvm_method *m, char kind,
               "", cls, name, (long long)v->j);
       return;
    }
-   if (kind == 'I') {
+   if (strchr("ZBCSI", kind)) {
       fprintf(stderr, "[dvm] %*sreturn %s.%s -> %d\n", vm->depth * 2, "", cls,
               name, v->i);
+      return;
+   }
+   if (kind == 'F' || kind == 'D') {
+      fprintf(stderr, "[dvm] %*sreturn %s.%s -> %.17g (%s)\n", vm->depth * 2,
+              "", cls, name, kind == 'F' ? (double)v->f : v->d,
+              kind == 'F' ? "float" : "double");
       return;
    }
    dvm_ref r = (dvm_ref)v->u;
@@ -2587,18 +2649,14 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
 
       /* --- returns --- */
       case 0x0e:
-         if (vm->trace && trace_this) trace_return(vm, m, 'V', out);
          return true;
       case 0x0f: case 0x11:
          REQ(AA(u0));
          out->u = r[AA(u0)];
-         if (vm->trace && trace_this)
-            trace_return(vm, m, op == 0x11 ? 'L' : 'I', out);
          return true;
       case 0x10:
          REQ(AA(u0) + 1);
          out->ju = rw(r, AA(u0));
-         if (vm->trace && trace_this) trace_return(vm, m, 'J', out);
          return true;
 
       /* --- constants --- */
@@ -4339,15 +4397,27 @@ void dvm_gil_leave_to_guest(struct dvm *vm, unsigned cookie)
 
 extern int arm_exec_host_ui_thread(void) __attribute__((weak));
 extern void arm_exec_service_host_ui(void) __attribute__((weak));
+extern int arm_exec_main_looper_enter(void) __attribute__((weak));
+extern void arm_exec_main_looper_leave(void) __attribute__((weak));
 
-/* A modal JNI call can wait on the same host thread that normally pumps the
- * UI. Waiting releases execution, including the Android window's redraw and
- * input work. Do not run unrelated Handler callbacks recursively here. */
+/* A non-main guest can wait on the host executor that normally pumps UI.
+ * Main Looper work has an independent identity; a wait by the main Java
+ * thread itself must not re-enter that thread's Handler callbacks. */
 static void ui_before_platform_wait(struct dvm *vm)
 {
    static _Thread_local bool active;
    if (active || !arm_exec_host_ui_thread || !arm_exec_host_ui_thread()) return;
    active = true;
+   if (!dvm__logical_main_thread(vm) && arm_exec_main_looper_enter &&
+       arm_exec_main_looper_leave && arm_exec_main_looper_enter()) {
+      /* The host executor is borrowed by a suspended non-main guest. Run
+       * the main Looper as its own Java/native identity, then restore it. */
+      dvm_main_looper_tick(vm);
+      arm_exec_main_looper_leave();
+      if (arm_exec_service_host_ui) arm_exec_service_host_ui();
+      active = false;
+      return;
+   }
    struct dvm_tstate saved, main_turn = { 0 };
    dvm__tstate_save(vm, &saved);
    main_turn.cur_thread = vm->main_thread;
@@ -4403,7 +4473,6 @@ void dvm_gil_wait_for(struct dvm *vm, uintptr_t channel, unsigned ms)
 void dvm_gil_wait_for_ns(struct dvm *vm, uintptr_t channel, uint64_t ns)
 {
    if (dvm_is_stopping(vm)) return;
-   ui_before_platform_wait(vm);
 
    struct dvm_event_waiter w;
    pthread_condattr_t attr;
@@ -4445,6 +4514,10 @@ void dvm_gil_wait_for_ns(struct dvm *vm, uintptr_t channel, uint64_t ns)
    w.next = g_event_waiters;
    g_event_waiters = &w;
    pthread_mutex_unlock(&g_gil.m);
+
+   /* Main work can notify this very waiter. Register first so a notification
+    * delivered while the borrowed host executor services UI is not lost. */
+   ui_before_platform_wait(vm);
 
    unsigned d = dvm_gil_unlock_all(vm);
    /* See dvm_gil_wait(): the execution lock cannot be held across a wait for
@@ -4885,6 +4958,7 @@ void dvm_destroy(struct dvm *vm)
    for (uint32_t i = 0; i < vm->heap_size; ++i) {
       struct dvm_object *o = heap_slot(vm, i + 1u);
       free(o->utf8);
+      free(o->string_units);
       object_data_destroy(o);
       free(o->slots);
    }
@@ -4928,6 +5002,7 @@ void dvm_destroy(struct dvm *vm)
       free(vm->missing[i]);
    free(vm->missing);
 
+   if (g_gil_vm == vm) g_gil_vm = NULL;
    free(vm);
 }
 

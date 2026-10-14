@@ -1875,6 +1875,11 @@ enum SvcId : uint32_t {
     /* Add new SVCs above this line.  One past the highest SVC: build_jni_tables()
      * builds a trampoline for every number below it, and the unknown-symbol pool
      * starts here. */
+    SVC_GL_Uniform2i,
+    SVC_GL_Uniform3i,
+    SVC_GL_Uniform4i,
+    SVC_ANA_SET_WINDOW_FLAGS,
+    SVC_LOG_ASSERT,
     SVC_TRAMP_TOTAL,
 };
 

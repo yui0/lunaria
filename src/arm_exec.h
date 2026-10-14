@@ -541,6 +541,8 @@ typedef struct {
     const char *text;
 } ArmExecResourceValue;
 int arm_exec_apk_resource_bag(uint32_t id, ArmExecResourceValue **entries, size_t *count);
+/* Tests the selected entry itself, without resolving its parent or allocating. */
+int arm_exec_apk_resource_is_bag(uint32_t id);
 /* Resolve an attribute from a compiled style bag, following app-resource
  * parents.  Returns the Res_value data type, or 0 when absent. */
 int arm_exec_apk_style_value(uint32_t style_id, uint32_t attr_id,

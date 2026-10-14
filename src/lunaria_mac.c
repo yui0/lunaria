@@ -22,13 +22,24 @@
  *     in place, and the caller copies.
  */
 
+#define LUNARIA_SYMLINK_NATIVE
 #include "lunaria_os.h"
 
 #include <locale.h>
+#include <xlocale.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdatomic.h>
 #include <pthread.h>
+
+size_t luna_os_stack_remaining(void)
+{
+   uintptr_t high = (uintptr_t)pthread_get_stackaddr_np(pthread_self());
+   size_t size = pthread_get_stacksize_np(pthread_self());
+   uintptr_t current = (uintptr_t)__builtin_frame_address(0);
+   uintptr_t low = high - size;
+   return size && current >= low && current < high ? (size_t)(current - low) : SIZE_MAX;
+}
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>

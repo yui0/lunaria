@@ -1617,7 +1617,7 @@ void java_lang_StringBuilder__init_(JNIEnv *env, jobject obj, va_list args)
 jobject java_lang_StringBuilder_append(JNIEnv *env, jobject obj, va_list args)
 {
    int i = sb_get_or_alloc(obj);
-   if (i >= 0 && args) {
+   if (i >= 0 && JVM_VA_HAS_ARGS(args)) {
       uintptr_t raw = va_arg(args, uintptr_t);
       if (raw > 0 && raw <= 65536) {
          const char *s = (*env)->GetStringUTFChars(env, (jstring)(void*)raw, NULL);
@@ -1900,9 +1900,25 @@ jvm_va_from_jvalues(struct jvm_va_wrap *v, const jvalue *args)
 }
 
 /* Invoke a `T (*)(JNIEnv*, C, va_list)` stub with a jvalue array.  A NULL array
- * means "no arguments" and is forwarded as a NULL va_list, which is the sentinel
- * every stub already tests for — synthesising an empty va_list instead would
- * make those tests pass and the stub read past the end of nothing. */
+ * means "no arguments".  On Darwin/x86_64 that is a NULL va_list pointer; on
+ * AArch64 Linux (struct va_list) it is a zeroed va_list.  Stubs test this with
+ * JVM_VA_HAS_ARGS — synthesising a real empty list would make those tests pass
+ * and the stub read past the end of nothing. */
+#if defined(__aarch64__) && !defined(__APPLE__)
+#define JVM_CALL_A(f, T, C, p0, p1, args) \
+   ((args) ? ({ struct jvm_va_wrap v_; \
+                jvm_va_from_jvalues(&v_, (args)); \
+                ((T (*)(JNIEnv *, C, va_list))(f))((p0), (p1), v_.ap); }) \
+           : ({ struct jvm_va_wrap v_; memset(&v_, 0, sizeof v_); \
+                ((T (*)(JNIEnv *, C, va_list))(f))((p0), (p1), v_.ap); }))
+
+#define JVM_CALL_NV_A(f, T, p0, p1, p2, args) \
+   ((args) ? ({ struct jvm_va_wrap v_; \
+                jvm_va_from_jvalues(&v_, (args)); \
+                ((T (*)(JNIEnv *, jobject, jclass, va_list))(f))((p0), (p1), (p2), v_.ap); }) \
+           : ({ struct jvm_va_wrap v_; memset(&v_, 0, sizeof v_); \
+                ((T (*)(JNIEnv *, jobject, jclass, va_list))(f))((p0), (p1), (p2), v_.ap); }))
+#else
 #define JVM_CALL_A(f, T, C, p0, p1, args) \
    ((args) ? ({ struct jvm_va_wrap v_; \
                 jvm_va_from_jvalues(&v_, (args)); \
@@ -1914,6 +1930,7 @@ jvm_va_from_jvalues(struct jvm_va_wrap *v, const jvalue *args)
                 jvm_va_from_jvalues(&v_, (args)); \
                 ((T (*)(JNIEnv *, jobject, jclass, va_list))(f))((p0), (p1), (p2), v_.ap); }) \
            : ((T (*)(JNIEnv *, jobject, jclass, void *))(f))((p0), (p1), (p2), NULL))
+#endif
 
 static void
 JNIEnv_CallStaticVoidMethodV(JNIEnv* p0, jclass p1, jmethodID p2, va_list p3)

@@ -185,11 +185,37 @@ void luna_overlay_prepare_platform(void);
 unsigned char *luna_overlay_image_decode(const void *data, size_t len,
                                          int *w, int *h);
 void luna_overlay_image_free(unsigned char *pixels);
+/* Copies one ARGB Bitmap generation. Pending updates of the same key coalesce
+ * and are uploaded by the presenting thread; no image file or codec. */
+bool luna_overlay_image_argb(const char *key,int width,int height,const uint32_t *pixels);
+void luna_overlay_image_forget(const char *key);
 
 /* The width of one line of `text` at `px`, and the line height at `px`, in
  * the overlay's own type — what an Android TextView has to measure against
  * for the box the overlay then draws it in to fit.  Any thread; serialised
  * with the overlay's render. */
+/* CPU text runs shared by Android measurement and Bitmap Canvas drawing. */
+struct luna_text_glyph {
+ const void *font,*font_data;
+ uint32_t glyph,cluster;
+ float x,y,advance;
+};
+struct luna_text_run {
+ struct luna_text_glyph *glyphs;
+ size_t count;
+ float width;
+ bool missing;
+};
+struct luna_text_bitmap {
+ unsigned char *coverage;
+ int width,height,left,top;
+};
+bool luna_overlay_shape_text(const uint16_t *text,size_t length,float px,bool bold,struct luna_text_run *run);
+bool luna_overlay_raster_glyph(const struct luna_text_glyph *glyph,float px,struct luna_text_bitmap *bitmap);
+void luna_overlay_free_glyph(struct luna_text_bitmap *bitmap);
+/* At each UTF-16 boundary: bit 0 line opportunity, bit 1 grapheme boundary,
+ * bit 2 mandatory line break. Caller supplies length+1 bytes. */
+bool luna_overlay_text_breaks(const uint16_t *text,size_t length,const char *locale,unsigned char *breaks);
 float luna_overlay_text_width(const char *text, float px, bool bold);
 float luna_overlay_line_height(float px);
 struct luna_overlay_font_metrics {

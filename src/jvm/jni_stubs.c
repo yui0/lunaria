@@ -220,7 +220,7 @@ java_lang_System_getProperty(JNIEnv *env, jobject object, va_list args)
    assert(env && object);
    // The ARM JNI bridge dispatches through CallObjectMethodA with a NULL
    // argument vector, so `args` may be NULL.
-   if (!args) return NULL;
+   if (!JVM_VA_HAS_ARGS(args)) return NULL;
    const char *key = (*env)->GetStringUTFChars(env, va_arg(args, jstring), NULL);
    if (!key) return NULL;
 
@@ -244,7 +244,7 @@ void
 java_lang_System_load(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
-   if (!args) return;
+   if (!JVM_VA_HAS_ARGS(args)) return;
    jstring jlib = va_arg(args, jstring);
    const char *lib = (*env)->GetStringUTFChars(env, jlib, NULL);
    if (!lib) return;
@@ -261,7 +261,7 @@ jobject
 java_lang_ClassLoader_findLibrary(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
-   if (!args) return NULL;
+   if (!JVM_VA_HAS_ARGS(args)) return NULL;
    const char *libname = (*env)->GetStringUTFChars(env, va_arg(args, jstring), NULL);
    const char *libdir = arm_exec_get_main_lib_dir();
    char lib[4096];
@@ -329,7 +329,7 @@ jobject
 java_lang_ClassLoader_findClass(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
-   if (!args) return NULL;
+   if (!JVM_VA_HAS_ARGS(args)) return NULL;
    jstring str = va_arg(args, jstring);
    const char *utf = (*env)->GetStringUTFChars(env, str, NULL);
    return (*env)->FindClass(env, utf);
@@ -368,7 +368,7 @@ jclass
 java_lang_Class_forName(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
-   if (!args) return NULL;
+   if (!JVM_VA_HAS_ARGS(args)) return NULL;
    jstring str = va_arg(args, jstring);
    const char *utf = (*env)->GetStringUTFChars(env, str, NULL);
    return (*env)->FindClass(env, utf);
@@ -436,7 +436,7 @@ jboolean
 java_lang_String_equals(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
-   if (!args) return false;
+   if (!JVM_VA_HAS_ARGS(args)) return false;
    jstring str = va_arg(args, jstring);
    const char *utf1 = (*env)->GetStringUTFChars(env, object, NULL);
    const char *utf2 = (*env)->GetStringUTFChars(env, str, NULL);
@@ -598,7 +598,7 @@ static void motion_trace(const char *m)
 static jint
 android_log_write(JNIEnv *env, char level, va_list args)
 {
-   if (!args) return 0;
+   if (!JVM_VA_HAS_ARGS(args)) return 0;
    const char *tag = (*env)->GetStringUTFChars(env, va_arg(args, jstring), NULL);
    /* Log.w(String, Throwable) has no message argument; GetStringUTFChars
     * answers NULL for a non-string handle rather than misreading it. */
@@ -625,7 +625,7 @@ jint
 android_util_Log_println(JNIEnv *env, jobject object, va_list args)
 {
    (void)object;
-   if (!args) return 0;
+   if (!JVM_VA_HAS_ARGS(args)) return 0;
    int prio = va_arg(args, jint);
    static const char lv[] = "??VDIWEF";
    return android_log_write(env, lv[(prio >= 2 && prio <= 7) ? prio : 0], args);
@@ -660,7 +660,7 @@ android_util_Log_getStackTraceString(JNIEnv *env, jobject object, va_list args)
 static jstring
 android_gl_get_string(JNIEnv *env, va_list args)
 {
-   if (!args) return NULL;
+   if (!JVM_VA_HAS_ARGS(args)) return NULL;
    unsigned name = (unsigned)va_arg(args, jint);
    const char *s = arm_exec_gl_string(name);
    return s ? (*env)->NewStringUTF(env, s) : NULL;
@@ -1521,7 +1521,7 @@ android_content_Context_getDir(JNIEnv *env, jobject object, va_list args)
    char namebuf[256];
    snprintf(namebuf, sizeof namebuf, "%s", "dir");
    jstring js = NULL;
-   if (args) {
+   if (JVM_VA_HAS_ARGS(args)) {
       js = va_arg(args, jstring);
       (void)va_arg(args, jint); /* mode */
       if (js) {
@@ -1548,7 +1548,7 @@ jstring
 android_net_Uri_decode(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
-   if (!args) return NULL;
+   if (!JVM_VA_HAS_ARGS(args)) return NULL;
    jstring str = va_arg(args, jstring);
    (*env)->GetStringUTFChars(env, str, NULL);
    return str;
@@ -1558,7 +1558,7 @@ jstring
 android_net_Uri_encode(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
-   if (!args) return NULL;
+   if (!JVM_VA_HAS_ARGS(args)) return NULL;
    jstring str = va_arg(args, jstring);
    (*env)->GetStringUTFChars(env, str, NULL);
    return str;
@@ -1568,7 +1568,7 @@ jstring
 android_os_Bundle_getString(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
-   if (!args) return NULL;
+   if (!JVM_VA_HAS_ARGS(args)) return NULL;
    jstring str1 = va_arg(args, jstring);
    (*env)->GetStringUTFChars(env, str1, NULL);
    return NULL;
@@ -1922,7 +1922,7 @@ jobject
 android_content_Context_getSystemService(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
-   if (!args)
+   if (!JVM_VA_HAS_ARGS(args))
       return NULL;
 
    /* Share the context-owned service and virtual wrapper dispatch with Java.
@@ -1997,7 +1997,7 @@ jobject
 android_content_pm_PackageManager_getPackageInfo(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
-   if (!args) return NULL;
+   if (!JVM_VA_HAS_ARGS(args)) return NULL;
    jstring name = va_arg(args, jstring);
    jint flags = va_arg(args, jint);
    return dvm_jni_package_info(env, name, flags);
@@ -2016,7 +2016,7 @@ android_content_pm_PackageManager_getApplicationInfo(JNIEnv *env,
                                                        va_list args)
 {
    assert(env && object);
-   if (!args) return NULL;
+   if (!JVM_VA_HAS_ARGS(args)) return NULL;
    jstring name = va_arg(args, jstring);
    (void)va_arg(args, jint);
    if (!name) return NULL;
@@ -2518,7 +2518,7 @@ jobject
 android_os_PowerManager_newWakeLock(JNIEnv *env, jobject object, va_list args)
 {
    (void)object;
-   if (args) {
+   if (JVM_VA_HAS_ARGS(args)) {
       (void)va_arg(args, jint);    /* levelAndFlags */
       (void)va_arg(args, jstring); /* tag */
    }
@@ -2674,7 +2674,7 @@ android_app_ActivityManager_getMemoryInfo(JNIEnv *env, jobject obj, va_list args
    (void)obj;
 
    jobject out_info = NULL;
-   if (args)
+   if (JVM_VA_HAS_ARGS(args))
       out_info = va_arg(args, jobject);
    if (!out_info)
       return;
@@ -3209,7 +3209,7 @@ void
 android_view_Display_getRealMetrics(JNIEnv *e, jobject o, va_list a)
 {
    (void)o;
-   if (!a) return;
+   if (!JVM_VA_HAS_ARGS(a)) return;
    android_view_Display_fillMetrics(e, va_arg(a, jobject));
 }
 void
@@ -3246,7 +3246,7 @@ void
 android_view_Display_getRealSize(JNIEnv *e, jobject o, va_list a)
 {
    (void)o;
-   if (!a) return;
+   if (!JVM_VA_HAS_ARGS(a)) return;
    android_view_Display_fillPoint(e, va_arg(a, jobject));
 }
 void android_view_Display_getSize(JNIEnv *e, jobject o, va_list a)

@@ -4,6 +4,9 @@
 #   ./_make-release.sh [OPTIONS] [TAG]     # TAGを指定 (省略時は YYYY.M.D)
 #   ./_make-release.sh                     # Linux ネイティブ + Linux 対向アーキ (aarch64 ⇄ x86_64) クロス
 #   ./_make-release.sh --native-only       # Linux ネイティブのみ (対向アーキのクロスをしない)
+#   bash _make-release.sh                  # clone 直後で Permission denied のとき (chmod +x でも可)
+#   ※ Orange Pi 等で panfork Mesa があると amd64 の libegl が multiarch 同居できない。
+#     その場合は .deb を .cross-sysroot-amd64/ に展開してクロスリンクする。
 #   ./_make-release.sh --windows           # + Windows (mingw クロス, .zip)
 #   ./_make-release.sh --macos             # Linux + macOS (.dmg; macOS ホスト上のみビルド可)
 #   ./_make-release.sh --all-targets       # Linux + Windows + macOS すべて
@@ -33,6 +36,12 @@
 #   SYNC_REPO           — --sync-os の同期先 (default: yui0/qBerryOS)
 #   SYNC_TAG_PREFIX     — 同期先でのタグ接頭辞 (default: lunaria-)  例: lunaria-2026.10.9
 #   WIN_DEPS 他         — scripts/dist-cross-win.sh が参照する変数をそのまま引き継ぐ
+#
+# `sh _make-release.sh` (dash 等) でも動くよう、bash でなければ付け替える。
+# この分岐だけ POSIX にする（pipefail / [[ は bash 専用）。
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -99,19 +108,136 @@ fi
 # クロスアーキ用の -dev パッケージ (Makefile が -lglfw -lEGL -lGLESv2 -lasound -lbsd -lunwind -lssl -lz を使う)
 CROSS_DEV_PKGS=(libglfw3-dev libegl-dev libgles-dev libasound2-dev libbsd-dev
                 libunwind-dev libssl-dev zlib1g-dev)
+# libEGL/libGLESv2 の DT_NEEDED。-dev 依存の再帰取得が欠けることがあるので明示する。
+CROSS_RUNTIME_PKGS=(libglvnd0 libegl1 libgles2)
+# panfork 等のカスタム Mesa がある board では Multi-Arch:same の Mesa が
+# 対向アーキと同居できない。その場合 deb を展開した sysroot でリンクする。
+CROSS_SYSROOT=""
+CROSS_LIB_FLAGS=""
+
+# 対向アーキの .so をシステム multiarch か sysroot から探す
+# name は "EGL" / "GLdispatch" など。versioned soname (libGLdispatch.so.0) も探す。
+cross_lib_path() {
+  local name="$1" p dir
+  local dirs=("/usr/lib/$CROSS_TRIPLE" "/lib/$CROSS_TRIPLE")
+  if [[ -n "${CROSS_SYSROOT:-}" ]]; then
+    dirs+=("$CROSS_SYSROOT/usr/lib/$CROSS_TRIPLE" "$CROSS_SYSROOT/lib/$CROSS_TRIPLE")
+  fi
+  for dir in "${dirs[@]}"; do
+    [[ -d "$dir" ]] || continue
+    for p in "$dir/lib${name}.so" "$dir/lib${name}.so."*; do
+      [[ -e "$p" ]] && { echo "$p"; return 0; }
+    done
+  done
+  return 1
+}
+
+# クロスリンク時、共有ライブラリの DT_NEEDED (libGLdispatch 等) を解決する -L / -rpath-link
+cross_link_flags() {
+  local dirs=() d flags="" rpath_link=""
+  if [[ -n "$CROSS_SYSROOT" ]]; then
+    dirs+=(
+      "$CROSS_SYSROOT/usr/lib/$CROSS_TRIPLE"
+      "$CROSS_SYSROOT/lib/$CROSS_TRIPLE"
+      "$CROSS_SYSROOT/usr/lib"
+      "$CROSS_SYSROOT/lib"
+    )
+  fi
+  dirs+=("/usr/lib/$CROSS_TRIPLE" "/lib/$CROSS_TRIPLE" "/usr/$CROSS_TRIPLE/lib")
+  for d in "${dirs[@]}"; do
+    [[ -d "$d" ]] || continue
+    flags+=" -L$d"
+    rpath_link+="${rpath_link:+:}$d"
+  done
+  [[ -n "$rpath_link" ]] && flags+=" -Wl,-rpath-link,$rpath_link"
+  # trim leading space
+  echo "${flags# }"
+}
+
+# apt で入れられない対向アーキ -dev を、deb 展開 sysroot で賄う
+# (Orange Pi + panfork Mesa など: arm64 カスタム Mesa と amd64 標準 Mesa が同居不可)
+setup_cross_sysroot() {
+  local arch="$1"
+  local sysroot="$SCRIPT_DIR/.cross-sysroot-$arch"
+  local tmpdir pkgs pkg
+  info "対向アーキ ($arch) を sysroot に展開します (multiarch 同居不可時のフォールバック)..."
+  tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/lunaria-cross-debs.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmpdir'" RETURN
+  rm -rf "$sysroot"
+  mkdir -p "$sysroot"
+  # 依存を再帰解決して download (インストールはしない → Mesa 衝突を回避)
+  mapfile -t pkgs < <(
+    apt-cache depends --recurse --no-recommends --no-suggests \
+      --no-conflicts --no-breaks --no-replaces --no-enhances \
+      "${CROSS_DEV_PKGS[@]/%/:$arch}" "${CROSS_RUNTIME_PKGS[@]/%/:$arch}" 2>/dev/null \
+      | awk '/^[^[:space:]]/ { sub(/:.*$/, ""); print }' \
+      | sed "s/\$/:$arch/" \
+      | sort -u
+  )
+  # apt-cache が空振りしたときは最低限のパッケージ名だけ落とす
+  if [[ ${#pkgs[@]} -eq 0 ]]; then
+    pkgs=("${CROSS_DEV_PKGS[@]/%/:$arch}" "${CROSS_RUNTIME_PKGS[@]/%/:$arch}")
+  fi
+  (
+    cd "$tmpdir"
+    # 仮想パッケージ等で落ちる依存は飛ばす (リンクに不要なことが多い)
+    for pkg in "${pkgs[@]}" "${CROSS_DEV_PKGS[@]/%/:$arch}" "${CROSS_RUNTIME_PKGS[@]/%/:$arch}"; do
+      apt-get download "$pkg" 2>/dev/null || true
+    done
+    shopt -s nullglob
+    set -- ./*.deb
+    [[ -e "$1" ]] || die "対向アーキの .deb を download できませんでした"
+    for deb in "$@"; do
+      dpkg-deb -x "$deb" "$sysroot"
+    done
+  )
+  # リンク用 .so の有無を確認 (glfw / EGL / GLESv2 は Mesa 衝突で欠ける典型。
+  # GLdispatch は libEGL の DT_NEEDED — 欠けると undefined reference to __glDispatch*)
+  CROSS_SYSROOT="$sysroot"
+  for name in glfw EGL GLESv2 GLdispatch; do
+    cross_lib_path "$name" >/dev/null \
+      || die "sysroot に lib${name}.so がありません ($sysroot)。--native-only でクロスを省略できます"
+  done
+  CROSS_LIB_FLAGS="$(cross_link_flags)"
+  success "クロス用 sysroot: $sysroot"
+}
+
+# 既存 sysroot に libglvnd (GLdispatch) だけ欠けている場合、その deb だけ足す
+ensure_sysroot_glvnd() {
+  local arch="$1" sysroot="$2" tmpdir pkg
+  CROSS_SYSROOT="$sysroot"
+  cross_lib_path GLdispatch >/dev/null && return 0
+  info "sysroot に libGLdispatch が無いため libglvnd0:$arch を追加します..."
+  tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/lunaria-glvnd.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmpdir'" RETURN
+  (
+    cd "$tmpdir"
+    for pkg in "${CROSS_RUNTIME_PKGS[@]/%/:$arch}"; do
+      apt-get download "$pkg" 2>/dev/null || true
+    done
+    shopt -s nullglob
+    for deb in ./*.deb; do
+      dpkg-deb -x "$deb" "$sysroot"
+    done
+  )
+  cross_lib_path GLdispatch >/dev/null \
+    || die "sysroot に libGLdispatch を追加できませんでした ($sysroot)。apt で libglvnd0:$arch が取れるか確認するか、--native-only でクロスを省略できます"
+}
 
 # ── ビルド依存パッケージ (Linux ホスト / apt) ─────────
 # qfkey 版と同様、無ければ自動インストールする (Rust は不要)。
-# Windows クロスには mingw-w64 + ninja + zip、tar の zstd 展開 (依存取得用) が要る。
+# Windows クロスには UCRT 対応 MinGW + ninja + zip、tar の zstd 展開 (依存取得用) が要る。
+# Ubuntu apt の mingw-w64 (GCC 13) は -mcrtdll=ucrt 非対応なので使わず、後段で llvm-mingw を入れる。
 if [[ "$HOST_OS" == "Linux" ]] && command -v apt-get &>/dev/null; then
   APT_PKGS=(
     build-essential nasm cmake ninja-build clang libclang-dev pkg-config
     libboost-dev libssl-dev libglfw3-dev libgles2-mesa-dev libegl1-mesa-dev
-    libasound2-dev libbsd-dev libunwind-dev zlib1g-dev
+    libasound2-dev libbsd-dev libunwind-dev zlib1g-dev libvulkan-dev
     libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
     python3 curl jq zip unzip bzip2 xz-utils zstd git
   )
-  [[ "$BUILD_WINDOWS" == "true" ]] && APT_PKGS+=(mingw-w64)
   [[ "$LINUX_CROSS" == "true" ]] && APT_PKGS+=("crossbuild-essential-$APT_CROSS_ARCH")
   APT_MISSING=()
   for p in "${APT_PKGS[@]}"; do
@@ -123,6 +249,53 @@ if [[ "$HOST_OS" == "Linux" ]] && command -v apt-get &>/dev/null; then
     sudo apt-get install -y --no-install-recommends "${APT_MISSING[@]}"
   fi
 
+  # Ubuntu apt MinGW lacks -mcrtdll=ucrt; install llvm-mingw (UCRT) when needed.
+  # Host arch matters: aarch64 (Orange Pi 等) には *-ubuntu-22.04-aarch64 を入れる。
+  # x86_64 用バイナリを PATH に置くと Exec format error で
+  # "cross compiler failed to link a trivial program" になる。
+  if [[ "$BUILD_WINDOWS" == "true" ]]; then
+    _need_llvm_mingw=true
+    if command -v x86_64-w64-mingw32-gcc &>/dev/null \
+        && x86_64-w64-mingw32-gcc --version &>/dev/null; then
+      if printf 'int main(void){return 0;}\n' \
+          | x86_64-w64-mingw32-gcc -mcrtdll=ucrt -x c -fsyntax-only - &>/dev/null; then
+        _need_llvm_mingw=false
+      else
+        _probe=$(mktemp -d)
+        printf 'int main(void){return 0;}\n' >"$_probe/t.c"
+        if x86_64-w64-mingw32-gcc "$_probe/t.c" -o "$_probe/t.exe" &>/dev/null \
+            && x86_64-w64-mingw32-objdump -p "$_probe/t.exe" | grep -Eiq 'ucrtbase|api-ms-win-crt-'; then
+          _need_llvm_mingw=false
+        fi
+        rm -rf "$_probe"
+      fi
+    fi
+    if [[ "$_need_llvm_mingw" == "true" ]]; then
+      _ver=20261006
+      case "$(uname -m)" in
+        x86_64)        _llvm_host=x86_64 ;;
+        aarch64|arm64) _llvm_host=aarch64 ;;
+        *) die "Windows クロス用 llvm-mingw は x86_64 / aarch64 ホストのみ対応です (今: $(uname -m))" ;;
+      esac
+      _prefix="/opt/llvm-mingw-${_ver}-ucrt-ubuntu-22.04-${_llvm_host}"
+      _gcc="$_prefix/bin/x86_64-w64-mingw32-gcc"
+      # -x だけでは他アーキの ELF を弾けないので、実際に --version が通るか見る
+      if [[ ! -x "$_gcc" ]] || ! "$_gcc" --version &>/dev/null; then
+        info "UCRT 用 llvm-mingw ($_llvm_host ホスト) をインストール中..."
+        _archive="llvm-mingw-${_ver}-ucrt-ubuntu-22.04-${_llvm_host}.tar.xz"
+        curl -fsSL -o "/tmp/$_archive" \
+          "https://github.com/mstorsjo/llvm-mingw/releases/download/${_ver}/$_archive"
+        sudo rm -rf "$_prefix"
+        sudo tar -xJf "/tmp/$_archive" -C /opt
+        rm -f "/tmp/$_archive"
+        "$_gcc" --version &>/dev/null \
+          || die "llvm-mingw の gcc を実行できません ($_gcc)。アーカイブとホストアーキを確認してください"
+      fi
+      sudo ln -sfn "$_prefix" /opt/llvm-mingw
+      export PATH="/opt/llvm-mingw/bin:$PATH"
+    fi
+  fi
+
   # 対向アーキの -dev ライブラリ (multiarch)
   if [[ "$LINUX_CROSS" == "true" ]]; then
     if ! dpkg -s "libglfw3-dev:$APT_CROSS_ARCH" &>/dev/null || ! dpkg -s "libunwind-dev:$APT_CROSS_ARCH" &>/dev/null; then
@@ -132,8 +305,17 @@ if [[ "$HOST_OS" == "Linux" ]] && command -v apt-get &>/dev/null; then
 
       # 既存の apt ソースを native アーキに限定し、対向アーキ用のミラーを別ファイルで追加する。
       # (ports.ubuntu.com は amd64 を、archive.ubuntu.com は arm64 を配信しない → 404 回避)
+      # 既に amd64-cross.list 等で対向アーキミラーがある場合は二重登録しない。
       _CROSS_LIST="/etc/apt/sources.list.d/lunaria-cross-$APT_CROSS_ARCH.list"
-      if [[ ! -f "$_CROSS_LIST" ]]; then
+      _HAS_CROSS_MIRROR=false
+      for _f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+        [[ -f "$_f" ]] || continue
+        if grep -qE "^deb[[:space:]]+\[arch=$APT_CROSS_ARCH\]" "$_f"; then
+          _HAS_CROSS_MIRROR=true
+          break
+        fi
+      done
+      if [[ "$_HAS_CROSS_MIRROR" == "false" && ! -f "$_CROSS_LIST" ]]; then
         _CODENAME="$(lsb_release -sc 2>/dev/null || echo noble)"
         [[ -f /etc/apt/sources.list ]] && \
           sudo sed -i "/^deb [^[]/ s|^deb |deb [arch=$NATIVE_DPKG_ARCH] |" /etc/apt/sources.list || true
@@ -152,16 +334,48 @@ deb [arch=$APT_CROSS_ARCH] $_MIRROR $_CODENAME main restricted universe multiver
 deb [arch=$APT_CROSS_ARCH] $_MIRROR $_CODENAME-updates main restricted universe multiverse
 deb [arch=$APT_CROSS_ARCH] $_MIRROR $_CODENAME-security main restricted universe multiverse
 APT_EOF
+      elif [[ "$_HAS_CROSS_MIRROR" == "true" ]]; then
+        info "対向アーキ ($APT_CROSS_ARCH) の apt ミラーは既にあるため追加しません"
+        # 手動の amd64-cross.list 等と lunaria-cross-*.list が二重だと apt が大量警告する
+        if [[ -f "$_CROSS_LIST" ]]; then
+          for _f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+            [[ -f "$_f" && "$_f" != "$_CROSS_LIST" ]] || continue
+            if grep -qE "^deb[[:space:]]+\[arch=$APT_CROSS_ARCH\]" "$_f"; then
+              warn "重複ミラー $_CROSS_LIST を削除します ($_f を利用)"
+              sudo rm -f "$_CROSS_LIST"
+              break
+            fi
+          done
+        fi
       fi
       sudo apt-get update -qq || true
       sudo apt-get install -y --no-install-recommends \
-        "${CROSS_DEV_PKGS[@]/%/:$APT_CROSS_ARCH}" || \
+        "${CROSS_DEV_PKGS[@]/%/:$APT_CROSS_ARCH}" \
+        "${CROSS_RUNTIME_PKGS[@]/%/:$APT_CROSS_ARCH}" || \
         warn "対向アーキの -dev パッケージを一括インストールできませんでした。個別に再試行します。"
-      for p in "${CROSS_DEV_PKGS[@]}"; do
+      for p in "${CROSS_DEV_PKGS[@]}" "${CROSS_RUNTIME_PKGS[@]}"; do
         dpkg -s "$p:$APT_CROSS_ARCH" &>/dev/null || \
           sudo apt-get install -y --no-install-recommends "$p:$APT_CROSS_ARCH" || \
           warn "$p:$APT_CROSS_ARCH をインストールできませんでした"
       done
+    fi
+    # multiarch で GLFW/EGL が入らない場合 (panfork Mesa 等) は sysroot へフォールバック
+    if ! cross_lib_path glfw >/dev/null || ! cross_lib_path EGL >/dev/null || ! cross_lib_path GLESv2 >/dev/null; then
+      _EXISTING_SYSROOT="$SCRIPT_DIR/.cross-sysroot-$APT_CROSS_ARCH"
+      if [[ -e "$_EXISTING_SYSROOT/usr/lib/$CROSS_TRIPLE/libglfw.so" \
+         && -e "$_EXISTING_SYSROOT/usr/lib/$CROSS_TRIPLE/libEGL.so" \
+         && -e "$_EXISTING_SYSROOT/usr/lib/$CROSS_TRIPLE/libGLESv2.so" ]]; then
+        CROSS_SYSROOT="$_EXISTING_SYSROOT"
+        ensure_sysroot_glvnd "$APT_CROSS_ARCH" "$CROSS_SYSROOT"
+        CROSS_LIB_FLAGS="$(cross_link_flags)"
+        info "既存のクロス用 sysroot を再利用: $CROSS_SYSROOT"
+      else
+        warn "対向アーキの GLFW/EGL/GLES が multiarch で入りません (カスタム Mesa PPA との衝突が典型です)"
+        setup_cross_sysroot "$APT_CROSS_ARCH"
+      fi
+    else
+      # multiarch でも DT_NEEDED (libGLdispatch.so.0) 解決に -rpath-link が要る
+      CROSS_LIB_FLAGS="$(cross_link_flags)"
     fi
   fi
 fi
@@ -174,9 +388,12 @@ check_cmd python3
 if [[ "$UPLOAD" == "true" ]]; then check_cmd curl; check_cmd jq; fi
 if [[ "$HOST_OS" == "Linux" && "$LINUX_CROSS" == "true" ]]; then
   for c in "$CROSS_TRIPLE-gcc" "$CROSS_TRIPLE-g++" "$CROSS_TRIPLE-objdump"; do check_cmd "$c"; done
-  for l in glfw EGL GLESv2 asound bsd unwind ssl crypto z; do
-    [[ -e "/usr/lib/$CROSS_TRIPLE/lib$l.so" ]] ||       die "対向アーキのライブラリが見つかりません: /usr/lib/$CROSS_TRIPLE/lib$l.so (対応する -dev:$APT_CROSS_ARCH パッケージを確認してください。--native-only でクロスを省略できます)"
+  for l in glfw EGL GLESv2 GLdispatch asound bsd unwind ssl crypto z; do
+    cross_lib_path "$l" >/dev/null || \
+      die "対向アーキのライブラリが見つかりません: lib${l}.so (対応する -dev:$APT_CROSS_ARCH / libglvnd0:$APT_CROSS_ARCH を確認するか、--native-only でクロスを省略できます)"
   done
+  # 未設定なら multiarch パス向けに -L/-rpath-link を組み立てる
+  [[ -z "$CROSS_LIB_FLAGS" ]] && CROSS_LIB_FLAGS="$(cross_link_flags)"
 fi
 if [[ "$BUILD_WINDOWS" == "true" ]]; then
   for c in x86_64-w64-mingw32-gcc x86_64-w64-mingw32-g++ ninja zip curl bunzip2; do check_cmd "$c"; done
@@ -246,16 +463,29 @@ if [[ "$HOST_OS" == "Linux" && "$LINUX_CROSS" == "true" ]]; then
   NAME="lunaria-$DIST_DATE-linux-$CROSS_ARCH"
   info "ビルド中: $NAME.tar.gz (クロス: $CROSS_TRIPLE) ..."
   _GCC_CROSS_LIB="$(ls -d /usr/lib/gcc-cross/$CROSS_TRIPLE/* 2>/dev/null | sort -V | tail -1 || true)"
+  _CROSS_LPATH="/usr/lib/$CROSS_TRIPLE:/lib/$CROSS_TRIPLE:/usr/$CROSS_TRIPLE/lib"
+  [[ -n "$_GCC_CROSS_LIB" ]] && _CROSS_LPATH="$_CROSS_LPATH:$_GCC_CROSS_LIB"
+  if [[ -n "$CROSS_SYSROOT" ]]; then
+    _CROSS_LPATH="$CROSS_SYSROOT/usr/lib/$CROSS_TRIPLE:$CROSS_SYSROOT/lib/$CROSS_TRIPLE:$_CROSS_LPATH"
+    info "クロスリンクに sysroot を使用: $CROSS_SYSROOT"
+  fi
   reset_tree
+  [[ -z "$CROSS_LIB_FLAGS" ]] && CROSS_LIB_FLAGS="$(cross_link_flags)"
+  _MAKE_CROSS_ARGS=(
+    dist
+    "DIST_NAME=$NAME" "DIST_ARCH=$CROSS_ARCH" "OPENH264_ARCH=$CROSS_OPENH264"
+    "CC=$CROSS_TRIPLE-gcc" "CXX=$CROSS_TRIPLE-g++"
+    "HOST_CPPFLAGS="
+    "HOST_GL_LIBS=$CROSS_LIB_FLAGS -lEGL -lGLESv2"
+    "HOST_WINDOW_LIBS=$CROSS_LIB_FLAGS -lglfw"
+    "HOST_LIBC_LIBS=$CROSS_LIB_FLAGS -lbsd -lunwind"
+    "LDFLAGS=$CROSS_LIB_FLAGS"
+    "DYNARMIC_CMAKE_FLAGS=-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=$CROSS_ARCH -DCMAKE_C_COMPILER=$CROSS_TRIPLE-gcc -DCMAKE_CXX_COMPILER=$CROSS_TRIPLE-g++ -DBoost_INCLUDE_DIR=/usr/include -DBoost_NO_BOOST_CMAKE=ON"
+  )
   OBJDUMP="$CROSS_TRIPLE-objdump" \
-  DIST_LIB_DIRS="/usr/lib/$CROSS_TRIPLE:/lib/$CROSS_TRIPLE:/usr/$CROSS_TRIPLE/lib:${_GCC_CROSS_LIB}" \
-  make -j"$JOBS" dist \
-    DIST_NAME="$NAME" DIST_ARCH="$CROSS_ARCH" OPENH264_ARCH="$CROSS_OPENH264" \
-    CC="$CROSS_TRIPLE-gcc" CXX="$CROSS_TRIPLE-g++" \
-    HOST_CPPFLAGS="" \
-    HOST_WINDOW_LIBS="-lglfw" \
-    HOST_LIBC_LIBS="-lbsd -lunwind" \
-    DYNARMIC_CMAKE_FLAGS="-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=$CROSS_ARCH -DCMAKE_C_COMPILER=$CROSS_TRIPLE-gcc -DCMAKE_CXX_COMPILER=$CROSS_TRIPLE-g++ -DBoost_INCLUDE_DIR=/usr/include -DBoost_NO_BOOST_CMAKE=ON"
+  LIBRARY_PATH="${CROSS_SYSROOT:+$CROSS_SYSROOT/usr/lib/$CROSS_TRIPLE:$CROSS_SYSROOT/lib/$CROSS_TRIPLE:}${LIBRARY_PATH:-}" \
+  DIST_LIB_DIRS="$_CROSS_LPATH" \
+  make -j"$JOBS" "${_MAKE_CROSS_ARGS[@]}"
   collect "$NAME.tar.gz"
   reset_tree
 fi

@@ -21,9 +21,17 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/syscall.h>
-#include <sys/user.h> // PAGE_SIZE, PAGE_SHIFT
+#include <sys/user.h> /* may define PAGE_SIZE on x86; aarch64 glibc omits it */
 #include <netdb.h> // h_errno
 #include "trace.h"
+
+/* Bionic guests and linker.h use a fixed 4 KiB page. Do not inherit the host
+ * PAGE_SIZE: aarch64 glibc leaves it undefined (variable page size), and a
+ * 16/64 KiB host page would be wrong for the guest ABI. */
+#undef PAGE_SIZE
+#undef PAGE_SHIFT
+#define PAGE_SIZE 4096
+#define PAGE_SHIFT 12
 
 struct bionic_dirent {
    uint64_t d_ino;

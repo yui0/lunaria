@@ -1,82 +1,95 @@
 # Lunaria
 
-### Android を起動せずに、Android ゲームエンジンを動かす。
+### Androidゲームを、いつものPCで。
 
 [![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-5b5bd6.svg)](LICENSE)
 [![Guests](https://img.shields.io/badge/guest-ARM32%20%7C%20ARM64-20232a.svg)](#仕組み)
-[![Engines](https://img.shields.io/badge/engines-Unity%20%7C%20Unreal-20232a.svg)](#互換性)
+[![Engines](https://img.shields.io/badge/engines-Unity%20%7C%20Unreal%20%7C%20native-20232a.svg)](#互換性)
 [![Sponsor](https://img.shields.io/badge/sponsor-%E2%99%A5-ea4aaa.svg)](https://github.com/sponsors/yui0)
 
 [English](README.md)
 
-Lunaria は、Android 向けアプリを Linux 上で動かすための実験的な変換レイヤーです。
-APK、XAPK、APKS からネイティブライブラリを読み込み、ARM32/ARM64 コードを
-[dynarmic](https://github.com/merryhime/dynarmic) で実行し、Android API、JNI、EGL、
-OpenGL ES、MediaCodec を Linux ホスト側へ橋渡しします。APK 内の Java コードは、
-内蔵の Dalvik バイトコードエミュレーターで実行されるため、Android のシステムイメージは不要です。
+**Lunariaは、Androidのシステムイメージを使わずに、AndroidアプリやゲームをPC上で動かすための互換レイヤーです。**
+Android OS全体を仮想マシンで起動する代わりに、アプリ本体を直接読み込み、ARM32／ARM64のコードを
+[dynarmic](https://github.com/merryhime/dynarmic)で実行します。JNI、EGL、OpenGL ES、MediaCodecなどの
+Android向け機能はホスト側へ橋渡しし、APKに含まれるJavaバイトコードは内蔵のDalvikインタプリタで処理します。
 
-`android.webkit.WebView` は Chrome DevTools のパイプ経由でホスト側ブラウザーに描画されます。
-利用できるのは、インストール済みの Chrome / Chromium、または内蔵の
-[luna-browser](luna-browser/)（luna-ui + QuickJS）です。
+`.apk`、`.xapk`、`.apks`、`.aab` に対応。パッケージの展開やマニフェスト解析、split APKの統合、キャッシュ管理、
+アカウントごとのデータ分離まで、Lunariaがまとめて行います。WebViewはChrome／Chromium、または内蔵の
+[luna-browser](luna-browser/)を使って表示します。
+
+**動作を確認したタイトル：** 原神、二ノ国：Cross Worlds、アルケミアストーリー、
+気球！エアロノート（2013年のARM32向けAPK）、Black Clover: Asta Fightなど。
+ただし、プレイできる範囲はタイトルによって異なります。詳しくは[互換性](#互換性)をご覧ください。
+
+起動処理も、Androidアプリ本来の流れを尊重しています。マニフェストに従って`Application`と
+ContentProviderを初期化し、ランチャー`Activity`を起動します。Unreal Engineなどの`NativeActivity`を使う
+アプリも、Androidのライフサイクルに沿って処理するため、ゲームごとの専用ローダーは必要ありません。
 
 > [!IMPORTANT]
-> Lunaria は現在も開発中の互換性プロジェクトであり、完全な Android エミュレーターではありません。
-> 対応状況はタイトルやゲームエンジンのバージョンによって異なります。
+> **Lunariaは開発中の実験的なソフトウェアです。** 完全なAndroidエミュレーターではなく、
+> ゲームによって動作状況が異なります。実際にプレイできるものもあれば、タイトル画面までのものもあります。
+> 以下の画像は、別のエミュレーターではなく、Lunariaが描画したフレームを直接取得したものです。
 
 <p align="center">
-  <img src="shots/genshin-mondstadt.png" width="100%" alt="原神：モンド城の上空を滑空する蛍。大聖堂の傍らに二つの竜巻">
+  <img src="shots/genshin-mondstadt-night.png" width="100%" alt="原神：夜のモンド城を滑空する蛍。風車と街灯、タッチ HUD">
 </p>
 
 <p align="center">
-  <img src="shots/genshin-lakeshore.png" width="32%" alt="原神のオープンワールド：湖畔に立つ旅人。秋の木と HUD">
+  <img src="shots/genshin-glide-coast.png" width="32%" alt="原神：夕暮れの海岸へ向かって滑空する蛍">
   &nbsp;
-  <img src="shots/genshin-jean.png" width="32%" alt="原神：騎士団の図書室に立つジン。奥の机にリサ">
+  <img src="shots/genshin-lisa.png" width="32%" alt="原神：四風を語るリサ。日本語の会話 UI">
   &nbsp;
-  <img src="shots/cross-worlds-cutscene.png" width="32%" alt="二ノ国：Cross Worlds のカットシーン。空を背景に白髪の少年">
+  <img src="shots/cross-worlds-crystal.png" width="32%" alt="二ノ国：Cross Worlds、装飾された広間に浮かぶ青い結晶">
 </p>
 
-<p align="center"><sub>原神 7.1.0 · Unity IL2CPP · arm64-v8a &nbsp;·&nbsp; 二ノ国：Cross Worlds · Unreal Engine 4 · arm64-v8a<br>Linux 上のゲストフレームバッファー。パッケージは改変していない。</sub></p>
+<p align="center"><sub>夜のモンド城を飛ぶ · 夕暮れの海岸 · リサとの会話 · Cross Worldsの結晶の間<br>
+原神 7.1.0（Unity IL2CPP、arm64-v8a）· 二ノ国：Cross Worlds（Unreal Engine 4、arm64-v8a）<br>
+Linux上で取得したゲストフレーム。ゲーム本体は改変していません。</sub></p>
 
-## Lunaria の特徴
+<p align="center">
+  <img src="shots/alchemia-story-title.png" width="48%" alt="Alchemia Story のタイトル画面">
+  &nbsp;
+  <img src="shots/cross-worlds-lighthouse.png" width="48%" alt="Cross Worlds：夕暮れの灯台そばでフィールドプレイ">
+</p>
 
-| | 内容 |
+<p align="center"><sub>Alchemia Story 1.0.154 · Cross Worlds のフィールド</sub></p>
+
+<p align="center">
+  <img src="shots/launcher.png" width="72%" alt="Lunaria ランチャー：APK / XAPK / APKS / AAB のドロップと設定">
+</p>
+
+<p align="center"><sub>パッケージをドラッグ＆ドロップするだけで起動できます。データ保存先や端末設定は<code>lunaria.conf</code>に保存できます。</sub></p>
+
+## Lunariaの特徴
+
+| 特徴 | できること |
 |---|---|
-| **2種類のゲストアーキテクチャ** | dynarmic JIT により ARMv7 と AArch64 を実行 |
-| **Android システムイメージ不要** | Linux から `.apk`、`.xapk`、`.apks` を直接起動 |
-| **実際のグラフィックス経路** | EGL と OpenGL ES 3 の呼び出しをホスト GPU に渡します。ホストのブリッジが利用可能なら Vulkan を既定で公開します |
-| **ゲームエンジンを意識したブリッジ** | JNI、AssetManager、OBB、pthread、OpenSL ES、Android API スタブ |
-| **ホスト上の Dalvik** | ホスト側スタブが存在しない場合、APK の `classes*.dex` を `src/dvm/` で実行 |
-| **MediaCodec 経路** | H.264 は openh264、AAC は libavcodec で処理。イントロ動画も最後まで再生可能 |
-| **ホスト上の WebView** | Chrome / Chromium または luna-browser を同じ DevTools パイプで使用し、ビュー内に合成 |
-| **実在端末として認識** | `lunaria.conf` で実在する市販端末プロファイルを返します（既定は Pixel 6） |
-| **AArch64 の並列実行** | `LUNARIA_A64_ENGINES>1` にすると、ホストスレッド上で複数のゲストワーカーを実行 |
-| **タッチ HUD をキーボード操作** | 原神と Cross Worlds 用のキーマップを同梱。WASD、スキル、マウス視点操作を同時使用可能 |
-| **設定が残る** | SharedPreferences をステージし、commit して、次回起動で読み戻す。ログイン、サーバー、変更した音量が残る |
-| **アカウントを分ける** | `--profile` はインストール済みパッケージを共有したまま、設定とログイン状態を分ける |
-| **ヘッドレス対応** | X11 ウィンドウを利用できない場合は、サーフェスレス EGL pbuffer にフォールバック |
-| **診断機能を重視** | フレームキャプチャ、JIT プロファイリング、SVC トレース、ゲストメモリ監視に対応 |
+| **Androidのシステムイメージが不要** | Android OSを仮想マシンで起動せず、`.apk`、`.xapk`、`.apks`、`.aab`を直接読み込みます。 |
+| **ARM32／ARM64に対応** | dynarmicのJITコンパイラでARMv7とAArch64のコードを実行します。 |
+| **ホストGPUを活用** | EGL／OpenGL ES 3をホスト側へ橋渡しします。Vulkanも利用可能な環境では公開します。 |
+| **ゲームに必要なAndroid機能を実装** | JNI、AssetManager、OBB、pthread、OpenSL ES、各種Android APIの互換処理を提供します。 |
+| **APK内のJavaコードを実行** | ホスト側に対応するスタブがない場合、内蔵Dalvikインタプリタで`classes*.dex`のメソッドを処理します。 |
+| **動画・音声にも対応** | 対応するH.264ストリームはOpenH264で、AACはlibavcodecが使える環境でデコードします。 |
+| **WebViewを表示** | Chrome／Chromiumや内蔵のluna-browserを使って、Webコンテンツをゲーム画面へ合成します。 |
+| **端末プロファイルを切り替え** | `lunaria.conf`で端末情報を設定できます。標準設定はPixel 6です。 |
+| **AArch64の並列実行** | `LUNARIA_A64_ENGINES`で複数のホストスレッドに処理を分散できます。 |
+| **キーボード・マウスで操作** | タッチ操作をキーへ割り当て、移動・スキル・視点操作を組み合わせられます。マクロや入力の録画・再生にも対応します。 |
+| **設定とアカウントを保持** | ゲームの設定を次回起動へ引き継ぎ、`--profile`でアカウント別のデータを分離できます。 |
+| **画面なしの実行・診断** | X11を使わないEGL描画、フレームの保存、JITの性能計測、SVCトレースなどを利用できます。 |
 
 ## ギャラリー
 
-以下の画像は、Lunaria のゲストフレームバッファー（GLFW ウィンドウまたはヘッドレス EGL）
-から直接取得したものです。スマートフォンの画面キャプチャや、Android エミュレーターの
-ウィンドウを撮影したものではありません。
+掲載画像は、Lunariaが描画したフレームをGLFWウィンドウまたはヘッドレスEGLから直接保存したものです。スマートフォンや、ほかのAndroidエミュレーターの画面を撮影したものではありません。
 
 ### 原神 7.1.0
 
-arm64-v8a 上の Unity IL2CPP、フレームバッファーは **1024×576** です。
-2026年10月1日の実行では、保存済みのログインと Asia サーバーが戻り、
-シェーダーコンパイルとリソースのダウンロードを通過してオープンワールドに入りました。
-プロローグ、騎士団の図書室、モンド城の上空飛行はカラーで描画されています。
-フィールドではキーボード移動が通ります。計測に使ったホスト（Xeon E5-2697 v2）では
-フィールドがおよそ 18–22 fps、設定画面がおよそ 30 fps でした。
-変更した音楽音量は再起動後も残っていました。ホストの WebView からアカウントページを開けます。
-Google Play の課金は未実装です。
+Unity IL2CPP版（`arm64-v8a`）で、**1024×576**の描画を確認しています。Google Playのアプリ内課金には、現時点で対応していません。
 
 <p align="center">
   <img src="shots/genshin-wings.png" width="48%" alt="原神：青空を背景に風の翼を開いた蛍">
   &nbsp;
-  <img src="shots/genshin-lumine.png" width="48%" alt="原神のクローズアップ：味方か、新しい嵐かを問う蛍">
+  <img src="shots/genshin-lisa-obtained.png" width="48%" alt="原神：新キャラクター獲得画面のリサ">
 </p>
 
 <p align="center">
@@ -88,10 +101,20 @@ Google Play の課金は未実装です。
 <p align="center">
   <img src="shots/genshin-knights.png" width="48%" alt="原神：西風騎士団の門前に立つ旅人。近くにガイアとアンバー">
   &nbsp;
+  <img src="shots/genshin-jean.png" width="48%" alt="原神：騎士団の図書室に立つジン">
+</p>
+
+<p align="center">
+  <img src="shots/genshin-lakeshore.png" width="48%" alt="原神：湖畔に立つ旅人">
+  &nbsp;
   <img src="shots/genshin-shore.png" width="48%" alt="原神：夕暮れのモンド城外、水辺に立つ旅人">
 </p>
 
-<p align="center"><sub>飛行 · プロローグ · 騎士団の門 · モンド城外の岸</sub></p>
+<p align="center">
+  <img src="shots/genshin-swim.png" width="100%" alt="原神：夕暮れのモンド城外を泳ぐ旅人">
+</p>
+
+<p align="center"><sub>飛行 · リサ獲得 · プロローグ · 騎士団 · 湖畔 · 夕暮れの水辺</sub></p>
 
 <details>
 <summary>ログイン、ダウンロード、設定</summary>
@@ -122,24 +145,21 @@ Google Play の課金は未実装です。
 
 </details>
 
-途中のフレームも残しています。シェーダー進行（`shots/genshin-compile.png`、
+このほか、シェーダーのコンパイル画面（`shots/genshin-compile.png`、
 `shots/genshin-compile-early.png`）、データ読み込み（`shots/genshin-loading.png`）、
-別の **TAP TO BEGIN**（`shots/genshin-begin.png`）、元素のスプラッシュ
-（`shots/genshin-elements.png`）、HoYoverse カード（`shots/genshin-splash.png`）、
-ギフトメール（`shots/genshin-mail.png`）です。
+別の **TAP TO BEGIN** 画面（`shots/genshin-begin.png`）、元素の演出
+（`shots/genshin-elements.png`）、HoYoverseのロゴ画面（`shots/genshin-splash.png`）、
+ゲーム内メール（`shots/genshin-mail.png`）の画像もあります。
 
 ### 二ノ国：Cross Worlds
 
-arm64-v8a 上で動作する商用 UE4 タイトルです。ゲスト側のログイン、サーバー選択、
-キャラクター選択、開始地点の村、ストーリー会話、音声付きカットシーンを経て、
-ゲーム内プレイまで到達しています。APK やゲスト側には一切パッチを当てておらず、
-修正はすべてエミュレーター側で行っています。
+Unreal Engine 4を採用した商用タイトルです。ログイン、サーバー選択、キャラクター選択から、最初の村、ストーリー会話、音声付きムービーを経て、フィールドでのゲームプレイまで確認できています。描画サイズは**1024×576**です。
 
-プログラムからのタップ入力には `LUNARIA_TOUCH_TEST` を使用します。
-単純な `x,y` はフレームバッファーに対する百分率として扱われます。
-つまり `50,84` と `50%,84%` は同じ位置です。`640px,606px` のように指定すれば、
-ゲスト側のピクセル座標になります。`xdotool` の合成クリックは GLFW に無視されます。
-フレームバッファーは **1024×576** です。
+<p align="center">
+  <img src="shots/cross-worlds-crystal.png" width="48%" alt="Cross Worlds：広間に浮かぶ青い結晶">
+  &nbsp;
+  <img src="shots/cross-worlds-peek.png" width="48%" alt="Cross Worlds：茂みから覗く少女と使い魔">
+</p>
 
 <p align="center">
   <img src="shots/cross-worlds-village.png" width="48%" alt="Cross Worlds の開始地点の村">
@@ -153,7 +173,13 @@ arm64-v8a 上で動作する商用 UE4 タイトルです。ゲスト側のロ�
   <img src="shots/cross-worlds-characters.png" width="48%" alt="Cross Worlds のキャラクター選択画面">
 </p>
 
-<p align="center"><sub>開始地点の村 · ゲーム内 · クロエ · キャラクター選択</sub></p>
+<p align="center">
+  <img src="shots/cross-worlds-cutscene.png" width="72%" alt="Cross Worlds のカットシーン">
+</p>
+
+<p align="center"><sub>結晶の間 · 茂みから顔を出す少女と使い魔 · 最初の村 · フィールド探索 · クロエとの会話 · キャラクター選択 · ムービーシーン</sub></p>
+
+タッチ操作を自動化する場合は`LUNARIA_TOUCH_TEST`を使用します。`50,84`のような数値は画面サイズに対する割合で、`50%,84%`と同じ位置を示します。`640px,606px`のように`px`を付けると、ゲーム側のピクセル座標を直接指定できます。なお、GLFWは`xdotool`による疑似クリックを受け付けません。
 
 <details>
 <summary>タイトル、サーバー、イントロ</summary>
@@ -178,54 +204,99 @@ arm64-v8a 上で動作する商用 UE4 タイトルです。ゲスト側のロ�
 
 </details>
 
-### オープンソースおよび小規模タイトル
+### アルケミアストーリー（Alchemia Story）
+
+アソビモのRPG『アルケミアストーリー』も、Unity IL2CPP（`arm64-v8a`）で動作を確認しています。タイトル画面、ストーリー、キャラクター作成画面を描画でき、横画面**1024×576**と縦画面**576×1024**の両方に対応します。
+
+<p align="center">
+  <img src="shots/alchemia-story-cave.png" width="48%" alt="Alchemia Story：洞窟で驚く黒髪のヒロイン。日本語の会話枠">
+  &nbsp;
+  <img src="shots/alchemia-story-neko.png" width="26%" alt="Alchemia Story：白髪の猫耳少女。縦画面">
+</p>
+
+<p align="center"><sub>横画面のストーリーシーン · 縦画面のキャラクター表示</sub></p>
+
+### [気球！エアロノート](https://github.com/yui0/Kikyu)
+
+2013年に制作された`armeabi`版APKも、ARM32実行環境で起動できます。オリジナルの`libCatNative.so`を読み込み、月夜の街並みやドット絵の主人公が登場するタイトル画面を描画しています。
+
+<p align="center">
+  <img src="shots/kikyu-title.png" width="48%" alt="気球！エアロノートのタイトル画面">
+</p>
+
+<p align="center"><sub>2013年のAPKを改変せずに実行</sub></p>
+
+### Cross Worldsのほかのシーン
+
+<p align="center">
+  <img src="shots/cross-worlds-portal.png" width="32%" alt="Cross Worlds：青い結晶の前の二人">
+  &nbsp;
+  <img src="shots/cross-worlds-gatling.png" width="32%" alt="Cross Worlds：ガトリングを構える赤髪のヒロイン">
+  &nbsp;
+  <img src="shots/cross-worlds-lighthouse.png" width="32%" alt="Cross Worlds：夕暮れのフィールドと HUD">
+</p>
+
+### オープンソース作品・小規模なゲーム
 
 <p align="center">
   <img src="shots/between-two-worlds.png" width="48%" alt="Between Two Worlds のメインメニュー">
   &nbsp;
-  <img src="shots/unreal-first-person.png" width="48%" alt="Unreal Engine 4 の FirstPersonExampleMap">
+  <img src="shots/fpsmobile.png" width="48%" alt="FPSMobile：First Person Template と仮想スティック">
 </p>
 
-<p align="center"><sub>Between Two Worlds · Unity 2023 IL2CPP · 1280×720 &nbsp;·&nbsp; FPSMobile · UE4 · armeabi-v7a · Mesa llvmpipe</sub></p>
+<p align="center"><sub>Between Two Worlds · Unity 2023 IL2CPP · 1280×720 &nbsp;·&nbsp; FPSMobile · UE4 · armeabi-v7a</sub></p>
 
 <p align="center">
   <img src="shots/unity-sample.png" width="48%" alt="UnitySampleGame の 3D ゲームプレイ">
   &nbsp;
+  <img src="shots/black-clover.png" width="48%" alt="Black Clover: Asta Fight のステージプレイ">
+</p>
+
+<p align="center"><sub>UnitySampleGame：Start から 3D シーンへ · 1280×720 &nbsp;·&nbsp; Black Clover：ゲームプレイ · 1024×576</sub></p>
+
+<p align="center">
+  <img src="shots/demo-project-light.png" width="48%" alt="Demo Project Light のタイトル。TAP THE SCREEN">
+  &nbsp;
+  <img src="shots/unreal-first-person.png" width="48%" alt="Unreal Engine 4 の FirstPersonExampleMap">
+</p>
+
+<p align="center">
   <img src="shots/time-locker.png" width="28%" alt="TIME LOCKER の縦画面チュートリアル">
 </p>
 
-<p align="center"><sub>UnitySampleGame：以前の 1280×720 実行でプレイ可能シーンまで到達 &nbsp;·&nbsp; TIME LOCKER：720×1280 のチュートリアル</sub></p>
+<p align="center"><sub>Demo Project Light · Unreal サンプル · Mesa llvmpipe &nbsp;·&nbsp; TIME LOCKER · 720×1280</sub></p>
+
+### Lunariaの操作画面
+
+Lunariaを引数なしで起動すると、パッケージを選ぶランチャーが開きます。`.apk`、`.xapk`、`.apks`、`.aab`を
+ドラッグ＆ドロップするだけで読み込めます。保存先や端末プロファイルなどの設定は、`lunaria.conf`に記録できます。
+
+大規模なゲームでは、ライブラリの読み込みやARMコードの変換、dexのコンパイルに時間がかかることがあります。
+その間は専用の起動画面に進行状況が表示されます。
+
+ゲーム画面で**右クリックするとLunariaのメニュー**を開けます。スクリーンショット（**F12**）、
+文字入力、戻る操作、音量調整、キーボード割り当て、WebViewの設定、入力の録画・再生、
+プロファイル切り替え、再起動、フルスクリーン表示、終了などをここから操作できます。
 
 <p align="center">
-  <img src="shots/black-clover.png" width="360" alt="Black Clover の Unity スプラッシュ画面">
-</p>
-
-<p align="center"><sub>Black Clover: Asta Fight · Unity スプラッシュ画面、ヘッドレス</sub></p>
-
-### Lunaria 本体
-
-大規模タイトルでは、最初のゲストフレームが表示されるまでに、
-リンク、変換、dex コンパイルに長い時間がかかる場合があります。
-その待ち時間に表示されるのが Lunaria 独自の起動画面です。
-
-ゲスト側の描画が始まった後は、右クリックでホストメニューをフレーム上に表示できます。
-メニューから、スクリーンショット（F12 でも可能）、入力時の貼り付け、Back、音量、ミュート、
-ALSA 出力、キーボードマップ、WebView のズームとエンジン、再読み込み、
-フルスクリーン、終了を操作できます。
-
-<p align="center">
-  <img src="shots/boot.png" width="48%" alt="Lunaria の起動画面。青空を背景に進捗リングが 95% を示す">
+  <img src="shots/launcher.png" width="56%" alt="Lunaria ランチャー。青空の上の Open an application">
   &nbsp;
-  <img src="shots/host-menu.png" width="42%" alt="Lunaria のホストメニュー。WebView エンジンのサブメニューを表示">
+  <img src="shots/boot.png" width="40%" alt="Lunaria 起動カード：月のワードマークと ARM／dex 進捗">
 </p>
 
-<p align="center"><sub>起動画面 · ホストメニュー（WebView エンジンは luna-browser、ズーム 200%、ミュート有効）</sub></p>
+<p align="center">
+  <img src="shots/host-menu-kikyu.png" width="56%" alt="気球！エアロノート上のホストメニュー。Keyboard Controls とキーマップ一覧">
+  &nbsp;
+  <img src="shots/host-menu.png" width="40%" alt="WebView エンジン選択。luna-browser を選択中">
+</p>
+
+<p align="center"><sub>ランチャー · 起動カード · 2013 年 APK 上のホストメニュー · WebView エンジン</sub></p>
 
 ## クイックスタート
 
-### 1. ビルド依存パッケージをインストール
+### 1. 必要なパッケージをインストール
 
-Ubuntu または Debian の場合：
+**Ubuntu／Debian**
 
 ```bash
 sudo apt install \
@@ -236,98 +307,83 @@ sudo apt install \
   libasound2-dev libvulkan-dev
 ```
 
-`libvulkan-dev` は Vulkan ブリッジ用のヘッダーを提供します。
-ブリッジはホストの Vulkan ライブラリが利用可能なら既定で有効です。`LUNARIA_VULKAN=0` で無効にできます。有効な場合、
-ホスト側の `libvulkan.so.1` を `dlopen` します。
+`libvulkan-dev`はVulkanブリッジに必要なヘッダーです。ホスト側にVulkanライブラリがあれば、ブリッジは標準で有効になります。無効にする場合は`LUNARIA_VULKAN=0`を指定してください。利用時には`libvulkan.so.1`を動的に読み込みます。
 
-Apple Silicon macOS では、このディレクトリで `make` を実行すると、
-バージョンを固定した ANGLE、MoltenVK、OpenH264 を含む依存ファイルを取得してビルドします。
-XAPK は `./lunaria-apk.sh /path/to/game.xapk` で起動できます。
+**macOS（Apple Silicon）**
 
-Windows x86_64 は [MSYS2 UCRT64 シェル](https://www.msys2.org/docs/environments/)を使います。
+このディレクトリで`make`を実行すると、バージョンを固定したANGLE、MoltenVK、OpenH264などを取得してビルドします。XAPKの起動には`./lunaria-apk.sh /path/to/game.xapk`を使用してください。画面表示には現在制限があるため、[開発状況](#開発状況)も参照してください。
+
+**Windows（x86_64）**
+
+[MSYS2 UCRT64シェル](https://www.msys2.org/docs/environments/)を開き、次のパッケージをインストールします。
 
 ```bash
 pacman -S --needed git make zip unzip bzip2 \
   mingw-w64-ucrt-x86_64-{gcc,cmake,ninja,pkgconf,python,boost,glfw,angleproject,openssl,zlib,libgnurx,vulkan-headers}
 ```
 
-`ANDROID_HOME` に Build Tools の RenderScript arm64 ライブラリを含む Android SDK、
-`ANDROID_NDK_HOME` に NDK ディレクトリを指定して実行します。
+`ANDROID_HOME`にAndroid SDK（Build ToolsのARM64用RenderScriptライブラリを含むもの）、`ANDROID_NDK_HOME`にNDKのディレクトリを指定してからビルドします。
 
 ```bash
 make -j4 dist CC=gcc CXX=g++ DYNARMIC_JOBS=4
 ```
 
-Windows は JVM・Dalvik・UI・Android のホスト API を `lunaria.exe` に結合します。
-Linux からは `make -j4 dist-cross-win` で同じ Windows ZIP を生成できます。
-初回は MSYS2 UCRT64 の依存パッケージ（実行時依存 DLL を含む）と Boost
-ヘッダーを `/tmp/lunaria-windows-deps` に自動ダウンロードし、以後は再利用します。
-Linux 側には UCRT 対応の `x86_64-w64-mingw32-gcc/g++`、CMake、Ninja、
-Python 3.11 以降、curl、tar（zstd 対応）、zip、および上記の Android SDK/NDK が必要です。
-中間ファイルは `/tmp/lunaria-cross-win` と `/tmp/lunaria-dist-build/cross-windows-x86_64`
-に置き、完成した ZIP はこのディレクトリに出力します。
-既存環境を使う場合は `WIN_DEPS=/path/to/deps make dist-cross-win` と指定できます。
-`WIN_CROSS_PREFIX`、`WIN_ANGLE`、`WIN_GLFW_LIB`、`WIN_BOOST_INCLUDE`、
-`WIN_BUILD_DIR`、`WIN_DIST_BUILD_DIR` も環境変数で上書きできます。
-ZIP には外部のホスト DLL と OpenH264、および既存のゲスト JIT 経路で使う
-実際の AArch64 ライブラリを `syslib-arm64/` に含めます。ホスト shim DLL は不要です。
-展開先で PowerShell から `.\lunaria.exe game.apk` を実行するか、APK を実行ファイルへドロップします。
-実行時には MSYS2・シェル・Python・ICU は不要です。
+Windows版では、JVM、Dalvikインタプリタ、UI、Android向け互換APIを`lunaria.exe`にまとめます。完成したZIPを展開し、PowerShellから`.\lunaria.exe game.apk`を実行するか、APKを実行ファイルへドラッグ＆ドロップしてください。実行時にMSYS2、Python、別のシェル、ICUをインストールする必要はありません。
+
+LinuxからWindows版ZIPをクロスビルドする場合は、`make -j4 dist-cross-win`を実行します。初回のみ、MSYS2 UCRT64の依存パッケージや実行用DLL、Boostのヘッダーを`/tmp/lunaria-windows-deps`へダウンロードし、次回以降は再利用します。
+
+クロスビルドにはUCRT対応の`x86_64-w64-mingw32-gcc/g++`、CMake、Ninja、Python 3.11以降、curl、zstd対応のtar、zip、および前述のAndroid SDK／NDKが必要です。中間ファイルは`/tmp/lunaria-cross-win`と`/tmp/lunaria-dist-build/cross-windows-x86_64`へ保存され、完成したZIPは作業ディレクトリに出力されます。
+
+既存の依存ライブラリを使用するには`WIN_DEPS=/path/to/deps make dist-cross-win`と指定します。`WIN_CROSS_PREFIX`、`WIN_ANGLE`、`WIN_GLFW_LIB`、`WIN_BOOST_INCLUDE`、`WIN_BUILD_DIR`、`WIN_DIST_BUILD_DIR`も変更可能です。
+
+配布ZIPにはホスト側のDLLとOpenH264、ゲストJIT用のAArch64ライブラリ（`syslib-arm64/`）が含まれます。ICUやホスト用の`runtime/*.so`スタブは含まれません。WindowsのUTF-16コマンドライン引数はUTF-8に変換して処理します。
 
 ### 2. ビルド
+
+WebP画像のデコードには、同梱の[simplewebp](https://github.com/MikuAuahDark/simplewebp/blob/main/simplewebp.h)（C言語のシングルヘッダーライブラリ、20260718版）を使用します。別途WebP用コーデックをインストールする必要はありません。BSDライセンスと特許許諾の文面は`LICENSE.simplewebp`に収録しています。
 
 ```bash
 make dynarmic-build
 make x86_64 -j"$(nproc)"   # ホストが x86_64 の場合。単純な `make` は 32bit x86 ABI をビルド
 ```
 
-`make` / `make x86_64` は、MediaCodec の H.264 に必要な Cisco の openh264 共有ライブラリを
-`runtime/` に自動取得します。更新したい場合は、明示的に `make fetch-openh264` を再実行してください。
+`make`や`make x86_64`を実行すると、MediaCodecのH.264処理で使うCiscoのOpenH264共有ライブラリが`runtime/`に自動的に取得されます。更新したい場合は`make fetch-openh264`を実行してください。
 
-`make syslib` は `syslib-arm64/` に AArch64 用の libm、bionic libc、libz を配置します。
-このディレクトリが存在する場合、ランチャーは `LUNARIA_SYSLIB_DIR` をそこへ向けます。
-これにより、監査済みの純粋な算術処理（`pow`、`sincosf`）やメモリ処理をゲスト JIT 内で処理します。
-システムの zlib は、既存の計測でゲスト JIT より高速なホスト実装を SVC 経由で使用します。
+`make syslib`を実行すると、AArch64用の`libm`、bionic `libc`、`libz`が`syslib-arm64/`に配置されます。このディレクトリがある場合、ランチャーは`LUNARIA_SYSLIB_DIR`を自動設定します。`pow`や`sincosf`などの算術処理や一部のメモリ処理は、ホスト呼び出しを介さずゲストJIT内で実行できます。zlibについては、計測で高速だったホスト実装をSVC経由で利用します。
 
-`make guestlib` は `src/lib/guest.c` から `liblunaria_guest.so` をビルドします。
-ゼロ時間の `nanosleep` は JIT の外へ出ることなく処理されます。
+`make guestlib`は`src/lib/guest.c`から`liblunaria_guest.so`を生成します。現在は、待ち時間が0の`nanosleep`などをJIT内で完結させるために利用しています。
 
-Unicode の分類・正規化・IDN は本体に組み込んだ文字テーブルを使います。
-その他の文字コードは Windows のコードページまたは Linux/macOS の iconv、
-Windows の日時は OS の時刻規則と小さな CLDR 対応表を使います。ICU はビルド時・実行時とも不要です。
+Unicodeの文字分類・正規化・IDNには組み込みテーブルを使用します。その他の文字コードはWindowsのコードページ、またはLinux／macOSの`iconv`を使用します。Windowsの日時処理にはOSのタイムゾーン情報と小規模なCLDR対応表を利用するため、**ビルド時も実行時もICUは不要です。**
 
 ### 3. パッケージを起動
 
 ```bash
+./lunaria                         # ランチャー UI
 ./lunaria path/to/game.apk
 ./lunaria path/to/game.xapk
 ./lunaria path/to/game.apks
-LUNARIA_ALSA_DEVICE="hw:7,0" ./lunaria Cross+Worlds_5.03.04_APKPure.xapk
+./lunaria path/to/game.aab
+LUNARIA_ALSA_DEVICE="hw:7,0" ./lunaria Cross+Worlds_5.04.12_APKPure.xapk
 ```
 
-ランチャーは `arm64-v8a` または `armeabi-v7a` を判定し、メインのネイティブライブラリを探し、
-インストール済みパッケージのように見える一時構成を準備してランタイムを起動します。
+ビルド環境に依存しない配布用パッケージも作成できます。
 
-XAPK / APKS では、ベース APK 自体は変更せず、split APK の内容をその一時構成へ重ね合わせます。
-展開済みツリーは、パッケージ識別情報をキーとして
-起動時に選択したデータ保存先の `cache/packages/` 以下にキャッシュされます。
-`LUNARIA_CACHE_DIR` で展開キャッシュだけを別の場所に変更できます。
-`LUNARIA_NO_CACHE=1` を指定すると、毎回新しく展開します。
+```bash
+make dist        # lunaria-<version>-linux-x86_64.tar.gz
+make dist-mac    # Lunaria.app + .dmg（Darwin のみ）
+```
 
-展開中は進捗率・処理済み MiB・ファイル数・処理中のファイル名を表示します。
-巨大なファイルの途中でも表示を更新し、キャッシュ確認や大きなファイルのコピーも表示します。
-OBB の別名はハードリンクまたはシンボリックリンクで元のアーカイブを共有し、
-起動のたびに数 GB をコピーする処理を避けます。
+Lunariaはパッケージを直接解析し、ZIP／ZIP64、バイナリマニフェスト、署名ブロック、split APK、OBB、展開キャッシュを処理します。`arm64-v8a`または`armeabi-v7a`を判定した後、ネイティブライブラリを読み込んでランタイムを起動します。
 
-1回の起動ではなくインストール単位の設定は、`lunaria.conf`
-（`lunaria.conf.sample` を参照）に記述します。ここでは、ゲストに報告する端末、
-ゲスト `/data` の保存先（`LUNARIA_DATA_ROOT`）、使用する WebView エンジンなどを設定します。
-同じ変数が環境変数として指定されている場合は、その起動に限り環境変数が優先されます。
+XAPK／APKSでは、元のベースAPKを書き換えずに、必要なsplit APKを実行環境に重ね合わせます。AABはprotobuf形式の`BundleConfig`からベースモジュールとアセットパックを読み込みます。
 
-設定ファイルの既定は起動ディレクトリ直下の `lunaria.conf`、データの既定も
-起動ディレクトリです。設定ファイルは `--config` または `LUNARIA_CONF`、
-データは `--data-root` または設定ファイル内の `LUNARIA_DATA_ROOT` で変更できます。
-相対パスは起動ディレクトリを基準にします。別ドライブのパスや空白を含むパスも指定できます。
+展開したデータは、指定した保存先の`cache/packages/`にキャッシュされます。保存先を変更するには`LUNARIA_CACHE_DIR`、毎回展開し直すには`LUNARIA_NO_CACHE=1`を指定してください。
+
+展開処理では進捗率、処理済み容量（MiB）、ファイル数、処理中のファイル名が表示されます。大きなファイルのコピー中も進行状況を確認できます。OBBは可能な限りハードリンクやシンボリックリンクで共有し、起動のたびに数GBをコピーするのを防ぎます。
+
+端末プロファイルや保存先、WebViewの種類など、起動後も使う設定は`lunaria.conf`（記入例：`lunaria.conf.sample`）に保存します。環境変数にも同じ項目がある場合、その起動では環境変数が優先されます。
+
+設定ファイルとデータ保存先の標準位置は、Lunariaを起動した作業ディレクトリです。設定ファイルは`--config FILE`または`LUNARIA_CONF`、データ保存先は`--data-root DIR`または`LUNARIA_DATA_ROOT`で変更できます。相対パスは起動ディレクトリを基準とし、空白を含むパスも使用できます。
 
 ```bash
 ./lunaria --config ./lunaria.conf --data-root "/mnt/games/Lunaria data" game.xapk
@@ -335,9 +391,7 @@ OBB の別名はハードリンクまたはシンボリックリンクで元の�
 # Windows のシェル: --data-root D:/Games/Lunaria
 ```
 
-アカウントのプロファイルは、インストール済みの APK と設定したゲームのリソースパスを共有し、
-設定、データベース、ログインファイル、その他の外部ファイルは分けます。
-`default` は既存アカウントのディレクトリをそのまま使います。
+**アカウントを分けても、ゲーム本体は共有できます。** プロファイルごとに設定、データベース、ログイン情報などを分離しつつ、インストール済みのAPKや指定したゲームリソースは共通で利用します。`default`プロファイルは従来のデータ保存先をそのまま使用します。
 
 ```bash
 ./lunaria --choose-profile game.xapk
@@ -345,12 +399,9 @@ OBB の別名はハードリンクまたはシンボリックリンクで元の�
 ./lunaria --list-profiles game.xapk
 ```
 
-`LUNARIA_PROFILE_PROMPT=1` で起動のたびに選択します。共有するリソース名は
-`LUNARIA_SHARED_ASSETS` にコロン区切りで、新しいプロファイルへ一度だけコピーする
-リソースの一覧は `LUNARIA_PROFILE_SEED_FILES` に書きます。サンプルには原神の
-リソース配置が入っています。新しいプロファイルは、自分のログイン状態から始まります。
+`LUNARIA_PROFILE_PROMPT=1`を指定すると、起動するたびにプロファイルを選べます。共有するリソースは`LUNARIA_SHARED_ASSETS`へコロン区切りで指定し、新しいプロファイルへ一度だけコピーするファイルの一覧は`LUNARIA_PROFILE_SEED_FILES`へ指定します。原神向けの設定例も付属しています。
 
-複数の ABI を含むパッケージでゲストアーキテクチャを固定したい場合：
+ARM32とARM64の両方を含むパッケージでは、実行するアーキテクチャを明示的に選択できます。
 
 ```bash
 LUNARIA_ARCH=armeabi-v7a ./lunaria game.apk
@@ -359,14 +410,15 @@ LUNARIA_ARCH=arm64-v8a  ./lunaria game.apk
 
 ## 互換性
 
-以下は実際に確認できた到達点であり、一般的な互換性を保証するものではありません。
-詳細な状況や起動手順は `PROGRESS.md` に記載しています。
+以下は、各タイトルで**実際に確認できた動作範囲**です。「起動できた」ことと「最後までプレイできる」ことは区別しています。ゲームのバージョンやOS、GPUドライバーによって結果が変わる場合があります。詳しい検証記録と起動方法は`PROGRESS.md`をご覧ください。
 
 | タイトル | エンジン / ABI | 現在の状況 |
 |---|---|---|
-| **Ni no Kuni: Cross Worlds** | Unreal Engine 4 · AArch64 XAPK | Linux 上で、ゲストログイン、村、ストーリー会話、ゲーム内カットシーン、実際のプレイまで描画を確認。SharedPreferences も保持されます。macOS Apple Silicon では 5.04.12 の動画と 3D イントロがウィンドウに表示され、利用規約ダイアログまで到達しました。規約への同意後は未確認です |
-| **Blade & Soul Masia** | Unreal Engine 5 · AArch64 APKS | オープニング動画が EOS まで到達。タイトル画面と追加パッチのダイアログを表示でき、Agree を押すとダウンロードが進みます |
-| **Genshin Impact 7.1.0** | Unity IL2CPP · AArch64 XAPK | Linux 上でオープンワールドまで到達。保存済みのログインと Asia サーバーが戻り、シェーダーコンパイル、リソースダウンロード、**TAP TO BEGIN**、フィールドへ進む。プロローグ、図書室、モンド城上空の飛行はカラーで描画。フィールドではキーボード移動が通り、計測ホストではフィールドおよそ 18–22 fps、設定画面およそ 30 fps。変更した音楽音量は再起動後も残った。ホスト WebView でアカウントページを開ける。Google Play の課金は未実装 |
+| **Ni no Kuni: Cross Worlds** | Unreal Engine 4 · AArch64 XAPK | Linux上ではログイン、サーバー・キャラクター選択、村でのストーリーや音声付きムービー、フィールドでの操作を確認しました。SharedPreferencesも保持されます。Apple Silicon搭載Macではバージョン5.04.12のオープニング動画、3Dイントロ、利用規約画面まで確認しています。規約同意後の動作は未検証です。 |
+| **Blade & Soul Masia** | Unreal Engine 5 · AArch64 APKS | オープニング動画を最後まで再生し、タイトル画面と追加データの確認画面を表示。Agreeを選ぶとダウンロードが始まります。 |
+| **Genshin Impact 7.1.0** | Unity IL2CPP · AArch64 XAPK | Linux上でオープンワールドまで到達。プロローグ、図書室、モンド城上空での滑空を描画できました。ログイン状態、Asiaサーバーの選択、音量設定は再起動後も保持されます。キーボード移動も動作し、ある検証環境ではフィールドで約18～22fps、設定画面で約30fpsを記録しました。アカウント用WebViewも表示できますが、Google Playの課金には未対応です。 |
+| **Alchemia Story 1.0.154** | Unity IL2CPP · AArch64 APK | タイトル画面、日本語のストーリー会話（横画面・縦画面）、キャラクター作成画面を描画しました（2026-10-09）。 |
+| **Kikyu! Aeronaut** | native `armeabi` · ARM32 APK（2013） | オリジナルのタイトル画面を描画し、Returnキーの入力を待つ状態まで確認しました。 |
 | **Between Two Worlds** | Unity 2023 IL2CPP · ARMv7 | プレイ可能。メインストーリーのシーンまで到達 |
 | **Between Two Worlds** | Unity 2023 IL2CPP · AArch64 | 記録済みの実行ではメインメニューまで到達。最近の確認では言語選択画面まで約 70 fps |
 | **FPSMobile** | Unreal Engine 4 · ARMv7 | FirstPersonExampleMap を描画。16,000 回以上の swap を確認 |
@@ -421,43 +473,26 @@ make fetch-libunity
 
 </details>
 
-## キーボード操作
+## キーボード・マウスで操作する
 
-タッチ操作を前提としたゲームでも、キーと画面上のタッチ位置を対応付けることで、
-キーボードから操作できます。
+Lunariaでは、画面上の仮想ボタンやスティックにキーを割り当てることで、タッチ操作のゲームをキーボードとマウスから操作できます。
 
-右クリックメニューから **Keyboard Controls** を開き、キーマップファイルを選ぶと、
-ゲーム実行中でもレイアウトを切り替えられます。別のフォルダーを参照して、
-独自のキーマップを読み込むこともできます。
-
-キーボードマッピングを無効にするには **Off**、編集後のキーマップを読み直すには
-**Reload Current File** を選択します。キーマップの読み込みに失敗した場合、
-現在の設定は変更されません。起動時にキーマップを指定することもできます。
+ゲーム画面で右クリックし、**Keyboard Controls**からキーマップを選んでください。ゲームの実行中でも切り替えられます。独自の設定ファイルを読み込むことも可能です。**Off**で無効化、**Reload Current File**で編集内容を再読み込みできます。読み込みに失敗しても、それまでの設定は維持されます。
 
 ```sh
 LUNARIA_KEYMAP=genshin ./lunaria /path/to/Genshin.xapk
 LUNARIA_KEYMAP=crossworlds ./lunaria /path/to/CrossWorlds.apks
 ```
 
-同梱レイアウトでは、**WASD** を移動、**F** を通常攻撃、
-**E/Q/1/2/3** をスキルまたはキャラクター選択、**Space** をジャンプ、
-**Shift** をダッシュに割り当てています。Cross Worlds では、
-**Space** と **Shift** は回避操作に割り当てられています。
+付属の原神・Cross Worlds用レイアウトでは、**WASD**で移動、**F**で通常攻撃、**E／Q／1／2／3**でスキルやキャラクターを選択します。**Space**と**Shift**はゲームに応じてジャンプ・ダッシュ・回避などに割り当てられます。マウスの左ドラッグで視点を動かせ、キーによる移動やスキル操作と組み合わせることもできます。
 
-左マウスボタンでドラッグするとカメラを操作できます。
-移動、割り当て済みボタン、マウス入力は同時に使用できます。
+**Ctrlを押しながらマウスホイールを回すと、2本指のピンチ操作**になります。上に回すと拡大方向、下に回すと縮小方向に動き、カーソル位置が操作の中心になります。ほかのキーやマウスによるタッチ操作は、先に解除してください。
 
-**Ctrl＋マウスホイール**で、カーソル位置を中心とした２指のピンチ操作ができます。
-上に回すとピンチアウト、下に回すとピンチインです。
-ピンチ操作の前にマウスのドラッグやキーによるタッチを解除してください。
+テキスト入力欄を選んでいる間は文字入力が優先されます。また、ウィンドウが非アクティブになると押下中のキーを自動解除するため、操作が入りっぱなしになるのを防げます。
 
-テキスト入力欄にフォーカスがある場合は、ゲーム操作よりテキスト入力が優先されます。
-ウィンドウがフォーカスを失った場合、押しっぱなしになっているキーは自動的に解除されます。
+### キーマップをカスタマイズする
 
-別のゲームや異なる HUD レイアウトに合わせる場合は、`keymaps/*.conf` のいずれかをコピーし、
-座標を調整して `LUNARIA_KEYMAP=/path/to/my.conf` で読み込んでください。
-この設定は `lunaria.conf` に保存することもできます。
-キーボードマッピングを無効にするには `LUNARIA_KEYMAP=off` を指定します。
+`keymaps/*.conf`をコピーして座標を変更し、`LUNARIA_KEYMAP=/path/to/my.conf`で読み込んでください。`lunaria.conf`へ設定を保存することもできます。マッピングを無効にする場合は`LUNARIA_KEYMAP=off`です。
 
 ```text
 stick 0.15625 0.764 0.18
@@ -466,21 +501,36 @@ button SPACE 0.922 0.665
 button F 0.826 0.769
 ```
 
-`stick` は、WASD で操作する仮想スティックの中心 X/Y 座標と半径を定義します。
-`button` は、キーを X/Y のタッチ位置へ割り当てます。
-`walk` は、指定キーを押しながらWASDを操作するときの小さい半径を定義します。
-原神ではWASDで走り、Ctrl＋WASDで歩きます。
-X と Y は画面の幅・高さを基準とした 0〜1 の正規化座標です。
-スティック半径は画面の短辺を基準にしています。
+`stick`はWASDで動かす仮想スティックの中心座標（X、Y）と半径、`button`はキーを押したときにタッチする位置を指定します。XとYは画面サイズに対する**0～1の相対座標**、スティックの半径は画面の短辺を基準にした値です。
 
-最大 8 個のボタンを割り当てられます。
-対応キーは大文字英字、数字、`SPACE`、`SHIFT`、`CTRL` です。
-同梱レイアウトは横画面 HUD 向けに調整されているため、
-HUD の大きさや配置を変更した場合は座標も調整してください。
+`walk`は指定したキーを押したときにスティックの可動半径を小さくします。原神では**WASDで走り、Ctrl＋WASDで歩く**設定です。
 
-## フレームをキャプチャする
+設定できるのはボタン最大8個、マクロ最大8個です。キーには大文字の英字、数字、`SPACE`、`SHIFT`、`CTRL`を使用できます。付属の設定は横画面用なので、HUDの配置や大きさを変えた場合はタッチ座標も調整してください。
 
-指定した swap 番号のフレームを保存する場合：
+### 同時タップ・連続入力・マクロ
+
+```text
+button F 0.10 0.20 0.30 0.40 0.50 0.60     # 1キーで3点を同時にタップ
+button G 0.70 0.70 repeat=100 hold=20      # 押下中は100msごとに20msタップ
+macro Z 0.5,0.5|0.6,0.6/40 @100 0.9,0.9    # 2点を40ms同時タップ→100ms待機→1点タップ
+macro X 0.1,0.1 loop                       # キーを押している間、繰り返す
+```
+
+`button`には最大4組のX／Y座標を指定でき、同時にタップできます。`repeat=MS`はキーを押している間の繰り返し間隔（10～60000ms）、`hold=MS`は各タップの押下時間です（標準30ms。繰り返し間隔の半分が30msより短ければそちらを使用）。
+
+`macro`では、タップ位置（`x,y`）、複数点同時タップ（`|x,y`）、押下時間（`/MS`）、待機（`@MS`）を組み合わせられます。`loop`を付けると押下中に繰り返します。実行タイミングはフレームクロックに従い、60fpsなら約16ms刻みです。
+
+### 操作の録画・再生
+
+**F9**または右クリックメニューの**Record Input**で、マウス・キーマップ・マクロによるタッチ操作を録画できます。データは`~/Documents/Lunaria <date>.rec`に保存され、使用できない場合は`~/`へ保存されます。
+
+**F10**または**Play Recording**で直前の操作を再生できます。`LUNARIA_PLAY`で録画ファイルを指定し、`LUNARIA_PLAY_LOOP=1`で繰り返し再生することも可能です。座標は画面サイズに対する相対値で記録されるため、ウィンドウの大きさが変わっても再生できます。
+
+## スクリーンショットとフレーム保存
+
+動作中の画面を一時停止したいときは、右クリックメニューから**Pause**を選びます。**Resume**で再開します。一時停止中もホストメニューは操作できますが、ゲーム本体にはキーやマウスの入力が送られません。一時停止状態は次回起動へ引き継がれません。
+
+特定のフレーム（swap番号）を保存するには、次のように指定します。
 
 ```bash
 mkdir -p /tmp/lunaria-shots
@@ -489,7 +539,7 @@ LUNARIA_DUMP_FRAME=0,60,120 \
 ./lunaria game.apk
 ```
 
-または、*N* 回の swap ごとに保存する場合：
+一定間隔で保存したい場合は、次のように指定します。
 
 ```bash
 LUNARIA_DUMP_DIR=/tmp/lunaria-shots \
@@ -497,17 +547,15 @@ LUNARIA_SCREENSHOT_EVERY=60 \
 ./lunaria game.xapk
 ```
 
-フレームは PNG として保存されます（例：`lunaria_0000.png`）。
-`$LUNARIA_SHOT_TRIGGER`（既定は `/tmp/lunaria-shot`）を作成すると、追加で 1 フレーム保存します。
+保存形式はPNGで、`lunaria_0000.png`のような名前が付きます。`$LUNARIA_SHOT_TRIGGER`で指定したファイル（既定は`/tmp/lunaria-shot`）を作成すると、追加の1フレームを保存できます。
 
-F12 キー、またはホストメニューの **Take Screenshot** を使用した場合は、
-`~/Pictures/Lunaria YYYY-MM-DD HH.MM.SS.png` に保存されます。
+通常のスクリーンショットは**F12**、またはホストメニューの**Take Screenshot**で撮影できます。保存先は`~/Pictures/Lunaria YYYY-MM-DD HH.MM.SS.png`です。
 
 ## 仕組み
 
 ```text
- APK / XAPK / APKS
-     │  base、split、native library、assets、OBB を展開
+ APK / XAPK / APKS / AAB
+     │  ベース・分割APK、ネイティブライブラリ、アセット、OBBを展開
      ▼
  Android ELF loader ─── relocation と依存関係解決
      │
@@ -520,17 +568,8 @@ F12 キー、またはホストメニューの **Take Screenshot** を使用し�
      └── graphics ───── EGL · OpenGL ES 3 · optional Vulkan · host GPU
 ```
 
-- **ARM32:** fastmem を使うフラットな 4 GiB のゲストメモリ空間。
-- **ARM64:** ゲスト仮想アドレスをホストアドレスへ 1 対 1 でマッピングします。
-  高位アドレス側のイメージ領域に、読み込んだ ELF、トランポリン、JNI テーブル、
-  スタックを配置し、dynarmic fastmem を利用できるようにしています。
-  `LUNARIA_A64_ENGINES`（1〜8、既定値はホスト CPU コア数から決定）を使うと、
-  複数の JIT エンジンをホストスレッド上で並行実行できます。
-  `lunaria` は `LUNARIA_A64_SELF_SCHED=1` を設定するため、
-  各エンジンは実行可能なゲストを継続的に取得します。
-  `LUNARIA_A64_SELF_SCHED=0` にすると、各 frame-pump パスで同期バリアを使う方式へ戻ります。
-  自由実行型のエンジンは実機に近い動作となり、スループットが大幅に向上します。
-  一方、Cross Worlds のセキュリティモジュールでは、このモードで約 25 秒後に abort した例があります。
+- **ARM32：** fastmemを利用した、4GiBの連続したゲストメモリ空間を使用します。
+- **ARM64：** ゲストの仮想アドレスをホストアドレスに1対1で対応させ、ELF、トランポリン、JNIテーブル、スタックを高位アドレス領域へ配置します。これによりdynarmicのfastmemを利用できます。`LUNARIA_A64_ENGINES`（1～8、標準ではCPUコア数に応じて自動選択）で複数のJITエンジンを並列実行できます。標準設定の`LUNARIA_A64_SELF_SCHED=1`では各エンジンが独立して実行可能なスレッドを取得し、`0`ではフレームごとに同期する方式へ戻ります。並列実行は高速化に役立ちますが、Cross Worldsのセキュリティモジュールが約25秒後に異常終了した事例もあります。
 - **ネイティブ呼び出し:** ゲストの libc、EGL、GLES、JNI 呼び出しは、
   自動生成された `SVC #n` トランポリンを通ってホスト側実装へ渡されます。
 - **ゲストライブラリ:** `make syslib` は、AArch64 用の libm、libc、libz を
@@ -538,19 +577,13 @@ F12 キー、またはホストメニューの **Take Screenshot** を使用し�
   `make guestlib` は、毎回 trap させたくない処理用に `liblunaria_guest.so` を追加します。
   現在その対象になっているのは、ゼロ時間の `nanosleep` です。
   ディレクトリが存在する場合、ランチャーは `LUNARIA_SYSLIB_DIR` をそこへ向けます。
-- **スレッド:** ゲスト pthread は協調的なラウンドロビンスケジューリングを使用し、
-  ワーカーごとに独立した JIT コンテキストを持ちます。
-  mutex の unlock 時には待機中スレッドへ直接制御を渡せます。
-  ゲストの sleep は実時間だけ待機します。ブロッキング read は通常スケジューラー上に残りますが、
-  `LUNARIA_FD_PARK` を設定すると park します。
-- **Java:** JNI 呼び出しに対応するホストスタブがない場合、
-  `src/dvm/` が APK 内の `classes*.dex` からそのメソッドを実行します
-  （`LUNARIA_DVM=1` が既定）。
-- **Assets:** `AssetManager` は APK および OBB 拡張ファイル内の
-  DEFLATE / STORE エントリを読み込みます。
-- **Media:** `android.media.MediaCodec` は、H.264 を openh264、
-  AAC を利用可能な場合は libavcodec でデコードします。
-  `LUNARIA_OPENH264` / `LUNARIA_LIBAVCODEC` で共有ライブラリのパスを上書きできます。
+- **スレッド：** ゲストのpthreadは協調的なラウンドロビン方式で管理し、各ワーカーが独立したJITコンテキストを持ちます。mutexのロック解除時には待機スレッドへ直接処理を引き継げます。sleepは実時間に従い、ブロッキングreadは`LUNARIA_FD_PARK`で待機方式を変更できます。
+- **Java：** JNI呼び出しに対応するホスト側スタブがない場合、内蔵の`src/dvm/`がAPK内の`classes*.dex`から該当メソッドを実行します（標準設定は`LUNARIA_DVM=1`）。
+- **アプリの起動：** マニフェストに従って`Application`とContentProviderを初期化し、ランチャー`Activity`の`onCreate`／`onStart`／`onResume`を実行します。`NativeActivity`を利用するエンジンは`ANativeActivity_onCreate`から入り、ウィンドウや入力キューは`APP_CMD_*`として渡されます。
+- **ライブラリの読み込み：** `System.loadLibrary`で指定されたライブラリとその依存関係を、Androidのリンカーに近い順序で解決します。
+- **音声：** OpenSL ES、AAudio、Javaの`AudioTrack`は共通のミキサーを通してALSAへ出力されます。ブロッキング`AudioTrack.write()`が描画ループを止めないようにしています。
+- **アセット：** `AssetManager`がAPKやOBBに含まれるDEFLATE／STORE形式のデータを読み込みます。
+- **メディア：** `android.media.MediaCodec`はH.264をOpenH264で、AACを利用可能な場合はlibavcodecでデコードします。`LUNARIA_OPENH264`と`LUNARIA_LIBAVCODEC`で共有ライブラリの場所を指定できます。
 - **WebView:** `android.webkit.WebView` は DevTools パイプ経由でホストブラウザーと通信します。
   `LUNARIA_WEB_ENGINE` には `auto`（Chrome / Chromium があればそれを使用、
   なければ luna-browser）、`chrome`、`luna`、`off` を指定できます。
@@ -565,9 +598,7 @@ F12 キー、またはホストメニューの **Take Screenshot** を使用し�
 
 ## 実行時設定
 
-よく使う設定を以下にまとめます。
-ソースには互換性検証用の、より限定的な診断スイッチも含まれています。
-すべての診断設定については `PROGRESS.md` を参照してください。
+主な起動オプションと診断用の環境変数をまとめました。ここにない開発・検証用の設定については、ソースコードと`PROGRESS.md`を参照してください。
 
 | 変数 | 既定値 | 用途 |
 |---|---:|---|
@@ -583,11 +614,11 @@ F12 キー、またはホストメニューの **Take Screenshot** を使用し�
 | `LUNARIA_A64_SELF_SCHED` | `1` | ランチャーの既定値。エンジンが実行可能ゲストを自由に取得。`0` で barrier-pooled pass に戻す。バイナリ単体ではこの変数が設定されるまで無効 |
 | `LUNARIA_A64_FASTMEM` | `1` | `0` でメモリアクセスをコールバック経由に変更 |
 | `LUNARIA_A64_CODE_CACHE_MB` | `128` | JIT エンジンごとの変換済みコードキャッシュ |
-| `LUNARIA_FD_PARK` | on / off | ブロッキング read を park |
+| `LUNARIA_FD_PARK` | on / off | ブロッキングreadを待機状態に移すか指定 |
 | `LUNARIA_SYSLIB_DIR` | `syslib-arm64/`（存在する場合） | ゲストコードとして実行する AArch64 プラットフォームライブラリ。`make syslib` で libm、libc、libz を取得し、`make guestlib` で `liblunaria_guest.so` を作成 |
 | `LUNARIA_VULKAN` | 利用可能なら on | `0` で Vulkan ブリッジと端末機能の公開を無効にする。タイトルは GLES も選択可能 |
 | `LUNARIA_TOUCH_TEST` | off | `x,y[;x,y…]` 形式でタップを注入（最大 8 個）。単純な数値はフレームバッファーに対する百分率、`640px` はゲストピクセル |
-| `LUNARIA_TOUCH_FIFO` | off | 実行中のタップ入力。`echo 'x,y[,hold]' > $LUNARIA_TOUCH_FIFO` Windows は `\\.\pipe\lunaria-touch`（名前付きパイプ）。 |
+| `LUNARIA_TOUCH_FIFO` | off | 実行中のタップやドラッグを入力。タップは`x,y[,hold]`、ドラッグは`down x,y`、`move x,y`、`up x,y`。座標は割合または`px`指定。Windowsでは`\\.\pipe\lunaria-touch`（名前付きパイプ）。 |
 | `LUNARIA_KEYMAP` | off | `genshin`、`crossworlds`、`off`、またはキーマップファイルのパス。ホストメニューから実行中に変更可能 |
 | `LUNARIA_DEVICE` | `pixel6` | 端末プロファイル：`pixel6`、`pixel7`、`galaxys21`、`lunaria`。通常は `lunaria.conf` を推奨 |
 | `LUNARIA_DATA_ROOT` | 起動ディレクトリ | ゲストの `/data` と `/storage`。`--data-root DIR` でも指定可能 |
@@ -608,24 +639,18 @@ F12 キー、またはホストメニューの **Take Screenshot** を使用し�
 | `LUNARIA_A64_PCPROF_EVERY` | `20000` | profiler レポート間のサンプル数 |
 | `LUNARIA_SCHED_DUMP` | off | *N* 回の scheduler pass ごとに全ゲストスレッドの状態を出力 |
 | `LUNARIA_SCHED_DUMP_STACK` | off | 上記出力に各スレッドのスタック内リターンアドレススキャンを追加 |
-| `LUNARIA_DUMP_LAST_SVC` | off | 終了時に直近の SVC リングを表示 |
-| `LUNARIA_JIT_UI` | `1` | 起動画面（月、変換進捗、dex 進捗）を表示。`0` ではゲスト描画開始まで空の surface |
+| `LUNARIA_DUMP_LAST_SVC` | off | 終了時に直近のSVC呼び出し履歴を表示 |
+| `LUNARIA_JIT_UI` | `1` | ARMコード変換やdex処理の進捗画面を表示。`0`ではゲームの描画が始まるまで何も表示しない |
 | `LUNARIA_DVM` | `1` | Dalvik バイトコードエミュレーター。`0` 無効、`1` ホストスタブがない場合のみ APK の dex を実行、`2` ホストスタブより dex を優先 |
-| `LUNARIA_DVM_TRACE` | off | エミュレーターが処理できなかったメソッドを `[dvm] miss …` として記録 |
+| `LUNARIA_DVM_TRACE` | off | Dalvikインタプリタで処理できなかったメソッドを`[dvm] miss …`として記録 |
 | `LUNARIA_DEX_START` | on | APK の Activity ライフサイクルを dex から実行。旧来の手書き起動シーケンスと比較する場合のみ `0` |
 | `LUNARIA_NET` | on | `0` でゲストの全 socket 通信を拒否 |
 | `LUNARIA_CACHE_DIR` | 起動時のデータ保存先の `cache/packages/` | ランチャーの永続展開キャッシュ。個別に移動可能 |
 | `LUNARIA_NO_CACHE` | off | APK / XAPK / APKS を毎回新しく展開 |
 
-エンジンのエントリポイント（`ANativeActivity_onCreate`、`UnityPlayer.initJni`）を持たない APK でも、
-現在は拒否せず、launcher Activity から起動します。
+特定のエンジン用エントリポイントがなくても、Lunariaはマニフェストで指定されたランチャー`Activity`から起動を試みます。`ANDROID_LAUNCH_ACTIVITY`と`ANDROID_APPLICATION_CLASS`にクラス情報を渡し、バイトコードVMでアプリのライフサイクルを実行します。ネイティブライブラリはアプリ自身の`System.loadLibrary`から読み込まれます。
 
-`lunaria` が manifest から対象 Activity を読み取り、
-`ANDROID_LAUNCH_ACTIVITY` として渡します。
-ローダーはバイトコード VM 経由で `onCreate` / `onStart` / `onResume` を実行します。
-
-tick 値には `K`、`M`、`G` の接尾辞を使用できます。
-例：`LUNARIA_ONLOAD_TICKS=5G`
+tick値には`K`、`M`、`G`の接尾辞が使えます（例：`LUNARIA_ONLOAD_TICKS=5G`）。
 
 ## リポジトリ構成
 
@@ -634,7 +659,9 @@ tick 値には `K`、`M`、`G` の接尾辞を使用できます。
 | `src/arm_exec.cpp` | dynarmic エンジン、SVC dispatch、JNI、EGL/GLES、スレッド処理 |
 | `src/arm.c` / `src/arm.h` | 共通 ARM 実行ロックとマルチエンジン補助 |
 | `src/dvm/` | Dalvik バイトコードエミュレーター。APK の `classes*.dex` に含まれる Java を実行 |
-| `src/loader.c` | ランタイムのエントリポイントと Unity レンダーループの制御 |
+| `src/loader.c` | マニフェストに基づく`Application`・ContentProvider・`Activity`の起動とフレームループ |
+| `src/dvm/audio_track.c` | Javaの`AudioTrack`から共通ミキサーへのキュー処理 |
+| `src/dvm/apk_signers.c` | `PackageInfo`で参照するAPK署名ブロックの解析 |
 | `src/linker/` | ホスト向けに調整した Android ELF linker |
 | `src/jvm/` | 軽量 JVM / JNI オブジェクトモデルとスタブ |
 | `src/lib/` | Android ネイティブコードへ公開するホスト側実装。`guest.c` はゲスト内 libc |
@@ -647,7 +674,7 @@ tick 値には `K`、`M`、`G` の接尾辞を使用できます。
 | `keymaps/` | 同梱タッチマップ（`genshin.conf`、`crossworlds.conf`） |
 | `lunaria.conf.sample` | 端末プロファイル、data root、画面スケール、パッケージ台帳、WebView エンジン |
 | `runtime/` | 生成された Android 互換ホスト共有ライブラリ |
-| `src/apk.c` | 本体内の APK / XAPK / APKS 展開キャッシュ、manifest 解析、起動 |
+| `src/apk.c` | APK／XAPK／APKS／AABの読み込み、展開キャッシュ、マニフェスト解析、起動処理 |
 | `src/luna_unicode.c` | 組み込み Unicode 分類・正規化・IDNA2003 |
 | `PROGRESS.md` | 詳細な互換性メモと現在の開発状況 |
 
@@ -656,27 +683,11 @@ tick 値には `K`、`M`、`G` の接尾辞を使用できます。
 <details>
 <summary><strong>起動時のムービーが再生されない</strong></summary>
 
-Lunaria は H.264 のデコードに openh264 を使用しており、
-Constrained Baseline を読み取れます。
+LunariaはH.264動画のデコードにOpenH264を使用します。ただし、現在対応しているConstrained Baselineプロファイルでは、すべてのゲーム内動画を再生できるわけではありません。例えば、Blade & Soul Revolutionのオープニングなどに使われているMain／Highプロファイル（CABACやBフレームを含む）は未対応です。
 
-一方、多くのタイトルのスプラッシュ動画は CABAC や B-frame を含む Main / High profile です。
-Blade & Soul Revolution の動画も該当し、これらは現状ここではデコードできません。
+デコードを16アクセスユニット試しても映像が得られない場合、Lunariaは`MEDIA_ERROR_UNSUPPORTED`をゲーム側へ通知します。これにより、対応したゲームエンジンは再生できない動画をスキップし、起動処理を続けられます。以前のように映像の終了を待ち続け、白画面から進めなくなる状況を避けるための処理です。
 
-エミュレーターはこの状態を検出すると
-（16 個の access unit を処理しても画像が得られない場合）、
-ゲストへ `MEDIA_ERROR_UNSUPPORTED` を返し、ゲームエンジンが動画をスキップして
-起動を続けられるようにします。
-
-以前は、実際にはフレームが出ない動画を「再生中」として処理し続けていたため、
-ゲーム側がその動画の終了を待ち続け、白画面から先へ進めなくなることがありました。
-
-ストリームが Constrained Baseline のタイトル
-（例：Blade & Soul Masia のオープニング）は、
-openh264 が利用可能な場合に `BUFFER_FLAG_END_OF_STREAM` まで到達します
-（`make fetch-openh264`）。
-
-AAC 音声は、ホスト側で利用可能な場合に libavcodec を使用します。
-コーデックの状態遷移を確認するには `LUNARIA_TRACE_MEDIA=1` を使用してください。
+Blade & Soul Masiaのオープニングなど、対応するプロファイルの動画はOpenH264が利用可能であれば最後まで再生できます（`make fetch-openh264`）。AAC音声には、ホスト側で利用可能な場合にlibavcodecを使用します。デコードの状況は`LUNARIA_TRACE_MEDIA=1`で確認できます。
 
 </details>
 
@@ -702,72 +713,51 @@ make runtime/libmediandk.so runtime/libGLESv3.so
 <details>
 <summary><strong>画面が真っ黒、または起動途中で止まる</strong></summary>
 
-まず OBB / split ファイルを確認し、その後、必要なトレースを取得してください。
+必要なOBBファイルやsplit APKが揃っているか確認してください。それでも止まる場合は、次のコマンドで診断ログを取得します。
 
 ```bash
 LUNARIA_TRACE_EXC=1 LUNARIA_DUMP_LAST_SVC=1 \
 ./lunaria game.apk 2>&1 | tee lunaria.log
 ```
 
-UE5 タイトルでは、可能であればハードウェア GL ドライバーを使用してください。
-`LIBGL_ALWAYS_SOFTWARE=1`（llvmpipe）では、同じ起動経路でも 10 倍以上遅くなる場合があり、
-実際にはソフトウェアラスタライザーが遅いだけなのに、
-エミュレーターが停止したように見えることがあります。
+Unreal Engine 5のゲームでは、可能な限りGPUによるOpenGL描画を使用してください。`LIBGL_ALWAYS_SOFTWARE=1`を指定するとllvmpipeによるソフトウェア描画になり、起動が極端に遅くなる場合があります。フリーズに見えても、実際には描画処理が進んでいる可能性があります。
 
 </details>
 
 <details>
 <summary><strong>描画が遅い</strong></summary>
 
-Mesa llvmpipe はソフトウェアレンダラーであり、ヘッドレス検証には便利ですが、
-性能評価には向きません。リアルタイム描画には GPU アクセラレーション対応の
-ホスト EGL / OpenGL スタックを使用してください。
+MesaのllvmpipeはGPUを使わないソフトウェアレンダラーです。画面なしでの動作確認には便利ですが、性能を比較する用途には向きません。実際のゲームプレイではGPUアクセラレーションを有効にしてください。
 
-AArch64 タイトルでは、まずシングルエンジンで安定動作を確認してから
-`LUNARIA_A64_ENGINES=4` を試してください。
-
-速度を測る場合は、`LUNARIA_SLICE_DETAIL` /
-`LUNARIA_SVC_HISTO` を設定しないでください。
+AArch64では、まず単一のJITエンジンで安定動作を確認し、その後`LUNARIA_A64_ENGINES=4`を試すとよいでしょう。性能測定時は`LUNARIA_SLICE_DETAIL`と`LUNARIA_SVC_HISTO`を無効のままにしてください。
 
 </details>
 
 <details>
 <summary><strong>クリックしても反応しない</strong></summary>
 
-GLFW は `xdotool` / `XSendEvent` による合成クリックを無視します。
+GLFWは`xdotool`や`XSendEvent`からの疑似クリックを受け付けません。ゲーム画面を直接クリックするか、`LUNARIA_TOUCH_TEST='50,84;…'`でタップ位置を指定してください。位置は画面に対する割合で、`px`を付ければピクセル単位でも指定できます。ゲーム起動後は`LUNARIA_TOUCH_FIFO`からも入力できます。
 
-代わりに、
-`LUNARIA_TOUCH_TEST='50,84;…'`
-（フレームバッファーに対する百分率。ゲストピクセルを指定する場合は `px` を付ける）、
-タイトル起動後の `LUNARIA_TOUCH_FIFO`、
-または実際の GLFW ウィンドウ内をクリックしてください。
-
-右クリックはホストメニューを開くため、ゲスト側には渡されません。
+なお、右クリックはLunariaのホストメニュー専用で、ゲーム側には送られません。
 
 </details>
 
-## プロジェクトの状況
+## 開発状況
 
-Lunaria は研究開発段階のソフトウェアです。
+Lunariaは**現在も開発を進めている研究段階のソフトウェア**です。以下は検証環境で確認した状況であり、すべてのPCやタイトルで同じ結果になるとは限りません。
 
-Linux では、ウィンドウ表示とフレームバッファーの内容が一致します。
-macOS ビルド（`make dist-mac`）ではフレームバッファーへ描画できるものの、
-画面上の実ウィンドウが黒いままになる場合があります。
+**Linux：** 検証環境では、描画されたフレームバッファーとウィンドウの表示が一致しています。
 
-Windows の `make dist` は、結合した実行ファイルと依存 DLL を含む ZIP を生成します。
-ZIP の展開先から、Wine 上の ARM32・ARM64 ABI テストと EGL/GLES 初期化を確認しました。
-Windows 実機での表示・音声は未検証です。
+**Apple Silicon搭載Mac：** `make dist-mac`で配布物を作成できます。ただし、内部では描画できていても、ウィンドウが黒いままになる場合があります。
 
-`make dist` は、ビルドディレクトリに依存しない配布ツリーを作成します。
-配布用は `-O3`、`-DNDEBUG`、LTO で最適化し、Dynarmic も Release + IPO で
-専用ディレクトリへ再ビルドします。`-march=native` は指定しません。
+**Windows：** `make dist`で実行ファイルと依存DLLをまとめたZIPを作成できます。Wine上ではARM32／ARM64のABIテストとEGL／GLESの初期化を確認しました。Windows実機での画面表示と音声出力は未検証です。
 
-Android API の未実装、タイトル固有の問題、大量の診断出力、
-破壊的変更が含まれることを前提にしてください。
+配布用ビルドは`-O3`、`-DNDEBUG`、LTOで最適化し、dynarmicもRelease＋IPOで別途ビルドします。`-march=native`は使用しないため、ビルドしたPC固有の命令セットへの依存を避けています。
 
-コントリビューションを行う場合は、タイトル名、ABI、エンジンのバージョン、
-最後に成功した到達点、ログ、キャプチャしたフレームを添えていただけると特に役立ちます。
+未実装のAndroid APIやゲーム固有の不具合、詳細な診断ログ、互換性を壊す変更が残っています。安定版の代替としてではなく、開発・検証中のプロジェクトとしてご利用ください。
 
-[Mozilla Public License 2.0](LICENSE) の下でライセンスされています。
+**不具合報告や開発への参加を歓迎します。** ゲーム名、エンジンのバージョン、ABI、正常に進めた最後の画面、ログ、描画画像を添えていただけると、原因を調べるうえで大変助かります。
+
+ライセンスは[Mozilla Public License 2.0](LICENSE)です。
 
 Project Lunaria © 2026 Yuichiro Nakada.

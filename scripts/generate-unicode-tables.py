@@ -4,6 +4,7 @@ Usage: python3 scripts/generate-unicode-tables.py /path/to/UCD.zip
 No Unicode library is required when building or running Lunaria.
 """
 import sys, zipfile, stringprep
+from fractions import Fraction
 from pathlib import Path
 z=zipfile.ZipFile(sys.argv[1])
 N=0x110000
@@ -84,3 +85,65 @@ out+=['static const uint32_t prep_data[]={'+','.join(hex(c) for c in pool)+'};',
  'static const struct prep_map { uint32_t cp,offset; uint8_t length; } prep_maps[]={']
 out+=['{%#x,%d,%d},'%r for r in rows];out+=['};']
 Path(__file__).resolve().parents[1].joinpath('src/unicode/character_data.h').write_text('\n'.join(out)+'\n')
+
+# Java numeric values include Unihan-derived values as well as UnicodeData.
+numeric={}
+for row in lines('extracted/DerivedNumericValues.txt'):
+ value=Fraction(row[3])
+ result=int(value) if value.denominator==1 and 0<=value<=0x7fffffff else -2
+ for cp in points(row[0]): numeric[cp]=result
+out=['/* Generated from Unicode 15.0.0 UCD. License: LICENSE.unicode. */',
+ 'static const struct uc_numeric { uint32_t cp; int32_t value; } uc_numeric_values[]={']
+out+=['{%#x,%d},'%(cp,value) for cp,value in sorted(numeric.items())]
+out+=['};']
+Path(__file__).resolve().parents[1].joinpath('src/unicode/numeric_data.h').write_text('\n'.join(out)+'\n')
+
+# UAX #14/#29 boundary properties and official conformance fixtures.
+root = Path(__file__).resolve().parents[1]
+archive = z
+count = 0x110000
+lb_names = 'XX AI AL B2 BA BB BK CB CJ CL CM CP CR EB EM EX GL H2 H3 HL HY ID IN IS JL JT JV LF NL NS NU OP PO PR QU RI SA SG SP SY WJ ZW ZWJ'.split()
+gb_names = 'Other CR LF Control Extend ZWJ Regional_Indicator Prepend SpacingMark L V T LV LVT'.split()
+lb = bytearray(count)
+gb = bytearray(count)
+flags = bytearray(count)
+
+def rows(name):
+    for line in archive.read(name).decode().splitlines():
+        line = line.split('#')[0].strip()
+        if line:
+            code, value = map(str.strip, line.split(';')[:2])
+            ends = code.split('..')
+            yield int(ends[0], 16), int(ends[-1], 16), value
+
+for first, last, value in rows('LineBreak.txt'):
+    lb[first:last + 1] = bytes([lb_names.index(value)]) * (last + 1 - first)
+for first, last, value in rows('auxiliary/GraphemeBreakProperty.txt'):
+    gb[first:last + 1] = bytes([gb_names.index(value)]) * (last + 1 - first)
+for name, accepted, bit in [('emoji/emoji-data.txt', ['Extended_Pictographic'], 1),
+                            ('EastAsianWidth.txt', ['F', 'W', 'H'], 2)]:
+    for first, last, value in rows(name):
+        if value in accepted:
+            for cp in range(first, last + 1):
+                flags[cp] |= bit
+out = ['/* Generated from Unicode 15.0.0 UCD. License: LICENSE.unicode. */',
+       'enum uc_lb { ' + ', '.join('LB_' + x for x in lb_names) + ' };',
+       'enum uc_gb { ' + ', '.join('GB_' + x for x in gb_names) + ' };',
+       'static const struct uc_break_range { uint32_t first, last; uint8_t lb, gb, flags; } uc_break_ranges[] = {']
+start = 0
+previous = (lb[0], gb[0], flags[0])
+for cp in range(1, count + 1):
+    current = (lb[cp], gb[cp], flags[cp]) if cp < count else None
+    if current != previous:
+        out.append('{0x%x,0x%x,%d,%d,%d},' % (start, cp - 1, *previous))
+        start, previous = cp, current
+out.append('};')
+out.append('static const struct uc_break_range uc_break_ascii[] = {')
+for cp in range(128):
+    out.append('{0x%x,0x%x,%d,%d,%d},' % (cp, cp, lb[cp], gb[cp], flags[cp]))
+out.append('};')
+(root / 'src/unicode/break_data.h').write_text('\n'.join(out) + '\n')
+fixtures = root / 'test/unicode-breaks'
+fixtures.mkdir(exist_ok=True)
+for name in ['GraphemeBreakTest.txt', 'LineBreakTest.txt']:
+    (fixtures / name).write_bytes(archive.read('auxiliary/' + name))

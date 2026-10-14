@@ -26,16 +26,38 @@ boost=${WIN_BOOST_INCLUDE:-$deps/include}
 [ -f "$glfw" ] || fail "missing $glfw; set WIN_GLFW_LIB"
 [ -f "$angle/lib/libEGL.dll.a" ] || fail "missing ANGLE import libraries in $angle; set WIN_ANGLE"
 [ -d "$boost/boost" ] || fail "missing Boost headers in $boost; set WIN_BOOST_INCLUDE"
-printf 'int main(void) { return 0; }\n' | "${cross}gcc" -mcrtdll=ucrt -x c -fsyntax-only - \
-    || fail 'the cross compiler must support -mcrtdll=ucrt'
+# Prefer GCC's -mcrtdll=ucrt (Fedora/newer MinGW). Ubuntu's apt MinGW (GCC 13)
+# lacks it; llvm-mingw UCRT toolchains already default to UCRT and reject the flag.
+# Probe with a real link (not -fsyntax-only) so a wrong-arch compiler on PATH
+# (e.g. x86_64 llvm-mingw on aarch64) fails here with a clear message.
+crt_flags=
+crt_probe=$(mktemp -d)
+printf 'int main(void) { return 0; }\n' >"$crt_probe/t.c"
+crt_err=$crt_probe/err.txt
+if "${cross}gcc" -mcrtdll=ucrt "$crt_probe/t.c" -o "$crt_probe/t.exe" >"$crt_err" 2>&1; then
+    crt_flags=-mcrtdll=ucrt
+elif "${cross}gcc" "$crt_probe/t.c" -o "$crt_probe/t.exe" >"$crt_err" 2>&1; then
+    if ! "${cross}objdump" -p "$crt_probe/t.exe" | grep -Eiq 'ucrtbase|api-ms-win-crt-'; then
+        rm -rf "$crt_probe"
+        fail 'the cross compiler must target UCRT (GCC with -mcrtdll=ucrt, or llvm-mingw UCRT)'
+    fi
+else
+    _msg=$(cat "$crt_err" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')
+    rm -rf "$crt_probe"
+    fail "cross compiler failed to link a trivial program (${cross}gcc): ${_msg:-no output; check host arch vs toolchain}"
+fi
+rm -rf "$crt_probe"
 export OBJDUMP="${cross}objdump"
 export WINDOWS_DLL_DIRS="$deps/bin:$angle/bin:$deps${WINDOWS_DLL_DIRS:+:$WINDOWS_DLL_DIRS}"
-echo "dist-cross-win: dependencies=$deps, ANGLE=$angle, GLFW=$glfw"
+echo "dist-cross-win: dependencies=$deps, ANGLE=$angle, GLFW=$glfw, CRT_FLAGS=${crt_flags:-(toolchain default UCRT)}"
 work=${WIN_BUILD_DIR:-/tmp/lunaria-cross-win}
 mkdir -p "$work"
+# FMT_CONSTEVAL=: bundled fmt 10.x fails Clang 20+ consteval checks (llvm-mingw).
+cxx_flags="${crt_flags:+$crt_flags }-DFMT_CONSTEVAL="
 exec "${1:-make}" dist \
     LUNA_OS_NAME=MINGW64 DIST_OS=windows DIST_ARCH=x86_64 \
     CC="${cross}gcc" CXX="${cross}g++" \
+    WINDOWS_CRT_FLAGS="$crt_flags" \
     BUILD_DIR="$work" LUNARIA_BIN="$work/lunaria.exe" \
     OPENH264_SO="$work/runtime/openh264.dll" SYSLIB_DIR="$work/syslib-arm64" \
     DIST_BUILD_DIR="${WIN_DIST_BUILD_DIR:-/tmp/lunaria-dist-build/cross-windows-x86_64}" \
@@ -44,4 +66,4 @@ exec "${1:-make}" dist \
     HOST_GL_LIBS="-L$angle/lib -lEGL -lGLESv2" \
     HOST_CRYPTO_LIBS="-L$angle/lib -L$deps/lib -lssl -lcrypto" \
     HOST_Z_LIBS="-L$angle/lib -L$deps/lib -lz" \
-    DYNARMIC_CMAKE_FLAGS="-G Ninja -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=AMD64 -DCMAKE_C_COMPILER=${cross}gcc -DCMAKE_CXX_COMPILER=${cross}g++ -DCMAKE_C_FLAGS=-mcrtdll=ucrt -DCMAKE_CXX_FLAGS=-mcrtdll=ucrt -DBoost_INCLUDE_DIR=$boost -DBoost_NO_BOOST_CMAKE=ON -DDYNARMIC_USE_LLVM=OFF"
+    DYNARMIC_CMAKE_FLAGS="-G Ninja -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=AMD64 -DCMAKE_C_COMPILER=${cross}gcc -DCMAKE_CXX_COMPILER=${cross}g++ -DCMAKE_C_FLAGS=\"$crt_flags\" -DCMAKE_CXX_FLAGS=\"$cxx_flags\" -DBoost_INCLUDE_DIR=$boost -DBoost_NO_BOOST_CMAKE=ON -DDYNARMIC_USE_LLVM=OFF"

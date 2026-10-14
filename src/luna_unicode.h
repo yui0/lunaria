@@ -32,6 +32,8 @@ bool luna_uc_graph(int32_t cp);
 bool luna_uc_print(int32_t cp);
 bool luna_uc_punct(int32_t cp);
 bool luna_uc_xdigit(int32_t cp);
+/* UTF-16 boundaries: 1=line opportunity, 2=grapheme, 4=mandatory line break. */
+bool luna_uc_breaks_utf16(const uint16_t *text, size_t length, unsigned char *breaks);
 #ifdef __cplusplus
 }
 #endif

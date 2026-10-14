@@ -135,6 +135,9 @@ struct dvm_object {
    /* strings */
    char *utf8;
    uint32_t utf8_len;
+   uint16_t *string_units; /* lazy immutable String index; NULL for ASCII */
+   uint32_t string_length;
+   bool string_index_ready;
 
    /* arrays */
    uint32_t length;
@@ -369,6 +372,17 @@ void dvm__warn_placeholder(struct dvm *vm);
  * several overloads at once (Field.get/getInt/..., Field.set/setInt/...)
  * whose behaviour differs by which one the caller named. */
 struct dvm_method *dvm__builtin_method(void);
+
+/* Field resolution starts at the class named by the accessing code, rather
+ * than at the receiver's runtime class. The caller supplies an owner from the
+ * receiver's superclass chain, as a resolved dex field reference does.
+ * NULL retains the public API's lookup from the receiver's runtime class. */
+bool dvm__get_field_from(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
+                         const char *name, const char *type,
+                         union dvm_value *out);
+bool dvm__set_field_from(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
+                         const char *name, const char *type,
+                         union dvm_value val);
 bool dvm__monitor_enter(struct dvm *vm, dvm_ref ref);
 bool dvm__monitor_try_enter(struct dvm *vm, dvm_ref ref);
 bool dvm__monitor_exit(struct dvm *vm, dvm_ref ref);
@@ -494,6 +508,7 @@ void dvm__network_tick(struct dvm *vm);
 
 /* Runs threads queued by Thread.start(); called when the VM returns to JNI. */
 void dvm__run_pending_threads(struct dvm *vm);
+uint64_t dvm__current_thread_id(struct dvm *vm);
 /* Same queue, for a thread that is blocked waiting on another one: this form
  * is allowed to nest, because what it waits for is queued here too. */
 /* Run whatever is due on the pending queue and answer how many ran.  A caller
@@ -550,3 +565,6 @@ struct dvm_class *dvm_runtime_define(struct dvm *vm, const char *desc);
 
 /* A fresh Bundle containing only the installed application metadata. */
 dvm_ref dvm_runtime_manifest_bundle(struct dvm *vm);
+
+/* Host route providers update capabilities and notify filtered observers. */
+bool dvm__media_router_update_types(struct dvm *vm, dvm_ref route, int types);

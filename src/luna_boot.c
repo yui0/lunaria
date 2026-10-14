@@ -584,7 +584,7 @@ static void character(GLFWwindow *w, unsigned int c)
 static void scroll(GLFWwindow *w, double x, double y)
 { (void)w; luna_scroll(x, y); }
 
-/* A file dropped on the window is the same answer as typing its path. */
+/* A file dropped on the window is the same answer as choosing it in the dialog. */
 static char dropped[4096];
 static void drop(GLFWwindow *w, int count, const char **paths)
 {
@@ -737,9 +737,8 @@ int luna_launcher_cancelled(void) { return cancelled; }
  * Started with no application (a double-clicked .app, a desktop launcher) the
  * emulator asks which one to run, and where this installation keeps its data:
  * the one setting that cannot be recreated, because a later run pointed
- * elsewhere does not find what an earlier one downloaded.  The application is
- * a path field, Browse (luna-ui's own file dialog, so it is the same on every
- * host OS) and drag-and-drop. */
+ * elsewhere does not find what an earlier one downloaded.  The package button
+ * opens luna-ui's file dialog and also accepts drag-and-drop on the window. */
 #define PICK_FIELDS 16
 #ifndef LUNARIA_VERSION
 #define LUNARIA_VERSION ""
@@ -874,7 +873,7 @@ static void pick_open_dialog(int field)
     }
     if (luna_file_dialog_show(&config, pick_dialog_done, NULL) < 0)
         luna_set_text(luna_get_element_by_id("error"),
-                      "No file browser here: type the path or drop the file on this window.");
+                      "Cannot open the file browser. Drop the file on this window.");
 }
 
 static void pick_browse(LunaElement *element) { (void)element; pick_open_dialog(-1); }
@@ -1019,8 +1018,9 @@ static const char pick_css_extra[] =
     "#launcher-card h1{font-size:21px;margin:0 0 4px 0;color:#12324d;}"
     "#launcher-card h2{font-size:12px;margin:22px 0 2px 0;color:#5c7a92;letter-spacing:2px;}"
     "#launcher-card .sub{margin:0 0 12px 0;color:#5c7a92;font-size:13px;text-align:left;padding:0;}"
-    "#launcher-card .drop{padding:14px;border:2px dashed #9cc7e4;border-radius:10px;background:#eef7fd;"
-    "text-align:center;color:#3f7fa8;margin-bottom:10px;}"
+    "#launcher-card button.drop{box-sizing:border-box;display:block;width:100%;padding:14px;border:2px dashed #9cc7e4;border-radius:10px;background:#eef7fd;"
+    "text-align:center;color:#3f7fa8;margin:0 0 10px 0;cursor:pointer;}"
+    "#launcher-card button.drop:hover,#launcher-card button.drop:focus{background:#e3f1fb;border-color:#3f7fa8;}"
     "#launcher-card .row{position:relative;height:42px;margin:0 0 4px 0;}"
     "#launcher-card .row input{position:absolute;left:0;right:104px;top:0;height:40px;width:auto;padding:0 12px;"
     "border:1px solid #bcd6e8;border-radius:8px;background:#ffffff;color:#12324d;}"
@@ -1083,9 +1083,7 @@ static int launcher_form(char *path, size_t capacity,
         "<div class=\"card\" id=\"launcher-card\"><div class=\"main\"><h1 id=\"launcher-title\"></h1>"
         "<p class=\"sub\" id=\"launcher-sub\"></p>");
     if (!package) at += (size_t)snprintf(html + at, html_size - at,
-        "<div class=\"drop\" id=\"drop\">Drop a package file here</div>"
-        "<div class=\"row\"><input id=\"path\" value=\"\">"
-        "<button id=\"browse\">Browse…</button></div>");
+        "<button class=\"drop\" id=\"drop\">Drop a package file here or click to browse…</button>");
     at += (size_t)snprintf(html + at, html_size - at, "<h2>%s</h2>", package ? "PROFILE" : "SETTINGS");
     for (size_t i = 0; i < count; ++i) {
         if (settings[i].compact) {
@@ -1140,7 +1138,7 @@ static int launcher_form(char *path, size_t capacity,
     free(html); free(css);
     luna_set_text(luna_get_element_by_id("launcher-title"), package ? "Open a profile" : "Open an application");
     luna_set_text(luna_get_element_by_id("launcher-sub"), package ? package : "Choose an APK, XAPK, APKS or AAB package.");
-    luna_set_on_click(luna_get_element_by_id("browse"), pick_browse);
+    if (!package) luna_set_on_click(luna_get_element_by_id("drop"), pick_browse);
     luna_set_on_click(luna_get_element_by_id("continue"), pick_continue);
     for (size_t i = 0; i < count; ++i) {
         char id[32]; snprintf(id, sizeof id, "browse%zu", i);
@@ -1160,6 +1158,7 @@ static int launcher_form(char *path, size_t capacity,
     else fprintf(stderr, "[apk-ui] no application given: asking which to open\n");
 
     int result = -1;
+    char selected_path[4096] = "";
     while (!cancelled) {
         frame(1);
         if (pick_folder[0] && pick_folder_for >= 0) {
@@ -1167,7 +1166,7 @@ static int launcher_form(char *path, size_t capacity,
             pick_folder[0] = 0; pick_folder_for = -1;
         }
         if (dropped[0]) {
-            luna_set_value(luna_get_element_by_id("path"), dropped);
+            snprintf(selected_path, sizeof selected_path, "%s", dropped);
             dropped[0] = 0;
             pick_chosen = 1;
         }
@@ -1187,9 +1186,10 @@ static int launcher_form(char *path, size_t capacity,
                 luna_set_text(luna_get_element_by_id("error"), "Use 1–64 letters, digits, dots, hyphens or underscores.");
                 continue;
             }
-            const char *typed = luna_get_value(luna_get_element_by_id("path"));
             char cleaned[4096];
-            if (!typed || pick_clean(typed, cleaned, sizeof cleaned) ||
+            if (!selected_path[0]) {
+                pick_open_dialog(-1);
+            } else if (pick_clean(selected_path, cleaned, sizeof cleaned) ||
                 !pick_acceptable(cleaned) || strlen(cleaned) >= capacity) {
                 luna_set_text(luna_get_element_by_id("error"),
                               "That is not an existing .apk, .xapk, .apks or .aab file.");
