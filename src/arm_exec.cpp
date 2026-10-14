@@ -20872,9 +20872,76 @@ extern "C" char **arm_exec_asset_list(const char *name, size_t *count) {
     return names;
 }
 
-/* java.util.zip.ZipFile's host bridge.  Package archives reuse the index that
- * AssetManager already owns; other guest-visible archives get a short-lived
- * local index, so Java's ZipFile is not secretly tied to the current APK. */
+/* java.util.zip.ZipFile's host bridge. Base APK reads reuse AssetManager's
+ * permanent index. Other archives used to rebuild the entire central directory
+ * for EVERY ZipFile.getEntry(), making many small resource reads quadratic in
+ * archive entry count. Cache only the directory (never mutable entry bytes).
+ * Validate metadata on each call so changed archives are reindexed. */
+struct luna_zip_index_cache {
+    uint64_t size = 0;
+    int64_t mtime_ns = 0, ctime_ns = 0;
+    uint64_t used = 0;
+    std::shared_ptr<const std::map<std::string, asset_bridge::ZipEntry>> entries;
+};
+static std::mutex g_luna_zip_mu;
+static std::map<std::string, luna_zip_index_cache> g_luna_zip_indexes;
+static uint64_t g_luna_zip_clock = 0;
+static constexpr size_t kLunaZipIndexLimit = 12;
+
+static int64_t luna_zip_mtime_ns(const struct stat &sb) {
+#if defined(__APPLE__)
+    return (int64_t)sb.st_mtimespec.tv_sec * 1000000000ll + sb.st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    return (int64_t)sb.st_mtime * 1000000000ll;
+#else
+    return (int64_t)sb.st_mtim.tv_sec * 1000000000ll + sb.st_mtim.tv_nsec;
+#endif
+}
+static int64_t luna_zip_ctime_ns(const struct stat &sb) {
+#if defined(__APPLE__)
+    return (int64_t)sb.st_ctimespec.tv_sec * 1000000000ll + sb.st_ctimespec.tv_nsec;
+#elif defined(_WIN32)
+    return (int64_t)sb.st_ctime * 1000000000ll;
+#else
+    return (int64_t)sb.st_ctim.tv_sec * 1000000000ll + sb.st_ctim.tv_nsec;
+#endif
+}
+static std::shared_ptr<const std::map<std::string, asset_bridge::ZipEntry>>
+luna_zip_cached_index(FILE *fp, const std::string &path, const struct stat &sb) {
+    const uint64_t size = (uint64_t)sb.st_size;
+    const int64_t mtime = luna_zip_mtime_ns(sb);
+    const int64_t ctime = luna_zip_ctime_ns(sb);
+    {
+        std::lock_guard<std::mutex> guard(g_luna_zip_mu);
+        const auto it = g_luna_zip_indexes.find(path);
+        if (it != g_luna_zip_indexes.end() && it->second.size == size &&
+            it->second.mtime_ns == mtime && it->second.ctime_ns == ctime) {
+            it->second.used = ++g_luna_zip_clock;
+            return it->second.entries;
+        }
+    }
+    std::map<std::string, asset_bridge::ZipEntry> parsed;
+    if (!asset_bridge::zip_index_file(fp, parsed)) return {};
+    auto result = std::make_shared<const std::map<std::string, asset_bridge::ZipEntry>>(
+        std::move(parsed));
+    {
+        std::lock_guard<std::mutex> guard(g_luna_zip_mu);
+        auto &slot = g_luna_zip_indexes[path];
+        slot.size = size;
+        slot.mtime_ns = mtime;
+        slot.ctime_ns = ctime;
+        slot.used = ++g_luna_zip_clock;
+        slot.entries = result;
+        if (g_luna_zip_indexes.size() > kLunaZipIndexLimit) {
+            auto victim = g_luna_zip_indexes.begin();
+            for (auto it = g_luna_zip_indexes.begin(); it != g_luna_zip_indexes.end(); ++it)
+                if (it->second.used < victim->second.used) victim = it;
+            g_luna_zip_indexes.erase(victim);
+        }
+    }
+    return result;
+}
+
 extern "C" unsigned char *arm_exec_zip_read(const char *archive,
                                              const char *name, size_t *len) {
     if (!archive || !*archive || !name || !*name) return nullptr;
@@ -20893,13 +20960,14 @@ extern "C" unsigned char *arm_exec_zip_read(const char *archive,
             std::string path = std::string(host) + "/" + name;
             if (!asset_bridge::read_host_regular(path, data)) return nullptr;
         } else {
+            if (!S_ISREG(sb.st_mode) || sb.st_size < 0) return nullptr;
             FILE *fp = luna_file_fopen(host, "rb");
             if (!fp) return nullptr;
-            std::map<std::string, asset_bridge::ZipEntry> dir;
-            bool ok = asset_bridge::zip_index_file(fp, dir);
-            auto it = dir.find(name);
-            ok = ok && it != dir.end() &&
-                 asset_bridge::zip_read_entry(fp, it->second, name, data);
+            const auto dir = luna_zip_cached_index(fp, host, sb);
+            const auto it = dir ? dir->find(name) :
+                                  std::map<std::string, asset_bridge::ZipEntry>::const_iterator();
+            const bool ok = dir && it != dir->end() &&
+                            asset_bridge::zip_read_entry(fp, it->second, name, data);
             fclose(fp);
             if (!ok) return nullptr;
         }
