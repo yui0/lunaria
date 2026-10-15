@@ -35,12 +35,31 @@ def bundle(stage):
     # Native MSYS2 Python sees Windows paths, so /ucrt64 is not its install
     # prefix. Its own executable (or GCC) locates the actual toolchain bin.
     directories.append(Path(sys.executable).resolve().parent)
-    compiler = shutil.which("gcc")
-    if compiler:
-        directories.append(Path(compiler).resolve().parent)
+    # Prefer the cross toolchain that built lunaria.exe (llvm-mingw puts
+    # libc++.dll in $prefix/x86_64-w64-mingw32/bin; host gcc is useless here).
+    for tool in (
+        os.environ.get("CXX"),
+        os.environ.get("CC"),
+        "x86_64-w64-mingw32-g++",
+        "x86_64-w64-mingw32-gcc",
+        "gcc",
+    ):
+        if not tool:
+            continue
+        tool = tool.split()[0]
+        compiler = tool if os.path.isabs(tool) and os.path.isfile(tool) else shutil.which(tool)
+        if not compiler:
+            continue
+        resolved = Path(compiler).resolve()
+        directories.append(resolved.parent)
+        # llvm-mingw layout: $prefix/bin/<triple>-g++ → $prefix/<triple>/bin/*.dll
+        triple_bin = resolved.parent.parent / "x86_64-w64-mingw32" / "bin"
+        if triple_bin.is_dir():
+            directories.append(triple_bin)
     directories += [Path(p) for p in os.environ.get("WINDOWS_DLL_DIRS", "").split(os.pathsep) if p]
     directories += [Path(p) for p in (
-        "/mingw64/bin", "/ucrt64/bin", "/usr/x86_64-w64-mingw32/sys-root/mingw/bin")]
+        "/mingw64/bin", "/ucrt64/bin", "/usr/x86_64-w64-mingw32/sys-root/mingw/bin",
+        "/opt/llvm-mingw/x86_64-w64-mingw32/bin")]
     index = {}
     for directory in directories:
         if directory.is_dir():
@@ -55,9 +74,15 @@ def bundle(stage):
         if binary.resolve() in seen:
             continue
         seen.add(binary.resolve())
+        # GNU objdump prints pei-x86-64; llvm-objdump (llvm-mingw) prints
+        # coff-x86-64 for the same PE32+ image. LANG=C keeps the label English
+        # when a localized host objdump is used as a fallback.
+        env = os.environ.copy()
+        env.setdefault("LC_ALL", "C")
+        env.setdefault("LANG", "C")
         result = subprocess.run([objdump, "-p", str(binary)], check=True,
-                                text=True, stdout=subprocess.PIPE)
-        if "file format pei-x86-64" not in result.stdout:
+                                text=True, stdout=subprocess.PIPE, env=env)
+        if not re.search(r"file format (?:pei|coff)-x86-64\b", result.stdout):
             raise RuntimeError(f"{binary}: expected a Windows x86_64 PE binary")
         for name in re.findall(r"DLL Name:\s*(\S+)", result.stdout):
             key = name.lower()

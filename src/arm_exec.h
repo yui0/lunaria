@@ -292,6 +292,8 @@ void arm_exec_glfw_poll(void);
 /* Host input only, and only on the window owner, while execution is paused. */
 void arm_exec_pause_poll(void);
 int arm_exec_host_ui_thread(void);
+/* Dispatch main-Looper NDK frame callbacks from the framework frame pump. */
+void arm_exec_main_choreographer_tick(void);
 void arm_exec_service_host_ui(void);
 
 /* GL_VENDOR / GL_RENDERER / GL_VERSION / GL_SHADING_LANGUAGE_VERSION /
@@ -670,6 +672,8 @@ int arm_exec_boot_present(void);
 /* How many times guest abort() has been called (mono g_assert, etc.). */
 uint64_t arm_exec_guest_abort_count(void);
 uint64_t arm_exec_guest_exit_count(void);
+/* Process status after a non-child guest exit (valid when exit_count > 0). */
+int arm_exec_guest_exit_status(void);
 
 /* Consumes a pending SetDesiredViewSize change: returns 1 once per resize and
  * fills the width/height outputs with the new view size, so the pump can deliver the engine's

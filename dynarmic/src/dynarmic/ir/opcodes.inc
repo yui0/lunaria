@@ -4,6 +4,7 @@
 
 OPCODE(Void,                                                Void,                                                                           )
 OPCODE(Identity,                                            Opaque,         Opaque                                                          )
+OPCODE(ProcessorYield,                                     Void,                                                                           )
 OPCODE(Breakpoint,                                          Void,                                                                           )
 OPCODE(CallHostFunction,                                    Void,           U64,            Opaque,         Opaque,         Opaque          )
 

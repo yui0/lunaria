@@ -18,6 +18,9 @@
 #include <string.h>
 
 static struct dvm *g_vm;
+/* A successfully loaded VM lives until process teardown; shutdown joins its
+ * threads without freeing the JNI-referenced heap. Publish it after loading. */
+static _Atomic(struct dvm *) g_ready_vm;
 static bool g_tried;
 static enum dvm_jni_mode g_mode = DVM_JNI_FILL_GAPS;
 /* The env of the call currently in flight *on this thread*.
@@ -1770,6 +1773,7 @@ static struct dvm *vm_get(void)
       }
    }
    fprintf(stderr, "[dvm] bytecode emulator ready (%d dex, mode %d)\n", n, (int)g_mode);
+   atomic_store_explicit(&g_ready_vm,g_vm,memory_order_release);
    return g_vm;
 }
 
@@ -2283,6 +2287,16 @@ void dvm_jni_report(void)
                    "%llu instructions\n",
            g_calls, g_external_calls, g_native_calls,
            (unsigned long long)dvm_instructions(g_vm));
+}
+
+bool dvm_jni_process_exited(int *status)
+{
+   return dvm_process_exited(atomic_load_explicit(&g_ready_vm,memory_order_acquire),status);
+}
+
+void dvm_jni_exit_process(int status)
+{
+   dvm_exit_process(atomic_load_explicit(&g_ready_vm,memory_order_acquire),status);
 }
 
 struct dvm *dvm_jni_vm(void)

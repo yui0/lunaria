@@ -128,6 +128,9 @@ void dvm_glsurface_finish(struct dvm *vm);
  * host threads before releasing the JNI table or execution engines. */
 bool dvm_is_stopping(struct dvm *vm);
 void dvm_request_stop(struct dvm *vm);
+/* Explicit Java exit/halt, distinct from forced host teardown. */
+bool dvm_process_exited(struct dvm *vm, int *status);
+void dvm_exit_process(struct dvm *vm, int status);
 void dvm_threads_finish(struct dvm *vm);
 
 /* Adds one classes*.dex.  Later files do not override classes already

@@ -2863,6 +2863,10 @@ U128 IREmitter::FPVectorToUnsignedFixed(size_t esize, const U128& a, size_t fbit
     UNREACHABLE();
 }
 
+void IREmitter::ProcessorYield() {
+    Inst(Opcode::ProcessorYield);
+}
+
 void IREmitter::Breakpoint() {
     Inst(Opcode::Breakpoint);
 }

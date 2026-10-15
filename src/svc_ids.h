@@ -1099,9 +1099,8 @@ enum SvcId : uint32_t {
     SVC_AMOTION_TOOLTYPE,
     SVC_AMOTION_AXISVALUE,
 
-    /* AAsset stream reads.  AAssetManager_open already materialises the whole
-     * entry, so the stream API is a cursor over that buffer — the NDK contract
-     * every non-mmap reader (`AAsset_read` loops until it returns 0) relies on. */
+    /* AAsset stream reads use host data or file reads; getBuffer alone
+     * materialises a complete guest buffer. */
     SVC_AASSET_READ,
     SVC_AASSET_SEEK,
     SVC_AASSET_SEEK64,

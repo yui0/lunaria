@@ -40,6 +40,7 @@
 #include "luna_compositor.h"
 #include "luna_overlay.h"
 #include "dvm/dvm_jni.h"
+#include "dvm/dvm.h"
 
 #ifdef _WIN32
 /* This call targets the Android ELF loader, using Android flag values. */
@@ -1022,11 +1023,20 @@ pump_now_us(void)
  * when Unity happened to call into Java, apply()'d preferences never reached
  * the disk (the account a login stored was gone next launch), and typed text
  * waited for the guest to call Java before the input method saw it. */
+static bool process_exit_status(int *status)
+{
+   if (dvm_jni_process_exited(status)) return true;
+   if (!arm_exec_guest_exit_count()) return false;
+   if (status) *status=arm_exec_guest_exit_status();
+   return true;
+}
+
 static void
 pump_java_frame(void)
 {
-   if (luna_guest_paused()) return;
+   if (luna_guest_paused() || process_exit_status(NULL) || arm_exec_guest_abort_count()) return;
    thread_dump_request_tick();
+   arm_exec_main_choreographer_tick();
    const uint64_t t_media = frame_now_ns();
    struct dvm *vm = dvm_jni_vm();
    if (vm) {
@@ -1063,6 +1073,7 @@ pump_run_frame(void (*run_threads)(void))
       const uint64_t t_sched = frame_now_ns();
       run_threads();
       frame_stage_add(FRAME_STAGE_SCHED, t_sched);
+      if (process_exit_status(NULL) || arm_exec_guest_abort_count()) return;
       const uint64_t now = pump_now_us();
       if (now >= deadline)
          break;
@@ -1446,13 +1457,16 @@ run_dex_activity(struct jvm *jvm, int is_a64)
    { const char *mf = getenv("LUNARIA_MAX_FRAMES"); if (mf && *mf) max_frames = atoi(mf); }
    fprintf(stderr, "[loader] dex startup: entering pump loop (max_frames=%d)\n",
            max_frames);
-   int frame = 0;
+   int frame = 0, exit_status = 0;
    for (; max_frames <= 0 || frame < max_frames; ++frame) {
       if (arm_exec_guest_abort_count() > 0) {
          fprintf(stderr, "[loader] guest abort — stopping dex loop (frame %d)\n", frame);
          return EXIT_FAILURE;
       }
+      if (process_exit_status(&exit_status)) return exit_status;
       pump_run_frame(run_threads);
+      if (process_exit_status(&exit_status)) return exit_status;
+      if (arm_exec_guest_abort_count()) return EXIT_FAILURE;
       if (is_a64) arm64_exec_egl_swap(); else arm_exec_egl_swap();
       arm_exec_glfw_poll();
       /* LUNARIA_TOUCH_FIFO / LUNARIA_TOUCH_TEST: the other pump loops replay them;
@@ -1486,8 +1500,10 @@ run_jni_game_arm64(struct jvm *jvm)
     * app has none: its entry point is the launcher Activity, in the dex.  With
     * a bytecode VM that is runnable, so start it the way Android does instead
     * of giving up on the package. */
-   if (run_dex_activity(jvm, 1) == EXIT_SUCCESS)
-      return EXIT_SUCCESS;
+   int result = run_dex_activity(jvm, 1);
+   int exit_status=0;
+   if (process_exit_status(&exit_status)) return exit_status;
+   if (result == EXIT_SUCCESS) return EXIT_SUCCESS;
    fprintf(stderr, "[loader] arm64: no known entry point\n");
    return EXIT_FAILURE;
 }
@@ -1943,6 +1959,7 @@ main(int argc, const char *argv[])
          a64_preload_platform_libs();
 
       int ret = run_dex_activity(&jvm, is_a64);
+      (void)process_exit_status(&ret);
       arm_exec_begin_shutdown();
       dvm_jni_shutdown();
       arm_exec_shutdown_engines();
@@ -2029,8 +2046,12 @@ main(int argc, const char *argv[])
          fprintf(stderr, "[loader] early arm64 host EGL init failed\n");
 
       int jni_ver = arm64_exec_jni_onload(argv[1], &jvm);
-      if (jni_ver < 0) warnx("arm64_exec_jni_onload failed");
-      int ret = jni_ver < 0 ? EXIT_FAILURE : run_jni_game_arm64(&jvm);
+      int ret=0;
+      if (!process_exit_status(&ret)) {
+         if (jni_ver < 0) warnx("arm64_exec_jni_onload failed");
+         ret=jni_ver < 0 ? EXIT_FAILURE : run_jni_game_arm64(&jvm);
+         (void)process_exit_status(&ret);
+      }
       arm_exec_begin_shutdown();
       dvm_jni_shutdown();
       arm_exec_shutdown_engines();
@@ -2138,8 +2159,12 @@ main(int argc, const char *argv[])
 
       /* メインライブラリ (libunity.so) をロード & JNI_OnLoad 実行 */
       int jni_ver = arm_exec_jni_onload(argv[1], &jvm);
-      if (jni_ver < 0) warnx("arm_exec_jni_onload failed");
-      int ret = jni_ver < 0 ? EXIT_FAILURE : run_jni_game_arm(&jvm);
+      int ret=0;
+      if (!process_exit_status(&ret)) {
+         if (jni_ver < 0) warnx("arm_exec_jni_onload failed");
+         ret=jni_ver < 0 ? EXIT_FAILURE : run_jni_game_arm(&jvm);
+         (void)process_exit_status(&ret);
+      }
       arm_exec_begin_shutdown();
       dvm_jni_shutdown();
       arm_exec_shutdown_engines();

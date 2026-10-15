@@ -1345,6 +1345,27 @@ int luna_os_cpu_count(void);
 
 /* Name the calling thread, for the host's own debuggers and profilers. */
 void luna_os_thread_name(const char *name);
+/* Host thread token is valid only while that thread remains alive. Priority
+ * is Java's 1..10 range, 5 normal. Return 0 or -1 with errno. */
+uint64_t luna_os_thread_token(void);
+int luna_os_thread_priority(uint64_t token, int priority);
+int luna_os_thread_nice(uint64_t token, int niceness);
+/* ART's Android mapping; non-Linux hosts use the nearest Java level for an
+ * Android-specific niceness request. Scheduling remains a host policy. */
+static inline int luna_java_priority_nice(int priority)
+{
+   static const int values[]={19,16,13,10,0,-2,-4,-5,-6,-8};
+   return values[priority-1];
+}
+static inline int luna_nice_java_priority(int niceness)
+{
+   int best=1,distance=100;
+   for(int p=1;p<=10;++p) {
+      int delta=niceness-luna_java_priority_nice(p);if(delta<0) delta=-delta;
+      if(delta<=distance) {distance=delta;best=p;}
+   }
+   return best;
+}
 
 /* Give up the rest of this thread's slice. */
 void luna_os_yield(void);
@@ -1355,6 +1376,10 @@ void luna_os_yield(void);
  * Realtime is the wall clock the guest asks for. */
 uint64_t luna_os_monotonic_ns(void);
 uint64_t luna_os_realtime_ns(void);
+/* Android elapsedRealtime includes suspend; uptime excludes it. Both are
+ * boot-relative, independent of wall-clock adjustments. */
+uint64_t luna_os_boottime_ns(void);
+uint64_t luna_os_uptime_ns(void);
 
 /* ---- what the machine has ----------------------------------------------
  *

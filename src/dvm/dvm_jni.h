@@ -134,6 +134,9 @@ void dvm_jni_bind_unity_activity(JNIEnv *env, jobject activity);
 
 struct dvm;
 struct dvm *dvm_jni_vm(void);
+/* Process status must not initialize bytecode from a native SVC poll. */
+bool dvm_jni_process_exited(int *status);
+void dvm_jni_exit_process(int status);
 /* Write out any preferences an apply() left pending; declared in dvm.h too,
  * and repeated here because the frame pump calls it and does not (and cannot)
  * include the interpreter's own header. */

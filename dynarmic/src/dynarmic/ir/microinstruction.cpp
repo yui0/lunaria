@@ -542,7 +542,8 @@ bool Inst::IsSetCheckBitOperation() const {
 }
 
 bool Inst::MayHaveSideEffects() const {
-    return op == Opcode::PushRSB
+    return op == Opcode::ProcessorYield
+        || op == Opcode::PushRSB
         || op == Opcode::CallHostFunction
         || op == Opcode::A64DataCacheOperationRaised
         || op == Opcode::A64InstructionCacheOperationRaised

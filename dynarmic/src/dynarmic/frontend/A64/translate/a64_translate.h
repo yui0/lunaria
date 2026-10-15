@@ -32,7 +32,7 @@ struct TranslationOptions {
     bool wall_clock_cntpct = false;
 
     /// This changes what IR we emit when we translate a hint instruction.
-    /// If this is false, we treat the instruction as a NOP.
+    /// If this is false, YIELD becomes a host processor hint; other hints are NOPs.
     /// If this is true, we emit an ExceptionRaised instruction.
     bool hook_hint_instructions = true;
 };

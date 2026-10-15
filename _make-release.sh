@@ -14,12 +14,12 @@
 #   ./_make-release.sh --no-upload         # ビルドのみ (GitHub Release を作らない)
 #   ./_make-release.sh --sync-os           # リリース後に yui0/qBerryOS へアセットを同期
 #
-# ビルド成果物 (Makefile の `make dist` が作る。名前は lunaria-YYYY-MM-DD-<os>[-<arch>].*):
+# ビルド成果物 (Makefile の `make dist` が作る。名前は lunaria-YYYY-MM-DD-<os>-<arch>.*):
 #   lunaria-*-linux-aarch64.tar.gz / lunaria-*-linux-x86_64.tar.gz
 #                            : Linux (同梱 lib/runtime/fonts 付き)。ホストが aarch64 なら
 #                              x86_64 を gcc クロス (crossbuild-essential-amd64) で作る
-#   lunaria-*-windows.zip    : Windows x86_64 UCRT (Linux から `make dist-cross-win`)
-#   lunaria-*-macos.dmg      : macOS (hdiutil/codesign が要るため macOS 上でのみ生成)
+#   lunaria-*-windows-x86_64.zip : Windows x86_64 UCRT (Linux から `make dist-cross-win`)
+#   lunaria-*-macos-arm64.dmg    : macOS (hdiutil/codesign が要るため macOS 上でのみ生成)
 #
 # 注意: ツリー直下の lunaria / runtime/ / libdl.so / libpthread.so はビルドのたびに
 #       消して作り直す (アーキ違いのビルド成果物が混ざらないようにするため)。
@@ -28,7 +28,7 @@
 # macOS について:
 #   Linux ホストでは .dmg を作れない。--macos 指定時、Linux ホストでは
 #   リポジトリ直下 (または MACOS_DMG=/path/to.dmg) に Mac で作成済みの
-#   lunaria-*-macos.dmg があればそれをリリースに含め、無ければ警告してスキップする。
+#   lunaria-*-macos-*.dmg があればそれをリリースに含め、無ければ警告してスキップする。
 #
 # 環境変数:
 #   GITHUB_TOKEN        — Release 作成用 (未設定時は ~/.config/gh/hosts.yml から取得)
@@ -441,11 +441,12 @@ case "$HOST_OS" in
     ;;
   Darwin)
     if [[ "$BUILD_MACOS" == "true" ]]; then
-      info "ビルド中: lunaria-$DIST_DATE-macos.dmg ..."
+      NAME="lunaria-$DIST_DATE-macos-$HOST_ARCH"
+      info "ビルド中: $NAME.dmg ..."
       make macos-deps
       build_syslib
-      make -j"$JOBS" dist
-      collect "lunaria-$DIST_DATE-macos.dmg"
+      make -j"$JOBS" dist DIST_NAME="$NAME"
+      collect "$NAME.dmg"
     else
       warn "macOS ホストですが --macos が無いため macOS ビルドをスキップします。"
     fi
@@ -497,9 +498,12 @@ if [[ "$BUILD_WINDOWS" == "true" ]]; then
   if [[ "$HOST_OS" != "Linux" ]]; then
     warn "Windows クロスビルドは Linux ホストのみ対応です。スキップします。"
   else
-    info "ビルド中: lunaria-$DIST_DATE-windows.zip (mingw クロス) ..."
+    NAME="lunaria-$DIST_DATE-windows-x86_64"
+    info "ビルド中: $NAME.zip (mingw クロス) ..."
+    # Guest AArch64 syslib はホスト非依存。先に作って dist-cross-win で再利用する。
+    build_syslib
     make dist-cross-win
-    collect "lunaria-$DIST_DATE-windows.zip"
+    collect "$NAME.zip"
   fi
 fi
 
@@ -509,14 +513,14 @@ fi
 if [[ "$BUILD_MACOS" == "true" && "$HOST_OS" != "Darwin" ]]; then
   DMG="${MACOS_DMG:-}"
   if [[ -z "$DMG" ]]; then
-    DMG="$(ls -t lunaria-*-macos.dmg 2>/dev/null | head -1 || true)"
+    DMG="$(ls -t lunaria-*-macos-*.dmg lunaria-*-macos.dmg 2>/dev/null | head -1 || true)"
   fi
   if [[ -n "$DMG" && -f "$DMG" ]]; then
     cp "$DMG" "$ARTIFACTS_DIR/$(basename "$DMG")"
     success "作成済みの macOS dmg を取り込みました: $(basename "$DMG")"
   else
     warn "macOS の .dmg は Linux では作れません (hdiutil/codesign が必要)。"
-    warn "Mac で ./_make-release.sh --macos --no-upload を実行して lunaria-*-macos.dmg を作り、"
+    warn "Mac で ./_make-release.sh --macos --no-upload を実行して lunaria-*-macos-*.dmg を作り、"
     warn "このディレクトリに置くか MACOS_DMG=/path/to.dmg を指定してください。macOS はスキップします。"
   fi
 fi
@@ -578,7 +582,7 @@ Open the .dmg, drag `Lunaria.app` where you like, then run
 `/Applications/Lunaria.app/Contents/MacOS/Lunaria /path/to/app.apk`.
 
 ### Windows
-Unzip `lunaria-*-windows.zip` and run `lunaria.exe /path/to/app.apk`.
+Unzip `lunaria-*-windows-x86_64.zip` and run `lunaria.exe /path/to/app.apk`.
 EOF
 )
 

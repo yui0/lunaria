@@ -33,6 +33,7 @@
 #include <mstcpip.h>
 #include <limits.h>
 #include <mmsystem.h>
+#include <realtimeapiset.h>
 #include <stdatomic.h>
 
 size_t luna_os_stack_remaining(void)
@@ -745,6 +746,28 @@ void luna_os_thread_name(const char *name)
    SetThreadDescription(GetCurrentThread(), w);
 }
 
+uint64_t luna_os_thread_token(void) { return GetCurrentThreadId(); }
+int luna_os_thread_priority(uint64_t token, int priority)
+{
+   static const int levels[]={THREAD_PRIORITY_IDLE,THREAD_PRIORITY_LOWEST,
+      THREAD_PRIORITY_LOWEST,THREAD_PRIORITY_BELOW_NORMAL,THREAD_PRIORITY_NORMAL,
+      THREAD_PRIORITY_ABOVE_NORMAL,THREAD_PRIORITY_ABOVE_NORMAL,
+      THREAD_PRIORITY_HIGHEST,THREAD_PRIORITY_HIGHEST,THREAD_PRIORITY_HIGHEST};
+   if(priority<1 || priority>10) {errno=EINVAL;return -1;}
+   if(!token || token>UINT32_MAX) {errno=ESRCH;return -1;}
+   HANDLE thread=OpenThread(THREAD_SET_INFORMATION,FALSE,(DWORD)token);
+   if(!thread) {errno=GetLastError()==ERROR_INVALID_PARAMETER ? ESRCH : EACCES;return -1;}
+   BOOL good=SetThreadPriority(thread,levels[priority-1]);CloseHandle(thread);
+   if(!good) {errno=EACCES;return -1;}
+   return 0;
+}
+
+int luna_os_thread_nice(uint64_t token,int niceness)
+{
+   if(niceness<-20 || niceness>19) {errno=EINVAL;return -1;}
+   return luna_os_thread_priority(token,luna_nice_java_priority(niceness));
+}
+
 void luna_os_yield(void)
 {
    SwitchToThread();
@@ -763,6 +786,20 @@ uint64_t luna_os_monotonic_ns(void)
    return (uint64_t)(now.QuadPart / freq.QuadPart) * 1000000000ull +
           (uint64_t)(now.QuadPart % freq.QuadPart) * 1000000000ull /
               (uint64_t)freq.QuadPart;
+}
+
+uint64_t luna_os_boottime_ns(void)
+{
+   ULONGLONG ticks;
+   QueryInterruptTimePrecise(&ticks);
+   return (uint64_t)ticks * 100;
+}
+
+uint64_t luna_os_uptime_ns(void)
+{
+   ULONGLONG ticks;
+   QueryUnbiasedInterruptTimePrecise(&ticks);
+   return (uint64_t)ticks * 100;
 }
 
 uint64_t luna_os_realtime_ns(void)

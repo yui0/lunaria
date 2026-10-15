@@ -15,7 +15,8 @@ namespace detail {
 template<class VL>
 struct lift_sequence_impl;
 
-template<class T, template<class, T...> class VLT, T... values>
+// Clang 20+ needs VLT before T (merryhime/mcl#4 / llvm#130778).
+template<template<class T, T...> class VLT, class T, T... values>
 struct lift_sequence_impl<VLT<T, values...>> {
     using type = list<std::integral_constant<T, values>...>;
 };

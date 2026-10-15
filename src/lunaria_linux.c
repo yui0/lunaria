@@ -404,6 +404,21 @@ void luna_os_thread_name(const char *name)
    prctl(PR_SET_NAME, buf, 0, 0, 0);
 }
 
+uint64_t luna_os_thread_token(void) { return (uint64_t)syscall(SYS_gettid); }
+int luna_os_thread_priority(uint64_t token, int priority)
+{
+   if(priority<1 || priority>10) {errno=EINVAL;return -1;}
+   if(!token || token>INT32_MAX) {errno=ESRCH;return -1;}
+   return luna_os_thread_nice(token,luna_java_priority_nice(priority));
+}
+
+int luna_os_thread_nice(uint64_t token,int niceness)
+{
+   if(niceness<-20 || niceness>19) {errno=EINVAL;return -1;}
+   if(!token || token>INT32_MAX) {errno=ESRCH;return -1;}
+   return setpriority(PRIO_PROCESS,(id_t)token,niceness);
+}
+
 void luna_os_yield(void)
 {
    sched_yield();
@@ -412,6 +427,20 @@ void luna_os_yield(void)
 /* ---- time --------------------------------------------------------------- */
 
 uint64_t luna_os_monotonic_ns(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+uint64_t luna_os_boottime_ns(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_BOOTTIME, &ts);
+   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+uint64_t luna_os_uptime_ns(void)
 {
    struct timespec ts;
    clock_gettime(CLOCK_MONOTONIC, &ts);

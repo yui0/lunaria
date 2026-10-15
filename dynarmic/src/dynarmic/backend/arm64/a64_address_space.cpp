@@ -330,7 +330,7 @@ A64AddressSpace::A64AddressSpace(const A64::UserConfig& conf)
 IR::Block A64AddressSpace::GenerateIR(IR::LocationDescriptor descriptor) const {
     const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
     IR::Block ir_block = A64::Translate(A64::LocationDescriptor{descriptor}, get_code,
-                                        {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+                                        {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct, conf.hook_hint_instructions});
 
     Optimization::A64CallbackConfigPass(ir_block, conf);
     Optimization::NamingPass(ir_block);

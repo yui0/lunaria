@@ -65,6 +65,10 @@ void EmitX64::EmitIdentity(EmitContext& ctx, IR::Inst* inst) {
     }
 }
 
+void EmitX64::EmitProcessorYield(EmitContext&, IR::Inst*) {
+    code.pause();
+}
+
 void EmitX64::EmitBreakpoint(EmitContext&, IR::Inst*) {
     code.int3();
 }

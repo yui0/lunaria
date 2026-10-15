@@ -31,6 +31,11 @@ void EmitIR<IR::Opcode::Identity>(oaknut::CodeGenerator&, EmitContext& ctx, IR::
 }
 
 template<>
+void EmitIR<IR::Opcode::ProcessorYield>(oaknut::CodeGenerator& code, EmitContext&, IR::Inst*) {
+    code.YIELD();
+}
+
+template<>
 void EmitIR<IR::Opcode::Breakpoint>(oaknut::CodeGenerator& code, EmitContext&, IR::Inst*) {
     code.BRK(0);
 }

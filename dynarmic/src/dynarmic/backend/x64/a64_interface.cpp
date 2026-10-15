@@ -358,7 +358,7 @@ private:
         const auto phase_t0 = phase_now();
         const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
         IR::Block ir_block = A64::Translate(A64::LocationDescriptor{current_location}, get_code,
-                                            {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+                                            {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct, conf.hook_hint_instructions});
         const auto phase_t1 = phase_now();
         Optimization::PolyfillPass(ir_block, polyfill_options);
         Optimization::A64CallbackConfigPass(ir_block, conf);

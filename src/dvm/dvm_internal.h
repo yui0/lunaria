@@ -135,6 +135,7 @@ struct dvm_object {
    /* strings */
    char *utf8;
    uint32_t utf8_len;
+   uint32_t builder_capacity; /* bytes including NUL; mutable builders only */
    uint16_t *string_units; /* lazy immutable String index; NULL for ASCII */
    uint32_t string_length;
    bool string_index_ready;
@@ -198,9 +199,16 @@ struct dvm_attached_thread { uint64_t token; dvm_ref thread; };
 struct dvm_network_callback { dvm_ref callback, network; bool online; };
 struct dvm {
    _Atomic bool stopping;
+   _Atomic int process_exit_phase; /* 0 live, 1 publishing, 2 terminal */
+   _Atomic int process_exit_status;
+   dvm_ref runtime_instance, shutdown_hooks_lock;
+   bool runtime_shutting_down; /* hooks and registration are under the GIL */
+   dvm_ref *shutdown_hooks;
+   size_t shutdown_hook_count, shutdown_hook_capacity;
    int io_cancel[2]; /* readable until destruction once process stop is requested */
    struct bytecode_thread *host_threads; /* joinable Java threads, under GIL */
    struct dvm_hooks hooks;
+   dvm_ref pending_intents; /* live IntentSender tokens, under GIL */
    dvm_ref content_providers; /* attached local providers, under GIL */
    struct dvm_network_callback *network_callbacks;
    size_t nnetwork_callbacks;
@@ -270,7 +278,12 @@ struct dvm {
    dvm_ref resource_bundle_cache; /* per-VM default classpath bundle cache */
    /* The Thread the interpreter is currently inside, or 0 for the main one. */
    dvm_ref cur_thread;
+   dvm_ref default_trust_manager, keystore_entries;
+   bool keystore_hydrated;
+   dvm_ref accepted_issuers; /* host CA snapshot belongs to this VM */
    dvm_ref main_thread;
+   uint64_t main_host_thread;
+   dvm_ref main_thread_group, system_thread_group;
    struct dvm_attached_thread native_threads[256];
    /* How many drains of the pending queue are on the stack.  This used to be a
     * flat re-entrancy lock, which made every blocking wait inside a Runnable
@@ -305,6 +318,9 @@ struct dvm {
    struct dvm_call_frame *invoke_frame;
    int depth;
    int trace;
+   /* Captured before runtime installation and any application code. */
+   int64_t process_start_elapsed_ms;
+   int64_t process_start_uptime_ms;
    uint64_t steps;       /* since dvm_create, for diagnostics */
    uint64_t call_steps;  /* since the outermost dvm_call, for the step limit */
    uint64_t step_limit;
@@ -352,6 +368,9 @@ void dvm__tstate_load(struct dvm *vm, const struct dvm_tstate *t);
 void dvm__tstate_reset(struct dvm *vm);
 /* Marks the calling host thread as one started for bytecode. */
 void dvm__mark_bytecode_thread(void);
+
+bool dvm__runtime_hook(struct dvm *, dvm_ref, const union dvm_value *, int, union dvm_value *);
+bool dvm__runtime_exit(struct dvm *, dvm_ref, const union dvm_value *, int, union dvm_value *);
 
 /* dvm.c */
 struct dvm_class *dvm__register_builtin(struct dvm *vm, const char *desc);
@@ -568,3 +587,33 @@ dvm_ref dvm_runtime_manifest_bundle(struct dvm *vm);
 
 /* Host route providers update capabilities and notify filtered observers. */
 bool dvm__media_router_update_types(struct dvm *vm, dvm_ref route, int types);
+
+/* MessageFormat compiled pattern, shared with the runtime tests. */
+enum luna_message_type {
+   LUNA_MESSAGE_OBJECT, LUNA_MESSAGE_NUMBER, LUNA_MESSAGE_DATE,
+   LUNA_MESSAGE_TIME, LUNA_MESSAGE_CHOICE
+};
+struct luna_message_element {
+   size_t offset; /* UTF-16 offset in the literal text, not the source pattern. */
+   int32_t argument;
+   enum luna_message_type type;
+   uint16_t *style;
+   size_t style_length;
+};
+struct luna_message_pattern {
+   uint16_t *literal;
+   size_t literal_length;
+   struct luna_message_element *elements;
+   size_t count;
+};
+enum luna_message_error {
+   LUNA_MESSAGE_OK, LUNA_MESSAGE_NULL, LUNA_MESSAGE_MEMORY,
+   LUNA_MESSAGE_ARGUMENT, LUNA_MESSAGE_TYPE, LUNA_MESSAGE_BRACES
+};
+/* Output must be zero-initialized or previously compiled by this API.
+ * Success replaces it; failure leaves it unchanged. Subformat style validation
+ * belongs to the Number/Date/ChoiceFormat constructor, not this syntax layer.
+ * Input and style strings are length-delimited: embedded NUL is significant. */
+enum luna_message_error luna_message_compile(const uint16_t *text, size_t length,
+                                             struct luna_message_pattern *out);
+void luna_message_free(struct luna_message_pattern *pattern);

@@ -42,6 +42,8 @@ bool TranslatorVisitor::NOP() {
 
 bool TranslatorVisitor::YIELD() {
     if (!options.hook_hint_instructions) {
+        // Keep spin-wait hints in generated code without a host callback.
+        ir.ProcessorYield();
         return true;
     }
     return RaiseException(Exception::Yield);

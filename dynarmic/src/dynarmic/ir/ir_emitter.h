@@ -395,6 +395,7 @@ public:
     U128 FPVectorToSignedFixed(size_t esize, const U128& a, size_t fbits, FP::RoundingMode rounding, bool fpcr_controlled = true);
     U128 FPVectorToUnsignedFixed(size_t esize, const U128& a, size_t fbits, FP::RoundingMode rounding, bool fpcr_controlled = true);
 
+    void ProcessorYield();
     void Breakpoint();
     void CallHostFunction(void (*fn)(void));
     void CallHostFunction(void (*fn)(u64), const U64& arg1);

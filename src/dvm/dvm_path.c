@@ -137,6 +137,43 @@ bool luna_path_arc(luna_path *p,const float r[4],float start,float sweep,bool mo
    }
    return true;
 }
+bool luna_path_round_rect(luna_path *path,const float rect[4],const float input[8],bool direction)
+{
+   for(int i=0;i<4;++i) if(!isfinite(rect[i])) return true;
+   if(!(rect[0]<rect[2] && rect[1]<rect[3])) return true;
+   float radii[8];memcpy(radii,input,sizeof radii);
+   bool finite=true;for(int i=0;i<8;++i) finite=finite && isfinite(radii[i]);
+   if(!finite) memset(radii,0,sizeof radii);
+   for(int i=0;i<8;i+=2) {
+      if(radii[i]<=0 || radii[i+1]<=0) radii[i]=radii[i+1]=0;
+   }
+   double width=(double)rect[2]-rect[0],height=(double)rect[3]-rect[1],scale=1;
+   double sums[]={(double)radii[0]+radii[2],(double)radii[6]+radii[4],
+      (double)radii[1]+radii[7],(double)radii[3]+radii[5]};
+   for(int i=0;i<4;++i) if(sums[i]>0) scale=fmin(scale,(i<2 ? width : height)/sums[i]);
+   for(int i=0;i<8;++i) radii[i]=(float)(radii[i]*scale);
+   /* Build clockwise first, then reverse all cubic contours for CCW. */
+   luna_path rounded={0};
+   bool good=luna_path_move(&rounded,rect[0]+radii[0],rect[1]);
+   const int corners[]={1,2,3,0};
+   for(int j=0;j<4 && good;++j) {
+      int c=corners[j];float rx=radii[2*c],ry=radii[2*c+1];
+      float cx=(c==1 || c==2) ? rect[2]-rx : rect[0]+rx;
+      float cy=c>=2 ? rect[3]-ry : rect[1]+ry;
+      float r[]={cx-rx,cy-ry,cx+rx,cy+ry};
+      if(rx>0 && ry>0) good=luna_path_arc(&rounded,r,-90+j*90,90,false);
+      else good=luna_path_line(&rounded,(c==1 || c==2) ? rect[2] : rect[0],c>=2 ? rect[3] : rect[1]);
+   }
+   good=good && luna_path_close(&rounded);
+   if(good && direction && rounded.first) {
+      NSVGpath *n=rounded.first;int count=n->npts;
+      for(int i=0;i<count/2;++i) for(int k=0;k<2;++k) {float v=n->pts[2*i+k];n->pts[2*i+k]=n->pts[2*(count-1-i)+k];n->pts[2*(count-1-i)+k]=v;}
+   }
+   if(good) good=luna_path_append(path,&rounded,NULL);
+   luna_path_clear(&rounded,true);
+   return good;
+}
+
 bool luna_path_parse(luna_path *p,const char *data)
 {
    if(!data) return false;

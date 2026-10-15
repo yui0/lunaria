@@ -4271,6 +4271,24 @@ bool dvm_is_stopping(struct dvm *vm)
    return vm && atomic_load_explicit(&vm->stopping, memory_order_relaxed);
 }
 
+bool dvm_process_exited(struct dvm *vm, int *status)
+{
+   if (!vm || atomic_load_explicit(&vm->process_exit_phase,memory_order_acquire)!=2) return false;
+   if (status) *status=atomic_load_explicit(&vm->process_exit_status,memory_order_relaxed);
+   return true;
+}
+
+void dvm_exit_process(struct dvm *vm, int status)
+{
+   if (!vm) return;
+   int live=0;
+   if (!atomic_compare_exchange_strong_explicit(&vm->process_exit_phase,&live,1,
+         memory_order_relaxed,memory_order_relaxed)) return;
+   atomic_store_explicit(&vm->process_exit_status,status,memory_order_relaxed);
+   atomic_store_explicit(&vm->process_exit_phase,2,memory_order_release);
+   dvm_request_stop(vm);
+}
+
 void dvm_request_stop(struct dvm *vm)
 {
    if (!vm) return;
@@ -4893,7 +4911,12 @@ struct dvm *dvm_create(const struct dvm_hooks *hooks)
 {
    struct dvm *vm = calloc(1, sizeof *vm);
    if (!vm) return NULL;
+   vm->process_start_elapsed_ms = (int64_t)(luna_os_boottime_ns() / 1000000ULL);
+   vm->process_start_uptime_ms = (int64_t)(luna_os_uptime_ns() / 1000000ULL);
+   vm->main_host_thread=luna_os_thread_token();
    atomic_init(&vm->stopping, false);
+   atomic_init(&vm->process_exit_phase, 0);
+   atomic_init(&vm->process_exit_status, 0);
    vm->io_cancel[0] = vm->io_cancel[1] = -1;
    if (luna_socket_pair(AF_UNIX, SOCK_STREAM, 0, vm->io_cancel) < 0) {
       free(vm);
@@ -4939,6 +4962,7 @@ void dvm_destroy(struct dvm *vm)
    if (!vm) return;
    dvm_request_stop(vm);
    dvm_threads_finish(vm);
+   free(vm->shutdown_hooks);
    free(vm->network_callbacks);
    /* A pending apply() must reach the disk before the process goes away. */
    dvm_prefs_finish(vm);

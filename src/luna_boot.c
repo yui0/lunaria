@@ -608,6 +608,12 @@ static void frame(int force)
          * would sit at its first frame for as long as this ran every pass. */
         static int last_w, last_h;
         if (w != last_w || h != last_h) {
+            /* GLFW only tells us the window changed; the EGL surface is ours.
+             * On Wayland it is a wl_egl_window of our own making, so without
+             * this it keeps its old size while the window (and xdg geometry)
+             * has moved on -- the compositor then frames a 1024x576 window
+             * around a 960x680 buffer holding a cropped picture. */
+            if (last_w) luna_os_native_window(window);
             luna_resize((float)w, (float)h);
             last_w = w; last_h = h;
         }

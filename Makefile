@@ -200,7 +200,7 @@ CPPFLAGS += -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00
 # Unicode data is compiled in; Windows supplies timezone and code-page APIs.
 HOST_CHARSET_LIBS =
 WINDOWS_ENTRY_FLAGS = -municode
-HOST_NATIVE_LIBS = -lws2_32 -ladvapi32 -lpsapi -lwinmm -lntdll -lgdi32 -liphlpapi -lregex
+HOST_NATIVE_LIBS = -lonecore -lws2_32 -ladvapi32 -lpsapi -lwinmm -lntdll -lgdi32 -liphlpapi -lregex
 WINDOWS_CMAKE_GENERATOR ?= Ninja
 # FMT_CONSTEVAL=: bundled fmt 10.x fails Clang 20+ consteval checks (same as Darwin).
 DYNARMIC_CMAKE_FLAGS += -G "$(WINDOWS_CMAKE_GENERATOR)" \
@@ -268,61 +268,62 @@ macos-deps:
 # made.  Those are pure arithmetic that has no business leaving the JIT: give
 # the guest the same code a device runs and it stays inside it.
 #
-# The file is bionic's arm64 libm, which Google ships inside the SDK
+# The files are bionic's arm64 libm/libc, which Google ships inside the SDK
 # build-tools archive (the renderscript intermediates are real AArch64 objects,
 # unlike the NDK sysroot stubs, which carry no code).  A local SDK or NDK is
 # used when there is one, so this only reaches the network when it has to.
+# libz and liblunaria_guest.so still need a local NDK toolchain to link.
 SYSLIB_DIR    ?= syslib-arm64
 SYSLIB_LIBM   := $(SYSLIB_DIR)/libm.so
 SYSLIB_LIBC   := $(SYSLIB_DIR)/libc-pure.so
 SYSLIB_LIBZ   := $(SYSLIB_DIR)/libz.so
 BUILD_TOOLS_ZIP ?= build-tools_r34-linux.zip
 BUILD_TOOLS_URL ?= https://dl.google.com/android/repository/$(BUILD_TOOLS_ZIP)
+BUILD_TOOLS_CACHE ?= $(BUILD_DIR)/$(BUILD_TOOLS_ZIP)
 
 syslib: $(SYSLIB_LIBM) $(SYSLIB_LIBC) $(SYSLIB_LIBZ)
 
-$(SYSLIB_LIBM):
+# Downloadable without an NDK (build-tools zip). Used by Windows dist when the
+# optional NDK pieces are missing.
+syslib-core: $(SYSLIB_LIBM) $(SYSLIB_LIBC)
+
+# Extract one renderscript arm64-v8a DSO into $@.  $1 = archive member basename
+# (libm.so / libc.so).  Shared zip cache avoids a second download for libc.
+define SYSLIB_FETCH_RS
 	@mkdir -p $(SYSLIB_DIR)
 	@set -e; \
 	found=""; \
 	for root in "$$LUNARIA_ANDROID_SDK" "$$ANDROID_HOME" "$$ANDROID_SDK_ROOT" \
 	            "$$HOME/Library/Android/sdk" "$$HOME/Android/Sdk" /root/image/android; do \
 	    [ -n "$$root" ] || continue; \
-	    cand=`find "$$root" -path '*/renderscript/lib/intermediates/arm64-v8a/libm.so' 2>/dev/null | head -1`; \
+	    cand=`find "$$root" -path '*/renderscript/lib/intermediates/arm64-v8a/$(1)' 2>/dev/null | head -1`; \
 	    if [ -n "$$cand" ]; then found="$$cand"; break; fi; \
 	done; \
 	if [ -n "$$found" ]; then \
 	    echo "syslib: using $$found"; \
 	    cp "$$found" $@; \
 	else \
-	    echo "syslib: fetching $(BUILD_TOOLS_URL)"; \
-	    mkdir -p $(BUILD_DIR); tmp=`mktemp -d $(BUILD_DIR)/syslib.XXXXXX`; \
-	    curl -fsSL -o "$$tmp/bt.zip" "$(BUILD_TOOLS_URL)"; \
-	    entry=`unzip -Z1 "$$tmp/bt.zip" '*/renderscript/lib/intermediates/arm64-v8a/libm.so' | head -1`; \
-	    [ -n "$$entry" ] || { echo "syslib: no arm64 libm in the archive" >&2; rm -rf "$$tmp"; exit 1; }; \
-	    unzip -p "$$tmp/bt.zip" "$$entry" > $@; \
-	    rm -rf "$$tmp"; \
+	    mkdir -p $(BUILD_DIR); \
+	    if [ ! -f "$(BUILD_TOOLS_CACHE)" ]; then \
+	        echo "syslib: fetching $(BUILD_TOOLS_URL)"; \
+	        curl -fsSL -o "$(BUILD_TOOLS_CACHE).tmp" "$(BUILD_TOOLS_URL)"; \
+	        mv "$(BUILD_TOOLS_CACHE).tmp" "$(BUILD_TOOLS_CACHE)"; \
+	    fi; \
+	    entry=`unzip -Z1 "$(BUILD_TOOLS_CACHE)" '*/renderscript/lib/intermediates/arm64-v8a/$(1)' | head -1`; \
+	    [ -n "$$entry" ] || { echo "syslib: no arm64 $(1) in the archive" >&2; exit 1; }; \
+	    echo "syslib: extracting $$entry"; \
+	    unzip -p "$(BUILD_TOOLS_CACHE)" "$$entry" > $@; \
 	fi; \
 	head -c 20 $@ | od -An -tu1 -j18 -N1 | grep -q 183 || \
 	    { echo "syslib: $@ is not AArch64" >&2; rm -f $@; exit 1; }
 	@echo "syslib: $@ ready"
+endef
+
+$(SYSLIB_LIBM):
+	$(call SYSLIB_FETCH_RS,libm.so)
 
 $(SYSLIB_LIBC):
-	@mkdir -p $(SYSLIB_DIR)
-	@set -e; \
-	found=""; \
-	for root in "$$LUNARIA_ANDROID_SDK" "$$ANDROID_HOME" "$$ANDROID_SDK_ROOT" \
-	            "$$HOME/Library/Android/sdk" "$$HOME/Android/Sdk" /root/image/android; do \
-	    [ -n "$$root" ] || continue; \
-	    cand=`find "$$root" -path '*/renderscript/lib/intermediates/arm64-v8a/libc.so' 2>/dev/null | head -1`; \
-	    if [ -n "$$cand" ]; then found="$$cand"; break; fi; \
-	done; \
-	[ -n "$$found" ] || { echo "syslib: no executable arm64 bionic libc found" >&2; exit 1; }; \
-	echo "syslib: using $$found"; \
-	cp "$$found" $@; \
-	head -c 20 $@ | od -An -tu1 -j18 -N1 | grep -q 183 || \
-	    { echo "syslib: $@ is not AArch64" >&2; rm -f $@; exit 1; }
-	@echo "syslib: $@ ready"
+	$(call SYSLIB_FETCH_RS,libc.so)
 
 # NDK libz.so files are API stubs (their functions are eight-byte trap
 # veneers), not executable device implementations.  The adjacent libz.a is
@@ -498,7 +499,7 @@ DVM_HDR = src/dvm/color_blend.h src/luna_overlay.h src/dvm/dvm_path.h src/lunari
           src/webview_cdp.h
 DVM_HDR += src/unicode/breaks.h src/unicode/break_data.h
 DVM_HDR += src/dvm/calendar.h src/dvm/calendar_data.h
-
+DVM_HDR += src/dvm/dvm_reflect.h src/dvm/dvm_android_ui.h src/dvm/dvm_graphics.h src/dvm/dvm_text.h src/dvm/dvm_time.h src/dvm/dvm_crypto.h
 # The Dalvik bytecode emulator lives in libjvm.so: it is reached from jvm.c
 # (a JNI call with no host stub) and it calls back out through the same JNI
 # table, so the two have to be in one object.
@@ -772,6 +773,7 @@ test:
 
 HOST_ELF_REGRESSION = $(if $(filter Darwin,$(LUNA_OS_NAME)),,host-elf-test)
 test-host:
+	$(MAKE) message-pattern-test
 	$(MAKE) apk-launcher-test unity-reflection-test host-memory-test host-file-test host-socket-test host-timer-test host-pattern-test $(HOST_ELF_REGRESSION) run-queue-test heap-core-test pixels-test charset-test unicode-test regex-test dex-reader-test dvm-test pcm-queue-test webview-cdp-test
 
 test-sync:
@@ -829,18 +831,29 @@ $(BUILD_DIR)/test_dex_reader: test/dex_reader_test.c src/dvm/dex.c src/dvm/dex.h
 	$(CC) -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Isrc $(DVM_TEST_SAN) \
 	    test/dex_reader_test.c src/dvm/dex.c -o $@
 
-test/test_dvm: test/vector_fixture.h test/dvm_test.c test/dvm_host_fixture.c src/jvm/packages.c $(DVM_SRC) $(DVM_HDR) $(LUNA_OS_OBJ) $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o
+test/test_dvm: test/runtime_shutdown_tests.h test/vector_fixture.h test/dvm_test.c test/dvm_host_fixture.c src/jvm/packages.c $(DVM_SRC) $(DVM_HDR) $(LUNA_OS_OBJ) $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o
 	$(CC) -std=c11 -g -O1 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -Isrc \
 	    $(CPPFLAGS) $(HOST_TEST_RPATH) \
 	    $(DVM_TEST_SAN) \
 	    test/dvm_test.c test/dvm_host_fixture.c src/jvm/packages.c $(DVM_SRC:src/dvm/dvm_jni.c=) $(LUNA_OS_OBJ) $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o \
 	    -lm $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_CRYPTO_LIBS) $(HOST_CHARSET_LIBS) $(HOST_Z_LIBS) $(HOST_SYSTEM_DL_LIBS) $(HOST_GL_LIBS) -o $@
 
+.PHONY: runtime-shutdown-test
+test/test_dvm: test/pending_intent_tests.h test/choice_format_tests.h test/message_format_tests.h
+runtime-shutdown-test: test/test_dvm
+	@set -e; for mode in 0 1 2 3 4 5 6 7 8; do \
+	    timeout -k 2s 15s ./test/test_dvm test/dvm_test.dex --runtime-shutdown=$$mode; \
+	done
+
 .PHONY: color-blend-test
 color-blend-test: test/color_blend_test.c src/dvm/color_blend.h
 	@mkdir -p $(BUILD_DIR)
 	$(CC) -std=c11 -O1 -g $(DVM_TEST_SAN) -Isrc test/color_blend_test.c -lm -o $(BUILD_DIR)/color_blend_test
 	$(BUILD_DIR)/color_blend_test
+
+.PHONY: message-pattern-test
+message-pattern-test: test/test_dvm
+	./test/test_dvm --message-pattern-test
 
 # Pass a real classes.dex as DVM_DEX to also run every method in it.
 DVM_DEX ?=
@@ -1366,10 +1379,68 @@ test/libjniprefs-failure.so: test/jni_prefs_test.c
 	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -DPREFS_WRITE=2 \
 	    -Wl,-soname,libjniprefs-failure.so -o $@ $<
 
+test/libjniprefs-exit.so: test/jni_prefs_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -DPREFS_WRITE=3 \
+	    -Wl,-soname,libjniprefs-exit.so -o $@ $<
+
+test/libjniprefs-java-exit.so: test/jni_prefs_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -DPREFS_WRITE=4 \
+	    -Wl,-soname,libjniprefs-java-exit.so -o $@ $<
+
+test/libjniprefs-java-halt.so: test/jni_prefs_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -DPREFS_WRITE=5 \
+	    -Wl,-soname,libjniprefs-java-halt.so -o $@ $<
+
+test/libjniprefs-dex-exit.so: test/jni_prefs_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -DPREFS_WRITE=6 \
+	    -Wl,-soname,libjniprefs-dex-exit.so -o $@ $<
+
+$(BUILD_DIR)/jni-prefs-exit/code/classes.dex: test/make_jni_prefs_dex.py test/make_dex.py
+	python3 test/make_jni_prefs_dex.py $@ java-exit
+
+test/libjniprefs-onload-exit64.so: test/jni_prefs_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -DPREFS_WRITE=7 -o $@ $<
+test/libjniprefs-onload-halt64.so: test/jni_prefs_test.c
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -DPREFS_WRITE=8 -o $@ $<
+test/libjniprefs-onload-exit32.so: test/jni_prefs_test.c
+	clang -target armv7a-linux-androideabi -mfloat-abi=softfp $(ABI_TEST_CFLAGS) -std=c11 -DPREFS_WRITE=7 -o $@ $<
+test/libjniprefs-onload-halt32.so: test/jni_prefs_test.c
+	clang -target armv7a-linux-androideabi -mfloat-abi=softfp $(ABI_TEST_CFLAGS) -std=c11 -DPREFS_WRITE=8 -o $@ $<
+
+.PHONY: java-onload-exit-test
+java-onload-exit-test: lunaria test/libjniprefs-onload-exit64.so test/libjniprefs-onload-halt64.so test/libjniprefs-onload-exit32.so test/libjniprefs-onload-halt32.so $(BUILD_DIR)/jni-prefs/code/classes.dex
+	@rc=0; for abi in 64 32; do for mode in exit halt; do \
+	    expected=29; if [ "$$mode" = halt ]; then expected=31; fi; \
+	    status=0; timeout -k 2s 15s env \
+	        ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/jni-prefs/code" \
+	        LD_LIBRARY_PATH="$(CURDIR):$(CURDIR)/runtime" \
+	        ./lunaria test/libjniprefs-onload-$$mode$$abi.so > .jniprefs-onload-$$mode$$abi.out 2>&1 || status=$$?; \
+	    if [ "$$status" != "$$expected" ] || grep -q 'FAIL:' .jniprefs-onload-$$mode$$abi.out; then \
+	        printf 'FAIL: %s/%s returned %s, expected %s\n' "$$abi" "$$mode" "$$status" "$$expected"; rc=1; \
+	    else printf '%s/%s status=%s PASS\n' "$$abi" "$$mode" "$$status"; fi; \
+	done; done; exit $$rc
+
+.PHONY: java-process-exit-test
+java-process-exit-test: lunaria test/libjniprefs-java-exit.so test/libjniprefs-java-halt.so test/libjniprefs-dex-exit.so $(BUILD_DIR)/jni-prefs/code/classes.dex $(BUILD_DIR)/jni-prefs-exit/code/classes.dex
+	@rc=0; for mode in java-exit java-halt dex-exit; do \
+	    expected=13; code="$(BUILD_DIR)/jni-prefs/code"; \
+	    if [ "$$mode" = java-halt ]; then expected=19; fi; \
+	    if [ "$$mode" = dex-exit ]; then expected=23; code="$(BUILD_DIR)/jni-prefs-exit/code"; fi; \
+	    status=0; timeout -k 2s 15s env \
+	        ANDROID_PACKAGE_CODE_PATH="$$code" ANDROID_LAUNCH_ACTIVITY=test.PreferencesActivity \
+	        LD_LIBRARY_PATH="$(CURDIR):$(CURDIR)/runtime" \
+	        ./lunaria test/libjniprefs-$$mode.so > .jniprefs-$$mode.out 2>&1 || status=$$?; \
+	    if [ "$$status" != "$$expected" ] || grep -q 'FAIL:' .jniprefs-$$mode.out; then \
+	        printf 'FAIL: %s returned %s, expected %s\n' "$$mode" "$$status" "$$expected"; rc=1; \
+	    else printf '%s status=%s PASS\n' "$$mode" "$$status"; fi; \
+	done; exit $$rc
+
+$(BUILD_DIR)/jni-prefs/code/classes.dex: test/make_jni_prefs_dex.py test/make_dex.py
+	python3 test/make_jni_prefs_dex.py $@
+
 .PHONY: jni-prefs-test
-jni-prefs-test: lunaria test/libjniprefs-write.so test/libjniprefs-read.so test/libjniprefs-failure.so test/dvm_test.dex
+jni-prefs-test: lunaria test/libjniprefs-write.so test/libjniprefs-read.so test/libjniprefs-failure.so test/libjniprefs-exit.so $(BUILD_DIR)/jni-prefs/code/classes.dex
 	@mkdir -p $(BUILD_DIR)/jni-prefs/code $(BUILD_DIR)/jni-prefs/store
-	@cp test/dvm_test.dex $(BUILD_DIR)/jni-prefs/code/classes.dex
 	@rm -f $(BUILD_DIR)/jni-prefs/store/native-regression.xml
 	@touch $(BUILD_DIR)/jni-prefs/blocked
 	@rc=0; for phase in write read failure; do \
@@ -1378,11 +1449,21 @@ jni-prefs-test: lunaria test/libjniprefs-write.so test/libjniprefs-read.so test/
 	    timeout -k 2s 30s env \
 	        ANDROID_PREFS_DIR="$$prefs_dir" \
 	        ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/jni-prefs/code" \
+	        ANDROID_LAUNCH_ACTIVITY="test.PreferencesActivity" \
 	        LD_LIBRARY_PATH="$(CURDIR):$(CURDIR)/runtime" \
-	        ./lunaria test/libjniprefs-$$phase.so > .jniprefs-$$phase.out 2>&1; \
+	        ./lunaria test/libjniprefs-$$phase.so > .jniprefs-$$phase.out 2>&1 || rc=1; \
 	    grep 'jniprefs.*RESULT' .jniprefs-$$phase.out; \
 	    grep -q 'RESULT PASS' .jniprefs-$$phase.out || rc=1; \
-	done; exit $$rc
+	done; \
+	    status=0; timeout -k 2s 30s env \
+	        ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/jni-prefs/code" \
+	        ANDROID_LAUNCH_ACTIVITY="test.PreferencesActivity" \
+	        LD_LIBRARY_PATH="$(CURDIR):$(CURDIR)/runtime" \
+	        ./lunaria test/libjniprefs-exit.so > .jniprefs-exit.out 2>&1 || status=$$?; \
+	    if [ "$$status" != 7 ]; then printf 'FAIL: guest exit returned %s, expected 7\n' "$$status"; rc=1; fi; \
+	    grep 'jniprefs.*RESULT' .jniprefs-exit.out; \
+	    if grep -q 'FAIL: guest exit returned' .jniprefs-exit.out; then rc=1; fi; \
+	    exit $$rc
 
 .PHONY: jni-collections-test
 jni-collections-test: lunaria test/libjnicollections.so test/dvm_test.dex
@@ -1858,10 +1939,11 @@ DIST_OS      ?= windows
 else
 DIST_OS      ?= linux
 endif
-# The archive is named for the day it was made and the system it is for:
-# lunaria-YYYY-MM-DD-macos.dmg (linux .tar.gz, windows .zip).  What it was built from is in the app's Info.plist and in git.
+# The archive is named for the day it was made, the system and the CPU:
+# lunaria-YYYY-MM-DD-linux-x86_64.tar.gz (macos .dmg, windows .zip).
+# What it was built from is in the app's Info.plist and in git.
 DIST_DATE    ?= $(shell date +%Y-%m-%d)
-DIST_NAME     = lunaria-$(DIST_DATE)-$(DIST_OS)
+DIST_NAME     = lunaria-$(DIST_DATE)-$(DIST_OS)-$(DIST_ARCH)
 DIST_STAGE    = $(BUILD_DIR)/dist/$(DIST_NAME)
 
 # Distribution builds favour execution speed and deliberately carry no debug
@@ -1901,10 +1983,18 @@ dist-stage:
 dist-stage-build: $(LUNARIA_BIN) $(libs) $(OPENH264_SO)
 	sh scripts/make-dist.sh "$(DIST_STAGE)" "$(DIST_OS)" "$(DIST_ARCH)" "$(LUNARIA_BIN)" "$(SYSLIB_DIR)" "$(OPENH264_SO)"
 ifeq ($(DIST_OS),windows)
-# Include real guest code for the audited JIT paths, rather than silently
-# shipping a distribution that routes every audited math/memory call via SVC.
-dist-stage-build: syslib guestlib
+# Prefer full guest libs (libm/libc/libz + liblunaria_guest). libm/libc come
+# from the build-tools zip; libz/guestlib need an NDK. Fall back to the
+# downloadable core rather than failing the whole Windows package.
+dist-stage-build: syslib-for-dist
 endif
+
+.PHONY: syslib-for-dist
+syslib-for-dist:
+	@$(MAKE) syslib guestlib || { \
+	    echo "syslib: NDK pieces unavailable; packaging downloadable libm+libc only" >&2; \
+	    $(MAKE) syslib-core; \
+	}
 
 # The archive, next to the sources, ready to upload.  On macOS that is the
 # disk image: the .app bundle inside it launches without arguments and asks
@@ -1969,7 +2059,7 @@ dist-clean:
 	$(RM) -r "$(BUILD_DIR)/dist"
 	$(RM) lunaria-*.tar.gz lunaria-*.dmg lunaria-*.zip
 
-.PHONY: primary-mutex-test gl-map-test luna-browser luna-browser-test vulkan-test dist dist-stage dist-stage-build dist-mac dist-clean all pixels-test dl-test jit-speed syslib guestlib syslib-clean host-all macos-deps x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
+.PHONY: primary-mutex-test gl-map-test luna-browser luna-browser-test vulkan-test dist dist-stage dist-stage-build dist-mac dist-clean all pixels-test dl-test jit-speed syslib syslib-core syslib-for-dist guestlib syslib-clean host-all macos-deps x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
 	        clean install install-bin install-lib test net-test dvm-test http-chunked-test regex-test charset-test abi-test \
 	        posix-test boot-card-test surface-window-test binary128-test fd-callback-test \
 	        thread-start-test mutex-test heap-test heap-core-test icache-sync-test guestmem-test lock-test \
@@ -2377,3 +2467,38 @@ cond-callback-reuse-test: lunaria $(BUILD_DIR)/cond-callback-reuse32.so $(BUILD_
 	  grep 'cond-callback-reuse.*\(FAIL\|RESULT\)' $(BUILD_DIR)/cond-callback-reuse$$abi.log; \
 	  grep -q 'RESULT PASS' $(BUILD_DIR)/cond-callback-reuse$$abi.log; \
 	done
+
+.PHONY: resource-index-test
+resource-index-test:
+	python3 test/resource_index_test.py
+
+.PHONY: disk-read-pool-test
+disk-read-pool-test:
+	python3 test/disk_read_pool_test.py
+
+.PHONY: thread-tls-test
+$(BUILD_DIR)/thread_tls_test.so: test/thread_tls_test.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
+
+thread-tls-test: lunaria $(BUILD_DIR)/thread_tls_test.so
+	@timeout -k 2s 30s env LUNARIA_A64_ENGINES=4 LUNARIA_AUDIO=0 \
+	    ./lunaria $(BUILD_DIR)/thread_tls_test.so > $(BUILD_DIR)/thread_tls_test.log 2>&1 || true
+	@grep 'threadtls.*RESULT' $(BUILD_DIR)/thread_tls_test.log
+	@grep -q 'threadtls.*RESULT PASS' $(BUILD_DIR)/thread_tls_test.log && \
+	    ! grep -q 'no caller stack.*skipped' $(BUILD_DIR)/thread_tls_test.log
+
+.PHONY: yield-hint-test
+$(BUILD_DIR)/test_yield_hint: test/yield_hint_test.cpp $(DYNARMIC_LIB) | $(BUILD_DIR)
+	$(CXX) -std=c++20 -O2 -g $(DYNARMIC_INCS) $< \
+	    $(DYNARMIC_LIBS) -lpthread -o $@
+yield-hint-test: $(BUILD_DIR)/test_yield_hint
+	$(BUILD_DIR)/test_yield_hint
+
+.PHONY: yield-hint-guest-test
+$(BUILD_DIR)/yield_hint_guest.so: test/yield_hint_guest.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -O2 -std=c11 -o $@ $<
+yield-hint-guest-test: lunaria $(BUILD_DIR)/yield_hint_guest.so
+	@timeout -k 2s 30s env LUNARIA_AUDIO=0 \
+	    ./lunaria $(BUILD_DIR)/yield_hint_guest.so > $(BUILD_DIR)/yield_hint_guest.log 2>&1 || true
+	@grep 'yield-bench' $(BUILD_DIR)/yield_hint_guest.log
+	@grep -q 'yield-bench.*RESULT PASS' $(BUILD_DIR)/yield_hint_guest.log

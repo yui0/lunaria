@@ -3552,14 +3552,10 @@ static int guest_strcmp_mapped(const ArmExecCtx &ctx, GuestVA va1, GuestVA va2) 
     const char *s2 = ctx.mem.cstr(va2);
     size_t lim1 = guest_string_span(ctx, va1);
     size_t lim2 = guest_string_span(ctx, va2);
-    size_t i = 0;
-    while (i < lim1 && i < lim2) {
-        unsigned char c1 = (unsigned char)s1[i];
-        unsigned char c2 = (unsigned char)s2[i];
-        if (c1 != c2) return (c1 < c2) ? -1 : 1;
-        if (c1 == '\0') return 0;
-        ++i;
-    }
+    const size_t i = std::min(lim1, lim2);
+    int cmp = strncmp(s1, s2, i);
+    if (cmp) return cmp < 0 ? -1 : 1;
+    if (i && memchr(s1, 0, i)) return 0;
     if (i < lim1 && s1[i] == '\0') return -1;
     if (i < lim2 && s2[i] == '\0') return 1;
     if (i >= lim1 && i >= lim2) return 0;
@@ -10307,6 +10303,18 @@ static int main_wait_signal(void)
 }
 static uint64_t g_guest_abort_count = 0;
 static std::atomic<uint64_t> g_guest_exit_count{0};
+static std::atomic<int> g_guest_exit_status{0};
+/* JNI may terminate Java while a native call is still on the guest stack.
+ * Its SVC boundary must stop that caller rather than return into native code. */
+static bool process_exit_pending(void) {
+    if (g_guest_exit_count.load(std::memory_order_acquire)) return true;
+    int status=0;
+    if (!dvm_jni_process_exited(&status)) return false;
+    g_guest_exit_status.store(status & 0xff,std::memory_order_relaxed);
+    g_guest_exit_count.fetch_add(1,std::memory_order_release);
+    return true;
+}
+
 // ALooper_wake() sets this; ALooper_pollOnce spin loop checks it
 /* One pending-wake flag per guest thread, because a device has one Looper
  * per thread and ALooper_wake(l) names which one. A single process-wide flag
@@ -12349,6 +12357,14 @@ static void guest_tls_destructors_run(ArmExecCtx &ctx, uint32_t tid)
 
 static void guest_thread_atexit_run(ArmExecCtx &ctx, uint32_t tid)
 {
+   /* A thread returning from its start routine has no active SVC frame.
+    * Cleanup may be nested in another callback's scheduler pass, so depth>0
+    * alone does not identify a caller stack. Use the exiting thread's saved
+    * SP while its stack is still mapped, rather than dropping its dtors. */
+   ArmThread *exiting = thread_slot_by_tid(tid);
+   const GuestVA cleanup_sp = g_svc_caller_sp ? g_svc_caller_sp
+       : exiting ? (ctx.is_arm64 ? exiting->sp64 : exiting->regs[13]) : 0;
+   SvcCallerStackGuard cleanup_stack(cleanup_sp, ctx.is_arm64);
    /* Bionic pthread_exit: C++ thread_local dtors, cleanup handlers, then
     * pthread key dtors. Keep the identity and TLS alive through all three. */
    for (;;) {
@@ -12777,45 +12793,50 @@ static void drive_ndk_choreographer(ArmExecCtx &ctx) {
      * the past by less than one period, so a frame pacer's catch-up loop runs
      * at most once — see display_vsync_now(). */
     const uint64_t frame_time = display_vsync_now();
-    size_t best = SIZE_MAX;
-    for (size_t i = 0; i < g_ndk_choreo_q.size(); ++i) {
-        if (g_ndk_choreo_q[i].tid != g_current_tid) continue;
-        if (g_ndk_choreo_q[i].due_ns > now) continue;
-        if (best == SIZE_MAX ||
-            g_ndk_choreo_q[i].due_ns < g_ndk_choreo_q[best].due_ns)
-            best = i;
-    }
-    if (best == SIZE_MAX) return;
-    NdkChoreoCb c = g_ndk_choreo_q[best];
-    g_ndk_choreo_q.erase(g_ndk_choreo_q.begin() + (long)best);
-    const uint64_t delivered_frame = frame_time;
-    static std::unordered_map<uint32_t, uint64_t> fired;
-    uint64_t &fn_n = fired[g_current_tid];
-    static const bool verbose = lunaria_env("LUNARIA_TRACE_CHOREO") != nullptr;
-    const bool log = (verbose || fn_n < 4 || (fn_n % 600) == 0);
-    if (log)
-        fprintf(stderr, "[achoreo] firing 1 callback on tid=%u (#%llu)\n",
-                g_current_tid, (unsigned long long)fn_n);
-    ++fn_n;
-    fire_choreographer_callback(ctx, c.fn, c.data, c.wide64, c.refresh_rate,
-                                delivered_frame);
-    if (log)
-        fprintf(stderr, "[achoreo] fired, back on tid=%u\n", g_current_tid);
+    /* All callbacks due for this vsync share the same frame timestamp.
+     * A callback reposted from delivery belongs to a later vsync. */
+    for (;;) {
+        size_t best = SIZE_MAX;
+        for (size_t i = 0; i < g_ndk_choreo_q.size(); ++i) {
+            if (g_ndk_choreo_q[i].tid != g_current_tid) continue;
+            if (g_ndk_choreo_q[i].due_ns > now) continue;
+            if (best == SIZE_MAX ||
+                g_ndk_choreo_q[i].due_ns < g_ndk_choreo_q[best].due_ns)
+                best = i;
+        }
+        if (best == SIZE_MAX) return;
+        NdkChoreoCb c = g_ndk_choreo_q[best];
+        g_ndk_choreo_q.erase(g_ndk_choreo_q.begin() + (long)best);
+        const uint64_t delivered_frame = frame_time;
+        static std::unordered_map<uint32_t, uint64_t> fired;
+        uint64_t &fn_n = fired[g_current_tid];
+        static const bool verbose = lunaria_env("LUNARIA_TRACE_CHOREO") != nullptr;
+        const bool log = (verbose || fn_n < 4 || (fn_n % 600) == 0);
+        if (log)
+            fprintf(stderr, "[achoreo] firing 1 callback on tid=%u (#%llu)\n",
+                    g_current_tid, (unsigned long long)fn_n);
+        ++fn_n;
+        fire_choreographer_callback(ctx, c.fn, c.data, c.wide64, c.refresh_rate,
+                                    delivered_frame);
+        if (log)
+            fprintf(stderr, "[achoreo] fired, back on tid=%u\n", g_current_tid);
 
-    /* AChoreographer_postFrameCallback is one-shot: the callback that just ran
-     * is gone, and if the guest wants another frame it posts another one (Swappy
-     * does exactly that from the callback while its MAX_CALLBACKS_BEFORE_IDLE
-     * budget lasts, and refills the budget on the next swap). So an empty queue
-     * and a Looper parked in ALooper_pollOnce(-1) is Swappy idling, not a stall
-     * to be repaired from here; re-posting a callback nobody asked for is not
-     * something a device can do. If presentation has stopped, the question is
-     * why the render or game thread never reached its next swap. */
-    /* Back to the Looper, which is all a device does at the end of a frame
-     * callback. Ask the scheduler for a pass at the next ordinary boundary:
-     * running other guest threads from *inside* the callback re-enters the
-     * scheduler at a point no Android device ever does, and changes the
-     * happens-before relations the guest was written against. */
-    g_yield_requested = true;
+        /* AChoreographer_postFrameCallback is one-shot: the callback that just ran
+         * is gone, and if the guest wants another frame it posts another one (Swappy
+         * does exactly that from the callback while its MAX_CALLBACKS_BEFORE_IDLE
+         * budget lasts, and refills the budget on the next swap). So an empty queue
+         * and a Looper parked in ALooper_pollOnce(-1) is Swappy idling, not a stall
+         * to be repaired from here; re-posting a callback nobody asked for is not
+         * something a device can do. If presentation has stopped, the question is
+         * why the render or game thread never reached its next swap. */
+        /* Back to the Looper, which is all a device does at the end of a frame
+         * callback. Ask the scheduler for a pass at the next ordinary boundary:
+         * running other guest threads from *inside* the callback re-enters the
+         * scheduler at a point no Android device ever does, and changes the
+         * happens-before relations the guest was written against. */
+        g_yield_requested = true;
+        if (arm_exec_guest_exit_count() || arm_exec_guest_abort_count()) return;
+    }
 }
 
 // glMapBufferRange shadows: host pointers can't be exposed to the guest.
@@ -17697,25 +17718,31 @@ static uint32_t arsc_style_parent(uint32_t style) {
 /* Resolve a Resources.getIdentifier(type/name) through the package's type and
  * key string pools.  Resource entry names are not in the global value pool;
  * Android keeps them in per-package pools referenced by each ResTable_entry. */
-static uint32_t arsc_identifier(const char *want_type, const char *want_name) {
-    arsc_ensure_loaded();
-    if (!want_type || !want_name || g_arsc.size() < 12) return 0;
-    const uint8_t *b = g_arsc.data();
-    size_t n = g_arsc.size();
+struct ArscNames {
+    std::unordered_map<std::string, uint32_t> ids;
+    std::unordered_map<uint32_t, std::pair<std::string, std::string>> names;
+};
+
+/* Built once for the immutable resource tables. First occurrence wins, as in
+ * the original scan; configuration variants share the same resource name. */
+static void arsc_index_names(const uint8_t *b, size_t n, ArscNames &index) {
+    if (n < 12) return;
     uint16_t table_hs;
     memcpy(&table_hs, b + 2, 2);
+    if (table_hs < 12 || table_hs > n) return;
     for (size_t i = table_hs; i + 8 <= n;) {
         uint16_t ct, hs;
         uint32_t cs;
         memcpy(&ct, b + i, 2); memcpy(&hs, b + i + 2, 2);
         memcpy(&cs, b + i + 4, 4);
-        if (cs < 8 || i + cs > n) break;
+        if (cs < 8 || cs > n - i || hs > cs) break;
         if (ct != 0x0200 || hs < 284) { i += cs; continue; }
 
         uint32_t pkg_id, type_pool_off, key_pool_off;
         memcpy(&pkg_id, b + i + 8, 4);
         memcpy(&type_pool_off, b + i + 268, 4);
         memcpy(&key_pool_off, b + i + 276, 4);
+        uint32_t type_offset = hs >= 288 ? arsc_u32(b+i+284) : 0;
         std::vector<std::string> types, keys;
         if (type_pool_off < cs)
             arsc_read_pool(b + i + type_pool_off, cs - type_pool_off, types);
@@ -17728,92 +17755,74 @@ static uint32_t arsc_identifier(const char *want_type, const char *want_name) {
             memcpy(&t2, b + j, 2); memcpy(&h2, b + j + 2, 2);
             memcpy(&s2, b + j + 4, 4);
             if (s2 < 8 || j + s2 > i + cs) break;
-            if (t2 != 0x0201) { j += s2; continue; }
+            if (t2 != 0x0201 || h2 < 20 || h2 > s2) { j += s2; continue; }
             uint8_t type_id = b[j + 8];
-            if (!type_id || type_id > types.size() ||
-                types[type_id - 1] != want_type) { j += s2; continue; }
+            if (!type_id || type_id > types.size()) { j += s2; continue; }
             uint32_t entry_count, entries_start;
             memcpy(&entry_count, b + j + 12, 4);
             memcpy(&entries_start, b + j + 16, 4);
-            for (uint32_t entry = 0; entry < entry_count; ++entry) {
-                size_t oo = j + h2 + (size_t)entry * 4u;
-                if (oo + 4 > j + s2) break;
-                uint32_t eoff;
-                memcpy(&eoff, b + oo, 4);
-                if (eoff == 0xffffffffu) continue;
+            const unsigned flags = b[j+9];
+            const size_t width = (flags & 2) ? 2 : 4;
+            if ((flags & 3) == 3 || entries_start < h2 || entries_start > s2 ||
+                entry_count > (entries_start - h2) / width) { j += s2; continue; }
+            for (uint32_t k = 0; k < entry_count; ++k) {
+                const uint8_t *idx = b+j+h2+(size_t)k*width;
+                const uint32_t entry = (flags & 1) ? arsc_u16(idx) : k;
+                uint32_t eoff = (flags & 1) ? (uint32_t)arsc_u16(idx+2)*4
+                              : (flags & 2) ? (arsc_u16(idx) == 65535 ? UINT32_MAX
+                                             : (uint32_t)arsc_u16(idx)*4)
+                              : arsc_u32(idx);
+                if (entry > 65535 || eoff == UINT32_MAX || eoff > s2-entries_start ||
+                    s2-entries_start-eoff < 8 || type_id+type_offset > 255) continue;
                 size_t e = j + entries_start + eoff;
-                if (e + 8 > j + s2) continue;
                 uint32_t key_index;
                 memcpy(&key_index, b + e + 4, 4);
-                if (key_index < keys.size() && keys[key_index] == want_name)
-                    return ((pkg_id & 0xffu) << 24) |
-                           ((uint32_t)type_id << 16) | entry;
+                if (key_index < keys.size()) {
+                    const uint32_t id = ((pkg_id & 0xffu) << 24) |
+                                        ((type_id + type_offset) << 16) | entry;
+                    const auto &type = types[type_id - 1];
+                    const auto &name = keys[key_index];
+                    index.ids.emplace(type + "/" + name, id);
+                    index.names.emplace(id, std::make_pair(type, name));
+                }
             }
             j += s2;
         }
         i += cs;
     }
-    return 0;
 }
 
-extern "C" uint32_t arm_exec_apk_resource_id(const char *type,
-                                                const char *name) {
+static const ArscNames &arsc_names() {
+    arsc_ensure_loaded();
+    static const ArscNames index = [] {
+        ArscNames result;
+        arsc_index_names(g_arsc.data(), g_arsc.size(), result);
+        for (auto *source = g_arsc_splits; source; source = source->next)
+            arsc_index_names(source->bytes, source->size, result);
+        return result;
+    }();
+    return index;
+}
+
+static uint32_t arsc_identifier(const char *type, const char *name) {
+    if (!type || !name) return 0;
+    const auto &ids = arsc_names().ids;
+    auto it = ids.find(std::string(type) + "/" + name);
+    return it == ids.end() ? 0 : it->second;
+}
+
+extern "C" uint32_t arm_exec_apk_resource_id(const char *type, const char *name) {
     return arsc_identifier(type, name);
 }
 
-/* The reverse of arsc_identifier(): the type ("id", "layout", ...) and entry
- * name of a resource id, read from the package's type and key pools. */
 extern "C" int arm_exec_apk_resource_name(uint32_t id, char *type, size_t type_cap,
                                           char *entry, size_t entry_cap) {
-    arsc_ensure_loaded();
-    if (g_arsc.size() < 12) return 0;
-    const uint8_t *b = g_arsc.data();
-    const size_t n = g_arsc.size();
-    const uint32_t want_pkg = id >> 24, want_type = (id >> 16) & 0xffu, want_entry = id & 0xffffu;
-    uint16_t table_hs;
-    memcpy(&table_hs, b + 2, 2);
-    for (size_t i = table_hs; i + 8 <= n;) {
-        uint16_t ct, hs;
-        uint32_t cs;
-        memcpy(&ct, b + i, 2); memcpy(&hs, b + i + 2, 2);
-        memcpy(&cs, b + i + 4, 4);
-        if (cs < 8 || i + cs > n) break;
-        uint32_t pkg_id = 0;
-        if (ct == 0x0200 && hs >= 284) memcpy(&pkg_id, b + i + 8, 4);
-        if (ct != 0x0200 || hs < 284 || (pkg_id & 0xffu) != want_pkg) { i += cs; continue; }
-        uint32_t type_pool_off, key_pool_off;
-        memcpy(&type_pool_off, b + i + 268, 4);
-        memcpy(&key_pool_off, b + i + 276, 4);
-        std::vector<std::string> types, keys;
-        if (type_pool_off < cs) arsc_read_pool(b + i + type_pool_off, cs - type_pool_off, types);
-        if (key_pool_off < cs) arsc_read_pool(b + i + key_pool_off, cs - key_pool_off, keys);
-        if (!want_type || want_type > types.size()) return 0;
-        for (size_t j = i + hs; j + 8 <= i + cs;) {
-            uint16_t t2, h2;
-            uint32_t s2;
-            memcpy(&t2, b + j, 2); memcpy(&h2, b + j + 2, 2);
-            memcpy(&s2, b + j + 4, 4);
-            if (s2 < 8 || j + s2 > i + cs) break;
-            if (t2 != 0x0201 || b[j + 8] != want_type) { j += s2; continue; }
-            uint32_t entry_count, entries_start;
-            memcpy(&entry_count, b + j + 12, 4);
-            memcpy(&entries_start, b + j + 16, 4);
-            if (want_entry >= entry_count) { j += s2; continue; }
-            uint32_t eoff;
-            memcpy(&eoff, b + j + h2 + (size_t)want_entry * 4u, 4);
-            if (eoff == 0xffffffffu) { j += s2; continue; }
-            const size_t e = j + entries_start + eoff;
-            if (e + 8 > j + s2) { j += s2; continue; }
-            uint32_t key_index;
-            memcpy(&key_index, b + e + 4, 4);
-            if (key_index >= keys.size()) return 0;
-            snprintf(type, type_cap, "%s", types[want_type - 1].c_str());
-            snprintf(entry, entry_cap, "%s", keys[key_index].c_str());
-            return 1;
-        }
-        return 0;
-    }
-    return 0;
+    const auto &names = arsc_names().names;
+    auto it = names.find(id);
+    if (it == names.end()) return 0;
+    snprintf(type, type_cap, "%s", it->second.first.c_str());
+    snprintf(entry, entry_cap, "%s", it->second.second.c_str());
+    return 1;
 }
 
 extern "C" int arm_exec_apk_resource_value(uint32_t id, int32_t *iv,
@@ -18641,7 +18650,8 @@ static bool apk_read_or_splits(const std::string &name, std::vector<uint8_t> &ou
         out.insert(out.end(), chunk.begin(), chunk.end());
     }
     if (out.empty()) return false;
-    fprintf(stderr, "[asset] read %s via %d+ splits (%zu bytes)\n",
+    if (lunaria_env("LUNARIA_TRACE_ASSET"))
+        fprintf(stderr, "[asset] read %s via %d+ splits (%zu bytes)\n",
             name.c_str(), /* approximate */ 1, out.size());
     return true;
 }
@@ -19010,8 +19020,6 @@ struct GuestAsset {
 };
 static std::map<uint32_t, GuestAsset> g_assets;
 static uint32_t g_next_asset_handle = 0xA55E7000u;
-/* Defer buffering past this size when a host path is known (shader archives). */
-static constexpr uint64_t kAAssetDeferBytes = 64u * 1024u;
 
 struct GuestAssetDir {
     std::vector<std::string> names;
@@ -19153,7 +19161,8 @@ static bool apk_concat_splits_to_cache(const std::string &base_inner,
         }
         fclose(wf);
         if (!ok) { luna_file_unlink(out); return false; }
-        fprintf(stderr, "[asset] concatenated %zu splits -> %s (%llu bytes)\n",
+        if (lunaria_env("LUNARIA_TRACE_ASSET"))
+            fprintf(stderr, "[asset] concatenated %zu splits -> %s (%llu bytes)\n",
                 parts.size(), out, (unsigned long long)total);
         return true;
     }
@@ -19208,7 +19217,8 @@ static bool apk_extract_to_cache(const char *path, char *out, size_t outsz) {
     size_t n = fwrite(data.data(), 1, data.size(), f);
     fclose(f);
     if (n != data.size()) { luna_file_unlink(out); return false; }
-    fprintf(stderr, "[asset] extracted %s (%zu bytes) -> %s\n", inner, data.size(), out);
+    if (lunaria_env("LUNARIA_TRACE_ASSET"))
+        fprintf(stderr, "[asset] extracted %s (%zu bytes) -> %s\n", inner, data.size(), out);
     return true;
 }
 
@@ -20716,7 +20726,7 @@ static uint64_t aasset_length(const GuestAsset &a) {
     return a.length ? a.length : (uint64_t)a.data.size();
 }
 
-/* Ensure data[] + buf_va exist (getBuffer / bytewise read). */
+/* Allocate a stable guest buffer only for getBuffer. */
 static bool aasset_materialize(ArmExecCtx &ctx, GuestAsset &a) {
     if (a.buf_va && !a.data.empty()) return true;
     if (a.data.empty()) {
@@ -21448,7 +21458,8 @@ static bool try_asset_jni(ArmExecCtx &ctx, uint32_t svc, std::array<uint64_t,16>
             ok = aasset_load_bytes(namebuf, data, &via);
         }
         if (!ok) {
-            fprintf(stderr, "[asset] open MISS %s\n", namebuf);
+            if (lunaria_env("LUNARIA_TRACE_ASSET"))
+                fprintf(stderr, "[asset] open MISS %s\n", namebuf);
             regs[0] = 0;
             return true;
         }
@@ -21457,7 +21468,8 @@ static bool try_asset_jni(ArmExecCtx &ctx, uint32_t svc, std::array<uint64_t,16>
         size_t sz = data.size();
         g_streams[h] = Stream{ std::move(data), 0 };
         g_last_stream = h;
-        fprintf(stderr, "[asset] open %s via %s -> stream 0x%x (%zu bytes)\n",
+        if (lunaria_env("LUNARIA_TRACE_ASSET"))
+            fprintf(stderr, "[asset] open %s via %s -> stream 0x%x (%zu bytes)\n",
                 namebuf, via ? via : "?", h, sz);
         regs[0] = h;
         return true;
@@ -23817,6 +23829,57 @@ struct GuestDiskRead {
         for (int p : completion) if (p >= 0) luna_fd_close(p);
     }
 };
+/* Reuse host workers across large asset reads. Creating and detaching one
+ * thread per 256 KiB read makes warm-cache scene loads pay thread startup
+ * costs even when the actual read finishes in microseconds. Jobs still own
+ * their duplicated descriptor and completion pipe, preserving offset sharing
+ * and the existing signal/retry protocol. */
+class GuestDiskReadPool {
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::deque<std::shared_ptr<GuestDiskRead>> pending;
+    unsigned workers = 0;
+
+    void run() {
+        for (;;) {
+            std::shared_ptr<GuestDiskRead> job;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                ready.wait(lock, [&] { return !pending.empty(); });
+                job = std::move(pending.front());
+                pending.pop_front();
+            }
+            job->result = luna_fd_read(job->fd, job->buffer, job->len);
+            job->error = errno;
+            job->done.store(true, std::memory_order_release);
+            const char byte = 1;
+            (void)luna_fd_write(job->completion[1], &byte, 1);
+        }
+    }
+public:
+    bool submit(const std::shared_ptr<GuestDiskRead> &job) {
+        std::lock_guard<std::mutex> lock(mutex);
+        /* Only regular files enter this queue. Two workers allow independent
+         * file reads to overlap without creating a host thread for every guest. */
+        while (workers < 2) {
+            try { std::thread([this] { run(); }).detach(); ++workers; }
+            catch (const std::system_error &) { break; }
+        }
+        if (!workers) return false;
+        try { pending.push_back(job); }
+        catch (const std::bad_alloc &) { return false; }
+        ready.notify_one();
+        return true;
+    }
+};
+
+static bool guest_disk_submit(const std::shared_ptr<GuestDiskRead> &job) {
+    /* Workers may still be blocked in read at process exit. Keep their queue
+     * alive through teardown, like the detached jobs they replace. */
+    static auto *pool = new GuestDiskReadPool;
+    return pool->submit(job);
+}
+
 static std::unordered_map<uint32_t, std::shared_ptr<GuestDiskRead>> g_disk_reads;
 
 /* true means the read was completed or parked; false uses the synchronous
@@ -23824,7 +23887,7 @@ static std::unordered_map<uint32_t, std::shared_ptr<GuestDiskRead>> g_disk_reads
 static bool guest_disk_read(ArmExecCtx &ctx, int fd, GuestVA dst,
                             size_t len, ssize_t *result)
 {
-    /* Handing a read to a host thread costs a thread, a dup, a pipe pair and
+    /* Handing a read to a host worker costs a queue hand-off, a dup, a pipe pair and
      * a trip through the scheduler's descriptor monitor.  That pays only when
      * the read can really wait on the device (a cold multi-MiB read from an
      * external disk); the 4-64 KiB reads of a hash or a pak index come from
@@ -23858,17 +23921,7 @@ static bool guest_disk_read(ArmExecCtx &ctx, int fd, GuestVA dst,
         if (job->fd < 0 || luna_os_pipe_open(job->completion, 1, 1)) return false;
         job->original_fd = fd; job->dst = dst; job->len = len;
         job->caller_sp = g_svc_sp64;
-        try {
-            std::thread([job] {
-                job->result = luna_fd_read(job->fd, job->buffer, job->len);
-                job->error = errno;
-                job->done.store(true, std::memory_order_release);
-                const char byte = 1;
-                (void)luna_fd_write(job->completion[1], &byte, 1);
-            }).detach();
-        } catch (const std::system_error &) {
-            return false;
-        }
+        if (!guest_disk_submit(job)) return false;
         g_disk_reads[g_current_tid] = job;
     }
     if (job->done.load(std::memory_order_acquire)) {
@@ -44685,10 +44738,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_EXIT: {
         guest_thread_atexit_run(ctx, g_current_tid);
-        /* exit() in a forked child ends the child, not the emulator: it is a
-         * separate process on a device, and its parent is about to ask waitpid()
-         * what became of it. Halting the run here would kill the process that was
-         * going to ask. */
+        /* A fork child has its own process status; its parent remains alive. */
         if (fork_child_by_tid(g_current_tid)) {
             fork_child_mark_exited(g_current_tid, (int32_t)((r0 & 0xffu) << 8));
             if (ArmThread *t = arm_thread_by_tid(g_current_tid)) {
@@ -44696,19 +44746,29 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 t->finished = true;
                 join_wake_on_target_exit(ctx, g_current_tid);
             }
-            g_yield_requested = true;
-            ret32(0);
-            break;
+        } else {
+            int status=(int)(r0 & 0xffu);
+            dvm_jni_exit_process(status);
+            (void)dvm_jni_process_exited(&status);
+            static int exit_count = 0;
+            if (exit_count == 0)
+                g_guest_exit_status.store(status & 0xff, std::memory_order_relaxed);
+            g_guest_exit_count.fetch_add(1, std::memory_order_release);
+            fprintf(stderr, "[arm_exec] guest exit(%d) — halting run (lr=0x%08x pc=0x%08lx)\n",
+                    (int)r0, lr, regs[15]);
+            if (exit_count++ < 1) svc_ring_dump();
         }
-        static int exit_count = 0;
-        g_guest_exit_count.fetch_add(1, std::memory_order_relaxed);
-        fprintf(stderr, "[arm_exec] guest exit(%d) — halting run (lr=0x%08x pc=0x%08lx)\n",
-                (int)r0, lr, regs[15]);
-        if (exit_count++ < 1)  
-            svc_ring_dump();
-        regs[14] = SENTINEL_ADDR;
-        regs[15] = SENTINEL_ADDR;
-        ret32(0);
+        /* exit never returns. Setting only the A32 shadow registers lets
+         * A64 resume the caller after exit, including from a frame callback. */
+        if (ctx.is_arm64 && g_svc_jit64) {
+            g_svc_jit64->SetPC(a64_guest_va(SENTINEL_ADDR));
+            g_svc_context_restored = true;
+            g_svc_jit64->HaltExecution();
+        } else {
+            regs[14] = SENTINEL_ADDR;
+            regs[15] = SENTINEL_ADDR;
+        }
+        g_yield_requested = true;
         break;
     }
 
@@ -48827,10 +48887,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             namebuf[n] = '\0';
             if (fname[n]) { ret32(0); break; } /* truncated */
         }
-        const int mode = ctx.is_arm64 ? (int)g_svc_args64[2] : (int)r2;
-        /* NDK: UNKNOWN=0 RANDOM=1 STREAMING=2 BUFFER=3.  BUFFER wants getBuffer;
-         * RANDOM/STREAMING typically openFileDescriptor — keep host path only. */
-        const bool want_buffer = (mode == 3);
+        /* All modes defer guest allocation until getBuffer requests it. */
 
         std::string host;
         uint64_t host_len = 0;
@@ -48842,7 +48899,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
 
         GuestAsset asset;
-        if (have_host && !want_buffer && host_len >= kAAssetDeferBytes) {
+        if (have_host) {
             asset.host_path = std::move(host);
             asset.length = host_len;
             asset.pos = 0;
@@ -48868,7 +48925,6 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             asset.length = asset.data.size();
             asset.pos = 0;
             asset.host_path = have_host ? std::move(host) : std::string();
-            if (!aasset_materialize(ctx, asset)) { ret32(0); break; }
         }
 
         /* Record the package span when there is one, so
@@ -48889,7 +48945,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         const size_t reported = (size_t)asset.length;
         const char *how = asset.data.empty() ? "fd-defer" : "buffered";
         g_assets[handle] = std::move(asset);
-        fprintf(stderr, "[AAsset] open %s via %s -> handle 0x%x (%zu bytes, %s)\n",
+        if (lunaria_env("LUNARIA_TRACE_ASSET"))
+            fprintf(stderr, "[AAsset] open %s via %s -> handle 0x%x (%zu bytes, %s)\n",
                 namebuf, via ? via : "?", handle, reported, how);
         ret32(handle);
         break;
@@ -48948,7 +49005,6 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 if (got < 0) { arm_set_errno(ctx, e); ret32((uint32_t)-1); break; }
                 n = (uint64_t)got;
             } else {
-                if (!aasset_materialize(ctx, a)) { ret32((uint32_t)-1); break; }
                 uint8_t *p = ctx.mem.try_ptr(dst, (size_t)n);
                 if (!p) { arm_set_errno(ctx, EFAULT); ret32((uint32_t)-1); break; }
                 memcpy(p, a.data.data() + a.pos, (size_t)n);
@@ -49029,7 +49085,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         auto it = g_assets.find(r0);
         if (it != g_assets.end()) {
             const GuestAsset &a = it->second;
-            if (a.n_reads)
+            if (a.n_reads && lunaria_env("LUNARIA_TRACE_ASSET"))
                 fprintf(stderr, "[asset-prof] %s reads=%llu bytes=%.1fMB "
                         "avg=%.1fKB max=%.1fKB read_ms=%.1f\n",
                         a.name.empty() ? "?" : a.name.c_str(),
@@ -50951,6 +51007,10 @@ public:
         g_svc_retry = false;
         g_svc_context_restored = false;
         dispatch_svc(*ctx, svc_no, arr);
+        if (process_exit_pending()) {
+            arr[14]=SENTINEL_ADDR;
+            arr[15]=SENTINEL_ADDR;
+        }
         if (g_svc_context_restored) g_svc_context_restored = false;
         else for (size_t i = 0; i < 16; ++i) regs[i] = (uint32_t)arr[i];
         /* A restarted SVC needs the original arguments, not a scalar result. */
@@ -54947,7 +55007,11 @@ extern "C" uint64_t arm_exec_guest_abort_count(void) {
 }
 
 extern "C" uint64_t arm_exec_guest_exit_count(void) {
-    return g_guest_exit_count.load(std::memory_order_relaxed);
+    return g_guest_exit_count.load(std::memory_order_acquire);
+}
+
+extern "C" int arm_exec_guest_exit_status(void) {
+    return g_guest_exit_status.load(std::memory_order_relaxed);
 }
 
 extern "C" const char *arm_exec_get_main_lib_dir(void) {
@@ -55281,6 +55345,18 @@ extern "C" void arm_exec_main_looper_leave(void) {
     g_dvm_guest_tid = s->dvm_tid;
     s->active = false;
 }
+/* Java owns the process main Looper in a DEX Activity. Its native
+ * Choreographer callbacks need the same turn even without a guest pollOnce. */
+extern "C" void arm_exec_main_choreographer_tick(void) {
+    if (!g_ctx || !arm_exec_host_ui_thread() || g_in_cb()) return;
+    arm_lock_acquire();
+    if (arm_exec_main_looper_enter()) {
+        drive_ndk_choreographer(*g_ctx);
+        arm_exec_main_looper_leave();
+    }
+    arm_lock_release();
+}
+
 extern "C" void arm_exec_service_host_ui(void) {
     if (!arm_exec_host_ui_thread() || !luna_overlay_guest_window_up()) return;
     (void)guest_window_present_frame();
@@ -58490,6 +58566,11 @@ public:
         g_svc_retry = false;
         g_svc_context_restored = false;
         dispatch_svc(*ctx, svc_no, regs32);
+        if (process_exit_pending()) {
+            jit64->SetPC(a64_guest_va(SENTINEL_ADDR));
+            g_svc_context_restored=true;
+            jit64->HaltExecution();
+        }
         svc_pres.restore_identity();
         if (trace_recreate_svc)
             fprintf(stderr, "[recreate-svc] leave no=%u retry=%d restored=%d yield=%d pc=%llx ret=%llx rem=%llu total=%llu\n",
@@ -61337,6 +61418,7 @@ static void call_guest_abi64(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *arg
             break;
         }
         if (cb.ticks_remaining == 0) {
+            if (pc_histo_on()) pc_histo_add(pc, j.GetRegister(30), callback_tid);
             /* Slice spent and the callback has not returned: it is waiting for somebody.
              * Run the other guest threads, then hand it another slice. Nested callbacks
              * stay out of the scheduler, which is already running one.

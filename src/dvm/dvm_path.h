@@ -21,6 +21,7 @@ bool luna_path_close(luna_path *path);
 bool luna_path_append(luna_path *path,const luna_path *other,const float *matrix);
 bool luna_path_transform(luna_path *path,const float matrix[9]);
 bool luna_path_arc(luna_path *path,const float rect[4],float start,float sweep,bool move);
+bool luna_path_round_rect(luna_path *path,const float rect[4],const float radii[8],bool counterclockwise);
 bool luna_path_parse(luna_path *path,const char *data);
 bool luna_path_trim(luna_path *out,const luna_path *path,float start,float end,float offset);
 void luna_path_bounds(const luna_path *path,float bounds[4]);
