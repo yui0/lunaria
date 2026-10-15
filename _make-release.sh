@@ -569,7 +569,13 @@ An Android runtime that runs an APK on the desktop: AArch64 and ARM32 guest
 code on dynarmic, the platform's Java on its own bytecode interpreter, and GLES
 straight through to the host.
 
-### Linux
+### Install (Linux / macOS)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/yui0/lunaria/master/install.sh | bash
+```
+
+### Linux (manual)
 ```bash
 tar -xzf lunaria-*-linux-x86_64.tar.gz && cd lunaria-*-linux-x86_64   # or -aarch64
 ./lunaria /path/to/app.apk      # or .xapk / .apks
@@ -577,7 +583,7 @@ tar -xzf lunaria-*-linux-x86_64.tar.gz && cd lunaria-*-linux-x86_64   # or -aarc
 The archive carries its own shim libraries, host libraries and fonts; it uses
 the running system's C library.
 
-### macOS
+### macOS (manual)
 Open the .dmg, drag `Lunaria.app` where you like, then run
 `/Applications/Lunaria.app/Contents/MacOS/Lunaria /path/to/app.apk`.
 

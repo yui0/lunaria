@@ -60,6 +60,47 @@ Genshin Impact 7.1.0 (Unity IL2CPP, arm64-v8a) · Ni no Kuni: Cross Worlds (Unre
 
 <p align="center"><sub>Drop a package into the launcher or choose a file. Save the data location, cache settings, and device profile in <code>lunaria.conf</code>.</sub></p>
 
+## Install
+
+Prebuilt binaries are on [GitHub Releases](https://github.com/yui0/lunaria/releases).
+
+### Linux / macOS
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/yui0/lunaria/master/install.sh | bash
+```
+
+The script picks the asset for your OS and CPU from the latest release, installs under `~/.local` (or `/usr/local` with `sudo`), and adds a `lunaria` command. On macOS it also places `Lunaria.app` in `~/Applications` (or `/Applications` with `sudo`). Apple Silicon only for the macOS build.
+
+```bash
+# Specific release tag
+curl -fsSL https://raw.githubusercontent.com/yui0/lunaria/master/install.sh | bash -s -- --version 2026.10.15
+
+# System-wide prefix
+curl -fsSL https://raw.githubusercontent.com/yui0/lunaria/master/install.sh | sudo bash -s -- --prefix /usr/local
+
+# Uninstall (keeps lunaria.conf and app data)
+curl -fsSL https://raw.githubusercontent.com/yui0/lunaria/master/install.sh | bash -s -- --uninstall
+```
+
+```bash
+lunaria /path/to/app.apk    # or .xapk / .apks / .aab
+lunaria                      # graphical launcher
+```
+
+If `~/.local/bin` is not on your `PATH`, add it (for example `export PATH="$HOME/.local/bin:$PATH"`).
+
+**Manual Linux:** unpack `lunaria-*-linux-x86_64.tar.gz` or `…-aarch64.tar.gz`, then run `./lunaria` from that directory. The archive ships its own shim libraries, host libraries, and fonts; it uses the system C library.
+
+**Manual macOS:** open the `.dmg`, drag `Lunaria.app` where you like, then run  
+`/Applications/Lunaria.app/Contents/MacOS/Lunaria /path/to/app.apk`.
+
+### Windows
+
+Download `lunaria-*-windows-x86_64.zip` from [Releases](https://github.com/yui0/lunaria/releases), unzip it, and run `lunaria.exe /path/to/app.apk` (or drag an APK onto the executable). No MSYS2 or extra runtime install is required.
+
+To build from source instead, see [Quick start](#quick-start).
+
 ## What makes Lunaria different
 
 | Feature | What it does |
@@ -296,6 +337,8 @@ Once a game is running, **right-click to open the host menu**. From there you ca
 <p align="center"><sub>Launcher · boot card · host menu on a 2013 APK · WebView engine picker</sub></p>
 
 ## Quick start
+
+For a prebuilt binary, use [Install](#install) (`curl … | bash` on Linux/macOS, or the ZIP on Windows). The steps below build from source.
 
 ### 1. Install dependencies
 

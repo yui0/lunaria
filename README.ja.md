@@ -294,7 +294,28 @@ Lunariaを引数なしで起動すると、パッケージを選ぶランチャ�
 
 ## クイックスタート
 
-### 1. 必要なパッケージをインストール
+### リリース版のインストール（Linux／macOS）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/yui0/lunaria/master/install.sh | bash
+```
+
+[GitHub Releases](https://github.com/yui0/lunaria/releases)から環境に合うアセットを取得し、`~/.local`（root実行時は`/usr/local`）へ入れます。macOSではあわせて`Lunaria.app`を`~/Applications`（root時は`/Applications`）へコピーします。
+
+```bash
+# タグを指定
+curl -fsSL https://raw.githubusercontent.com/yui0/lunaria/master/install.sh | bash -s -- --version 2026.10.15
+
+# システム全体へ導入
+curl -fsSL https://raw.githubusercontent.com/yui0/lunaria/master/install.sh | sudo bash -s -- --prefix /usr/local
+
+# アンインストール（設定ファイルは残す）
+curl -fsSL https://raw.githubusercontent.com/yui0/lunaria/master/install.sh | bash -s -- --uninstall
+```
+
+導入後は`lunaria /path/to/app.apk`で起動できます（引数なしでグラフィカルランチャー）。手動ダウンロードは[リリースページ](https://github.com/yui0/lunaria/releases)を参照してください。
+
+### 1. 必要なパッケージをインストール（ソースからビルドする場合）
 
 **Ubuntu／Debian**
 
