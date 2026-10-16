@@ -580,13 +580,10 @@ static const struct rt_field rt_method_fields[] = {
     * of matching against a Method that only knew its name. */
    { "sig", "Ljava/lang/String;" },
    { "access", "I" },
-   /* AccessibleObject's own flag.  Nothing in this VM enforces access, so
-    * setting it changes no behaviour — but it is a flag with a *value*, and
-    * isAccessible() was answering `true` for members nobody had opened.  Code
-    * that saves the old value and restores it afterwards (a common pattern
-    * around a single reflective read) was restoring the wrong one. */
-   { "accessible", "Z" },
    F_END
+};
+static const struct rt_field rt_accessible_fields[] = {
+   { "accessible", "Z" }, F_END
 };
 
 /* One type descriptor → Class.  Primitives are the single-letter classes
@@ -705,6 +702,22 @@ static bool ao_isAccessible(struct dvm *vm, dvm_ref self,
    (void)dvm_get_field(vm, self, "accessible", "Z", &v);
    RETI(v.i ? 1 : 0);
 }
+
+static bool rf_isSynthetic(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out);
+static const struct rt_method rt_accessible_object[]={
+   M("setAccessible","(Z)V",ao_setAccessible),
+   M("isAccessible","()Z",ao_isAccessible),M_END
+};
+static const struct rt_method rt_executable[]={
+   {"getName","()Ljava/lang/String;",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
+   M("isSynthetic","()Z",rf_isSynthetic),M_END
+};
+static const struct rt_method rt_reflect_member[]={
+   {"getName","()Ljava/lang/String;",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
+   {"getDeclaringClass","()Ljava/lang/Class;",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
+   {"getModifiers","()I",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
+   {"isSynthetic","()Z",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},M_END
+};
 
 static bool rm_getAnnotations(struct dvm *vm, dvm_ref self,
                               const union dvm_value *args, int nargs,
@@ -1386,6 +1399,10 @@ static bool rf_isAnnotationPresent(struct dvm *vm, dvm_ref self,
    RETI(field_annotation(vm, self, ARG(0).l) != 0);
 }
 
+static bool rf_getAnnotations(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out);
+
 static const struct rt_method rt_reflect_field[] = {
    M("getName", "()Ljava/lang/String;", rm_getName),
    M("getDeclaringClass", "()Ljava/lang/Class;", rf_getDeclaringClass),
@@ -1395,6 +1412,8 @@ static const struct rt_method rt_reflect_field[] = {
    M("isSynthetic", "()Z", rf_isSynthetic),
    M("setAccessible", "(Z)V", ao_setAccessible),
    M("isAccessible", "()Z", ao_isAccessible),
+   M("getAnnotations", "()[Ljava/lang/annotation/Annotation;", rf_getAnnotations),
+   M("getDeclaredAnnotations", "()[Ljava/lang/annotation/Annotation;", rf_getAnnotations),
    M("getAnnotation", "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
      rf_getAnnotation),
    M("getDeclaredAnnotation",
@@ -2327,6 +2346,13 @@ static bool cl_isInterface(struct dvm *vm, dvm_ref self,
    struct dvm_object *co = dvm__obj(vm, self);
    RETI(co && co->klass && co->klass->is_interface);
 }
+static bool cl_has_flag(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   struct dvm_object *object=dvm__obj(vm,self);
+   uint32_t flag=!strcmp(builtin_name(),"isAnnotation") ? DEX_ACC_ANNOTATION : DEX_ACC_SYNTHETIC;
+   RETI(object && object->klass && (object->klass->access&flag)!=0);
+}
 
 /* Materialised DEX annotations use their annotation interface as their
  * object class; return that interface, not a generated proxy class. */
@@ -2414,13 +2440,27 @@ static bool cl_getSuperclass(struct dvm *vm, dvm_ref self,
    RETL(class_object_for(vm, c->super));
 }
 
+static uint32_t class_java_modifiers(struct dvm_class *c)
+{
+   if (!c) return 0;
+   if (c->is_array) {
+      uint32_t component = class_java_modifiers(c->elem);
+      if (component & DEX_ACC_INTERFACE) component &= ~(DEX_ACC_INTERFACE | DEX_ACC_STATIC);
+      return component | DEX_ACC_ABSTRACT | DEX_ACC_FINAL;
+   }
+   if (c->is_primitive) return DEX_ACC_PUBLIC | DEX_ACC_ABSTRACT | DEX_ACC_FINAL;
+   uint32_t flags = c->access;
+   if (c->dex) (void)dex_class_inner_flags(c->dex, c->class_def_idx, &flags);
+   return flags & 0xffffu;
+}
+
 static bool cl_getModifiers(struct dvm *vm, dvm_ref self,
                             const union dvm_value *args, int nargs,
                             union dvm_value *out)
 {
    (void)args; (void)nargs;
    struct dvm_object *o = dvm__obj(vm, self);
-   RETI(o && o->klass ? o->klass->access : 0);
+   RETI(class_java_modifiers(o ? o->klass : NULL));
 }
 
 static dvm_ref class_annotation(struct dvm *vm, dvm_ref class_ref,
@@ -2614,6 +2654,53 @@ static bool cl_getEnclosingClass(struct dvm *vm, dvm_ref self,
    const char *desc = c && c->dex
       ? dex_class_enclosing_type(c->dex, c->class_def_idx) : NULL;
    RETL(desc ? class_object_for(vm, dvm__class_by_desc(vm, desc)) : 0);
+}
+
+static bool cl_getDeclaredClasses(struct dvm *vm, dvm_ref self,
+                                   const union dvm_value *args, int nargs,
+                                   union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   struct dvm_object *o = dvm__obj(vm, self);
+   struct dvm_class *c = o ? o->klass : NULL;
+   int count = c && c->dex && !c->is_array
+      ? dex_class_member_types(c->dex, c->class_def_idx, NULL, 0) : 0;
+   if (count < 0) {
+      dvm__throw(vm, "java/lang/annotation/AnnotationFormatError", "invalid MemberClasses metadata");
+      return false;
+   }
+   const char **types = count ? calloc((size_t)count, sizeof *types) : NULL;
+   if (count && !types) {
+      dvm__throw(vm, "java/lang/OutOfMemoryError", "member classes");
+      return false;
+   }
+   if (count) (void)dex_class_member_types(c->dex, c->class_def_idx, types, count);
+   dvm_ref array = dvm_new_array(vm, 'L', "Ljava/lang/Class;", (uint32_t)count);
+   if (!array) { free(types); return false; }
+   dvm_pin(vm, array);
+   for (int i = 0; i < count; ++i) {
+      struct dvm_class *member = dvm__class_by_desc(vm, types[i]);
+      if (member && member->synthesized) {
+         dvm__throw(vm, "java/lang/NoClassDefFoundError", "%s", types[i]);
+         dvm_unpin(vm, array); free(types); return false;
+      }
+      dvm_ref ref = member ? class_object_for(vm, member) : 0;
+      if (!ref) { dvm_unpin(vm, array); free(types); return false; }
+      ((dvm_ref *)dvm_array_data(vm, array))[i] = ref;
+   }
+   dvm_unpin(vm, array);
+   free(types);
+   RETL(array);
+}
+
+static bool cl_getDeclaringClass(struct dvm *vm, dvm_ref self,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+   struct dvm_object *o = dvm__obj(vm, self);
+   struct dvm_class *c = o ? o->klass : NULL;
+   if (!c || !c->dex || !dex_class_is_member(c->dex, c->class_def_idx)) RETL(0);
+   return cl_getEnclosingClass(vm, self, args, nargs, out);
 }
 
 #define MODIFIER_TEST(fn, bit) \
@@ -3177,6 +3264,36 @@ static dvm_ref refl_annotation_array(struct dvm *vm, struct dex_file *dex,
    return arr;
 }
 
+/* A Field's annotations belong to its actual declaring class; they are
+ * never inherited from an overridden/hidden field with the same name. */
+static bool rf_getAnnotations(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value owner={0},field_name={0};
+   dvm_get_field(vm,self,"owner","Ljava/lang/Class;",&owner);
+   dvm_get_field(vm,self,"name","Ljava/lang/String;",&field_name);
+   struct dvm_object *object=dvm__obj(vm,owner.l);
+   struct dvm_class *c=object ? object->klass : NULL;
+   const char *name=dvm_string_utf8(vm,field_name.l);
+   while(c && name && !class_declares_field(c,name)) c=c->super;
+   if (!c || !c->dex || !name)
+      RETL(dvm_new_array(vm,'L',"Ljava/lang/annotation/Annotation;",0));
+   int count=dex_field_annotations(c->dex,c->class_def_idx,name,NULL,NULL,0);
+   if (!count) RETL(dvm_new_array(vm,'L',"Ljava/lang/annotation/Annotation;",0));
+   uint32_t *offsets=calloc((size_t)count,sizeof *offsets);
+   const char **types=calloc((size_t)count,sizeof *types);
+   if (!offsets || !types) {
+      free(offsets);free(types);
+      dvm__throw(vm,"java/lang/OutOfMemoryError","field annotations");return false;
+   }
+   dex_field_annotations(c->dex,c->class_def_idx,name,offsets,types,count);
+   dvm_ref array=refl_annotation_array(vm,c->dex,offsets,types,count);
+   free(offsets);free(types);
+   RETL(array);
+}
+
 /* getAnnotations() / getDeclaredAnnotations(): a method's annotations are
  * never inherited, so both are the declared set. */
 static bool rm_getAnnotations(struct dvm *vm, dvm_ref self,
@@ -3466,8 +3583,14 @@ static bool cl_asSubclass(struct dvm *vm, dvm_ref self,
    return false;
 }
 
+static bool rc_getName(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   union dvm_value owner={0};
+   (void)dvm_get_field(vm,self,"owner","Ljava/lang/Class;",&owner);
+   return cl_getName(vm,owner.l,args,nargs,out);
+}
 static const struct rt_method rt_reflect_ctor[] = {
-   M("getName", "()Ljava/lang/String;", rm_getName),
+   M("getName", "()Ljava/lang/String;", rc_getName),
    M("newInstance", "([Ljava/lang/Object;)Ljava/lang/Object;", rc_newInstance),
    M("newInstance", "()Ljava/lang/Object;", rc_newInstance),
    M("setAccessible", "(Z)V", ao_setAccessible),
@@ -3714,6 +3837,8 @@ static const struct rt_method rt_class[] = {
    M("getComponentType", "()Ljava/lang/Class;", cl_getComponentType),
    M("isPrimitive", "()Z", cl_isPrimitive),
    M("isInterface", "()Z", cl_isInterface),
+   M("isAnnotation", "()Z", cl_has_flag),
+   M("isSynthetic", "()Z", cl_has_flag),
    M("isEnum", "()Z", cl_isEnum),
    M("getEnumConstants", "()[Ljava/lang/Object;", cl_getEnumConstants),
    M("getAnnotation", "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
@@ -3736,6 +3861,8 @@ static const struct rt_method rt_class[] = {
    M("getFields", "()[Ljava/lang/reflect/Field;", cl_getFields),
    M("getSuperclass", "()Ljava/lang/Class;", cl_getSuperclass),
    M("getModifiers", "()I", cl_getModifiers),
+   M("getDeclaredClasses", "()[Ljava/lang/Class;", cl_getDeclaredClasses),
+   M("getDeclaringClass", "()Ljava/lang/Class;", cl_getDeclaringClass),
    M("getEnclosingClass", "()Ljava/lang/Class;", cl_getEnclosingClass),
    M("getGenericSuperclass", "()Ljava/lang/reflect/Type;",
      cl_getGenericSuperclass),

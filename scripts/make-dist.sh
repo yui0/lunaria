@@ -60,6 +60,11 @@ cp -R ./keymaps "$stage/"
 [ -f README.md ] && cp -p README.md "$stage/"
 [ -f README.ja.md ] && cp -p README.ja.md "$stage/"
 [ -f LICENSE ] && cp -p LICENSE "$stage/"
+if [ "$os" = linux ]; then
+    mkdir -p "$stage/scripts" "$stage/systemd"
+    [ -f scripts/lunaria-server.sh ] && cp -p scripts/lunaria-server.sh "$stage/scripts/" && chmod 0755 "$stage/scripts/lunaria-server.sh"
+    [ -f systemd/lunaria@.service ] && cp -p systemd/lunaria@.service "$stage/systemd/"
+fi
 mkdir -p "$stage/licenses"
 cp -p src/lib/musl/COPYRIGHT "$stage/licenses/musl.txt"
 cp -p LICENSE.unicode "$stage/licenses/unicode.txt"

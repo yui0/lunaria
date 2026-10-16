@@ -681,7 +681,7 @@ tick値には`K`、`M`、`G`の接尾辞が使えます（例：`LUNARIA_ONLOAD_
 | `src/arm.c` / `src/arm.h` | 共通 ARM 実行ロックとマルチエンジン補助 |
 | `src/dvm/` | Dalvik バイトコードエミュレーター。APK の `classes*.dex` に含まれる Java を実行 |
 | `src/loader.c` | マニフェストに基づく`Application`・ContentProvider・`Activity`の起動とフレームループ |
-| `src/dvm/audio_track.c` | Javaの`AudioTrack`から共通ミキサーへのキュー処理 |
+| `src/dvm/dvm_media.c` | Javaの`AudioTrack`から共通ミキサーへのキュー処理 |
 | `src/dvm/apk_signers.c` | `PackageInfo`で参照するAPK署名ブロックの解析 |
 | `src/linker/` | ホスト向けに調整した Android ELF linker |
 | `src/jvm/` | 軽量 JVM / JNI オブジェクトモデルとスタブ |
@@ -782,3 +782,16 @@ Lunariaは**現在も開発を進めている研究段階のソフトウェア**
 ライセンスは[Mozilla Public License 2.0](LICENSE)です。
 
 Project Lunaria © 2026 Yuichiro Nakada.
+
+Android標準テーマの継承には、SDK Platform 31の実リソースを使用します。
+Googleの公式アーカイブを取得して、次の手順で配置できます。
+
+```sh
+curl -fL https://dl.google.com/android/repository/platform-31_r01.zip -o /tmp/platform-31_r01.zip
+python3 scripts/install-framework.py /tmp/platform-31_r01.zip
+```
+
+インストーラは配布元のSHA-1を検証し、`android.jar`からリソースと通知ファイルを
+変更せずに`runtime/framework-res/`へ取り出します。アプリのAPKは変更しません。
+別の配置先を使う場合は、`resources.arsc`と`res/`を含むディレクトリを
+`LUNARIA_FRAMEWORK_RES`で指定してください。既定の配置先は実行ファイルを基準に探します。

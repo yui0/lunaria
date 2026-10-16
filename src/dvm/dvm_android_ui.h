@@ -1412,10 +1412,14 @@ static bool ctx_get_color(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out)
 {
-   (void)vm; (void)self; (void)nargs;
-   int32_t color = 0; const char *text = NULL;
-   (void)arm_exec_apk_resource_value((uint32_t)ARG(0).i, &color, &text);
-   RETI(color);
+   (void)nargs;
+   union dvm_value resources={0}, values[2]={ARG(0),{0}};
+   if (!am_vcall(vm,self,"getResources","()Landroid/content/res/Resources;",NULL,0,&resources)) return false;
+   dvm_pin(vm,resources.l);
+   bool good=am_vcall(vm,self,"getTheme","()Landroid/content/res/Resources$Theme;",NULL,0,&values[1]);
+   if (good) good=am_vcall(vm,resources.l,"getColor","(ILandroid/content/res/Resources$Theme;)I",values,2,out);
+   dvm_unpin(vm,resources.l);
+   return good;
 }
 
 static const struct rt_method rt_context[] = {
@@ -2719,8 +2723,49 @@ static bool compound_toggle(struct dvm *vm, dvm_ref self,
    union dvm_value cur = { 0 };
    (void)dvm_get_field(vm, self, "checked", "Z", &cur);
    union dvm_value flip = { .i = cur.i ? 0 : 1 };
-   return compound_set_checked(vm, self, &flip, 1, out);
+   return am_vcall(vm,self,"setChecked","(Z)V",&flip,1,out);
 }
+
+static bool radio_toggle(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                          int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   union dvm_value checked={0};
+   if (!am_vcall(vm,self,"isChecked","()Z",NULL,0,&checked)) return false;
+   if (checked.i) RETV();
+   return compound_toggle(vm,self,NULL,0,out);
+}
+
+/* Each concrete widget declares its own constructors. Java never inherits
+ * <init>, even though these adapters share View context/resource setup. */
+#define COMPOUND_WIDGET_CTORS \
+   M("<init>","(Landroid/content/Context;)V",view_init_context), \
+   M("<init>","(Landroid/content/Context;Landroid/util/AttributeSet;)V",view_init_context), \
+   M("<init>","(Landroid/content/Context;Landroid/util/AttributeSet;I)V",view_init_context), \
+   M("<init>","(Landroid/content/Context;Landroid/util/AttributeSet;II)V",view_init_context),
+static const struct rt_method rt_compound_widget_constructors[]={
+   COMPOUND_WIDGET_CTORS
+   M_END,
+};
+static const struct rt_method rt_radio_button[]={
+   COMPOUND_WIDGET_CTORS
+   M("toggle","()V",radio_toggle),
+   M_END,
+};
+#undef COMPOUND_WIDGET_CTORS
+
+static bool radio_group_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                              int nargs,union dvm_value *out)
+{
+   if (!view_init_context(vm,self,args,nargs,out)) return false;
+   (void)dvm_set_field(vm,self,"orientation","I",(union dvm_value){.i=1});
+   RETV();
+}
+static const struct rt_method rt_radio_group_constructors[]={
+   M("<init>","(Landroid/content/Context;)V",radio_group_init),
+   M("<init>","(Landroid/content/Context;Landroid/util/AttributeSet;)V",radio_group_init),
+   M_END,
+};
 
 static bool compound_set_listener(struct dvm *vm, dvm_ref self,
                                   const union dvm_value *args, int nargs,
@@ -2746,6 +2791,7 @@ static const struct rt_method rt_compound_button[] = {
    M("<init>", "(Landroid/content/Context;)V", view_init_context),
    M("<init>", "(Landroid/content/Context;Landroid/util/AttributeSet;)V", view_init_context),
    M("<init>", "(Landroid/content/Context;Landroid/util/AttributeSet;I)V", view_init_context),
+   M("<init>", "(Landroid/content/Context;Landroid/util/AttributeSet;II)V", view_init_context),
    M("setChecked", "(Z)V", compound_set_checked),
    M("isChecked", "()Z", compound_is_checked),
    M("toggle", "()V", compound_toggle),
@@ -2910,8 +2956,8 @@ static const struct rt_method rt_typed_array[] = {
    M("getInteger", "(II)I", typed_array_default_int),
    M("getFloat", "(IF)F", typed_array_default_float),
    M("getDimension", "(IF)F", typed_array_dimension),
-   M("getResourceId", "(II)I", typed_array_default_int),
-   M("getColor", "(II)I", typed_array_default_int),
+   M("getResourceId", "(II)I", typed_array_resource_id),
+   M("getColor", "(II)I", typed_array_color),
    M("getDimensionPixelSize", "(II)I", typed_array_dimension_size),
    M("getDimensionPixelOffset", "(II)I", typed_array_dimension_offset),
    M("getDrawable", "(I)Landroid/graphics/drawable/Drawable;",
@@ -2921,7 +2967,7 @@ static const struct rt_method rt_typed_array[] = {
    M("getText", "(I)Ljava/lang/CharSequence;", typed_array_get_text),
    M("getString", "(I)Ljava/lang/String;", typed_array_get_text),
    M("getColorStateList", "(I)Landroid/content/res/ColorStateList;",
-     typed_array_get_colors),
+     typed_array_color),
    /* recycle() returns the array to a pool this runtime does not keep: a
       TypedArray here is an ordinary object the collector owns. */
    M("recycle", "()V", empty_void),
@@ -3266,10 +3312,10 @@ static bool res_get_color_state_list(struct dvm *vm, dvm_ref self,
                                      const union dvm_value *args, int nargs,
                                      union dvm_value *out)
 {
-   (void)self; (void)nargs;
-   int32_t value = 0; const char *string = NULL;
-   (void)res_value_resolved((uint32_t)ARG(0).i, &value, &string);
-   RETL(color_state_list_new(vm, value));
+   (void)self;
+   dvm_ref colors=color_value_list(vm,1,ARG(0).i,NULL,nargs>1 ? ARG(1).l : 0,0);
+   if (!colors) return false;
+   RETL(colors);
 }
 
 /* Resources.getColor(int) — the packed ARGB of a colour resource.  Left
@@ -3279,10 +3325,8 @@ static bool res_get_color(struct dvm *vm, dvm_ref self,
                           const union dvm_value *args, int nargs,
                           union dvm_value *out)
 {
-   (void)vm; (void)self; (void)nargs;
-   int32_t value = 0; const char *string = NULL;
-   (void)res_value_resolved((uint32_t)ARG(0).i, &value, &string);
-   RETI(value);
+   (void)self;
+   return color_value_argb(vm,1,ARG(0).i,NULL,nargs>1 ? ARG(1).l : 0,0,out);
 }
 
 /* Resources.getDrawable(id): the class a device builds for this resource.  What
@@ -4581,7 +4625,8 @@ static bool color_state_init(struct dvm *vm, dvm_ref self,
 }
 
 static const struct rt_field rt_color_state_fields[] = {
-   { "color", "I" }, { "stateSpecs", "[[I" }, { "colors", "[I" }, F_END
+   { "color", "I" }, { "stateSpecs", "[[I" }, { "colors", "[I" },
+   { "themeXml", "Ljava/lang/String;" }, { "themePending", "Z" }, F_END
 };
 /* ColorStateList.valueOf(int) — the single-colour list every widget uses when
  * it is handed a plain colour.  Unresolved it answered null, and the caller
@@ -4595,7 +4640,23 @@ static bool color_state_value_of(struct dvm *vm, dvm_ref self,
    RETL(color_state_list_new(vm, ARG(0).i));
 }
 
+static bool color_state_theme(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                               int nargs,union dvm_value *out)
+{
+   union dvm_value pending={0},source={0};
+   (void)dvm_get_field(vm,self,"themePending","Z",&pending);
+   if(!strcmp(builtin_name(),"canApplyTheme")) RETI(pending.i);
+   if(!pending.i || !nargs || !ARG(0).l) RETL(self);
+   (void)dvm_get_field(vm,self,"themeXml","Ljava/lang/String;",&source);
+   const char *path=dvm_string_utf8(vm,source.l);
+   dvm_ref copy=color_value_list(vm,'L',0,path,ARG(0).l,0);
+   if(!copy) return false;
+   RETL(copy);
+}
+
 static const struct rt_method rt_color_state[] = {
+   M("canApplyTheme","()Z",color_state_theme),
+   M("obtainForTheme","(Landroid/content/res/Resources$Theme;)Landroid/content/res/ColorStateList;",color_state_theme),
    M("<init>", "([[I[I)V", color_state_init),
    SM("valueOf", "(I)Landroid/content/res/ColorStateList;", color_state_value_of),
    M("getDefaultColor", "()I", color_state_default),
@@ -7256,6 +7317,125 @@ static dvm_ref dx_item_states(struct dvm *vm,const struct dx *x,const struct dx_
    return array;
 }
 
+/* Scalar colors need no guest ColorStateList allocation. */
+static bool color_value_argb(struct dvm *vm,int kind,int32_t value,const char *text,
+                             dvm_ref theme,unsigned depth,union dvm_value *out)
+{
+   if(depth>32) {dvm__throw(vm,"android/content/res/Resources$NotFoundException","Cyclic color reference");return false;}
+   if(kind==1) {
+      kind=res_value_resolved((uint32_t)value,&value,&text);
+      if(!kind) {dvm__throw(vm,"android/content/res/Resources$NotFoundException","Color resource could not be resolved");return false;}
+   }
+   if(kind==2 && theme) {
+      int next=theme_style_value(vm,theme,(uint32_t)value,&value,&text);
+      if(next) return color_value_argb(vm,next,value,text,theme,depth+1,out);
+   }
+   if(kind>=0x10 && kind<=0x1f) {out->i=value;return true;}
+   dvm_ref colors=color_value_list(vm,kind,value,text,theme,depth);
+   return colors && dvm_get_field(vm,colors,"color","I",out);
+}
+
+/* Shared resource/TypedArray color loading. Keep resource IDs out of ARGB. */
+static dvm_ref color_value_list(struct dvm *vm,int kind,int32_t value,
+                               const char *text,dvm_ref theme,unsigned depth)
+{
+   if (depth>32) goto missing;
+   if (kind==1) {
+      kind=res_value_resolved((uint32_t)value,&value,&text);
+      if (!kind) goto missing;
+   }
+   if (kind==2) {
+      if (!theme) goto invalid;
+      int next=theme_style_value(vm,theme,(uint32_t)value,&value,&text);
+      if (!next) goto invalid;
+      return color_value_list(vm,next,value,text,theme,depth+1);
+   }
+   if (kind>=0x10 && kind<=0x1f) return color_state_list_new(vm,value);
+   if (kind!='L' || !text) goto invalid;
+   size_t length=0;
+   unsigned char *bytes=arm_exec_asset_read(text,&length);
+   if (!bytes || length<8 || ax_u16(bytes)!=3) {free(bytes);goto missing;}
+   struct dx xml={.b=bytes,.n=length,.pos=ax_u16(bytes+2),.theme=theme};
+   xml.s=ax_string_pool(bytes,length,&xml.ns);
+   struct dx_tag tag;
+   bool good=xml.s && dx_next(&xml,&tag)==0x0102 && !strcmp(tag.name,"selector");
+   struct dx scan=xml;unsigned count=0;int nesting=1,event;
+   while (good && nesting && (event=dx_next(&scan,&tag))) {
+      if (event==0x0103) --nesting;
+      else {if(nesting==1 && !strcmp(tag.name,"item")) ++count;++nesting;}
+   }
+   good=good && nesting==0;
+   dvm_ref result=good ? dx_new(vm,"Landroid/content/res/ColorStateList;") : 0;
+   if (result) dvm_pin(vm,result); else good=false;
+   dvm_ref specs=good ? dvm_new_array(vm,'L',"[I",count) : 0;
+   if (specs) (void)dvm_set_field(vm,result,"stateSpecs","[[I",(union dvm_value){.l=specs}); else good=false;
+   dvm_ref colors=good ? dvm_new_array(vm,'I',"I",count) : 0;
+   if (colors) (void)dvm_set_field(vm,result,"colors","[I",(union dvm_value){.l=colors}); else good=false;
+   unsigned index=0;bool pending=false;
+   while (good && (event=dx_next(&xml,&tag))==0x0102) {
+      if (strcmp(tag.name,"item")) {dx_skip(&xml);continue;}
+      uint8_t type=0;uint32_t data=0;int32_t color=(int32_t)0xffff00ffu;
+      if (dx_attr(&xml,&tag,"color",&type,&data)) {
+         if (!dx_resolve_attribute(vm,&xml,&type,&data)) pending=true;
+         else {
+            union dvm_value v={0};
+            if (!color_value_argb(vm,type,(int32_t)data,NULL,theme,depth+1,&v)) {good=false;break;}
+            color=v.i;
+         }
+      }
+      float alpha=1;
+      if (dx_attr(&xml,&tag,"alpha",&type,&data)) {
+         if (!dx_resolve_attribute(vm,&xml,&type,&data)) pending=true;
+         else {
+            int32_t raw=(int32_t)data;const char *unused=NULL;int k=type;
+            if(k==1) k=res_value_resolved(data,&raw,&unused);
+            if(k==4) memcpy(&alpha,&raw,sizeof alpha);
+            else if(k>=0x10 && k<=0x1f) alpha=(float)raw;
+            else {good=false;break;}
+         }
+      }
+      float modulated=(float)((uint32_t)color>>24)*alpha+.5f;
+      int a=isnan(modulated) || modulated<=0 ? 0 : modulated>=255 ? 255 : (int)modulated;
+      color=(int32_t)(((uint32_t)color&0xffffffu)|((uint32_t)a<<24));
+      dvm_ref states=dvm_new_array(vm,'I',"I",tag.count);
+      if(!states) {good=false;break;}
+      ((dvm_ref *)dvm_array_data(vm,specs))[index]=states;
+      int32_t *requirements=dvm_array_data(vm,states);unsigned nstates=0;
+      for(uint16_t i=0;tag.asz>=20 && i<tag.count;++i) {
+         size_t at=tag.attrs+(size_t)i*tag.asz;
+         if(at+20>tag.end) {good=false;break;}
+         uint32_t name=ax_u32(xml.b+at+4);
+         const char *label=name<xml.ns ? xml.s[name] : NULL;
+         uint32_t id=name<xml.resource_count ? ax_u32(xml.resource_map+name*4) : 0;
+         if(!id || (label && (!strcmp(label,"color") || !strcmp(label,"alpha") || !strcmp(label,"lStar")))) continue;
+         requirements[nstates++]=ax_u32(xml.b+at+16) ? (int32_t)id : -(int32_t)id;
+      }
+      dvm__obj(vm,states)->length=nstates;
+      ((int32_t *)dvm_array_data(vm,colors))[index++]=color;
+      dx_skip(&xml);
+   }
+   if(good && index==count) {
+      union dvm_value args[]={{.l=specs},{.l=colors}},ignored={0};
+      good=color_state_init(vm,result,args,2,&ignored);
+      if(good && !count) (void)dvm_set_field(vm,result,"color","I",(union dvm_value){.u=0xffff0000u});
+   } else good=false;
+   if(good && pending) {
+      dvm_ref source=dvm_new_string(vm,text);
+      good=source && dvm_set_field(vm,result,"themeXml","Ljava/lang/String;",(union dvm_value){.l=source}) &&
+         dvm_set_field(vm,result,"themePending","Z",(union dvm_value){.i=1});
+   }
+   for(uint32_t i=0;xml.s && i<xml.ns;++i) free(xml.s[i]);
+   free(xml.s);free(bytes);
+   if(result) dvm_unpin(vm,result);
+   if(good) return result;
+   if(!dvm_exception(vm)) dvm__throw(vm,"android/content/res/Resources$NotFoundException","Invalid color selector");
+   return 0;
+missing:
+   dvm__throw(vm,"android/content/res/Resources$NotFoundException","Color resource could not be resolved");return 0;
+invalid:
+   dvm__throw(vm,"java/lang/UnsupportedOperationException","Can't convert type 0x%x to color",kind);return 0;
+}
+
 static bool gd_init(struct dvm *,dvm_ref,const union dvm_value *,int,union dvm_value *);
 
 static dvm_ref dx_shape(struct dvm *vm, struct dx *x, const struct dx_tag *t)
@@ -7368,7 +7548,7 @@ struct vector_data {
    bool mirrored;
    bool tint;
    uint32_t tint_color;
-   unsigned cached_tint_gen;uint32_t cached_tint_color;
+   int density;
 };
 static void vector_nodes_clear(struct vector_node *node)
 {
@@ -7380,6 +7560,64 @@ static void vector_destroy(void *data)
    struct vector_data *vector=data;if(!vector) return;
    vector_nodes_clear(vector->root.children);free(vector);
 }
+/* The VM reference owns native vector state and roots its tint references.
+ * Drawable instances retain it through a normal scanned object field. */
+static dvm_ref vector_state_ref(struct dvm *vm,dvm_ref drawable)
+{ return ui_obj(vm,drawable,"vectorState","Landroid/graphics/drawable/VectorDrawable$VectorDrawableState;"); }
+static struct vector_data *vector_of(struct dvm *vm,dvm_ref drawable)
+{
+   struct dvm_object *state=dvm__obj(vm,vector_state_ref(vm,drawable));
+   return state ? state->data : NULL;
+}
+static bool vector_attach(struct dvm *vm,dvm_ref drawable,struct vector_data *data)
+{
+   dvm_pin(vm,drawable);
+   dvm_ref state=dvm_new_object(vm,dvm_find_class(vm,"android/graphics/drawable/VectorDrawable$VectorDrawableState"));
+   if (!state) {dvm_unpin(vm,drawable);vector_destroy(data);return false;}
+   struct dvm_object *object=dvm__obj(vm,state);
+   object->data=data;object->data_destroy=vector_destroy;
+   data->density=device_density_dpi();
+   bool good=dvm_set_field(vm,drawable,"vectorState","Landroid/graphics/drawable/VectorDrawable$VectorDrawableState;",
+                           (union dvm_value){.l=state});
+   dvm_unpin(vm,drawable);return good;
+}
+static struct vector_gradient *vector_gradient_copy(const struct vector_gradient *source)
+{
+   if (!source) return NULL;
+   struct vector_gradient *copy=calloc(1,sizeof *copy);
+   if (!copy) return NULL;
+   *copy=*source;copy->colors=NULL;copy->positions=NULL;copy->count=copy->capacity=0;
+   for (size_t i=0;i<source->count;++i)
+      if (!vector_gradient_stop(copy,source->colors[i],source->positions[i])) {
+         vector_gradient_free(copy);return NULL;
+      }
+   return copy;
+}
+static bool vector_nodes_copy(const struct vector_node *source,struct vector_node **out)
+{
+   for (;source;source=source->next) {
+      struct vector_node *copy=calloc(1,sizeof *copy);
+      if (!copy) return false;
+      *copy=*source;copy->next=copy->children=NULL;
+      copy->path=(luna_path){0};copy->fill_gradient=copy->stroke_gradient=NULL;
+      *out=copy;out=&copy->next;
+      if (!luna_path_append(&copy->path,&source->path,NULL)) return false;
+      copy->path.fill=source->path.fill;copy->path.after_close=source->path.after_close;
+      if (source->fill_gradient && !(copy->fill_gradient=vector_gradient_copy(source->fill_gradient))) return false;
+      if (source->stroke_gradient && !(copy->stroke_gradient=vector_gradient_copy(source->stroke_gradient))) return false;
+      if (!vector_nodes_copy(source->children,&copy->children)) return false;
+   }
+   return true;
+}
+static struct vector_data *vector_copy(const struct vector_data *source)
+{
+   struct vector_data *copy=malloc(sizeof *copy);
+   if (!copy) return NULL;
+   *copy=*source;copy->root.children=NULL;
+   if (!vector_nodes_copy(source->root.children,&copy->root.children)) {vector_destroy(copy);return NULL;}
+   return copy;
+}
+
 static float dx_float(const struct dx *x,const struct dx_tag *t,const char *name,float def);
 static struct vector_gradient *vector_gradient_resource(struct dvm *vm,uint32_t id,dvm_ref theme)
 {
@@ -7475,7 +7713,7 @@ static dvm_ref dx_vector(struct dvm *vm,struct dx *x,const struct dx_tag *tag)
    if(!drawable) return 0;
    struct vector_data *vector=calloc(1,sizeof *vector);
    if(!vector) {dvm__throw(vm,"java/lang/OutOfMemoryError","Vector");return 0;}
-   struct dvm_object *object=dvm__obj(vm,drawable);object->data=vector;object->data_destroy=vector_destroy;
+   if (!vector_attach(vm,drawable,vector)) return 0;
    vector->width=dx_px(vm,x,tag,"width",0);vector->height=dx_px(vm,x,tag,"height",0);
    vector->viewport_width=dx_float(x,tag,"viewportWidth",0);vector->viewport_height=dx_float(x,tag,"viewportHeight",0);
    vector->alpha=dx_float(x,tag,"alpha",1);vector->mirrored=dx_int(x,tag,"autoMirrored",0)!=0;
@@ -7767,6 +8005,7 @@ static void ax_apply_attribute(struct dvm *vm, dvm_ref view, const char *name,
       { ax_set_int(vm, view, "gravity", (int32_t)data); return; }
    if (!strcmp(name, "layout_gravity"))
       { ax_set_int(vm, view, "layoutGravity", (int32_t)data); return; }
+   if (!strcmp(name,"visibility") && ui_is_a(vm,view,"android/view/ViewStub")) return;
    if (!strcmp(name, "visibility"))
       { if (data <= 2) ax_set_int(vm, view, "visibility", (int32_t)data * 4); return; }
    /* android:tag is View.setTag(Object): a String.  Data binding finds the
@@ -8016,6 +8255,11 @@ static dvm_ref li_inflate_resource(struct dvm *vm, dvm_ref inflater,dvm_ref cont
             dvm_ref view=li_create_tag(vm,inflater,parent,tag,context,parser);
             if (!view || dvm_exception(vm)) break;
             dvm_pin(vm,view);
+            if (ui_is_a(vm,view,"android/view/ViewStub")) {
+               union dvm_value ctx={.l=context},clone={0};
+               if (!li_clone(vm,inflater,&ctx,1,&clone)) {dvm_unpin(vm,view);break;}
+               dvm_set_field(vm,view,"stubInflater","Landroid/view/LayoutInflater;",clone);
+            }
             if (parent && view) {
                struct dvm_class *parent_class = dvm_object_class(vm, parent);
                struct dvm_method *generate = parent_class ? dvm_find_method(vm, parent_class,
@@ -8116,6 +8360,151 @@ static bool view_inflate(struct dvm *vm, dvm_ref self,
    return m && dvm_call(vm, m, inflater.l, args + 1, 2, out);
 }
 
+/* ViewStub is a zero-sized placeholder. Its layout is inflated only on
+ * request; normal parent operations preserve callbacks and child ordering. */
+static bool viewstub_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                           int nargs,union dvm_value *out)
+{
+   if (!view_init_context(vm,self,args,1,out)) return false;
+   rt_set_int(vm,self,"visibility",8);rt_set_int(vm,self,"inflatedId",-1);rt_set_int(vm,self,"id",-1);
+   dvm_set_field(vm,self,"willNotDraw","Z",(union dvm_value){.i=1});
+   if (nargs==2 && strstr(builtin_sig(),"Context;I)")) {
+      rt_set_int(vm,self,"layoutResource",ARG(1).i);RETV();
+   }
+   const uint32_t attrs[]={0x010100d0u,0x010100f2u,0x010100f3u}; /* id, layout, inflatedId */
+   dvm_ref ids=dvm_new_array(vm,'I',"I",3);
+   if (!ids) return false;
+   memcpy(dvm_array_data(vm,ids),attrs,sizeof attrs);
+   union dvm_value input[]={{.l=nargs>1 ? ARG(1).l : 0},{.l=ids},
+      {.i=nargs>2 ? ARG(2).i : 0},{.i=nargs>3 ? ARG(3).i : 0}},array={0},ignored={0};
+   if (!am_vcall(vm,ARG(0).l,"obtainStyledAttributes",
+      "(Landroid/util/AttributeSet;[III)Landroid/content/res/TypedArray;",input,4,&array)) return false;
+   dvm_pin(vm,array.l);
+   const char *fields[]={"id","layoutResource","inflatedId"};
+   bool good=true;
+   for (int i=0;i<3 && good;++i) {
+      union dvm_value a[]={{.i=i},{.i=i==1 ? 0 : -1}},value={0};
+      good=am_vcall(vm,array.l,"getResourceId","(II)I",a,2,&value);
+      if (good) rt_set_int(vm,self,fields[i],value.i);
+   }
+   if (good) good=am_vcall(vm,array.l,"recycle","()V",NULL,0,&ignored);
+   dvm_unpin(vm,array.l);return good;
+}
+
+static bool viewstub_inflate(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                              int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   dvm_ref parent=ui_obj(vm,self,"parent","Landroid/view/ViewParent;");
+   if (!parent || !ui_is_a(vm,parent,"android/view/ViewGroup")) {
+      dvm__throw(vm,"java/lang/IllegalStateException","ViewStub must have a non-null ViewGroup parent");return false;
+   }
+   int32_t layout=rt_get_int(vm,self,"layoutResource");
+   if (!layout) {dvm__throw(vm,"java/lang/IllegalArgumentException","ViewStub must have a valid layoutResource");return false;}
+   dvm_ref inflater=ui_obj(vm,self,"stubInflater","Landroid/view/LayoutInflater;");
+   if (!inflater) {
+      union dvm_value context={.l=ui_obj(vm,self,"context","Landroid/content/Context;")},result={0};
+      if (!li_from(vm,0,&context,1,&result)) return false;
+      inflater=result.l;
+   }
+   union dvm_value input[]={{.i=layout},{.l=parent},{.i=0}},view={0};
+   if (!am_vcall(vm,inflater,"inflate","(ILandroid/view/ViewGroup;Z)Landroid/view/View;",input,3,&view)) return false;
+   dvm_pin(vm,view.l);
+   union dvm_value ignored={0},index={0},stub={.l=self};
+   int32_t id=rt_get_int(vm,self,"inflatedId");
+   bool good=true;
+   if (id!=-1) {
+      union dvm_value value={.i=id};good=am_vcall(vm,view.l,"setId","(I)V",&value,1,&ignored);
+   }
+   if (good) good=am_vcall(vm,parent,"indexOfChild","(Landroid/view/View;)I",&stub,1,&index);
+   if (good) good=am_vcall(vm,parent,"removeViewInLayout","(Landroid/view/View;)V",&stub,1,&ignored);
+   union dvm_value a[]={{.l=view.l},{.i=index.i},{.l=ui_obj(vm,self,"layoutParams","Landroid/view/ViewGroup$LayoutParams;")}};
+   if (good) good=am_vcall(vm,parent,"addView",a[2].l ?
+      "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;)V" : "(Landroid/view/View;I)V",a,a[2].l ? 3 : 2,&ignored);
+   if (good) {
+      dvm_ref weak=dvm_new_object(vm,dvm_find_class(vm,"java/lang/ref/WeakReference"));
+      good=weak && ref_init(vm,weak,&view,1,&ignored)
+         && dvm_set_field(vm,self,"inflatedViewRef","Ljava/lang/ref/WeakReference;",(union dvm_value){.l=weak});
+   }
+   dvm_ref listener=ui_obj(vm,self,"inflateListener","Landroid/view/ViewStub$OnInflateListener;");
+   if (good && listener) {
+      union dvm_value notify[]={{.l=self},{.l=view.l}};
+      good=am_vcall(vm,listener,"onInflate","(Landroid/view/ViewStub;Landroid/view/View;)V",notify,2,&ignored);
+   }
+   dvm_unpin(vm,view.l);
+   if (!good) return false;
+   RETL(view.l);
+}
+
+static bool viewstub_visibility(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                                 int nargs,union dvm_value *out)
+{
+   dvm_ref weak=ui_obj(vm,self,"inflatedViewRef","Ljava/lang/ref/WeakReference;");
+   if (weak) {
+      union dvm_value view={0};
+      if (!ref_get(vm,weak,NULL,0,&view)) return false;
+      if (!view.l) {dvm__throw(vm,"java/lang/IllegalStateException","setVisibility called on un-referenced view");return false;}
+      return am_vcall(vm,view.l,"setVisibility","(I)V",args,nargs,out);
+   }
+   if (!view_set_visibility(vm,self,args,nargs,out)) return false;
+   if (ARG(0).i==0 || ARG(0).i==4) {
+      union dvm_value ignored={0};return viewstub_inflate(vm,self,NULL,0,&ignored);
+   }
+   RETV();
+}
+static bool viewstub_measure(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                              int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   union dvm_value zero[2]={{.i=0},{.i=0}};
+   return view_set_measured(vm,self,zero,2,out);
+}
+static bool viewstub_property(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                               int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   const char *name=builtin_name();
+   const char *field=strstr(name,"LayoutResource") ? "layoutResource" : "inflatedId";
+   if (name[0]=='g') RETI(rt_get_int(vm,self,field));
+   rt_set_int(vm,self,field,ARG(0).i);RETV();
+}
+static bool viewstub_reference(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                                int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   bool inflater=strstr(builtin_name(),"LayoutInflater")!=NULL;
+   const char *field=inflater ? "stubInflater" : "inflateListener";
+   const char *sig=inflater ? "Landroid/view/LayoutInflater;" : "Landroid/view/ViewStub$OnInflateListener;";
+   if (builtin_name()[0]=='g') {union dvm_value value={0};dvm_get_field(vm,self,field,sig,&value);RETL(value.l);}
+   dvm_set_field(vm,self,field,sig,ARG(0));RETV();
+}
+static const struct rt_field rt_viewstub_fields[]={
+ {"layoutResource","I"},{"inflatedId","I"},
+ {"stubInflater","Landroid/view/LayoutInflater;"},
+ {"inflateListener","Landroid/view/ViewStub$OnInflateListener;"},
+ {"inflatedViewRef","Ljava/lang/ref/WeakReference;"},F_END,
+};
+static const struct rt_method rt_viewstub[]={
+ M("<init>","(Landroid/content/Context;)V",viewstub_init),
+ M("<init>","(Landroid/content/Context;I)V",viewstub_init),
+ M("<init>","(Landroid/content/Context;Landroid/util/AttributeSet;)V",viewstub_init),
+ M("<init>","(Landroid/content/Context;Landroid/util/AttributeSet;I)V",viewstub_init),
+ M("<init>","(Landroid/content/Context;Landroid/util/AttributeSet;II)V",viewstub_init),
+ M("inflate","()Landroid/view/View;",viewstub_inflate),
+ M("setVisibility","(I)V",viewstub_visibility),
+ M("onMeasure","(II)V",viewstub_measure),
+ M("draw","(Landroid/graphics/Canvas;)V",empty_void),
+ M("dispatchDraw","(Landroid/graphics/Canvas;)V",empty_void),
+ M("getLayoutResource","()I",viewstub_property),M("setLayoutResource","(I)V",viewstub_property),
+ M("getInflatedId","()I",viewstub_property),M("setInflatedId","(I)V",viewstub_property),
+ M("getLayoutInflater","()Landroid/view/LayoutInflater;",viewstub_reference),
+ M("setLayoutInflater","(Landroid/view/LayoutInflater;)V",viewstub_reference),
+ M("setOnInflateListener","(Landroid/view/ViewStub$OnInflateListener;)V",viewstub_reference),M_END,
+};
+static const struct rt_method rt_viewstub_listener[]={
+ {"onInflate","(Landroid/view/ViewStub;Landroid/view/View;)V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},M_END,
+};
+
 static const struct rt_field rt_layout_inflater_fields[] = {
    { "context", "Landroid/content/Context;" },
    { "mFactory", "Landroid/view/LayoutInflater$Factory;" },
@@ -8159,11 +8548,10 @@ static const struct rt_method rt_inflater_factory2[] = {
    {"onCreateView","(Landroid/view/View;Ljava/lang/String;Landroid/content/Context;Landroid/util/AttributeSet;)Landroid/view/View;",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT}, M_END
 };
 
-/* A Typeface is a family and a style (NORMAL 0, BOLD 1, ITALIC 2,
- * BOLD_ITALIC 3).  The overlay renders one face, so the family is recorded
- * and the style is what reaches the text. */
+/* Typeface retains its selected immutable host face as well as style. */
 static const struct rt_field rt_typeface_fields[] = {
-   { "style", "I" }, { "family", "Ljava/lang/String;" }, F_END
+   { "style", "I" }, { "weight", "I" }, { "family", "Ljava/lang/String;" }, { "fontHandle", "I" },
+   { "fontFamily", "Landroid/graphics/fonts/FontFamily;" }, { "weightStyles", "Ljava/util/HashMap;" }, F_END
 };
 static const struct rt_field rt_typeface_sfields[] = {
    { "DEFAULT", "Landroid/graphics/Typeface;" },
@@ -8180,10 +8568,209 @@ static dvm_ref typeface_new(struct dvm *vm, const char *family, int32_t style)
    dvm_ref t = c ? dvm_new_object(vm, c) : 0;
    if (!t) return 0;
    rt_set_int(vm, t, "style", style & 3);
+   rt_set_int(vm, t, "weight", (style&1) ? 700 : 400);
    union dvm_value v = { .l = dvm_new_string(vm, family ? family : "sans-serif") };
    (void)dvm_set_field(vm, t, "family", "Ljava/lang/String;", v);
    return t;
 }
+
+/* Font files and API 29 builders. Included by dvm_android_ui.h.
+ * Data is copied into the host font cache; Java objects retain immutable handles.
+ * Variable-font axes and additional custom fallback families are not implemented. */
+static const struct rt_field rt_font_style_fields[] = {{"weight","I"},{"slant","I"},F_END};
+static dvm_ref font_style_new(struct dvm *vm,int weight,int slant)
+{
+   dvm_ref ref=dvm_new_object(vm,dvm__class_by_desc(vm,"Landroid/graphics/fonts/FontStyle;"));
+   if(ref) {rt_set_int(vm,ref,"weight",weight);rt_set_int(vm,ref,"slant",slant);}
+   return ref;
+}
+static bool font_style_method(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;const char *name=builtin_name();
+   if(!strcmp(name,"<init>")) {
+      int weight=nargs ? ARG(0).i : 400,slant=nargs ? ARG(1).i : 0;
+      if(weight<1 || weight>1000 || slant<0 || slant>1) {
+         dvm__throw(vm,"java/lang/IllegalArgumentException","Invalid font style");return false;
+      }
+      rt_set_int(vm,self,"weight",weight);rt_set_int(vm,self,"slant",slant);RETV();
+   }
+   if(!strcmp(name,"getWeight")) RETI(rt_get_int(vm,self,"weight"));
+   RETI(rt_get_int(vm,self,"slant"));
+}
+static const struct rt_method rt_font_style[]={
+   M("<init>","()V",font_style_method),M("<init>","(II)V",font_style_method),
+   M("getWeight","()I",font_style_method),M("getSlant","()I",font_style_method),M_END
+};
+static const struct rt_field rt_font_fields[]={
+   {"handle","I"},{"fontStyle","Landroid/graphics/fonts/FontStyle;"},{"ttcIndex","I"},F_END
+};
+static const struct rt_field rt_font_builder_fields[]={
+   {"path","Ljava/lang/String;"},{"weight","I"},{"slant","I"},{"ttcIndex","I"},F_END
+};
+static uint32_t font_file_load(const char *path,int index,int *weight,int *slant)
+{
+   FILE *file=path ? luna_file_fopen(path,"rb") : NULL;
+   if(!file) return 0;
+   long size=0;unsigned char *bytes=NULL;
+   if(!fseek(file,0,SEEK_END) && (size=ftell(file))>0 && size<=INT_MAX && !fseek(file,0,SEEK_SET)) {
+      bytes=malloc((size_t)size);
+      if(bytes && fread(bytes,1,(size_t)size,file)!=(size_t)size) {free(bytes);bytes=NULL;}
+   }
+   fclose(file);
+   uint32_t handle=bytes ? luna_overlay_font_load(bytes,(size_t)size,index) : 0;
+   if(handle && (weight || slant)) {
+      /* OS/2 usWeightClass and fsSelection, with the Android default on absence. */
+      if(weight) *weight=400;
+      if(slant) *slant=0;
+      size_t offset=0;
+      if(!memcmp(bytes,"ttcf",4)) offset=((size_t)bytes[12+4*index]<<24)|((size_t)bytes[13+4*index]<<16)|((size_t)bytes[14+4*index]<<8)|bytes[15+4*index];
+      unsigned count=((unsigned)bytes[offset+4]<<8)|bytes[offset+5];
+      for(unsigned i=0;i<count;++i) {
+         const unsigned char *entry=bytes+offset+12+16*i;
+         if(memcmp(entry,"OS/2",4)) continue;
+         size_t pos=((size_t)entry[8]<<24)|((size_t)entry[9]<<16)|((size_t)entry[10]<<8)|entry[11];
+         size_t length=((size_t)entry[12]<<24)|((size_t)entry[13]<<16)|((size_t)entry[14]<<8)|entry[15];
+         if(length>=6 && weight) {int w=((unsigned)bytes[pos+4]<<8)|bytes[pos+5];*weight=w<1 ? 1 : w>1000 ? 1000 : w;}
+         if(length>=64 && slant) *slant=(bytes[pos+63]&1)!=0;
+         break;
+      }
+   }
+   free(bytes);return handle;
+}
+static bool font_builder_method(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;const char *name=builtin_name();
+   if(!strcmp(name,"<init>")) {
+      if(!ARG(0).l) {dvm__throw(vm,"java/lang/NullPointerException","font source");return false;}
+      const char *path=NULL;char host[DVM_PATH_MAX];
+      if(!strcmp(builtin_sig(),"(Landroid/content/res/Resources;I)V")) {
+         int32_t value=ARG(1).i;const char *entry=NULL;int kind=1;
+         for(int depth=0;kind==1 && depth<32;++depth) kind=arm_exec_apk_resource_value((uint32_t)value,&value,&entry);
+         if(kind==0 || kind==1) {dvm__throw(vm,"android/content/res/Resources$NotFoundException","Font resource #0x%x",ARG(1).u);return false;}
+         if(kind=='L' && entry && !strstr(entry,".xml")) path=arm_exec_apk_entry_path(entry);
+      } else {
+         const char *guest=file_path(vm,ARG(0).l);
+         if(guest) path=arm_exec_map_guest_path(guest,host,sizeof host);
+      }
+      if(path) (void)dvm_set_field(vm,self,"path","Ljava/lang/String;",(union dvm_value){.l=dvm_new_string(vm,path)});
+      rt_set_int(vm,self,"weight",-1);rt_set_int(vm,self,"slant",-1);RETV();
+   }
+   if(!strcmp(name,"setWeight")) {
+      if(ARG(0).i<1 || ARG(0).i>1000) {dvm__throw(vm,"java/lang/IllegalArgumentException","font weight");return false;}
+      rt_set_int(vm,self,"weight",ARG(0).i);RETL(self);
+   }
+   if(!strcmp(name,"setSlant")) {rt_set_int(vm,self,"slant",ARG(0).i!=0);RETL(self);}
+   if(!strcmp(name,"setTtcIndex")) {rt_set_int(vm,self,"ttcIndex",ARG(0).i);RETL(self);}
+   union dvm_value path={0};(void)dvm_get_field(vm,self,"path","Ljava/lang/String;",&path);
+   int weight=400,slant=0,index=rt_get_int(vm,self,"ttcIndex");
+   uint32_t handle=font_file_load(path.l ? dvm_string_utf8(vm,path.l) : NULL,index,&weight,&slant);
+   if(!handle) {dvm__throw(vm,"java/io/IOException","Failed to read font contents");return false;}
+   if(rt_get_int(vm,self,"weight")!=-1) weight=rt_get_int(vm,self,"weight");
+   if(rt_get_int(vm,self,"slant")!=-1) slant=rt_get_int(vm,self,"slant");
+   dvm_ref font=dvm_new_object(vm,dvm__class_by_desc(vm,"Landroid/graphics/fonts/Font;"));
+   if(!font) return false;
+   rt_set_int(vm,font,"handle",(int32_t)handle);rt_set_int(vm,font,"ttcIndex",index);
+   (void)dvm_set_field(vm,font,"fontStyle","Landroid/graphics/fonts/FontStyle;",(union dvm_value){.l=font_style_new(vm,weight,slant)});
+   RETL(font);
+}
+static const struct rt_method rt_font_builder[]={
+   M("<init>","(Landroid/content/res/Resources;I)V",font_builder_method),
+   M("<init>","(Ljava/io/File;)V",font_builder_method),
+   M("setWeight","(I)Landroid/graphics/fonts/Font$Builder;",font_builder_method),
+   M("setSlant","(I)Landroid/graphics/fonts/Font$Builder;",font_builder_method),
+   M("setTtcIndex","(I)Landroid/graphics/fonts/Font$Builder;",font_builder_method),
+   M("build","()Landroid/graphics/fonts/Font;",font_builder_method),M_END
+};
+static bool font_method(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   if(!strcmp(builtin_name(),"getTtcIndex")) RETI(rt_get_int(vm,self,"ttcIndex"));
+   union dvm_value style={0};(void)dvm_get_field(vm,self,"fontStyle","Landroid/graphics/fonts/FontStyle;",&style);RETL(style.l);
+}
+static const struct rt_method rt_font[]={M("getStyle","()Landroid/graphics/fonts/FontStyle;",font_method),M("getTtcIndex","()I",font_method),M_END};
+static const struct rt_field rt_font_family_fields[]={{"fonts","[Landroid/graphics/fonts/Font;"},F_END};
+static bool font_family_method(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;const char *name=builtin_name();union dvm_value list={0};
+   (void)dvm_get_field(vm,self,"fonts","[Landroid/graphics/fonts/Font;",&list);
+   int count=list.l ? dvm_array_length(vm,list.l) : 0;
+   if(!strcmp(name,"getSize")) RETI(count);
+   if(!strcmp(name,"getFont")) {
+      if(ARG(0).i<0 || ARG(0).i>=count) {dvm__throw(vm,"java/lang/IndexOutOfBoundsException","font index");return false;}
+      RETL(((dvm_ref *)dvm_array_data(vm,list.l))[ARG(0).i]);
+   }
+   if(!strcmp(name,"build")) {
+      dvm_ref family=dvm_new_object(vm,dvm__class_by_desc(vm,"Landroid/graphics/fonts/FontFamily;"));
+      (void)dvm_set_field(vm,family,"fonts","[Landroid/graphics/fonts/Font;",list);RETL(family);
+   }
+   if(!ARG(0).l) {dvm__throw(vm,"java/lang/NullPointerException","font");return false;}
+   if(!strcmp(name,"<init>")) count=0;
+   union dvm_value style={0};(void)dvm_get_field(vm,ARG(0).l,"fontStyle","Landroid/graphics/fonts/FontStyle;",&style);
+   for(int i=0;i<count;++i) {
+      dvm_ref other=((dvm_ref *)dvm_array_data(vm,list.l))[i];union dvm_value other_style={0};
+      (void)dvm_get_field(vm,other,"fontStyle","Landroid/graphics/fonts/FontStyle;",&other_style);
+      if(rt_get_int(vm,style.l,"weight")==rt_get_int(vm,other_style.l,"weight") && rt_get_int(vm,style.l,"slant")==rt_get_int(vm,other_style.l,"slant")) {
+         dvm__throw(vm,"java/lang/IllegalArgumentException","Font style already present");return false;
+      }
+   }
+   dvm_ref next=dvm_new_array(vm,'L',"Landroid/graphics/fonts/Font;",count+1);if(!next) return false;
+   if(count) memcpy(dvm_array_data(vm,next),dvm_array_data(vm,list.l),(size_t)count*sizeof(dvm_ref));
+   ((dvm_ref *)dvm_array_data(vm,next))[count]=ARG(0).l;
+   (void)dvm_set_field(vm,self,"fonts","[Landroid/graphics/fonts/Font;",(union dvm_value){.l=next});
+   if(!strcmp(name,"<init>")) RETV();
+   RETL(self);
+}
+static const struct rt_method rt_font_family_builder[]={
+   M("<init>","(Landroid/graphics/fonts/Font;)V",font_family_method),
+   M("addFont","(Landroid/graphics/fonts/Font;)Landroid/graphics/fonts/FontFamily$Builder;",font_family_method),
+   M("build","()Landroid/graphics/fonts/FontFamily;",font_family_method),M_END
+};
+static const struct rt_method rt_font_family[]={M("getSize","()I",font_family_method),M("getFont","(I)Landroid/graphics/fonts/Font;",font_family_method),M_END};
+static const struct rt_field rt_font_fallback_fields[]={
+   {"fontFamily","Landroid/graphics/fonts/FontFamily;"},{"fontStyle","Landroid/graphics/fonts/FontStyle;"},F_END
+};
+static dvm_ref font_family_match(struct dvm *vm,dvm_ref family,int weight,int slant)
+{
+   union dvm_value list={0};
+   (void)dvm_get_field(vm,family,"fonts","[Landroid/graphics/fonts/Font;",&list);
+   uint32_t count=list.l ? dvm_array_length(vm,list.l) : 0;
+   if(!count) {dvm__throw(vm,"java/lang/IllegalArgumentException","Empty font family");return 0;}
+   dvm_ref best=0;int score=INT_MAX;
+   for(uint32_t i=0;i<count;++i) {
+      dvm_ref font=((dvm_ref *)dvm_array_data(vm,list.l))[i];union dvm_value fs={0};
+      (void)dvm_get_field(vm,font,"fontStyle","Landroid/graphics/fonts/FontStyle;",&fs);
+      int match=abs(rt_get_int(vm,fs.l,"weight")-weight)/100+(rt_get_int(vm,fs.l,"slant")!=slant ? 2 : 0);
+      if(match<score) {score=match;best=font;}
+   }
+   return best;
+}
+static bool font_fallback_method(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;const char *name=builtin_name();
+   if(!strcmp(name,"<init>") || !strcmp(name,"setStyle")) {
+      if(!ARG(0).l) {dvm__throw(vm,"java/lang/NullPointerException","font family/style");return false;}
+      if(!strcmp(name,"<init>")) {
+         (void)dvm_set_field(vm,self,"fontFamily","Landroid/graphics/fonts/FontFamily;",ARG(0));RETV();
+      }
+      (void)dvm_set_field(vm,self,"fontStyle","Landroid/graphics/fonts/FontStyle;",ARG(0));RETL(self);
+   }
+   union dvm_value family={0},style={0};
+   (void)dvm_get_field(vm,self,"fontFamily","Landroid/graphics/fonts/FontFamily;",&family);
+   (void)dvm_get_field(vm,self,"fontStyle","Landroid/graphics/fonts/FontStyle;",&style);
+   int weight=style.l ? rt_get_int(vm,style.l,"weight") : 400,slant=style.l ? rt_get_int(vm,style.l,"slant") : 0;
+   dvm_ref best=font_family_match(vm,family.l,weight,slant);
+   if(!best) return false;
+   dvm_ref face=typeface_new(vm,"custom",(weight>=600 ? 1 : 0)|(slant ? 2 : 0));
+   if(!face) return false;
+   rt_set_int(vm,face,"weight",weight);
+   (void)dvm_set_field(vm,face,"fontFamily","Landroid/graphics/fonts/FontFamily;",family);
+   rt_set_int(vm,face,"fontHandle",rt_get_int(vm,best,"handle"));RETL(face);
+}
+static const struct rt_method rt_font_fallback[]={
+   M("<init>","(Landroid/graphics/fonts/FontFamily;)V",font_fallback_method),
+   M("setStyle","(Landroid/graphics/fonts/FontStyle;)Landroid/graphics/Typeface$CustomFallbackBuilder;",font_fallback_method),
+   M("build","()Landroid/graphics/Typeface;",font_fallback_method),M_END
+};
 
 /* create(String family, int style) / create(Typeface family, int style) /
  * defaultFromStyle(int style). */
@@ -8202,7 +8789,63 @@ static bool typeface_create(struct dvm *vm, dvm_ref self,
       (void)dvm_get_field(vm, ARG(0).l, "family", "Ljava/lang/String;", &f);
       if (f.l) snprintf(family, sizeof family, "%s", dvm_string_utf8(vm, f.l) ?: "");
    }
-   RETL(typeface_new(vm, family, style));
+   dvm_ref face=typeface_new(vm,family,style);
+   if(face && sig && !strncmp(sig,"(Landroid/graphics/Typeface;",28) && ARG(0).l) {
+      union dvm_value source_family={0};
+      (void)dvm_get_field(vm,ARG(0).l,"fontFamily","Landroid/graphics/fonts/FontFamily;",&source_family);
+      int handle=rt_get_int(vm,ARG(0).l,"fontHandle");
+      if(source_family.l) {
+         dvm_ref font=font_family_match(vm,source_family.l,(style&1) ? 700 : 400,(style&2)!=0);
+         if(!font) return false;
+         handle=rt_get_int(vm,font,"handle");
+         (void)dvm_set_field(vm,face,"fontFamily","Landroid/graphics/fonts/FontFamily;",source_family);
+      }
+      rt_set_int(vm,face,"fontHandle",handle);
+   }
+   RETL(face);
+}
+
+static bool typeface_weight_style(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)nargs;
+   int weight=args[1].i,italic=args[2].i!=0;
+   /* Android checks 0..1000 even though the public annotation says 1..1000. */
+   if(weight<0 || weight>1000) {dvm__throw(vm,"java/lang/IllegalArgumentException","weight out of range");return false;}
+   dvm_ref base=args[0].l;union dvm_value value={0};
+   if(!base) {
+      (void)dvm_get_static(vm,dvm__class_by_desc(vm,"Landroid/graphics/Typeface;"),"DEFAULT","Landroid/graphics/Typeface;",&value);
+      base=value.l;
+   }
+   if(!base) return false;
+   union dvm_value cache={0},family={0};
+   (void)dvm_get_field(vm,base,"weightStyles","Ljava/util/HashMap;",&cache);
+   union dvm_value key={.l=box_make(vm,"Ljava/lang/Integer;",(union dvm_value){.i=(weight<<1)|italic})};
+   if(!key.l) return false;
+   if(cache.l) {
+      if(!map_get(vm,cache.l,&key,1,&value)) return false;
+      if(value.l) RETL(value.l);
+   }
+   (void)dvm_get_field(vm,base,"family","Ljava/lang/String;",&family);
+   dvm_ref face=typeface_new(vm,dvm_string_utf8(vm,family.l),(weight>=600 ? 1 : 0)|(italic ? 2 : 0));
+   if(!face) return false;
+   rt_set_int(vm,face,"weight",weight);
+   (void)dvm_get_field(vm,base,"fontFamily","Landroid/graphics/fonts/FontFamily;",&family);
+   int handle=rt_get_int(vm,base,"fontHandle");
+   if(family.l) {
+      dvm_ref font=font_family_match(vm,family.l,weight,italic);
+      if(!font) return false;
+      handle=rt_get_int(vm,font,"handle");
+      (void)dvm_set_field(vm,face,"fontFamily","Landroid/graphics/fonts/FontFamily;",family);
+   }
+   rt_set_int(vm,face,"fontHandle",handle);
+   if(!cache.l) {
+      cache.l=coll_new_map(vm);
+      if(!cache.l) return false;
+      (void)dvm_set_field(vm,base,"weightStyles","Ljava/util/HashMap;",cache);
+   }
+   union dvm_value entry[2]={key,{.l=face}};
+   if(!map_put(vm,cache.l,entry,2,&value)) return false;
+   RETL(face);
 }
 
 /* createFromAsset / createFromFile: the font has to exist — a missing one is
@@ -8224,24 +8867,23 @@ static bool typeface_createFrom(struct dvm *vm, dvm_ref self,
       dvm__throw(vm, "java/lang/NullPointerException", "path");
       return false;
    }
-   bool found;
+   uint32_t handle=0;int weight=400,slant=0;
    if (asset) {
-      size_t len = 0;
-      unsigned char *data = arm_exec_asset_read(path, &len);
-      found = data != NULL;
+      size_t len=0;unsigned char *data=arm_exec_asset_read(path,&len);
+      if(data) handle=luna_overlay_font_load(data,len,0);
       free(data);
    } else {
       char host[DVM_PATH_MAX];
-      const char *hp = arm_exec_map_guest_path(path, host, sizeof host);
-      found = hp && luna_file_access(hp, R_OK) == 0;
+      const char *hp=arm_exec_map_guest_path(path,host,sizeof host);
+      handle=font_file_load(hp,0,&weight,&slant);
    }
-   if (!found) {
-      dvm__throw(vm, "java/lang/RuntimeException", "%s not found %s",
-                 asset ? "Font asset" : "Font", path);
-      return false;
+   if(!handle) {
+      dvm__throw(vm,"java/lang/RuntimeException","Unable to load font %s",path);return false;
    }
-   const char *slash = strrchr(path, '/');
-   RETL(typeface_new(vm, slash ? slash + 1 : path, 0));
+   const char *slash=strrchr(path,'/');
+   dvm_ref face=typeface_new(vm,slash ? slash+1 : path,(weight>=600 ? 1 : 0)|(slant ? 2 : 0));
+   if(face) {rt_set_int(vm,face,"fontHandle",(int32_t)handle);rt_set_int(vm,face,"weight",weight);}
+   RETL(face);
 }
 
 static bool typeface_getStyle(struct dvm *vm, dvm_ref self,
@@ -8251,6 +8893,7 @@ static bool typeface_getStyle(struct dvm *vm, dvm_ref self,
    (void)args; (void)nargs;
    const int32_t st = rt_get_int(vm, self, "style");
    const char *n = builtin_name();
+   if (!strcmp(n, "getWeight")) RETI(rt_get_int(vm,self,"weight"));
    if (!strcmp(n, "isBold")) RETI((st & 1) != 0);
    if (!strcmp(n, "isItalic")) RETI((st & 2) != 0);
    RETI(st);
@@ -8268,8 +8911,10 @@ static const struct rt_method rt_typeface[] = {
       typeface_create),
    SM("create", "(Landroid/graphics/Typeface;I)Landroid/graphics/Typeface;",
       typeface_create),
+   SM("create", "(Landroid/graphics/Typeface;IZ)Landroid/graphics/Typeface;", typeface_weight_style),
    SM("defaultFromStyle", "(I)Landroid/graphics/Typeface;", typeface_create),
    M("getStyle", "()I", typeface_getStyle),
+   M("getWeight", "()I", typeface_getStyle),
    M("isBold", "()Z", typeface_getStyle),
    M("isItalic", "()Z", typeface_getStyle),
    M_END,
@@ -9026,6 +9671,9 @@ struct ui_node {
    int32_t l, r, t, b;
 };
 
+/* Unscoped framework changes conservatively invalidate all measurements.
+ * requestLayout marks just the affected branch instead. */
+static uint64_t g_ui_measure_epoch=1;
 static struct ui_node *g_ui_nodes;
 /* Slots in the per-view layout table (a power of two: it is probed by hash).
  * A Material home screen is several thousand views, and nodes are handed out
@@ -9966,10 +10614,32 @@ static void ui_measure_dispatch(struct dvm *vm, dvm_ref view, struct ui_ms ws,
 
 /* LUNARIA_UI_LAYOUT_TRACE=1: every measure, with the specs it was given, the
  * LayoutParams it read and the size it took. */
+static bool view_measure_reuse(struct dvm *vm,dvm_ref view,int32_t width,int32_t height)
+{
+   union dvm_value epoch={0};
+   if(!ui_int(vm,view,"measuredDimensionSet") || ui_int(vm,view,"layoutRequired") ||
+      ui_int(vm,view,"measureWidthSpec")!=width || ui_int(vm,view,"measureHeightSpec")!=height ||
+      !dvm_get_field(vm,view,"measureEpoch","J",&epoch) || (uint64_t)epoch.j!=g_ui_measure_epoch) return false;
+   struct ui_node *node=ui_node(vm,view);
+   if(!node) return false;
+   node->w=(int32_t)((uint32_t)ui_int(vm,view,"measuredWidth")&0x00ffffffu);
+   node->h=(int32_t)((uint32_t)ui_int(vm,view,"measuredHeight")&0x00ffffffu);
+   return true;
+}
+static void view_measure_remember(struct dvm *vm,dvm_ref view,int32_t width,int32_t height,uint64_t epoch)
+{
+   rt_set_int(vm,view,"measureWidthSpec",width);rt_set_int(vm,view,"measureHeightSpec",height);
+   (void)dvm_set_field(vm,view,"measureEpoch","J",(union dvm_value){.j=(int64_t)epoch});
+}
+
 static void ui_measure(struct dvm *vm, dvm_ref view, struct ui_ms ws,
                        struct ui_ms hs, unsigned depth)
 {
    if (dvm_exception(vm) || depth > 48 || !view) return;
+   int32_t width_spec=(int32_t)((uint32_t)ws.size|((uint32_t)ws.mode<<30));
+   int32_t height_spec=(int32_t)((uint32_t)hs.size|((uint32_t)hs.mode<<30));
+   if(!ui_gone(vm,view) && view_measure_reuse(vm,view,width_spec,height_spec)) return;
+   uint64_t epoch=g_ui_measure_epoch;
    struct dvm_class *klass = dvm_object_class(vm, view);
    struct dvm_method *on_measure = klass
       ? dvm_find_method(vm, klass, "onMeasure", "(II)V") : NULL;
@@ -9991,6 +10661,7 @@ static void ui_measure(struct dvm *vm, dvm_ref view, struct ui_ms ws,
       if (n) {
          union dvm_value sizes[2] = {{ .i = n->w }, { .i = n->h }}, ignored;
          (void)view_set_measured(vm, view, sizes, 2, &ignored);
+         view_measure_remember(vm,view,width_spec,height_spec,epoch);
       }
    }
    static int trace = -1;
@@ -10085,6 +10756,8 @@ static bool view_measure_api(struct dvm *vm, dvm_ref self,
    struct dvm_method *resolve = c ? dvm_find_method(vm, c, "resolveLayoutParams", "()V") : NULL;
    union dvm_value ignored = {0};
    if (resolve && !dvm_call(vm, resolve, self, NULL, 0, &ignored)) return false;
+   if(view_measure_reuse(vm,self,ARG(0).i,ARG(1).i)) RETV();
+   uint64_t epoch=g_ui_measure_epoch;
    union dvm_value flag = {0};
    (void)dvm_set_field(vm, self, "measuredDimensionSet", "Z", flag);
    struct dvm_method *m = c ? dvm_find_method(vm, c, "onMeasure", "(II)V") : NULL;
@@ -10094,6 +10767,7 @@ static bool view_measure_api(struct dvm *vm, dvm_ref self,
       dvm__throw(vm, "java/lang/IllegalStateException", "onMeasure must call setMeasuredDimension");
       return false;
    }
+   view_measure_remember(vm,self,ARG(0).i,ARG(1).i,epoch);
    static int trace = -1;
    if (trace < 0) trace = getenv("LUNARIA_UI_LAYOUT_TRACE") != NULL;
    if (trace) {
@@ -10490,8 +11164,11 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
    const bool disabled = ui_int(vm, view, "disabled") != 0;
    union dvm_value alpha_set = { 0 };
    (void)dvm_get_field(vm, view, "alphaSet", "Z", &alpha_set);
-   const float alpha = alpha_set.i ? ui_float(vm, view, "alpha") : 1.0f;
-   if (disabled || alpha_set.i)
+   union dvm_value transition_set = {0};
+   (void)dvm_get_field(vm, view, "transitionAlphaSet", "Z", &transition_set);
+   const float alpha = (alpha_set.i ? ui_float(vm, view, "alpha") : 1.0f) *
+                       (transition_set.i ? ui_float(vm, view, "transitionAlpha") : 1.0f);
+   if (disabled || alpha_set.i || transition_set.i)
       ui_printf(b2, "opacity:%g;", (double)(alpha * (disabled ? 0.45f : 1.0f)));
    /* An EditText takes a touch to focus it, listener or not. */
    struct dvm_class *touch_class=dvm_object_class(vm,view);
@@ -10536,8 +11213,9 @@ static dvm_ref g_ui_windows[UI_MAX_WINDOWS];
 static int g_ui_nwindows;
 static bool g_ui_dirty;
 static bool g_ui_building;
+static unsigned g_ui_draw_trace_budget;
 static bool g_ui_measure_dirty = true;
-static struct {uint64_t builds,build_ns,draws,draw_ns,publish_ns;} g_ui_render_prof;
+static struct {uint64_t builds,build_ns,draws,draw_ns,publish_ns,layout_ns,scroll_ns,emit_ns;} g_ui_render_prof;
 static uint64_t ui_render_ns(void)
 {
    if(!getenv("LUNARIA_UI_RENDER_PROF")) return 0;
@@ -10807,10 +11485,10 @@ static void ui_dump_tree(struct dvm *vm, dvm_ref view, unsigned depth)
 {
    if (!view || depth > 40) return;
    const struct ui_node *n = ui_node(vm, view);
-   fprintf(stderr, "[tree] %*s%s id=0x%x vis=%d %dx%d @%d,%d\n", (int)(depth * 2), "",
+   fprintf(stderr, "[tree] %*s%s id=0x%x vis=%d %dx%d @%d,%d ref=%u\n", (int)(depth * 2), "",
            ui_class_simple_name(vm, view), (unsigned)ui_int(vm, view, "id"),
            ui_int(vm, view, "visibility"), n ? n->w : -1, n ? n->h : -1,
-           n ? n->x : 0, n ? n->y : 0);
+           n ? n->x : 0, n ? n->y : 0,(unsigned)view);
    dvm_ref kids[UI_MAX_KIDS];
    const uint32_t nk = ui_children(vm, view, kids, UI_MAX_KIDS);
    for (uint32_t i = 0; i < nk; ++i) ui_dump_tree(vm, kids[i], depth + 1);
@@ -10837,6 +11515,15 @@ static bool ui_compute_scroll(struct dvm *vm,dvm_ref view,unsigned depth)
 static void ui_rebuild(struct dvm *vm)
 {
    uint64_t started=ui_render_ns();
+   g_ui_draw_trace_budget=0;
+   const char *trigger=getenv("LUNARIA_VIEW_DRAW_TRIGGER");
+   if(trigger && *trigger) {
+      FILE *request=luna_file_fopen(trigger,"rb");
+      if(request) {
+         fclose(request);
+         if(luna_file_unlink(trigger)==0) g_ui_draw_trace_budget=4096;
+      }
+   }
    g_ui_dirty = false;
    if (!g_ui_nwindows) {
       luna_overlay_set_document(NULL, NULL);
@@ -10858,12 +11545,6 @@ static void ui_rebuild(struct dvm *vm)
    if (!drawable) {
       luna_overlay_set_document(NULL, NULL);
       return;
-   }
-   if (getenv("LUNARIA_UI_TREE")) {
-      static int dumps;
-      if (dumps++ < 100000)
-         for (int i = 0; i < g_ui_nwindows; ++i)
-            ui_dump_tree(vm, ui_window_content(vm, g_ui_windows[i]), 0);
    }
    struct ui_buf b = { 0 }, css = { 0 };
    g_ui_building = true;
@@ -10895,9 +11576,16 @@ static void ui_rebuild(struct dvm *vm)
       dvm_ref content = ui_window_content(vm, g_ui_windows[i]);
       if (!content) continue;
       ui_printf(&b, "<div id=\"win%u\" class=\"root\">", (unsigned)g_ui_windows[i]);
+      uint64_t phase=started ? ui_render_ns() : 0;
       ui_emit_window_box(vm, &css, g_ui_windows[i]);
+      /* Window layout has now measured and positioned this tree.  Dumping
+       * before it reports stale boxes (or zeroes for newly added children). */
+      if (getenv("LUNARIA_UI_TREE")) ui_dump_tree(vm, content, 0);
+      if(started) {uint64_t now=ui_render_ns();g_ui_render_prof.layout_ns+=now-phase;phase=now;}
       if(!ui_compute_scroll(vm,content,0)) ui_report_exception(vm,"computeScroll");
+      if(started) {uint64_t now=ui_render_ns();g_ui_render_prof.scroll_ns+=now-phase;phase=now;}
       ui_emit_view(vm, &b, &css, content, -1, 0);
+      if(started) g_ui_render_prof.emit_ns+=ui_render_ns()-phase;
       if (dvm_exception(vm)) {
          g_ui_building=false;
          free(b.p); free(css.p);
@@ -10925,11 +11613,16 @@ static void ui_rebuild(struct dvm *vm)
    free(css.p);
    if(started) {
       ++g_ui_render_prof.builds;g_ui_render_prof.build_ns+=ui_render_ns()-started;
-      if(g_ui_render_prof.builds==1 || g_ui_render_prof.builds%10==0)
+      if(g_ui_render_prof.builds==1 || g_ui_render_prof.builds%10==0) {
+         fprintf(stderr,"[ui-stage] layout=%.3f scroll=%.3f emit=%.3f ms/build\n",
+            g_ui_render_prof.layout_ns/1e6/g_ui_render_prof.builds,
+            g_ui_render_prof.scroll_ns/1e6/g_ui_render_prof.builds,
+            g_ui_render_prof.emit_ns/1e6/g_ui_render_prof.builds);
          fprintf(stderr,"[ui-render-prof] %llu builds %.3f ms/build; %llu captures %.3f ms/draw %.3f ms/publish\n",
             (unsigned long long)g_ui_render_prof.builds,g_ui_render_prof.build_ns/1e6/g_ui_render_prof.builds,
             (unsigned long long)g_ui_render_prof.draws,g_ui_render_prof.draws ? g_ui_render_prof.draw_ns/1e6/g_ui_render_prof.draws : 0,
             g_ui_render_prof.draws ? g_ui_render_prof.publish_ns/1e6/g_ui_render_prof.draws : 0);
+      }
    }
 }
 
@@ -11005,7 +11698,7 @@ static void ui_dispatch_click(struct dvm *vm, dvm_ref clicked)
    }
    if (ui_is_a(vm, target, "android/widget/CompoundButton")) {
       union dvm_value ignored = { 0 };
-      if (!compound_toggle(vm, target, NULL, 0, &ignored))
+      if (!am_vcall(vm,target,"toggle","()V",NULL,0,&ignored))
          ui_report_exception(vm, "toggle");
    }
    dvm_ref listener = ui_obj(vm, target, "clickListener",
@@ -11053,7 +11746,7 @@ static bool view_perform_click(struct dvm *vm, dvm_ref self,
    (void)args; (void)nargs;
    if (ui_is_a(vm, self, "android/widget/CompoundButton")) {
       union dvm_value ignored = { 0 };
-      if (!compound_toggle(vm, self, NULL, 0, &ignored)) return false;
+      if (!am_vcall(vm,self,"toggle","()V",NULL,0,&ignored)) return false;
    }
    dvm_ref listener = ui_obj(vm, self, "clickListener",
                              "Landroid/view/View$OnClickListener;");
@@ -11082,9 +11775,22 @@ static void ui_invalidate(void)
 
 static void ui_layout_changed(void)
 {
+   ++g_ui_measure_epoch;
    if (g_ui_building) return;
    g_ui_measure_dirty = true;
    ui_invalidate();
+}
+
+static void ui_view_layout_changed(struct dvm *vm,dvm_ref view)
+{
+   /* A child request must invalidate cached ancestor measurements as well;
+    * unchanged sibling branches keep their measured dimensions/state. */
+   for(unsigned depth=0;view && depth<64;++depth) {
+      rt_set_int(vm,view,"layoutRequired",1);
+      view=ui_obj(vm,view,"parent","Landroid/view/ViewParent;");
+   }
+   if(g_ui_building) return;
+   g_ui_measure_dirty=true;ui_invalidate();
 }
 
 static void ui_window_shown(struct dvm *vm, dvm_ref window)

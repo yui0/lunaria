@@ -180,6 +180,19 @@ const char *dex_class_enclosing_type(struct dex_file *d,
 /* Member classes declare EnclosingClass; local/anonymous classes use EnclosingMethod. */
 bool dex_class_is_member(struct dex_file *d, uint32_t class_def_idx);
 
+/* InnerClass.name: true when present, with NULL for an anonymous class. */
+bool dex_class_inner_name(struct dex_file *d, uint32_t class_def_idx,
+                           const char **name);
+
+/* Source-level access flags retained in the InnerClass system annotation. */
+bool dex_class_inner_flags(struct dex_file *d, uint32_t class_def_idx,
+                            uint32_t *flags);
+
+/* MemberClasses system metadata: total count, or -1 for malformed data.
+ * Fill up to max descriptors; NULL/0 queries the count. */
+int dex_class_member_types(struct dex_file *d, uint32_t class_def_idx,
+                            const char **types, int max);
+
 /* Runtime-visible class annotations.  `encoded_off` points at the
  * encoded_annotation (its type_idx, not the preceding visibility byte).
  * AnnotationDefault is kept on the annotation interface itself and is used
@@ -195,6 +208,11 @@ int dex_class_annotations(struct dex_file *d, uint32_t class_def_idx,
 bool dex_field_annotation(struct dex_file *d, uint32_t class_def_idx,
                           const char *field_name, const char *annotation_desc,
                           uint32_t *encoded_off);
+/* Runtime-visible annotations on the named field; same count/capacity
+ * convention as dex_class_annotations. */
+int dex_field_annotations(struct dex_file *d, uint32_t class_def_idx,
+                           const char *field_name, uint32_t *encoded_offs,
+                           const char **types, int max);
 /* A method's annotations, named by its name and signature
  * ("(Ljava/lang/String;I)V").  Same conventions as the class forms. */
 int dex_method_annotations(struct dex_file *d, uint32_t class_def_idx,

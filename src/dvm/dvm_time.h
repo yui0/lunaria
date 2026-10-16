@@ -765,6 +765,30 @@ static const char *const kMonths[] = { "January", "February", "March", "April",
 static const char *const kDays[] = { "Sunday", "Monday", "Tuesday",
    "Wednesday", "Thursday", "Friday", "Saturday" };
 
+static unsigned date_pattern_row(char *locale)
+{
+   for (;;) {
+      size_t lo=0,hi=sizeof date_pattern_locales/sizeof *date_pattern_locales;
+      while (lo<hi) {
+         size_t mid=lo+(hi-lo)/2;int cmp=strcmp(locale,date_pattern_locales[mid].locale);
+         if (!cmp) return date_pattern_locales[mid].row;
+         if (cmp<0) hi=mid;else lo=mid+1;
+      }
+      char *end=strrchr(locale,'_');
+      if (end) *end=0;
+      else if (strcmp(locale,"root")) strcpy(locale,"root");
+      else return 0;
+   }
+}
+static bool date_locale_name(struct dvm *vm,dvm_ref locale,char *name,size_t size)
+{
+   union dvm_value text={0};
+   if (!locale) {dvm__throw(vm,"java/lang/NullPointerException","locale");return false;}
+   if (!loc_toString(vm,locale,NULL,0,&text)) return false;
+   const char *value=dvm_string_utf8(vm,text.l);
+   snprintf(name,size,"%s",value && *value ? value : "root");return true;
+}
+
 static bool sdf_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                      int nargs, union dvm_value *out)
 {
@@ -776,6 +800,7 @@ static bool sdf_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
    dvm_ref calendar=dvm_new_object(vm,dvm_find_class(vm,"java/util/GregorianCalendar"));
    if (!calendar || !cal_initialize(vm,calendar,0,locale.l,false)) return false;
    dvm_set_field(vm,self,"calendar","Ljava/util/Calendar;",(union dvm_value){.l=calendar});
+   dvm_set_field(vm,self,"locale","Ljava/util/Locale;",locale);
    union dvm_value v = ARG(0);
    (void)dvm_set_field(vm, self, "pattern", "Ljava/lang/String;", v);
    RETV();
@@ -857,7 +882,8 @@ static void sdf_field(struct rt_bytes *b, char c, int n, const struct tm *tm,
 /* Renders a broken-down time through a date/time pattern.  java.time formats
  * the same letters as SimpleDateFormat does, so both go through here. */
 static void time_render(struct rt_bytes *b, const char *pat,
-                        const struct tm *tm, int32_t sub_ms, int32_t off_secs)
+                        const struct tm *tm, int32_t sub_ms, int32_t off_secs,
+                        const char *const *symbols,unsigned zero,int era)
 {
    for (const char *p = pat; p && *p;) {
       if (*p == '\'') {           /* quoted literal; '' is one quote */
@@ -871,7 +897,28 @@ static void time_render(struct rt_bytes *b, const char *pat,
       char c = *p;
       int n = 0;
       while (p[n] == c) ++n;
-      sdf_field(b, c, n, tm, sub_ms, off_secs);
+      const char *word=NULL;
+      if ((c=='M' || c=='L') && n>=3) word=symbols[(n>=4 ? 2 : 15)+tm->tm_mon];
+      else if (c=='E') word=symbols[(n>=4 ? 28 : 36)+tm->tm_wday+1];
+      else if (c=='a') word=symbols[44+(tm->tm_hour>=12)];
+      else if (c=='G') word=symbols[era!=0];
+      if (word) bytes_append(b,word,strlen(word));
+      else if (zero=='0' || c=='z' || c=='Z' || c=='X')
+         sdf_field(b,c=='L' ? 'M' : c,n,tm,sub_ms,off_secs);
+      else {
+         unsigned char storage[64];struct rt_bytes field={.p=storage,.cap=sizeof storage};
+         sdf_field(&field,c=='L' ? 'M' : c,n,tm,sub_ms,off_secs);
+         for (size_t k=0;k<field.len;++k) {
+            unsigned ch=field.p[k];
+            if (zero!='0' && ch>='0' && ch<='9' && c!='z' && c!='Z' && c!='X') {
+               unsigned cp=zero+ch-'0';uint16_t units[2];size_t count=1;
+               if (cp>0xffff) {cp-=0x10000;units[0]=(uint16_t)(0xd800+(cp>>10));units[1]=(uint16_t)(0xdc00+(cp&1023));count=2;}
+               else units[0]=(uint16_t)cp;
+               char text[6];size_t length=jcs_utf16_to_wtf8(units,count,text);bytes_append(b,text,length);
+            } else bytes_append(b,field.p+k,1);
+         }
+         if (field.p!=storage) free(field.p);
+      }
       p += n;
    }
 }
@@ -902,7 +949,7 @@ static bool sdf_format(struct dvm *vm, dvm_ref self,
    if (!state || !cal_error(vm,lc_set_millis(state,ms))) return false;
    int32_t ignored;if (!cal_error(vm,lc_get(state,&zone,LC_YEAR,&ignored))) return false;
    const int32_t *fields=state->fields;struct tm tm={0};
-   tm.tm_year=fields[LC_EXTENDED_YEAR]-1900;tm.tm_mon=fields[LC_MONTH];tm.tm_mday=fields[LC_DATE];
+   tm.tm_year=fields[LC_YEAR]-1900;tm.tm_mon=fields[LC_MONTH];tm.tm_mday=fields[LC_DATE];
    tm.tm_yday=fields[LC_DAY_OF_YEAR]-1;tm.tm_wday=fields[LC_DAY_OF_WEEK]-1;
    tm.tm_hour=fields[LC_HOUR_OF_DAY];tm.tm_min=fields[LC_MINUTE];tm.tm_sec=fields[LC_SECOND];
    tm.tm_isdst=fields[LC_DST_OFFSET]!=0;
@@ -914,7 +961,13 @@ static bool sdf_format(struct dvm *vm, dvm_ref self,
 #endif
 
    struct rt_bytes b = { 0 };
-   time_render(&b, pat, &tm, sub, off);
+   union dvm_value locale={0};dvm_get_field(vm,self,"locale","Ljava/util/Locale;",&locale);
+   if (!locale.l && !loc_getDefault(vm,0,NULL,0,&locale)) return false;
+   char symbol_name[256],pattern_name[256];
+   if (!date_locale_name(vm,locale.l,symbol_name,sizeof symbol_name)) return false;
+   snprintf(pattern_name,sizeof pattern_name,"%s",symbol_name);
+   unsigned row=dfs_locale_row(symbol_name),pattern_row=date_pattern_row(pattern_name);
+   time_render(&b,pat,&tm,sub,off,date_symbol_rows[row],date_pattern_rows[pattern_row].zero,fields[LC_ERA]);
    dvm_ref s = dvm_new_string_n(vm, b.p ? (const char *)b.p : "", b.len);
    free(b.p);
    RETL(s);
@@ -1035,13 +1088,61 @@ static bool date_toInstant(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out);
 
+/* DateFormat style factories use generated CLDR data and create independent
+ * mutable SimpleDateFormat/Calendar objects on every call. */
+static bool date_instance(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                           int nargs,union dvm_value *out)
+{
+   (void)self;int style=nargs ? ARG(0).i : 2;
+   if (style<0 || style>3) {dvm__throw(vm,"java/lang/IllegalArgumentException","Invalid date style %d",style);return false;}
+   union dvm_value locale={0};
+   if (nargs>1) locale=ARG(1);
+   else if (!loc_getDefault(vm,0,NULL,0,&locale)) return false;
+   char name[256];if (!date_locale_name(vm,locale.l,name,sizeof name)) return false;
+   unsigned row=date_pattern_row(name);
+   dvm_ref format=dvm_new_object(vm,dvm_find_class(vm,"java/text/SimpleDateFormat"));
+   if (!format) return false;
+   dvm_pin(vm,format);
+   union dvm_value init[]={{.l=dvm_new_string(vm,date_pattern_rows[row].styles[style])},locale};
+   bool good=init[0].l && sdf_init(vm,format,init,2,out);
+   dvm_unpin(vm,format);
+   if (!good) return false;
+   RETL(format);
+}
+static bool am_vcall(struct dvm *, dvm_ref, const char *, const char *,
+                     const union dvm_value *, int, union dvm_value *);
+static bool android_date_instance(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                                   int nargs,union dvm_value *out)
+{
+   (void)self;(void)nargs;
+   if (!ARG(0).l) {dvm__throw(vm,"java/lang/NullPointerException","context");return false;}
+   union dvm_value resources={0},configuration={0},locale={0};
+   if (!am_vcall(vm,ARG(0).l,"getResources","()Landroid/content/res/Resources;",NULL,0,&resources) ||
+       !am_vcall(vm,resources.l,"getConfiguration","()Landroid/content/res/Configuration;",NULL,0,&configuration)) return false;
+   dvm_get_field(vm,configuration.l,"locale","Ljava/util/Locale;",&locale);
+   if (!locale.l && !loc_getDefault(vm,0,NULL,0,&locale)) return false;
+   const char *name=builtin_name();
+   union dvm_value factory[]={{.i=strstr(name,"Medium") ? 2 : strstr(name,"Long") ? 1 : 3},locale};
+   return date_instance(vm,0,factory,2,out);
+}
+static bool sdf_toPattern(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                           int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;return dvm_get_field(vm,self,"pattern","Ljava/lang/String;",out);
+}
+static const struct rt_method rt_android_date_format[]={
+ SM("getDateFormat","(Landroid/content/Context;)Ljava/text/DateFormat;",android_date_instance),
+ SM("getMediumDateFormat","(Landroid/content/Context;)Ljava/text/DateFormat;",android_date_instance),
+ SM("getLongDateFormat","(Landroid/content/Context;)Ljava/text/DateFormat;",android_date_instance),M_END,
+};
+
 static const struct rt_field rt_time_fields[] = {
    { "millis", "J" }, { "zone", "Ljava/lang/String;" }, F_END
 };
 
 static const struct rt_field rt_sdf_fields[] = {
    { "pattern", "Ljava/lang/String;" },
-   { "calendar", "Ljava/util/Calendar;" }, F_END
+   { "calendar", "Ljava/util/Calendar;" }, { "locale", "Ljava/util/Locale;" }, F_END
 };
 
 static const struct rt_method rt_date[] = {
@@ -1072,6 +1173,10 @@ static const struct rt_method rt_timezone[] = {
 };
 
 static const struct rt_method rt_sdf[] = {
+   SM("getDateInstance","()Ljava/text/DateFormat;",date_instance),
+   SM("getDateInstance","(I)Ljava/text/DateFormat;",date_instance),
+   SM("getDateInstance","(ILjava/util/Locale;)Ljava/text/DateFormat;",date_instance),
+   M("toPattern","()Ljava/lang/String;",sdf_toPattern),
    M("<init>", "(Ljava/lang/String;)V", sdf_init),
    M("<init>", "(Ljava/lang/String;Ljava/util/Locale;)V", sdf_init),
    M("applyPattern", "(Ljava/lang/String;)V", sdf_applyPattern),
@@ -1100,14 +1205,13 @@ static const struct rt_method rt_sdf[] = {
  * store wrote a null date into its own state.  Netmarble's Utils takes the same
  * LocalDateTime.format() step.
  *
- * Instant, OffsetDateTime and LocalDateTime all keep the same two values: the
- * epoch millisecond, and the offset (seconds east of UTC) that the wall-clock
- * fields are read at.  An Instant is by definition UTC, so its offset stays 0 —
- * the field only exists because the rendering below is shared.
+ * Temporal values retain seconds, nanoseconds and an offset. LocalDateTime
+ * keeps its wall-clock fields through that offset; arithmetic never scales
+ * the entire supported date range to milliseconds.
  * ------------------------------------------------------------------------ */
 
 static const struct rt_field rt_temporal_fields[] = {
-   { "millis", "J" }, { "offset", "I" }, F_END
+   { "seconds", "J" }, { "nano", "I" }, { "offset", "I" }, F_END
 };
 
 static const struct rt_field rt_zone_offset_fields[] = {
@@ -1118,59 +1222,67 @@ static const struct rt_field rt_dtf_fields[] = {
    { "pattern", "Ljava/lang/String;" }, F_END
 };
 
-static dvm_ref jt_new(struct dvm *vm, const char *desc, int64_t ms, int32_t off)
+static dvm_ref jt_new_parts(struct dvm *vm, const char *desc, int64_t seconds,
+                             int32_t nano, int32_t off)
 {
    struct dvm_class *c = dvm__class_by_desc(vm, desc);
    dvm_ref r = c ? dvm_new_object(vm, c) : 0;
    if (!r) return 0;
-   union dvm_value v = { .j = ms };
-   (void)dvm_set_field(vm, r, "millis", "J", v);
-   v.i = off;
-   (void)dvm_set_field(vm, r, "offset", "I", v);
+   (void)dvm_set_field(vm, r, "seconds", "J", (union dvm_value){.j=seconds});
+   (void)dvm_set_field(vm, r, "nano", "I", (union dvm_value){.i=nano});
+   (void)dvm_set_field(vm, r, "offset", "I", (union dvm_value){.i=off});
    return r;
 }
 
-static int64_t jt_millis(struct dvm *vm, dvm_ref self)
+/* Millisecond sources (Date, the host clock) enter the same precise model. */
+static dvm_ref jt_new(struct dvm *vm, const char *desc, int64_t ms, int32_t off)
 {
-   union dvm_value v = { 0 };
-   (void)dvm_get_field(vm, self, "millis", "J", &v);
+   int64_t seconds = lc_floor(ms, 1000);
+   int32_t nano = (int32_t)(ms % 1000);
+   if (nano < 0) nano += 1000;
+   return jt_new_parts(vm, desc, seconds, nano * 1000000, off);
+}
+
+static int64_t jt_seconds(struct dvm *vm, dvm_ref self)
+{
+   union dvm_value v = {0};
+   (void)dvm_get_field(vm, self, "seconds", "J", &v);
    return v.j;
+}
+
+static int32_t jt_nano(struct dvm *vm, dvm_ref self)
+{
+   union dvm_value v = {0};
+   (void)dvm_get_field(vm, self, "nano", "I", &v);
+   return v.i;
 }
 
 static int32_t jt_offset(struct dvm *vm, dvm_ref self)
 {
-   union dvm_value v = { 0 };
+   union dvm_value v = {0};
    (void)dvm_get_field(vm, self, "offset", "I", &v);
    return v.i;
 }
 
-/* Whole seconds since the epoch, floored — Instant.getEpochSecond()'s contract
- * for a negative instant, which a truncating divide would get wrong. */
-static int64_t jt_epoch_second(int64_t ms)
-{
-   int64_t s = ms / 1000;
-   if (ms < 0 && ms % 1000) --s;
-   return s;
-}
-
-static int32_t jt_nano_of_second(int64_t ms)
-{
-   int32_t sub = (int32_t)(ms % 1000);
-   if (sub < 0) sub += 1000;
-   return sub * 1000000;
-}
-
-/* The temporal's wall-clock fields.  A fixed offset is not a zone name the
- * host's localtime_r knows, so the offset is folded into the instant and the
- * result is broken down as UTC. */
+/* java.time uses the proleptic Gregorian calendar at every year, including
+ * year zero. No host time_t or millisecond range limits enter this path. */
 static void jt_break(struct dvm *vm, dvm_ref self, struct tm *tm,
                      int32_t *sub_ms, int32_t *off_secs)
 {
-   int64_t ms = jt_millis(vm, self);
    int32_t off = jt_offset(vm, self);
-   time_break(ms + (int64_t)off * 1000, "UTC", tm);
-   *sub_ms = (int32_t)(ms % 1000);
-   if (*sub_ms < 0) *sub_ms += 1000;
+   int64_t wall = jt_seconds(vm, self) + off;
+   int64_t day = lc_floor(wall, 86400);
+   int64_t year; unsigned month, date;
+   lc_day_civil(day + LC_EPOCH_JD, true, &year, &month, &date);
+   int32_t tod = (int32_t)(wall - day * 86400);
+   memset(tm, 0, sizeof *tm);
+   tm->tm_year = (int)(year - 1900);
+   tm->tm_mon = (int)month - 1; tm->tm_mday = (int)date;
+   tm->tm_hour = tod / 3600; tm->tm_min = tod / 60 % 60; tm->tm_sec = tod % 60;
+   tm->tm_yday = (int)(day + LC_EPOCH_JD - lc_civil_day(year, 1, 1, true));
+   tm->tm_wday = (int)((day + 4) % 7);
+   if (tm->tm_wday < 0) tm->tm_wday += 7;
+   *sub_ms = jt_nano(vm, self) / 1000000;
    *off_secs = off;
 }
 
@@ -1180,7 +1292,32 @@ static dvm_ref jt_render(struct dvm *vm, dvm_ref temporal, const char *pattern)
    int32_t sub = 0, off = 0;
    jt_break(vm, temporal, &tm, &sub, &off);
    struct rt_bytes b = { 0 };
-   time_render(&b, pattern ? pattern : "", &tm, sub, off);
+   const char *p = pattern ? pattern : "";
+   while (*p) {
+      if (*p == '\'') {
+         ++p;
+         if (*p == '\'') { bytes_append(&b, "'", 1); ++p; continue; }
+         while (*p && *p != '\'') bytes_append(&b, p++, 1);
+         if (*p) ++p;
+         continue;
+      }
+      if (!isalpha((unsigned char)*p)) { bytes_append(&b, p++, 1); continue; }
+      char c = *p; int n = 0;
+      while (p[n] == c) ++n;
+      if (c == 'S') {
+         if (n > 9) { free(b.p); dvm__throw(vm, "java/lang/IllegalArgumentException", "fraction width"); return 0; }
+         char fraction[16]; snprintf(fraction, sizeof fraction, "%09d", jt_nano(vm, temporal));
+         bytes_append(&b, fraction, (size_t)n);
+      } else if (c == 'u' || c == 'y') {
+         int year = tm.tm_year + 1900;
+         if (c == 'y' && year <= 0) year = 1 - year;
+         char text[32];
+         if (n == 2) snprintf(text, sizeof text, "%02d", abs(year) % 100);
+         else snprintf(text, sizeof text, "%s%0*d", year < 0 ? "-" : (n >= 4 && year > 9999 ? "+" : ""), n > 16 ? 16 : n, abs(year));
+         bytes_append(&b, text, strlen(text));
+      } else sdf_field(&b, c, n, &tm, sub, off);
+      p += n;
+   }
    dvm_ref s = dvm_new_string_n(vm, b.p ? (const char *)b.p : "", b.len);
    free(b.p);
    return s;
@@ -1257,9 +1394,19 @@ static bool instant_ofEpochSecond(struct dvm *vm, dvm_ref self,
                                   union dvm_value *out)
 {
    (void)self;
-   int64_t ms = ARG(0).j * 1000;
-   if (nargs > 1) ms += ARG(1).j / 1000000;   /* nanosecond adjustment */
-   RETL(jt_new(vm, "Ljava/time/Instant;", ms, 0));
+   int64_t adjustment = nargs > 1 ? ARG(1).j : 0;
+   int64_t extra = lc_floor(adjustment, 1000000000);
+   if ((extra > 0 && ARG(0).j > INT64_MAX - extra) ||
+       (extra < 0 && ARG(0).j < INT64_MIN - extra)) {
+      dvm__throw(vm, "java/lang/ArithmeticException", "instant seconds overflow"); return false;
+   }
+   int64_t seconds = ARG(0).j + extra;
+   if (seconds < INT64_C(-31557014167219200) || seconds > INT64_C(31556889864403199)) {
+      dvm__throw(vm, "java/time/DateTimeException", "instant out of range"); return false;
+   }
+   int32_t nano = (int32_t)(adjustment % 1000000000);
+   if (nano < 0) nano += 1000000000;
+   RETL(jt_new_parts(vm, "Ljava/time/Instant;", seconds, nano, 0));
 }
 
 static bool jt_toEpochMilli(struct dvm *vm, dvm_ref self,
@@ -1267,7 +1414,18 @@ static bool jt_toEpochMilli(struct dvm *vm, dvm_ref self,
                             union dvm_value *out)
 {
    (void)args; (void)nargs;
-   RETJ(jt_millis(vm, self));
+   int64_t seconds = jt_seconds(vm, self), fraction = jt_nano(vm, self) / 1000000;
+   /* Move a negative fraction into the preceding multiplication's range. */
+   int64_t scaled = seconds < 0 ? seconds + 1 : seconds;
+   if (seconds < 0) fraction -= 1000;
+   if (scaled > INT64_MAX / 1000 || scaled < INT64_MIN / 1000) goto overflow;
+   int64_t value = scaled * 1000;
+   if ((fraction > 0 && value > INT64_MAX - fraction) ||
+       (fraction < 0 && value < INT64_MIN - fraction)) goto overflow;
+   RETJ(value + fraction);
+overflow:
+   dvm__throw(vm, "java/lang/ArithmeticException", "epoch milliseconds overflow");
+   return false;
 }
 
 static bool jt_getEpochSecond(struct dvm *vm, dvm_ref self,
@@ -1275,43 +1433,54 @@ static bool jt_getEpochSecond(struct dvm *vm, dvm_ref self,
                               union dvm_value *out)
 {
    (void)args; (void)nargs;
-   RETJ(jt_epoch_second(jt_millis(vm, self)));
+   RETJ(jt_seconds(vm, self));
 }
 
-/* OffsetDateTime.toEpochSecond() is the same instant; the offset only decides
- * how the fields read, not where the point on the timeline is. */
 static bool jt_getNano(struct dvm *vm, dvm_ref self,
                        const union dvm_value *args, int nargs,
                        union dvm_value *out)
 {
    (void)args; (void)nargs;
-   RETI(jt_nano_of_second(jt_millis(vm, self)));
+   RETI(jt_nano(vm, self));
+}
+
+static bool jt_order(struct dvm *vm, dvm_ref self, dvm_ref other, int *order)
+{
+   if (!other) { dvm__throw(vm, "java/lang/NullPointerException", "other"); return false; }
+   struct dvm_class *c = dvm_object_class(vm, self);
+   bool local = c && !strcmp(c->name, "java/time/LocalDateTime");
+   int64_t a = jt_seconds(vm, self), b = jt_seconds(vm, other);
+   if (local) { a += jt_offset(vm, self); b += jt_offset(vm, other); }
+   int32_t na = jt_nano(vm, self), nb = jt_nano(vm, other);
+   *order = a < b ? -1 : a > b ? 1 : na < nb ? -1 : na > nb ? 1 : 0;
+   return true;
 }
 
 static bool jt_compareTo(struct dvm *vm, dvm_ref self,
                          const union dvm_value *args, int nargs,
                          union dvm_value *out)
 {
-   (void)nargs;
-   int64_t a = jt_millis(vm, self);
-   int64_t b = ARG(0).l ? jt_millis(vm, ARG(0).l) : 0;
-   RETI(a < b ? -1 : a > b ? 1 : 0);
+   (void)nargs; int order;
+   if (!jt_order(vm, self, ARG(0).l, &order)) return false;
+   RETI(order);
 }
 
 static bool jt_isBefore(struct dvm *vm, dvm_ref self,
                         const union dvm_value *args, int nargs,
                         union dvm_value *out)
 {
-   (void)nargs;
-   RETI(jt_millis(vm, self) < (ARG(0).l ? jt_millis(vm, ARG(0).l) : 0));
+   (void)nargs; int order;
+   if (!jt_order(vm, self, ARG(0).l, &order)) return false;
+   RETI(order < 0);
 }
 
 static bool jt_isAfter(struct dvm *vm, dvm_ref self,
                        const union dvm_value *args, int nargs,
                        union dvm_value *out)
 {
-   (void)nargs;
-   RETI(jt_millis(vm, self) > (ARG(0).l ? jt_millis(vm, ARG(0).l) : 0));
+   (void)nargs; int order;
+   if (!jt_order(vm, self, ARG(0).l, &order)) return false;
+   RETI(order > 0);
 }
 
 static dvm_ref zone_offset_new(struct dvm *vm, int32_t seconds)
@@ -1330,6 +1499,9 @@ static bool zoff_ofHours(struct dvm *vm, dvm_ref self,
                          union dvm_value *out)
 {
    (void)self; (void)nargs;
+   if (ARG(0).i < -18 || ARG(0).i > 18) {
+      dvm__throw(vm, "java/time/DateTimeException", "offset hours out of range"); return false;
+   }
    RETL(zone_offset_new(vm, ARG(0).i * 3600));
 }
 
@@ -1338,6 +1510,9 @@ static bool zoff_ofTotalSeconds(struct dvm *vm, dvm_ref self,
                                 union dvm_value *out)
 {
    (void)self; (void)nargs;
+   if (ARG(0).i < -64800 || ARG(0).i > 64800) {
+      dvm__throw(vm, "java/time/DateTimeException", "offset seconds out of range"); return false;
+   }
    RETL(zone_offset_new(vm, ARG(0).i));
 }
 
@@ -1356,18 +1531,35 @@ static bool zoff_getTotalSeconds(struct dvm *vm, dvm_ref self,
    RETI(zone_offset_seconds(vm, self));
 }
 
+static void jt_offset_text(char *buf, size_t cap, int32_t off)
+{
+   if (!off) { snprintf(buf, cap, "Z"); return; }
+   int seconds = abs(off);
+   int n = snprintf(buf, cap, "%c%02d:%02d", off < 0 ? '-' : '+', seconds / 3600, seconds / 60 % 60);
+   if (seconds % 60 && n >= 0 && (size_t)n < cap)
+      snprintf(buf + n, cap - (size_t)n, ":%02d", seconds % 60);
+}
+
 static bool zoff_toString(struct dvm *vm, dvm_ref self,
                           const union dvm_value *args, int nargs,
                           union dvm_value *out)
 {
    (void)args; (void)nargs;
-   int32_t s = zone_offset_seconds(vm, self);
-   if (!s) RETL(dvm_new_string(vm, "Z"));
-   char buf[16];
-   int m = s / 60;
-   snprintf(buf, sizeof buf, "%c%02d:%02d", m < 0 ? '-' : '+',
-            abs(m) / 60, abs(m) % 60);
+   char buf[20];
+   jt_offset_text(buf, sizeof buf, zone_offset_seconds(vm, self));
    RETL(dvm_new_string(vm, buf));
+}
+
+/* Bounds are wall-clock seconds for -999999999-01-01 through
+ * +999999999-12-31. Check before adding the offset to avoid C overflow. */
+static bool jt_local_range(struct dvm *vm, int64_t seconds, int32_t off)
+{
+   int64_t min = (lc_civil_day(-999999999, 1, 1, true) - LC_EPOCH_JD) * 86400;
+   int64_t max = (lc_civil_day(999999999, 12, 31, true) - LC_EPOCH_JD) * 86400 + 86399;
+   if (seconds < min - off || seconds > max - off) {
+      dvm__throw(vm, "java/time/DateTimeException", "local date-time out of range"); return false;
+   }
+   return true;
 }
 
 static bool instant_atOffset(struct dvm *vm, dvm_ref self,
@@ -1375,7 +1567,9 @@ static bool instant_atOffset(struct dvm *vm, dvm_ref self,
                              union dvm_value *out)
 {
    (void)nargs;
-   RETL(jt_new(vm, "Ljava/time/OffsetDateTime;", jt_millis(vm, self),
+   if (!ARG(0).l) { dvm__throw(vm, "java/lang/NullPointerException", "offset"); return false; }
+   if (!jt_local_range(vm, jt_seconds(vm, self), zone_offset_seconds(vm, ARG(0).l))) return false;
+   RETL(jt_new_parts(vm, "Ljava/time/OffsetDateTime;", jt_seconds(vm, self), jt_nano(vm, self),
                zone_offset_seconds(vm, ARG(0).l)));
 }
 
@@ -1384,7 +1578,7 @@ static bool odt_toInstant(struct dvm *vm, dvm_ref self,
                           union dvm_value *out)
 {
    (void)args; (void)nargs;
-   RETL(jt_new(vm, "Ljava/time/Instant;", jt_millis(vm, self), 0));
+   RETL(jt_new_parts(vm, "Ljava/time/Instant;", jt_seconds(vm, self), jt_nano(vm, self), 0));
 }
 
 /* toLocalDateTime() drops the offset from the value's identity but keeps the
@@ -1394,7 +1588,7 @@ static bool odt_toLocalDateTime(struct dvm *vm, dvm_ref self,
                                 union dvm_value *out)
 {
    (void)args; (void)nargs;
-   RETL(jt_new(vm, "Ljava/time/LocalDateTime;", jt_millis(vm, self),
+   RETL(jt_new_parts(vm, "Ljava/time/LocalDateTime;", jt_seconds(vm, self), jt_nano(vm, self),
                jt_offset(vm, self)));
 }
 
@@ -1404,6 +1598,138 @@ static bool odt_getOffset(struct dvm *vm, dvm_ref self,
 {
    (void)args; (void)nargs;
    RETL(zone_offset_new(vm, jt_offset(vm, self)));
+}
+
+static bool ldt_ofEpochSecond(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   if (!ARG(2).l) { dvm__throw(vm, "java/lang/NullPointerException", "offset"); return false; }
+   if (ARG(1).i < 0 || ARG(1).i > 999999999) {
+      dvm__throw(vm, "java/time/DateTimeException", "nano-of-second out of range"); return false;
+   }
+   int32_t off = zone_offset_seconds(vm, ARG(2).l);
+   if (!jt_local_range(vm, ARG(0).j, off)) return false;
+   RETL(jt_new_parts(vm, "Ljava/time/LocalDateTime;", ARG(0).j, ARG(1).i, off));
+}
+
+static bool ldt_toEpochSecond(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)nargs;
+   if (!ARG(0).l) { dvm__throw(vm, "java/lang/NullPointerException", "offset"); return false; }
+   RETJ(jt_seconds(vm, self) + jt_offset(vm, self) - zone_offset_seconds(vm, ARG(0).l));
+}
+
+static bool ldt_toInstant(struct dvm *vm, dvm_ref self,
+                           const union dvm_value *args, int nargs,
+                           union dvm_value *out)
+{
+   union dvm_value seconds = {0};
+   if (!ldt_toEpochSecond(vm, self, args, nargs, &seconds)) return false;
+   RETL(jt_new_parts(vm, "Ljava/time/Instant;", seconds.j, jt_nano(vm, self), 0));
+}
+
+/* Month constants use the shared Enum allocation/identity machinery. */
+#define JT_MONTHS(X) \
+   X(JANUARY) X(FEBRUARY) X(MARCH) X(APRIL) X(MAY) X(JUNE) \
+   X(JULY) X(AUGUST) X(SEPTEMBER) X(OCTOBER) X(NOVEMBER) X(DECEMBER)
+#define JT_MONTH_FIELD(name) { #name, "Ljava/time/Month;" },
+static const struct rt_field rt_month_sfields[] = { JT_MONTHS(JT_MONTH_FIELD) F_END };
+#undef JT_MONTH_FIELD
+#undef JT_MONTHS
+
+static bool month_of(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                       int nargs, union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   int month = ARG(0).i;
+   if (month < 1 || month > 12) {
+      dvm__throw(vm, "java/time/DateTimeException", "month out of range"); return false;
+   }
+   struct dvm_class *c = dvm__class_by_desc(vm, "Ljava/time/Month;");
+   RETL(c && c->sslots ? c->sslots[month - 1].l : 0);
+}
+
+static int month_number(struct dvm *vm, dvm_ref self)
+{
+   union dvm_value ordinal = {0};
+   (void)dvm_get_field(vm, self, "ordinal", "I", &ordinal);
+   return ordinal.i + 1;
+}
+
+static bool month_getValue(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   RETI(month_number(vm, self));
+}
+
+static bool month_shift(struct dvm *vm, dvm_ref self,
+                         const union dvm_value *args, int nargs,
+                         union dvm_value *out)
+{
+   (void)nargs;
+   int shift = (int)(ARG(0).j % 12);
+   if (!strcmp(builtin_name(), "minus")) shift = -shift;
+   int index = (month_number(vm, self) - 1 + shift + 12) % 12;
+   union dvm_value value = {.i = index + 1};
+   return month_of(vm, 0, &value, 1, out);
+}
+
+static bool month_length(struct dvm *vm, dvm_ref self,
+                          const union dvm_value *args, int nargs,
+                          union dvm_value *out)
+{
+   static const int days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+   int month = month_number(vm, self);
+   const char *method = builtin_name();
+   bool leap = !strcmp(method, "maxLength") || (nargs && ARG(0).i);
+   if (!strcmp(method, "minLength")) leap = false;
+   if (!strcmp(method, "firstDayOfYear")) {
+      int day = 1;
+      for (int i = 1; i < month; ++i) day += days[i - 1] + (i == 2 && leap);
+      RETI(day);
+   }
+   RETI(days[month - 1] + (month == 2 && leap));
+}
+
+static bool month_firstQuarter(struct dvm *vm, dvm_ref self,
+                                const union dvm_value *args, int nargs,
+                                union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value value = {.i = (month_number(vm, self) - 1) / 3 * 3 + 1};
+   return month_of(vm, 0, &value, 1, out);
+}
+
+static const struct rt_method rt_month[] = {
+   SM("of", "(I)Ljava/time/Month;", month_of),
+   SM("values", "()[Ljava/time/Month;", builtin_enum_values),
+   SM("valueOf", "(Ljava/lang/String;)Ljava/time/Month;", builtin_enum_values),
+   M("getValue", "()I", month_getValue),
+   M("plus", "(J)Ljava/time/Month;", month_shift),
+   M("minus", "(J)Ljava/time/Month;", month_shift),
+   M("length", "(Z)I", month_length),
+   M("minLength", "()I", month_length),
+   M("maxLength", "()I", month_length),
+   M("firstDayOfYear", "(Z)I", month_length),
+   M("firstMonthOfQuarter", "()Ljava/time/Month;", month_firstQuarter),
+   M_END,
+};
+
+static bool ldt_getMonth(struct dvm *vm, dvm_ref self,
+                          const union dvm_value *args, int nargs,
+                          union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   struct tm tm; int32_t sub, off;
+   jt_break(vm, self, &tm, &sub, &off);
+   union dvm_value value = {.i = tm.tm_mon + 1};
+   return month_of(vm, 0, &value, 1, out);
 }
 
 static bool ldt_now(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -1440,12 +1766,39 @@ JT_FIELD(ldt_getMinute,     tm.tm_min)
 JT_FIELD(ldt_getSecond,     tm.tm_sec)
 #undef JT_FIELD
 
+/* ISO toString retains subsecond precision; LocalTime omits zero seconds,
+ * while Instant always writes seconds and a UTC suffix. */
+static dvm_ref jt_iso_string(struct dvm *vm, dvm_ref self, int kind)
+{
+   struct tm tm; int32_t sub, off;
+   jt_break(vm, self, &tm, &sub, &off);
+   int year = tm.tm_year + 1900, nano = jt_nano(vm, self);
+   char text[128], fraction[16], zone[20] = "";
+   int length = snprintf(text, sizeof text, "%s%04d-%02d-%02dT%02d:%02d",
+      year < 0 ? "-" : year > 9999 ? "+" : "", abs(year),
+      tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
+   if (kind == 0 || tm.tm_sec || nano)
+      length += snprintf(text + length, sizeof text - (size_t)length, ":%02d", tm.tm_sec);
+   if (nano) {
+      int width = nano % 1000000 == 0 ? 3 : nano % 1000 == 0 ? 6 : 9;
+      snprintf(fraction, sizeof fraction, "%09d", nano);
+      text[length++] = '.';
+      memcpy(text + length, fraction, (size_t)width); length += width;
+      text[length] = 0;
+   }
+   if (kind == 0 || kind == 2) {
+      jt_offset_text(zone, sizeof zone, kind == 0 ? 0 : off);
+      length += snprintf(text + length, sizeof text - (size_t)length, "%s", zone);
+   }
+   return dvm_new_string_n(vm, text, (size_t)length);
+}
+
 static bool instant_toString(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
                              union dvm_value *out)
 {
    (void)args; (void)nargs;
-   RETL(jt_render(vm, self, "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"));
+   RETL(jt_iso_string(vm, self, 0));
 }
 
 static bool ldt_toString(struct dvm *vm, dvm_ref self,
@@ -1453,7 +1806,7 @@ static bool ldt_toString(struct dvm *vm, dvm_ref self,
                          union dvm_value *out)
 {
    (void)args; (void)nargs;
-   RETL(jt_render(vm, self, "yyyy-MM-dd'T'HH:mm:ss"));
+   RETL(jt_iso_string(vm, self, 1));
 }
 
 static bool odt_toString(struct dvm *vm, dvm_ref self,
@@ -1461,8 +1814,124 @@ static bool odt_toString(struct dvm *vm, dvm_ref self,
                          union dvm_value *out)
 {
    (void)args; (void)nargs;
-   RETL(jt_render(vm, self, "yyyy-MM-dd'T'HH:mm:ssXXX"));
+   RETL(jt_iso_string(vm, self, 2));
 }
+
+/* LocalDate stores normalized local midnight in the shared temporal fields.
+ * No host timezone or millisecond conversion participates in extraction. */
+static dvm_ref ld_new_day(struct dvm *vm,int64_t day)
+{
+   int64_t min=lc_civil_day(-999999999,1,1,true)-LC_EPOCH_JD;
+   int64_t max=lc_civil_day(999999999,12,31,true)-LC_EPOCH_JD;
+   if (day<min || day>max) {
+      dvm__throw(vm,"java/time/DateTimeException","epoch day out of range");return 0;
+   }
+   return jt_new_parts(vm,"Ljava/time/LocalDate;",day*86400,0,0);
+}
+
+static bool ldt_toLocalDate(struct dvm *vm,dvm_ref self,
+                            const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   dvm_ref date=ld_new_day(vm,lc_floor(jt_seconds(vm,self)+jt_offset(vm,self),86400));
+   if (!date) return false;
+   RETL(date);
+}
+
+static bool ld_ofEpochDay(struct dvm *vm,dvm_ref self,
+                          const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)nargs;
+   dvm_ref date=ld_new_day(vm,ARG(0).j);
+   if (!date) return false;
+   RETL(date);
+}
+
+static bool ld_of(struct dvm *vm,dvm_ref self,
+                  const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)nargs;
+   int year=ARG(0).i,month=ARG(1).i,day=ARG(2).i;
+   if (year < -999999999 || year > 999999999 || month<1 || month>12 || day<1 || day>31) {
+      dvm__throw(vm,"java/time/DateTimeException","invalid local date");return false;
+   }
+   int64_t jd=lc_civil_day(year,(unsigned)month,(unsigned)day,true),y;
+   unsigned m,d;
+   lc_day_civil(jd,true,&y,&m,&d);
+   if (y!=year || m!=(unsigned)month || d!=(unsigned)day) {
+      dvm__throw(vm,"java/time/DateTimeException","invalid day of month");return false;
+   }
+   dvm_ref date=ld_new_day(vm,jd-LC_EPOCH_JD);
+   if (!date) return false;
+   RETL(date);
+}
+
+static bool ld_now(struct dvm *vm,dvm_ref self,
+                   const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)args;(void)nargs;
+   int64_t ms=now_millis();
+   dvm_ref date=ld_new_day(vm,lc_floor(lc_floor(ms,1000)+time_offset(ms,""),86400));
+   if (!date) return false;
+   RETL(date);
+}
+
+static bool ld_toEpochDay(struct dvm *vm,dvm_ref self,
+                          const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;RETJ(jt_seconds(vm,self)/86400);
+}
+
+static bool ld_toString(struct dvm *vm,dvm_ref self,
+                        const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   struct tm tm;int32_t sub,off;
+   jt_break(vm,self,&tm,&sub,&off);
+   int year=tm.tm_year+1900;
+   char text[32];
+   int n=snprintf(text,sizeof text,"%s%04d-%02d-%02d",year<0 ? "-" : year>9999 ? "+" : "",
+                  abs(year),tm.tm_mon+1,tm.tm_mday);
+   RETL(dvm_new_string_n(vm,text,(size_t)n));
+}
+
+static bool ld_equals(struct dvm *vm,dvm_ref self,
+                      const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   struct dvm_class *c=nargs ? dvm_object_class(vm,ARG(0).l) : NULL;
+   RETI(c && !strcmp(c->name,"java/time/LocalDate") && jt_seconds(vm,self)==jt_seconds(vm,ARG(0).l));
+}
+
+static bool ld_hashCode(struct dvm *vm,dvm_ref self,
+                        const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   struct tm tm;int32_t sub,off;
+   jt_break(vm,self,&tm,&sub,&off);
+   uint32_t y=(uint32_t)(tm.tm_year+1900);
+   RETI((int32_t)((y&0xfffff800u)^(y<<11)^((uint32_t)(tm.tm_mon+1)<<6)^(uint32_t)tm.tm_mday));
+}
+
+static const struct rt_method rt_local_date[]={
+   SM("now","()Ljava/time/LocalDate;",ld_now),
+   SM("of","(III)Ljava/time/LocalDate;",ld_of),
+   SM("ofEpochDay","(J)Ljava/time/LocalDate;",ld_ofEpochDay),
+   M("toEpochDay","()J",ld_toEpochDay),
+   M("getYear","()I",ldt_getYear),
+   M("getMonthValue","()I",ldt_getMonthValue),
+   M("getMonth","()Ljava/time/Month;",ldt_getMonth),
+   M("getDayOfMonth","()I",ldt_getDayOfMonth),
+   M("format","(Ljava/time/format/DateTimeFormatter;)Ljava/lang/String;",jt_format),
+   M("compareTo","(Ljava/time/chrono/ChronoLocalDate;)I",jt_compareTo),
+   M("compareTo","(Ljava/lang/Object;)I",jt_compareTo),
+   M("isBefore","(Ljava/time/chrono/ChronoLocalDate;)Z",jt_isBefore),
+   M("isAfter","(Ljava/time/chrono/ChronoLocalDate;)Z",jt_isAfter),
+   M("isEqual","(Ljava/time/chrono/ChronoLocalDate;)Z",ld_equals),
+   M("equals","(Ljava/lang/Object;)Z",ld_equals),
+   M("hashCode","()I",ld_hashCode),
+   M("toString","()Ljava/lang/String;",ld_toString),
+   M_END,
+};
 
 static const struct rt_method rt_instant[] = {
    SM("now", "()Ljava/time/Instant;", instant_now),
@@ -1495,10 +1964,12 @@ static const struct rt_method rt_offset_date_time[] = {
    SM("now", "()Ljava/time/OffsetDateTime;", odt_now),
    M("toInstant", "()Ljava/time/Instant;", odt_toInstant),
    M("toLocalDateTime", "()Ljava/time/LocalDateTime;", odt_toLocalDateTime),
+   M("toLocalDate", "()Ljava/time/LocalDate;", ldt_toLocalDate),
    M("toEpochSecond", "()J", jt_getEpochSecond),
    M("getOffset", "()Ljava/time/ZoneOffset;", odt_getOffset),
    M("getYear", "()I", ldt_getYear),
    M("getMonthValue", "()I", ldt_getMonthValue),
+   M("getMonth", "()Ljava/time/Month;", ldt_getMonth),
    M("getDayOfMonth", "()I", ldt_getDayOfMonth),
    M("getHour", "()I", ldt_getHour),
    M("getMinute", "()I", ldt_getMinute),
@@ -1511,9 +1982,14 @@ static const struct rt_method rt_offset_date_time[] = {
 };
 
 static const struct rt_method rt_local_date_time[] = {
+   M("toLocalDate", "()Ljava/time/LocalDate;", ldt_toLocalDate),
    SM("now", "()Ljava/time/LocalDateTime;", ldt_now),
+   SM("ofEpochSecond", "(JILjava/time/ZoneOffset;)Ljava/time/LocalDateTime;", ldt_ofEpochSecond),
+   M("toEpochSecond", "(Ljava/time/ZoneOffset;)J", ldt_toEpochSecond),
+   M("toInstant", "(Ljava/time/ZoneOffset;)Ljava/time/Instant;", ldt_toInstant),
    M("getYear", "()I", ldt_getYear),
    M("getMonthValue", "()I", ldt_getMonthValue),
+   M("getMonth", "()Ljava/time/Month;", ldt_getMonth),
    M("getDayOfMonth", "()I", ldt_getDayOfMonth),
    M("getHour", "()I", ldt_getHour),
    M("getMinute", "()I", ldt_getMinute),

@@ -174,6 +174,21 @@ const uint8_t *lm_mp4_sample(struct lm_mp4 *m, int t, int i, size_t *len,
 /* Index of the last sync sample at or before `us` — where a seek lands. */
 int lm_mp4_sync_sample_at(const struct lm_mp4 *m, int t, int64_t us);
 
+/* Owned PCM queues shared by Java AudioTrack and the output mixer. */
+struct luna_audio_track;
+struct luna_audio_track *luna_at_create(unsigned rate, unsigned channels, unsigned capacity);
+void luna_at_destroy(void *track);
+void luna_at_play(struct luna_audio_track *track, int playing);
+void luna_at_flush(struct luna_audio_track *track);
+void luna_at_volume(struct luna_audio_track *track, float volume);
+unsigned luna_at_write(struct luna_audio_track *track, const int16_t *pcm, unsigned frames);
+void luna_at_wait_space(struct luna_audio_track *track);
+unsigned luna_at_space(struct luna_audio_track *track);
+uint64_t luna_at_played(struct luna_audio_track *track);
+int luna_at_active(void);
+unsigned luna_at_mix(int32_t *mix, unsigned frames, unsigned rate, unsigned channels);
+void luna_at_advance(unsigned frames, unsigned rate, unsigned channels);
+
 #endif /* LUNARIA_DVM_MEDIA_H */
 
 /* Included by dvm_runtime.c after its object and collection helpers. */

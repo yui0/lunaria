@@ -1664,6 +1664,7 @@ static bool canvas_fill_color(struct dvm *vm,dvm_ref self,const float *rect,
    if (!state) return false;
    int limits[4]; canvas_clip_limits(state, dst, limits);
    int x0=limits[0],y0=limits[1],x1=limits[2],y1=limits[3];
+   bool full_pixels=!rect;
    if (rect && matrix[6]==0 && matrix[7]==0 && matrix[8]!=0) {
       float l=rect[0]-(style ? half_x : 0),r=rect[2]+(style ? half_x : 0);
       float t=rect[1]-(style ? half_y : 0),b=rect[3]+(style ? half_y : 0);
@@ -1678,11 +1679,33 @@ static bool canvas_fill_color(struct dvm *vm,dvm_ref self,const float *rect,
          miny=fminf(miny,py[i]); maxy=fmaxf(maxy,py[i]);
       }
       if (finite) {
+         full_pixels=style==0 && matrix[1]==0 && matrix[3]==0 &&
+            floorf(minx)==minx && floorf(maxx)==maxx &&
+            floorf(miny)==miny && floorf(maxy)==maxy;
          x0=(int)fmaxf(x0,fminf(dst->w,floorf(minx)));
          y0=(int)fmaxf(y0,fminf(dst->h,floorf(miny)));
          x1=(int)fminf(x1,fmaxf(0,ceilf(maxx)));
          y1=(int)fminf(y1,fmaxf(0,ceilf(maxy)));
       }
+   }
+   canvas_prepare_clip(state);
+   if(full_pixels && state->clip_simple) {
+      /* Integer-aligned axis rectangles cover complete pixels even with AA.
+       * Rectangular clip membership depends on pixel centers, so fractional
+       * clips can be resolved once per span rather than once per pixel. */
+      x0=(int)fmaxf(x0,fminf(dst->w,ceilf(state->clip_bounds[0]-.5f)));
+      y0=(int)fmaxf(y0,fminf(dst->h,ceilf(state->clip_bounds[1]-.5f)));
+      x1=(int)fminf(x1,fmaxf(0,ceilf(state->clip_bounds[2]-.5f)));
+      y1=(int)fminf(y1,fmaxf(0,ceilf(state->clip_bounds[3]-.5f)));
+      bool replace=mode==0 || ((mode==1 || mode==3) && (color>>24)==255);
+      uint32_t value=mode==0 ? 0 : color;
+      if(!dst->has_alpha) value|=0xff000000u;
+      for(int y=y0;y<y1;++y) {
+         uint32_t *row=dst->px+(size_t)y*dst->w;
+         if(replace) for(int x=x0;x<x1;++x) row[x]=value;
+         else for(int x=x0;x<x1;++x) row[x]=canvas_blend(color,row[x],mode,255,!dst->has_alpha);
+      }
+      ++dst->gen;RETV();
    }
    for(int y=y0;y<y1;++y) for(int x=x0;x<x1;++x) {
       if (!canvas_clip_contains(state,x+0.5f,y+0.5f)) continue;
@@ -2591,8 +2614,29 @@ static bool vg_draw_child(struct dvm *vm,dvm_ref self,const union dvm_value *arg
       good=am_vcall(vm,canvas,"clipRect","(IIII)Z",clip,4,&ignored);
       visible=ignored.i!=0;
    }
+   bool trace=g_ui_draw_trace_budget!=0;
+   uint32_t before=0;struct rt_bitmap *trace_bitmap=NULL;
+   if(trace) {
+      --g_ui_draw_trace_budget;
+      trace_bitmap=bitmap_of(vm,ui_obj(vm,canvas,"bitmap","Landroid/graphics/Bitmap;"));
+      if(trace_bitmap && trace_bitmap->px && trace_bitmap->w>0 && trace_bitmap->h>0)
+         before=trace_bitmap->px[(size_t)(trace_bitmap->h/2)*trace_bitmap->w+trace_bitmap->w/2];
+      int clip[4]={0};struct canvas_state *state=canvas_state(vm,canvas);
+      if(state && trace_bitmap) canvas_clip_limits(state,trace_bitmap,clip);
+      fprintf(stderr,"[view-draw] begin p=%u %s c=%u %s id=%08x vis=%d box=%d,%d %dx%d visible=%d good=%d clip=%d,%d,%d,%d matrix=%g,%g,%g,%g,%g,%g,%g,%g,%g center=%08x\n",
+         (unsigned)self,ui_class_simple_name(vm,self),(unsigned)child,ui_class_simple_name(vm,child),
+         (unsigned)ui_int(vm,child,"id"),ui_int(vm,child,"visibility"),node ? node->x : 0,node ? node->y : 0,
+         node ? node->w : 0,node ? node->h : 0,visible,good,clip[0],clip[1],clip[2],clip[3],
+         matrix[0],matrix[1],matrix[2],matrix[3],matrix[4],matrix[5],matrix[6],matrix[7],matrix[8],before);
+   }
    union dvm_value argument={.l=canvas};
    if (good && (visible || more)) good=am_vcall(vm,child,"draw","(Landroid/graphics/Canvas;)V",&argument,1,&ignored);
+   if(trace) {
+      uint32_t after=0;
+      if(trace_bitmap && trace_bitmap->px && trace_bitmap->w>0 && trace_bitmap->h>0)
+         after=trace_bitmap->px[(size_t)(trace_bitmap->h/2)*trace_bitmap->w+trace_bitmap->w/2];
+      fprintf(stderr,"[view-draw] end p=%u c=%u good=%d center=%08x -> %08x\n",(unsigned)self,(unsigned)child,good,before,after);
+   }
    /* Restore host Canvas state even if an app drawing callback throws. */
    dvm_ref raised=vm->exception;
    if (raised) {dvm_pin(vm,raised); dvm_clear_exception(vm);}
@@ -2728,33 +2772,38 @@ static bool vector_render_nodes(const struct vector_node *node,int width,int hei
 }
 static bool vector_property(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   (void)nargs;struct dvm_object *object=dvm__obj(vm,self);struct vector_data *vector=object ? object->data : NULL;
+   (void)nargs;struct vector_data *vector=vector_of(vm,self);
    const char *name=builtin_name();
    if(!strcmp(name,"<init>")) {
       if(!vector) {vector=calloc(1,sizeof *vector);if(!vector) {dvm__throw(vm,"java/lang/OutOfMemoryError","Vector");return false;}
-         object->data=vector;object->data_destroy=vector_destroy;vector->alpha=1;vector->width=vector->height=-1;}
+         if (!vector_attach(vm,self,vector)) return false;vector->alpha=1;vector->width=vector->height=-1;}
       return drawable_init(vm,self,NULL,0,out);
    }
-   if(!strcmp(name,"getIntrinsicWidth")) RETI(vector ? vector->width : -1);
-   if(!strcmp(name,"getIntrinsicHeight")) RETI(vector ? vector->height : -1);
+   if(!strcmp(name,"getIntrinsicWidth") || !strcmp(name,"getIntrinsicHeight")) {
+      int value=vector ? (!strcmp(name,"getIntrinsicWidth") ? vector->width : vector->height) : -1;
+      int target=ui_int(vm,self,"vectorDensity");
+      if (vector && value>0 && target>0 && vector->density>0)
+         value=(int)(((int64_t)value*target+vector->density/2)/vector->density);
+      RETI(value);
+   }
    if(!strcmp(name,"getAlpha")) RETI(vector ? (int)(fmaxf(0,fminf(1,vector->alpha))*255) : 255);
    if(!strcmp(name,"setAlpha")) {if(vector) vector->alpha=fmaxf(0,fminf(1,ARG(0).i/255.f));ui_invalidate();RETV();}
    if(!strcmp(name,"isAutoMirrored")) RETI(vector && vector->mirrored);
    if(!strcmp(name,"setAutoMirrored")) {if(vector) vector->mirrored=ARG(0).i!=0;ui_invalidate();RETV();}
    if(!strcmp(name,"setTint")) {
       if(vector) {vector->tint=true;vector->tint_color=ARG(0).u;}
-      (void)dvm_set_field(vm,self,"vectorTint","Landroid/content/res/ColorStateList;",(union dvm_value){0});
+      (void)dvm_set_field(vm,vector_state_ref(vm,self),"vectorTint","Landroid/content/res/ColorStateList;",(union dvm_value){0});
    } else if(!strcmp(name,"setTintList")) {
       if(vector) vector->tint=ARG(0).l!=0;
-      (void)dvm_set_field(vm,self,"vectorTint","Landroid/content/res/ColorStateList;",ARG(0));
+      (void)dvm_set_field(vm,vector_state_ref(vm,self),"vectorTint","Landroid/content/res/ColorStateList;",ARG(0));
    } else if(!strcmp(name,"setTintMode")) {
-      (void)dvm_set_field(vm,self,"vectorTintMode","Landroid/graphics/PorterDuff$Mode;",ARG(0));
+      (void)dvm_set_field(vm,vector_state_ref(vm,self),"vectorTintMode","Landroid/graphics/PorterDuff$Mode;",ARG(0));
    }
    ui_invalidate();RETV();
 }
 static bool vector_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   (void)nargs;struct dvm_object *object=dvm__obj(vm,self);struct vector_data *vector=object ? object->data : NULL;
+   (void)nargs;struct vector_data *vector=vector_of(vm,self);
    if(!vector || !vector->root.children) RETV();
    dvm_ref bounds=ui_obj(vm,self,"bounds","Landroid/graphics/Rect;");if(!bounds) RETV();
    int left=ui_int(vm,bounds,"left"),top=ui_int(vm,bounds,"top");
@@ -2783,8 +2832,8 @@ static bool vector_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
    /* Tint/filter affect the completed vector, rather than each overlapping path. */
    union dvm_value tint_list={0},mode={0},filter={0};
    dvm_get_field(vm,self,"colorFilter","Landroid/graphics/ColorFilter;",&filter);
-   (void)dvm_get_field(vm,self,"vectorTint","Landroid/content/res/ColorStateList;",&tint_list);
-   (void)dvm_get_field(vm,self,"vectorTintMode","Landroid/graphics/PorterDuff$Mode;",&mode);
+   (void)dvm_get_field(vm,vector_state_ref(vm,self),"vectorTint","Landroid/content/res/ColorStateList;",&tint_list);
+   (void)dvm_get_field(vm,vector_state_ref(vm,self),"vectorTintMode","Landroid/graphics/PorterDuff$Mode;",&mode);
    uint32_t tint=vector->tint_color;
    if(tint_list.l) {
       dvm_ref states=ui_obj(vm,self,"stateSet","[I");struct dvm_object *array=states ? dvm__obj(vm,states) : NULL;
@@ -2800,12 +2849,12 @@ static bool vector_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
       if(!tinted || tinted->w!=cache_w || tinted->h!=cache_h || tinted->recycled) {
          shown=bitmap_new(vm,cache_w,cache_h);if(!shown) return false;
          (void)dvm_set_field(vm,self,"vectorTintCache","Landroid/graphics/Bitmap;",(union dvm_value){.l=shown});
-         tinted=bitmap_of(vm,shown);tinted->is_mutable=true;tinted->density=0;vector->cached_tint_gen=0;
+         tinted=bitmap_of(vm,shown);tinted->is_mutable=true;tinted->density=0;rt_set_int(vm,self,"vectorTintGeneration",0);
       }
-      if(vector->cached_tint_gen!=bitmap->gen || vector->cached_tint_color!=tint) {
+      if((unsigned)ui_int(vm,self,"vectorTintGeneration")!=bitmap->gen || (uint32_t)ui_int(vm,self,"vectorTintColor")!=tint) {
          for(size_t i=0;i<(size_t)cache_w*cache_h;++i)
             tinted->px[i]=(tint&0xffffffu)|((((tint>>24)*(bitmap->px[i]>>24)+127)/255)<<24);
-         vector->cached_tint_gen=bitmap->gen;vector->cached_tint_color=tint;++tinted->gen;
+         rt_set_int(vm,self,"vectorTintGeneration",(int32_t)bitmap->gen);++tinted->gen;
          rt_set_int(vm,self,"vectorTintColor",(int32_t)tint);
       }
    }
@@ -2828,7 +2877,75 @@ static bool vector_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
    union dvm_value draw[]={{.l=shown},{.l=transform},{.l=paint}};
    return canvas_draw_bitmap(vm,ARG(0).l,draw,3,out);
 }
+static bool vector_constant_state(struct dvm *vm,dvm_ref self,
+                                   const union dvm_value *args,int nargs,union dvm_value *out)
+{ (void)args;(void)nargs;RETL(vector_state_ref(vm,self)); }
+
+static bool vector_mutate(struct dvm *vm,dvm_ref self,
+                          const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   struct vector_data *source=vector_of(vm,self);
+   if (source && !ui_int(vm,self,"vectorMutated")) {
+      dvm_ref old=vector_state_ref(vm,self);
+      dvm_pin(vm,old);
+      struct vector_data *copy=vector_copy(source);
+      if (!copy) {dvm_unpin(vm,old);dvm__throw(vm,"java/lang/OutOfMemoryError","Vector state copy");return false;}
+      int density=source->density;
+      if (!vector_attach(vm,self,copy)) {dvm_unpin(vm,old);return false;}
+      copy->density=density;
+      const char *names[]={"vectorTint","vectorTintMode"};
+      const char *sigs[]={"Landroid/content/res/ColorStateList;","Landroid/graphics/PorterDuff$Mode;"};
+      for (int i=0;i<2;++i) {
+         union dvm_value value={0};dvm_get_field(vm,old,names[i],sigs[i],&value);
+         dvm_set_field(vm,vector_state_ref(vm,self),names[i],sigs[i],value);
+      }
+      dvm_unpin(vm,old);rt_set_int(vm,self,"vectorMutated",1);
+   }
+   RETL(self);
+}
+
+static bool vector_new_drawable(struct dvm *vm,dvm_ref self,
+                                const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   dvm_ref drawable=dvm_new_object(vm,dvm_find_class(vm,"android/graphics/drawable/VectorDrawable"));
+   if (!drawable) return false;
+   dvm_pin(vm,drawable);
+   bool good=dvm_set_field(vm,drawable,"vectorState","Landroid/graphics/drawable/VectorDrawable$VectorDrawableState;",
+                           (union dvm_value){.l=self});
+   if (good && nargs>0 && ARG(0).l) {
+      union dvm_value metrics={0};
+      good=am_vcall(vm,ARG(0).l,"getDisplayMetrics","()Landroid/util/DisplayMetrics;",NULL,0,&metrics);
+      if (good && metrics.l) rt_set_int(vm,drawable,"vectorDensity",ui_int(vm,metrics.l,"densityDpi"));
+   }
+   if (good) good=drawable_init(vm,drawable,NULL,0,out);
+   dvm_unpin(vm,drawable);
+   if (!good) return false;
+   RETL(drawable);
+}
+/* ConstantState's concrete overloads dispatch to the subclass factory. */
+static bool drawable_state_new(struct dvm *vm,dvm_ref self,
+                               const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   if (nargs>1) return am_vcall(vm,self,"newDrawable","(Landroid/content/res/Resources;)Landroid/graphics/drawable/Drawable;",args,1,out);
+   return am_vcall(vm,self,"newDrawable","()Landroid/graphics/drawable/Drawable;",NULL,0,out);
+}
+static const struct rt_method rt_drawable_constant_state[]={
+ {"newDrawable","()Landroid/graphics/drawable/Drawable;",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
+ M("newDrawable","(Landroid/content/res/Resources;)Landroid/graphics/drawable/Drawable;",drawable_state_new),
+ M("newDrawable","(Landroid/content/res/Resources;Landroid/content/res/Resources$Theme;)Landroid/graphics/drawable/Drawable;",drawable_state_new),
+ M("<init>","()V",nop_void),M("getChangingConfigurations","()I",ret_zero),
+ M("canApplyTheme","()Z",ret_false),M_END};
+static const struct rt_method rt_vector_state[]={
+ M("newDrawable","()Landroid/graphics/drawable/Drawable;",vector_new_drawable),
+ M("newDrawable","(Landroid/content/res/Resources;)Landroid/graphics/drawable/Drawable;",vector_new_drawable),
+ M("newDrawable","(Landroid/content/res/Resources;Landroid/content/res/Resources$Theme;)Landroid/graphics/drawable/Drawable;",vector_new_drawable),M_END};
+static const struct rt_field rt_vector_state_fields[]={
+ {"vectorTint","Landroid/content/res/ColorStateList;"},{"vectorTintMode","Landroid/graphics/PorterDuff$Mode;"},F_END};
+
 static const struct rt_method rt_vector_drawable[]={
+ M("getConstantState","()Landroid/graphics/drawable/Drawable$ConstantState;",vector_constant_state),
+ M("mutate","()Landroid/graphics/drawable/Drawable;",vector_mutate),
  M("<init>","()V",vector_property),M("draw","(Landroid/graphics/Canvas;)V",vector_draw),
  M("getIntrinsicWidth","()I",vector_property),M("getIntrinsicHeight","()I",vector_property),
  M("getAlpha","()I",vector_property),M("setAlpha","(I)V",vector_property),
@@ -2838,8 +2955,8 @@ static const struct rt_method rt_vector_drawable[]={
 static const struct rt_field rt_vector_drawable_fields[]={
  {"vectorCache","Landroid/graphics/Bitmap;"},{"vectorTintCache","Landroid/graphics/Bitmap;"},
  {"vectorPaint","Landroid/graphics/Paint;"},{"vectorMatrix","Landroid/graphics/Matrix;"},
- {"vectorTint","Landroid/content/res/ColorStateList;"},{"vectorTintMode","Landroid/graphics/PorterDuff$Mode;"},
- {"vectorTintColor","I"},F_END};
+ {"vectorState","Landroid/graphics/drawable/VectorDrawable$VectorDrawableState;"},
+ {"vectorMutated","I"},{"vectorDensity","I"},{"vectorTintGeneration","I"},{"vectorTintColor","I"},F_END};
 
 /* ImageView placement follows configureBounds; endpoint rounding is Java's
  * floor(x + .5), including negative center/crop translations. */
@@ -4152,8 +4269,35 @@ static bool gd_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
    uint32_t solid=(uint32_t)rt_get_int(vm,self,"color"),line=(uint32_t)rt_get_int(vm,self,"strokeColor");
    bool layer=shape!=2 && stroke>0 && (gd_alpha(line,alpha)>>24)>0 && (gd_alpha(line,alpha)>>24)<255 && alpha<255;
    uint32_t paint_line=color_filter_pixel(&filter_state,layer ? line : gd_alpha(line,alpha));
+   /* The union of the two central strips lies entirely inside a rounded
+    * rectangle. If a whole device pixel maps inside either strip, all 16
+    * coverage samples have the same solid color; evaluate/blend it once.
+    * Perspective and boundary pixels retain the exact sampling path below. */
+   const bool solid_interior=shape==0 && !colors && stroke<=0 &&
+      inverse[6]==0 && inverse[7]==0 && inverse[8]!=0;
+   float half_x=0,half_y=0;
+   if(solid_interior) {
+      half_x=(fabsf(inverse[0])+fabsf(inverse[1]))/(2*fabsf(inverse[8]));
+      half_y=(fabsf(inverse[3])+fabsf(inverse[4]))/(2*fabsf(inverse[8]));
+   }
+   const float inner_left=box[0]+fmaxf(radii[0],radii[6]);
+   const float inner_right=box[2]-fmaxf(radii[2],radii[4]);
+   const float inner_top=box[1]+fmaxf(radii[1],radii[3]);
+   const float inner_bottom=box[3]-fmaxf(radii[5],radii[7]);
+   const uint32_t paint_solid=color_filter_pixel(&filter_state,gd_alpha(solid,alpha));
    for (int y=top;y<bottom;++y) for (int x=left;x<right;++x) {
       if (!canvas_clip_contains(clip,x+0.5f,y+0.5f)) continue;
+      if(solid_interior) {
+         float lx,ly;mat_map(inverse,x+.5f,y+.5f,&lx,&ly);
+         if(lx-half_x>=box[0] && lx+half_x<=box[2] &&
+            ly-half_y>=box[1] && ly+half_y<=box[3] &&
+            ((lx-half_x>=inner_left && lx+half_x<=inner_right) ||
+             (ly-half_y>=inner_top && ly+half_y<=inner_bottom))) {
+            size_t pixel=(size_t)y*dst->w+x;
+            dst->px[pixel]=canvas_src_over(paint_solid,dst->px[pixel],!dst->has_alpha);
+            continue;
+         }
+      }
       float accum[4]={0};
       for (int sy=0;sy<4;++sy) for (int sx=0;sx<4;++sx) {
          float lx,ly; mat_map(inverse,x+(sx+0.5f)*0.25f,y+(sy+0.5f)*0.25f,&lx,&ly);

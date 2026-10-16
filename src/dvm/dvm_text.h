@@ -2,30 +2,134 @@
  * Implementation section of dvm_runtime.c; shared helpers remain in that
  * translation unit. Keep registration tables in dvm_runtime.c. */
 
+#include <locale.h>
+#include <fenv.h>
+
+static const char *const decsym_interfaces[]={"Ljava/lang/Cloneable;","Ljava/io/Serializable;",NULL};
+
+/* Number formatting uses instance-local symbols, never the host LC_NUMERIC.
+ * The locale groups below cover the numeric conventions implemented here;
+ * unknown locale identifiers inherit the root decimal convention. */
+static const struct rt_field rt_decimal_symbols_fields[] = {
+   {"zeroDigit","C"},{"decimalSeparator","C"},{"groupingSeparator","C"},
+   {"minusSign","C"},{"primaryGroup","I"},{"secondaryGroup","I"},F_END
+};
+static bool decsym_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   union dvm_value locale={0};
+   if(nargs) {
+      locale=args[0];
+      if(!locale.l) {dvm__throw(vm,"java/lang/NullPointerException","locale");return false;}
+   } else if(!loc_getDefault(vm,0,NULL,0,&locale)) return false;
+   const char *language=loc_field_utf8(vm,locale.l,"language");
+   const char *country=loc_field_utf8(vm,locale.l,"country");
+   uint16_t zero='0',decimal='.',group=',';
+   int secondary=3;
+   static const char *const comma_languages[]={"de","da","el","es","id","is","it","nl","pt","ro","tr","vi",NULL};
+   static const char *const space_languages[]={"bg","cs","et","fi","hr","hu","lt","lv","nb","nn","pl","ru","sk","sl","sq","sv","uk",NULL};
+   for(size_t i=0;comma_languages[i];++i) if(!strcmp(language,comma_languages[i])) {decimal=',';group='.';break;}
+   for(size_t i=0;space_languages[i];++i) if(!strcmp(language,space_languages[i])) {decimal=',';group=0x00a0;break;}
+   if(!strcmp(language,"fr")) {decimal=',';group=!strcmp(country,"CA") ? 0x00a0 : 0x202f;}
+   if(!strcmp(language,"de") && (!strcmp(country,"CH") || !strcmp(country,"LI"))) {decimal='.';group=0x2019;}
+   if(!strcmp(language,"ar") && strcmp(country,"DZ") && strcmp(country,"MA") && strcmp(country,"TN") && strcmp(country,"LY")) {
+      zero=0x0660;decimal=0x066b;group=0x066c;
+   }
+   if(!strcmp(language,"fa")) {zero=0x06f0;decimal=0x066b;group=0x066c;}
+   if(!strcmp(language,"bn")) zero=0x09e6;
+   if(!strcmp(language,"mr") || !strcmp(language,"ne")) zero=0x0966;
+   if(!strcmp(language,"as")) zero=0x09e6;
+   if(!strcmp(language,"bn") || !strcmp(language,"as") || !strcmp(language,"hi") ||
+      !strcmp(language,"mr") || !strcmp(language,"ne") ||
+      ((!strcmp(language,"en") || !strcmp(language,"ta") || !strcmp(language,"te") || !strcmp(language,"kn") || !strcmp(language,"ml")) && !strcmp(country,"IN"))) secondary=2;
+   (void)dvm_set_field(vm,self,"zeroDigit","C",(union dvm_value){.i=zero});
+   (void)dvm_set_field(vm,self,"decimalSeparator","C",(union dvm_value){.i=decimal});
+   (void)dvm_set_field(vm,self,"groupingSeparator","C",(union dvm_value){.i=group});
+   (void)dvm_set_field(vm,self,"minusSign","C",(union dvm_value){.i='-'});
+   rt_set_int(vm,self,"primaryGroup",3);rt_set_int(vm,self,"secondaryGroup",secondary);
+   RETV();
+}
+static dvm_ref decsym_copy(struct dvm *vm,dvm_ref source)
+{
+   dvm_ref copy=dvm_new_object(vm,dvm_find_class(vm,"java/text/DecimalFormatSymbols"));
+   if(!copy) return 0;
+   for(const struct rt_field *f=rt_decimal_symbols_fields;f->name;++f) {
+      union dvm_value value={0};
+      (void)dvm_get_field(vm,source,f->name,f->type,&value);
+      (void)dvm_set_field(vm,copy,f->name,f->type,value);
+   }
+   return copy;
+}
+static bool decsym_factory(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;
+   dvm_ref symbols=dvm_new_object(vm,dvm_find_class(vm,"java/text/DecimalFormatSymbols"));
+   if(!symbols) return false;
+   dvm_pin(vm,symbols);union dvm_value ignored={0};
+   bool good=decsym_init(vm,symbols,args,nargs,&ignored);dvm_unpin(vm,symbols);
+   if(!good) return false;
+   RETL(symbols);
+}
+static bool decsym_clone(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;RETL(decsym_copy(vm,self));
+}
+static bool decsym_char(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   const char *name=builtin_name();
+   const char *field=strstr(name,"ZeroDigit") ? "zeroDigit" : strstr(name,"DecimalSeparator") ? "decimalSeparator" :
+      strstr(name,"GroupingSeparator") ? "groupingSeparator" : "minusSign";
+   union dvm_value value={0};
+   if(nargs) {(void)dvm_set_field(vm,self,field,"C",args[0]);RETV();}
+   (void)dvm_get_field(vm,self,field,"C",&value);*out=value;return true;
+}
+static const struct rt_method rt_decimal_symbols[]={
+   M("<init>","()V",decsym_init),M("<init>","(Ljava/util/Locale;)V",decsym_init),
+   SM("getInstance","()Ljava/text/DecimalFormatSymbols;",decsym_factory),
+   SM("getInstance","(Ljava/util/Locale;)Ljava/text/DecimalFormatSymbols;",decsym_factory),
+   M("clone","()Ljava/lang/Object;",decsym_clone),
+   M("getZeroDigit","()C",decsym_char),M("setZeroDigit","(C)V",decsym_char),
+   M("getDecimalSeparator","()C",decsym_char),M("setDecimalSeparator","(C)V",decsym_char),
+   M("getGroupingSeparator","()C",decsym_char),M("setGroupingSeparator","(C)V",decsym_char),
+   M("getMinusSign","()C",decsym_char),M("setMinusSign","(C)V",decsym_char),M_END
+};
+static int decfmt_symbol(struct dvm *vm,dvm_ref self,const char *name,int fallback)
+{
+   union dvm_value symbols={0},value={0};
+   (void)dvm_get_field(vm,self,"symbols","Ljava/text/DecimalFormatSymbols;",&symbols);
+   if(!symbols.l || !dvm_get_field(vm,symbols.l,name,"C",&value)) return fallback;
+   return value.i;
+}
+
 /* java.text.DecimalFormat.  Only the pattern features that change the output
  * are modelled: the fraction-digit range and grouping. */
 static const struct rt_field rt_decimal_format_fields[] = {
    { "pattern", "Ljava/lang/String;" },
-   { "minFrac", "I" }, { "maxFrac", "I" }, { "grouping", "Z" }, F_END
+   { "minFrac", "I" }, { "maxFrac", "I" }, { "minInt", "I" }, { "maxInt", "I" },
+   { "primaryGroup", "I" }, { "secondaryGroup", "I" },
+   { "grouping", "Z" }, { "parseIntegerOnly", "Z" }, { "symbols", "Ljava/text/DecimalFormatSymbols;" }, F_END
 };
 
-static void decfmt_apply(struct dvm *vm, dvm_ref self, const char *pattern)
+static void decfmt_apply(struct dvm *vm,dvm_ref self,const char *pattern)
 {
-   int min = 0, max = 0;
-   bool grouping = false, frac = false;
-   for (const char *p = pattern; p && *p; ++p) {
-      if (*p == ',')            grouping = true;
-      else if (*p == '.')       frac = true;
-      else if (!frac)           continue;
-      else if (*p == '0')     { ++min; ++max; }
-      else if (*p == '#')       ++max;
+   int min=0,max=0,min_integer=0,digits=0,last=-1,previous=-1;
+   bool frac=false,quote=false;
+   for(const char *p=pattern;p && *p;++p) {
+      if(*p=='\'') {quote=!quote;continue;}
+      if(quote) continue;
+      if(*p==';' || *p=='E') break;
+      if(*p=='.') {frac=true;continue;}
+      if(*p==',' && !frac) {previous=last;last=digits;continue;}
+      if(*p=='0' || *p=='#') {
+         if(frac) {++max;if(*p=='0') ++min;}
+         else {++digits;if(*p=='0') ++min_integer;}
+      }
    }
-   union dvm_value v = { .l = dvm_new_string(vm, pattern ? pattern : "") };
-   (void)dvm_set_field(vm, self, "pattern", "Ljava/lang/String;", v);
-   rt_set_int(vm, self, "minFrac", min);
-   rt_set_int(vm, self, "maxFrac", max);
-   v.i = grouping;
-   (void)dvm_set_field(vm, self, "grouping", "Z", v);
+   (void)dvm_set_field(vm,self,"pattern","Ljava/lang/String;",(union dvm_value){.l=dvm_new_string(vm,pattern ? pattern : "")});
+   rt_set_int(vm,self,"minFrac",min);rt_set_int(vm,self,"maxFrac",max);
+   rt_set_int(vm,self,"minInt",min_integer);rt_set_int(vm,self,"maxInt",309);
+   rt_set_int(vm,self,"primaryGroup",last<0 ? 3 : digits-last);
+   rt_set_int(vm,self,"secondaryGroup",previous<0 ? digits-last : last-previous);
+   (void)dvm_set_field(vm,self,"grouping","Z",(union dvm_value){.i=last>=0});
 }
 
 static bool decfmt_init(struct dvm *vm, dvm_ref self,
@@ -37,6 +141,15 @@ static bool decfmt_init(struct dvm *vm, dvm_ref self,
       dvm__throw(vm,"java/lang/NullPointerException","pattern"); return false;
    }
    const char *pattern = nargs ? dvm_string_utf8(vm, ARG(0).l) : "#,##0.###";
+   union dvm_value symbols={0};
+   if(nargs>1) {
+      if(!args[1].l) {dvm__throw(vm,"java/lang/NullPointerException","symbols");return false;}
+      symbols.l=decsym_copy(vm,args[1].l);
+   } else if(!decsym_factory(vm,0,NULL,0,&symbols)) return false;
+   if(!symbols.l) return false;
+   (void)dvm_set_field(vm,self,"symbols","Ljava/text/DecimalFormatSymbols;",symbols);
+   rt_set_int(vm,self,"minInt",1);rt_set_int(vm,self,"maxInt",309);
+   if(!nargs && rt_get_int(vm,symbols.l,"secondaryGroup")==2) pattern="#,##,##0.###";
    decfmt_apply(vm, self, pattern);
    RETV();
 }
@@ -53,81 +166,85 @@ static bool decfmt_applyPattern(struct dvm *vm, dvm_ref self,
    RETV();
 }
 
-static bool decfmt_render(struct dvm *vm, dvm_ref self, double value,
-                          union dvm_value *out)
+static dvm_ref text_from_utf16(struct dvm *vm,const uint16_t *units,size_t length);
+static bool decfmt_ascii(struct dvm *vm,dvm_ref self,const char *ascii,union dvm_value *out)
 {
-   int min = rt_get_int(vm, self, "minFrac");
-   int max = rt_get_int(vm, self, "maxFrac");
-   union dvm_value g = { 0 };
-   bool grouping = dvm_get_field(vm, self, "grouping", "Z", &g) && g.i;
-   if (min < 0) min = 0;
-   if (max < min) max = min;
-   if (max > 15) max = 15;
-
-   char buf[64];
-   snprintf(buf, sizeof buf, "%.*f", max, value);
-   char *dot = strchr(buf, '.');
-   if (dot) {
-      /* '#' fraction digits disappear when they are zero, '0' digits stay. */
-      char *end = buf + strlen(buf);
-      char *keep = dot + 1 + min;
-      while (end > keep && end[-1] == '0') --end;
-      if (end == dot + 1) --end;
-      *end = '\0';
+   uint16_t units[2048];size_t used=0;
+   if(*ascii=='-') {units[used++]=(uint16_t)decfmt_symbol(vm,self,"minusSign",'-');++ascii;}
+   uint16_t zero=(uint16_t)decfmt_symbol(vm,self,"zeroDigit",'0');
+   uint16_t decimal=(uint16_t)decfmt_symbol(vm,self,"decimalSeparator",'.');
+   uint16_t group=(uint16_t)decfmt_symbol(vm,self,"groupingSeparator",',');
+   const char *dot=strchr(ascii,'.');size_t digits=dot ? (size_t)(dot-ascii) : strlen(ascii);
+   int min=rt_get_int(vm,self,"minInt"),max=rt_get_int(vm,self,"maxInt");
+   if(min<0) min=0;if(min>309) min=309;
+   if(max<min) max=min;if(max>309) max=309;
+   if(digits>(size_t)max) {ascii+=digits-(size_t)max;digits=(size_t)max;}
+   size_t padding=(size_t)min>digits ? (size_t)min-digits : 0,total=padding+digits;
+   if(!min && digits==1 && ascii[0]=='0' && dot && dot[1]) total=digits=0;
+   union dvm_value grouping={0};(void)dvm_get_field(vm,self,"grouping","Z",&grouping);
+   int primary=rt_get_int(vm,self,"primaryGroup"),secondary=rt_get_int(vm,self,"secondaryGroup");
+   if(primary<1) primary=3;if(secondary<1) secondary=primary;
+   for(size_t i=0;i<total;++i) {
+      size_t remaining=total-i;
+      if(i && grouping.i && (remaining==(size_t)primary ||
+         (remaining>(size_t)primary && (remaining-(size_t)primary)%(size_t)secondary==0))) units[used++]=group;
+      units[used++]=(uint16_t)(zero+(i<padding ? 0 : ascii[i-padding]-'0'));
    }
-   if (grouping) {
-      char grouped[128], *dst = grouped;
-      const char *src = buf;
-      if (*src == '-') *dst++ = *src++;
-      const char *int_end = src;
-      while (*int_end >= '0' && *int_end <= '9') ++int_end;
-      size_t ndig = (size_t)(int_end - src);
-      for (size_t i = 0; i < ndig; ++i) {
-         if (i && (ndig - i) % 3 == 0) *dst++ = ',';
-         *dst++ = src[i];
-      }
-      snprintf(dst, sizeof grouped - (size_t)(dst - grouped), "%s", int_end);
-      snprintf(buf, sizeof buf, "%s", grouped);
+   if(dot && dot[1]) {
+      units[used++]=decimal;
+      for(const char *p=dot+1;*p;++p) units[used++]=(uint16_t)(zero+*p-'0');
    }
-   RETL(dvm_new_string(vm, buf));
+   dvm_ref text=text_from_utf16(vm,units,used);
+   if(!text) return false;
+   RETL(text);
 }
-
-static bool decfmt_format_d(struct dvm *vm, dvm_ref self,
-                            const union dvm_value *args, int nargs,
-                            union dvm_value *out)
+static bool decfmt_render(struct dvm *vm,dvm_ref self,double value,union dvm_value *out)
 {
-   return decfmt_render(vm, self, ARG(0).d, out);
+   if(isnan(value)) RETL(dvm_new_string(vm,"NaN"));
+   if(isinf(value)) {
+      uint16_t units[2]={(uint16_t)decfmt_symbol(vm,self,"minusSign",'-'),0x221e};
+      RETL(text_from_utf16(vm,units+(value>0),value>0 ? 1 : 2));
+   }
+   int min=rt_get_int(vm,self,"minFrac"),max=rt_get_int(vm,self,"maxFrac");
+   if(min<0) min=0;if(min>340) min=340;
+   if(max<min) max=min;if(max>340) max=340;
+   /* A finite double needs at most309 integer digits. Space for340 fraction
+    * digits avoids the old fixed64-byte output truncation and15-digit cap. */
+   char ascii[768];int rounding=fegetround();
+   if(rounding!=FE_TONEAREST) (void)fesetround(FE_TONEAREST);
+   int length=snprintf(ascii,sizeof ascii,"%.*f",max,value);
+   if(rounding!=-1 && rounding!=FE_TONEAREST) (void)fesetround(rounding);
+   if(length<0 || (size_t)length>=sizeof ascii) {dvm__throw(vm,"java/lang/OutOfMemoryError","formatted double");return false;}
+   const char *host_decimal=localeconv()->decimal_point;
+   if(host_decimal && *host_decimal && strcmp(host_decimal,".")) {
+      char *point=strstr(ascii,host_decimal);
+      if(point) {size_t n=strlen(host_decimal);memmove(point+1,point+n,strlen(point+n)+1);*point='.';}
+   }
+   char *dot=strchr(ascii,'.');
+   if(dot) {
+      char *end=ascii+strlen(ascii),*keep=dot+1+min;
+      while(end>keep && end[-1]=='0') --end;
+      if(end==dot+1) --end;
+      *end=0;
+   }
+   return decfmt_ascii(vm,self,ascii,out);
 }
-
-static bool decfmt_format_j(struct dvm *vm, dvm_ref self,
-                            const union dvm_value *args, int nargs,
-                            union dvm_value *out)
+static bool decfmt_format_d(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   return decfmt_render(vm,self,ARG(0).d,out);
+}
+static bool decfmt_format_j(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
    (void)nargs;
-   /* Converting to double loses integer digits above 2^53. Produce decimal
-    * digits directly, including INT64_MIN without signed negation overflow. */
    int64_t value=ARG(0).j;
    uint64_t magnitude=value<0 ? UINT64_C(0)-(uint64_t)value : (uint64_t)value;
-   char digits[20]; size_t count=0;
-   do { digits[count++]=(char)('0'+magnitude%10); magnitude/=10; } while (magnitude);
-   int min=rt_get_int(vm,self,"minFrac"); if (min<0) min=0;
-   union dvm_value grouping={0};
-   (void)dvm_get_field(vm,self,"grouping","Z",&grouping);
-   size_t capacity=count+(grouping.i ? (count-1)/3 : 0)+(value<0)+
-                   (min ? (size_t)min+1 : 0)+1;
-   char *text=malloc(capacity);
-   if (!text) { dvm__throw(vm,"java/lang/OutOfMemoryError","formatted integer"); return false; }
-   char *next=text;
-   if (value<0) *next++='-';
-   for (size_t i=count;i>0;--i) {
-      *next++=digits[i-1];
-      if (grouping.i && i>1 && (i-1)%3==0) *next++=',';
-   }
-   if (min) { *next++='.'; memset(next,'0',(size_t)min); next+=min; }
-   *next=0;
-   dvm_ref result=dvm_new_string_n(vm,text,(size_t)(next-text)); free(text);
-   if (!result) return false;
-   RETL(result);
+   char digits[20],ascii[384];size_t count=0,used=0;
+   do {digits[count++]=(char)('0'+magnitude%10);magnitude/=10;} while(magnitude);
+   if(value<0) ascii[used++]='-';
+   while(count) ascii[used++]=digits[--count];
+   int min=rt_get_int(vm,self,"minFrac");if(min<0) min=0;if(min>340) min=340;
+   if(min) {ascii[used++]='.';memset(ascii+used,'0',(size_t)min);used+=(size_t)min;}
+   ascii[used]=0;return decfmt_ascii(vm,self,ascii,out);
 }
 
 static bool decfmt_set_max_frac(struct dvm *vm, dvm_ref self,
@@ -287,9 +404,30 @@ static bool numfmt_format_object(struct dvm *vm,dvm_ref self,const union dvm_val
    union dvm_value arguments[3]={number,args[1],args[2]};
    return format && dvm_call(vm,format,self,arguments,3,out);
 }
+/* Each factory result owns its symbols and digit settings. */
+static bool numfmt_factory(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;
+   union dvm_value symbols={0};
+   if(!decsym_factory(vm,0,args,nargs,&symbols)) return false;
+   dvm_pin(vm,symbols.l);
+   dvm_ref format=dvm_new_object(vm,dvm_find_class(vm,"java/text/DecimalFormat"));
+   if(!format) {dvm_unpin(vm,symbols.l);return false;}
+   dvm_pin(vm,format);
+   bool good=dvm_set_field(vm,format,"symbols","Ljava/text/DecimalFormatSymbols;",symbols);
+   if(good) decfmt_apply(vm,format,rt_get_int(vm,symbols.l,"secondaryGroup")==2 ? "#,##,##0.###" : "#,##0.###");
+   dvm_unpin(vm,format);dvm_unpin(vm,symbols.l);
+   if(!good) return false;
+   RETL(format);
+}
 static const struct rt_method rt_decimal_format[] = {
+   SM("getInstance","()Ljava/text/NumberFormat;",numfmt_factory),
+   SM("getInstance","(Ljava/util/Locale;)Ljava/text/NumberFormat;",numfmt_factory),
+   SM("getNumberInstance","()Ljava/text/NumberFormat;",numfmt_factory),
+   SM("getNumberInstance","(Ljava/util/Locale;)Ljava/text/NumberFormat;",numfmt_factory),
    M("<init>", "()V", decfmt_init),
    M("<init>", "(Ljava/lang/String;)V", decfmt_init),
+   M("<init>", "(Ljava/lang/String;Ljava/text/DecimalFormatSymbols;)V", decfmt_init),
    M("applyPattern", "(Ljava/lang/String;)V", decfmt_applyPattern),
    M("toPattern", "()Ljava/lang/String;", decfmt_toPattern),
    M("format", "(D)Ljava/lang/String;", numfmt_primitive),

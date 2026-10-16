@@ -24,6 +24,7 @@
 
 #include "luna_boot.h"
 #include "luna_overlay.h"
+#include "luna_qfkey.h"
 #include "lunaria_os.h"
 #include "jvm/jvm.h"
 #include <GLFW/glfw3.h>
@@ -38,6 +39,15 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
+#ifndef EGL_PLATFORM_SURFACELESS_MESA
+#define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
+#endif
 
 /* ---- state ------------------------------------------------------------- *
  *
@@ -558,6 +568,8 @@ static EGLDisplay display = EGL_NO_DISPLAY;
 static EGLSurface surface = EGL_NO_SURFACE;
 static EGLContext context = EGL_NO_CONTEXT;
 static int ready, cancelled, choosing;
+static int use_pbuffer;          /* LUNARIA_PBUFFER: no GLFW, stream via qfkey */
+static int fb_w, fb_h;           /* framebuffer size (window or pbuffer) */
 static uint64_t last_frame;
 
 static void pointer_position(GLFWwindow *w, double *x, double *y)
@@ -593,15 +605,82 @@ static void drop(GLFWwindow *w, int count, const char **paths)
         snprintf(dropped, sizeof dropped, "%s", paths[0]);
 }
 
+/* qfkey → luna-ui while the launcher owns the surface (PBUFFER / remote). */
+static void qfkey_host_touch(int action, float x, float y)
+{
+    double dx = (double)x, dy = (double)y;
+    if (action == 0) {
+        luna_mouse_move(dx, dy);
+        luna_mouse_button(GLFW_MOUSE_BUTTON_LEFT, GLFW_PRESS, 0, dx, dy);
+    } else if (action == 1) {
+        luna_mouse_button(GLFW_MOUSE_BUTTON_LEFT, GLFW_RELEASE, 0, dx, dy);
+    } else if (action == 2) {
+        luna_mouse_move(dx, dy);
+    }
+}
+static void qfkey_host_key(int hid, int down)
+{
+    int key = 0;
+    switch (hid) {
+    case 0x29: key = GLFW_KEY_ESCAPE; break;
+    case 0x28: key = GLFW_KEY_ENTER; break;
+    case 0x2a: key = GLFW_KEY_BACKSPACE; break;
+    case 0x2c: key = GLFW_KEY_SPACE; break;
+    case 0x2b: key = GLFW_KEY_TAB; break;
+    default: break;
+    }
+    if (!key) return;
+    int action = down ? GLFW_PRESS : GLFW_RELEASE;
+    if (luna_file_dialog_handle_key(key, 0, action, 0)) return;
+    if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS && pick_select_for < 0)
+        cancelled = 1;
+    luna_key(key, 0, action, 0);
+}
+
+static void launcher_qfkey_title(char *buf, size_t n)
+{
+    const char *inst = getenv("LUNARIA_INSTANCE");
+    if (inst && *inst) snprintf(buf, n, "lunaria-%s", inst);
+    else snprintf(buf, n, "lunaria");
+}
+
+static void launcher_publish_qfkey(int w, int h)
+{
+    char title[96];
+    launcher_qfkey_title(title, sizeof title);
+    luna_qfkey_start(title, w, h);
+    if (!luna_qfkey_wants_frame() || w <= 0 || h <= 0) return;
+    size_t stride = (size_t)w * 4u;
+    size_t bytes = stride * (size_t)h;
+    uint8_t *px = (uint8_t *)malloc(bytes), *row = (uint8_t *)malloc(stride);
+    if (!px || !row) { free(px); free(row); return; }
+    GLint alignment = 4;
+    glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    glPixelStorei(GL_PACK_ALIGNMENT, alignment);
+    for (int y = 0; y < h / 2; ++y) {
+        uint8_t *lo = px + stride * (size_t)y;
+        uint8_t *hi = px + stride * (size_t)(h - 1 - y);
+        memcpy(row, lo, stride); memcpy(lo, hi, stride); memcpy(hi, row, stride);
+    }
+    luna_qfkey_publish(px, w, h, (int)stride, false);
+    free(px); free(row);
+}
+
 static void frame(int force)
 {
     if (!ready) return;
     uint64_t now = luna_os_monotonic_ns();
     if (!force && now - last_frame < UINT64_C(33000000)) return;
-    glfwPollEvents();
-    if (glfwWindowShouldClose(window)) cancelled = 1;
-    int w, h;
-    glfwGetFramebufferSize(window, &w, &h);
+    luna_qfkey_pump_input();
+    if (!use_pbuffer) {
+        glfwPollEvents();
+        if (window && glfwWindowShouldClose(window)) cancelled = 1;
+    }
+    int w = fb_w, h = fb_h;
+    if (!use_pbuffer && window)
+        glfwGetFramebufferSize(window, &w, &h);
     if (w > 0 && h > 0) {
         /* Only when the size changed: a resize re-lays the page out, and a
          * page that is laid out again starts its keyframes over -- the snow
@@ -613,9 +692,10 @@ static void frame(int force)
              * this it keeps its old size while the window (and xdg geometry)
              * has moved on -- the compositor then frames a 1024x576 window
              * around a 960x680 buffer holding a cropped picture. */
-            if (last_w) luna_os_native_window(window);
+            if (!use_pbuffer && last_w && window) luna_os_native_window(window);
             luna_resize((float)w, (float)h);
             last_w = w; last_h = h;
+            fb_w = w; fb_h = h;
         }
         glViewport(0, 0, w, h);
         glClearColor(.95f, .96f, .97f, 1);
@@ -638,6 +718,7 @@ static void frame(int force)
             else if (frames == 200) luna_overlay_screenshot(later);
         }
         eglSwapBuffers(display, surface);
+        launcher_publish_qfkey(w, h);
     }
     last_frame = now;
 }
@@ -653,35 +734,82 @@ static void progress_document(void)
 /* The launcher's window, EGL surface and luna-ui instance.  Shared by the
  * "open an application" screen and the installer, so one window serves the
  * whole run up to the guest taking it over.  Returns 0 when there is no
- * display to open it on. */
+ * display to open it on (unless LUNARIA_PBUFFER uses a headless pbuffer). */
 static int launcher_window_open(int width, int height)
 {
     if (ready) return 1;
-    const char *pbuffer = getenv("LUNARIA_PBUFFER");
-    if (pbuffer && *pbuffer && *pbuffer != '0') return 0;
-    if (!glfwInit()) return 0;
-    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    const char *pb = getenv("LUNARIA_PBUFFER");
+    use_pbuffer = (pb && *pb && *pb != '0');
     if (width <= 0 || height <= 0) {
-        const struct lunaria_screen *screen = lunaria_screen();
-        width = screen->width; height = screen->height;
+        if (use_pbuffer) { width = 960; height = 680; }
+        else {
+            const struct lunaria_screen *screen = lunaria_screen();
+            width = screen->width; height = screen->height;
+        }
     }
-    window = glfwCreateWindow(width, height, "Lunaria — Preparing application", NULL, NULL);
-    if (!window) return 0;
-    display = eglGetDisplay((EGLNativeDisplayType)luna_os_native_display());
+    {
+        const char *ew = getenv("LUNARIA_WIDTH"), *eh = getenv("LUNARIA_HEIGHT");
+        if (use_pbuffer && ew && *ew) width = atoi(ew);
+        if (use_pbuffer && eh && *eh) height = atoi(eh);
+        if (width <= 0) width = 960;
+        if (height <= 0) height = 680;
+    }
+    fb_w = width; fb_h = height;
+    cancelled = 0;
+
     EGLint major, minor, n;
     EGLConfig config;
-    const EGLint config_attrs[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_RED_SIZE, 8,
-        EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_NONE };
     const EGLint context_attrs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
-    if (display == EGL_NO_DISPLAY || !eglInitialize(display, &major, &minor) ||
-        !eglBindAPI(EGL_OPENGL_ES_API) ||
-        !eglChooseConfig(display, config_attrs, &config, 1, &n) || !n) goto fail;
-    surface = eglCreateWindowSurface(display, config,
-        (EGLNativeWindowType)(uintptr_t)luna_os_native_window(window), NULL);
-    context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attrs);
-    if (surface == EGL_NO_SURFACE || context == EGL_NO_CONTEXT ||
-        !eglMakeCurrent(display, surface, surface, context)) goto fail;
+
+    if (use_pbuffer) {
+        fprintf(stderr, "[apk-ui] LUNARIA_PBUFFER=1 — headless launcher %dx%d via qfkey\n",
+                width, height);
+#if !defined(_WIN32) && !defined(__APPLE__)
+        {
+            PFNEGLGETPLATFORMDISPLAYEXTPROC getPlatformDisplay =
+                (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+            if (getPlatformDisplay) {
+                display = getPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA,
+                                             EGL_DEFAULT_DISPLAY, NULL);
+                if (display != EGL_NO_DISPLAY && !eglInitialize(display, &major, &minor))
+                    display = EGL_NO_DISPLAY;
+            }
+        }
+#endif
+        if (display == EGL_NO_DISPLAY) {
+            display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+            if (display == EGL_NO_DISPLAY || !eglInitialize(display, &major, &minor))
+                goto fail;
+        }
+        const EGLint config_attrs[] = { EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_RED_SIZE, 8,
+            EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_NONE };
+        if (!eglBindAPI(EGL_OPENGL_ES_API) ||
+            !eglChooseConfig(display, config_attrs, &config, 1, &n) || !n) goto fail;
+        const EGLint pb_attribs[] = { EGL_WIDTH, width, EGL_HEIGHT, height, EGL_NONE };
+        surface = eglCreatePbufferSurface(display, config, pb_attribs);
+        context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attrs);
+        if (surface == EGL_NO_SURFACE || context == EGL_NO_CONTEXT ||
+            !eglMakeCurrent(display, surface, surface, context)) goto fail;
+    } else {
+        if (!glfwInit()) return 0;
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+        window = glfwCreateWindow(width, height, "Lunaria — Preparing application", NULL, NULL);
+        if (!window) return 0;
+        display = eglGetDisplay((EGLNativeDisplayType)luna_os_native_display());
+        const EGLint config_attrs[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_RED_SIZE, 8,
+            EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_NONE };
+        if (display == EGL_NO_DISPLAY || !eglInitialize(display, &major, &minor) ||
+            !eglBindAPI(EGL_OPENGL_ES_API) ||
+            !eglChooseConfig(display, config_attrs, &config, 1, &n) || !n) goto fail;
+        surface = eglCreateWindowSurface(display, config,
+            (EGLNativeWindowType)(uintptr_t)luna_os_native_window(window), NULL);
+        context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attrs);
+        if (surface == EGL_NO_SURFACE || context == EGL_NO_CONTEXT ||
+            !eglMakeCurrent(display, surface, surface, context)) goto fail;
+    }
+
     luna_overlay_prepare_platform();
     luna_set_gles3(1);
     LunaInitConfig cfg = {.width=width, .height=height, .frameless=1,
@@ -689,12 +817,20 @@ static int launcher_window_open(int width, int height)
     if (!luna_init(&cfg)) goto fail;
     ready = 1;
     g_installing = true;
-    glfwSetCursorPosCallback(window, cursor);
-    glfwSetMouseButtonCallback(window, mouse);
-    glfwSetKeyCallback(window, key);
-    glfwSetCharCallback(window, character);
-    glfwSetScrollCallback(window, scroll);
-    glfwSetDropCallback(window, drop);
+    luna_qfkey_set_host_handlers(qfkey_host_touch, qfkey_host_key);
+    {
+        char title[96];
+        launcher_qfkey_title(title, sizeof title);
+        luna_qfkey_start(title, width, height);
+    }
+    if (!use_pbuffer) {
+        glfwSetCursorPosCallback(window, cursor);
+        glfwSetMouseButtonCallback(window, mouse);
+        glfwSetKeyCallback(window, key);
+        glfwSetCharCallback(window, character);
+        glfwSetScrollCallback(window, scroll);
+        glfwSetDropCallback(window, drop);
+    }
     return 1;
 fail:
     fprintf(stderr, "[apk-ui] cannot initialize launch UI (EGL 0x%x)\n", eglGetError());
@@ -704,19 +840,27 @@ fail:
 
 int luna_launcher_begin(const char *path)
 {
-    if (!launcher_window_open(0, 0)) return 0;
+    const char *pb = getenv("LUNARIA_PBUFFER");
+    int headless = (pb && *pb && *pb != '0');
     const struct lunaria_screen *screen = lunaria_screen();
+    if (!launcher_window_open(headless ? screen->width : 0,
+                              headless ? screen->height : 0))
+        return 0;
     /* Resolve the app size after launcher edits and manifest/config loading.
      * The setup form must not freeze the guest display before these inputs. */
-    int ww, wh;
-    glfwGetWindowSize(window, &ww, &wh);
-    if (ww != screen->width || wh != screen->height)
-        glfwSetWindowSize(window, screen->width, screen->height);
+    if (!use_pbuffer && window) {
+        int ww, wh;
+        glfwGetWindowSize(window, &ww, &wh);
+        if (ww != screen->width || wh != screen->height)
+            glfwSetWindowSize(window, screen->width, screen->height);
+    }
     progress_document();
     luna_launcher_progress("Opening archive", path, 0, 0);
     frame(1);
-    fprintf(stderr, "[apk-ui] window shown before archive extraction (%dx%d)\n",
-            screen->width, screen->height);
+    fprintf(stderr, "[apk-ui] %s shown before archive extraction (%dx%d)\n",
+            use_pbuffer ? "pbuffer" : "window",
+            use_pbuffer ? fb_w : screen->width,
+            use_pbuffer ? fb_h : screen->height);
     return 1;
 }
 
@@ -1059,7 +1203,7 @@ static int launcher_form(char *path, size_t capacity,
     if (!launcher_window_open(960, 680)) return -1;
     if (count > PICK_FIELDS) count = PICK_FIELDS;
     pick_settings = settings; pick_count = count;
-    glfwSetWindowTitle(window, "Lunaria");
+    if (!use_pbuffer && window) glfwSetWindowTitle(window, "Lunaria");
     choosing = 1; pick_chosen = 0; dropped[0] = 0; pick_folder[0] = 0; pick_folder_for = -1; pick_select_for = -1;
 
     /* luna-ui's file dialog is part of the document, hidden until Browse. */
@@ -1205,7 +1349,15 @@ static int launcher_form(char *path, size_t capacity,
                 break;
             }
         }
-        glfwWaitEventsTimeout(.02);
+        if (use_pbuffer) {
+#ifdef _WIN32
+            Sleep(20);
+#else
+            usleep(20000);
+#endif
+        } else {
+            glfwWaitEventsTimeout(.02);
+        }
     }
     choosing = 0;
     if (pick_select_for >= 0) {
@@ -1244,6 +1396,7 @@ int luna_launcher_choose(const char *package, const char *const *profiles,
 void luna_launcher_end(int keep_window)
 {
     g_installing = false;
+    luna_qfkey_set_host_handlers(NULL, NULL);
     if (keep_window && ready) {
         boot_write_begin(&g_jit_seq);
         snprintf(g_jit_line, sizeof g_jit_line, "Starting application");
@@ -1270,6 +1423,7 @@ void luna_launcher_end(int keep_window)
     }
     display=EGL_NO_DISPLAY; context=EGL_NO_CONTEXT; surface=EGL_NO_SURFACE;
     if (!keep_window && window) { glfwDestroyWindow(window); window=NULL; }
+    use_pbuffer = 0;
 }
 void *luna_launcher_take_window(void)
 { GLFWwindow *result=window; window=NULL; return result; }

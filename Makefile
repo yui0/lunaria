@@ -491,11 +491,11 @@ runtime/libOpenSLES.so: src/trace.h
 # IMPORTANT: The user requires ICU-independent number formatting. Do not add
 # ICU compile/link flags or an ICU package dependency to implement DVM APIs.
 DVM_SRC = src/dvm/calendar.c src/dvm/dvm_path.c src/luna_unicode.c src/dvm/dex.c src/dvm/dvm.c src/dvm/dvm_runtime.c src/dvm/dvm_jni.c \
-          src/dvm/dvm_net.c src/dvm/dvm_media.c src/dvm/regex.c src/dvm/charset.c src/dvm/audio_track.c src/dvm/apk_signers.c src/dvm/dvm_sqlite.c \
+          src/dvm/dvm_net.c src/dvm/dvm_media.c src/dvm/regex.c src/dvm/charset.c src/dvm/apk_signers.c src/dvm/dvm_sqlite.c \
           src/webview_cdp.c $(WEBVIEW_CDP_HOST_SRC)
 DVM_HDR = src/dvm/color_blend.h src/luna_overlay.h src/dvm/dvm_path.h src/lunaria_file.h src/jvm/java_type.h src/simplewebp.h src/luna_unicode.h src/unicode/character_data.h src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
           src/dvm/dvm_net.h src/lunaria_os.h src/dvm/dvm_media.h src/dvm/apk_signers.h src/dvm/dvm_sqlite.h \
-          src/dvm/regex.h src/dvm/charset.h src/dvm/locale_names.h src/dvm/audio_track.h src/dvm/date_symbols_data.h src/dvm/framework.h \
+          src/dvm/regex.h src/dvm/charset.h src/dvm/locale_names.h src/dvm/date_symbols_data.h src/dvm/framework.h \
           src/webview_cdp.h
 DVM_HDR += src/unicode/breaks.h src/unicode/break_data.h
 DVM_HDR += src/dvm/calendar.h src/dvm/calendar_data.h
@@ -660,7 +660,7 @@ $(BUILD_DIR)/luna_compositor.o: src/luna_compositor.c src/luna_compositor.h src/
 	    -c src/luna_compositor.c -o $@
 
 $(BUILD_DIR)/luna_boot.o: | $(BUILD_DIR)
-$(BUILD_DIR)/luna_boot.o: src/luna_boot.c src/luna_boot.h src/luna_overlay.h src/lunaria_os.h $(LUNA_UI_DIR)/luna-ui.h
+$(BUILD_DIR)/luna_boot.o: src/luna_boot.c src/luna_boot.h src/luna_overlay.h src/luna_qfkey.h src/lunaria_os.h $(LUNA_UI_DIR)/luna-ui.h
 	$(CC) -std=c11 $(OPTFLAGS) -fPIC $(CPPFLAGS) -I$(LUNA_UI_DIR) -D_GNU_SOURCE \
 	    -Wno-unused-function -Wno-unused-variable -Wno-sign-compare \
 	    -c src/luna_boot.c -o $@
@@ -831,11 +831,11 @@ $(BUILD_DIR)/test_dex_reader: test/dex_reader_test.c src/dvm/dex.c src/dvm/dex.h
 	$(CC) -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Isrc $(DVM_TEST_SAN) \
 	    test/dex_reader_test.c src/dvm/dex.c -o $@
 
-test/test_dvm: test/runtime_shutdown_tests.h test/vector_fixture.h test/dvm_test.c test/dvm_host_fixture.c src/jvm/packages.c $(DVM_SRC) $(DVM_HDR) $(LUNA_OS_OBJ) $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o
+test/test_dvm: test/int_animator_tests.h test/class_initialization_tests.h test/runtime_shutdown_tests.h test/vector_fixture.h test/dvm_test.c test/dvm_host_fixture.c src/jvm/packages.c $(DVM_SRC) $(DVM_HDR) $(LUNA_OS_OBJ) $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_qfkey.o
 	$(CC) -std=c11 -g -O1 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -Isrc \
 	    $(CPPFLAGS) $(HOST_TEST_RPATH) \
 	    $(DVM_TEST_SAN) \
-	    test/dvm_test.c test/dvm_host_fixture.c src/jvm/packages.c $(DVM_SRC:src/dvm/dvm_jni.c=) $(LUNA_OS_OBJ) $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o \
+	    test/dvm_test.c test/dvm_host_fixture.c src/jvm/packages.c $(DVM_SRC:src/dvm/dvm_jni.c=) $(LUNA_OS_OBJ) $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_qfkey.o \
 	    -lm $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_CRYPTO_LIBS) $(HOST_CHARSET_LIBS) $(HOST_Z_LIBS) $(HOST_SYSTEM_DL_LIBS) $(HOST_GL_LIBS) -o $@
 
 .PHONY: runtime-shutdown-test
@@ -2502,3 +2502,7 @@ yield-hint-guest-test: lunaria $(BUILD_DIR)/yield_hint_guest.so
 	    ./lunaria $(BUILD_DIR)/yield_hint_guest.so > $(BUILD_DIR)/yield_hint_guest.log 2>&1 || true
 	@grep 'yield-bench' $(BUILD_DIR)/yield_hint_guest.log
 	@grep -q 'yield-bench.*RESULT PASS' $(BUILD_DIR)/yield_hint_guest.log
+
+.PHONY: resource-packages-test
+resource-packages-test:
+	python3 test/resource_packages_test.py

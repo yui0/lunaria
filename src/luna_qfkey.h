@@ -17,8 +17,15 @@
 extern "C" {
 #endif
 
+/* Host-UI (launcher) input: action 0=down 1=up 2=move; key is USB HID usage
+ * and down is 0/1.  When set, pump_input delivers here instead of the guest. */
+typedef void (*luna_qfkey_touch_fn)(int action, float x, float y);
+typedef void (*luna_qfkey_key_fn)(int hid, int down);
+void luna_qfkey_set_host_handlers(luna_qfkey_touch_fn touch, luna_qfkey_key_fn key);
+
 /* Starts the background connector if LUNARIA_QFKEY (or lunaria.conf qfkey) is
- * not "off".  Safe to call more than once. */
+ * not "off".  Safe to call more than once.  When LUNARIA_INSTANCE is set and
+ * title is empty or "lunaria", the window title becomes "lunaria-<instance>". */
 void luna_qfkey_start(const char *title, int width, int height);
 
 /* True while qfkey wants frames.  Cheap (one atomic load); call before any
@@ -26,7 +33,7 @@ void luna_qfkey_start(const char *title, int width, int height);
 bool luna_qfkey_wants_frame(void);
 
 /* Pump thread, once per frame: delivers input received from qfkey to the
- * emulator's own queues (they are not safe to touch from other threads). */
+ * host handlers (if set) or the emulator's own queues. */
 void luna_qfkey_pump_input(void);
 
 /* Publish a finished frame: top row first, 4 bytes/pixel, stride in bytes. */

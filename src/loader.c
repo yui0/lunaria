@@ -1038,6 +1038,10 @@ pump_java_frame(void)
    thread_dump_request_tick();
    arm_exec_main_choreographer_tick();
    const uint64_t t_media = frame_now_ns();
+   static int profile=-1;
+   static uint64_t sums[5],count,reported;
+   if(profile<0) profile=getenv("LUNARIA_JAVA_FRAME_PROF")!=NULL;
+   uint64_t marks[6]={0};if(profile) marks[0]=frame_now_ns();
    struct dvm *vm = dvm_jni_vm();
    if (vm) {
       /* The main thread's Looper.  A device runs it every turn of the main
@@ -1045,15 +1049,31 @@ pump_java_frame(void)
        * without this it only ran when the guest itself called into Java, which
        * left armed callbacks seconds late (see dvm_main_looper_tick). */
       dvm_main_looper_tick(vm);
+      if(profile) marks[1]=frame_now_ns();
       dvm_media_pump_active(vm);
+      if(profile) marks[2]=frame_now_ns();
       dvm_glsurface_tick(vm);
+      if(profile) marks[3]=frame_now_ns();
       /* Preferences an apply() left pending: on a device the framework writes
        * them behind the caller's back, and this is that writer. */
       dvm_prefs_flush(vm);
+      if(profile) marks[4]=frame_now_ns();
       /* The input method: a game blocked on the text the player is typing
        * calls no Java of its own, so the keystrokes need a way in that does
        * not depend on the guest doing anything. */
       dvm_ime_frame(vm);
+      if(profile) marks[5]=frame_now_ns();
+   }
+   if(profile && vm) {
+      for(int i=0;i<5;++i) sums[i]+=marks[i+1]-marks[i];
+      ++count;
+      if(!reported) reported=marks[5];
+      if(marks[5]-reported>=10000000000ull) {
+         fprintf(stderr,"[java-frame] %llu turns looper=%.3f player=%.3f glview=%.3f prefs=%.3f ime=%.3f ms/turn\n",
+            (unsigned long long)count,sums[0]/1e6/count,sums[1]/1e6/count,
+            sums[2]/1e6/count,sums[3]/1e6/count,sums[4]/1e6/count);
+         memset(sums,0,sizeof sums);count=0;reported=marks[5];
+      }
    }
    frame_stage_add(FRAME_STAGE_MEDIA, t_media);
 }

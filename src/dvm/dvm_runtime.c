@@ -20,7 +20,6 @@
 
 #include "dvm/dvm_internal.h"
 #include "dvm/dvm_media.h"
-#include "dvm/audio_track.h"
 #include "dvm/framework.h"
 #include "lunaria_file.h"
 #include "dvm_path.h"
@@ -127,6 +126,7 @@ static dvm_ref coll_new_map(struct dvm *vm);
  * change tells it so, and the document is rebuilt on the next drain. */
 static void ui_invalidate(void);
 static void ui_layout_changed(void);
+static void ui_view_layout_changed(struct dvm *,dvm_ref);
 static void ui_offset_position(dvm_ref view, int32_t offset, bool vertical);
 /* Defined with the widget accessors, below the View tables that name them. */
 static bool view_set_enabled(struct dvm *vm, dvm_ref self,
@@ -188,9 +188,6 @@ static bool view_cancel_child_touch(struct dvm *vm, dvm_ref self, dvm_ref child)
 /* Every ViewTreeObserver an app hung a global-layout listener on.  A layout
  * pass is what tells an application its window changed shape, and the input
  * method coming up is the one thing in this emulator that changes it. */
-#define RT_MAX_LAYOUT_OBSERVERS 16
-static dvm_ref g_layout_observers[RT_MAX_LAYOUT_OBSERVERS];
-static int g_nlayout_observers;
 static bool g_layout_pass_pending;
 /* A layout pass is running right now, and how many passes the listeners it
  * ran have asked for from inside it.  See view_request_layout(). */
@@ -569,6 +566,7 @@ struct rt_bytes {
 
 static bool bytes_append(struct rt_bytes *b, const void *data, size_t n)
 {
+   if (!n) return true;
    if (n > SIZE_MAX - b->len) return false;
    if (b->len + n > b->cap) {
       size_t cap = b->cap ? b->cap : 256;
@@ -1617,6 +1615,19 @@ static bool s_valueOf_char(struct dvm *vm, dvm_ref self, const union dvm_value *
    (void)self; (void)nargs;
    char buf[4];
    RETL(dvm_new_string_n(vm, buf, utf8_put_unit(buf, ARG(0).u)));
+}
+
+/* The array overloads copy UTF-16 units, just like the String constructors.
+ * Reuse their bounds checks and surrogate-preserving conversion. */
+static bool s_valueOf_chars(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)self;
+   dvm_ref text=dvm_new_object(vm,dvm_find_class(vm,"java/lang/String"));
+   if (!text) return false;
+   if (!s_init(vm,text,args,nargs,out)) return false;
+   RETL(text);
 }
 
 /* ------------------------------------------------------------------------ *
@@ -3547,49 +3558,121 @@ static bool regex_hitEnd(struct dvm *vm, dvm_ref self,
    RETI(0);
 }
 
-/* Expand one replacement template against the current match.  Java's rules:
- * `$n` names a group (greedily, as far as a group that exists), `${name}` a
- * named one, and a backslash quotes the next character. */
-static void regex_expand(struct rt_bytes *b, const struct rx *re,
+/* Android through API 33 uses appendEvaluated: a numeric reference consumes
+ * one digit; a dollar before an ordinary character is discarded. This VM
+ * advertises Android 12. Keep its platform behavior rather than applying the
+ * stricter Java/Android 14 replacement grammar. */
+static bool regex_expand(struct dvm *vm, struct rt_bytes *b, const struct rx *re,
                          const char *input, const int *caps, int ncaps,
-                         const char *repl)
+                         const char *repl, size_t length)
 {
-   for (const char *r = repl; *r; ++r) {
-      if (*r == '\\' && r[1]) { bytes_append(b, ++r, 1); continue; }
-      if (*r == '$' && r[1] == '{') {
-         const char *s = r + 2;
-         const char *e = strchr(s, '}');
-         if (e) {
-            char name[64];
-            size_t n = (size_t)(e - s);
-            if (n < sizeof name) {
-               memcpy(name, s, n); name[n] = '\0';
-               int g = rx_group_index(re, name);
-               if (g >= 0 && 2 * g + 1 < ncaps && caps[2 * g] >= 0)
-                  bytes_append(b, input + caps[2 * g],
-                               (size_t)(caps[2 * g + 1] - caps[2 * g]));
-            }
-            r = e;
-            continue;
+   bool escape=false,dollar=false,named=false;
+   size_t begin=0;
+   for (size_t i=0;i<length;++i) {
+      unsigned char c=(unsigned char)repl[i];
+      int g=-1;
+      if (c=='\\' && !escape) {escape=true;continue;}
+      if (c=='$' && !escape) {dollar=true;continue;}
+      if (c>='0' && c<='9' && dollar && !named) {
+         g=c-'0';
+         if (g>=ncaps/2) {
+            dvm__throw(vm,"java/lang/IndexOutOfBoundsException","No group %d",g);
+            return false;
          }
-      }
-      if (*r == '$' && r[1] >= '0' && r[1] <= '9') {
-         int g = 0;
-         const char *q = r + 1;
-         while (*q >= '0' && *q <= '9') {
-            int cand = g * 10 + (*q - '0');
-            if (2 * cand + 1 >= ncaps) break;
-            g = cand;
-            ++q;
+      } else if (c=='{' && dollar) {named=true;begin=i+1;continue;}
+      else if (c=='}' && dollar && named) {
+         size_t n=i-begin;
+         char *name=malloc(n+1);
+         if (!name) goto oom;
+         memcpy(name,repl+begin,n);name[n]=0;
+         g=rx_group_index(re,name);free(name);
+         if (g<0) {
+            dvm__throw(vm,"java/lang/IllegalArgumentException","Unknown replacement group");return false;
          }
-         r = q - 1;
-         if (2 * g + 1 < ncaps && caps[2 * g] >= 0)
-            bytes_append(b, input + caps[2 * g],
-                         (size_t)(caps[2 * g + 1] - caps[2 * g]));
-         continue;
+         named=false;
+      } else if (c!='}' && dollar && named) continue;
+      else {
+         if (!bytes_append(b,repl+i,1)) goto oom;
+         dollar=escape=named=false;continue;
       }
-      bytes_append(b, r, 1);
+      if (caps[2*g]>=0 && !bytes_append(b,input+caps[2*g],
+            (size_t)(caps[2*g+1]-caps[2*g]))) goto oom;
+      dollar=false;
    }
+   if (escape || dollar || named) {
+      dvm__throw(vm,"java/lang/IllegalArgumentException","Incomplete replacement group or escape");return false;
+   }
+   return true;
+oom:
+   dvm__throw(vm,"java/lang/OutOfMemoryError","regex replacement");
+   return false;
+}
+
+/* Appending does not advance find(): only the append cursor moves. Build the
+ * substitution before touching the destination, so a bad template is atomic. */
+static bool regex_append_replacement(struct dvm *vm,dvm_ref self,
+                                      const union dvm_value *args,int nargs,
+                                      union dvm_value *out)
+{
+   struct rt_regex_matcher *m=matcher_of(vm,self);
+   if (!m || !m->matched) {
+      dvm__throw(vm,"java/lang/IllegalStateException","No match available");return false;
+   }
+   size_t n=0;
+   const char *replacement=nargs>1 ? sdata(vm,ARG(1).l,&n) : NULL;
+   dvm_ref buffer=nargs ? ARG(0).l : 0;
+   if (!buffer || !replacement) {
+      dvm__throw(vm,"java/lang/NullPointerException","replacement or buffer");return false;
+   }
+   size_t start=(size_t)m->caps[0],end=(size_t)m->caps[1];
+   if (start<m->append_pos) {
+      dvm__throw(vm,"java/lang/IndexOutOfBoundsException","append position after match");return false;
+   }
+   struct rt_bytes b={0};
+   if (!regex_expand(vm,&b,m->pattern->re,m->input,m->caps,m->ncaps,replacement,n)) {
+      free(b.p);return false;
+   }
+   struct dvm_object *o=dvm__obj(vm,buffer);
+   size_t prefix=start-m->append_pos,have=o && o->utf8 ? o->utf8_len : 0;
+   if (!o || prefix>UINT32_MAX-have || b.len>UINT32_MAX-have-prefix ||
+       !sb_reserve(vm,o,have+prefix+b.len)) {free(b.p);return false;}
+   if (prefix) sb_append(vm,buffer,m->input+m->append_pos,prefix);
+   if (b.len) sb_append(vm,buffer,(char *)b.p,b.len);
+   free(b.p);
+   if (dvm_exception(vm)) return false;
+   m->append_pos=end;
+   RETL(self);
+}
+
+static bool regex_append_tail(struct dvm *vm,dvm_ref self,
+                              const union dvm_value *args,int nargs,
+                              union dvm_value *out)
+{
+   struct rt_regex_matcher *m=matcher_of(vm,self);
+   dvm_ref buffer=nargs ? ARG(0).l : 0;
+   if (!buffer) {dvm__throw(vm,"java/lang/NullPointerException","buffer");return false;}
+   if (m && m->region_end>m->append_pos)
+      sb_append(vm,buffer,m->input+m->append_pos,m->region_end-m->append_pos);
+   if (dvm_exception(vm)) return false;
+   RETL(buffer);
+}
+
+static bool regex_quote_replacement(struct dvm *vm,dvm_ref self,
+                                    const union dvm_value *args,int nargs,
+                                    union dvm_value *out)
+{
+   (void)self;
+   size_t n=0;const char *text=nargs ? sdata(vm,ARG(0).l,&n) : NULL;
+   if (!text) {dvm__throw(vm,"java/lang/NullPointerException","replacement");return false;}
+   struct rt_bytes b={0};
+   for (size_t i=0;i<n;++i) {
+      if (((text[i]=='$' || text[i]=='\\') && !bytes_append(&b,"\\",1)) ||
+          !bytes_append(&b,text+i,1)) {
+         free(b.p);dvm__throw(vm,"java/lang/OutOfMemoryError","quoteReplacement");return false;
+      }
+   }
+   dvm_ref result=dvm_new_string_n(vm,b.p ? (char *)b.p : "",b.len);
+   free(b.p);RETL(result);
 }
 
 /* Bytes in the UTF-8 character starting at `i`, clamped to the string. */
@@ -3617,7 +3700,9 @@ static dvm_ref regex_replace_text(struct dvm *vm, const struct rx *re,
    while (pos <= len && rx_search(re, input, len, pos, caps, ncaps, false, false)) {
       const size_t ms = (size_t)caps[0], me = (size_t)caps[1];
       bytes_append(&b, input + pos, ms - pos);
-      regex_expand(&b, re, input, caps, ncaps, replacement);
+      if (!regex_expand(vm,&b,re,input,caps,ncaps,replacement,strlen(replacement))) {
+         free(b.p);free(caps);return 0;
+      }
       pos = me;
       if (first_only) break;
       if (me == ms) {
@@ -3642,10 +3727,12 @@ static bool regex_replaceAll(struct dvm *vm, dvm_ref self,
 {
    struct rt_regex_matcher *m = matcher_of(vm, self);
    const char *replacement = nargs ? dvm_string_utf8(vm, ARG(0).l) : NULL;
-   RETL(m && m->pattern
+   dvm_ref result=m && m->pattern
         ? regex_replace_text(vm, m->pattern->re, m->input, m->inlen,
                              replacement, false)
-        : 0);
+        : 0;
+   if (dvm_exception(vm)) return false;
+   RETL(result);
 }
 
 static bool regex_replaceFirst(struct dvm *vm, dvm_ref self,
@@ -3654,10 +3741,12 @@ static bool regex_replaceFirst(struct dvm *vm, dvm_ref self,
 {
    struct rt_regex_matcher *m = matcher_of(vm, self);
    const char *replacement = nargs ? dvm_string_utf8(vm, ARG(0).l) : NULL;
-   RETL(m && m->pattern
+   dvm_ref result=m && m->pattern
         ? regex_replace_text(vm, m->pattern->re, m->input, m->inlen,
                              replacement, true)
-        : 0);
+        : 0;
+   if (dvm_exception(vm)) return false;
+   RETL(result);
 }
 
 static bool regex_quote(struct dvm *vm, dvm_ref self,
@@ -3755,6 +3844,7 @@ static bool s_replaceAll(struct dvm *vm, dvm_ref self,
    dvm_ref result = regex_replace_text(vm, re, s ? s : "", s ? n : 0,
                                        replacement, false);
    rx_cached_release(re);
+   if (dvm_exception(vm)) return false;
    RETL(result);
 }
 
@@ -3771,6 +3861,7 @@ static bool s_replaceFirst(struct dvm *vm, dvm_ref self,
    dvm_ref result = regex_replace_text(vm, re, s ? s : "", s ? n : 0,
                                        replacement, true);
    rx_cached_release(re);
+   if (dvm_exception(vm)) return false;
    RETL(result);
 }
 
@@ -3963,14 +4054,32 @@ static bool cl_getName(struct dvm *vm, dvm_ref self, const union dvm_value *args
 static bool cl_getSimpleName(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                              int nargs, union dvm_value *out)
 {
-   (void)args; (void)nargs;
    struct dvm_object *o = dvm__obj(vm, self);
-   const char *n = (o && o->klass) ? o->klass->name : "Object";
-   const char *primitive = o && o->klass
-      ? luna_java_primitive_name(o->klass->desc) : NULL;
-   if (primitive) n = primitive;
-   const char *slash = strrchr(n, '/');
-   RETL(dvm_new_string(vm, slash ? slash + 1 : n));
+   struct dvm_class *c = o ? o->klass : NULL;
+   if (c && c->is_array) {
+      union dvm_value component = {0};
+      if (!cl_getSimpleName(vm, class_object_for(vm, c->elem), args, nargs, &component)) return false;
+      const char *name = dvm_string_utf8(vm, component.l);
+      if (!name) return false;
+      size_t length = strlen(name);
+      char *array_name = malloc(length + 3);
+      if (!array_name) { dvm__throw(vm, "java/lang/OutOfMemoryError", "array simple name"); return false; }
+      memcpy(array_name, name, length);
+      memcpy(array_name + length, "[]", 3);
+      dvm_ref result = dvm_new_string(vm, array_name);
+      free(array_name);
+      RETL(result);
+   }
+   const char *name = NULL;
+   if (c && c->dex && dex_class_inner_name(c->dex, c->class_def_idx, &name))
+      RETL(dvm_new_string(vm, name ? name : ""));
+   name = c ? luna_java_primitive_name(c->desc) : NULL;
+   if (!name) {
+      name = c ? c->name : "Object";
+      const char *slash = strrchr(name, '/');
+      if (slash) name = slash + 1;
+   }
+   RETL(dvm_new_string(vm, name));
 }
 
 static bool cl_forName(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -6161,6 +6270,8 @@ static int64_t map_find_key(struct dvm *vm, dvm_ref self, dvm_ref key)
    }
 }
 
+static void map_destroy(void *data) { free(data); }
+
 static bool map_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                      int nargs, union dvm_value *out)
 {
@@ -6169,6 +6280,7 @@ static bool map_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
    if (!o) RETV();
    free(o->data);
    o->data = calloc(1, sizeof(struct rt_map) + 8 * sizeof(*((struct rt_map *)0)->e));
+   o->data_destroy = map_destroy;
    if (o->data) ((struct rt_map *)o->data)->cap = 8;
    RETV();
 }
@@ -6544,6 +6656,11 @@ static const struct rt_method rt_regex_pattern[] = {
 };
 
 static const struct rt_method rt_regex_matcher[] = {
+   SM("quoteReplacement", "(Ljava/lang/String;)Ljava/lang/String;", regex_quote_replacement),
+   M("appendReplacement", "(Ljava/lang/StringBuffer;Ljava/lang/String;)Ljava/util/regex/Matcher;", regex_append_replacement),
+   M("appendTail", "(Ljava/lang/StringBuffer;)Ljava/lang/StringBuffer;", regex_append_tail),
+   M("appendReplacement", "(Ljava/lang/StringBuilder;Ljava/lang/String;)Ljava/util/regex/Matcher;", regex_append_replacement),
+   M("appendTail", "(Ljava/lang/StringBuilder;)Ljava/lang/StringBuilder;", regex_append_tail),
    M("matches", "()Z", regex_matches),
    M("lookingAt", "()Z", regex_lookingAt),
    M("find", "()Z", regex_find),
@@ -6744,6 +6861,10 @@ static const struct rt_method rt_string[] = {
    SM("valueOf", "(D)Ljava/lang/String;", s_valueOf_double),
    SM("valueOf", "(Z)Ljava/lang/String;", s_valueOf_bool),
    SM("valueOf", "(C)Ljava/lang/String;", s_valueOf_char),
+   SM("valueOf", "([C)Ljava/lang/String;", s_valueOf_chars),
+   SM("valueOf", "([CII)Ljava/lang/String;", s_valueOf_chars),
+   SM("copyValueOf", "([C)Ljava/lang/String;", s_valueOf_chars),
+   SM("copyValueOf", "([CII)Ljava/lang/String;", s_valueOf_chars),
    M_END,
 };
 
@@ -13294,6 +13415,7 @@ static bool iter_remove(struct dvm *vm, dvm_ref self,
    memmove(&l->items[i], &l->items[i + 1],
            (l->size - i - 1) * sizeof(dvm_ref));
    --l->size;
+   ++l->mod_count;
    idx.i = (int32_t)i;   /* the next element shifted down into this slot */
    (void)dvm_set_field(vm, self, "index", "I", idx);
    ok.i = 0;             /* one remove() per next(), as Java specifies */
@@ -13327,6 +13449,64 @@ static bool list_iterator(struct dvm *vm, dvm_ref self, const union dvm_value *a
    RETL(it);
 }
 
+
+/* Builtin non-concurrent Deques use the same storage as Lists. A descending
+ * iterator keeps a live cursor, never a snapshot; removal leaves lower indexes
+ * unchanged. Structural versions detect mutation even on the same Java thread. */
+static bool deque_descending_iterator(struct dvm *vm,dvm_ref self,
+                                      const union dvm_value *args,int nargs,
+                                      union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   struct rt_list *list=list_of(vm,self);
+   dvm_ref iterator=dvm_new_object(vm,dvm_find_class(vm,"lunaria/util/DescendingItr"));
+   if (!iterator) return false;
+   dvm_set_field(vm,iterator,"target","Ljava/lang/Object;",(union dvm_value){.l=self});
+   rt_set_int(vm,iterator,"index",list ? (int32_t)list->size-1 : -1);
+   rt_set_int(vm,iterator,"last",-1);
+   rt_set_int(vm,iterator,"expected",list ? (int32_t)list->mod_count : 0);
+   RETL(iterator);
+}
+
+static bool deque_descending_op(struct dvm *vm,dvm_ref self,
+                                const union dvm_value *args,int nargs,
+                                union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   union dvm_value target={0};
+   dvm_get_field(vm,self,"target","Ljava/lang/Object;",&target);
+   struct rt_list *list=list_of(vm,target.l);
+   int32_t index=rt_get_int(vm,self,"index"),last=rt_get_int(vm,self,"last");
+   const char *name=builtin_name();
+   if (!strcmp(name,"hasNext")) RETI(index>=0);
+   if (list && list->mod_count!=(uint32_t)rt_get_int(vm,self,"expected")) {
+      dvm__throw(vm,"java/util/ConcurrentModificationException",NULL);return false;
+   }
+   if (!strcmp(name,"next")) {
+      if (!list || index<0 || (uint32_t)index>=list->size) {
+         dvm__throw(vm,"java/util/NoSuchElementException",NULL);return false;
+      }
+      dvm_ref element=list->items[index];
+      rt_set_int(vm,self,"last",index);rt_set_int(vm,self,"index",index-1);
+      RETL(element);
+   }
+   if (last<0 || !list || (uint32_t)last>=list->size) {
+      dvm__throw(vm,"java/lang/IllegalStateException",NULL);return false;
+   }
+   union dvm_value at={.i=last},ignored={0};
+   if (!list_remove(vm,target.l,&at,1,&ignored)) return false;
+   rt_set_int(vm,self,"last",-1);
+   rt_set_int(vm,self,"expected",(int32_t)list_of(vm,target.l)->mod_count);
+   RETV();
+}
+static const struct rt_method rt_descending_iterator[]={
+   M("hasNext","()Z",deque_descending_op),
+   M("next","()Ljava/lang/Object;",deque_descending_op),
+   M("remove","()V",deque_descending_op),M_END,
+};
+static const struct rt_field rt_descending_iterator_fields[]={
+   {"last","I"},{"expected","I"},F_END,
+};
 
 /* ListIterator over a builtin List: a cursor between elements, and the index
  * of the element the last next()/previous() returned (-1 once it has been
@@ -13797,8 +13977,8 @@ static bool map_init_map(struct dvm *vm, dvm_ref self,
                          union dvm_value *out)
 {
    union dvm_value ignored = { 0 };
-   (void)map_init(vm, self, NULL, 0, &ignored);
-   if (ARG(0).l) (void)map_putAll(vm, self, args, nargs, &ignored);
+   if (!map_init(vm, self, NULL, 0, &ignored)) return false;
+   if (!map_putAll(vm, self, args, nargs, &ignored)) return false;
    (void)out;
    RETV();
 }
@@ -14446,23 +14626,33 @@ static const struct rt_method rt_map_set[] = {
 };
 #undef MAP_VIEW_METHODS
 
-/* Map.putAll().  Volley's HurlStack builds its request headers with two
- * putAll() calls; with this unimplemented the call fell out to the stub layer
- * and every header the request declared was dropped on the floor. */
+/* Foreign Maps expose their entries through the public Map contract. */
+static bool map_putAll_entries(struct dvm *vm, dvm_ref self, dvm_ref source);
+
 static bool map_putAll(struct dvm *vm, dvm_ref self,
                        const union dvm_value *args, int nargs,
                        union dvm_value *out)
 {
    (void)nargs; (void)out;
-   struct dvm_object *o = ARG(0).l ? dvm__obj(vm, ARG(0).l) : NULL;
-   struct rt_map *src = o ? o->data : NULL;
-   /* Copy the source out first: put() may grow `self`, and if the two are the
-    * same object that would move the entries out from under this loop. */
+   dvm_ref source = ARG(0).l;
+   if (!source) {
+      dvm__throw(vm, "java/lang/NullPointerException", "null map");
+      return false;
+   }
+   struct dvm_object *o = dvm__obj(vm, source);
+   struct dvm_method *entries = o && o->cls
+      ? dvm_find_method(vm, o->cls, "entrySet", "()Ljava/util/Set;") : NULL;
+   /* Bundle/Intent also use native key/value storage. An overridden entrySet
+    * must still dispatch virtually, even on a native HashMap subclass. */
+   if (!o || o->data_destroy != map_destroy ||
+       (entries && entries->builtin != map_entrySet))
+      return map_putAll_entries(vm, self, source);
+   struct rt_map *src = o->data;
    for (uint32_t i = 0; src && i < src->size; ++i) {
       union dvm_value kv[2] = { { .l = src->e[i].k }, { .l = src->e[i].v } };
       union dvm_value ignored = { 0 };
       if (!map_put(vm, self, kv, 2, &ignored)) return false;
-      o = dvm__obj(vm, ARG(0).l);
+      o = dvm__obj(vm, source);
       src = o ? o->data : NULL;
    }
    RETV();
@@ -15438,11 +15628,17 @@ static dvm_ref coll_new_list(struct dvm *vm, const char *desc)
    return l;
 }
 
+static dvm_ref coll_empty_constant(struct dvm *vm,const char *name,const char *type)
+{
+   union dvm_value value={0};
+   (void)dvm_get_static(vm,dvm__class_by_desc(vm,"Ljava/util/Collections;"),name,type,&value);
+   return value.l;
+}
 static bool coll_emptyList(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                            int nargs, union dvm_value *out)
 {
    (void)self; (void)args; (void)nargs;
-   RETL(coll_new_list(vm, "Ljava/util/ArrayList;"));
+   RETL(coll_empty_constant(vm,"EMPTY_LIST","Ljava/util/List;"));
 }
 
 static bool pm_launch_intent(struct dvm *vm, dvm_ref self,
@@ -15534,7 +15730,7 @@ static bool coll_emptySet(struct dvm *vm, dvm_ref self, const union dvm_value *a
                           int nargs, union dvm_value *out)
 {
    (void)self; (void)args; (void)nargs;
-   RETL(coll_new_list(vm, "Ljava/util/HashSet;"));
+   RETL(coll_empty_constant(vm,"EMPTY_SET","Ljava/util/Set;"));
 }
 
 static bool coll_singletonList(struct dvm *vm, dvm_ref self,
@@ -15618,8 +15814,121 @@ static bool coll_emptyMap(struct dvm *vm, dvm_ref self, const union dvm_value *a
                           int nargs, union dvm_value *out)
 {
    (void)self; (void)args; (void)nargs;
-   RETL(coll_new_map(vm));
+   RETL(coll_empty_constant(vm,"EMPTY_MAP","Ljava/util/Map;"));
 }
+
+/* MPL-2.0. java.util.Collections empty constants have no mutable storage. */
+static bool empty_collection_unsupported(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)args;(void)nargs;(void)out;
+   dvm__throw(vm,"java/lang/UnsupportedOperationException",NULL);return false;
+}
+static bool empty_collection_index(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)nargs;(void)out;
+   dvm__throw(vm,"java/lang/IndexOutOfBoundsException","index %d size 0",args[0].i);return false;
+}
+static bool empty_collection_add_at(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   if(args[0].i!=0) return empty_collection_index(vm,self,args,nargs,out);
+   return empty_collection_unsupported(vm,self,args,nargs,out);
+}
+static bool empty_collection_bulk(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;
+   bool indexed=builtin_sig()[1]=='I';
+   if(indexed && args[0].i!=0) return empty_collection_index(vm,self,args,nargs,out);
+   dvm_ref source=args[indexed ? 1 : 0].l;
+   if(!source) {dvm__throw(vm,"java/lang/NullPointerException","collection");return false;}
+   union dvm_value size={0};
+   if(!list_virtual(vm,source,"size","()I",NULL,0,&size)) return false;
+   if(!strcmp(builtin_name(),"addAll") && size.i)
+      return empty_collection_unsupported(vm,self,args,nargs,out);
+   RETI(!strcmp(builtin_name(),"containsAll") && size.i==0);
+}
+static bool empty_collection_callback(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)nargs;
+   if(!args[0].l) {dvm__throw(vm,"java/lang/NullPointerException","action");return false;}
+   if(!strcmp(builtin_name(),"removeIf")) RETI(0);
+   RETV();
+}
+static bool empty_collection_value(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   const char *desc=dvm_object_class(vm,self)->desc;
+   bool list=strstr(desc,"EmptyList;")!=NULL;
+   if(!strcmp(builtin_name(),"hashCode")) RETI(list ? 1 : 0);
+   const char *type=list ? "Ljava/util/List;" : strstr(desc,"EmptySet;") ? "Ljava/util/Set;" : "Ljava/util/Map;";
+   struct dvm_class *other=dvm_object_class(vm,args[0].l);
+   if(!other || !dvm__class_assignable(vm,other,dvm__class_by_desc(vm,type))) RETI(0);
+   union dvm_value size={0};
+   if(!list_virtual(vm,args[0].l,"size","()I",NULL,0,&size)) return false;
+   RETI(size.i==0);
+}
+static bool empty_list_sublist(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   if(args[0].i<0 || args[1].i>0) return empty_collection_index(vm,self,args,nargs,out);
+   if(args[0].i>args[1].i) {dvm__throw(vm,"java/lang/IllegalArgumentException","fromIndex > toIndex");return false;}
+   RETL(self);
+}
+static bool empty_map_view(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   return coll_emptySet(vm,self,args,nargs,out);
+}
+static bool empty_map_put_all(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   if(!args[0].l) {dvm__throw(vm,"java/lang/NullPointerException","map");return false;}
+   union dvm_value size={0};
+   if(!list_virtual(vm,args[0].l,"size","()I",NULL,0,&size)) return false;
+   if(size.i) return empty_collection_unsupported(vm,self,args,nargs,out);
+   RETV();
+}
+#define EMPTY_COLLECTION_METHODS \
+   M("size","()I",ret_zero),M("isEmpty","()Z",ret_true), \
+   M("contains","(Ljava/lang/Object;)Z",ret_false), \
+   M("toArray","()[Ljava/lang/Object;",list_toArray), \
+   M("toArray","([Ljava/lang/Object;)[Ljava/lang/Object;",list_toArray), \
+   M("iterator","()Ljava/util/Iterator;",list_iterator), \
+   M("add","(Ljava/lang/Object;)Z",empty_collection_unsupported), \
+   M("remove","(Ljava/lang/Object;)Z",ret_false),M("clear","()V",empty_void), \
+   M("addAll","(Ljava/util/Collection;)Z",empty_collection_bulk), \
+   M("containsAll","(Ljava/util/Collection;)Z",empty_collection_bulk), \
+   M("removeAll","(Ljava/util/Collection;)Z",empty_collection_bulk), \
+   M("retainAll","(Ljava/util/Collection;)Z",empty_collection_bulk), \
+   M("removeIf","(Ljava/util/function/Predicate;)Z",empty_collection_callback), \
+   M("forEach","(Ljava/util/function/Consumer;)V",empty_collection_callback), \
+   M("equals","(Ljava/lang/Object;)Z",empty_collection_value),M("hashCode","()I",empty_collection_value), \
+   M("toString","()Ljava/lang/String;",list_toString)
+static const struct rt_method rt_empty_list[]={
+   EMPTY_COLLECTION_METHODS,
+   M("get","(I)Ljava/lang/Object;",empty_collection_index),
+   M("remove","(I)Ljava/lang/Object;",empty_collection_unsupported),
+   M("set","(ILjava/lang/Object;)Ljava/lang/Object;",empty_collection_unsupported),
+   M("add","(ILjava/lang/Object;)V",empty_collection_unsupported),
+   M("addAll","(ILjava/util/Collection;)Z",empty_collection_bulk),
+   M("indexOf","(Ljava/lang/Object;)I",list_indexOf),M("lastIndexOf","(Ljava/lang/Object;)I",list_indexOf),
+   M("subList","(II)Ljava/util/List;",empty_list_sublist),
+   M("listIterator","()Ljava/util/ListIterator;",list_listIterator),
+   M("listIterator","(I)Ljava/util/ListIterator;",list_listIterator),
+   M("replaceAll","(Ljava/util/function/UnaryOperator;)V",empty_collection_callback),
+   M("sort","(Ljava/util/Comparator;)V",empty_void),M_END
+};
+static const struct rt_method rt_empty_set[]={EMPTY_COLLECTION_METHODS,M_END};
+#undef EMPTY_COLLECTION_METHODS
+static const struct rt_method rt_empty_map[]={
+   M("size","()I",ret_zero),M("isEmpty","()Z",ret_true),
+   M("containsKey","(Ljava/lang/Object;)Z",ret_false),M("containsValue","(Ljava/lang/Object;)Z",ret_false),
+   M("entrySet","()Ljava/util/Set;",empty_map_view),M("keySet","()Ljava/util/Set;",empty_map_view),
+   M("values","()Ljava/util/Collection;",empty_map_view),
+   M("put","(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",empty_collection_unsupported),
+   M("putAll","(Ljava/util/Map;)V",empty_map_put_all),
+   M("clear","()V",empty_void),
+   M("equals","(Ljava/lang/Object;)Z",empty_collection_value),M("hashCode","()I",empty_collection_value),M_END
+};
+static const char *const empty_list_interfaces[]={"Ljava/util/RandomAccess;","Ljava/io/Serializable;",NULL};
+static const char *const empty_serializable[]={"Ljava/io/Serializable;",NULL};
 
 static bool coll_singletonMap(struct dvm *vm, dvm_ref self,
                               const union dvm_value *args, int nargs,
@@ -17043,6 +17352,7 @@ static bool q_take(struct dvm *vm, dvm_ref self, const union dvm_value *args,
    dvm_ref head = l->items[0];
    memmove(&l->items[0], &l->items[1], (l->size - 1) * sizeof(dvm_ref));
    --l->size;
+   ++l->mod_count;
    RETL(head);
 }
 
@@ -17055,6 +17365,7 @@ static bool q_poll(struct dvm *vm, dvm_ref self, const union dvm_value *args,
    dvm_ref head = l->items[0];
    memmove(&l->items[0], &l->items[1], (l->size - 1) * sizeof(dvm_ref));
    --l->size;
+   ++l->mod_count;
    RETL(head);
 }
 
@@ -17110,6 +17421,7 @@ static bool q_drainTo(struct dvm *vm, dvm_ref self,
       memmove(&source->items[0], &source->items[1],
               (source->size - 1) * sizeof source->items[0]);
       --source->size;
+      ++source->mod_count;
       ++moved;
    }
    RETI((int32_t)moved);
@@ -17148,6 +17460,7 @@ static bool deque_end(struct dvm *vm, dvm_ref self, const union dvm_value *args,
       memmove(&l->items[i], &l->items[i + 1],
               (l->size - i - 1) * sizeof l->items[0]);
       --l->size;
+      ++l->mod_count;
    }
    (void)nargs;
    RETL(item);
@@ -17207,6 +17520,16 @@ static const struct rt_method rt_blocking_queue[] = {
    M("drainTo", "(Ljava/util/Collection;I)I", q_drainTo),
    M("iterator", "()Ljava/util/Iterator;", list_iterator),
    M_END,
+};
+
+/* Only the non-concurrent Deque classes expose this fail-fast iterator.
+ * Concurrent Deques require their separate weakly consistent iterator model. */
+static const struct rt_method rt_deque_methods[]={
+   M("<init>","()V",list_init),M("<init>","(I)V",list_init),
+   M("descendingIterator","()Ljava/util/Iterator;",deque_descending_iterator),M_END,
+};
+static const struct rt_method rt_deque_interface[]={
+   {"descendingIterator","()Ljava/util/Iterator;",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},M_END,
 };
 
 /* The atomic corner of java.util.Map / ConcurrentMap.  Bytecode runs one
@@ -21203,11 +21526,199 @@ static const struct rt_field rt_reader_fields[] = {
     * readLine() needs it to tell a lone CR from a CRLF. */
    { "ahead", "I" },
    { "closed", "Z" },
+   { "mark", "I" }, { "markAhead", "I" },
    /* The struct jcs_decoder turning streamIn's bytes into chars, in the
     * charset the InputStreamReader was made with. */
    { "decoder", "J" },
    F_END
 };
+
+static const struct rt_field rt_buffered_reader_fields[] = {
+   { "cbuf", "[C" }, { "cpos", "I" }, { "ccount", "I" },
+   { "readAheadLimit", "I" }, { "skipLF", "I" }, F_END
+};
+
+static bool reader_ensure_open(struct dvm *vm, dvm_ref self)
+{
+   union dvm_value closed = {0};
+   (void)dvm_get_field(vm, self, "closed", "Z", &closed);
+   if (!closed.i) return true;
+   dvm__throw(vm, "java/io/IOException", "reader closed");
+   return false;
+}
+
+static bool buffered_reader_init(struct dvm *vm, dvm_ref self,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+   if (!ARG(0).l) { dvm__throw(vm, "java/lang/NullPointerException", "reader"); return false; }
+   int32_t size = nargs > 1 ? ARG(1).i : 8192;
+   if (size <= 0) { dvm__throw(vm, "java/lang/IllegalArgumentException", "buffer size <= 0"); return false; }
+   dvm_ref buffer = dvm_new_array(vm, 'C', "C", (uint32_t)size);
+   if (!buffer) return false;
+   (void)dvm_set_field(vm, self, "cbuf", "[C", (union dvm_value){.l=buffer});
+   (void)dvm_set_field(vm, self, "readerIn", "Ljava/io/Reader;", ARG(0));
+   stream_set_field(vm, self, "mark", -1);
+   RETV();
+}
+
+/* Retain only the marked UTF-16 range across refills. Grow geometrically,
+ * bounded by the read-ahead limit, as Android BufferedReader does. */
+static bool buffered_reader_fill(struct dvm *vm, dvm_ref self)
+{
+   union dvm_value buffer = {0}, delegate = {0};
+   (void)dvm_get_field(vm, self, "cbuf", "[C", &buffer);
+   (void)dvm_get_field(vm, self, "readerIn", "Ljava/io/Reader;", &delegate);
+   if (!buffer.l || !delegate.l) {
+      dvm__throw(vm, "java/io/IOException", "reader closed"); return false;
+   }
+   int32_t pos=0, mark=-1, limit=0;
+   stream_field(vm,self,"cpos",&pos); stream_field(vm,self,"mark",&mark);
+   stream_field(vm,self,"readAheadLimit",&limit);
+   int32_t keep=0, cap=(int32_t)dvm_array_length(vm,buffer.l);
+   if (mark >= 0) {
+      keep=pos-mark;
+      if (keep >= limit) {
+         stream_set_field(vm,self,"mark",-2);
+         stream_set_field(vm,self,"readAheadLimit",0);
+         keep=0;
+      } else {
+         if (limit > cap) {
+            int32_t next = cap > limit / 2 ? limit : cap * 2;
+            dvm_ref bigger=dvm_new_array(vm,'C',"C",(uint32_t)next);
+            if (!bigger) return false;
+            if (keep) memcpy(dvm_array_data(vm,bigger),
+               (uint16_t *)dvm_array_data(vm,buffer.l)+mark,(size_t)keep*sizeof(uint16_t));
+            buffer.l=bigger; cap=next;
+            dvm_set_field(vm,self,"cbuf","[C",buffer);
+         } else if (keep && mark) {
+            uint16_t *chars=dvm_array_data(vm,buffer.l);
+            memmove(chars,chars+mark,(size_t)keep*sizeof(uint16_t));
+         }
+         stream_set_field(vm,self,"mark",0);
+      }
+   }
+   stream_set_field(vm,self,"cpos",keep);
+   stream_set_field(vm,self,"ccount",keep);
+   struct dvm_method *read=dvm_find_method(vm,dvm_object_class(vm,delegate.l),"read","([CII)I");
+   if (!read) { dvm__throw(vm,"java/lang/AbstractMethodError","Reader.read(char[],int,int)"); return false; }
+   union dvm_value args[3]={buffer,{.i=keep},{.i=cap-keep}}, result={0};
+   do {
+      if (!dvm_call(vm,read,delegate.l,args,3,&result)) return false;
+   } while (!result.i);
+   if (result.i > 0) stream_set_field(vm,self,"ccount",keep+result.i);
+   return true;
+}
+
+static bool buffered_reader_next(struct dvm *vm, dvm_ref self, int32_t *out)
+{
+   for (;;) {
+      int32_t pos=0,count=0,skip=0;
+      stream_field(vm,self,"cpos",&pos); stream_field(vm,self,"ccount",&count);
+      if (pos >= count) {
+         if (!buffered_reader_fill(vm,self)) return false;
+         stream_field(vm,self,"cpos",&pos); stream_field(vm,self,"ccount",&count);
+         if (pos >= count) { *out=-1; return true; }
+      }
+      union dvm_value buffer={0}; dvm_get_field(vm,self,"cbuf","[C",&buffer);
+      int32_t ch=((uint16_t *)dvm_array_data(vm,buffer.l))[pos];
+      stream_set_field(vm,self,"cpos",pos+1);
+      stream_field(vm,self,"skipLF",&skip);
+      if (skip) { stream_set_field(vm,self,"skipLF",0); if (ch=='\n') continue; }
+      *out=ch; return true;
+   }
+}
+
+static bool buffered_reader_mark(struct dvm *vm, dvm_ref self,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+   (void)nargs;
+   if (ARG(0).i < 0) { dvm__throw(vm,"java/lang/IllegalArgumentException","negative read-ahead limit"); return false; }
+   if (!reader_ensure_open(vm,self)) return false;
+   int32_t pos=0,skip=0;
+   stream_field(vm,self,"cpos",&pos); stream_field(vm,self,"skipLF",&skip);
+   stream_set_field(vm,self,"mark",pos); stream_set_field(vm,self,"markAhead",skip);
+   stream_set_field(vm,self,"readAheadLimit",ARG(0).i);
+   RETV();
+}
+
+static bool buffered_reader_reset(struct dvm *vm, dvm_ref self,
+                                   const union dvm_value *args, int nargs,
+                                   union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   if (!reader_ensure_open(vm,self)) return false;
+   int32_t mark=-1,skip=0;
+   stream_field(vm,self,"mark",&mark); stream_field(vm,self,"markAhead",&skip);
+   if (mark < 0) { dvm__throw(vm,"java/io/IOException",mark==-2 ? "mark invalid" : "stream not marked"); return false; }
+   stream_set_field(vm,self,"cpos",mark); stream_set_field(vm,self,"skipLF",skip);
+   RETV();
+}
+
+static bool buffered_reader_ready(struct dvm *vm, dvm_ref self,
+                                   const union dvm_value *args, int nargs,
+                                   union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   if (!reader_ensure_open(vm,self)) return false;
+   union dvm_value delegate={0},ready={0};
+   dvm_get_field(vm,self,"readerIn","Ljava/io/Reader;",&delegate);
+   struct dvm_method *method=dvm_find_method(vm,dvm_object_class(vm,delegate.l),"ready","()Z");
+   int32_t pos=0,count=0,skip=0;
+   stream_field(vm,self,"cpos",&pos); stream_field(vm,self,"ccount",&count);
+   stream_field(vm,self,"skipLF",&skip);
+   if (skip) {
+      if (pos >= count && method) {
+         if (!dvm_call(vm,method,delegate.l,NULL,0,&ready)) return false;
+         if (ready.i) {
+            if (!buffered_reader_fill(vm,self)) return false;
+            stream_field(vm,self,"cpos",&pos); stream_field(vm,self,"ccount",&count);
+         }
+      }
+      if (pos < count) {
+         union dvm_value buffer={0}; dvm_get_field(vm,self,"cbuf","[C",&buffer);
+         if (((uint16_t *)dvm_array_data(vm,buffer.l))[pos]=='\n') stream_set_field(vm,self,"cpos",++pos);
+         stream_set_field(vm,self,"skipLF",0);
+      }
+   }
+   if (pos < count) RETI(1);
+   if (method && !dvm_call(vm,method,delegate.l,NULL,0,&ready)) return false;
+   RETI(ready.i != 0);
+}
+
+static bool reader_mark_unsupported(struct dvm *vm, dvm_ref self,
+                                     const union dvm_value *args, int nargs,
+                                     union dvm_value *out)
+{
+   (void)self; (void)args; (void)nargs; (void)out;
+   dvm__throw(vm,"java/io/IOException","mark/reset not supported"); return false;
+}
+
+static bool string_reader_mark(struct dvm *vm, dvm_ref self,
+                                const union dvm_value *args, int nargs,
+                                union dvm_value *out)
+{
+   (void)nargs;
+   if (ARG(0).i < 0) { dvm__throw(vm,"java/lang/IllegalArgumentException","negative read-ahead limit"); return false; }
+   if (!reader_ensure_open(vm,self)) return false;
+   int32_t pos=0,ahead=0;
+   stream_field(vm,self,"rpos",&pos); stream_field(vm,self,"ahead",&ahead);
+   stream_set_field(vm,self,"mark",pos); stream_set_field(vm,self,"markAhead",ahead);
+   RETV();
+}
+
+static bool string_reader_reset(struct dvm *vm, dvm_ref self,
+                                 const union dvm_value *args, int nargs,
+                                 union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   if (!reader_ensure_open(vm,self)) return false;
+   int32_t mark=0,ahead=0;
+   stream_field(vm,self,"mark",&mark); stream_field(vm,self,"markAhead",&ahead);
+   stream_set_field(vm,self,"rpos",mark); stream_set_field(vm,self,"ahead",ahead);
+   RETV();
+}
 
 static bool string_reader_init(struct dvm *vm, dvm_ref self,
                                const union dvm_value *args, int nargs,
@@ -21406,14 +21917,8 @@ static bool reader_next_cp(struct dvm *vm, dvm_ref self, int32_t *cp_out)
       return true;
    }
 
-   if (dvm_get_field(vm, self, "readerIn", "Ljava/io/Reader;", &v) && v.l) {
-      struct dvm_class *rc = dvm_object_class(vm, v.l);
-      struct dvm_method *m = rc ? dvm_find_method(vm, rc, "read", "()I") : NULL;
-      if (!m) return true;
-      union dvm_value r = { 0 };
-      if (!dvm_call(vm, m, v.l, NULL, 0, &r)) return false;
-      *cp_out = r.i;
-   }
+   if (dvm_get_field(vm, self, "readerIn", "Ljava/io/Reader;", &v) && v.l)
+      return buffered_reader_next(vm, self, cp_out);
    return true;
 }
 
@@ -21482,6 +21987,7 @@ static bool reader_skip(struct dvm *vm, dvm_ref self,
 {
    (void)nargs;
    int64_t want = ARG(0).j, n = 0;
+   if (!reader_ensure_open(vm,self)) return false;
    while (n < want) {
       int32_t cp;
       if (!reader_next_cp(vm, self, &cp)) return false;
@@ -21489,6 +21995,14 @@ static bool reader_skip(struct dvm *vm, dvm_ref self,
       ++n;
    }
    RETJ(n);
+}
+
+static bool buffered_reader_skip(struct dvm *vm, dvm_ref self,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+   if (ARG(0).j < 0) { dvm__throw(vm,"java/lang/IllegalArgumentException","negative skip"); return false; }
+   return reader_skip(vm,self,args,nargs,out);
 }
 
 /* BufferedReader.readLine(): the line without its terminator, or null once the
@@ -21516,6 +22030,10 @@ static bool reader_readLine(struct dvm *vm, dvm_ref self,
       any = true;
       if (cp == '\n') break;
       if (cp == '\r') {
+         if (object_is_a(vm,self,"Ljava/io/BufferedReader;")) {
+            stream_set_field(vm,self,"skipLF",1);
+            break;
+         }
          int32_t next;
          if (!reader_next_cp(vm, self, &next)) {
             if (buf != inline_buf) free(buf);
@@ -21560,6 +22078,8 @@ static bool reader_close(struct dvm *vm, dvm_ref self,
    if (closed.i) RETV();
    closed.i = 1;
    (void)dvm_set_field(vm, self, "closed", "Z", closed);
+   if (object_is_a(vm,self,"Ljava/io/BufferedReader;"))
+      (void)dvm_set_field(vm,self,"cbuf","[C",(union dvm_value){.l=0});
    union dvm_value dv = { 0 };
    if (dvm_get_field(vm, self, "decoder", "J", &dv) && dv.j) {
       jcs_decoder_free((struct jcs_decoder *)(intptr_t)dv.j);
@@ -21595,6 +22115,8 @@ static const struct rt_method rt_reader[] = {
     * read never blocks. */
    M("ready", "()Z", ret_true),
    M("markSupported", "()Z", ret_false),
+   M("mark", "(I)V", reader_mark_unsupported),
+   M("reset", "()V", reader_mark_unsupported),
    M("close", "()V", reader_close),
    M_END,
 };
@@ -21609,13 +22131,21 @@ static const struct rt_method rt_input_stream_reader[] = {
 
 static const struct rt_method rt_string_reader[] = {
    M("<init>", "(Ljava/lang/String;)V", string_reader_init),
+   M("markSupported", "()Z", ret_true),
+   M("mark", "(I)V", string_reader_mark),
+   M("reset", "()V", string_reader_reset),
    M_END,
 };
 
 static const struct rt_method rt_buffered_reader[] = {
-   M("<init>", "(Ljava/io/Reader;)V", reader_init),
-   M("<init>", "(Ljava/io/Reader;I)V", reader_init),
+   M("<init>", "(Ljava/io/Reader;)V", buffered_reader_init),
+   M("<init>", "(Ljava/io/Reader;I)V", buffered_reader_init),
    M("readLine", "()Ljava/lang/String;", reader_readLine),
+   M("markSupported", "()Z", ret_true),
+   M("mark", "(I)V", buffered_reader_mark),
+   M("reset", "()V", buffered_reader_reset),
+   M("ready", "()Z", buffered_reader_ready),
+   M("skip", "(J)J", buffered_reader_skip),
    M_END,
 };
 
@@ -22066,6 +22596,10 @@ static bool url_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                  (int)sl, spec);
       return false;
    }
+   if(sl==3 && !strncasecmp(spec,"jar",3) && !strstr(spec+4,"!/")) {
+      dvm__throw(vm,"java/net/MalformedURLException","no !/ in archive URL");
+      return false;
+   }
    union dvm_value v = { .l = dvm_new_string(vm, spec) };
    (void)dvm_set_field(vm, self, "url", "Ljava/lang/String;", v);
    RETV();
@@ -22245,12 +22779,193 @@ static bool conn_init(struct dvm *vm, dvm_ref self,
    RETV();
 }
 
+/* MPL-2.0. Included by dvm_runtime.c after the URLConnection constructor.
+ * Local archive entry transport shares the ZIP bridge with ZipFile. */
+static const struct rt_field rt_jar_connection_fields[]={
+   {"jarFileURL","Ljava/net/URL;"},{"entryName","Ljava/lang/String;"},
+   {"entryBytes","[B"},{"input","Ljava/io/InputStream;"},{"closed","Z"},F_END
+};
+
+static dvm_ref jarconn_field(struct dvm *vm,dvm_ref self,const char *name,const char *type)
+{
+   union dvm_value value={0};
+   (void)dvm_get_field(vm,self,name,type,&value);
+   return value.l;
+}
+static bool jarconn_closed(struct dvm *vm,dvm_ref self)
+{
+   union dvm_value value={0};
+   (void)dvm_get_field(vm,self,"closed","Z",&value);
+   return value.i!=0;
+}
+
+static char *jarconn_decode(struct dvm *vm,const char *text,size_t length)
+{
+   for(size_t i=0;i<length;++i) if(text[i]=='%') {
+      if(i+2>=length || uri_hexval(text[i+1])<0 || uri_hexval(text[i+2])<0) {
+         dvm__throw(vm,"java/lang/IllegalArgumentException","invalid URL escape");return NULL;
+      }
+      i+=2;
+   }
+   size_t decoded_length=0;
+   char *decoded=uri_decode_n(text,length,false,&decoded_length);
+   if(!decoded) dvm__throw(vm,"java/lang/OutOfMemoryError","URL escape");
+   else if(memchr(decoded,0,decoded_length)) {
+      free(decoded);decoded=NULL;
+      dvm__throw(vm,"java/io/IOException","NUL in archive URL");
+   }
+   return decoded;
+}
+
+static bool jarconn_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   const char *spec=url_text(vm,args[0].l);
+   const char *separator=!strncasecmp(spec,"jar:",4) ? strstr(spec+4,"!/") : NULL;
+   if(!separator) {
+      dvm__throw(vm,"java/net/MalformedURLException","no !/ in archive URL");return false;
+   }
+   if(!conn_init(vm,self,args,nargs,out)) return false;
+   dvm_ref nested=dvm_new_object(vm,dvm__class_by_desc(vm,"Ljava/net/URL;"));
+   union dvm_value text={.l=dvm_new_string_n(vm,spec+4,(size_t)(separator-spec-4))},ignored={0};
+   if(!nested || !url_init(vm,nested,&text,1,&ignored)) return false;
+   (void)dvm_set_field(vm,self,"jarFileURL","Ljava/net/URL;",(union dvm_value){.l=nested});
+   const char *entry=separator+2;
+   size_t length=strcspn(entry,"#");
+   if(length) {
+      char *decoded=jarconn_decode(vm,entry,length);
+      if(!decoded) return false;
+      dvm_ref name=dvm_new_string(vm,decoded);free(decoded);
+      if(!name) return false;
+      (void)dvm_set_field(vm,self,"entryName","Ljava/lang/String;",(union dvm_value){.l=name});
+   }
+   RETV();
+}
+
+static bool jarconn_get_url(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;RETL(jarconn_field(vm,self,"jarFileURL","Ljava/net/URL;"));
+}
+static bool jarconn_get_name(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;RETL(jarconn_field(vm,self,"entryName","Ljava/lang/String;"));
+}
+
+static bool jarconn_connect(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   struct rt_conn *connection=conn_of(vm,self);
+   if(!connection) return false;
+   if(connection->connected) RETV();
+   const char *url=url_text(vm,jarconn_field(vm,self,"jarFileURL","Ljava/net/URL;"));
+   if(strncasecmp(url,"file:",5)) {
+      dvm__throw(vm,"java/io/IOException","non-file archive transport is not implemented: %s",url);return false;
+   }
+   const char *path=url+5;
+   if(!strncmp(path,"//",2)) {
+      const char *end=strchr(path+2,'/');
+      if(!end || (end!=path+2 && ((size_t)(end-path-2)!=9 || strncasecmp(path+2,"localhost",9)))) {
+         dvm__throw(vm,"java/io/IOException","non-local file authority");return false;
+      }
+      path=end;
+   }
+   char *decoded=jarconn_decode(vm,path,strcspn(path,"?#"));
+   if(!decoded) return false;
+   dvm_ref name=jarconn_field(vm,self,"entryName","Ljava/lang/String;");
+   if(!name) {
+      free(decoded);
+      dvm__throw(vm,"java/io/IOException","archive-only connection is not implemented");return false;
+   }
+   size_t length=0;
+   unsigned char *data=arm_exec_zip_read(decoded,dvm_string_utf8(vm,name),&length);
+   free(decoded);
+   if(!data) {
+      dvm__throw(vm,"java/io/FileNotFoundException","%s",dvm_string_utf8(vm,name));return false;
+   }
+   if(length>INT32_MAX) {
+      free(data);dvm__throw(vm,"java/lang/OutOfMemoryError","archive entry too large");return false;
+   }
+   dvm_ref bytes=dvm_new_array(vm,'B',"B",(uint32_t)length);
+   if(bytes && length) memcpy(dvm_array_data(vm,bytes),data,length);
+   free(data);
+   if(!bytes) return false;
+   (void)dvm_set_field(vm,self,"entryBytes","[B",(union dvm_value){.l=bytes});
+   connection->connected=true;
+   RETV();
+}
+
+static bool jarconn_input(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   if(jarconn_closed(vm,self)) {
+      dvm__throw(vm,"java/lang/IllegalStateException","archive input stream has been closed");return false;
+   }
+   if(!jarconn_connect(vm,self,args,nargs,out)) return false;
+   dvm_ref input=jarconn_field(vm,self,"input","Ljava/io/InputStream;");
+   if(!input) {
+      input=dvm_new_object(vm,dvm__class_by_desc(vm,"Llibcore/net/url/JarURLConnectionImpl$InputStream;"));
+      if(!input) return false;
+      union dvm_value bytes={.l=jarconn_field(vm,self,"entryBytes","[B")},ignored={0};
+      if(!st_init_bytes(vm,input,&bytes,1,&ignored)) return false;
+      (void)dvm_set_field(vm,input,"connection","Ljava/net/JarURLConnection;",(union dvm_value){.l=self});
+      (void)dvm_set_field(vm,self,"input","Ljava/io/InputStream;",(union dvm_value){.l=input});
+   }
+   RETL(input);
+}
+static bool jarstream_close(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   dvm_ref connection=jarconn_field(vm,self,"connection","Ljava/net/JarURLConnection;");
+   (void)dvm_set_field(vm,connection,"closed","Z",(union dvm_value){.i=1});
+   RETV();
+}
+static bool jarstream_read(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   if(jarconn_closed(vm,jarconn_field(vm,self,"connection","Ljava/net/JarURLConnection;"))) {
+      dvm__throw(vm,"java/io/IOException","stream closed");return false;
+   }
+   return st_read(vm,self,args,nargs,out);
+}
+static const struct rt_field rt_jar_stream_fields[]={
+   {"connection","Ljava/net/JarURLConnection;"},F_END
+};
+static const struct rt_method rt_jar_stream[]={
+   M("read","()I",jarstream_read),M("read","([B)I",jarstream_read),
+   M("read","([BII)I",jarstream_read),M("close","()V",jarstream_close),M_END
+};
+static bool jarconn_length(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   union dvm_value ignored={0};int64_t length=-1;
+   if(jarconn_connect(vm,self,args,nargs,&ignored))
+      length=dvm_array_length(vm,jarconn_field(vm,self,"entryBytes","[B"));
+   else {
+      struct dvm_class *exception=dvm_object_class(vm,dvm_exception(vm));
+      if(!exception || !dvm__class_assignable(vm,exception,dvm_find_class(vm,"java/io/IOException"))) return false;
+      dvm_clear_exception(vm);
+   }
+   if(builtin_sig()[2]=='J') RETJ(length);
+   RETI((int32_t)length);
+}
+static const struct rt_method rt_jar_connection[]={
+   M("<init>","(Ljava/net/URL;)V",jarconn_init),
+   M("getJarFileURL","()Ljava/net/URL;",jarconn_get_url),
+   M("getEntryName","()Ljava/lang/String;",jarconn_get_name),
+   M("connect","()V",jarconn_connect),
+   M("getInputStream","()Ljava/io/InputStream;",jarconn_input),
+   M("getContentLength","()I",jarconn_length),
+   M("getContentLengthLong","()J",jarconn_length),M_END
+};
+
 static bool url_openConnection(struct dvm *vm, dvm_ref self,
                                const union dvm_value *args, int nargs,
                                union dvm_value *out)
 {
    (void)args; (void)nargs;
    const char *s = url_text(vm, self);
+   if (!strncasecmp(s, "jar:", 4)) {
+      dvm_ref connection=dvm_new_object(vm,dvm__class_by_desc(vm,"Llibcore/net/url/JarURLConnectionImpl;"));
+      union dvm_value url={.l=self},ignored={0};
+      if(!connection || !jarconn_init(vm,connection,&url,1,&ignored)) return false;
+      RETL(connection);
+   }
    bool tls = !strncasecmp(s, "https", 5);
    struct dvm_class *cls = dvm__class_by_desc(
       vm, tls ? "Ljavax/net/ssl/HttpsURLConnection;"
@@ -23112,6 +23827,15 @@ static const struct rt_method rt_https_connection[] = {
    M_END,
 };
 
+static bool url_open_stream(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   struct dvm_method *method=dvm_find_method(vm,dvm_object_class(vm,self),"openConnection","()Ljava/net/URLConnection;");
+   union dvm_value connection={0};
+   if(!method || !dvm_call(vm,method,self,NULL,0,&connection)) return false;
+   method=dvm_find_method(vm,dvm_object_class(vm,connection.l),"getInputStream","()Ljava/io/InputStream;");
+   return method && dvm_call(vm,method,connection.l,NULL,0,out);
+}
 static const struct rt_method rt_url[] = {
    M("<init>", "(Ljava/lang/String;)V", url_init),
    M("<init>", "(Ljava/net/URL;Ljava/lang/String;)V", url_init),
@@ -23129,6 +23853,7 @@ static const struct rt_method rt_url[] = {
    M("getRef", "()Ljava/lang/String;", url_get_ref),
    M("getUserInfo", "()Ljava/lang/String;", url_get_user_info),
    M("openConnection", "()Ljava/net/URLConnection;", url_openConnection),
+   M("openStream", "()Ljava/io/InputStream;", url_open_stream),
    M_END,
 };
 
@@ -23322,6 +24047,8 @@ static const struct rt_method rt_handler[] = {
    M("sendMessageAtFrontOfQueue", "(Landroid/os/Message;)Z", h_sendMessage),
    M("sendEmptyMessage", "(I)Z", h_sendEmptyMessage),
    M("sendEmptyMessageDelayed", "(IJ)Z", h_sendEmptyMessage),
+   M("sendEmptyMessageAtTime", "(IJ)Z", h_sendEmptyMessage),
+   M("sendMessageAtTime", "(Landroid/os/Message;J)Z", h_sendMessage),
    M("sendMessageDelayed", "(Landroid/os/Message;J)Z", h_sendMessage),
    /* Handler.handleMessage() is empty on Android too — it exists to be
     * overridden, and a Handler built without a subclass or a Callback is one
@@ -23725,8 +24452,13 @@ static bool h_sendMessage(struct dvm *vm, dvm_ref self,
    /* sendMessageDelayed(msg, ms) carries a delay, and the Message's own `obj`
     * is the token removeCallbacksAndMessages() will be asked about. */
    int64_t delay = nargs > 1 ? ARG(1).j : 0;
-   if (delay < 0) delay = 0;
-   union dvm_value when = { .j = (int64_t)dvm__now_ms() + delay };
+   const int64_t now = (int64_t)dvm__now_ms();
+   const struct dvm_method *method = dvm__builtin_method();
+   const bool absolute = method && (strcmp(method->name, "sendMessageAtTime") == 0 ||
+                                    strcmp(method->name, "sendEmptyMessageAtTime") == 0);
+   if (!absolute && delay < 0) delay = 0;
+   union dvm_value when = { .j = absolute ? delay : now + delay };
+   if (absolute) delay = when.j > now ? when.j - now : 0;
    (void)dvm_set_field(vm, msg, "when", "J", when);
    union dvm_value obj = { 0 };
    (void)dvm_get_field(vm, msg, "obj", "Ljava/lang/Object;", &obj);
@@ -32643,12 +33375,14 @@ static bool intent_getExtras(struct dvm *vm, dvm_ref self,
                              union dvm_value *out)
 {
    (void)args; (void)nargs;
+   struct dvm_object *intent = dvm__obj(vm, self);
+   if (!intent || !intent->data) RETL(0);
    struct dvm_class *bc = dvm__class_by_desc(vm, "Landroid/os/Bundle;");
    dvm_ref bundle = bc ? dvm_new_object(vm, bc) : 0;
    if (bundle) {
       union dvm_value src = { .l = self }, ignored = { 0 };
       (void)map_init(vm, bundle, NULL, 0, &ignored);
-      (void)map_putAll(vm, bundle, &src, 1, &ignored);
+      if (!map_putAll(vm, bundle, &src, 1, &ignored)) return false;
    }
    RETL(bundle);
 }
@@ -36479,6 +37213,12 @@ static const char *const rt_iface_class[] = {
    "Ljava/lang/reflect/AnnotatedElement;", "Ljava/io/Serializable;", NULL };
 static const char *const rt_iface_reflect_type[] = {
    "Ljava/lang/reflect/Type;", NULL };
+static const char *const rt_iface_reflect_member[] = {
+   "Ljava/lang/reflect/Member;", NULL };
+static const char *const rt_iface_executable[] = {
+   "Ljava/lang/reflect/Member;", "Ljava/lang/reflect/GenericDeclaration;", NULL };
+static const char *const rt_iface_annotated[] = {
+   "Ljava/lang/reflect/AnnotatedElement;", NULL };
 static const char *const rt_iface_parameterized_type[] = {
    "Ljava/lang/reflect/ParameterizedType;", "Ljava/lang/reflect/Type;", NULL };
 static const char *const rt_iface_wildcard_type[] = {
@@ -37029,6 +37769,20 @@ static bool am_value(struct dvm *vm, dvm_ref e, dvm_ref *val)
    if (!am_vcall(vm, e, "getValue", "()Ljava/lang/Object;", NULL, 0, &v)) return false;
    *val = v.l;
    return true;
+}
+
+static int map_copy_entry(struct dvm *vm, void *ctx, dvm_ref it, dvm_ref entry)
+{
+   (void)it;
+   union dvm_value pair[2] = {0}, ignored = {0};
+   if (!am_key(vm, entry, &pair[0].l) || !am_value(vm, entry, &pair[1].l))
+      return -1;
+   return map_put(vm, *(dvm_ref *)ctx, pair, 2, &ignored) ? 0 : -1;
+}
+
+static bool map_putAll_entries(struct dvm *vm, dvm_ref self, dvm_ref source)
+{
+   return am_each(vm, source, map_copy_entry, &self);
 }
 
 struct am_find { dvm_ref want; bool by_value; bool remove; bool found; dvm_ref value; };
@@ -43237,8 +43991,7 @@ static bool view_get_padding_end(struct dvm *vm, dvm_ref self,
                      : view_get_padding_right(vm, self, args, nargs, out);
 }
 
-/* AOSP View.forceLayout marks only this view. Public measure() currently
- * always invokes onMeasure, so there is no measurement cache to clear. */
+/* AOSP View.forceLayout invalidates this view without propagating to its parent. */
 static bool view_force_layout(struct dvm *vm, dvm_ref self,
                                const union dvm_value *args, int nargs,
                                union dvm_value *out)
@@ -43325,6 +44078,23 @@ static bool view_get_alpha(struct dvm *vm, dvm_ref self,
    (void)dvm_get_field(vm, self, "alphaSet", "Z", &set);
    if (set.i) (void)dvm_get_field(vm, self, "alpha", "F", &alpha);
    RETF(alpha.f);
+}
+
+/* Transition opacity is independent of the application's alpha property. */
+static bool view_transition_alpha(struct dvm *vm, dvm_ref self,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+   union dvm_value set = {0}, alpha = {.f=1.0f};
+   (void)dvm_get_field(vm,self,"transitionAlphaSet","Z",&set);
+   if (set.i) (void)dvm_get_field(vm,self,"transitionAlpha","F",&alpha);
+   if (!strcmp(builtin_name(),"getTransitionAlpha")) RETF(alpha.f);
+   if (nargs && alpha.f != ARG(0).f) {
+      (void)dvm_set_field(vm,self,"transitionAlpha","F",ARG(0));
+      (void)dvm_set_field(vm,self,"transitionAlphaSet","Z",(union dvm_value){.i=1});
+      ui_invalidate();
+   }
+   RETV();
 }
 
 static bool view_animate(struct dvm *vm, dvm_ref self,
@@ -43848,6 +44618,8 @@ VIEW_SET_L(view_set_content_description, "contentDescription",
            "Ljava/lang/CharSequence;")
 VIEW_GET_L(view_get_content_description, "contentDescription",
            "Ljava/lang/CharSequence;")
+VIEW_SET_L(view_set_transition_name, "transitionName", "Ljava/lang/String;")
+VIEW_GET_L(view_get_transition_name, "transitionName", "Ljava/lang/String;")
 VIEW_GET_L(view_get_state_description, "stateDescription",
            "Ljava/lang/CharSequence;")
 static bool view_set_state_description(struct dvm *vm, dvm_ref self,
@@ -43969,9 +44741,14 @@ static bool view_set_padding(struct dvm *vm, dvm_ref self,
 {
    (void)out;
    static const char *names[] = { "paddingLeft", "paddingTop", "paddingRight", "paddingBottom" };
-   for (int i = 0; i < 4 && i < nargs; ++i)
-      (void)dvm_set_field(vm, self, names[i], "I", ARG(i));
-   ui_layout_changed();
+   bool changed=false;
+   for (int i = 0; i < 4 && i < nargs; ++i) {
+      union dvm_value previous={0};
+      (void)dvm_get_field(vm,self,names[i],"I",&previous);
+      if(previous.i==ARG(i).i) continue;
+      (void)dvm_set_field(vm,self,names[i],"I",ARG(i));changed=true;
+   }
+   if(changed) return view_request_layout(vm,self,NULL,0,out);
    RETV();
 }
 
@@ -44816,9 +45593,7 @@ static bool view_set_layout_params(struct dvm *vm, dvm_ref self,
    struct dvm_method *resolve = c ? dvm_find_method(vm, c, "resolveLayoutParams", "()V") : NULL;
    union dvm_value ignored = {0};
    if (resolve && !dvm_call(vm, resolve, self, NULL, 0, &ignored)) return false;
-   ui_layout_changed();
-   ui_invalidate();
-   RETV();
+   return view_request_layout(vm,self,NULL,0,out);
 }
 
 static bool view_get_layout_params(struct dvm *vm, dvm_ref self,
@@ -44850,26 +45625,54 @@ static bool view_get_tree_observer(struct dvm *vm, dvm_ref self,
    RETL(v.l);
 }
 
-static bool vto_add_global_listener(struct dvm *vm, dvm_ref self,
-                                    const union dvm_value *args, int nargs,
-                                    union dvm_value *out)
+static bool vto_register(struct dvm *vm,dvm_ref observer)
+{
+   for(size_t i=0;i<vm->nlayout_observers;++i) if(vm->layout_observers[i]==observer) return true;
+   if(vm->nlayout_observers==vm->layout_observer_capacity) {
+      size_t capacity=vm->layout_observer_capacity ? vm->layout_observer_capacity*2 : 16;
+      if(capacity<vm->layout_observer_capacity || capacity>SIZE_MAX/sizeof(dvm_ref)) {
+         dvm__throw(vm,"java/lang/OutOfMemoryError","Layout observers");return false;
+      }
+      dvm_ref *grown=realloc(vm->layout_observers,capacity*sizeof *grown);
+      if(!grown) {dvm__throw(vm,"java/lang/OutOfMemoryError","Layout observers");return false;}
+      vm->layout_observers=grown;vm->layout_observer_capacity=capacity;
+   }
+   dvm_pin(vm,observer);vm->layout_observers[vm->nlayout_observers++]=observer;return true;
+}
+static bool vto_listener_change(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
    (void)out;
-   union dvm_value v = { .l = nargs > 0 ? ARG(0).l : 0 };
-   (void)dvm_set_field(vm, self, "globalLayoutListener",
-                       "Landroid/view/ViewTreeObserver$OnGlobalLayoutListener;",
-                       v);
-   /* Storing the listener was enough to keep getViewTreeObserver() honest, but
-    * nothing could ever call it: there is no layout pass here to fire it from.
-    * That silence is what an app hears as "the window never changed shape" —
-    * and the window changing shape is exactly how it learns a keyboard came
-    * up.  Remember the observer so the input method can run the pass. */
-   if (v.l) {
-      for (int i = 0; i < g_nlayout_observers; ++i)
-         if (g_layout_observers[i] == self) RETV();
-      if (g_nlayout_observers < RT_MAX_LAYOUT_OBSERVERS) {
-         dvm_pin(vm, self);
-         g_layout_observers[g_nlayout_observers++] = self;
+   bool pre=strstr(builtin_name(),"PreDraw")!=NULL,remove=!strncmp(builtin_name(),"remove",6);
+   const char *field=pre ? "preDrawListeners" : "globalLayoutListeners";
+   const char *single=pre ? "preDrawListener" : "globalLayoutListener";
+   const char *type=pre ? "Landroid/view/ViewTreeObserver$OnPreDrawListener;" : "Landroid/view/ViewTreeObserver$OnGlobalLayoutListener;";
+   dvm_ref listener=nargs ? ARG(0).l : 0;
+   /* Removing an absent/null listener is harmless, including Glide cleanup
+    * after another request already cleared its pre-draw callback. */
+   if(!listener && remove) RETV();
+   if(!listener) {dvm__throw(vm,"java/lang/NullPointerException","listener");return false;}
+   union dvm_value list={0},ignored={0};(void)dvm_get_field(vm,self,field,"Ljava/util/List;",&list);
+   if(remove) {
+      if(list.l && !list_remove_obj(vm,list.l,args,1,&ignored)) return false;
+   } else {
+      if(!list.l) {
+         list.l=dvm_new_object(vm,dvm_find_class(vm,"java/util/ArrayList"));
+         if(!list.l || !list_init(vm,list.l,NULL,0,&ignored)) return false;
+         (void)dvm_set_field(vm,self,field,"Ljava/util/List;",list);
+      }
+      if(!vto_register(vm,self) || !list_add(vm,list.l,args,1,&ignored)) return false;
+      if(pre) g_layout_pass_pending=true;
+   }
+   struct rt_list *items=list_of(vm,list.l);
+   union dvm_value last={.l=items && items->size ? items->items[items->size-1] : 0};
+   (void)dvm_set_field(vm,self,single,type,last);
+   if(remove) {
+      union dvm_value global={0},predraw={0};
+      (void)dvm_get_field(vm,self,"globalLayoutListener","Landroid/view/ViewTreeObserver$OnGlobalLayoutListener;",&global);
+      (void)dvm_get_field(vm,self,"preDrawListener","Landroid/view/ViewTreeObserver$OnPreDrawListener;",&predraw);
+      if(!global.l && !predraw.l) for(size_t i=0;i<vm->nlayout_observers;++i) if(vm->layout_observers[i]==self) {
+         memmove(vm->layout_observers+i,vm->layout_observers+i+1,(vm->nlayout_observers-i-1)*sizeof(dvm_ref));
+         --vm->nlayout_observers;dvm_unpin(vm,self);break;
       }
    }
    RETV();
@@ -44907,7 +45710,7 @@ static bool view_set_insets_listener(struct dvm *vm, dvm_ref self,
    }
    /* Android delivers the first insets on the next layout pass, which the
     * registration itself schedules. */
-   if (v.l) g_layout_pass_pending = true;
+   if (v.l) {vm->insets_pass_pending=true;g_layout_pass_pending=true;}
    RETV();
 }
 
@@ -44982,6 +45785,7 @@ static const struct rt_field rt_view_fields[] = {
    { "cameraDistance", "F" }, { "cameraDistanceSet", "Z" },
    { "accessibilityDelegate", "Landroid/view/View$AccessibilityDelegate;" },
    { "measuredDimensionSet", "Z" },
+   { "measureWidthSpec", "I" }, { "measureHeightSpec", "I" }, { "measureEpoch", "J" },
    {"touchTarget","Landroid/view/View;"}, {"disallowIntercept","Z"},
    { "drawableState", "[I" }, { "drawableStateDirty", "Z" },
    { "pressed", "Z" }, { "hovered", "Z" },
@@ -44991,6 +45795,8 @@ static const struct rt_field rt_view_fields[] = {
    { "npOwner", "Landroid/view/View;" }, { "npStep", "I" },
    { "propertyAnimator", "Landroid/view/ViewPropertyAnimator;" },
    { "alpha", "F" }, { "alphaSet", "Z" }, { "elevation", "F" },
+   { "transitionAlpha", "F" }, { "transitionAlphaSet", "Z" },
+   { "transitionName", "Ljava/lang/String;" },
    { "animation", "Landroid/view/animation/Animation;" },
    { "typeface", "Landroid/graphics/Typeface;" },
    { "scaleType", "I" },
@@ -45708,6 +46514,8 @@ static bool view_request_apply_insets(struct dvm *vm, dvm_ref self,
     * may call requestApplyInsets() while insets are being dispatched; that
     * schedules at most one follow-up traversal, never a recursive traversal
     * for every nested dvm_call made by the listener. */
+   if(g_in_layout_pass && g_layout_repeat>=1) RETV();
+   vm->insets_pass_pending=true;
    if (g_in_layout_pass) {
       if (g_layout_repeat < 1) {
          ++g_layout_repeat;
@@ -46578,6 +47386,10 @@ static const struct rt_method rt_view[] = {
    M("getElevation", "()F", view_get_elevation),
    M("setAlpha", "(F)V", view_set_alpha),
    M("getAlpha", "()F", view_get_alpha),
+   M("getTransitionAlpha", "()F", view_transition_alpha),
+   M("setTransitionAlpha", "(F)V", view_transition_alpha),
+   M("getTransitionName", "()Ljava/lang/String;", view_get_transition_name),
+   M("setTransitionName", "(Ljava/lang/String;)V", view_set_transition_name),
    M("animate", "()Landroid/view/ViewPropertyAnimator;", view_animate),
    M("setStateListAnimator", "(Landroid/animation/StateListAnimator;)V",
      view_set_state_list_animator),
@@ -46887,55 +47699,22 @@ static const struct rt_field rt_view_tree_observer_fields[] = {
    { "globalLayoutListener",
      "Landroid/view/ViewTreeObserver$OnGlobalLayoutListener;" },
    { "preDrawListener", "Landroid/view/ViewTreeObserver$OnPreDrawListener;" },
+   { "globalLayoutListeners", "Ljava/util/List;" }, { "preDrawListeners", "Ljava/util/List;" },
    F_END,
 };
-
-/* addOnPreDrawListener(): run by the same pass as the global-layout listeners,
- * just before the frame is drawn, and until it is removed. */
-static bool vto_add_pre_draw_listener(struct dvm *vm, dvm_ref self,
-                                      const union dvm_value *args, int nargs,
-                                      union dvm_value *out)
-{
-   (void)out;
-   union dvm_value v = { .l = nargs > 0 ? ARG(0).l : 0 };
-   (void)dvm_set_field(vm, self, "preDrawListener",
-                       "Landroid/view/ViewTreeObserver$OnPreDrawListener;", v);
-   if (v.l) {
-      bool known = false;
-      for (int i = 0; i < g_nlayout_observers; ++i)
-         if (g_layout_observers[i] == self) known = true;
-      if (!known && g_nlayout_observers < RT_MAX_LAYOUT_OBSERVERS) {
-         dvm_pin(vm, self);
-         g_layout_observers[g_nlayout_observers++] = self;
-      }
-      g_layout_pass_pending = true;
-   }
-   RETV();
-}
-
-static bool vto_remove_pre_draw_listener(struct dvm *vm, dvm_ref self,
-                                         const union dvm_value *args, int nargs,
-                                         union dvm_value *out)
-{
-   (void)args; (void)nargs; (void)out;
-   (void)dvm_set_field(vm, self, "preDrawListener",
-                       "Landroid/view/ViewTreeObserver$OnPreDrawListener;",
-                       (union dvm_value){ .l = 0 });
-   RETV();
-}
 
 static const struct rt_method rt_view_tree_observer[] = {
    M("addOnGlobalLayoutListener",
      "(Landroid/view/ViewTreeObserver$OnGlobalLayoutListener;)V",
-     vto_add_global_listener),
+     vto_listener_change),
    M("removeOnGlobalLayoutListener",
-     "(Landroid/view/ViewTreeObserver$OnGlobalLayoutListener;)V", nop_void),
+     "(Landroid/view/ViewTreeObserver$OnGlobalLayoutListener;)V", vto_listener_change),
    M("addOnPreDrawListener",
      "(Landroid/view/ViewTreeObserver$OnPreDrawListener;)V",
-     vto_add_pre_draw_listener),
+     vto_listener_change),
    M("removeOnPreDrawListener",
      "(Landroid/view/ViewTreeObserver$OnPreDrawListener;)V",
-     vto_remove_pre_draw_listener),
+     vto_listener_change),
    M("isAlive", "()Z", ret_true),
    M_END,
 };
@@ -47007,6 +47786,24 @@ static bool surface_holder_get_surface(struct dvm *vm, dvm_ref self,
    RETL(v.l);
 }
 
+/* The frame describes the committed buffer, not a pending fixed-size request.
+ * Keep one Rect so readers observe geometry published before callbacks. */
+static bool surface_holder_get_frame(struct dvm *vm, dvm_ref self,
+                                      const union dvm_value *args, int nargs,
+                                      union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value frame = {0};
+   (void)dvm_get_field(vm, self, "surfaceFrame", "Landroid/graphics/Rect;", &frame);
+   if (!frame.l) {
+      struct dvm_class *rc = dvm__class_by_desc(vm, "Landroid/graphics/Rect;");
+      frame.l = rc ? dvm_new_object(vm, rc) : 0;
+      if (!frame.l) return false;
+      (void)dvm_set_field(vm, self, "surfaceFrame", "Landroid/graphics/Rect;", frame);
+   }
+   RETL(frame.l);
+}
+
 static bool surface_holder_set_fixed_size(struct dvm *vm, dvm_ref self,
                                           const union dvm_value *args,
                                           int nargs, union dvm_value *out)
@@ -47069,6 +47866,7 @@ static const struct rt_field rt_surface_holder_fields[] = {
    { "surface", "Landroid/view/Surface;" },
    { "width", "I" }, { "height", "I" }, { "format", "I" },
    { "creating", "Z" },
+   { "surfaceFrame", "Landroid/graphics/Rect;" },
    F_END,
 };
 
@@ -47078,6 +47876,7 @@ static const struct rt_method rt_surface_holder[] = {
    M("removeCallback", "(Landroid/view/SurfaceHolder$Callback;)V",
      surface_holder_remove_callback),
    M("getSurface", "()Landroid/view/Surface;", surface_holder_get_surface),
+   M("getSurfaceFrame", "()Landroid/graphics/Rect;", surface_holder_get_frame),
    M("setFixedSize", "(II)V", surface_holder_set_fixed_size),
    M("setSizeFromLayout", "()V", surface_holder_layout_size),
    M("isCreating", "()Z", surface_holder_is_creating),
@@ -47312,35 +48111,127 @@ static bool typed_array_has_value(struct dvm *vm, dvm_ref self,
    RETI(typed_array_style_value(vm, self, ARG(0).i, &value, &string) != 0);
 }
 
+static dvm_ref color_value_list(struct dvm *,int,int32_t,const char *,dvm_ref,unsigned);
+static bool color_value_argb(struct dvm *,int,int32_t,const char *,dvm_ref,unsigned,union dvm_value *);
+static bool typed_array_color(struct dvm *vm,dvm_ref self,
+                               const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   int32_t value=0;const char *text=NULL;
+   int kind=typed_array_style_value(vm,self,ARG(0).i,&value,&text);
+   bool list=!strcmp(builtin_name(),"getColorStateList");
+   if (!kind || (kind==1 && !value)) {if(list) RETL(0);RETI(nargs>1 ? ARG(1).i : 0);}
+   union dvm_value theme={0};
+   (void)dvm_get_field(vm,self,"themeSnapshot","Landroid/content/res/Resources$Theme;",&theme);
+   if (!list) return color_value_argb(vm,kind,value,text,theme.l,0,out);
+   dvm_ref colors=color_value_list(vm,kind,value,text,theme.l,0);
+   if (!colors) return false;
+   RETL(colors);
+}
+
+static int res_value_resolved(uint32_t,int32_t *,const char **);
+
+/* getResourceId retains identity; numeric getters dereference the value.
+ * XML attributes store TYPE_REFERENCE just like references from style bags. */
+static bool typed_array_number_value(struct dvm *vm,dvm_ref self,int index,
+                                      int *kind,int32_t *value,const char **text)
+{
+   *kind=typed_array_style_value(vm,self,index,value,text);
+   if (*kind==1) {
+      uint32_t id=(uint32_t)*value;
+      *kind=id ? res_value_resolved(id,value,text) : 0;
+      if (id && !*kind) {
+         dvm__throw(vm,"android/content/res/Resources$NotFoundException","resource #0x%08x",id);
+         return false;
+      }
+   }
+   if (*kind==2) {
+      dvm__throw(vm,"java/lang/UnsupportedOperationException","unresolved attribute at index %d",index);
+      return false;
+   }
+   return !dvm_exception(vm);
+}
+
+static bool typed_array_resource_id(struct dvm *vm,dvm_ref self,
+                                      const union dvm_value *args,int nargs,
+                                      union dvm_value *out)
+{
+   int32_t value=0;const char *text=NULL;
+   int kind=typed_array_style_value(vm,self,ARG(0).i,&value,&text);
+   if (dvm_exception(vm)) return false;
+   RETI(kind==1 && value ? value : nargs>1 ? ARG(1).i : 0);
+}
+
+static bool typed_array_parse_integer(struct dvm *vm,const char *text,int32_t *value)
+{
+   const char *p=text;
+   if (!p || !*p || isspace((unsigned char)*p)) goto invalid;
+   bool negative=*p=='-';
+   if (*p=='-' || *p=='+') ++p;
+   int base=0;
+   if (*p=='#') { ++p;base=16; }
+   if (!*p || *p=='-' || *p=='+' || isspace((unsigned char)*p)) goto invalid;
+   errno=0;char *end=NULL;
+   long long number=strtoll(p,&end,base);
+   if (errno==ERANGE || end==p || *end || number<0 ||
+       number>(negative ? INT64_C(2147483648) : INT64_C(2147483647))) goto invalid;
+   *value=(int32_t)(negative ? -number : number);
+   return true;
+invalid:
+   dvm__throw(vm,"java/lang/NumberFormatException","%s",text ? text : "null");
+   return false;
+}
+
 static bool typed_array_default_int(struct dvm *vm, dvm_ref self,
                                     const union dvm_value *args, int nargs,
                                     union dvm_value *out)
 {
-   int32_t value = 0; const char *string = NULL;
-   if (typed_array_style_value(vm, self, ARG(0).i, &value, &string)) RETI(value);
-   RETI(nargs > 1 ? ARG(1).i : 0);
+   int kind=0;int32_t value=0;const char *text=NULL;
+   if (!typed_array_number_value(vm,self,ARG(0).i,&kind,&value,&text)) return false;
+   if (!kind) RETI(nargs>1 ? ARG(1).i : 0);
+   if (kind>=0x10 && kind<=0x1f) RETI(value);
+   if (!strcmp(builtin_name(),"getInteger")) {
+      dvm__throw(vm,"java/lang/UnsupportedOperationException","attribute at index %d is not an integer (type=0x%x)",ARG(0).i,kind);
+      return false;
+   }
+   if ((kind=='L' || kind==3) && !text) RETI(nargs>1 ? ARG(1).i : 0);
+   if (kind=='L' || kind==3) {
+      if (!typed_array_parse_integer(vm,text,&value)) return false;
+      RETI(value);
+   }
+   /* Float, dimension and fraction string forms are not integer syntax. */
+   dvm__throw(vm,"java/lang/NumberFormatException","attribute at index %d has non-integer type 0x%x",ARG(0).i,kind);
+   return false;
 }
 
 static bool typed_array_default_bool(struct dvm *vm, dvm_ref self,
                                      const union dvm_value *args, int nargs,
                                      union dvm_value *out)
 {
-   int32_t value = 0; const char *string = NULL;
-   if (typed_array_style_value(vm, self, ARG(0).i, &value, &string)) RETI(value != 0);
-   return typed_array_default_int(vm, self, args, nargs, out);
+   int kind=0;int32_t value=0;const char *text=NULL;
+   if (!typed_array_number_value(vm,self,ARG(0).i,&kind,&value,&text)) return false;
+   if (!kind) RETI(nargs>1 ? ARG(1).i : 0);
+   if (kind>=0x10 && kind<=0x1f) RETI(value!=0);
+   if ((kind=='L' || kind==3) && !text) RETI(nargs>1 ? ARG(1).i : 0);
+   RETI((kind=='L' || kind==3) &&
+      (!strcmp(text,"1") || !strcmp(text,"true") || !strcmp(text,"TRUE")));
 }
 
 static bool typed_array_default_float(struct dvm *vm, dvm_ref self,
                                       const union dvm_value *args, int nargs,
                                       union dvm_value *out)
 {
-   int32_t value = 0; const char *string = NULL;
-   int kind = typed_array_style_value(vm, self, ARG(0).i, &value, &string);
-   if (!kind) RETF(nargs > 1 ? ARG(1).f : 0.0f);
-   if (kind == 4) {
-      float converted; memcpy(&converted, &value, sizeof converted); RETF(converted);
+   int kind=0;int32_t value=0;const char *text=NULL;
+   if (!typed_array_number_value(vm,self,ARG(0).i,&kind,&value,&text)) return false;
+   if (!kind) RETF(nargs>1 ? ARG(1).f : 0.0f);
+   if (kind==4) { float converted;memcpy(&converted,&value,sizeof converted);RETF(converted); }
+   if (kind>=0x10 && kind<=0x1f) RETF((float)value);
+   if ((kind=='L' || kind==3) && text) {
+      char *end=NULL;float converted=strtof(text,&end);
+      if (end!=text && !*end) RETF(converted);
+      dvm__throw(vm,"java/lang/NumberFormatException","%s",text);return false;
    }
-   RETF((float)value);
+   dvm__throw(vm,"java/lang/UnsupportedOperationException","attribute at index %d is not a float (type=0x%x)",ARG(0).i,kind);
+   return false;
 }
 
 static float android_complex_dimension(int32_t complex);
@@ -47534,16 +48425,6 @@ static dvm_ref color_state_list_new(struct dvm *vm, int32_t color)
       if(!specs || !colors || !wildcard) return 0;
    }
    return result;
-}
-
-static bool typed_array_get_colors(struct dvm *vm, dvm_ref self,
-                                   const union dvm_value *args, int nargs,
-                                   union dvm_value *out)
-{
-   (void)nargs;
-   int32_t value = 0; const char *string = NULL;
-   if (!typed_array_style_value(vm, self, ARG(0).i, &value, &string)) RETL(0);
-   RETL(color_state_list_new(vm, value));
 }
 
 static bool drawable_mutate(struct dvm *vm, dvm_ref self,
@@ -49679,34 +50560,43 @@ static bool view_clear_focus(struct dvm *vm, dvm_ref self,
  * the emulator that changes the window's shape, so it is the only caller. */
 static void ime_run_layout_pass(struct dvm *vm)
 {
-   for (int i = 0; i < g_nlayout_observers; ++i) {
-      dvm_ref listener =
-         ui_obj(vm, g_layout_observers[i], "globalLayoutListener",
-                "Landroid/view/ViewTreeObserver$OnGlobalLayoutListener;");
-      struct dvm_class *c = listener ? dvm_object_class(vm, listener) : NULL;
-      struct dvm_method *m =
-         c ? dvm_find_method(vm, c, "onGlobalLayout", "()V") : NULL;
-      union dvm_value ignored = { 0 };
-      if (m && !dvm_call(vm, m, listener, NULL, 0, &ignored))
-         ui_report_exception(vm, "onGlobalLayout");
+   const bool apply_insets=vm->insets_pass_pending;
+   vm->insets_pass_pending=false;
+   /* Snapshot observers: callbacks can add/remove observers, reallocating the
+    * registry. A removed listener remains in this dispatch's listener snapshot
+    * but never in a later dispatch. No fixed observer limit drops callbacks. */
+   size_t count=vm->nlayout_observers;
+   dvm_ref *observers=count ? malloc(count*sizeof *observers) : NULL;
+   if(count && !observers) {dvm__throw(vm,"java/lang/OutOfMemoryError","Layout dispatch");return;}
+   if(count) memcpy(observers,vm->layout_observers,count*sizeof *observers);
+   for(size_t i=0;i<count;++i) dvm_pin(vm,observers[i]);
+   for(int phase=0;phase<2;++phase) for(size_t i=0;i<count;++i) {
+      union dvm_value list={0},ignored={0};
+      (void)dvm_get_field(vm,observers[i],phase ? "preDrawListeners" : "globalLayoutListeners","Ljava/util/List;",&list);
+      struct rt_list *items=list_of(vm,list.l);
+      uint32_t listeners=items ? items->size : 0;
+      dvm_ref *snapshot=listeners ? malloc((size_t)listeners*sizeof *snapshot) : NULL;
+      if(listeners && !snapshot) {dvm__throw(vm,"java/lang/OutOfMemoryError","Layout listeners");ui_report_exception(vm,"layout listeners");continue;}
+      if(listeners) memcpy(snapshot,items->items,(size_t)listeners*sizeof *snapshot);
+      for(uint32_t j=0;j<listeners;++j) dvm_pin(vm,snapshot[j]);
+      for(uint32_t j=0;j<listeners;++j) {
+         dvm_ref listener=snapshot[j];
+         struct dvm_class *c=listener ? dvm_object_class(vm,listener) : NULL;
+         struct dvm_method *method=c ? dvm_find_method(vm,c,phase ? "onPreDraw" : "onGlobalLayout",phase ? "()Z" : "()V") : NULL;
+         if(method && !dvm_call(vm,method,listener,NULL,0,&ignored)) ui_report_exception(vm,phase ? "onPreDraw" : "onGlobalLayout");
+      }
+      for(uint32_t j=0;j<listeners;++j) dvm_unpin(vm,snapshot[j]);
+      free(snapshot);
    }
-   /* Then the pre-draw listeners, which run once the layout is settled and
-    * before the frame is drawn. */
-   for (int i = 0; i < g_nlayout_observers; ++i) {
-      dvm_ref listener =
-         ui_obj(vm, g_layout_observers[i], "preDrawListener",
-                "Landroid/view/ViewTreeObserver$OnPreDrawListener;");
-      struct dvm_class *c = listener ? dvm_object_class(vm, listener) : NULL;
-      struct dvm_method *m =
-         c ? dvm_find_method(vm, c, "onPreDraw", "()Z") : NULL;
-      union dvm_value ignored = { 0 };
-      if (m && !dvm_call(vm, m, listener, NULL, 0, &ignored))
-         ui_report_exception(vm, "onPreDraw");
-   }
-   /* The same pass delivers the window insets.  There is no status bar,
+   for(size_t i=0;i<count;++i) dvm_unpin(vm,observers[i]);
+   free(observers);
+   /* Insets dispatch is separate from ordinary layout: a listener may
+    * requestLayout or setLayoutParams itself. Re-delivering unchanged
+    * insets on that layout would create a permanent feedback loop.
+    * There is no status bar,
     * navigation bar or cutout here, so they are zero — a real answer, and the
     * one a full-screen game gets on a gesture-navigation device. */
-   for (int i = 0; i < g_ninsets_views; ++i) {
+   for (int i = 0; apply_insets && i < g_ninsets_views; ++i) {
       dvm_ref view = g_insets_views[i];
       dvm_ref listener =
          ui_obj(vm, view, "insetsListener",
@@ -49739,7 +50629,7 @@ static bool view_request_layout(struct dvm *vm, dvm_ref self,
    (void)args; (void)nargs; (void)out;
    union dvm_value required = {.i=1};
    (void)dvm_set_field(vm, self, "layoutRequired", "Z", required);
-   ui_layout_changed();
+   ui_view_layout_changed(vm,self);
    /* ViewRootImpl's rule.  A request made from *inside* the pass -- which is
     * what a global-layout listener that calls requestLayout() does, and UE4's
     * does -- buys one more pass and no more; ViewRootImpl calls that
@@ -49853,6 +50743,7 @@ static void ime_deliver_text(struct dvm *vm, dvm_ref view, const char *text)
 static void ime_disconnect(struct dvm *vm)
 {
    luna_ime_hide();
+   if(g_ime_band) vm->insets_pass_pending=true;
    g_ime_band = 0;
    g_layout_pass_pending = true;
    /* The field kept its text while the panel was up without the view layer
@@ -49923,7 +50814,9 @@ static bool imm_show_soft_input(struct dvm *vm, dvm_ref self,
                     ui_int(vm, view, "maxLines") != 1;
 
    luna_ime_show(text ? text : "", input_type, multiline);
-   g_ime_band = luna_ime_band_height(rt_surface_h());
+   int next_band=luna_ime_band_height(rt_surface_h());
+   if(g_ime_band!=next_band) vm->insets_pass_pending=true;
+   g_ime_band=next_band;
    /* Not fired here: on a device the window resizes and the layout pass runs
     * on the next frame, never inside showSoftInput(), and the caller is
     * holding its own lock while it asks. */
@@ -50032,7 +50925,12 @@ void dvm_ime_frame(struct dvm *vm)
    /* The frame pump does not carry the interpreter lock, and everything below
     * runs guest code. */
    unsigned cookie = dvm_gil_enter_from_guest(vm);
+   /* Layout listeners belong to one main-thread dispatch. A top-level
+    * dvm_call return otherwise drains and redraws the entire UI after every
+    * listener, including in the middle of this unfinished layout pass. */
+   ++vm->drain_depth;
    dvm_ime_tick(vm);
+   --vm->drain_depth;
    dvm_gil_leave_to_guest(vm, cookie);
 }
 
@@ -50125,6 +51023,12 @@ static void surface_visit(struct dvm *vm, dvm_ref view, unsigned depth)
          if (created || reformat || s->width != w || s->height != h) {
             if (reformat && !surface_notify(s, false, true)) return;
             s->width = w; s->height = h; s->format = format;
+            union dvm_value frame = {0};
+            if (!surface_holder_get_frame(vm, holder, NULL, 0, &frame)) return;
+            rt_set_int(vm, frame.l, "left", 0);
+            rt_set_int(vm, frame.l, "top", 0);
+            rt_set_int(vm, frame.l, "right", w);
+            rt_set_int(vm, frame.l, "bottom", h);
             surface_window_valid(vm, holder, true);
             if (!surface_notify(s, created || reformat, false)) return;
          }
@@ -50496,6 +51400,7 @@ void dvm__ui_tick(struct dvm *vm)
    if (w != display_w || h != display_h) {
       const int old_w = display_w, old_h = display_h;
       display_w = w; display_h = h;
+      vm->insets_pass_pending=true;g_layout_pass_pending=true;
       ui_layout_changed();
       activity_display_changed(vm, old_w, old_h, w, h);
    }
@@ -53414,7 +54319,7 @@ static bool paint_font_metrics(struct dvm *vm, dvm_ref self,
    (void)dvm_get_field(vm, self, "typeface", "Landroid/graphics/Typeface;", &face);
    bool bold = face.l && (rt_get_int(vm, face.l, "style") & 1);
    struct luna_overlay_font_metrics fm;
-   if (!luna_overlay_get_font_metrics(size.f, bold, &fm)) {
+   if (!luna_overlay_font_metrics(face.l ? (uint32_t)rt_get_int(vm,face.l,"fontHandle") : 0,size.f,bold,&fm)) {
       dvm__throw(vm, "java/lang/RuntimeException", "Font metrics unavailable");
       return false;
    }
@@ -53618,7 +54523,7 @@ static bool paint_shape_units(struct dvm *vm,dvm_ref paint,const uint16_t *units
    (void)dvm_get_field(vm,paint,"typeface","Landroid/graphics/Typeface;",&face);
    (void)dvm_get_field(vm,paint,"flags","I",&flags);
    bool bold=(flags.i&32) || (face.l && (rt_get_int(vm,face.l,"style")&1));
-   if (luna_overlay_shape_text(units,length,size.f,bold,run)) return true;
+   if (luna_overlay_shape_font(face.l ? (uint32_t)rt_get_int(vm,face.l,"fontHandle") : 0,units,length,size.f,bold,run)) return true;
    dvm__throw(vm,"java/lang/RuntimeException","Text shaping unavailable");return false;
 }
 
@@ -53734,7 +54639,7 @@ static bool textview_layout_build(struct dvm *vm,struct textview_layout *layout)
    } while(paragraph<=length);
    free(breaks);free(advances);
    struct luna_overlay_font_metrics metrics;
-   if(good && !luna_overlay_get_font_metrics(layout->px,layout->bold,&metrics)) {
+   if(good && !luna_overlay_font_metrics(layout->face ? (uint32_t)rt_get_int(vm,layout->face,"fontHandle") : 0,layout->px,layout->bold,&metrics)) {
       dvm__throw(vm,"java/lang/RuntimeException","Font metrics unavailable");good=false;
    }
    if(good) {
@@ -64679,28 +65584,66 @@ static void va_notify(struct dvm *vm, dvm_ref animator, bool update, const char 
    }
    free(snapshot);
 }
-static bool va_float_values(struct dvm *vm, dvm_ref self, const union dvm_value *args,
-                             int nargs, union dvm_value *out)
+static bool va_values(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                       union dvm_value *out, char kind)
 {
-   (void)nargs;
-   struct dvm_object *a = dvm__obj(vm, ARG(0).l);
-   if (!a || a->kind != DVM_OBJ_ARRAY || a->elem_kind != 'F' || !a->length) {
-      dvm__throw(vm, "java/lang/IllegalArgumentException", "ValueAnimator requires float values");
-      return false;
-   }
    bool create = !self;
    if (create) {
       struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/animation/ValueAnimator;");
       self = c ? dvm_new_object(vm, c) : 0;
+      if (!self) return false;
       anim_set_j(vm, self, "duration", 300);
       rt_set_int(vm, self, "repeatMode", 1);
    }
-   union dvm_value values = { .l = dvm_new_array(vm, 'F', "F", a->length) };
-   void *data = values.l ? dvm_array_data(vm, values.l) : NULL;
-   if (data) memcpy(data, a->data, a->length * sizeof(float));
-   (void)dvm_set_field(vm, self, "values", "[F", values);
+   struct dvm_object *a = dvm__obj(vm, args[0].l);
+   /* Android's setters ignore null/empty input, preserving existing values. */
+   if (a && a->length) {
+      if (a->kind != DVM_OBJ_ARRAY || a->elem_kind != kind) {
+         dvm__throw(vm, "java/lang/IllegalArgumentException", "animator value array type");
+         return false;
+      }
+      dvm_pin(vm, self);
+      const char *desc = kind == 'I' ? "I" : "F";
+      union dvm_value values = { .l = dvm_new_array(vm, kind, desc, a->length) };
+      void *data = values.l ? dvm_array_data(vm, values.l) : NULL;
+      if (!data) { dvm_unpin(vm, self); return false; }
+      memcpy(data, a->data, (size_t)a->length * sizeof(uint32_t));
+      (void)dvm_set_field(vm, self, kind == 'I' ? "intValues" : "values", kind == 'I' ? "[I" : "[F", values);
+      (void)dvm_set_field(vm, self, kind == 'I' ? "values" : "intValues", kind == 'I' ? "[F" : "[I", (union dvm_value){0});
+      dvm_unpin(vm, self);
+   }
    if (create) RETL(self);
    RETV();
+}
+static bool va_float_values(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                             int nargs, union dvm_value *out)
+{
+   (void)nargs; return va_values(vm,self,args,out,'F');
+}
+static bool va_int_values(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                           int nargs, union dvm_value *out)
+{
+   (void)nargs; return va_values(vm,self,args,out,'I');
+}
+/* IntKeyframeSet uses Java int subtraction/addition and truncates the float
+ * delta before adding the start value. Keep the original int keyframes:
+ * converting them to float storage loses low bits above 2^24. */
+static int32_t va_int_value(const int32_t *values,uint32_t count,float fraction)
+{
+   if (isnan(fraction)) return values[count-1];
+   uint32_t next = count > 1 ? count-1 : 1;
+   if (count > 1 && fraction < 1.0f) {
+      next = 1;
+      while (next < count-1 && !(fraction < (float)next/(float)(count-1))) ++next;
+   }
+   int32_t start = count > 1 ? values[next-1] : 0;
+   int32_t end = count > 1 ? values[next] : values[0];
+   float low = count > 1 ? (float)(next-1)/(float)(count-1) : 0.0f;
+   float high = count > 1 ? (float)next/(float)(count-1) : 1.0f;
+   float interval = (fraction-low)/(high-low);
+   int32_t delta = (int32_t)((uint32_t)end-(uint32_t)start);
+   int32_t offset = java_d2i((float)(interval*(float)delta));
+   return (int32_t)((uint32_t)start+(uint32_t)offset);
 }
 static bool va_property(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                          int nargs, union dvm_value *out)
@@ -64728,6 +65671,13 @@ static bool va_property(struct dvm *vm, dvm_ref self, const union dvm_value *arg
    (void)dvm_get_field(vm, self, "fraction", "F", &fraction);
    if (!strcmp(name, "getAnimatedFraction")) { *out = fraction; return true; }
    if (!strcmp(name, "getAnimatedValue")) {
+      union dvm_value integers = {0};
+      (void)dvm_get_field(vm, self, "intValues", "[I", &integers);
+      struct dvm_object *ints = dvm__obj(vm, integers.l);
+      if (ints && ints->length) {
+         union dvm_value value = {.i = va_int_value(ints->data, ints->length, fraction.f)};
+         RETL(box_make(vm, "Ljava/lang/Integer;", value));
+      }
       union dvm_value values = { 0 };
       (void)dvm_get_field(vm, self, "values", "[F", &values);
       struct dvm_object *a = dvm__obj(vm, values.l);
@@ -65058,7 +66008,7 @@ static bool va_control(struct dvm *vm, dvm_ref self, const union dvm_value *args
    RETV();
 }
 static const struct rt_field rt_value_animator_fields[] = {
-   { "values", "[F" }, { "fraction", "F" }, { "duration", "J" }, { "delay", "J" },
+   { "values", "[F" }, { "intValues", "[I" }, { "fraction", "F" }, { "duration", "J" }, { "delay", "J" },
    { "startTime", "J" }, { "repeatCount", "I" }, { "repeatMode", "I" },
    { "running", "Z" }, { "generation", "I" }, { "cycle", "I" },
    { "updates", "Ljava/util/List;" }, { "listeners", "Ljava/util/List;" },
@@ -65438,6 +66388,8 @@ static const struct rt_method rt_value_animator[] = {
    M("removeListener", "(Landroid/animation/Animator$AnimatorListener;)V", va_remove_listeners),
    M("removeUpdateListener", "(Landroid/animation/ValueAnimator$AnimatorUpdateListener;)V", va_remove_listeners),
    M("getStartDelay", "()J", va_property),
+   SM("ofInt", "([I)Landroid/animation/ValueAnimator;", va_int_values),
+   M("setIntValues", "([I)V", va_int_values),
    SM("ofFloat", "([F)Landroid/animation/ValueAnimator;", va_float_values),
    M("setFloatValues", "([F)V", va_float_values),
    M("setDuration", "(J)Landroid/animation/ValueAnimator;", va_property),
@@ -67654,7 +68606,7 @@ static const struct rt_class rt_classes[] = {
    { "Ldalvik/system/DexClassLoader;", "Ldalvik/system/BaseDexClassLoader;",
      rt_dex_class_loader, rt_dex_class_loader_fields, NULL },
    { "Ljava/util/ServiceLoader;", "Ljava/lang/Object;", rt_service_loader,
-     rt_service_loader_fields, NULL },
+     rt_service_loader_fields, rt_iface_iterable },
    { "Ljava/lang/Thread$State;", "Ljava/lang/Enum;", rt_enum_thread_state,
      NULL, NULL, rt_thread_state_sfields },
    { "Ljava/lang/Thread;", "Ljava/lang/Object;", rt_thread,
@@ -67682,6 +68634,12 @@ static const struct rt_class rt_classes[] = {
      NULL, rt_iface_collection },
    { "Ljava/util/AbstractList;", "Ljava/util/AbstractCollection;",
      rt_abstract_list_iterator_methods, NULL, rt_iface_list },
+   { "Ljava/util/Collections$EmptyList;", "Ljava/util/AbstractList;",
+     rt_empty_list, NULL, empty_list_interfaces },
+   { "Ljava/util/Collections$EmptySet;", "Ljava/util/AbstractSet;",
+     rt_empty_set, NULL, empty_serializable },
+   { "Ljava/util/Collections$EmptyMap;", "Ljava/util/AbstractMap;",
+     rt_empty_map, NULL, empty_serializable },
    { "Ljava/util/AbstractSet;", "Ljava/util/AbstractCollection;",
      rt_abstract_set, NULL, rt_iface_set },
    { "Ljava/util/AbstractQueue;", "Ljava/util/AbstractCollection;",
@@ -67989,11 +68947,11 @@ static const struct rt_class rt_classes[] = {
     * above them: as siblings under BlockingQueue a cast between the two would
     * fail, which is exactly what a check-cast to Queue does. */
    { "Ljava/util/Queue;", "Ljava/lang/Object;", NULL, NULL, NULL },
-   { "Ljava/util/Deque;", "Ljava/lang/Object;", NULL, NULL, NULL },
+   { "Ljava/util/Deque;", "Ljava/lang/Object;", rt_deque_interface, NULL, NULL },
    { "Ljava/util/ArrayDeque;", "Ljava/util/concurrent/BlockingQueue;",
-     rt_blocking_queue, NULL, rt_iface_queue },
+     rt_deque_methods, NULL, rt_iface_queue },
    { "Ljava/util/LinkedList;", "Ljava/util/concurrent/BlockingQueue;",
-     rt_blocking_queue, NULL, rt_iface_list, NULL, false,
+     rt_deque_methods, NULL, rt_iface_list, NULL, false,
      "<E:Ljava/lang/Object;>Ljava/lang/Object;Ljava/util/List<TE;>;Ljava/util/Deque<TE;>;Ljava/lang/Cloneable;Ljava/io/Serializable;" },
    /* java.io streams and java.net.  HttpsURLConnection only differs in the
     * scheme it accepts, which the URL already carries, so it inherits
@@ -68086,7 +69044,7 @@ static const struct rt_class rt_classes[] = {
    { "Ljava/io/InputStreamReader;", "Ljava/io/Reader;",
      rt_input_stream_reader, NULL, NULL },
    { "Ljava/io/BufferedReader;", "Ljava/io/Reader;",
-     rt_buffered_reader, NULL, NULL },
+     rt_buffered_reader, rt_buffered_reader_fields, NULL },
    { "Ljava/io/StringReader;", "Ljava/io/Reader;",
      rt_string_reader, NULL, NULL },
    { "Ljava/io/FileReader;", "Ljava/io/InputStreamReader;", rt_file_reader,
@@ -68231,6 +69189,12 @@ static const struct rt_class rt_classes[] = {
      rt_conn_fields, NULL },
    { "Ljava/net/HttpURLConnection;", "Ljava/net/URLConnection;",
      rt_url_connection, NULL, NULL },
+   { "Ljava/net/JarURLConnection;", "Ljava/net/URLConnection;",
+     rt_jar_connection, rt_jar_connection_fields, NULL },
+   { "Llibcore/net/url/JarURLConnectionImpl;", "Ljava/net/JarURLConnection;",
+     rt_jar_connection, NULL, NULL },
+   { "Llibcore/net/url/JarURLConnectionImpl$InputStream;", "Ljava/io/ByteArrayInputStream;",
+     rt_jar_stream, rt_jar_stream_fields, NULL },
    { "Ljavax/net/ssl/HttpsURLConnection;", "Ljava/net/HttpURLConnection;",
      rt_https_connection, NULL, NULL },
    { "Ljava/util/Date;", "Ljava/lang/Object;", rt_date, rt_time_fields,
@@ -68252,15 +69216,20 @@ static const struct rt_class rt_classes[] = {
    { "Ljava/text/Format;", "Ljava/lang/Object;", rt_format, NULL, rt_format_ifaces },
    { "Ljava/text/MessageFormat;", "Ljava/text/Format;", rt_message_format, rt_message_format_fields, NULL },
    { "Ljava/text/DateFormatSymbols;", "Ljava/lang/Object;", rt_dfs, rt_dfs_fields, NULL },
+   { "Landroid/text/format/DateFormat;", "Ljava/lang/Object;", rt_android_date_format, NULL, NULL },
    { "Ljava/text/DateFormat;", "Ljava/text/Format;", rt_sdf, rt_sdf_fields,
      NULL },
    { "Ljava/text/SimpleDateFormat;", "Ljava/text/DateFormat;", rt_sdf,
      NULL, NULL },
+   { "Ljava/time/DateTimeException;", "Ljava/lang/RuntimeException;", NULL, NULL, NULL },
    { "Ljava/time/Instant;", "Ljava/lang/Object;", rt_instant,
      rt_temporal_fields, NULL },
    { "Ljava/time/ZoneOffset;", "Ljava/lang/Object;", rt_zone_offset,
      rt_zone_offset_fields, NULL },
    { "Ljava/time/OffsetDateTime;", "Ljava/lang/Object;", rt_offset_date_time,
+     rt_temporal_fields, NULL },
+   { "Ljava/time/Month;", "Ljava/lang/Enum;", rt_month, NULL, NULL, rt_month_sfields },
+   { "Ljava/time/LocalDate;", "Ljava/lang/Object;", rt_local_date,
      rt_temporal_fields, NULL },
    { "Ljava/time/LocalDateTime;", "Ljava/lang/Object;", rt_local_date_time,
      rt_temporal_fields, NULL },
@@ -68268,6 +69237,7 @@ static const struct rt_class rt_classes[] = {
      rt_date_time_formatter, rt_dtf_fields, NULL },
    { "Ljava/text/NumberFormat;", "Ljava/text/Format;", rt_decimal_format,
      rt_decimal_format_fields, NULL },
+   { "Ljava/text/DecimalFormatSymbols;", "Ljava/lang/Object;", rt_decimal_symbols, rt_decimal_symbols_fields, decsym_interfaces },
    { "Ljava/text/DecimalFormat;", "Ljava/text/NumberFormat;", rt_decimal_format,
      NULL, NULL },
    { "Ljava/text/ChoiceFormat;", "Ljava/text/NumberFormat;", rt_choice,
@@ -68316,6 +69286,8 @@ static const struct rt_class rt_classes[] = {
      rt_iterator, rt_iterator_fields, NULL, NULL, false,
      "<E:Ljava/lang/Object;>Ljava/lang/Object;" },
    { "Ljava/util/ListIterator;", "Ljava/util/Iterator;", NULL, NULL, NULL },
+   { "Llunaria/util/DescendingItr;", "Ljava/util/Iterator;", rt_descending_iterator,
+     rt_descending_iterator_fields, NULL },
    { "Llunaria/util/ListItr;", "Ljava/lang/Object;", rt_list_itr,
      rt_list_itr_fields, rt_list_itr_ifaces },
    { "Landroid/text/TextUtils;", "Ljava/lang/Object;", rt_textutils, NULL, NULL },
@@ -68721,13 +69693,19 @@ static const struct rt_class rt_classes[] = {
      NULL, NULL, NULL },
    { "Ljava/nio/ReadOnlyBufferException;", "Ljava/lang/UnsupportedOperationException;",
      NULL, NULL, NULL },
-   { "Ljava/lang/reflect/Method;", "Ljava/lang/Object;",
+   { "Ljava/lang/reflect/Member;", "Ljava/lang/Object;",
+     rt_reflect_member, NULL, NULL, NULL, true },
+   { "Ljava/lang/reflect/AccessibleObject;", "Ljava/lang/Object;",
+     rt_accessible_object, rt_accessible_fields, rt_iface_annotated },
+   { "Ljava/lang/reflect/Executable;", "Ljava/lang/reflect/AccessibleObject;",
+     rt_executable, NULL, rt_iface_executable },
+   { "Ljava/lang/reflect/Method;", "Ljava/lang/reflect/Executable;",
      rt_reflect_method, rt_method_fields, NULL },
-   { "Ljava/lang/reflect/Field;", "Ljava/lang/Object;", rt_reflect_field,
-     rt_method_fields, NULL },
+   { "Ljava/lang/reflect/Field;", "Ljava/lang/reflect/AccessibleObject;", rt_reflect_field,
+     rt_method_fields, rt_iface_reflect_member },
    { "Ldalvik/system/DexFile;", "Ljava/lang/Object;", rt_dexfile,
      rt_dexfile_fields, NULL },
-   { "Ljava/lang/reflect/Constructor;", "Ljava/lang/Object;", rt_reflect_ctor,
+   { "Ljava/lang/reflect/Constructor;", "Ljava/lang/reflect/Executable;", rt_reflect_ctor,
      rt_method_fields, NULL },
    { "Ljava/lang/reflect/InvocationHandler;", "Ljava/lang/Object;",
      NULL, NULL, NULL, NULL, true },
@@ -68874,6 +69852,8 @@ static const struct rt_class rt_classes[] = {
      rt_condvar_fields, NULL },
    { "Landroid/app/LoadedApk$ReceiverDispatcher$Args;", "Ljava/lang/Object;",
      rt_receiver_args, rt_receiver_args_fields, rt_iface_runnable },
+   { "Landroid/view/ViewStub;", "Landroid/view/View;", rt_viewstub, rt_viewstub_fields, NULL },
+   { "Landroid/view/ViewStub$OnInflateListener;", "Ljava/lang/Object;", rt_viewstub_listener, NULL, NULL },
    { "Landroid/view/LayoutInflater;", "Ljava/lang/Object;", rt_layout_inflater,
      rt_layout_inflater_fields, NULL },
    { "Landroid/view/LayoutInflater$Factory;", "Ljava/lang/Object;", rt_inflater_factory,NULL,NULL,NULL,true },
@@ -68983,6 +69963,8 @@ static const struct rt_class rt_classes[] = {
      "Landroid/graphics/drawable/DrawableContainer;", rt_state_list_drawable,
      rt_state_list_drawable_fields, NULL },
    /* Types only: what getDrawable() hands back for the other drawable XML roots. */
+   { "Landroid/graphics/drawable/Drawable$ConstantState;", "Ljava/lang/Object;", rt_drawable_constant_state, NULL, NULL },
+   { "Landroid/graphics/drawable/VectorDrawable$VectorDrawableState;", "Landroid/graphics/drawable/Drawable$ConstantState;", rt_vector_state, rt_vector_state_fields, NULL },
    { "Landroid/graphics/drawable/VectorDrawable;",
      "Landroid/graphics/drawable/Drawable;", rt_vector_drawable, rt_vector_drawable_fields, NULL },
    { "Landroid/graphics/drawable/AnimatedVectorDrawable;",
@@ -69040,17 +70022,17 @@ static const struct rt_class rt_classes[] = {
      rt_image_view_fields, NULL },
    { "Landroid/widget/CompoundButton;", "Landroid/widget/Button;",
      rt_compound_button, rt_compound_fields, NULL },
-   { "Landroid/widget/CheckBox;", "Landroid/widget/CompoundButton;", NULL,
+   { "Landroid/widget/CheckBox;", "Landroid/widget/CompoundButton;", rt_compound_widget_constructors,
      NULL, NULL },
-   { "Landroid/widget/RadioButton;", "Landroid/widget/CompoundButton;", NULL,
+   { "Landroid/widget/RadioButton;", "Landroid/widget/CompoundButton;", rt_radio_button,
      NULL, NULL },
-   { "Landroid/widget/Switch;", "Landroid/widget/CompoundButton;", NULL,
+   { "Landroid/widget/Switch;", "Landroid/widget/CompoundButton;", rt_compound_widget_constructors,
      NULL, NULL },
-   { "Landroid/widget/ToggleButton;", "Landroid/widget/CompoundButton;", NULL,
+   { "Landroid/widget/ToggleButton;", "Landroid/widget/CompoundButton;", rt_compound_widget_constructors,
      NULL, NULL },
-   { "Landroid/widget/CheckedTextView;", "Landroid/widget/TextView;", NULL,
+   { "Landroid/widget/CheckedTextView;", "Landroid/widget/TextView;", rt_compound_widget_constructors,
      NULL, NULL },
-   { "Landroid/widget/RadioGroup;", "Landroid/widget/LinearLayout;", NULL,
+   { "Landroid/widget/RadioGroup;", "Landroid/widget/LinearLayout;", rt_radio_group_constructors,
      NULL, NULL },
    { "Landroid/widget/ImageButton;", "Landroid/widget/ImageView;", rt_image_button,
      NULL, NULL },
@@ -69191,6 +70173,12 @@ static const struct rt_class rt_classes[] = {
     * measure through one.  Constructors are not inherited from Paint. */
    { "Landroid/text/TextPaint;", "Landroid/graphics/Paint;", rt_text_paint,
      rt_paint_fields, NULL },
+   { "Landroid/graphics/fonts/FontStyle;", "Ljava/lang/Object;", rt_font_style, rt_font_style_fields, NULL },
+   { "Landroid/graphics/fonts/Font;", "Ljava/lang/Object;", rt_font, rt_font_fields, NULL },
+   { "Landroid/graphics/fonts/Font$Builder;", "Ljava/lang/Object;", rt_font_builder, rt_font_builder_fields, NULL },
+   { "Landroid/graphics/fonts/FontFamily;", "Ljava/lang/Object;", rt_font_family, rt_font_family_fields, NULL },
+   { "Landroid/graphics/fonts/FontFamily$Builder;", "Ljava/lang/Object;", rt_font_family_builder, rt_font_family_fields, NULL },
+   { "Landroid/graphics/Typeface$CustomFallbackBuilder;", "Ljava/lang/Object;", rt_font_fallback, rt_font_fallback_fields, NULL },
    { "Landroid/graphics/Typeface;", "Ljava/lang/Object;", rt_typeface,
      rt_typeface_fields, NULL, rt_typeface_sfields },
    { "Landroid/app/NotificationManager;", "Ljava/lang/Object;",
@@ -69625,7 +70613,7 @@ struct dvm_class *dvm_runtime_define(struct dvm *vm, const char *desc)
 
    if (!strcmp(desc, "Ljava/util/Collections;")) {
       static const char *const types[] = {
-         "Ljava/util/ArrayList;", "Ljava/util/HashSet;", "Ljava/util/HashMap;"
+         "Ljava/util/Collections$EmptyList;", "Ljava/util/Collections$EmptySet;", "Ljava/util/Collections$EmptyMap;"
       };
       c->nsfields = nf;
       c->sfields = c->ifields;
@@ -69639,9 +70627,6 @@ struct dvm_class *dvm_runtime_define(struct dvm *vm, const char *desc)
          c->sfields[i].access = DEX_ACC_STATIC;
          struct dvm_class *vc = dvm__class_by_desc(vm, types[i]);
          dvm_ref value = vc ? dvm_new_object(vm, vc) : 0;
-         union dvm_value ignored = { 0 };
-         if (i < 2) (void)list_init(vm, value, NULL, 0, &ignored);
-         else (void)map_init(vm, value, NULL, 0, &ignored);
          c->sslots[i].l = value;
          if (value) dvm_pin(vm, value);
       }
@@ -69942,8 +70927,8 @@ struct dvm_class *dvm_runtime_define(struct dvm *vm, const char *desc)
          "ISO_OFFSET_DATE_TIME", "ISO_INSTANT",
       };
       static const char *const fmt_patterns[] = {
-         "yyyy-MM-dd", "HH:mm:ss", "yyyy-MM-dd'T'HH:mm:ss",
-         "yyyy-MM-dd'T'HH:mm:ssXXX", "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",
+         "uuuu-MM-dd", "HH:mm:ss", "uuuu-MM-dd'T'HH:mm:ss",
+         "uuuu-MM-dd'T'HH:mm:ssXXX", "uuuu-MM-dd'T'HH:mm:ss.SSS'Z'",
       };
       bool is_zone = !strcmp(desc, "Ljava/time/ZoneOffset;");
       int n = is_zone ? (int)(sizeof zone_names / sizeof zone_names[0])

@@ -1333,7 +1333,7 @@ bool dvm_get_static(struct dvm *vm, struct dvm_class *cls, const char *name,
 {
    struct dvm_field *f = class_find_field(cls, name, type, true);
    if (!f || !f->cls->sslots || f->slot >= f->cls->nsslots) return false;
-   dvm_init_class(vm, f->cls);
+   if (!dvm_init_class(vm, f->cls)) return false;
    *out = f->cls->sslots[f->slot];
    return true;
 }
@@ -1357,6 +1357,18 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
 bool dvm_init_class(struct dvm *vm, struct dvm_class *cls)
 {
    if (!cls) return true;
+   if (cls->init_state == 2) return true;
+   /* Only the initialising Java thread may recursively use partial state.
+    * Other threads wait without GIL; the owner must be able to finish. */
+   uint64_t me = 0;
+   if (cls->init_state != 3) {
+      me = dvm__current_thread_id(vm);
+      if (!me) return false;
+      while (cls->init_state == 1 && cls->init_owner != me) {
+         if (dvm_is_stopping(vm)) return false;
+         dvm_gil_wait_for_ns(vm, (uintptr_t)&cls->init_owner, UINT64_MAX);
+      }
+   }
    /* A class whose <clinit> threw stays erroneous: every later use has to fail
     * too, because its static fields were never assigned.  Reporting success
     * once the first attempt is over hands out nulls that look like data. */
@@ -1367,8 +1379,9 @@ bool dvm_init_class(struct dvm *vm, struct dvm_class *cls)
    }
    if (cls->init_state) return true;
    cls->init_state = 1;
+   cls->init_owner = me;
 
-   if (cls->super) dvm_init_class(vm, cls->super);
+   if (cls->super && !dvm_init_class(vm, cls->super)) goto failed;
 
    /* Constant static fields come from the encoded array, in declaration
     * order, before <clinit> runs. */
@@ -1418,12 +1431,18 @@ bool dvm_init_class(struct dvm *vm, struct dvm_class *cls)
             dvm_describe_exception(vm, vm->exception, why, sizeof why);
          fprintf(stderr, "[dvm] <clinit> %s failed: %s\n", cls->name,
                  why[0] ? why : "no exception");
-         cls->init_state = 3;   /* erroneous: never retried, never usable */
-         return false;
+         goto failed;
       }
    }
    cls->init_state = 2;
+   cls->init_owner = 0;
+   dvm_gil_notify_for((uintptr_t)&cls->init_owner);
    return true;
+failed:
+   cls->init_state = 3;
+   cls->init_owner = 0;
+   dvm_gil_notify_for((uintptr_t)&cls->init_owner);
+   return false;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -2322,8 +2341,8 @@ static bool invoke_body(struct dvm *vm, struct dvm_method *m, dvm_ref self,
     * constructor, as the process Application is) never executes new-instance,
     * so its <clinit> -- System.loadLibrary of the app's own natives, say --
     * has to run here, before the constructor. */
-   if (m->cls && (is_static || (m->name && !strcmp(m->name, "<init>"))))
-      dvm_init_class(vm, m->cls);
+   if (m->cls && (is_static || (m->name && !strcmp(m->name, "<init>"))) &&
+       !dvm_init_class(vm, m->cls)) return false;
 
    const bool synchronized = (m->access & DEX_ACC_SYNCHRONIZED) != 0;
    dvm_ref monitor = 0;
@@ -2795,7 +2814,7 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
                        t && t->name ? t->name : "?");
             goto exception;
          }
-         dvm_init_class(vm, t);
+         if (!dvm_init_class(vm, t)) goto exception;
          if (t->external && vm->hooks.new_external) {
             uint32_t h = vm->hooks.new_external(vm->hooks.user, vm, t->name);
             r[AA(u0)] = h ? h : dvm_new_object(vm, t);
@@ -4978,6 +4997,7 @@ void dvm_destroy(struct dvm *vm)
    free(vm->pending_owner);
    free(vm->pending_token);
    free(vm->active_object_animators);
+   free(vm->layout_observers);
 
    for (uint32_t i = 0; i < vm->heap_size; ++i) {
       struct dvm_object *o = heap_slot(vm, i + 1u);
