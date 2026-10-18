@@ -1,31 +1,135 @@
-/* MPL-2.0. java.text number, choice and message formatting.
+/* MPL-2.0. Android text direction and java.text formatting.
  * Implementation section of dvm_runtime.c; shared helpers remain in that
  * translation unit. Keep registration tables in dvm_runtime.c. */
+
+#include <locale.h>
+#include <fenv.h>
+
+static const char *const decsym_interfaces[]={"Ljava/lang/Cloneable;","Ljava/io/Serializable;",NULL};
+
+/* Number formatting uses instance-local symbols, never the host LC_NUMERIC.
+ * The locale groups below cover the numeric conventions implemented here;
+ * unknown locale identifiers inherit the root decimal convention. */
+static const struct rt_field rt_decimal_symbols_fields[] = {
+   {"zeroDigit","C"},{"decimalSeparator","C"},{"groupingSeparator","C"},
+   {"minusSign","C"},{"primaryGroup","I"},{"secondaryGroup","I"},F_END
+};
+static bool decsym_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   union dvm_value locale={0};
+   if(nargs) {
+      locale=args[0];
+      if(!locale.l) {dvm__throw(vm,"java/lang/NullPointerException","locale");return false;}
+   } else if(!loc_getDefault(vm,0,NULL,0,&locale)) return false;
+   const char *language=loc_field_utf8(vm,locale.l,"language");
+   const char *country=loc_field_utf8(vm,locale.l,"country");
+   uint16_t zero='0',decimal='.',group=',';
+   int secondary=3;
+   static const char *const comma_languages[]={"de","da","el","es","id","is","it","nl","pt","ro","tr","vi",NULL};
+   static const char *const space_languages[]={"bg","cs","et","fi","hr","hu","lt","lv","nb","nn","pl","ru","sk","sl","sq","sv","uk",NULL};
+   for(size_t i=0;comma_languages[i];++i) if(!strcmp(language,comma_languages[i])) {decimal=',';group='.';break;}
+   for(size_t i=0;space_languages[i];++i) if(!strcmp(language,space_languages[i])) {decimal=',';group=0x00a0;break;}
+   if(!strcmp(language,"fr")) {decimal=',';group=!strcmp(country,"CA") ? 0x00a0 : 0x202f;}
+   if(!strcmp(language,"de") && (!strcmp(country,"CH") || !strcmp(country,"LI"))) {decimal='.';group=0x2019;}
+   if(!strcmp(language,"ar") && strcmp(country,"DZ") && strcmp(country,"MA") && strcmp(country,"TN") && strcmp(country,"LY")) {
+      zero=0x0660;decimal=0x066b;group=0x066c;
+   }
+   if(!strcmp(language,"fa")) {zero=0x06f0;decimal=0x066b;group=0x066c;}
+   if(!strcmp(language,"bn")) zero=0x09e6;
+   if(!strcmp(language,"mr") || !strcmp(language,"ne")) zero=0x0966;
+   if(!strcmp(language,"as")) zero=0x09e6;
+   if(!strcmp(language,"bn") || !strcmp(language,"as") || !strcmp(language,"hi") ||
+      !strcmp(language,"mr") || !strcmp(language,"ne") ||
+      ((!strcmp(language,"en") || !strcmp(language,"ta") || !strcmp(language,"te") || !strcmp(language,"kn") || !strcmp(language,"ml")) && !strcmp(country,"IN"))) secondary=2;
+   (void)dvm_set_field(vm,self,"zeroDigit","C",(union dvm_value){.i=zero});
+   (void)dvm_set_field(vm,self,"decimalSeparator","C",(union dvm_value){.i=decimal});
+   (void)dvm_set_field(vm,self,"groupingSeparator","C",(union dvm_value){.i=group});
+   (void)dvm_set_field(vm,self,"minusSign","C",(union dvm_value){.i='-'});
+   rt_set_int(vm,self,"primaryGroup",3);rt_set_int(vm,self,"secondaryGroup",secondary);
+   RETV();
+}
+static dvm_ref decsym_copy(struct dvm *vm,dvm_ref source)
+{
+   dvm_ref copy=dvm_new_object(vm,dvm_find_class(vm,"java/text/DecimalFormatSymbols"));
+   if(!copy) return 0;
+   for(const struct rt_field *f=rt_decimal_symbols_fields;f->name;++f) {
+      union dvm_value value={0};
+      (void)dvm_get_field(vm,source,f->name,f->type,&value);
+      (void)dvm_set_field(vm,copy,f->name,f->type,value);
+   }
+   return copy;
+}
+static bool decsym_factory(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;
+   dvm_ref symbols=dvm_new_object(vm,dvm_find_class(vm,"java/text/DecimalFormatSymbols"));
+   if(!symbols) return false;
+   dvm_pin(vm,symbols);union dvm_value ignored={0};
+   bool good=decsym_init(vm,symbols,args,nargs,&ignored);dvm_unpin(vm,symbols);
+   if(!good) return false;
+   RETL(symbols);
+}
+static bool decsym_clone(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;RETL(decsym_copy(vm,self));
+}
+static bool decsym_char(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   const char *name=builtin_name();
+   const char *field=strstr(name,"ZeroDigit") ? "zeroDigit" : strstr(name,"DecimalSeparator") ? "decimalSeparator" :
+      strstr(name,"GroupingSeparator") ? "groupingSeparator" : "minusSign";
+   union dvm_value value={0};
+   if(nargs) {(void)dvm_set_field(vm,self,field,"C",args[0]);RETV();}
+   (void)dvm_get_field(vm,self,field,"C",&value);*out=value;return true;
+}
+static const struct rt_method rt_decimal_symbols[]={
+   M("<init>","()V",decsym_init),M("<init>","(Ljava/util/Locale;)V",decsym_init),
+   SM("getInstance","()Ljava/text/DecimalFormatSymbols;",decsym_factory),
+   SM("getInstance","(Ljava/util/Locale;)Ljava/text/DecimalFormatSymbols;",decsym_factory),
+   M("clone","()Ljava/lang/Object;",decsym_clone),
+   M("getZeroDigit","()C",decsym_char),M("setZeroDigit","(C)V",decsym_char),
+   M("getDecimalSeparator","()C",decsym_char),M("setDecimalSeparator","(C)V",decsym_char),
+   M("getGroupingSeparator","()C",decsym_char),M("setGroupingSeparator","(C)V",decsym_char),
+   M("getMinusSign","()C",decsym_char),M("setMinusSign","(C)V",decsym_char),M_END
+};
+static int decfmt_symbol(struct dvm *vm,dvm_ref self,const char *name,int fallback)
+{
+   union dvm_value symbols={0},value={0};
+   (void)dvm_get_field(vm,self,"symbols","Ljava/text/DecimalFormatSymbols;",&symbols);
+   if(!symbols.l || !dvm_get_field(vm,symbols.l,name,"C",&value)) return fallback;
+   return value.i;
+}
 
 /* java.text.DecimalFormat.  Only the pattern features that change the output
  * are modelled: the fraction-digit range and grouping. */
 static const struct rt_field rt_decimal_format_fields[] = {
    { "pattern", "Ljava/lang/String;" },
-   { "minFrac", "I" }, { "maxFrac", "I" }, { "grouping", "Z" }, F_END
+   { "minFrac", "I" }, { "maxFrac", "I" }, { "minInt", "I" }, { "maxInt", "I" },
+   { "primaryGroup", "I" }, { "secondaryGroup", "I" },
+   { "grouping", "Z" }, { "parseIntegerOnly", "Z" }, { "symbols", "Ljava/text/DecimalFormatSymbols;" }, F_END
 };
 
-static void decfmt_apply(struct dvm *vm, dvm_ref self, const char *pattern)
+static void decfmt_apply(struct dvm *vm,dvm_ref self,const char *pattern)
 {
-   int min = 0, max = 0;
-   bool grouping = false, frac = false;
-   for (const char *p = pattern; p && *p; ++p) {
-      if (*p == ',')            grouping = true;
-      else if (*p == '.')       frac = true;
-      else if (!frac)           continue;
-      else if (*p == '0')     { ++min; ++max; }
-      else if (*p == '#')       ++max;
+   int min=0,max=0,min_integer=0,digits=0,last=-1,previous=-1;
+   bool frac=false,quote=false;
+   for(const char *p=pattern;p && *p;++p) {
+      if(*p=='\'') {quote=!quote;continue;}
+      if(quote) continue;
+      if(*p==';' || *p=='E') break;
+      if(*p=='.') {frac=true;continue;}
+      if(*p==',' && !frac) {previous=last;last=digits;continue;}
+      if(*p=='0' || *p=='#') {
+         if(frac) {++max;if(*p=='0') ++min;}
+         else {++digits;if(*p=='0') ++min_integer;}
+      }
    }
-   union dvm_value v = { .l = dvm_new_string(vm, pattern ? pattern : "") };
-   (void)dvm_set_field(vm, self, "pattern", "Ljava/lang/String;", v);
-   rt_set_int(vm, self, "minFrac", min);
-   rt_set_int(vm, self, "maxFrac", max);
-   v.i = grouping;
-   (void)dvm_set_field(vm, self, "grouping", "Z", v);
+   (void)dvm_set_field(vm,self,"pattern","Ljava/lang/String;",(union dvm_value){.l=dvm_new_string(vm,pattern ? pattern : "")});
+   rt_set_int(vm,self,"minFrac",min);rt_set_int(vm,self,"maxFrac",max);
+   rt_set_int(vm,self,"minInt",min_integer);rt_set_int(vm,self,"maxInt",309);
+   rt_set_int(vm,self,"primaryGroup",last<0 ? 3 : digits-last);
+   rt_set_int(vm,self,"secondaryGroup",previous<0 ? digits-last : last-previous);
+   (void)dvm_set_field(vm,self,"grouping","Z",(union dvm_value){.i=last>=0});
 }
 
 static bool decfmt_init(struct dvm *vm, dvm_ref self,
@@ -37,6 +141,15 @@ static bool decfmt_init(struct dvm *vm, dvm_ref self,
       dvm__throw(vm,"java/lang/NullPointerException","pattern"); return false;
    }
    const char *pattern = nargs ? dvm_string_utf8(vm, ARG(0).l) : "#,##0.###";
+   union dvm_value symbols={0};
+   if(nargs>1) {
+      if(!args[1].l) {dvm__throw(vm,"java/lang/NullPointerException","symbols");return false;}
+      symbols.l=decsym_copy(vm,args[1].l);
+   } else if(!decsym_factory(vm,0,NULL,0,&symbols)) return false;
+   if(!symbols.l) return false;
+   (void)dvm_set_field(vm,self,"symbols","Ljava/text/DecimalFormatSymbols;",symbols);
+   rt_set_int(vm,self,"minInt",1);rt_set_int(vm,self,"maxInt",309);
+   if(!nargs && rt_get_int(vm,symbols.l,"secondaryGroup")==2) pattern="#,##,##0.###";
    decfmt_apply(vm, self, pattern);
    RETV();
 }
@@ -53,81 +166,85 @@ static bool decfmt_applyPattern(struct dvm *vm, dvm_ref self,
    RETV();
 }
 
-static bool decfmt_render(struct dvm *vm, dvm_ref self, double value,
-                          union dvm_value *out)
+static dvm_ref text_from_utf16(struct dvm *vm,const uint16_t *units,size_t length);
+static bool decfmt_ascii(struct dvm *vm,dvm_ref self,const char *ascii,union dvm_value *out)
 {
-   int min = rt_get_int(vm, self, "minFrac");
-   int max = rt_get_int(vm, self, "maxFrac");
-   union dvm_value g = { 0 };
-   bool grouping = dvm_get_field(vm, self, "grouping", "Z", &g) && g.i;
-   if (min < 0) min = 0;
-   if (max < min) max = min;
-   if (max > 15) max = 15;
-
-   char buf[64];
-   snprintf(buf, sizeof buf, "%.*f", max, value);
-   char *dot = strchr(buf, '.');
-   if (dot) {
-      /* '#' fraction digits disappear when they are zero, '0' digits stay. */
-      char *end = buf + strlen(buf);
-      char *keep = dot + 1 + min;
-      while (end > keep && end[-1] == '0') --end;
-      if (end == dot + 1) --end;
-      *end = '\0';
+   uint16_t units[2048];size_t used=0;
+   if(*ascii=='-') {units[used++]=(uint16_t)decfmt_symbol(vm,self,"minusSign",'-');++ascii;}
+   uint16_t zero=(uint16_t)decfmt_symbol(vm,self,"zeroDigit",'0');
+   uint16_t decimal=(uint16_t)decfmt_symbol(vm,self,"decimalSeparator",'.');
+   uint16_t group=(uint16_t)decfmt_symbol(vm,self,"groupingSeparator",',');
+   const char *dot=strchr(ascii,'.');size_t digits=dot ? (size_t)(dot-ascii) : strlen(ascii);
+   int min=rt_get_int(vm,self,"minInt"),max=rt_get_int(vm,self,"maxInt");
+   if(min<0) min=0;if(min>309) min=309;
+   if(max<min) max=min;if(max>309) max=309;
+   if(digits>(size_t)max) {ascii+=digits-(size_t)max;digits=(size_t)max;}
+   size_t padding=(size_t)min>digits ? (size_t)min-digits : 0,total=padding+digits;
+   if(!min && digits==1 && ascii[0]=='0' && dot && dot[1]) total=digits=0;
+   union dvm_value grouping={0};(void)dvm_get_field(vm,self,"grouping","Z",&grouping);
+   int primary=rt_get_int(vm,self,"primaryGroup"),secondary=rt_get_int(vm,self,"secondaryGroup");
+   if(primary<1) primary=3;if(secondary<1) secondary=primary;
+   for(size_t i=0;i<total;++i) {
+      size_t remaining=total-i;
+      if(i && grouping.i && (remaining==(size_t)primary ||
+         (remaining>(size_t)primary && (remaining-(size_t)primary)%(size_t)secondary==0))) units[used++]=group;
+      units[used++]=(uint16_t)(zero+(i<padding ? 0 : ascii[i-padding]-'0'));
    }
-   if (grouping) {
-      char grouped[128], *dst = grouped;
-      const char *src = buf;
-      if (*src == '-') *dst++ = *src++;
-      const char *int_end = src;
-      while (*int_end >= '0' && *int_end <= '9') ++int_end;
-      size_t ndig = (size_t)(int_end - src);
-      for (size_t i = 0; i < ndig; ++i) {
-         if (i && (ndig - i) % 3 == 0) *dst++ = ',';
-         *dst++ = src[i];
-      }
-      snprintf(dst, sizeof grouped - (size_t)(dst - grouped), "%s", int_end);
-      snprintf(buf, sizeof buf, "%s", grouped);
+   if(dot && dot[1]) {
+      units[used++]=decimal;
+      for(const char *p=dot+1;*p;++p) units[used++]=(uint16_t)(zero+*p-'0');
    }
-   RETL(dvm_new_string(vm, buf));
+   dvm_ref text=text_from_utf16(vm,units,used);
+   if(!text) return false;
+   RETL(text);
 }
-
-static bool decfmt_format_d(struct dvm *vm, dvm_ref self,
-                            const union dvm_value *args, int nargs,
-                            union dvm_value *out)
+static bool decfmt_render(struct dvm *vm,dvm_ref self,double value,union dvm_value *out)
 {
-   return decfmt_render(vm, self, ARG(0).d, out);
+   if(isnan(value)) RETL(dvm_new_string(vm,"NaN"));
+   if(isinf(value)) {
+      uint16_t units[2]={(uint16_t)decfmt_symbol(vm,self,"minusSign",'-'),0x221e};
+      RETL(text_from_utf16(vm,units+(value>0),value>0 ? 1 : 2));
+   }
+   int min=rt_get_int(vm,self,"minFrac"),max=rt_get_int(vm,self,"maxFrac");
+   if(min<0) min=0;if(min>340) min=340;
+   if(max<min) max=min;if(max>340) max=340;
+   /* A finite double needs at most309 integer digits. Space for340 fraction
+    * digits avoids the old fixed64-byte output truncation and15-digit cap. */
+   char ascii[768];int rounding=fegetround();
+   if(rounding!=FE_TONEAREST) (void)fesetround(FE_TONEAREST);
+   int length=snprintf(ascii,sizeof ascii,"%.*f",max,value);
+   if(rounding!=-1 && rounding!=FE_TONEAREST) (void)fesetround(rounding);
+   if(length<0 || (size_t)length>=sizeof ascii) {dvm__throw(vm,"java/lang/OutOfMemoryError","formatted double");return false;}
+   const char *host_decimal=localeconv()->decimal_point;
+   if(host_decimal && *host_decimal && strcmp(host_decimal,".")) {
+      char *point=strstr(ascii,host_decimal);
+      if(point) {size_t n=strlen(host_decimal);memmove(point+1,point+n,strlen(point+n)+1);*point='.';}
+   }
+   char *dot=strchr(ascii,'.');
+   if(dot) {
+      char *end=ascii+strlen(ascii),*keep=dot+1+min;
+      while(end>keep && end[-1]=='0') --end;
+      if(end==dot+1) --end;
+      *end=0;
+   }
+   return decfmt_ascii(vm,self,ascii,out);
 }
-
-static bool decfmt_format_j(struct dvm *vm, dvm_ref self,
-                            const union dvm_value *args, int nargs,
-                            union dvm_value *out)
+static bool decfmt_format_d(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   return decfmt_render(vm,self,ARG(0).d,out);
+}
+static bool decfmt_format_j(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
    (void)nargs;
-   /* Converting to double loses integer digits above 2^53. Produce decimal
-    * digits directly, including INT64_MIN without signed negation overflow. */
    int64_t value=ARG(0).j;
    uint64_t magnitude=value<0 ? UINT64_C(0)-(uint64_t)value : (uint64_t)value;
-   char digits[20]; size_t count=0;
-   do { digits[count++]=(char)('0'+magnitude%10); magnitude/=10; } while (magnitude);
-   int min=rt_get_int(vm,self,"minFrac"); if (min<0) min=0;
-   union dvm_value grouping={0};
-   (void)dvm_get_field(vm,self,"grouping","Z",&grouping);
-   size_t capacity=count+(grouping.i ? (count-1)/3 : 0)+(value<0)+
-                   (min ? (size_t)min+1 : 0)+1;
-   char *text=malloc(capacity);
-   if (!text) { dvm__throw(vm,"java/lang/OutOfMemoryError","formatted integer"); return false; }
-   char *next=text;
-   if (value<0) *next++='-';
-   for (size_t i=count;i>0;--i) {
-      *next++=digits[i-1];
-      if (grouping.i && i>1 && (i-1)%3==0) *next++=',';
-   }
-   if (min) { *next++='.'; memset(next,'0',(size_t)min); next+=min; }
-   *next=0;
-   dvm_ref result=dvm_new_string_n(vm,text,(size_t)(next-text)); free(text);
-   if (!result) return false;
-   RETL(result);
+   char digits[20],ascii[384];size_t count=0,used=0;
+   do {digits[count++]=(char)('0'+magnitude%10);magnitude/=10;} while(magnitude);
+   if(value<0) ascii[used++]='-';
+   while(count) ascii[used++]=digits[--count];
+   int min=rt_get_int(vm,self,"minFrac");if(min<0) min=0;if(min>340) min=340;
+   if(min) {ascii[used++]='.';memset(ascii+used,'0',(size_t)min);used+=(size_t)min;}
+   ascii[used]=0;return decfmt_ascii(vm,self,ascii,out);
 }
 
 static bool decfmt_set_max_frac(struct dvm *vm, dvm_ref self,
@@ -287,9 +404,30 @@ static bool numfmt_format_object(struct dvm *vm,dvm_ref self,const union dvm_val
    union dvm_value arguments[3]={number,args[1],args[2]};
    return format && dvm_call(vm,format,self,arguments,3,out);
 }
+/* Each factory result owns its symbols and digit settings. */
+static bool numfmt_factory(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;
+   union dvm_value symbols={0};
+   if(!decsym_factory(vm,0,args,nargs,&symbols)) return false;
+   dvm_pin(vm,symbols.l);
+   dvm_ref format=dvm_new_object(vm,dvm_find_class(vm,"java/text/DecimalFormat"));
+   if(!format) {dvm_unpin(vm,symbols.l);return false;}
+   dvm_pin(vm,format);
+   bool good=dvm_set_field(vm,format,"symbols","Ljava/text/DecimalFormatSymbols;",symbols);
+   if(good) decfmt_apply(vm,format,rt_get_int(vm,symbols.l,"secondaryGroup")==2 ? "#,##,##0.###" : "#,##0.###");
+   dvm_unpin(vm,format);dvm_unpin(vm,symbols.l);
+   if(!good) return false;
+   RETL(format);
+}
 static const struct rt_method rt_decimal_format[] = {
+   SM("getInstance","()Ljava/text/NumberFormat;",numfmt_factory),
+   SM("getInstance","(Ljava/util/Locale;)Ljava/text/NumberFormat;",numfmt_factory),
+   SM("getNumberInstance","()Ljava/text/NumberFormat;",numfmt_factory),
+   SM("getNumberInstance","(Ljava/util/Locale;)Ljava/text/NumberFormat;",numfmt_factory),
    M("<init>", "()V", decfmt_init),
    M("<init>", "(Ljava/lang/String;)V", decfmt_init),
+   M("<init>", "(Ljava/lang/String;Ljava/text/DecimalFormatSymbols;)V", decfmt_init),
    M("applyPattern", "(Ljava/lang/String;)V", decfmt_applyPattern),
    M("toPattern", "()Ljava/lang/String;", decfmt_toPattern),
    M("format", "(D)Ljava/lang/String;", numfmt_primitive),
@@ -994,3 +1132,325 @@ static const struct rt_method rt_message_format[]={
    M("clone","()Ljava/lang/Object;",message_clone),M_END
 };
 
+
+/* Android paragraph-direction heuristics, with Unicode data shared
+ * with Character. Isolate contents do not determine the outer direction. */
+static int td_strong(uint32_t cp)
+{
+   int d=luna_uc_directionality((int32_t)cp);
+   if(d==0) return 0;
+   if(d==1 || d==2) return 1;
+   if(d!=-1) return -1;
+   if((cp>=0x590 && cp<=0x8ff) || (cp>=0xfb1d && cp<=0xfdcf) ||
+      (cp>=0xfdf0 && cp<=0xfdff) || (cp>=0xfe70 && cp<=0xfeff) ||
+      (cp>=0x10800 && cp<=0x10fff) || (cp>=0x1e800 && cp<=0x1efff)) return 1;
+   if((cp>=0x2065 && cp<=0x2069) || (cp>=0xfff0 && cp<=0xfff8) ||
+      (cp>=0xe0000 && cp<=0xe0fff) || (cp>=0xfdd0 && cp<=0xfdef) ||
+      (cp&0xfffe)==0xfffe || (cp>=0x20a0 && cp<=0x20cf) ||
+      (cp>=0xd800 && cp<=0xdfff)) return -1;
+   return 0;
+}
+
+static bool td_unit(struct dvm *vm,dvm_ref text,struct dvm_method *char_at,
+                     const uint16_t *units,const char *ascii,int32_t at,uint16_t *unit)
+{
+   if(units) {*unit=units[at];return true;}
+   if(ascii) {*unit=(unsigned char)ascii[at];return true;}
+   union dvm_value index={.i=at},value={0};
+   if(!dvm_call(vm,char_at,text,&index,1,&value)) return false;
+   *unit=(uint16_t)value.i;return true;
+}
+
+static bool td_is_rtl(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                       int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   dvm_ref text=ARG(0).l;
+   int32_t start=ARG(1).i,count=ARG(2).i,length=0;
+   const uint16_t *units=NULL;const char *ascii=NULL;
+   struct dvm_method *char_at=NULL;
+   struct dvm_object *o=dvm__obj(vm,text);
+   bool array=builtin_sig()[1]=='[';
+   if(!o) {
+      if(array) {dvm__throw(vm,"java/lang/NullPointerException","array == null");return false;}
+      goto invalid;
+   }
+   if(array) {
+      if(o->kind!=DVM_OBJ_ARRAY || o->elem_kind!='C') goto invalid;
+      length=(int32_t)o->length;units=o->data;
+   } else if(o->kind==DVM_OBJ_STRING) {
+      if(!string_index(vm,o)) return false;
+      length=(int32_t)o->string_length;
+      units=o->string_units;ascii=units ? NULL : o->utf8;
+   } else {
+      struct dvm_class *c=dvm_object_class(vm,text);
+      struct dvm_method *len=dvm_find_method(vm,c,"length","()I");
+      char_at=dvm_find_method(vm,c,"charAt","(I)C");
+      union dvm_value value={0};
+      if(!len || !char_at) goto invalid;
+      if(!dvm_call(vm,len,text,NULL,0,&value)) return false;
+      length=value.i;
+   }
+   if(start<0 || count<0 || length<count || start>length-count) goto invalid;
+   int mode=rt_get_int(vm,self,"mode");
+   if(mode==0 || mode==1) RETI(mode);
+   if(mode==5) {
+      union dvm_value locale={0};
+      if(!loc_getDefault(vm,0,NULL,0,&locale)) return false;
+      RETI(locale_is_rtl(vm,locale.l));
+   }
+   unsigned isolates=0;
+   for(int32_t i=start,end=start+count;i<end;++i) {
+      uint16_t hi,lo;
+      if(!td_unit(vm,text,char_at,units,ascii,i,&hi)) return false;
+      uint32_t cp=hi;
+      /* Character.codePointAt examines the full sequence, even if the
+       * requested subrange ends between a surrogate pair. */
+      if(hi>=0xd800 && hi<=0xdbff && i+1<length) {
+         if(!td_unit(vm,text,char_at,units,ascii,i+1,&lo)) return false;
+         if(lo>=0xdc00 && lo<=0xdfff) {cp=0x10000+((hi-0xd800)<<10)+(lo-0xdc00);++i;}
+      }
+      if(cp>=0x2066 && cp<=0x2068) {++isolates;continue;}
+      if(cp==0x2069) {if(isolates) --isolates;continue;}
+      if(isolates) continue;
+      int strong=td_strong(cp);
+      if(strong<0) continue;
+      if(mode==4) {if(strong) RETI(1);}
+      else RETI(strong);
+   }
+   RETI(mode==3);
+invalid:
+   dvm__throw(vm,"java/lang/IllegalArgumentException","invalid text range");
+   return false;
+}
+static const struct rt_method rt_td_methods[]={
+ M("isRtl","(Ljava/lang/CharSequence;II)Z",td_is_rtl),
+ M("isRtl","([CII)Z",td_is_rtl),M_END};
+static const struct rt_field rt_td_fields[]={{"mode","I"},F_END};
+static const char *const rt_td_ifaces[]={"Landroid/text/TextDirectionHeuristic;",NULL};
+static const struct rt_field rt_td_statics[]={
+ {"LTR","Landroid/text/TextDirectionHeuristic;"},
+ {"RTL","Landroid/text/TextDirectionHeuristic;"},
+ {"FIRSTSTRONG_LTR","Landroid/text/TextDirectionHeuristic;"},
+ {"FIRSTSTRONG_RTL","Landroid/text/TextDirectionHeuristic;"},
+ {"ANYRTL_LTR","Landroid/text/TextDirectionHeuristic;"},
+ {"LOCALE","Landroid/text/TextDirectionHeuristic;"},F_END};
+static bool text_layout_direction(struct dvm *vm,struct textview_layout *layout,size_t start,size_t end)
+{
+   layout->paragraph_direction=1;
+   if(!layout->source) return true;
+   union dvm_value heuristic={.l=layout->direction},result={0};
+   if(!heuristic.l) dvm_get_static(vm,dvm_find_class(vm,"android/text/TextDirectionHeuristics"),
+      "FIRSTSTRONG_LTR","Landroid/text/TextDirectionHeuristic;",&heuristic);
+   struct dvm_class *c=dvm_object_class(vm,heuristic.l);
+   struct dvm_method *m=c ? dvm_find_method(vm,c,"isRtl","(Ljava/lang/CharSequence;II)Z") : NULL;
+   if(!m) {dvm__throw(vm,"java/lang/NullPointerException","text direction");return false;}
+   union dvm_value a[]={{.l=layout->source},{.i=layout->source_start+(int32_t)start},{.i=(int32_t)(end-start)}};
+   if(!dvm_call(vm,m,heuristic.l,a,3,&result)) return false;
+   layout->paragraph_direction=result.i ? 2 : 1;return true;
+}
+
+/* Unwrapped paragraph width, using the same font shaper as Layout drawing.
+ * Newlines separate paragraphs; tabs advance to the default 20-pixel stops. */
+static bool layout_desired_width(struct dvm *vm,dvm_ref self,
+ const union dvm_value *args,int nargs,union dvm_value *out)
+{
+ (void)self;
+ struct rt_text_units text={0};
+ if(!text_read_units(vm,ARG(0).l,false,"java/lang/NullPointerException",&text)) return false;
+ int64_t start=nargs==2 ? 0 : ARG(1).i,end=nargs==2 ? (int64_t)text.length : ARG(2).i;
+ dvm_ref paint=ARG(nargs==2 ? 1 : 3).l;
+ if(start<0 || end<start || (uint64_t)end>text.length) {
+   free(text.owned);dvm__throw(vm,"java/lang/IndexOutOfBoundsException","text range");return false;
+ }
+ if(!paint) {free(text.owned);dvm__throw(vm,"java/lang/NullPointerException","paint");return false;}
+ union dvm_value scale={0};dvm_get_field(vm,paint,"textScaleX","F",&scale);
+ struct textview_layout context={.source=ARG(0).l,.direction=nargs>=5 ? ARG(4).l : 0};
+ float widest=0,limit=nargs==6 ? ARG(5).f : INFINITY;
+ size_t paragraph=(size_t)start;
+ bool good=true;
+ while(paragraph<=(size_t)end) {
+   size_t stop=paragraph;
+   while(stop<(size_t)end && text.data[stop]!='\n') ++stop;
+   if(!text_layout_direction(vm,&context,paragraph,stop)) {good=false;break;}
+   float width=0;size_t segment=paragraph;
+   while(segment<stop) {
+     size_t next=segment;
+     while(next<stop && text.data[next]!='\t') ++next;
+     struct luna_text_run run={0};
+     good=paint_shape_units_direction(vm,paint,text.data+segment,next-segment,context.paragraph_direction,&run);
+     if(!good) break;
+     width+=run.width*scale.f;free(run.glyphs);
+     if(next<stop) width=(floorf(width/20)+1)*20;
+     segment=next<stop ? next+1 : next;
+   }
+   if(!good) break;
+   if(width>limit) {widest=limit;break;}
+   widest=fmaxf(widest,width);
+   if(stop==(size_t)end) break;
+   paragraph=stop+1;
+ }
+ free(text.owned);
+ if(!good) return false;
+ RETF(widest);
+}
+
+/* StaticLayout builders own VM references in fields; each build owns a new
+ * snapshot of UTF-16 units and shaped lines, independently of any TextView. */
+static const struct rt_field rt_static_builder_fields[]={
+ {"source","Ljava/lang/CharSequence;"},{"paint","Landroid/text/TextPaint;"},
+ {"start","I"},{"end","I"},{"width","I"},{"maxLines","I"},
+ {"spacingAdd","F"},{"spacingMult","F"},{"includePad","Z"},
+ {"direction","Landroid/text/TextDirectionHeuristic;"},
+ {"alignment","Landroid/text/Layout$Alignment;"},
+ {"ellipsize","Landroid/text/TextUtils$TruncateAt;"},{"ellipsizedWidth","I"},
+ {"breakStrategy","I"},{"hyphenation","I"},{"justification","I"},
+ {"fallbackSpacing","Z"},{"leftIndents","[I"},{"rightIndents","[I"},F_END};
+
+static bool static_builder_obtain(struct dvm *vm,dvm_ref self,
+ const union dvm_value *args,int nargs,union dvm_value *out)
+{
+ (void)self;(void)nargs;
+ dvm_ref b=dvm_new_object(vm,dvm_find_class(vm,"android/text/StaticLayout$Builder"));
+ if(!b) return false;
+ dvm_pin(vm,b);
+ dvm_set_field(vm,b,"source","Ljava/lang/CharSequence;",ARG(0));
+ dvm_set_field(vm,b,"start","I",ARG(1));dvm_set_field(vm,b,"end","I",ARG(2));
+ dvm_set_field(vm,b,"paint","Landroid/text/TextPaint;",ARG(3));
+ dvm_set_field(vm,b,"width","I",ARG(4));dvm_set_field(vm,b,"ellipsizedWidth","I",ARG(4));
+ dvm_set_field(vm,b,"maxLines","I",(union dvm_value){.i=INT_MAX});
+ dvm_set_field(vm,b,"spacingMult","F",(union dvm_value){.f=1});
+ dvm_set_field(vm,b,"includePad","Z",(union dvm_value){.i=1});
+ union dvm_value v={0};
+ dvm_get_static(vm,dvm_find_class(vm,"android/text/TextDirectionHeuristics"),"FIRSTSTRONG_LTR","Landroid/text/TextDirectionHeuristic;",&v);
+ dvm_set_field(vm,b,"direction","Landroid/text/TextDirectionHeuristic;",v);
+ dvm_get_static(vm,dvm_find_class(vm,"android/text/Layout$Alignment"),"ALIGN_NORMAL","Landroid/text/Layout$Alignment;",&v);
+ dvm_set_field(vm,b,"alignment","Landroid/text/Layout$Alignment;",v);
+ dvm_unpin(vm,b);RETL(b);
+}
+static bool static_builder_set(struct dvm *vm,dvm_ref self,
+ const union dvm_value *args,int nargs,union dvm_value *out)
+{
+ (void)nargs;
+ static const struct {const char *method,*field,*type;} map[]={
+ {"setTextDirection","direction","Landroid/text/TextDirectionHeuristic;"},
+ {"setAlignment","alignment","Landroid/text/Layout$Alignment;"},
+ {"setMaxLines","maxLines","I"},{"setEllipsize","ellipsize","Landroid/text/TextUtils$TruncateAt;"},
+ {"setEllipsizedWidth","ellipsizedWidth","I"},{"setIncludePad","includePad","Z"},
+ {"setBreakStrategy","breakStrategy","I"},{"setHyphenationFrequency","hyphenation","I"},
+ {"setJustificationMode","justification","I"},{"setUseLineSpacingFromFallbacks","fallbackSpacing","Z"},
+ {"setWidth","width","I"},{"setPaint","paint","Landroid/text/TextPaint;"}};
+ const char *name=builtin_name();
+ for(size_t i=0;i<sizeof map/sizeof *map;++i) if(!strcmp(name,map[i].method)) {
+   if(!dvm_set_field(vm,self,map[i].field,map[i].type,ARG(0))) return false;
+   if(!strcmp(name,"setWidth")) {
+     union dvm_value ellipsis={0};dvm_get_field(vm,self,"ellipsize","Landroid/text/TextUtils$TruncateAt;",&ellipsis);
+     if(!ellipsis.l) dvm_set_field(vm,self,"ellipsizedWidth","I",ARG(0));
+   }
+   RETL(self);
+ }
+ if(!strcmp(name,"setLineSpacing")) {
+   dvm_set_field(vm,self,"spacingAdd","F",ARG(0));dvm_set_field(vm,self,"spacingMult","F",ARG(1));
+ } else {
+   dvm_set_field(vm,self,"leftIndents","[I",ARG(0));dvm_set_field(vm,self,"rightIndents","[I",ARG(1));
+ }
+ RETL(self);
+}
+static bool static_layout_build(struct dvm *vm,dvm_ref self,
+ dvm_ref result,union dvm_value *out)
+{
+ union dvm_value source={0},paint={0},add={0},mult={0},ellipsis={0},left={0},right={0},direction={0},alignment={0};
+ dvm_get_field(vm,self,"source","Ljava/lang/CharSequence;",&source);
+ dvm_get_field(vm,self,"paint","Landroid/text/TextPaint;",&paint);
+ if(!source.l || !paint.l) {dvm__throw(vm,"java/lang/NullPointerException","text or paint");return false;}
+ struct rt_text_units units={0};
+ if(!text_read_units(vm,source.l,false,"java/lang/NullPointerException",&units)) return false;
+ int start=rt_get_int(vm,self,"start"),end=rt_get_int(vm,self,"end"),width=rt_get_int(vm,self,"width"),max=rt_get_int(vm,self,"maxLines");
+ if(start<0 || end<start || (size_t)end>units.length || width<0 || max<0) {
+   free(units.owned);dvm__throw(vm,"java/lang/IllegalArgumentException","layout range, width or line count");return false;
+ }
+ dvm_get_field(vm,self,"ellipsize","Landroid/text/TextUtils$TruncateAt;",&ellipsis);
+ dvm_get_field(vm,self,"leftIndents","[I",&left);dvm_get_field(vm,self,"rightIndents","[I",&right);
+ if(ellipsis.l || dvm_array_length(vm,left.l) || dvm_array_length(vm,right.l) ||
+    rt_get_int(vm,self,"breakStrategy") || rt_get_int(vm,self,"hyphenation") || rt_get_int(vm,self,"justification")) {
+   free(units.owned);dvm__throw(vm,"java/lang/UnsupportedOperationException","StaticLayout advanced line breaking is not implemented");return false;
+ }
+ dvm_get_field(vm,self,"direction","Landroid/text/TextDirectionHeuristic;",&direction);
+ dvm_get_field(vm,self,"alignment","Landroid/text/Layout$Alignment;",&alignment);
+ if(!direction.l || !alignment.l) {free(units.owned);dvm__throw(vm,"java/lang/NullPointerException","direction or alignment");return false;}
+ struct textview_layout *layout=calloc(1,sizeof *layout);
+ if(!layout) {free(units.owned);dvm__throw(vm,"java/lang/OutOfMemoryError","StaticLayout");return false;}
+ size_t count=(size_t)(end-start);
+ uint16_t *copy=malloc((count+1)*sizeof *copy);
+ if(!copy) {free(units.owned);free(layout);dvm__throw(vm,"java/lang/OutOfMemoryError","StaticLayout text");return false;}
+ if(count) memcpy(copy,units.data+start,count*sizeof *copy);
+ copy[count]=0;free(units.owned);
+ dvm_get_field(vm,self,"spacingAdd","F",&add);dvm_get_field(vm,self,"spacingMult","F",&mult);
+ union dvm_value px={0},scale={0},face={0},flags={0};
+ dvm_get_field(vm,paint.l,"textSize","F",&px);dvm_get_field(vm,paint.l,"textScaleX","F",&scale);
+ dvm_get_field(vm,paint.l,"typeface","Landroid/graphics/Typeface;",&face);dvm_get_field(vm,paint.l,"flags","I",&flags);
+ *layout=(struct textview_layout){.text={copy,copy,count},.source=source.l,.paint=paint.l,.face=face.l,
+   .direction=direction.l,.source_start=start,.source_end=end,
+   .spacing_add=add.f,.spacing_mult=mult.f,.fallback_spacing=rt_get_int(vm,self,"fallbackSpacing")!=0,
+   .px=px.f,.scale=scale.f,.width=width,.max_lines=max,.padding=rt_get_int(vm,self,"includePad")!=0,
+   .bold=(flags.i&32) || (face.l && (rt_get_int(vm,face.l,"style")&1))};
+ if(max && !textview_layout_build(vm,layout)) {textview_layout_destroy(layout);return false;}
+ int align=rt_get_int(vm,alignment.l,"ordinal");
+ for(size_t i=0;i<layout->count;++i) {
+   struct textview_line *line=&layout->lines[i];
+   float remaining=width-line->run.width*layout->scale;
+   bool rtl=line->direction==2;
+   line->left=align==2 ? remaining*.5f : align==4 || (align==0 && rtl) || (align==1 && !rtl) ? remaining : 0;
+ }
+ if(!result) result=dvm_new_object(vm,dvm_find_class(vm,"android/text/StaticLayout"));
+ struct dvm_object *o=dvm__obj(vm,result);
+ if(!o) {textview_layout_destroy(layout);return false;}
+ o->data=layout;o->data_destroy=textview_layout_destroy;
+ dvm_set_field(vm,result,"source","Ljava/lang/CharSequence;",source);
+ dvm_set_field(vm,result,"paint","Landroid/text/TextPaint;",paint);
+ dvm_set_field(vm,result,"alignment","Landroid/text/Layout$Alignment;",alignment);
+ dvm_set_field(vm,result,"direction","Landroid/text/TextDirectionHeuristic;",direction);
+ RETL(result);
+}
+static bool static_builder_build(struct dvm *vm,dvm_ref self,
+ const union dvm_value *args,int nargs,union dvm_value *out)
+{
+ (void)args;(void)nargs;
+ return static_layout_build(vm,self,0,out);
+}
+
+/* Legacy constructors use the same shaping and line metrics as Builder. */
+static bool static_layout_init(struct dvm *vm,dvm_ref self,
+ const union dvm_value *args,int nargs,union dvm_value *out)
+{
+ (void)nargs;
+ struct rt_text_units text={0};
+ if(!text_read_units(vm,ARG(0).l,false,"java/lang/NullPointerException",&text)) return false;
+ union dvm_value obtain[5]={ARG(0),{.i=0},{.i=(int)text.length},ARG(1),ARG(2)},builder={0};
+ free(text.owned);
+ if(!static_builder_obtain(vm,0,obtain,5,&builder)) return false;
+ dvm_pin(vm,builder.l);
+ bool good=dvm_set_field(vm,builder.l,"alignment","Landroid/text/Layout$Alignment;",ARG(3)) &&
+   dvm_set_field(vm,builder.l,"spacingMult","F",ARG(4)) &&
+   dvm_set_field(vm,builder.l,"spacingAdd","F",ARG(5)) &&
+   dvm_set_field(vm,builder.l,"includePad","Z",ARG(6)) &&
+   static_layout_build(vm,builder.l,self,out);
+ dvm_unpin(vm,builder.l);
+ if(!good) return false;
+ RETV();
+}
+
+static const struct rt_method rt_static_layout[]={
+ M("<init>","(Ljava/lang/CharSequence;Landroid/text/TextPaint;ILandroid/text/Layout$Alignment;FFZ)V",static_layout_init),
+ M_END};
+#define SL_SET(n,s) M(n,s "Landroid/text/StaticLayout$Builder;",static_builder_set)
+static const struct rt_method rt_static_builder[]={
+ SM("obtain","(Ljava/lang/CharSequence;IILandroid/text/TextPaint;I)Landroid/text/StaticLayout$Builder;",static_builder_obtain),
+ SL_SET("setTextDirection","(Landroid/text/TextDirectionHeuristic;)"),SL_SET("setAlignment","(Landroid/text/Layout$Alignment;)"),
+ SL_SET("setMaxLines","(I)"),SL_SET("setEllipsize","(Landroid/text/TextUtils$TruncateAt;)"),
+ SL_SET("setEllipsizedWidth","(I)"),SL_SET("setLineSpacing","(FF)"),SL_SET("setIncludePad","(Z)"),
+ SL_SET("setBreakStrategy","(I)"),SL_SET("setHyphenationFrequency","(I)"),SL_SET("setIndents","([I[I)"),
+ SL_SET("setJustificationMode","(I)"),SL_SET("setUseLineSpacingFromFallbacks","(Z)"),
+ SL_SET("setWidth","(I)"),SL_SET("setPaint","(Landroid/text/TextPaint;)"),
+ M("build","()Landroid/text/StaticLayout;",static_builder_build),M_END};
+#undef SL_SET

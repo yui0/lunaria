@@ -44,8 +44,31 @@ static const char *rt_charseq_utf8(struct dvm *vm, dvm_ref cs)
 }
 
 /* Text and spans stay in traced VM fields. Offsets are Java UTF-16 units. */
+struct span_builder_buffer {
+   uint16_t *chars;
+   size_t length,capacity;
+   unsigned watcher_depth;
+   bool dirty;
+};
+static void span_builder_destroy(void *data)
+{
+   struct span_builder_buffer *buffer=data;
+   if(buffer) {free(buffer->chars);free(buffer);}
+}
 static dvm_ref span_text(struct dvm *vm,dvm_ref self)
 {
+   struct dvm_object *object=dvm__obj(vm,self);
+   struct span_builder_buffer *buffer=object && object->data_destroy==span_builder_destroy ? object->data : NULL;
+   if(buffer && buffer->dirty) {
+      if(buffer->length>SIZE_MAX/3) {dvm__throw(vm,"java/lang/OutOfMemoryError","Editable text");return 0;}
+      char *bytes=malloc(buffer->length*3+1);
+      if(!bytes) {dvm__throw(vm,"java/lang/OutOfMemoryError","Editable text");return 0;}
+      size_t size=jcs_utf16_to_wtf8(buffer->chars,buffer->length,bytes);
+      dvm_ref text=dvm_new_string_n(vm,bytes,size);free(bytes);
+      if(!text) return 0;
+      dvm_set_field(vm,self,"text","Ljava/lang/String;",(union dvm_value){.l=text});
+      buffer->dirty=false;
+   }
    union dvm_value value={0};
    (void)dvm_get_field(vm,self,"text","Ljava/lang/String;",&value); return value.l;
 }
@@ -75,7 +98,8 @@ static bool span_add(struct dvm *vm,dvm_ref self,dvm_ref what,int32_t start,int3
       }
    }
    struct dvm_class *cls=dvm_object_class(vm,self);
-   if(start==end && (flags&0x33)==0x21 && cls && !strcmp(cls->name,"android/text/SpannableStringBuilder")) return true;
+   if(start==end && (flags&0x33)==0x21 && cls
+      && dvm__class_assignable(vm,cls,dvm_find_class(vm,"android/text/SpannableStringBuilder"))) return true;
    dvm_ref *objects; int32_t *data,n; span_arrays(vm,self,&objects,&data,&n);
    for(int i=0;i<n;++i) if(objects[i]==what) { data[i*3]=start;data[i*3+1]=end;data[i*3+2]=flags;return true; }
    union dvm_value refs={0}; (void)dvm_get_field(vm,self,"spans","[Ljava/lang/Object;",&refs);
@@ -138,12 +162,27 @@ static bool span_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,in
    (void)out;
    dvm_ref source=nargs ? ARG(0).l : dvm_new_string(vm,"");
    if(!source) {dvm__throw(vm,"java/lang/NullPointerException","text");return false;}
-   const char *value=rt_charseq_utf8(vm,source);if(!value) return false;
-   dvm_ref text=dvm_new_string(vm,value); union dvm_value length={0};
+   /* Strings are immutable: keep their complete storage, including NUL and
+    * unpaired UTF-16 surrogates, instead of round-tripping through strlen. */
+   dvm_ref text=source;
+   struct dvm_object *string=dvm__obj(vm,text);
+   if(!string || string->kind!=DVM_OBJ_STRING) {
+      union dvm_value value={0};
+      if(!am_vcall(vm,source,"toString","()Ljava/lang/String;",NULL,0,&value)) return false;
+      text=value.l;string=dvm__obj(vm,text);
+      if(!string || string->kind!=DVM_OBJ_STRING) {
+         dvm__throw(vm,"java/lang/NullPointerException","CharSequence.toString");return false;
+      }
+   }
+   union dvm_value length={0};
    if(!s_length(vm,text,NULL,0,&length)) return false;
    int32_t start=nargs==3 ? ARG(1).i : 0,end=nargs==3 ? ARG(2).i : length.i;
    if(start<0 || end<start || end>length.i) {
       dvm__throw(vm,"java/lang/IndexOutOfBoundsException","text %d..%d length %d",start,end,length.i);return false;
+   }
+   struct dvm_object *receiver=dvm__obj(vm,self);
+   if(receiver && receiver->data_destroy==span_builder_destroy) {
+      span_builder_destroy(receiver->data);receiver->data=NULL;receiver->data_destroy=NULL;
    }
    (void)dvm_set_field(vm,self,"spanCount","I",(union dvm_value){.i=0});
    union dvm_value range[]={{.i=start},{.i=end}},substring={0};
@@ -160,6 +199,8 @@ static bool span_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,in
       uint32_t count=dvm_array_length(vm,items.l);
       for(uint32_t i=0;i<count;++i) {
          dvm_ref span=((dvm_ref *)dvm_array_data(vm,items.l))[i];
+         if(dvm__class_assignable(vm,dvm_object_class(vm,self),dvm_find_class(vm,"android/text/SpannableStringBuilder"))
+            && dvm__class_assignable(vm,dvm_object_class(vm,span),dvm_find_class(vm,"android/text/NoCopySpan"))) continue;
          const char *names[]={"getSpanStart","getSpanEnd","getSpanFlags"};int32_t data[3];
          for(int k=0;k<3;++k) {
             struct dvm_method *method=dvm_find_method(vm,cls,names[k],"(Ljava/lang/Object;)I");
@@ -172,26 +213,72 @@ static bool span_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,in
    }
    RETV();
 }
+static bool span_value_of(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)nargs;
+   struct dvm_class *kind=dvm__builtin_method()->cls;
+   struct dvm_class *source=dvm_object_class(vm,ARG(0).l);
+   if(source && dvm__class_assignable(vm,source,kind)) RETL(ARG(0).l);
+   dvm_ref copy=dvm_new_object(vm,kind);union dvm_value ignored={0};
+   if(!copy || !span_init(vm,copy,args,1,&ignored)) return false;
+   RETL(copy);
+}
 static bool span_chars(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   const char *method=builtin_name(); dvm_ref text=span_text(vm,self);
+   const char *method=builtin_name();
+   struct dvm_object *object=dvm__obj(vm,self);
+   struct span_builder_buffer *buffer=object && object->data_destroy==span_builder_destroy ? object->data : NULL;
+   if(buffer && !strcmp(method,"length")) RETI((int32_t)buffer->length);
+   if(buffer && !strcmp(method,"charAt")) {
+      if(ARG(0).i<0 || (size_t)ARG(0).i>=buffer->length) {
+         dvm__throw(vm,"java/lang/IndexOutOfBoundsException","charAt %d",ARG(0).i);return false;
+      }
+      RETI(buffer->chars[ARG(0).i]);
+   }
+   dvm_ref text=span_text(vm,self);if(!text) return false;
    if(!strcmp(method,"toString")) RETL(text);
    if(!strcmp(method,"length")) return s_length(vm,text,args,nargs,out);
    if(!strcmp(method,"charAt")) return s_charAt(vm,text,args,nargs,out);
+   if(!strcmp(method,"getChars")) return s_getChars(vm,text,args,nargs,out);
    struct dvm_class *cls=dvm_object_class(vm,self);
    dvm_ref result=dvm_new_object(vm,cls);
    union dvm_value range[]={{.l=self},ARG(0),ARG(1)},ignored={0};
    if(!span_init(vm,result,range,3,&ignored)) return false;RETL(result);
 }
+static bool span_notify(struct dvm *,dvm_ref,dvm_ref,int,int,int,int);
 static bool span_mutate(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
    (void)nargs;
-   if(!strcmp(builtin_name(),"setSpan")) {if(!span_add(vm,self,ARG(0).l,ARG(1).i,ARG(2).i,ARG(3).i)) return false;RETV();}
    dvm_ref *objects;int32_t *data,n;span_arrays(vm,self,&objects,&data,&n);
-   if(!strcmp(builtin_name(),"clearSpans")) { if(n) memset(objects,0,(size_t)n*sizeof *objects);n=0; }
-   else for(int i=0;i<n;++i) if(objects[i]==ARG(0).l) {
+   if(!strcmp(builtin_name(),"setSpan")) {
+      int first=-1,last=-1;
+      for(int i=0;i<n;++i) if(objects[i]==args[0].l) {first=data[i*3];last=data[i*3+1];break;}
+      if(!span_add(vm,self,ARG(0).l,ARG(1).i,ARG(2).i,ARG(3).i)) return false;
+      if(ARG(1).i==ARG(2).i && (ARG(3).i&0x33)==0x21
+         && dvm__class_assignable(vm,dvm_object_class(vm,self),dvm_find_class(vm,"android/text/SpannableStringBuilder"))) RETV();
+      span_arrays(vm,self,&objects,&data,&n);
+      for(int i=0;i<n;++i) if(objects[i]==args[0].l) {
+         if(!span_notify(vm,self,args[0].l,first,last,data[i*3],data[i*3+1])) return false;
+         break;
+      }
+      RETV();
+   }
+   if(!strcmp(builtin_name(),"clearSpans")) {
+      while(n>0) {
+         dvm_ref what=objects[n-1];int first=data[(n-1)*3],last=data[(n-1)*3+1];
+         objects[--n]=0;dvm_set_field(vm,self,"spanCount","I",(union dvm_value){.i=n});
+         if(!span_notify(vm,self,what,first,last,-1,-1)) return false;
+         span_arrays(vm,self,&objects,&data,&n);
+      }
+      RETV();
+   }
+   for(int i=0;i<n;++i) if(objects[i]==ARG(0).l) {
+      int first=data[i*3],last=data[i*3+1];
       memmove(objects+i,objects+i+1,(size_t)(n-i-1)*sizeof *objects);
-      memmove(data+i*3,data+(i+1)*3,(size_t)(n-i-1)*3*sizeof *data);--n;objects[n]=0;break;
+      memmove(data+i*3,data+(i+1)*3,(size_t)(n-i-1)*3*sizeof *data);--n;objects[n]=0;
+      dvm_set_field(vm,self,"spanCount","I",(union dvm_value){.i=n});
+      if(!span_notify(vm,self,ARG(0).l,first,last,-1,-1)) return false;
+      RETV();
    }
    (void)dvm_set_field(vm,self,"spanCount","I",(union dvm_value){.i=n});RETV();
 }
@@ -205,33 +292,316 @@ static bool annotation_get(struct dvm *vm,dvm_ref self,const union dvm_value *ar
    (void)args;(void)nargs;union dvm_value value={0};
    (void)dvm_get_field(vm,self,!strcmp(builtin_name(),"getKey") ? "key" : "value","Ljava/lang/String;",&value);RETL(value.l);
 }
+/* Mutable UTF-16 backing and append transactions share the span storage above. */
+static struct span_builder_buffer *span_builder_buffer(struct dvm *vm,dvm_ref self)
+{
+   struct dvm_object *object=dvm__obj(vm,self);
+   if(!object) return NULL;
+   if(object->data_destroy==span_builder_destroy) return object->data;
+   dvm_ref text=span_text(vm,self);
+   struct dvm_object *string=dvm__obj(vm,text);
+   if(!string || !string_index(vm,string)) return NULL;
+   struct span_builder_buffer *buffer=calloc(1,sizeof *buffer);
+   if(buffer) {
+      buffer->length=string->string_length;
+      buffer->capacity=buffer->length<16 ? 16 : buffer->length;
+      buffer->chars=malloc(buffer->capacity*sizeof *buffer->chars);
+   }
+   if(!buffer || !buffer->chars) {
+      span_builder_destroy(buffer);dvm__throw(vm,"java/lang/OutOfMemoryError","Editable buffer");return NULL;
+   }
+   if(string->string_units) memcpy(buffer->chars,string->string_units,buffer->length*sizeof *buffer->chars);
+   else {
+      const unsigned char *bytes=(const unsigned char *)dvm_string_utf8(vm,text);
+      for(size_t i=0;i<buffer->length;++i) buffer->chars[i]=bytes[i];
+   }
+   object->data=buffer;object->data_destroy=span_builder_destroy;
+   return buffer;
+}
+static bool span_recipients(struct dvm *vm,dvm_ref self,int start,int end,const char *type,dvm_ref *recipients)
+{
+   dvm_ref klass=class_object_for(vm,dvm_find_class(vm,type));
+   union dvm_value args[]={{.i=start},{.i=end},{.l=klass}},result={0};
+   if(!klass || !am_vcall(vm,self,"getSpans","(IILjava/lang/Class;)[Ljava/lang/Object;",args,3,&result)) return false;
+   *recipients=result.l;return true;
+}
+static bool span_text_notify(struct dvm *vm,dvm_ref self,dvm_ref watchers,int phase,int start,int count)
+{
+   struct span_builder_buffer *buffer=span_builder_buffer(vm,self);if(!buffer) return false;
+   const char *names[]={"beforeTextChanged","onTextChanged","afterTextChanged"};
+   const char *sig=phase==2 ? "(Landroid/text/Editable;)V" : "(Ljava/lang/CharSequence;III)V";
+   union dvm_value args[]={{.l=self},{.i=start},{.i=0},{.i=count}},ignored={0};
+   ++buffer->watcher_depth;
+   bool good=true;
+   for(uint32_t i=0;good && i<dvm_array_length(vm,watchers);++i) {
+      dvm_ref watcher=((dvm_ref *)dvm_array_data(vm,watchers))[i];
+      good=am_vcall(vm,watcher,names[phase],sig,args,phase==2 ? 1 : 4,&ignored);
+   }
+   --buffer->watcher_depth;return good;
+}
+static bool span_notify(struct dvm *vm,dvm_ref self,dvm_ref what,int oldstart,int oldend,int start,int end)
+{
+   bool added=oldstart<0,removed=start<0;
+   int first=removed ? oldstart : added || start<oldstart ? start : oldstart;
+   int last=removed ? oldend : added || end>oldend ? end : oldend;
+   dvm_ref watchers=0;
+   if(!span_recipients(vm,self,first,last,"android/text/SpanWatcher",&watchers)) return false;
+   union dvm_value args[]={{.l=self},{.l=what},{.i=added ? start : oldstart},{.i=added ? end : oldend},{.i=start},{.i=end}},ignored={0};
+   const char *name=added ? "onSpanAdded" : removed ? "onSpanRemoved" : "onSpanChanged";
+   const char *sig=added || removed ? "(Landroid/text/Spannable;Ljava/lang/Object;II)V" : "(Landroid/text/Spannable;Ljava/lang/Object;IIII)V";
+   for(uint32_t i=0;i<dvm_array_length(vm,watchers);++i) {
+      dvm_ref watcher=((dvm_ref *)dvm_array_data(vm,watchers))[i];
+      if(!am_vcall(vm,watcher,name,sig,args,added || removed ? 4 : 6,&ignored)) return false;
+   }
+   return true;
+}
+static bool span_builder_filters(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;union dvm_value value={0};
+   if(!strcmp(builtin_name(),"setFilters")) {
+      if(!args[0].l) {dvm__throw(vm,"java/lang/IllegalArgumentException","filters must not be null");return false;}
+      dvm_set_field(vm,self,"filters","[Landroid/text/InputFilter;",args[0]);RETV();
+   }
+   dvm_get_field(vm,self,"filters","[Landroid/text/InputFilter;",&value);
+   if(!value.l) {
+      value.l=dvm_new_array(vm,'L',"Landroid/text/InputFilter;",0);if(!value.l) return false;
+      dvm_set_field(vm,self,"filters","[Landroid/text/InputFilter;",value);
+   }
+   RETL(value.l);
+}
+static bool span_builder_depth(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;struct span_builder_buffer *buffer=span_builder_buffer(vm,self);
+   if(!buffer) return false;RETI(buffer->watcher_depth);
+}
+struct span_append_notice {dvm_ref what;int start,end;};
+static bool span_builder_reserve(struct dvm *vm,struct span_builder_buffer *buffer,size_t count)
+{
+   if(count>(size_t)INT32_MAX-buffer->length) {dvm__throw(vm,"java/lang/OutOfMemoryError","Editable length");return false;}
+   if(buffer->length+count<=buffer->capacity) return true;
+   size_t capacity=buffer->capacity;
+   while(capacity<buffer->length+count) capacity=capacity>INT32_MAX/2 ? INT32_MAX : capacity*2;
+   uint16_t *grown=realloc(buffer->chars,capacity*sizeof *grown);
+   if(!grown) {dvm__throw(vm,"java/lang/OutOfMemoryError","Editable growth");return false;}
+   buffer->chars=grown;buffer->capacity=capacity;return true;
+}
+static bool span_builder_append(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   const char *sig=builtin_sig();
+   bool character=sig[1]=='C',with_span=strstr(sig,";Ljava/lang/Object;")!=NULL;
+   /* Without spans or filters, this exact framework class has no callbacks to
+    * dispatch. Repeated subtitle characters then need no Java allocations. */
+   if(character && !strcmp(dvm_object_class(vm,self)->name,"android/text/SpannableStringBuilder")) {
+      union dvm_value spans={0},filters={0};
+      dvm_get_field(vm,self,"spanCount","I",&spans);
+      dvm_get_field(vm,self,"filters","[Landroid/text/InputFilter;",&filters);
+      if(!spans.i && !dvm_array_length(vm,filters.l)) {
+         struct span_builder_buffer *buffer=span_builder_buffer(vm,self);
+         if(!buffer || !span_builder_reserve(vm,buffer,1)) return false;
+         buffer->chars[buffer->length++]=(uint16_t)args[0].i;buffer->dirty=true;RETL(self);
+      }
+   }
+   dvm_ref input=character ? 0 : args[0].l;
+   if(character) {
+      uint16_t unit=(uint16_t)args[0].i;char bytes[3];
+      size_t n=jcs_utf16_to_wtf8(&unit,1,bytes);input=dvm_new_string_n(vm,bytes,n);
+   }
+   if(!input) {if(!dvm_exception(vm)) dvm__throw(vm,"java/lang/NullPointerException","text");return false;}
+   union dvm_value length={0};
+   if(!am_vcall(vm,input,"length","()I",NULL,0,&length)) return false;
+   int first=nargs==3 && !with_span ? args[1].i : 0,last=nargs==3 && !with_span ? args[2].i : length.i;
+   if(first<0 || last<first || last>length.i) {dvm__throw(vm,"java/lang/IndexOutOfBoundsException","append range");return false;}
+   struct span_builder_buffer *buffer=span_builder_buffer(vm,self);if(!buffer) return false;
+   int start=(int)buffer->length;
+   union dvm_value filters={0};dvm_get_field(vm,self,"filters","[Landroid/text/InputFilter;",&filters);
+   for(uint32_t i=0;i<dvm_array_length(vm,filters.l);++i) {
+      dvm_ref filter=((dvm_ref *)dvm_array_data(vm,filters.l))[i];
+      union dvm_value fa[]={{.l=input},{.i=first},{.i=last},{.l=self},{.i=start},{.i=start}},replacement={0};
+      if(!am_vcall(vm,filter,"filter","(Ljava/lang/CharSequence;IILandroid/text/Spanned;II)Ljava/lang/CharSequence;",fa,6,&replacement)) return false;
+      if(replacement.l) {
+         input=replacement.l;first=0;
+         if(!am_vcall(vm,input,"length","()I",NULL,0,&length)) return false;
+         last=length.i;
+      }
+   }
+   /* Snapshot input before changing self: appending self or its subsequence
+    * must never read from a moving/reallocated destination. */
+   dvm_ref source=0,text=0;
+   if(dvm__class_assignable(vm,dvm_object_class(vm,input),dvm_find_class(vm,"android/text/Spanned"))) {
+      source=dvm_new_object(vm,dvm_find_class(vm,"android/text/SpannedString"));
+      union dvm_value slice[]={{.l=input},{.i=first},{.i=last}},ignored={0};
+      if(!source || !span_init(vm,source,slice,3,&ignored)) return false;
+      text=span_text(vm,source);
+   } else {
+      union dvm_value whole={0},slice[]={{.i=first},{.i=last}},part={0};
+      if(!am_vcall(vm,input,"toString","()Ljava/lang/String;",NULL,0,&whole)
+         || !s_substring(vm,whole.l,slice,2,&part)) return false;
+      text=part.l;
+   }
+   struct dvm_object *string=dvm__obj(vm,text);
+   if(!string || !string_index(vm,string)) return false;
+   size_t count=string->string_length;
+   dvm_ref *source_spans=NULL;int32_t *source_data=NULL,source_count=0;
+   if(source) span_arrays(vm,source,&source_spans,&source_data,&source_count);
+   bool adds_span=false;
+   for(int i=0;i<source_count;++i) if((source_data[i*3+2]&0x33)!=0x21 || source_data[i*3]!=source_data[i*3+1]) adds_span=true;
+   if(!count && !adds_span) {
+      if(with_span) {
+         union dvm_value span[]={{.l=args[1].l},{.i=start},{.i=start},args[2]},ignored={0};
+         if(!am_vcall(vm,self,"setSpan","(Ljava/lang/Object;III)V",span,4,&ignored)) return false;
+      }
+      RETL(self);
+   }
+   dvm_ref watchers=0;
+   if(!span_recipients(vm,self,start,start,"android/text/TextWatcher",&watchers)
+      || !span_text_notify(vm,self,watchers,0,start,(int)count)) return false;
+   buffer=span_builder_buffer(vm,self);if(!buffer) return false;
+   if((size_t)start>buffer->length) {dvm__throw(vm,"java/lang/IndexOutOfBoundsException","append after watcher");return false;}
+   if(count>(size_t)INT32_MAX-buffer->length) {dvm__throw(vm,"java/lang/OutOfMemoryError","Editable length");return false;}
+   dvm_ref *objects;int32_t *data,n;span_arrays(vm,self,&objects,&data,&n);
+   size_t notice_capacity=(size_t)n+(size_t)source_count;
+   struct span_append_notice *notices=notice_capacity ? calloc(notice_capacity,sizeof *notices) : NULL;
+   if(notice_capacity && !notices) {dvm__throw(vm,"java/lang/OutOfMemoryError","span notifications");return false;}
+   for(int i=0;i<n;++i) notices[i]=(struct span_append_notice){objects[i],data[i*3],data[i*3+1]};
+   int notices_count=n;
+   if(!span_builder_reserve(vm,buffer,count)) {free(notices);return false;}
+   memmove(buffer->chars+start+count,buffer->chars+start,(buffer->length-(size_t)start)*sizeof *buffer->chars);
+   if(string->string_units) memcpy(buffer->chars+start,string->string_units,count*sizeof *buffer->chars);
+   else {
+      const unsigned char *bytes=(const unsigned char *)dvm_string_utf8(vm,text);
+      for(size_t i=0;i<count;++i) buffer->chars[start+i]=bytes[i];
+   }
+   bool at_end=(size_t)start==buffer->length;
+   buffer->length+=count;buffer->dirty=true;
+   for(int i=0;i<n;++i) for(int k=0;k<2;++k) {
+      int flag=k ? data[i*3+2]&15 : (data[i*3+2]>>4)&15;
+      int *position=&data[i*3+k];
+      if(*position>start || (*position==start && (flag==2 || (flag==3 && at_end)))) *position+=(int)count;
+   }
+   bool good=true;
+   for(int i=0;good && i<source_count;++i) {
+      span_arrays(vm,self,&objects,&data,&n);
+      bool exists=false;for(int j=0;j<n;++j) if(objects[j]==source_spans[i]) {exists=true;break;}
+      if(exists || (source_data[i*3]==source_data[i*3+1] && (source_data[i*3+2]&0x33)==0x21)) continue;
+      if((source_data[i*3+2]&0x33)==0x33) {
+         int a=start+source_data[i*3],b=start+source_data[i*3+1];
+         if((a>0 && (size_t)a<buffer->length && buffer->chars[a-1]!='\n')
+            || (b>0 && (size_t)b<buffer->length && buffer->chars[b-1]!='\n')) continue;
+      }
+      good=span_add(vm,self,source_spans[i],start+source_data[i*3],start+source_data[i*3+1],source_data[i*3+2]);
+      if(good) notices[notices_count++]=(struct span_append_notice){source_spans[i],-1,-1};
+   }
+   if(good) good=span_text_notify(vm,self,watchers,1,start,(int)count)
+      && span_text_notify(vm,self,watchers,2,start,(int)count);
+   for(int i=0;good && i<notices_count;++i) {
+      span_arrays(vm,self,&objects,&data,&n);
+      for(int j=0;j<n;++j) if(objects[j]==notices[i].what) {
+         if(data[j*3]!=notices[i].start || data[j*3+1]!=notices[i].end)
+            good=span_notify(vm,self,objects[j],notices[i].start,notices[i].end,data[j*3],data[j*3+1]);
+         break;
+      }
+   }
+   free(notices);if(!good) return false;
+   if(with_span) {
+      union dvm_value span[]={{.l=args[1].l},{.i=start},{.i=(int)buffer->length},args[2]},ignored={0};
+      if(!am_vcall(vm,self,"setSpan","(Ljava/lang/Object;III)V",span,4,&ignored)) return false;
+   }
+   RETL(self);
+}
+#define SPAN_APPEND_METHODS(result) \
+ M("append","(C)" result,span_builder_append), \
+ M("append","(Ljava/lang/CharSequence;)" result,span_builder_append), \
+ M("append","(Ljava/lang/CharSequence;II)" result,span_builder_append)
+#define SPAN_BUILDER_METHODS \
+ SPAN_APPEND_METHODS("Landroid/text/SpannableStringBuilder;"), \
+ SPAN_APPEND_METHODS("Landroid/text/Editable;"), \
+ SPAN_APPEND_METHODS("Ljava/lang/Appendable;"), \
+ M("append","(Ljava/lang/CharSequence;Ljava/lang/Object;I)Landroid/text/SpannableStringBuilder;",span_builder_append), \
+ M("setFilters","([Landroid/text/InputFilter;)V",span_builder_filters), \
+ M("getFilters","()[Landroid/text/InputFilter;",span_builder_filters), \
+ M("getTextWatcherDepth","()I",span_builder_depth)
 #define SPANNED_METHODS \
+   M("getChars","(II[CI)V",span_chars), \
    M("length","()I",span_chars), M("charAt","(I)C",span_chars), \
    M("toString","()Ljava/lang/String;",span_chars), M("subSequence","(II)Ljava/lang/CharSequence;",span_chars), \
    M("getSpans","(IILjava/lang/Class;)[Ljava/lang/Object;",span_query), \
    M("getSpanStart","(Ljava/lang/Object;)I",span_query),M("getSpanEnd","(Ljava/lang/Object;)I",span_query), \
    M("getSpanFlags","(Ljava/lang/Object;)I",span_query),M("nextSpanTransition","(IILjava/lang/Class;)I",span_query)
 static const struct rt_method rt_spanned[]={
+   SM("valueOf","(Ljava/lang/CharSequence;)Landroid/text/SpannedString;",span_value_of),
    M("<init>","(Ljava/lang/CharSequence;)V",span_init),SPANNED_METHODS,M_END
 };
+#define SPANNABLE_METHODS \
+   M("<init>","()V",span_init),M("<init>","(Ljava/lang/CharSequence;)V",span_init), \
+   M("<init>","(Ljava/lang/CharSequence;II)V",span_init),SPANNED_METHODS, \
+   M("setSpan","(Ljava/lang/Object;III)V",span_mutate),M("removeSpan","(Ljava/lang/Object;)V",span_mutate), \
+   M("clearSpans","()V",span_mutate)
 static const struct rt_method rt_spannable[]={
-   M("<init>","()V",span_init),M("<init>","(Ljava/lang/CharSequence;)V",span_init),
-   M("<init>","(Ljava/lang/CharSequence;II)V",span_init),SPANNED_METHODS,
-   M("setSpan","(Ljava/lang/Object;III)V",span_mutate),M("removeSpan","(Ljava/lang/Object;)V",span_mutate),
-   M("clearSpans","()V",span_mutate),M_END
+   SM("valueOf","(Ljava/lang/CharSequence;)Landroid/text/SpannableString;",span_value_of),
+   SPANNABLE_METHODS,M_END
 };
+static const struct rt_method rt_spannable_builder[]={SPANNABLE_METHODS,SPAN_BUILDER_METHODS,M_END};
+#undef SPAN_BUILDER_METHODS
+#undef SPAN_APPEND_METHODS
+#undef SPANNABLE_METHODS
 #undef SPANNED_METHODS
 static const struct rt_field rt_spanned_fields[]={
-   {"text","Ljava/lang/String;"},{"spans","[Ljava/lang/Object;"},{"spanData","[I"},{"spanCount","I"},F_END
+   {"text","Ljava/lang/String;"},{"spans","[Ljava/lang/Object;"},{"spanData","[I"},{"spanCount","I"},
+   {"filters","[Landroid/text/InputFilter;"},F_END
 };
 static const struct rt_method rt_annotation[]={
    M("<init>","(Ljava/lang/String;Ljava/lang/String;)V",annotation_init),
    M("getKey","()Ljava/lang/String;",annotation_get),M("getValue","()Ljava/lang/String;",annotation_get),M_END
 };
+/* CharacterStyle and ForegroundColorSpan keep Java identity and color bits;
+ * applying the span dispatches through TextPaint just as framework code does. */
+static bool character_style_underlying(struct dvm *vm,dvm_ref self,
+   const union dvm_value *args,int nargs,union dvm_value *out)
+{ (void)vm;(void)args;(void)nargs;RETL(self); }
+static bool foreground_span_init(struct dvm *vm,dvm_ref self,
+   const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;union dvm_value color=ARG(0);
+   if (builtin_sig()[1]=='L' && !am_vcall(vm,ARG(0).l,"readInt","()I",NULL,0,&color)) return false;
+   if(!dvm_set_field(vm,self,"color","I",color)) return false;RETV();
+}
+static bool foreground_span_method(struct dvm *vm,dvm_ref self,
+   const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;const char *name=builtin_name();
+   if(!strcmp(name,"describeContents")) RETI(0);
+   if(!strcmp(name,"getSpanTypeId") || !strcmp(name,"getSpanTypeIdInternal")) RETI(2);
+   union dvm_value color={0};
+   if(!dvm_get_field(vm,self,"color","I",&color)) return false;
+   if(!strcmp(name,"getForegroundColor")) { *out=color;return true; }
+   return am_vcall(vm,ARG(0).l,!strcmp(name,"updateDrawState") ? "setColor" : "writeInt",
+                  "(I)V",&color,1,out);
+}
+static const struct rt_method rt_character_style[]={
+   M("<init>","()V",empty_void),
+   M("getUnderlying","()Landroid/text/style/CharacterStyle;",character_style_underlying),
+   {"updateDrawState","(Landroid/text/TextPaint;)V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},M_END
+};
+static const struct rt_method rt_foreground_span[]={
+   M("<init>","(I)V",foreground_span_init),M("<init>","(Landroid/os/Parcel;)V",foreground_span_init),
+   M("getForegroundColor","()I",foreground_span_method),
+   M("getSpanTypeId","()I",foreground_span_method),M("getSpanTypeIdInternal","()I",foreground_span_method),
+   M("describeContents","()I",foreground_span_method),
+   M("updateDrawState","(Landroid/text/TextPaint;)V",foreground_span_method),
+   M("writeToParcel","(Landroid/os/Parcel;I)V",foreground_span_method),
+   M("writeToParcelInternal","(Landroid/os/Parcel;I)V",foreground_span_method),M_END
+};
+static const struct rt_field rt_foreground_span_fields[]={{"color","I"},F_END};
+static const char *const rt_iface_foreground_span[]={"Landroid/text/style/UpdateAppearance;","Landroid/text/ParcelableSpan;",NULL};
+static const char *const rt_iface_parcelable_span[]={"Landroid/os/Parcelable;",NULL};
+
 static const struct rt_field rt_span_style_fields[]={{"style","I"},F_END};
 static const struct rt_field rt_annotation_fields[]={{"key","Ljava/lang/String;"},{"value","Ljava/lang/String;"},F_END};
 static const char *const rt_iface_spanned[]={"Landroid/text/Spanned;",NULL};
 static const char *const rt_iface_spannable[]={"Landroid/text/Spannable;",NULL};
+static const char *const rt_iface_editable[]={"Landroid/text/Spannable;","Ljava/lang/Appendable;",NULL};
+static const char *const rt_iface_builder[]={"Landroid/text/Editable;","Landroid/text/GetChars;",NULL};
+static const char *const rt_iface_no_copy[]={"Landroid/text/NoCopySpan;",NULL};
 static const char *const rt_iface_text_charseq[]={"Ljava/lang/CharSequence;",NULL};
 
 static dvm_ref resource_styled_text(struct dvm *vm,uint32_t id,const char *text)
@@ -1412,10 +1782,14 @@ static bool ctx_get_color(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out)
 {
-   (void)vm; (void)self; (void)nargs;
-   int32_t color = 0; const char *text = NULL;
-   (void)arm_exec_apk_resource_value((uint32_t)ARG(0).i, &color, &text);
-   RETI(color);
+   (void)nargs;
+   union dvm_value resources={0}, values[2]={ARG(0),{0}};
+   if (!am_vcall(vm,self,"getResources","()Landroid/content/res/Resources;",NULL,0,&resources)) return false;
+   dvm_pin(vm,resources.l);
+   bool good=am_vcall(vm,self,"getTheme","()Landroid/content/res/Resources$Theme;",NULL,0,&values[1]);
+   if (good) good=am_vcall(vm,resources.l,"getColor","(ILandroid/content/res/Resources$Theme;)I",values,2,out);
+   dvm_unpin(vm,resources.l);
+   return good;
 }
 
 static const struct rt_method rt_context[] = {
@@ -1761,6 +2135,7 @@ static bool image_set_drawable(struct dvm *vm, dvm_ref self,
          dimensions[i][k]=value.i;
       }
    }
+   if(!view_replace_drawable_callback(vm,self,previous.l,drawable.l)) return false;
    (void)dvm_set_field(vm,self,"imageResource","I",(union dvm_value){.i=0});
    (void)dvm_set_field(vm, self, "drawable",
                        "Landroid/graphics/drawable/Drawable;", drawable);
@@ -2628,7 +3003,21 @@ static bool image_crop_padding(struct dvm *vm,dvm_ref self,const union dvm_value
    ui_invalidate(); RETV();
 }
 
+static bool image_verify_drawable(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   union dvm_value drawable={0};dvm_get_field(vm,self,"drawable","Landroid/graphics/drawable/Drawable;",&drawable);
+   if(drawable.l==ARG(0).l) RETI(1);
+   return view_verify_drawable(vm,self,args,nargs,out);
+}
+static bool image_invalidate_drawable(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   union dvm_value drawable={0};dvm_get_field(vm,self,"drawable","Landroid/graphics/drawable/Drawable;",&drawable);
+   if(drawable.l==ARG(0).l) return am_vcall(vm,self,"invalidate","()V",NULL,0,out);
+   return view_drawable_callback(vm,self,args,nargs,out);
+}
 static const struct rt_method rt_image_view[] = {
+   M("verifyDrawable","(Landroid/graphics/drawable/Drawable;)Z",image_verify_drawable),
+   M("invalidateDrawable","(Landroid/graphics/drawable/Drawable;)V",image_invalidate_drawable),
    M("onDraw", "(Landroid/graphics/Canvas;)V", image_on_draw),
    M("getCropToPadding", "()Z", image_crop_padding),
    M("setCropToPadding", "(Z)V", image_crop_padding),
@@ -2719,8 +3108,49 @@ static bool compound_toggle(struct dvm *vm, dvm_ref self,
    union dvm_value cur = { 0 };
    (void)dvm_get_field(vm, self, "checked", "Z", &cur);
    union dvm_value flip = { .i = cur.i ? 0 : 1 };
-   return compound_set_checked(vm, self, &flip, 1, out);
+   return am_vcall(vm,self,"setChecked","(Z)V",&flip,1,out);
 }
+
+static bool radio_toggle(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                          int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   union dvm_value checked={0};
+   if (!am_vcall(vm,self,"isChecked","()Z",NULL,0,&checked)) return false;
+   if (checked.i) RETV();
+   return compound_toggle(vm,self,NULL,0,out);
+}
+
+/* Each concrete widget declares its own constructors. Java never inherits
+ * <init>, even though these adapters share View context/resource setup. */
+#define COMPOUND_WIDGET_CTORS \
+   M("<init>","(Landroid/content/Context;)V",view_init_context), \
+   M("<init>","(Landroid/content/Context;Landroid/util/AttributeSet;)V",view_init_context), \
+   M("<init>","(Landroid/content/Context;Landroid/util/AttributeSet;I)V",view_init_context), \
+   M("<init>","(Landroid/content/Context;Landroid/util/AttributeSet;II)V",view_init_context),
+static const struct rt_method rt_compound_widget_constructors[]={
+   COMPOUND_WIDGET_CTORS
+   M_END,
+};
+static const struct rt_method rt_radio_button[]={
+   COMPOUND_WIDGET_CTORS
+   M("toggle","()V",radio_toggle),
+   M_END,
+};
+#undef COMPOUND_WIDGET_CTORS
+
+static bool radio_group_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                              int nargs,union dvm_value *out)
+{
+   if (!view_init_context(vm,self,args,nargs,out)) return false;
+   (void)dvm_set_field(vm,self,"orientation","I",(union dvm_value){.i=1});
+   RETV();
+}
+static const struct rt_method rt_radio_group_constructors[]={
+   M("<init>","(Landroid/content/Context;)V",radio_group_init),
+   M("<init>","(Landroid/content/Context;Landroid/util/AttributeSet;)V",radio_group_init),
+   M_END,
+};
 
 static bool compound_set_listener(struct dvm *vm, dvm_ref self,
                                   const union dvm_value *args, int nargs,
@@ -2746,6 +3176,7 @@ static const struct rt_method rt_compound_button[] = {
    M("<init>", "(Landroid/content/Context;)V", view_init_context),
    M("<init>", "(Landroid/content/Context;Landroid/util/AttributeSet;)V", view_init_context),
    M("<init>", "(Landroid/content/Context;Landroid/util/AttributeSet;I)V", view_init_context),
+   M("<init>", "(Landroid/content/Context;Landroid/util/AttributeSet;II)V", view_init_context),
    M("setChecked", "(Z)V", compound_set_checked),
    M("isChecked", "()Z", compound_is_checked),
    M("toggle", "()V", compound_toggle),
@@ -2910,8 +3341,8 @@ static const struct rt_method rt_typed_array[] = {
    M("getInteger", "(II)I", typed_array_default_int),
    M("getFloat", "(IF)F", typed_array_default_float),
    M("getDimension", "(IF)F", typed_array_dimension),
-   M("getResourceId", "(II)I", typed_array_default_int),
-   M("getColor", "(II)I", typed_array_default_int),
+   M("getResourceId", "(II)I", typed_array_resource_id),
+   M("getColor", "(II)I", typed_array_color),
    M("getDimensionPixelSize", "(II)I", typed_array_dimension_size),
    M("getDimensionPixelOffset", "(II)I", typed_array_dimension_offset),
    M("getDrawable", "(I)Landroid/graphics/drawable/Drawable;",
@@ -2921,7 +3352,7 @@ static const struct rt_method rt_typed_array[] = {
    M("getText", "(I)Ljava/lang/CharSequence;", typed_array_get_text),
    M("getString", "(I)Ljava/lang/String;", typed_array_get_text),
    M("getColorStateList", "(I)Landroid/content/res/ColorStateList;",
-     typed_array_get_colors),
+     typed_array_color),
    /* recycle() returns the array to a pool this runtime does not keep: a
       TypedArray here is an ordinary object the collector owns. */
    M("recycle", "()V", empty_void),
@@ -3266,10 +3697,13 @@ static bool res_get_color_state_list(struct dvm *vm, dvm_ref self,
                                      const union dvm_value *args, int nargs,
                                      union dvm_value *out)
 {
-   (void)self; (void)nargs;
-   int32_t value = 0; const char *string = NULL;
-   (void)res_value_resolved((uint32_t)ARG(0).i, &value, &string);
-   RETL(color_state_list_new(vm, value));
+   (void)self;
+   dvm_ref colors=color_value_list(vm,1,ARG(0).i,NULL,nargs>1 ? ARG(1).l : 0,0);
+   if (getenv("LUNARIA_TRACE_TA"))
+      fprintf(stderr,"[ta-color] Resources self=%u id=0x%08x theme=%u -> ref=%u exception=%u\n",
+              self,ARG(0).u,nargs>1 ? ARG(1).l : 0,colors,dvm_exception(vm));
+   if (!colors) return false;
+   RETL(colors);
 }
 
 /* Resources.getColor(int) — the packed ARGB of a colour resource.  Left
@@ -3279,10 +3713,8 @@ static bool res_get_color(struct dvm *vm, dvm_ref self,
                           const union dvm_value *args, int nargs,
                           union dvm_value *out)
 {
-   (void)vm; (void)self; (void)nargs;
-   int32_t value = 0; const char *string = NULL;
-   (void)res_value_resolved((uint32_t)ARG(0).i, &value, &string);
-   RETI(value);
+   (void)self;
+   return color_value_argb(vm,1,ARG(0).i,NULL,nargs>1 ? ARG(1).l : 0,0,out);
 }
 
 /* Resources.getDrawable(id): the class a device builds for this resource.  What
@@ -3432,6 +3864,17 @@ static bool res_get_drawable(struct dvm *vm, dvm_ref self,
  * device.  Unimplemented, it answered an empty DisplayMetrics — widthPixels
  * 0 — and every SDK that sizes its widgets from the screen width sized them
  * all to nothing (HoYoverse's getDesignPx() is width * design / 680). */
+static bool res_getConfiguration(struct dvm *,dvm_ref,const union dvm_value *,int,union dvm_value *);
+
+static void resources_scale_metrics(struct dvm *vm,dvm_ref configuration,dvm_ref metrics)
+{
+   union dvm_value scale={0},density={0};
+   dvm_get_field(vm,configuration,"fontScale","F",&scale);
+   dvm_get_field(vm,metrics,"density","F",&density);
+   density.f*=scale.f!=0 ? scale.f : 1;
+   dvm_set_field(vm,metrics,"scaledDensity","F",density);
+}
+
 static bool res_get_display_metrics(struct dvm *vm, dvm_ref self,
                                     const union dvm_value *args, int nargs,
                                     union dvm_value *out)
@@ -3447,7 +3890,12 @@ static bool res_get_display_metrics(struct dvm *vm, dvm_ref self,
       if (dm.l && self)
          (void)dvm_set_field(vm, self, "displayMetrics",
                              "Landroid/util/DisplayMetrics;", dm);
-      if (dm.l) rt_fill_display_metrics(vm, dm.l);
+      if (dm.l) {
+         rt_fill_display_metrics(vm, dm.l);
+         union dvm_value config={0};
+         if(!res_getConfiguration(vm,self,NULL,0,&config)) return false;
+         resources_scale_metrics(vm,config.l,dm.l);
+      }
    }
    RETL(dm.l);
 }
@@ -3466,6 +3914,7 @@ static bool res_getConfiguration(struct dvm *vm, dvm_ref self,
          dvm__class_by_desc(vm, "Landroid/content/res/Configuration;");
       configuration = c ? dvm_new_object(vm, c) : 0;
       if (configuration) {
+         dvm_set_field(vm,configuration,"fontScale","F",(union dvm_value){.f=1});
          configuration_ensure_locale(vm, configuration);
          stored.l = configuration;
          (void)dvm_set_field(vm, self, "configuration",
@@ -3486,8 +3935,16 @@ static bool res_update_configuration(struct dvm *vm, dvm_ref self,
       union dvm_value current = { 0 };
       (void)res_getConfiguration(vm, self, NULL, 0, &current);
       if (current.l) {
+         union dvm_value previous_scale={0},new_scale={0};
+         dvm_get_field(vm,current.l,"fontScale","F",&previous_scale);
+         dvm_get_field(vm,ARG(0).l,"fontScale","F",&new_scale);
          union dvm_value source = { .l = ARG(0).l };
          (void)cfg_set_to(vm, current.l, &source, 1, out);
+         /* Undefined override fields do not erase the effective value. */
+         if(!(new_scale.f>0)) dvm_set_field(vm,current.l,"fontScale","F",previous_scale);
+         union dvm_value metrics={0};
+         if(!res_get_display_metrics(vm,self,NULL,0,&metrics)) return false;
+         resources_scale_metrics(vm,current.l,metrics.l);
       }
    }
    RETV();
@@ -4581,7 +5038,8 @@ static bool color_state_init(struct dvm *vm, dvm_ref self,
 }
 
 static const struct rt_field rt_color_state_fields[] = {
-   { "color", "I" }, { "stateSpecs", "[[I" }, { "colors", "[I" }, F_END
+   { "color", "I" }, { "stateSpecs", "[[I" }, { "colors", "[I" },
+   { "themeXml", "Ljava/lang/String;" }, { "themePending", "Z" }, F_END
 };
 /* ColorStateList.valueOf(int) — the single-colour list every widget uses when
  * it is handed a plain colour.  Unresolved it answered null, and the caller
@@ -4595,7 +5053,23 @@ static bool color_state_value_of(struct dvm *vm, dvm_ref self,
    RETL(color_state_list_new(vm, ARG(0).i));
 }
 
+static bool color_state_theme(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                               int nargs,union dvm_value *out)
+{
+   union dvm_value pending={0},source={0};
+   (void)dvm_get_field(vm,self,"themePending","Z",&pending);
+   if(!strcmp(builtin_name(),"canApplyTheme")) RETI(pending.i);
+   if(!pending.i || !nargs || !ARG(0).l) RETL(self);
+   (void)dvm_get_field(vm,self,"themeXml","Ljava/lang/String;",&source);
+   const char *path=dvm_string_utf8(vm,source.l);
+   dvm_ref copy=color_value_list(vm,'L',0,path,ARG(0).l,0);
+   if(!copy) return false;
+   RETL(copy);
+}
+
 static const struct rt_method rt_color_state[] = {
+   M("canApplyTheme","()Z",color_state_theme),
+   M("obtainForTheme","(Landroid/content/res/Resources$Theme;)Landroid/content/res/ColorStateList;",color_state_theme),
    M("<init>", "([[I[I)V", color_state_init),
    SM("valueOf", "(I)Landroid/content/res/ColorStateList;", color_state_value_of),
    M("getDefaultColor", "()I", color_state_default),
@@ -5239,40 +5713,25 @@ static struct svc_conn *svc_conn_find(dvm_ref conn)
 
 #define BIND_AUTO_CREATE 0x0001
 
-/* Context.bindService(intent, conn, flags).  Real Android connects
- * asynchronously; connecting inline is an ordering a caller cannot tell
- * apart, because it cannot use the binder before onServiceConnected() hands
- * it over. */
-static bool ctx_bindService(struct dvm *vm, dvm_ref self,
-                            const union dvm_value *args, int nargs,
-                            union dvm_value *out)
+/* Context.bindService(intent, conn, flags).  ActiveServices connects on the
+ * main thread after bindService() has returned: the service is created, its
+ * onBind() answers, and ServiceDispatcher posts onServiceConnected() to the
+ * connection's thread.  A caller therefore holds its own locks and has set
+ * its "connecting" flag when the callback arrives; delivering inline broke
+ * exactly that (Firebase Analytics' measurement client saw its connection
+ * come back before it had recorded that one was in progress, and never
+ * connected).  The bind itself is posted to the main looper. */
+static void svc_bind_deliver(struct dvm *vm, dvm_ref intent, dvm_ref conn, int flags)
 {
-   (void)self;
-   dvm_ref intent = ARG(0).l, conn = ARG(1).l;
-   const int flags = nargs > 2 ? ARG(2).i : 0;
-   if (!conn) {
-      dvm__throw(vm, "java/lang/IllegalArgumentException", "connection is null");
-      return false;
-   }
    struct svc_conn *c = svc_conn_find(conn);
-   if (!c) {
-      c = calloc(1, sizeof *c);
-      if (!c) RETI(0);
-      dvm_pin(vm, conn);
-      c->conn = conn;
-      c->next = g_service_conns;
-      g_service_conns = c;
-   }
+   if (!c) return;   /* unbound before the connection was made */
    struct dvm_class *cls = svc_resolve(vm, intent);
-   if (!cls) RETI(0);
+   if (!cls) return;
    struct svc_rec *r = svc_find(cls);
-   if (!r && !(flags & BIND_AUTO_CREATE)) {
-      /* Bound, but the service only comes up once something starts it. */
-      RETI(1);
-   }
+   if (!r && !(flags & BIND_AUTO_CREATE)) return;
    if (!r) r = svc_create(vm, cls);
-   if (!r) RETI(0);
-   if (c->svc == r) RETI(1);
+   if (!r) return;
+   if (c->svc == r) return;
    if (c->svc) {
       /* Rebinding a connection to another service drops the old binding. */
       c->svc->bindings--;
@@ -5303,6 +5762,59 @@ static bool ctx_bindService(struct dvm *vm, dvm_ref self,
    dvm_unpin(vm, a[0].l);
    fprintf(stderr, "[dvm] bindService %s -> %s\n", cls->name,
            r->binder ? "bound" : "null binding");
+}
+
+static const struct rt_field rt_service_bind_fields[] = {
+   { "intent", "Landroid/content/Intent;" }, { "conn", "Landroid/content/ServiceConnection;" },
+   { "flags", "I" }, F_END
+};
+
+static bool service_bind_run(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                             int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs; (void)out;
+   union dvm_value intent = { 0 }, conn = { 0 }, flags = { 0 };
+   (void)dvm_get_field(vm, self, "intent", "Landroid/content/Intent;", &intent);
+   (void)dvm_get_field(vm, self, "conn", "Landroid/content/ServiceConnection;", &conn);
+   (void)dvm_get_field(vm, self, "flags", "I", &flags);
+   svc_bind_deliver(vm, intent.l, conn.l, flags.i);
+   if (intent.l) dvm_unpin(vm, intent.l);
+   RETV();
+}
+static const struct rt_method rt_service_bind[] = { M("run", "()V", service_bind_run), M_END };
+
+static bool ctx_bindService(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)self;
+   dvm_ref intent = ARG(0).l, conn = ARG(1).l;
+   const int flags = nargs > 2 ? ARG(2).i : 0;
+   if (!conn) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException", "connection is null");
+      return false;
+   }
+   struct svc_conn *c = svc_conn_find(conn);
+   if (!c) {
+      c = calloc(1, sizeof *c);
+      if (!c) RETI(0);
+      dvm_pin(vm, conn);
+      c->conn = conn;
+      c->next = g_service_conns;
+      g_service_conns = c;
+   }
+   if (!svc_resolve(vm, intent)) RETI(0);
+   struct dvm_class *bind = dvm__class_by_desc(vm, "Llunaria/ServiceBind;");
+   dvm_ref job = bind ? dvm_new_object(vm, bind) : 0;
+   if (!job) RETI(0);
+   dvm_pin(vm, intent);
+   union dvm_value v = { .l = intent };
+   (void)dvm_set_field(vm, job, "intent", "Landroid/content/Intent;", v);
+   v.l = conn;
+   (void)dvm_set_field(vm, job, "conn", "Landroid/content/ServiceConnection;", v);
+   v.i = flags;
+   (void)dvm_set_field(vm, job, "flags", "I", v);
+   if (!queue_runnable(vm, job, false)) { dvm_unpin(vm, intent); RETI(0); }
    RETI(1);
 }
 
@@ -7256,6 +7768,125 @@ static dvm_ref dx_item_states(struct dvm *vm,const struct dx *x,const struct dx_
    return array;
 }
 
+/* Scalar colors need no guest ColorStateList allocation. */
+static bool color_value_argb(struct dvm *vm,int kind,int32_t value,const char *text,
+                             dvm_ref theme,unsigned depth,union dvm_value *out)
+{
+   if(depth>32) {dvm__throw(vm,"android/content/res/Resources$NotFoundException","Cyclic color reference");return false;}
+   if(kind==1) {
+      kind=res_value_resolved((uint32_t)value,&value,&text);
+      if(!kind) {dvm__throw(vm,"android/content/res/Resources$NotFoundException","Color resource could not be resolved");return false;}
+   }
+   if(kind==2 && theme) {
+      int next=theme_style_value(vm,theme,(uint32_t)value,&value,&text);
+      if(next) return color_value_argb(vm,next,value,text,theme,depth+1,out);
+   }
+   if(kind>=0x10 && kind<=0x1f) {out->i=value;return true;}
+   dvm_ref colors=color_value_list(vm,kind,value,text,theme,depth);
+   return colors && dvm_get_field(vm,colors,"color","I",out);
+}
+
+/* Shared resource/TypedArray color loading. Keep resource IDs out of ARGB. */
+static dvm_ref color_value_list(struct dvm *vm,int kind,int32_t value,
+                               const char *text,dvm_ref theme,unsigned depth)
+{
+   if (depth>32) goto missing;
+   if (kind==1) {
+      kind=res_value_resolved((uint32_t)value,&value,&text);
+      if (!kind) goto missing;
+   }
+   if (kind==2) {
+      if (!theme) goto invalid;
+      int next=theme_style_value(vm,theme,(uint32_t)value,&value,&text);
+      if (!next) goto invalid;
+      return color_value_list(vm,next,value,text,theme,depth+1);
+   }
+   if (kind>=0x10 && kind<=0x1f) return color_state_list_new(vm,value);
+   if (kind!='L' || !text) goto invalid;
+   size_t length=0;
+   unsigned char *bytes=arm_exec_asset_read(text,&length);
+   if (!bytes || length<8 || ax_u16(bytes)!=3) {free(bytes);goto missing;}
+   struct dx xml={.b=bytes,.n=length,.pos=ax_u16(bytes+2),.theme=theme};
+   xml.s=ax_string_pool(bytes,length,&xml.ns);
+   struct dx_tag tag;
+   bool good=xml.s && dx_next(&xml,&tag)==0x0102 && !strcmp(tag.name,"selector");
+   struct dx scan=xml;unsigned count=0;int nesting=1,event;
+   while (good && nesting && (event=dx_next(&scan,&tag))) {
+      if (event==0x0103) --nesting;
+      else {if(nesting==1 && !strcmp(tag.name,"item")) ++count;++nesting;}
+   }
+   good=good && nesting==0;
+   dvm_ref result=good ? dx_new(vm,"Landroid/content/res/ColorStateList;") : 0;
+   if (result) dvm_pin(vm,result); else good=false;
+   dvm_ref specs=good ? dvm_new_array(vm,'L',"[I",count) : 0;
+   if (specs) (void)dvm_set_field(vm,result,"stateSpecs","[[I",(union dvm_value){.l=specs}); else good=false;
+   dvm_ref colors=good ? dvm_new_array(vm,'I',"I",count) : 0;
+   if (colors) (void)dvm_set_field(vm,result,"colors","[I",(union dvm_value){.l=colors}); else good=false;
+   unsigned index=0;bool pending=false;
+   while (good && (event=dx_next(&xml,&tag))==0x0102) {
+      if (strcmp(tag.name,"item")) {dx_skip(&xml);continue;}
+      uint8_t type=0;uint32_t data=0;int32_t color=(int32_t)0xffff00ffu;
+      if (dx_attr(&xml,&tag,"color",&type,&data)) {
+         if (!dx_resolve_attribute(vm,&xml,&type,&data)) pending=true;
+         else {
+            union dvm_value v={0};
+            if (!color_value_argb(vm,type,(int32_t)data,NULL,theme,depth+1,&v)) {good=false;break;}
+            color=v.i;
+         }
+      }
+      float alpha=1;
+      if (dx_attr(&xml,&tag,"alpha",&type,&data)) {
+         if (!dx_resolve_attribute(vm,&xml,&type,&data)) pending=true;
+         else {
+            int32_t raw=(int32_t)data;const char *unused=NULL;int k=type;
+            if(k==1) k=res_value_resolved(data,&raw,&unused);
+            if(k==4) memcpy(&alpha,&raw,sizeof alpha);
+            else if(k>=0x10 && k<=0x1f) alpha=(float)raw;
+            else {good=false;break;}
+         }
+      }
+      float modulated=(float)((uint32_t)color>>24)*alpha+.5f;
+      int a=isnan(modulated) || modulated<=0 ? 0 : modulated>=255 ? 255 : (int)modulated;
+      color=(int32_t)(((uint32_t)color&0xffffffu)|((uint32_t)a<<24));
+      dvm_ref states=dvm_new_array(vm,'I',"I",tag.count);
+      if(!states) {good=false;break;}
+      ((dvm_ref *)dvm_array_data(vm,specs))[index]=states;
+      int32_t *requirements=dvm_array_data(vm,states);unsigned nstates=0;
+      for(uint16_t i=0;tag.asz>=20 && i<tag.count;++i) {
+         size_t at=tag.attrs+(size_t)i*tag.asz;
+         if(at+20>tag.end) {good=false;break;}
+         uint32_t name=ax_u32(xml.b+at+4);
+         const char *label=name<xml.ns ? xml.s[name] : NULL;
+         uint32_t id=name<xml.resource_count ? ax_u32(xml.resource_map+name*4) : 0;
+         if(!id || (label && (!strcmp(label,"color") || !strcmp(label,"alpha") || !strcmp(label,"lStar")))) continue;
+         requirements[nstates++]=ax_u32(xml.b+at+16) ? (int32_t)id : -(int32_t)id;
+      }
+      dvm__obj(vm,states)->length=nstates;
+      ((int32_t *)dvm_array_data(vm,colors))[index++]=color;
+      dx_skip(&xml);
+   }
+   if(good && index==count) {
+      union dvm_value args[]={{.l=specs},{.l=colors}},ignored={0};
+      good=color_state_init(vm,result,args,2,&ignored);
+      if(good && !count) (void)dvm_set_field(vm,result,"color","I",(union dvm_value){.u=0xffff0000u});
+   } else good=false;
+   if(good && pending) {
+      dvm_ref source=dvm_new_string(vm,text);
+      good=source && dvm_set_field(vm,result,"themeXml","Ljava/lang/String;",(union dvm_value){.l=source}) &&
+         dvm_set_field(vm,result,"themePending","Z",(union dvm_value){.i=1});
+   }
+   for(uint32_t i=0;xml.s && i<xml.ns;++i) free(xml.s[i]);
+   free(xml.s);free(bytes);
+   if(result) dvm_unpin(vm,result);
+   if(good) return result;
+   if(!dvm_exception(vm)) dvm__throw(vm,"android/content/res/Resources$NotFoundException","Invalid color selector");
+   return 0;
+missing:
+   dvm__throw(vm,"android/content/res/Resources$NotFoundException","Color resource could not be resolved");return 0;
+invalid:
+   dvm__throw(vm,"java/lang/UnsupportedOperationException","Can't convert type 0x%x to color",kind);return 0;
+}
+
 static bool gd_init(struct dvm *,dvm_ref,const union dvm_value *,int,union dvm_value *);
 
 static dvm_ref dx_shape(struct dvm *vm, struct dx *x, const struct dx_tag *t)
@@ -7368,7 +7999,7 @@ struct vector_data {
    bool mirrored;
    bool tint;
    uint32_t tint_color;
-   unsigned cached_tint_gen;uint32_t cached_tint_color;
+   int density;
 };
 static void vector_nodes_clear(struct vector_node *node)
 {
@@ -7380,6 +8011,64 @@ static void vector_destroy(void *data)
    struct vector_data *vector=data;if(!vector) return;
    vector_nodes_clear(vector->root.children);free(vector);
 }
+/* The VM reference owns native vector state and roots its tint references.
+ * Drawable instances retain it through a normal scanned object field. */
+static dvm_ref vector_state_ref(struct dvm *vm,dvm_ref drawable)
+{ return ui_obj(vm,drawable,"vectorState","Landroid/graphics/drawable/VectorDrawable$VectorDrawableState;"); }
+static struct vector_data *vector_of(struct dvm *vm,dvm_ref drawable)
+{
+   struct dvm_object *state=dvm__obj(vm,vector_state_ref(vm,drawable));
+   return state ? state->data : NULL;
+}
+static bool vector_attach(struct dvm *vm,dvm_ref drawable,struct vector_data *data)
+{
+   dvm_pin(vm,drawable);
+   dvm_ref state=dvm_new_object(vm,dvm_find_class(vm,"android/graphics/drawable/VectorDrawable$VectorDrawableState"));
+   if (!state) {dvm_unpin(vm,drawable);vector_destroy(data);return false;}
+   struct dvm_object *object=dvm__obj(vm,state);
+   object->data=data;object->data_destroy=vector_destroy;
+   data->density=device_density_dpi();
+   bool good=dvm_set_field(vm,drawable,"vectorState","Landroid/graphics/drawable/VectorDrawable$VectorDrawableState;",
+                           (union dvm_value){.l=state});
+   dvm_unpin(vm,drawable);return good;
+}
+static struct vector_gradient *vector_gradient_copy(const struct vector_gradient *source)
+{
+   if (!source) return NULL;
+   struct vector_gradient *copy=calloc(1,sizeof *copy);
+   if (!copy) return NULL;
+   *copy=*source;copy->colors=NULL;copy->positions=NULL;copy->count=copy->capacity=0;
+   for (size_t i=0;i<source->count;++i)
+      if (!vector_gradient_stop(copy,source->colors[i],source->positions[i])) {
+         vector_gradient_free(copy);return NULL;
+      }
+   return copy;
+}
+static bool vector_nodes_copy(const struct vector_node *source,struct vector_node **out)
+{
+   for (;source;source=source->next) {
+      struct vector_node *copy=calloc(1,sizeof *copy);
+      if (!copy) return false;
+      *copy=*source;copy->next=copy->children=NULL;
+      copy->path=(luna_path){0};copy->fill_gradient=copy->stroke_gradient=NULL;
+      *out=copy;out=&copy->next;
+      if (!luna_path_append(&copy->path,&source->path,NULL)) return false;
+      copy->path.fill=source->path.fill;copy->path.after_close=source->path.after_close;
+      if (source->fill_gradient && !(copy->fill_gradient=vector_gradient_copy(source->fill_gradient))) return false;
+      if (source->stroke_gradient && !(copy->stroke_gradient=vector_gradient_copy(source->stroke_gradient))) return false;
+      if (!vector_nodes_copy(source->children,&copy->children)) return false;
+   }
+   return true;
+}
+static struct vector_data *vector_copy(const struct vector_data *source)
+{
+   struct vector_data *copy=malloc(sizeof *copy);
+   if (!copy) return NULL;
+   *copy=*source;copy->root.children=NULL;
+   if (!vector_nodes_copy(source->root.children,&copy->root.children)) {vector_destroy(copy);return NULL;}
+   return copy;
+}
+
 static float dx_float(const struct dx *x,const struct dx_tag *t,const char *name,float def);
 static struct vector_gradient *vector_gradient_resource(struct dvm *vm,uint32_t id,dvm_ref theme)
 {
@@ -7475,7 +8164,7 @@ static dvm_ref dx_vector(struct dvm *vm,struct dx *x,const struct dx_tag *tag)
    if(!drawable) return 0;
    struct vector_data *vector=calloc(1,sizeof *vector);
    if(!vector) {dvm__throw(vm,"java/lang/OutOfMemoryError","Vector");return 0;}
-   struct dvm_object *object=dvm__obj(vm,drawable);object->data=vector;object->data_destroy=vector_destroy;
+   if (!vector_attach(vm,drawable,vector)) return 0;
    vector->width=dx_px(vm,x,tag,"width",0);vector->height=dx_px(vm,x,tag,"height",0);
    vector->viewport_width=dx_float(x,tag,"viewportWidth",0);vector->viewport_height=dx_float(x,tag,"viewportHeight",0);
    vector->alpha=dx_float(x,tag,"alpha",1);vector->mirrored=dx_int(x,tag,"autoMirrored",0)!=0;
@@ -7697,6 +8386,45 @@ static void ax_set_int(struct dvm *vm, dvm_ref view, const char *field,
       (void)dvm_set_field(vm, view, field, "Z", v);
 }
 
+/* Resolve XML inset shorthands after ordinary attributes. Android gives
+ * uniform values precedence over axes, and axes over physical edges,
+ * independently of the binary XML attribute order. */
+static void ax_apply_inset_shorthands(struct dvm *vm,dvm_ref view,const uint8_t *b,
+ size_t attrs,size_t end,uint16_t attr_size,uint16_t attr_count,
+ char *const *strings,uint32_t nstrings,bool margins_only)
+{
+   static const char *const names[]={"padding","paddingHorizontal","paddingVertical",
+      "layout_margin","layout_marginHorizontal","layout_marginVertical","paddingStart","paddingEnd"};
+   int32_t values[8]={-1,-1,-1,-1,-1,-1,-1,-1};
+   union dvm_value context={0};
+   dvm_get_field(vm,view,"context","Landroid/content/Context;",&context);
+   for(uint16_t i=0;attr_size>=20 && i<attr_count;++i) {
+      size_t q=attrs+(size_t)i*attr_size;
+      if(q>end || end-q<20) break;
+      uint32_t index=ax_u32(b+q+4);
+      const char *name=index<nstrings ? strings[index] : NULL;
+      if(!name) continue;
+      for(size_t j=0;j<8;++j) if(!strcmp(name,names[j])) {
+         values[j]=ax_dimension_px(vm,context.l,b[q+15],ax_u32(b+q+16));break;
+      }
+   }
+   static const char *const fields[]={"paddingLeft","paddingTop","paddingRight","paddingBottom",
+      "marginLeft","marginTop","marginRight","marginBottom"};
+   for(int group=margins_only ? 1 : 0;group<2;++group) {
+      for(int edge=0;edge<4;++edge) {
+         int base=group*3;
+         int32_t value=values[base]>=0 ? values[base] : values[base+1+(edge&1)];
+         if(value>=0) ax_set_int(vm,view,fields[group*4+edge],value);
+      }
+   }
+   /* Preserve relative-edge precedence, as with the existing inflater's
+    * start/end handling. Full inherited RTL resolution belongs to View. */
+   if(!margins_only) {
+      if(values[6]>=0) ax_set_int(vm,view,"paddingLeft",values[6]);
+      if(values[7]>=0) ax_set_int(vm,view,"paddingRight",values[7]);
+   }
+}
+
 /* android:gravity and android:layout_gravity are bit masks, not enums; the
  * constants are the platform's. */
 static void ax_apply_attribute(struct dvm *vm, dvm_ref view, const char *name,
@@ -7767,6 +8495,7 @@ static void ax_apply_attribute(struct dvm *vm, dvm_ref view, const char *name,
       { ax_set_int(vm, view, "gravity", (int32_t)data); return; }
    if (!strcmp(name, "layout_gravity"))
       { ax_set_int(vm, view, "layoutGravity", (int32_t)data); return; }
+   if (!strcmp(name,"visibility") && ui_is_a(vm,view,"android/view/ViewStub")) return;
    if (!strcmp(name, "visibility"))
       { if (data <= 2) ax_set_int(vm, view, "visibility", (int32_t)data * 4); return; }
    /* android:tag is View.setTag(Object): a String.  Data binding finds the
@@ -8003,6 +8732,8 @@ static dvm_ref li_inflate_resource(struct dvm *vm, dvm_ref inflater,dvm_ref cont
                    (has_width && has_height && !strncmp(an, "layout_", 7))))
                   ax_apply_attribute(vm, child, an, b[q + 15], ax_u32(b + q + 16), strings, nstrings);
             }
+            if(child && has_width && has_height)
+               ax_apply_inset_shorthands(vm,child,b,attrs,pos+size,attr_size,attr_count,strings,nstrings,true);
             if (child && id) {
                union dvm_value v = { .i = (int32_t)id };
                (void)dvm_set_field(vm, child, "id", "I", v);
@@ -8016,6 +8747,11 @@ static dvm_ref li_inflate_resource(struct dvm *vm, dvm_ref inflater,dvm_ref cont
             dvm_ref view=li_create_tag(vm,inflater,parent,tag,context,parser);
             if (!view || dvm_exception(vm)) break;
             dvm_pin(vm,view);
+            if (ui_is_a(vm,view,"android/view/ViewStub")) {
+               union dvm_value ctx={.l=context},clone={0};
+               if (!li_clone(vm,inflater,&ctx,1,&clone)) {dvm_unpin(vm,view);break;}
+               dvm_set_field(vm,view,"stubInflater","Landroid/view/LayoutInflater;",clone);
+            }
             if (parent && view) {
                struct dvm_class *parent_class = dvm_object_class(vm, parent);
                struct dvm_method *generate = parent_class ? dvm_find_method(vm, parent_class,
@@ -8041,6 +8777,7 @@ static dvm_ref li_inflate_resource(struct dvm *vm, dvm_ref inflater,dvm_ref cont
                ax_apply_attribute(vm, view, an, b[q + 15], ax_u32(b + q + 16),
                                   strings, nstrings);
             }
+            ax_apply_inset_shorthands(vm,view,b,attrs,pos+size,attr_size,attr_count,strings,nstrings,false);
             if (parent && view && add_to_parent) {
                union dvm_value a = { .l = view }, ignored = { 0 };
                (void)vg_add_view(vm, parent, &a, 1, &ignored);
@@ -8116,6 +8853,151 @@ static bool view_inflate(struct dvm *vm, dvm_ref self,
    return m && dvm_call(vm, m, inflater.l, args + 1, 2, out);
 }
 
+/* ViewStub is a zero-sized placeholder. Its layout is inflated only on
+ * request; normal parent operations preserve callbacks and child ordering. */
+static bool viewstub_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                           int nargs,union dvm_value *out)
+{
+   if (!view_init_context(vm,self,args,1,out)) return false;
+   rt_set_int(vm,self,"visibility",8);rt_set_int(vm,self,"inflatedId",-1);rt_set_int(vm,self,"id",-1);
+   dvm_set_field(vm,self,"willNotDraw","Z",(union dvm_value){.i=1});
+   if (nargs==2 && strstr(builtin_sig(),"Context;I)")) {
+      rt_set_int(vm,self,"layoutResource",ARG(1).i);RETV();
+   }
+   const uint32_t attrs[]={0x010100d0u,0x010100f2u,0x010100f3u}; /* id, layout, inflatedId */
+   dvm_ref ids=dvm_new_array(vm,'I',"I",3);
+   if (!ids) return false;
+   memcpy(dvm_array_data(vm,ids),attrs,sizeof attrs);
+   union dvm_value input[]={{.l=nargs>1 ? ARG(1).l : 0},{.l=ids},
+      {.i=nargs>2 ? ARG(2).i : 0},{.i=nargs>3 ? ARG(3).i : 0}},array={0},ignored={0};
+   if (!am_vcall(vm,ARG(0).l,"obtainStyledAttributes",
+      "(Landroid/util/AttributeSet;[III)Landroid/content/res/TypedArray;",input,4,&array)) return false;
+   dvm_pin(vm,array.l);
+   const char *fields[]={"id","layoutResource","inflatedId"};
+   bool good=true;
+   for (int i=0;i<3 && good;++i) {
+      union dvm_value a[]={{.i=i},{.i=i==1 ? 0 : -1}},value={0};
+      good=am_vcall(vm,array.l,"getResourceId","(II)I",a,2,&value);
+      if (good) rt_set_int(vm,self,fields[i],value.i);
+   }
+   if (good) good=am_vcall(vm,array.l,"recycle","()V",NULL,0,&ignored);
+   dvm_unpin(vm,array.l);return good;
+}
+
+static bool viewstub_inflate(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                              int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   dvm_ref parent=ui_obj(vm,self,"parent","Landroid/view/ViewParent;");
+   if (!parent || !ui_is_a(vm,parent,"android/view/ViewGroup")) {
+      dvm__throw(vm,"java/lang/IllegalStateException","ViewStub must have a non-null ViewGroup parent");return false;
+   }
+   int32_t layout=rt_get_int(vm,self,"layoutResource");
+   if (!layout) {dvm__throw(vm,"java/lang/IllegalArgumentException","ViewStub must have a valid layoutResource");return false;}
+   dvm_ref inflater=ui_obj(vm,self,"stubInflater","Landroid/view/LayoutInflater;");
+   if (!inflater) {
+      union dvm_value context={.l=ui_obj(vm,self,"context","Landroid/content/Context;")},result={0};
+      if (!li_from(vm,0,&context,1,&result)) return false;
+      inflater=result.l;
+   }
+   union dvm_value input[]={{.i=layout},{.l=parent},{.i=0}},view={0};
+   if (!am_vcall(vm,inflater,"inflate","(ILandroid/view/ViewGroup;Z)Landroid/view/View;",input,3,&view)) return false;
+   dvm_pin(vm,view.l);
+   union dvm_value ignored={0},index={0},stub={.l=self};
+   int32_t id=rt_get_int(vm,self,"inflatedId");
+   bool good=true;
+   if (id!=-1) {
+      union dvm_value value={.i=id};good=am_vcall(vm,view.l,"setId","(I)V",&value,1,&ignored);
+   }
+   if (good) good=am_vcall(vm,parent,"indexOfChild","(Landroid/view/View;)I",&stub,1,&index);
+   if (good) good=am_vcall(vm,parent,"removeViewInLayout","(Landroid/view/View;)V",&stub,1,&ignored);
+   union dvm_value a[]={{.l=view.l},{.i=index.i},{.l=ui_obj(vm,self,"layoutParams","Landroid/view/ViewGroup$LayoutParams;")}};
+   if (good) good=am_vcall(vm,parent,"addView",a[2].l ?
+      "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;)V" : "(Landroid/view/View;I)V",a,a[2].l ? 3 : 2,&ignored);
+   if (good) {
+      dvm_ref weak=dvm_new_object(vm,dvm_find_class(vm,"java/lang/ref/WeakReference"));
+      good=weak && ref_init(vm,weak,&view,1,&ignored)
+         && dvm_set_field(vm,self,"inflatedViewRef","Ljava/lang/ref/WeakReference;",(union dvm_value){.l=weak});
+   }
+   dvm_ref listener=ui_obj(vm,self,"inflateListener","Landroid/view/ViewStub$OnInflateListener;");
+   if (good && listener) {
+      union dvm_value notify[]={{.l=self},{.l=view.l}};
+      good=am_vcall(vm,listener,"onInflate","(Landroid/view/ViewStub;Landroid/view/View;)V",notify,2,&ignored);
+   }
+   dvm_unpin(vm,view.l);
+   if (!good) return false;
+   RETL(view.l);
+}
+
+static bool viewstub_visibility(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                                 int nargs,union dvm_value *out)
+{
+   dvm_ref weak=ui_obj(vm,self,"inflatedViewRef","Ljava/lang/ref/WeakReference;");
+   if (weak) {
+      union dvm_value view={0};
+      if (!ref_get(vm,weak,NULL,0,&view)) return false;
+      if (!view.l) {dvm__throw(vm,"java/lang/IllegalStateException","setVisibility called on un-referenced view");return false;}
+      return am_vcall(vm,view.l,"setVisibility","(I)V",args,nargs,out);
+   }
+   if (!view_set_visibility(vm,self,args,nargs,out)) return false;
+   if (ARG(0).i==0 || ARG(0).i==4) {
+      union dvm_value ignored={0};return viewstub_inflate(vm,self,NULL,0,&ignored);
+   }
+   RETV();
+}
+static bool viewstub_measure(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                              int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   union dvm_value zero[2]={{.i=0},{.i=0}};
+   return view_set_measured(vm,self,zero,2,out);
+}
+static bool viewstub_property(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                               int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   const char *name=builtin_name();
+   const char *field=strstr(name,"LayoutResource") ? "layoutResource" : "inflatedId";
+   if (name[0]=='g') RETI(rt_get_int(vm,self,field));
+   rt_set_int(vm,self,field,ARG(0).i);RETV();
+}
+static bool viewstub_reference(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                                int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   bool inflater=strstr(builtin_name(),"LayoutInflater")!=NULL;
+   const char *field=inflater ? "stubInflater" : "inflateListener";
+   const char *sig=inflater ? "Landroid/view/LayoutInflater;" : "Landroid/view/ViewStub$OnInflateListener;";
+   if (builtin_name()[0]=='g') {union dvm_value value={0};dvm_get_field(vm,self,field,sig,&value);RETL(value.l);}
+   dvm_set_field(vm,self,field,sig,ARG(0));RETV();
+}
+static const struct rt_field rt_viewstub_fields[]={
+ {"layoutResource","I"},{"inflatedId","I"},
+ {"stubInflater","Landroid/view/LayoutInflater;"},
+ {"inflateListener","Landroid/view/ViewStub$OnInflateListener;"},
+ {"inflatedViewRef","Ljava/lang/ref/WeakReference;"},F_END,
+};
+static const struct rt_method rt_viewstub[]={
+ M("<init>","(Landroid/content/Context;)V",viewstub_init),
+ M("<init>","(Landroid/content/Context;I)V",viewstub_init),
+ M("<init>","(Landroid/content/Context;Landroid/util/AttributeSet;)V",viewstub_init),
+ M("<init>","(Landroid/content/Context;Landroid/util/AttributeSet;I)V",viewstub_init),
+ M("<init>","(Landroid/content/Context;Landroid/util/AttributeSet;II)V",viewstub_init),
+ M("inflate","()Landroid/view/View;",viewstub_inflate),
+ M("setVisibility","(I)V",viewstub_visibility),
+ M("onMeasure","(II)V",viewstub_measure),
+ M("draw","(Landroid/graphics/Canvas;)V",empty_void),
+ M("dispatchDraw","(Landroid/graphics/Canvas;)V",empty_void),
+ M("getLayoutResource","()I",viewstub_property),M("setLayoutResource","(I)V",viewstub_property),
+ M("getInflatedId","()I",viewstub_property),M("setInflatedId","(I)V",viewstub_property),
+ M("getLayoutInflater","()Landroid/view/LayoutInflater;",viewstub_reference),
+ M("setLayoutInflater","(Landroid/view/LayoutInflater;)V",viewstub_reference),
+ M("setOnInflateListener","(Landroid/view/ViewStub$OnInflateListener;)V",viewstub_reference),M_END,
+};
+static const struct rt_method rt_viewstub_listener[]={
+ {"onInflate","(Landroid/view/ViewStub;Landroid/view/View;)V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},M_END,
+};
+
 static const struct rt_field rt_layout_inflater_fields[] = {
    { "context", "Landroid/content/Context;" },
    { "mFactory", "Landroid/view/LayoutInflater$Factory;" },
@@ -8159,11 +9041,10 @@ static const struct rt_method rt_inflater_factory2[] = {
    {"onCreateView","(Landroid/view/View;Ljava/lang/String;Landroid/content/Context;Landroid/util/AttributeSet;)Landroid/view/View;",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT}, M_END
 };
 
-/* A Typeface is a family and a style (NORMAL 0, BOLD 1, ITALIC 2,
- * BOLD_ITALIC 3).  The overlay renders one face, so the family is recorded
- * and the style is what reaches the text. */
+/* Typeface retains its selected immutable host face as well as style. */
 static const struct rt_field rt_typeface_fields[] = {
-   { "style", "I" }, { "family", "Ljava/lang/String;" }, F_END
+   { "style", "I" }, { "weight", "I" }, { "family", "Ljava/lang/String;" }, { "fontHandle", "I" },
+   { "fontFamily", "Landroid/graphics/fonts/FontFamily;" }, { "weightStyles", "Ljava/util/HashMap;" }, F_END
 };
 static const struct rt_field rt_typeface_sfields[] = {
    { "DEFAULT", "Landroid/graphics/Typeface;" },
@@ -8180,10 +9061,209 @@ static dvm_ref typeface_new(struct dvm *vm, const char *family, int32_t style)
    dvm_ref t = c ? dvm_new_object(vm, c) : 0;
    if (!t) return 0;
    rt_set_int(vm, t, "style", style & 3);
+   rt_set_int(vm, t, "weight", (style&1) ? 700 : 400);
    union dvm_value v = { .l = dvm_new_string(vm, family ? family : "sans-serif") };
    (void)dvm_set_field(vm, t, "family", "Ljava/lang/String;", v);
    return t;
 }
+
+/* Font files and API 29 builders. Included by dvm_android_ui.h.
+ * Data is copied into the host font cache; Java objects retain immutable handles.
+ * Variable-font axes and additional custom fallback families are not implemented. */
+static const struct rt_field rt_font_style_fields[] = {{"weight","I"},{"slant","I"},F_END};
+static dvm_ref font_style_new(struct dvm *vm,int weight,int slant)
+{
+   dvm_ref ref=dvm_new_object(vm,dvm__class_by_desc(vm,"Landroid/graphics/fonts/FontStyle;"));
+   if(ref) {rt_set_int(vm,ref,"weight",weight);rt_set_int(vm,ref,"slant",slant);}
+   return ref;
+}
+static bool font_style_method(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;const char *name=builtin_name();
+   if(!strcmp(name,"<init>")) {
+      int weight=nargs ? ARG(0).i : 400,slant=nargs ? ARG(1).i : 0;
+      if(weight<1 || weight>1000 || slant<0 || slant>1) {
+         dvm__throw(vm,"java/lang/IllegalArgumentException","Invalid font style");return false;
+      }
+      rt_set_int(vm,self,"weight",weight);rt_set_int(vm,self,"slant",slant);RETV();
+   }
+   if(!strcmp(name,"getWeight")) RETI(rt_get_int(vm,self,"weight"));
+   RETI(rt_get_int(vm,self,"slant"));
+}
+static const struct rt_method rt_font_style[]={
+   M("<init>","()V",font_style_method),M("<init>","(II)V",font_style_method),
+   M("getWeight","()I",font_style_method),M("getSlant","()I",font_style_method),M_END
+};
+static const struct rt_field rt_font_fields[]={
+   {"handle","I"},{"fontStyle","Landroid/graphics/fonts/FontStyle;"},{"ttcIndex","I"},F_END
+};
+static const struct rt_field rt_font_builder_fields[]={
+   {"path","Ljava/lang/String;"},{"weight","I"},{"slant","I"},{"ttcIndex","I"},F_END
+};
+static uint32_t font_file_load(const char *path,int index,int *weight,int *slant)
+{
+   FILE *file=path ? luna_file_fopen(path,"rb") : NULL;
+   if(!file) return 0;
+   long size=0;unsigned char *bytes=NULL;
+   if(!fseek(file,0,SEEK_END) && (size=ftell(file))>0 && size<=INT_MAX && !fseek(file,0,SEEK_SET)) {
+      bytes=malloc((size_t)size);
+      if(bytes && fread(bytes,1,(size_t)size,file)!=(size_t)size) {free(bytes);bytes=NULL;}
+   }
+   fclose(file);
+   uint32_t handle=bytes ? luna_overlay_font_load(bytes,(size_t)size,index) : 0;
+   if(handle && (weight || slant)) {
+      /* OS/2 usWeightClass and fsSelection, with the Android default on absence. */
+      if(weight) *weight=400;
+      if(slant) *slant=0;
+      size_t offset=0;
+      if(!memcmp(bytes,"ttcf",4)) offset=((size_t)bytes[12+4*index]<<24)|((size_t)bytes[13+4*index]<<16)|((size_t)bytes[14+4*index]<<8)|bytes[15+4*index];
+      unsigned count=((unsigned)bytes[offset+4]<<8)|bytes[offset+5];
+      for(unsigned i=0;i<count;++i) {
+         const unsigned char *entry=bytes+offset+12+16*i;
+         if(memcmp(entry,"OS/2",4)) continue;
+         size_t pos=((size_t)entry[8]<<24)|((size_t)entry[9]<<16)|((size_t)entry[10]<<8)|entry[11];
+         size_t length=((size_t)entry[12]<<24)|((size_t)entry[13]<<16)|((size_t)entry[14]<<8)|entry[15];
+         if(length>=6 && weight) {int w=((unsigned)bytes[pos+4]<<8)|bytes[pos+5];*weight=w<1 ? 1 : w>1000 ? 1000 : w;}
+         if(length>=64 && slant) *slant=(bytes[pos+63]&1)!=0;
+         break;
+      }
+   }
+   free(bytes);return handle;
+}
+static bool font_builder_method(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;const char *name=builtin_name();
+   if(!strcmp(name,"<init>")) {
+      if(!ARG(0).l) {dvm__throw(vm,"java/lang/NullPointerException","font source");return false;}
+      const char *path=NULL;char host[DVM_PATH_MAX];
+      if(!strcmp(builtin_sig(),"(Landroid/content/res/Resources;I)V")) {
+         int32_t value=ARG(1).i;const char *entry=NULL;int kind=1;
+         for(int depth=0;kind==1 && depth<32;++depth) kind=arm_exec_apk_resource_value((uint32_t)value,&value,&entry);
+         if(kind==0 || kind==1) {dvm__throw(vm,"android/content/res/Resources$NotFoundException","Font resource #0x%x",ARG(1).u);return false;}
+         if(kind=='L' && entry && !strstr(entry,".xml")) path=arm_exec_apk_entry_path(entry);
+      } else {
+         const char *guest=file_path(vm,ARG(0).l);
+         if(guest) path=arm_exec_map_guest_path(guest,host,sizeof host);
+      }
+      if(path) (void)dvm_set_field(vm,self,"path","Ljava/lang/String;",(union dvm_value){.l=dvm_new_string(vm,path)});
+      rt_set_int(vm,self,"weight",-1);rt_set_int(vm,self,"slant",-1);RETV();
+   }
+   if(!strcmp(name,"setWeight")) {
+      if(ARG(0).i<1 || ARG(0).i>1000) {dvm__throw(vm,"java/lang/IllegalArgumentException","font weight");return false;}
+      rt_set_int(vm,self,"weight",ARG(0).i);RETL(self);
+   }
+   if(!strcmp(name,"setSlant")) {rt_set_int(vm,self,"slant",ARG(0).i!=0);RETL(self);}
+   if(!strcmp(name,"setTtcIndex")) {rt_set_int(vm,self,"ttcIndex",ARG(0).i);RETL(self);}
+   union dvm_value path={0};(void)dvm_get_field(vm,self,"path","Ljava/lang/String;",&path);
+   int weight=400,slant=0,index=rt_get_int(vm,self,"ttcIndex");
+   uint32_t handle=font_file_load(path.l ? dvm_string_utf8(vm,path.l) : NULL,index,&weight,&slant);
+   if(!handle) {dvm__throw(vm,"java/io/IOException","Failed to read font contents");return false;}
+   if(rt_get_int(vm,self,"weight")!=-1) weight=rt_get_int(vm,self,"weight");
+   if(rt_get_int(vm,self,"slant")!=-1) slant=rt_get_int(vm,self,"slant");
+   dvm_ref font=dvm_new_object(vm,dvm__class_by_desc(vm,"Landroid/graphics/fonts/Font;"));
+   if(!font) return false;
+   rt_set_int(vm,font,"handle",(int32_t)handle);rt_set_int(vm,font,"ttcIndex",index);
+   (void)dvm_set_field(vm,font,"fontStyle","Landroid/graphics/fonts/FontStyle;",(union dvm_value){.l=font_style_new(vm,weight,slant)});
+   RETL(font);
+}
+static const struct rt_method rt_font_builder[]={
+   M("<init>","(Landroid/content/res/Resources;I)V",font_builder_method),
+   M("<init>","(Ljava/io/File;)V",font_builder_method),
+   M("setWeight","(I)Landroid/graphics/fonts/Font$Builder;",font_builder_method),
+   M("setSlant","(I)Landroid/graphics/fonts/Font$Builder;",font_builder_method),
+   M("setTtcIndex","(I)Landroid/graphics/fonts/Font$Builder;",font_builder_method),
+   M("build","()Landroid/graphics/fonts/Font;",font_builder_method),M_END
+};
+static bool font_method(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   if(!strcmp(builtin_name(),"getTtcIndex")) RETI(rt_get_int(vm,self,"ttcIndex"));
+   union dvm_value style={0};(void)dvm_get_field(vm,self,"fontStyle","Landroid/graphics/fonts/FontStyle;",&style);RETL(style.l);
+}
+static const struct rt_method rt_font[]={M("getStyle","()Landroid/graphics/fonts/FontStyle;",font_method),M("getTtcIndex","()I",font_method),M_END};
+static const struct rt_field rt_font_family_fields[]={{"fonts","[Landroid/graphics/fonts/Font;"},F_END};
+static bool font_family_method(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;const char *name=builtin_name();union dvm_value list={0};
+   (void)dvm_get_field(vm,self,"fonts","[Landroid/graphics/fonts/Font;",&list);
+   int count=list.l ? dvm_array_length(vm,list.l) : 0;
+   if(!strcmp(name,"getSize")) RETI(count);
+   if(!strcmp(name,"getFont")) {
+      if(ARG(0).i<0 || ARG(0).i>=count) {dvm__throw(vm,"java/lang/IndexOutOfBoundsException","font index");return false;}
+      RETL(((dvm_ref *)dvm_array_data(vm,list.l))[ARG(0).i]);
+   }
+   if(!strcmp(name,"build")) {
+      dvm_ref family=dvm_new_object(vm,dvm__class_by_desc(vm,"Landroid/graphics/fonts/FontFamily;"));
+      (void)dvm_set_field(vm,family,"fonts","[Landroid/graphics/fonts/Font;",list);RETL(family);
+   }
+   if(!ARG(0).l) {dvm__throw(vm,"java/lang/NullPointerException","font");return false;}
+   if(!strcmp(name,"<init>")) count=0;
+   union dvm_value style={0};(void)dvm_get_field(vm,ARG(0).l,"fontStyle","Landroid/graphics/fonts/FontStyle;",&style);
+   for(int i=0;i<count;++i) {
+      dvm_ref other=((dvm_ref *)dvm_array_data(vm,list.l))[i];union dvm_value other_style={0};
+      (void)dvm_get_field(vm,other,"fontStyle","Landroid/graphics/fonts/FontStyle;",&other_style);
+      if(rt_get_int(vm,style.l,"weight")==rt_get_int(vm,other_style.l,"weight") && rt_get_int(vm,style.l,"slant")==rt_get_int(vm,other_style.l,"slant")) {
+         dvm__throw(vm,"java/lang/IllegalArgumentException","Font style already present");return false;
+      }
+   }
+   dvm_ref next=dvm_new_array(vm,'L',"Landroid/graphics/fonts/Font;",count+1);if(!next) return false;
+   if(count) memcpy(dvm_array_data(vm,next),dvm_array_data(vm,list.l),(size_t)count*sizeof(dvm_ref));
+   ((dvm_ref *)dvm_array_data(vm,next))[count]=ARG(0).l;
+   (void)dvm_set_field(vm,self,"fonts","[Landroid/graphics/fonts/Font;",(union dvm_value){.l=next});
+   if(!strcmp(name,"<init>")) RETV();
+   RETL(self);
+}
+static const struct rt_method rt_font_family_builder[]={
+   M("<init>","(Landroid/graphics/fonts/Font;)V",font_family_method),
+   M("addFont","(Landroid/graphics/fonts/Font;)Landroid/graphics/fonts/FontFamily$Builder;",font_family_method),
+   M("build","()Landroid/graphics/fonts/FontFamily;",font_family_method),M_END
+};
+static const struct rt_method rt_font_family[]={M("getSize","()I",font_family_method),M("getFont","(I)Landroid/graphics/fonts/Font;",font_family_method),M_END};
+static const struct rt_field rt_font_fallback_fields[]={
+   {"fontFamily","Landroid/graphics/fonts/FontFamily;"},{"fontStyle","Landroid/graphics/fonts/FontStyle;"},F_END
+};
+static dvm_ref font_family_match(struct dvm *vm,dvm_ref family,int weight,int slant)
+{
+   union dvm_value list={0};
+   (void)dvm_get_field(vm,family,"fonts","[Landroid/graphics/fonts/Font;",&list);
+   uint32_t count=list.l ? dvm_array_length(vm,list.l) : 0;
+   if(!count) {dvm__throw(vm,"java/lang/IllegalArgumentException","Empty font family");return 0;}
+   dvm_ref best=0;int score=INT_MAX;
+   for(uint32_t i=0;i<count;++i) {
+      dvm_ref font=((dvm_ref *)dvm_array_data(vm,list.l))[i];union dvm_value fs={0};
+      (void)dvm_get_field(vm,font,"fontStyle","Landroid/graphics/fonts/FontStyle;",&fs);
+      int match=abs(rt_get_int(vm,fs.l,"weight")-weight)/100+(rt_get_int(vm,fs.l,"slant")!=slant ? 2 : 0);
+      if(match<score) {score=match;best=font;}
+   }
+   return best;
+}
+static bool font_fallback_method(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;const char *name=builtin_name();
+   if(!strcmp(name,"<init>") || !strcmp(name,"setStyle")) {
+      if(!ARG(0).l) {dvm__throw(vm,"java/lang/NullPointerException","font family/style");return false;}
+      if(!strcmp(name,"<init>")) {
+         (void)dvm_set_field(vm,self,"fontFamily","Landroid/graphics/fonts/FontFamily;",ARG(0));RETV();
+      }
+      (void)dvm_set_field(vm,self,"fontStyle","Landroid/graphics/fonts/FontStyle;",ARG(0));RETL(self);
+   }
+   union dvm_value family={0},style={0};
+   (void)dvm_get_field(vm,self,"fontFamily","Landroid/graphics/fonts/FontFamily;",&family);
+   (void)dvm_get_field(vm,self,"fontStyle","Landroid/graphics/fonts/FontStyle;",&style);
+   int weight=style.l ? rt_get_int(vm,style.l,"weight") : 400,slant=style.l ? rt_get_int(vm,style.l,"slant") : 0;
+   dvm_ref best=font_family_match(vm,family.l,weight,slant);
+   if(!best) return false;
+   dvm_ref face=typeface_new(vm,"custom",(weight>=600 ? 1 : 0)|(slant ? 2 : 0));
+   if(!face) return false;
+   rt_set_int(vm,face,"weight",weight);
+   (void)dvm_set_field(vm,face,"fontFamily","Landroid/graphics/fonts/FontFamily;",family);
+   rt_set_int(vm,face,"fontHandle",rt_get_int(vm,best,"handle"));RETL(face);
+}
+static const struct rt_method rt_font_fallback[]={
+   M("<init>","(Landroid/graphics/fonts/FontFamily;)V",font_fallback_method),
+   M("setStyle","(Landroid/graphics/fonts/FontStyle;)Landroid/graphics/Typeface$CustomFallbackBuilder;",font_fallback_method),
+   M("build","()Landroid/graphics/Typeface;",font_fallback_method),M_END
+};
 
 /* create(String family, int style) / create(Typeface family, int style) /
  * defaultFromStyle(int style). */
@@ -8202,7 +9282,63 @@ static bool typeface_create(struct dvm *vm, dvm_ref self,
       (void)dvm_get_field(vm, ARG(0).l, "family", "Ljava/lang/String;", &f);
       if (f.l) snprintf(family, sizeof family, "%s", dvm_string_utf8(vm, f.l) ?: "");
    }
-   RETL(typeface_new(vm, family, style));
+   dvm_ref face=typeface_new(vm,family,style);
+   if(face && sig && !strncmp(sig,"(Landroid/graphics/Typeface;",28) && ARG(0).l) {
+      union dvm_value source_family={0};
+      (void)dvm_get_field(vm,ARG(0).l,"fontFamily","Landroid/graphics/fonts/FontFamily;",&source_family);
+      int handle=rt_get_int(vm,ARG(0).l,"fontHandle");
+      if(source_family.l) {
+         dvm_ref font=font_family_match(vm,source_family.l,(style&1) ? 700 : 400,(style&2)!=0);
+         if(!font) return false;
+         handle=rt_get_int(vm,font,"handle");
+         (void)dvm_set_field(vm,face,"fontFamily","Landroid/graphics/fonts/FontFamily;",source_family);
+      }
+      rt_set_int(vm,face,"fontHandle",handle);
+   }
+   RETL(face);
+}
+
+static bool typeface_weight_style(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)nargs;
+   int weight=args[1].i,italic=args[2].i!=0;
+   /* Android checks 0..1000 even though the public annotation says 1..1000. */
+   if(weight<0 || weight>1000) {dvm__throw(vm,"java/lang/IllegalArgumentException","weight out of range");return false;}
+   dvm_ref base=args[0].l;union dvm_value value={0};
+   if(!base) {
+      (void)dvm_get_static(vm,dvm__class_by_desc(vm,"Landroid/graphics/Typeface;"),"DEFAULT","Landroid/graphics/Typeface;",&value);
+      base=value.l;
+   }
+   if(!base) return false;
+   union dvm_value cache={0},family={0};
+   (void)dvm_get_field(vm,base,"weightStyles","Ljava/util/HashMap;",&cache);
+   union dvm_value key={.l=box_make(vm,"Ljava/lang/Integer;",(union dvm_value){.i=(weight<<1)|italic})};
+   if(!key.l) return false;
+   if(cache.l) {
+      if(!map_get(vm,cache.l,&key,1,&value)) return false;
+      if(value.l) RETL(value.l);
+   }
+   (void)dvm_get_field(vm,base,"family","Ljava/lang/String;",&family);
+   dvm_ref face=typeface_new(vm,dvm_string_utf8(vm,family.l),(weight>=600 ? 1 : 0)|(italic ? 2 : 0));
+   if(!face) return false;
+   rt_set_int(vm,face,"weight",weight);
+   (void)dvm_get_field(vm,base,"fontFamily","Landroid/graphics/fonts/FontFamily;",&family);
+   int handle=rt_get_int(vm,base,"fontHandle");
+   if(family.l) {
+      dvm_ref font=font_family_match(vm,family.l,weight,italic);
+      if(!font) return false;
+      handle=rt_get_int(vm,font,"handle");
+      (void)dvm_set_field(vm,face,"fontFamily","Landroid/graphics/fonts/FontFamily;",family);
+   }
+   rt_set_int(vm,face,"fontHandle",handle);
+   if(!cache.l) {
+      cache.l=coll_new_map(vm);
+      if(!cache.l) return false;
+      (void)dvm_set_field(vm,base,"weightStyles","Ljava/util/HashMap;",cache);
+   }
+   union dvm_value entry[2]={key,{.l=face}};
+   if(!map_put(vm,cache.l,entry,2,&value)) return false;
+   RETL(face);
 }
 
 /* createFromAsset / createFromFile: the font has to exist — a missing one is
@@ -8224,24 +9360,23 @@ static bool typeface_createFrom(struct dvm *vm, dvm_ref self,
       dvm__throw(vm, "java/lang/NullPointerException", "path");
       return false;
    }
-   bool found;
+   uint32_t handle=0;int weight=400,slant=0;
    if (asset) {
-      size_t len = 0;
-      unsigned char *data = arm_exec_asset_read(path, &len);
-      found = data != NULL;
+      size_t len=0;unsigned char *data=arm_exec_asset_read(path,&len);
+      if(data) handle=luna_overlay_font_load(data,len,0);
       free(data);
    } else {
       char host[DVM_PATH_MAX];
-      const char *hp = arm_exec_map_guest_path(path, host, sizeof host);
-      found = hp && luna_file_access(hp, R_OK) == 0;
+      const char *hp=arm_exec_map_guest_path(path,host,sizeof host);
+      handle=font_file_load(hp,0,&weight,&slant);
    }
-   if (!found) {
-      dvm__throw(vm, "java/lang/RuntimeException", "%s not found %s",
-                 asset ? "Font asset" : "Font", path);
-      return false;
+   if(!handle) {
+      dvm__throw(vm,"java/lang/RuntimeException","Unable to load font %s",path);return false;
    }
-   const char *slash = strrchr(path, '/');
-   RETL(typeface_new(vm, slash ? slash + 1 : path, 0));
+   const char *slash=strrchr(path,'/');
+   dvm_ref face=typeface_new(vm,slash ? slash+1 : path,(weight>=600 ? 1 : 0)|(slant ? 2 : 0));
+   if(face) {rt_set_int(vm,face,"fontHandle",(int32_t)handle);rt_set_int(vm,face,"weight",weight);}
+   RETL(face);
 }
 
 static bool typeface_getStyle(struct dvm *vm, dvm_ref self,
@@ -8251,6 +9386,7 @@ static bool typeface_getStyle(struct dvm *vm, dvm_ref self,
    (void)args; (void)nargs;
    const int32_t st = rt_get_int(vm, self, "style");
    const char *n = builtin_name();
+   if (!strcmp(n, "getWeight")) RETI(rt_get_int(vm,self,"weight"));
    if (!strcmp(n, "isBold")) RETI((st & 1) != 0);
    if (!strcmp(n, "isItalic")) RETI((st & 2) != 0);
    RETI(st);
@@ -8268,8 +9404,10 @@ static const struct rt_method rt_typeface[] = {
       typeface_create),
    SM("create", "(Landroid/graphics/Typeface;I)Landroid/graphics/Typeface;",
       typeface_create),
+   SM("create", "(Landroid/graphics/Typeface;IZ)Landroid/graphics/Typeface;", typeface_weight_style),
    SM("defaultFromStyle", "(I)Landroid/graphics/Typeface;", typeface_create),
    M("getStyle", "()I", typeface_getStyle),
+   M("getWeight", "()I", typeface_getStyle),
    M("isBold", "()Z", typeface_getStyle),
    M("isItalic", "()Z", typeface_getStyle),
    M_END,
@@ -9026,6 +10164,9 @@ struct ui_node {
    int32_t l, r, t, b;
 };
 
+/* Unscoped framework changes conservatively invalidate all measurements.
+ * requestLayout marks just the affected branch instead. */
+static uint64_t g_ui_measure_epoch=1;
 static struct ui_node *g_ui_nodes;
 /* Slots in the per-view layout table (a power of two: it is probed by hash).
  * A Material home screen is several thousand views, and nodes are handed out
@@ -9139,8 +10280,6 @@ static void ui_read_lp(struct dvm *vm, dvm_ref view, struct ui_lp *lp)
       lp->mt = ui_int(vm, o, "topMargin");
       lp->mr = ui_int(vm, o, "rightMargin");
       lp->mb = ui_int(vm, o, "bottomMargin");
-      if (!lp->ml) lp->ml = ui_int(vm, o, "marginStart");
-      if (!lp->mr) lp->mr = ui_int(vm, o, "marginEnd");
       lp->weight = ui_float(vm, o, "weight");
       union dvm_value g = { 0 };
       if (dvm_get_field(vm, o, "gravity", "I", &g) && g.i) lp->gravity = g.i;
@@ -9283,16 +10422,23 @@ static bool ui_intrinsic_image(struct dvm *vm, dvm_ref view, int32_t *w, int32_t
 }
 
 struct rt_text_units { const uint16_t *data; uint16_t *owned; size_t length; };
-struct textview_line {size_t start,end;struct luna_text_run run;};
+struct textview_line {
+   size_t start,end;
+   struct luna_text_run run;
+   float left,top,bottom,baseline,descent,extra;
+   int direction;
+};
 struct textview_layout {
    struct rt_text_units text;
    struct textview_line *lines;
    size_t count;
-   dvm_ref source,paint,face;
-   float px,scale,line_height,baseline,height,widest,top_padding;
+   dvm_ref source,paint,face,direction,draw_units;
+   int source_start,source_end,paragraph_direction;
+   float px,scale,height,widest,top_padding,bottom_padding,spacing_mult,spacing_add;
    int width,max_lines;
-   bool bold,single,padding;
+   bool bold,single,padding,fallback_spacing;
 };
+static bool text_layout_direction(struct dvm *,struct textview_layout *,size_t,size_t);
 static struct textview_layout *textview_layout_get(struct dvm *,dvm_ref,int);
 
 /* The widest hard line of a TextView's text (its hint when empty) and how many
@@ -9321,12 +10467,22 @@ static dvm_ref layout_view(struct dvm *vm, dvm_ref self)
    return v.l;
 }
 
+/* Both TextView's cached layouts and independently built layouts own the
+ * same native shaped-line data. Only the former refresh from a View. */
+static struct textview_layout *layout_data(struct dvm *vm,dvm_ref self)
+{
+   dvm_ref view=layout_view(vm,self);
+   if(view) return textview_current_layout(vm,view);
+   struct dvm_object *object=dvm__obj(vm,self);
+   return object ? object->data : NULL;
+}
+
 static bool layout_line_count(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                               int nargs, union dvm_value *out)
 {
-   dvm_ref view = layout_view(vm, self);
-   if (!view) RETI(0);
-   return text_get_line_count(vm, view, args, nargs, out);
+   (void)args; (void)nargs;
+   struct textview_layout *layout=layout_data(vm,self);
+   RETI(layout ? (int32_t)layout->count : 0);
 }
 
 static float layout_line_height(struct dvm *vm, dvm_ref view)
@@ -9337,8 +10493,7 @@ static float layout_line_height(struct dvm *vm, dvm_ref view)
 static bool layout_get_height(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                               int nargs, union dvm_value *out)
 {
-   dvm_ref view = layout_view(vm, self);
-   struct textview_layout *layout=view ? textview_current_layout(vm,view) : NULL;
+   struct textview_layout *layout=layout_data(vm,self);
    RETI(layout ? (int32_t)ceilf(layout->height) : 0);
 }
 
@@ -9346,11 +10501,8 @@ static bool layout_get_width(struct dvm *vm, dvm_ref self, const union dvm_value
                              int nargs, union dvm_value *out)
 {
    (void)args; (void)nargs;
-   dvm_ref view = layout_view(vm, self);
-   const struct ui_node *n = view ? ui_node(vm, view) : NULL;
-   int32_t pad[4] = { 0, 0, 0, 0 };
-   if (view) ui_pad(vm, view, pad);
-   RETI((n ? n->w : 0) - pad[0] - pad[2]);
+   struct textview_layout *layout=layout_data(vm,self);
+   RETI(layout ? layout->width : 0);
 }
 
 /* getLineTop/getLineBottom/getLineBaseline(line): lines are stacked at the
@@ -9359,19 +10511,28 @@ static bool layout_line_edge(struct dvm *vm, dvm_ref self, const union dvm_value
                              int nargs, union dvm_value *out)
 {
    (void)nargs;
-   dvm_ref view = layout_view(vm, self);
-   if (!view) RETI(0);
    const char *name=builtin_name();
-   struct textview_layout *layout=textview_current_layout(vm,view);
+   struct textview_layout *layout=layout_data(vm,self);
    if(!layout) return false;
    int64_t line=ARG(0).i;
    if(line<0 || line>(int64_t)layout->count || (strcmp(name,"getLineTop") && line==(int64_t)layout->count)) {
       dvm__throw(vm,"java/lang/IndexOutOfBoundsException","line");return false;
    }
-   if(!strcmp(name,"getLineBaseline")) RETI((int32_t)ceilf(layout->baseline+line*layout->line_height));
-   if(!strcmp(name,"getLineBottom")) ++line;
-   RETI(line==(int64_t)layout->count ? (int32_t)ceilf(layout->height) :
-      line ? (int32_t)ceilf(layout->top_padding+line*layout->line_height) : 0);
+   if(line==(int64_t)layout->count) RETI((int32_t)layout->height);
+   struct textview_line *entry=&layout->lines[line];
+   if(!strcmp(name,"getLineBaseline")) RETI((int32_t)entry->baseline);
+   if(!strcmp(name,"getLineDescent")) RETI((int32_t)entry->descent);
+   if(!strcmp(name,"getLineExtra")) RETI((int32_t)entry->extra);
+   if(!strcmp(name,"getLineBottom")) RETI((int32_t)entry->bottom);
+   RETI((int32_t)entry->top);
+}
+
+static bool layout_padding(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                           int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   struct textview_layout *layout=layout_data(vm,self);
+   RETI(layout ? (int32_t)(!strcmp(builtin_name(),"getTopPadding") ? layout->top_padding : layout->bottom_padding) : 0);
 }
 
 static bool layout_ellipsis_count(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -9382,9 +10543,7 @@ static bool layout_line_width(struct dvm *vm, dvm_ref self, const union dvm_valu
                               int nargs, union dvm_value *out)
 {
    (void)args; (void)nargs;
-   dvm_ref view = layout_view(vm, self);
-   if (!view) RETF(0.0);
-   struct textview_layout *layout=textview_current_layout(vm,view);
+   struct textview_layout *layout=layout_data(vm,self);
    if(!layout) return false;
    int line=ARG(0).i;
    if(line<0 || (size_t)line>=layout->count) {dvm__throw(vm,"java/lang/IndexOutOfBoundsException","line");return false;}
@@ -9398,23 +10557,67 @@ static bool layout_get_text(struct dvm *vm, dvm_ref self, const union dvm_value 
    dvm_ref view = layout_view(vm, self);
    union dvm_value text = { 0 };
    if (view) (void)dvm_get_field(vm, view, "text", "Ljava/lang/CharSequence;", &text);
+   else (void)dvm_get_field(vm,self,"source","Ljava/lang/CharSequence;",&text);
    RETL(text.l);
 }
 
+static bool layout_line_position(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   struct textview_layout *layout=layout_data(vm,self);
+   int line=ARG(0).i;
+   if(!layout || line<0 || (size_t)line>=layout->count) {dvm__throw(vm,"java/lang/IndexOutOfBoundsException","line");return false;}
+   struct textview_line *entry=&layout->lines[line];
+   const char *name=builtin_name();
+   if(!strcmp(name,"getLineStart")) RETI(layout->source_start+entry->start);
+   if(!strcmp(name,"getLineEnd")) RETI(layout->source_start+entry->end);
+   if(!strcmp(name,"getParagraphDirection")) RETI(entry->direction==2 ? -1 : 1);
+   if(!strcmp(name,"getLineRight")) RETF(entry->left+entry->run.width*layout->scale);
+   RETF(entry->left);
+}
+static bool layout_property(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   const char *name=builtin_name();union dvm_value value={0};
+   if(!strcmp(name,"getAlignment")) {
+      dvm_get_field(vm,self,"alignment","Landroid/text/Layout$Alignment;",&value);
+      if(!value.l) dvm_get_static(vm,dvm_find_class(vm,"android/text/Layout$Alignment"),"ALIGN_NORMAL","Landroid/text/Layout$Alignment;",&value);
+   } else {
+      struct textview_layout *layout=layout_data(vm,self);
+      value.l=layout ? layout->paint : 0;
+   }
+   RETL(value.l);
+}
+static bool layout_draw(struct dvm *,dvm_ref,const union dvm_value *,int,union dvm_value *);
+static bool layout_desired_width(struct dvm *,dvm_ref,const union dvm_value *,int,union dvm_value *);
+
 static const struct rt_method rt_text_layout[] = {
+   SM("getDesiredWidth","(Ljava/lang/CharSequence;Landroid/text/TextPaint;)F",layout_desired_width),
+   SM("getDesiredWidth","(Ljava/lang/CharSequence;IILandroid/text/TextPaint;)F",layout_desired_width),
+   SM("getDesiredWidth","(Ljava/lang/CharSequence;IILandroid/text/TextPaint;Landroid/text/TextDirectionHeuristic;)F",layout_desired_width),
+   SM("getDesiredWidthWithLimit","(Ljava/lang/CharSequence;IILandroid/text/TextPaint;Landroid/text/TextDirectionHeuristic;F)F",layout_desired_width),
+   M("draw","(Landroid/graphics/Canvas;)V",layout_draw),
+   M("getPaint","()Landroid/text/TextPaint;",layout_property),
+   M("getAlignment","()Landroid/text/Layout$Alignment;",layout_property),
+   M("getLineStart","(I)I",layout_line_position),M("getLineEnd","(I)I",layout_line_position),
+   M("getParagraphDirection","(I)I",layout_line_position),
+   M("getLineLeft","(I)F",layout_line_position),M("getLineRight","(I)F",layout_line_position),
    M("getLineCount", "()I", layout_line_count),
    M("getHeight", "()I", layout_get_height),
    M("getWidth", "()I", layout_get_width),
    M("getLineTop", "(I)I", layout_line_edge),
    M("getLineBottom", "(I)I", layout_line_edge),
    M("getLineBaseline", "(I)I", layout_line_edge),
+   M("getLineDescent", "(I)I", layout_line_edge),M("getLineExtra", "(I)I", layout_line_edge),
+   M("getTopPadding", "()I", layout_padding),M("getBottomPadding", "()I", layout_padding),
    M("getEllipsisCount", "(I)I", layout_ellipsis_count),
    M("getLineWidth", "(I)F", layout_line_width),
    M("getText", "()Ljava/lang/CharSequence;", layout_get_text),
    M_END,
 };
 static const struct rt_field rt_text_layout_fields[] = {
-   { "view", "Landroid/widget/TextView;" }, {"source","Ljava/lang/CharSequence;"}, F_END
+   { "view", "Landroid/widget/TextView;" }, {"source","Ljava/lang/CharSequence;"}, {"paint","Landroid/text/TextPaint;"},
+   {"alignment","Landroid/text/Layout$Alignment;"},{"direction","Landroid/text/TextDirectionHeuristic;"}, F_END
 };
 
 /* TextView.getLayout(): null until the view has been measured, as on a device. */
@@ -9662,10 +10865,12 @@ static void ui_measure_frame(struct dvm *vm, dvm_ref view, struct ui_ms ws,
    dvm_ref kids[UI_MAX_KIDS];
    const uint32_t nk = ui_children(vm, view, kids, UI_MAX_KIDS);
    int32_t mw = 0, mh = 0;
+   uint32_t match_count = 0;
    for (uint32_t i = 0; i < nk; ++i) {
       if (ui_gone(vm, kids[i])) continue;
       struct ui_lp lp;
       ui_read_lp(vm, kids[i], &lp);
+      if (lp.w == -1 || lp.h == -1) ++match_count;
       struct ui_ms cw = ui_child_spec(ws, pad[0] + pad[2] + lp.ml + lp.mr, lp.w);
       struct ui_ms ch = ui_child_spec(hs, pad[1] + pad[3] + lp.mt + lp.mb, lp.h);
       if (vscroll) ch = ui_ms_make(UI_MS_UNSPEC, 0);
@@ -9702,21 +10907,22 @@ static void ui_measure_frame(struct dvm *vm, dvm_ref view, struct ui_ms ws,
          }
       }
    }
-   /* MATCH_PARENT children of a frame that was not exact are measured again
-    * against the size the frame took. */
-   if (ws.mode != UI_MS_EXACT || hs.mode != UI_MS_EXACT) {
+   /* FrameLayout remeasures only when more than one child requested a
+    * match-parent axis. Other axes retain the original parent constraint;
+    * forcing a wrapping axis exact can consume all space in nested layouts. */
+   if ((ws.mode != UI_MS_EXACT || hs.mode != UI_MS_EXACT) && match_count > 1) {
       for (uint32_t i = 0; i < nk; ++i) {
          if (ui_gone(vm, kids[i])) continue;
          struct ui_lp lp;
          ui_read_lp(vm, kids[i], &lp);
          if (lp.w != -1 && lp.h != -1) continue;
-         struct ui_node *c = ui_node(vm, kids[i]);
          struct ui_ms cw = lp.w == -1
             ? ui_ms_make(UI_MS_EXACT, n->w - pad[0] - pad[2] - lp.ml - lp.mr)
-            : ui_ms_make(UI_MS_EXACT, c->w);
+            : ui_child_spec(ws, pad[0] + pad[2] + lp.ml + lp.mr, lp.w);
          struct ui_ms ch = lp.h == -1 && !vscroll
             ? ui_ms_make(UI_MS_EXACT, n->h - pad[1] - pad[3] - lp.mt - lp.mb)
-            : ui_ms_make(UI_MS_EXACT, c->h);
+            : vscroll ? ui_ms_make(UI_MS_UNSPEC, 0)
+            : ui_child_spec(hs, pad[1] + pad[3] + lp.mt + lp.mb, lp.h);
          ui_measure(vm, kids[i], cw, ch, depth + 1);
       }
    }
@@ -9966,10 +11172,32 @@ static void ui_measure_dispatch(struct dvm *vm, dvm_ref view, struct ui_ms ws,
 
 /* LUNARIA_UI_LAYOUT_TRACE=1: every measure, with the specs it was given, the
  * LayoutParams it read and the size it took. */
+static bool view_measure_reuse(struct dvm *vm,dvm_ref view,int32_t width,int32_t height)
+{
+   union dvm_value epoch={0};
+   if(!ui_int(vm,view,"measuredDimensionSet") || ui_int(vm,view,"layoutRequired") ||
+      ui_int(vm,view,"measureWidthSpec")!=width || ui_int(vm,view,"measureHeightSpec")!=height ||
+      !dvm_get_field(vm,view,"measureEpoch","J",&epoch) || (uint64_t)epoch.j!=g_ui_measure_epoch) return false;
+   struct ui_node *node=ui_node(vm,view);
+   if(!node) return false;
+   node->w=(int32_t)((uint32_t)ui_int(vm,view,"measuredWidth")&0x00ffffffu);
+   node->h=(int32_t)((uint32_t)ui_int(vm,view,"measuredHeight")&0x00ffffffu);
+   return true;
+}
+static void view_measure_remember(struct dvm *vm,dvm_ref view,int32_t width,int32_t height,uint64_t epoch)
+{
+   rt_set_int(vm,view,"measureWidthSpec",width);rt_set_int(vm,view,"measureHeightSpec",height);
+   (void)dvm_set_field(vm,view,"measureEpoch","J",(union dvm_value){.j=(int64_t)epoch});
+}
+
 static void ui_measure(struct dvm *vm, dvm_ref view, struct ui_ms ws,
                        struct ui_ms hs, unsigned depth)
 {
    if (dvm_exception(vm) || depth > 48 || !view) return;
+   int32_t width_spec=(int32_t)((uint32_t)ws.size|((uint32_t)ws.mode<<30));
+   int32_t height_spec=(int32_t)((uint32_t)hs.size|((uint32_t)hs.mode<<30));
+   if(!ui_gone(vm,view) && view_measure_reuse(vm,view,width_spec,height_spec)) return;
+   uint64_t epoch=g_ui_measure_epoch;
    struct dvm_class *klass = dvm_object_class(vm, view);
    struct dvm_method *on_measure = klass
       ? dvm_find_method(vm, klass, "onMeasure", "(II)V") : NULL;
@@ -9991,6 +11219,7 @@ static void ui_measure(struct dvm *vm, dvm_ref view, struct ui_ms ws,
       if (n) {
          union dvm_value sizes[2] = {{ .i = n->w }, { .i = n->h }}, ignored;
          (void)view_set_measured(vm, view, sizes, 2, &ignored);
+         view_measure_remember(vm,view,width_spec,height_spec,epoch);
       }
    }
    static int trace = -1;
@@ -10085,6 +11314,8 @@ static bool view_measure_api(struct dvm *vm, dvm_ref self,
    struct dvm_method *resolve = c ? dvm_find_method(vm, c, "resolveLayoutParams", "()V") : NULL;
    union dvm_value ignored = {0};
    if (resolve && !dvm_call(vm, resolve, self, NULL, 0, &ignored)) return false;
+   if(view_measure_reuse(vm,self,ARG(0).i,ARG(1).i)) RETV();
+   uint64_t epoch=g_ui_measure_epoch;
    union dvm_value flag = {0};
    (void)dvm_set_field(vm, self, "measuredDimensionSet", "Z", flag);
    struct dvm_method *m = c ? dvm_find_method(vm, c, "onMeasure", "(II)V") : NULL;
@@ -10094,6 +11325,7 @@ static bool view_measure_api(struct dvm *vm, dvm_ref self,
       dvm__throw(vm, "java/lang/IllegalStateException", "onMeasure must call setMeasuredDimension");
       return false;
    }
+   view_measure_remember(vm,self,ARG(0).i,ARG(1).i,epoch);
    static int trace = -1;
    if (trace < 0) trace = getenv("LUNARIA_UI_LAYOUT_TRACE") != NULL;
    if (trace) {
@@ -10490,8 +11722,11 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
    const bool disabled = ui_int(vm, view, "disabled") != 0;
    union dvm_value alpha_set = { 0 };
    (void)dvm_get_field(vm, view, "alphaSet", "Z", &alpha_set);
-   const float alpha = alpha_set.i ? ui_float(vm, view, "alpha") : 1.0f;
-   if (disabled || alpha_set.i)
+   union dvm_value transition_set = {0};
+   (void)dvm_get_field(vm, view, "transitionAlphaSet", "Z", &transition_set);
+   const float alpha = (alpha_set.i ? ui_float(vm, view, "alpha") : 1.0f) *
+                       (transition_set.i ? ui_float(vm, view, "transitionAlpha") : 1.0f);
+   if (disabled || alpha_set.i || transition_set.i)
       ui_printf(b2, "opacity:%g;", (double)(alpha * (disabled ? 0.45f : 1.0f)));
    /* An EditText takes a touch to focus it, listener or not. */
    struct dvm_class *touch_class=dvm_object_class(vm,view);
@@ -10536,8 +11771,9 @@ static dvm_ref g_ui_windows[UI_MAX_WINDOWS];
 static int g_ui_nwindows;
 static bool g_ui_dirty;
 static bool g_ui_building;
+static unsigned g_ui_draw_trace_budget;
 static bool g_ui_measure_dirty = true;
-static struct {uint64_t builds,build_ns,draws,draw_ns,publish_ns;} g_ui_render_prof;
+static struct {uint64_t builds,build_ns,draws,draw_ns,publish_ns,layout_ns,scroll_ns,emit_ns;} g_ui_render_prof;
 static uint64_t ui_render_ns(void)
 {
    if(!getenv("LUNARIA_UI_RENDER_PROF")) return 0;
@@ -10807,10 +12043,17 @@ static void ui_dump_tree(struct dvm *vm, dvm_ref view, unsigned depth)
 {
    if (!view || depth > 40) return;
    const struct ui_node *n = ui_node(vm, view);
-   fprintf(stderr, "[tree] %*s%s id=0x%x vis=%d %dx%d @%d,%d\n", (int)(depth * 2), "",
+   fprintf(stderr, "[tree] %*s%s id=0x%x vis=%d %dx%d @%d,%d ref=%u\n", (int)(depth * 2), "",
            ui_class_simple_name(vm, view), (unsigned)ui_int(vm, view, "id"),
            ui_int(vm, view, "visibility"), n ? n->w : -1, n ? n->h : -1,
-           n ? n->x : 0, n ? n->y : 0);
+           n ? n->x : 0, n ? n->y : 0,(unsigned)view);
+   dvm_ref source=ui_obj(vm,view,"text","Ljava/lang/CharSequence;");
+   if(source) {
+      const char *text=ui_text_of(vm,view);
+      const char *kind=dvm_class_name(dvm_object_class(vm,source));
+      fprintf(stderr,"[tree-text] ref=%u source=%s color=%08x text=%.160s\n",
+         (unsigned)view,kind?kind:"?",(unsigned)ui_int(vm,view,"textColor"),text?text:"");
+   }
    dvm_ref kids[UI_MAX_KIDS];
    const uint32_t nk = ui_children(vm, view, kids, UI_MAX_KIDS);
    for (uint32_t i = 0; i < nk; ++i) ui_dump_tree(vm, kids[i], depth + 1);
@@ -10837,6 +12080,15 @@ static bool ui_compute_scroll(struct dvm *vm,dvm_ref view,unsigned depth)
 static void ui_rebuild(struct dvm *vm)
 {
    uint64_t started=ui_render_ns();
+   g_ui_draw_trace_budget=0;
+   const char *trigger=getenv("LUNARIA_VIEW_DRAW_TRIGGER");
+   if(trigger && *trigger) {
+      FILE *request=luna_file_fopen(trigger,"rb");
+      if(request) {
+         fclose(request);
+         if(luna_file_unlink(trigger)==0) g_ui_draw_trace_budget=4096;
+      }
+   }
    g_ui_dirty = false;
    if (!g_ui_nwindows) {
       luna_overlay_set_document(NULL, NULL);
@@ -10858,12 +12110,6 @@ static void ui_rebuild(struct dvm *vm)
    if (!drawable) {
       luna_overlay_set_document(NULL, NULL);
       return;
-   }
-   if (getenv("LUNARIA_UI_TREE")) {
-      static int dumps;
-      if (dumps++ < 100000)
-         for (int i = 0; i < g_ui_nwindows; ++i)
-            ui_dump_tree(vm, ui_window_content(vm, g_ui_windows[i]), 0);
    }
    struct ui_buf b = { 0 }, css = { 0 };
    g_ui_building = true;
@@ -10895,9 +12141,16 @@ static void ui_rebuild(struct dvm *vm)
       dvm_ref content = ui_window_content(vm, g_ui_windows[i]);
       if (!content) continue;
       ui_printf(&b, "<div id=\"win%u\" class=\"root\">", (unsigned)g_ui_windows[i]);
+      uint64_t phase=started ? ui_render_ns() : 0;
       ui_emit_window_box(vm, &css, g_ui_windows[i]);
+      /* Window layout has now measured and positioned this tree.  Dumping
+       * before it reports stale boxes (or zeroes for newly added children). */
+      if (getenv("LUNARIA_UI_TREE")) ui_dump_tree(vm, content, 0);
+      if(started) {uint64_t now=ui_render_ns();g_ui_render_prof.layout_ns+=now-phase;phase=now;}
       if(!ui_compute_scroll(vm,content,0)) ui_report_exception(vm,"computeScroll");
+      if(started) {uint64_t now=ui_render_ns();g_ui_render_prof.scroll_ns+=now-phase;phase=now;}
       ui_emit_view(vm, &b, &css, content, -1, 0);
+      if(started) g_ui_render_prof.emit_ns+=ui_render_ns()-phase;
       if (dvm_exception(vm)) {
          g_ui_building=false;
          free(b.p); free(css.p);
@@ -10925,11 +12178,16 @@ static void ui_rebuild(struct dvm *vm)
    free(css.p);
    if(started) {
       ++g_ui_render_prof.builds;g_ui_render_prof.build_ns+=ui_render_ns()-started;
-      if(g_ui_render_prof.builds==1 || g_ui_render_prof.builds%10==0)
+      if(g_ui_render_prof.builds==1 || g_ui_render_prof.builds%10==0) {
+         fprintf(stderr,"[ui-stage] layout=%.3f scroll=%.3f emit=%.3f ms/build\n",
+            g_ui_render_prof.layout_ns/1e6/g_ui_render_prof.builds,
+            g_ui_render_prof.scroll_ns/1e6/g_ui_render_prof.builds,
+            g_ui_render_prof.emit_ns/1e6/g_ui_render_prof.builds);
          fprintf(stderr,"[ui-render-prof] %llu builds %.3f ms/build; %llu captures %.3f ms/draw %.3f ms/publish\n",
             (unsigned long long)g_ui_render_prof.builds,g_ui_render_prof.build_ns/1e6/g_ui_render_prof.builds,
             (unsigned long long)g_ui_render_prof.draws,g_ui_render_prof.draws ? g_ui_render_prof.draw_ns/1e6/g_ui_render_prof.draws : 0,
             g_ui_render_prof.draws ? g_ui_render_prof.publish_ns/1e6/g_ui_render_prof.draws : 0);
+      }
    }
 }
 
@@ -11005,7 +12263,7 @@ static void ui_dispatch_click(struct dvm *vm, dvm_ref clicked)
    }
    if (ui_is_a(vm, target, "android/widget/CompoundButton")) {
       union dvm_value ignored = { 0 };
-      if (!compound_toggle(vm, target, NULL, 0, &ignored))
+      if (!am_vcall(vm,target,"toggle","()V",NULL,0,&ignored))
          ui_report_exception(vm, "toggle");
    }
    dvm_ref listener = ui_obj(vm, target, "clickListener",
@@ -11053,7 +12311,7 @@ static bool view_perform_click(struct dvm *vm, dvm_ref self,
    (void)args; (void)nargs;
    if (ui_is_a(vm, self, "android/widget/CompoundButton")) {
       union dvm_value ignored = { 0 };
-      if (!compound_toggle(vm, self, NULL, 0, &ignored)) return false;
+      if (!am_vcall(vm,self,"toggle","()V",NULL,0,&ignored)) return false;
    }
    dvm_ref listener = ui_obj(vm, self, "clickListener",
                              "Landroid/view/View$OnClickListener;");
@@ -11082,9 +12340,22 @@ static void ui_invalidate(void)
 
 static void ui_layout_changed(void)
 {
+   ++g_ui_measure_epoch;
    if (g_ui_building) return;
    g_ui_measure_dirty = true;
    ui_invalidate();
+}
+
+static void ui_view_layout_changed(struct dvm *vm,dvm_ref view)
+{
+   /* A child request must invalidate cached ancestor measurements as well;
+    * unchanged sibling branches keep their measured dimensions/state. */
+   for(unsigned depth=0;view && depth<64;++depth) {
+      rt_set_int(vm,view,"layoutRequired",1);
+      view=ui_obj(vm,view,"parent","Landroid/view/ViewParent;");
+   }
+   if(g_ui_building) return;
+   g_ui_measure_dirty=true;ui_invalidate();
 }
 
 static void ui_window_shown(struct dvm *vm, dvm_ref window)
@@ -11125,3 +12396,5 @@ static void ui_window_hidden(struct dvm *vm, dvm_ref window)
 }
 
 
+
+#include "dvm_html.h"

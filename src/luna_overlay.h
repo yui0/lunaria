@@ -39,6 +39,9 @@ extern "C" {
  * draws nothing while the boot card is up — the card is a screen of its own
  * and the two never share a frame. */
 void luna_overlay_present(int w, int h);
+/* False means contention skipped the required overlay. The compositor must
+ * not swap its cleared/incomplete back buffer in that case. */
+bool luna_overlay_present_checked(int w,int h,bool boot);
 
 /* The boot card's screen, drawn by the card's own presenter.  It is the whole
  * display: it clears first and the guest's frame is not underneath it. */
@@ -204,12 +207,23 @@ struct luna_text_run {
  struct luna_text_glyph *glyphs;
  size_t count;
  float width;
+ /* Unrounded baseline metrics of the faces actually used for this run. */
+ float ascent,descent;
  bool missing;
 };
 struct luna_text_bitmap {
  unsigned char *coverage;
  int width,height,left,top;
 };
+/* Immutable copied font data, cached until host shutdown. Zero is the system
+ * face. Handles remain valid across platform-font reloads and glyph runs. */
+uint32_t luna_overlay_font_load(const void *data,size_t size,int index);
+/* direction: 0=automatic, 1=LTR, 2=RTL. */
+bool luna_overlay_shape_font_direction(uint32_t font,const uint16_t *text,size_t length,float px,bool bold,int direction,struct luna_text_run *run);
+/* Shape only [start,start+count), retaining the surrounding UTF-16 context.
+ * Returned cluster offsets are relative to start. */
+bool luna_overlay_shape_font_context(uint32_t font,const uint16_t *text,size_t length,size_t start,size_t count,float px,bool bold,int direction,struct luna_text_run *run);
+bool luna_overlay_shape_font(uint32_t font,const uint16_t *text,size_t length,float px,bool bold,struct luna_text_run *run);
 bool luna_overlay_shape_text(const uint16_t *text,size_t length,float px,bool bold,struct luna_text_run *run);
 bool luna_overlay_raster_glyph(const struct luna_text_glyph *glyph,float px,struct luna_text_bitmap *bitmap);
 void luna_overlay_free_glyph(struct luna_text_bitmap *bitmap);
@@ -222,6 +236,8 @@ struct luna_overlay_font_metrics {
    float top, ascent, descent, bottom, leading;
 };
 /* Face metrics in Android's baseline coordinate system, without GL work. */
+bool luna_overlay_font_metrics(uint32_t font,float px,bool bold,
+                               struct luna_overlay_font_metrics *metrics);
 bool luna_overlay_get_font_metrics(float px, bool bold,
                                   struct luna_overlay_font_metrics *metrics);
 

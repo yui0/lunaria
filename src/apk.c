@@ -492,7 +492,7 @@ static int zip_extract(struct zip *z, const char *root, bool overwrite)
 struct manifest {
    char package[256], split[256], activity[512], application[512];
    char orientation[32], theme[32], min_sdk[32], target_sdk[32], config_changes[32];
-   char receivers[APK_META];
+   char receivers[APK_META], services[APK_META];
    char providers[APK_META], permissions[APK_META], query_actions[APK_META], query_packages[APK_META];
 };
 struct axml {
@@ -665,6 +665,8 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
    bool main = false, launcher = false, activity_launch = false;
    int receiver_depth = -1, enabled = 1, app_enabled = 1, exported = -1, boot = 0, app_boot = 0;
    bool receiver_filter = false;
+   int service_depth = -1, service_enabled = 1, service_exported = -1;
+   char service[512] = "", service_actions[2048] = "";
    char receiver[512] = "", permission[512] = "", process[512] = "";
    char app_permission[512] = "", app_process[512] = "";
    for (size_t at = 0; at < size;) {
@@ -742,6 +744,14 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
             } else if (copy_text(process, sizeof process, proc)) goto done;
             receiver_depth = depth;
             receiver_filter = false;
+         } else if (!strcmp(tag, "service")) {
+            if (class_name(service, sizeof service, m->package, attr_text(a, count, "name"))) goto done;
+            const struct attr *v = attribute(a, count, "enabled");
+            service_enabled = v ? attr_boolean(v) : 1;
+            v = attribute(a, count, "exported");
+            service_exported = v ? attr_boolean(v) : -1;
+            service_actions[0] = 0;
+            service_depth = depth;
          } else if (!strcmp(tag, "intent-filter") && receiver_depth >= 0) {
             receiver_filter = true;
          } else if (!strcmp(tag, "activity") || !strcmp(tag, "activity-alias")) {
@@ -756,6 +766,8 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
          } else if (!strcmp(tag, "action")) {
             const char *v = attr_text(a, count, "name");
             if (queries_depth >= 0 && append(m->query_actions, sizeof m->query_actions, v, ","))
+               goto done;
+            if (service_depth >= 0 && append(service_actions, sizeof service_actions, v, ","))
                goto done;
             if (intent_depth >= 0 && !strcmp(v, "android.intent.action.MAIN"))
                main = true;
@@ -818,6 +830,13 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
                              boot, permission, process);
             if (n < 0 || (size_t)n >= sizeof row || append(m->receivers, sizeof m->receivers, row, ";")) goto done;
             receiver_depth = -1;
+         }
+         if (depth == service_depth) {
+            char row[APK_META];
+            int n = snprintf(row, sizeof row, "%s|%d|%d|%s", service, service_enabled,
+                             service_exported, service_actions);
+            if (n < 0 || (size_t)n >= sizeof row || append(m->services, sizeof m->services, row, ";")) goto done;
+            service_depth = -1;
          }
          if (depth == provider_depth) {
             if (append(m->providers, sizeof m->providers, provider, ";"))
@@ -2111,7 +2130,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       {"ANDROID_LAUNCH_ACTIVITY", m->activity}, {"ANDROID_APPLICATION_CLASS", m->application},
       {"ANDROID_LAUNCH_CONFIG_CHANGES", m->config_changes},
       {"ANDROID_SCREEN_ORIENTATION", m->orientation}, {"ANDROID_THEME_RESOURCE", m->theme},
-      {"ANDROID_RECEIVERS", m->receivers},
+      {"ANDROID_RECEIVERS", m->receivers}, {"ANDROID_SERVICES", m->services},
       {"ANDROID_CONTENT_PROVIDERS", m->providers}, {"ANDROID_REQUESTED_PERMISSIONS", m->permissions},
       {"ANDROID_MIN_SDK", m->min_sdk}, {"ANDROID_TARGET_SDK", m->target_sdk},
       {"ANDROID_QUERY_ACTIONS", m->query_actions}, {"ANDROID_QUERY_PACKAGES", m->query_packages},

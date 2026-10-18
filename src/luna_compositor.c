@@ -568,10 +568,14 @@ static void *comp_main(void *arg)
       else if (have_frame && shown >= 0)
          draw_texture(g_comp_tex[shown], g_frame_w[shown], g_frame_h[shown], w, h);
 
-      if (luna_boot_active() && !have_frame && !luna_overlay_guest_window_up())
-         luna_overlay_present_boot(w, h);
-      else
-         luna_overlay_present(w, h);
+      const bool draw_boot=luna_boot_active() && !have_frame && !luna_overlay_guest_window_up();
+      if (!luna_overlay_present_checked(w,h,draw_boot)) {
+         /* The front buffer is still the last complete frame. Font shaping
+          * can hold the overlay lock while the guest builds a new document;
+          * publishing just the cleared backdrop would flash black. */
+         last_draw=now_ns();
+         continue;
+      }
 
       comp_maybe_dump(w, h);
       eglSwapBuffers(g_dpy, g_win);

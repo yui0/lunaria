@@ -964,9 +964,22 @@ static void overlay_drain_pointer(void)
                      g_web_focus[0] = 0;
                   pthread_mutex_unlock(&g_ptr_lock);
                }
+               /* A raster image represents a View subtree, not an input
+                * window. Start framework dispatch at its content root so
+                * ViewGroup interception and a parent's click handler still
+                * run when the painted child declines the gesture. WebView
+                * keeps its own browser-local input coordinates. */
+               LunaElement *receiver = e;
+               if (framework_touch) {
+                  for (int ancestor = luna_element_parent(parent); ancestor >= 0;
+                       ancestor = luna_element_parent(ancestor)) {
+                     LunaElement *candidate = luna_element_at(ancestor);
+                     if (candidate && candidate->id[0] == 'v') receiver = candidate;
+                  }
+               }
                if (g_web_pointer_capture[0])
-                  g_web_pointer_fn(e->id,
-                     (int)(batch[i].x - e->x), (int)(batch[i].y - e->y),
+                  g_web_pointer_fn(receiver->id,
+                     (int)(batch[i].x - receiver->x), (int)(batch[i].y - receiver->y),
                      batch[i].action);
                break;
             }
@@ -1116,19 +1129,19 @@ static pthread_mutex_t g_present_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void overlay_present_locked(int w, int h);
 
-static void overlay_present_screen(int w, int h, int screen)
+static bool overlay_present_screen(int w, int h, int screen)
 {
-   if (!luna_overlay_active() || w <= 0 || h <= 0) return;
+   if (!luna_overlay_active() || w <= 0 || h <= 0) return true;
    /* The two screens never share a frame.  While the card is up it is the
     * only thing drawn; a guest swap that arrives meanwhile is presented as
     * the guest drew it, with nothing of the emulator's on top. */
-   if (screen == OV_APP && overlay_boot_up()) return;
-   if (screen == OV_BOOT && luna_overlay_guest_window_up()) return;
+   if (screen == OV_APP && overlay_boot_up()) return true;
+   if (screen == OV_BOOT && luna_overlay_guest_window_up()) return true;
    /* The emulator's UI has one owner: with a compositor, its thread. */
    if (atomic_load(&g_hosted) &&
        (!atomic_load(&g_host_thread_set) ||
         !pthread_equal(pthread_self(), g_host_thread)))
-      return;
+      return true;
    if (screen != g_screen) {
       pthread_mutex_lock(&g_doc_lock);
       g_screen = screen;
@@ -1140,10 +1153,11 @@ static void overlay_present_screen(int w, int h, int screen)
       if ((skipped++ % 256) == 0)
          fprintf(stderr, "[overlay] another thread is compositing — skipping "
                  "this one (%lu)\n", skipped);
-      return;
+      return false;
    }
    overlay_present_locked(w, h);
    pthread_mutex_unlock(&g_present_lock);
+   return true;
 }
 
 void luna_overlay_present_boot(int w, int h)
@@ -1154,6 +1168,11 @@ void luna_overlay_present_boot(int w, int h)
 void luna_overlay_present(int w, int h)
 {
    overlay_present_screen(w, h, OV_APP);
+}
+
+bool luna_overlay_present_checked(int w,int h,bool boot)
+{
+   return overlay_present_screen(w,h,boot ? OV_BOOT : OV_APP);
 }
 
 static void overlay_present_locked(int w, int h)
@@ -1504,6 +1523,7 @@ struct text_hb_api {
  void (*buffer_destroy)(void *);
  void (*buffer_add_utf16)(void *,const uint16_t *,int,unsigned,int);
  void (*buffer_guess_segment_properties)(void *);
+ void (*buffer_set_direction)(void *,int);
  void (*shape)(void *,void *,const void *,unsigned);
  struct text_hb_info *(*buffer_get_glyph_infos)(void *,unsigned *);
  struct text_hb_position *(*buffer_get_glyph_positions)(void *,unsigned *);
@@ -1512,8 +1532,31 @@ struct text_hb_api {
 static struct text_hb_api text_hb;
 struct text_hb_face {stbtt_fontinfo *info;const unsigned char *data;long size;int offset;void *font;};
 static struct text_hb_face text_hb_faces[6];
+struct text_custom_face {
+ struct text_custom_face *next;
+ uint32_t handle;
+ size_t size;
+ int index;
+ unsigned char *bytes;
+ stbtt_fontinfo info;
+ struct text_hb_face hb;
+};
+static struct text_custom_face *text_custom_faces;
+static uint32_t text_custom_count;
+static struct text_custom_face *text_custom_find(uint32_t handle)
+{
+ for(struct text_custom_face *f=text_custom_faces;f;f=f->next)
+  if(f->handle==handle) return f;
+ return NULL;
+}
 static void text_hb_shutdown(void)
 {
+ while(text_custom_faces) {
+  struct text_custom_face *f=text_custom_faces;text_custom_faces=f->next;
+  if(f->hb.font) text_hb.font_destroy(f->hb.font);
+  free(f->bytes);free(f);
+ }
+ text_custom_count=0;
  for(size_t i=0;i<6;++i) if(text_hb_faces[i].font) {text_hb.font_destroy(text_hb_faces[i].font);text_hb_faces[i].font=NULL;}
  if(text_hb.library) {luna_os_library_close(text_hb.library);text_hb.library=NULL;}
 }
@@ -1537,7 +1580,7 @@ static bool text_hb_load(void)
  TEXT_HB_BIND(blob_create);TEXT_HB_BIND(face_create_for_tables);TEXT_HB_BIND(face_destroy);
  TEXT_HB_BIND(font_create);TEXT_HB_BIND(font_destroy);TEXT_HB_BIND(ot_font_set_funcs);TEXT_HB_BIND(font_set_scale);
  TEXT_HB_BIND(buffer_create);TEXT_HB_BIND(buffer_destroy);TEXT_HB_BIND(buffer_add_utf16);
- TEXT_HB_BIND(buffer_guess_segment_properties);TEXT_HB_BIND(shape);
+ TEXT_HB_BIND(buffer_guess_segment_properties);TEXT_HB_BIND(buffer_set_direction);TEXT_HB_BIND(shape);
  TEXT_HB_BIND(buffer_get_glyph_infos);TEXT_HB_BIND(buffer_get_glyph_positions);TEXT_HB_BIND(buffer_allocation_successful);
 #undef TEXT_HB_BIND
  text_hb.library=library;atexit(text_hb_shutdown);return true;
@@ -1562,13 +1605,17 @@ static void *text_hb_table(void *face,uint32_t tag,void *data)
 static void *text_hb_font(stbtt_fontinfo *info)
 {
  stbtt_fontinfo *fonts[]={&g_font_info,&g_bold_font_info,&g_cjk_font_info,&g_mono_font_info,&g_icon_font_info,&g_brand_font_info};
- size_t slot=0;while(slot<6 && fonts[slot]!=info) ++slot;if(slot==6) return NULL;
- struct text_hb_face *source=&text_hb_faces[slot];
+ size_t slot=0;while(slot<6 && fonts[slot]!=info) ++slot;
+ struct text_hb_face *source=NULL;
+ if(slot<6) source=&text_hb_faces[slot];
+ else for(struct text_custom_face *f=text_custom_faces;f;f=f->next)
+  if(&f->info==info) {source=&f->hb;break;}
+ if(!source) return NULL;
  if(source->font && (source->data!=info->data || source->offset!=info->fontstart)) {
   text_hb.font_destroy(source->font);source->font=NULL;
  }
  if(!source->font) {
-  source->info=info;source->data=info->data;source->offset=info->fontstart;source->size=g_font_blob_sizes[slot];
+  source->info=info;source->data=info->data;source->offset=info->fontstart;source->size=slot<6 ? g_font_blob_sizes[slot] : source->size;
   void *face=text_hb.face_create_for_tables(text_hb_table,source,NULL);if(!face) return NULL;
   source->font=text_hb.font_create(face);text_hb.face_destroy(face);if(!source->font) return NULL;
   text_hb.ot_font_set_funcs(source->font);
@@ -1583,22 +1630,28 @@ static uint32_t text_codepoint(const uint16_t *text,size_t length,size_t *offset
  else if(cp>=0xd800 && cp<=0xdfff) cp=0xfffd;
  return cp;
 }
-static bool text_shape_locked(const uint16_t *text,size_t length,float px,bool bold,struct luna_text_run *out)
+static bool text_shape_locked(const uint16_t *text,size_t length,size_t start,size_t item_count,float px,bool bold,stbtt_fontinfo *custom,int direction,struct luna_text_run *out)
 {
  memset(out,0,sizeof *out);
- if(length>INT_MAX || !isfinite(px) || px<0 || px>32768 || (!text && length)) return false;
- if(!length || px==0) return true;
+ if(length>INT_MAX || start>length || item_count>length-start || !isfinite(px) || px<0 || px>32768 || (!text && length)) return false;
+ if(!item_count || px==0) return true;
  if(!text_hb_load()) return false;
  int previous_bold=g_font_bold_hint;g_font_bold_hint=bold ? 1 : 0;
- bool good=true;size_t begin=0,capacity=0;
- while(begin<length && good) {
-  size_t end=begin;uint32_t cp=text_codepoint(text,length,&end);stbtt_fontinfo *info=font_for_codepoint((int)cp);
+ bool good=true;size_t begin=start,limit=start+item_count,capacity=0;
+ while(begin<limit && good) {
+  size_t end=begin;uint32_t cp=text_codepoint(text,limit,&end);stbtt_fontinfo *info=custom && stbtt_FindGlyphIndex(custom,(int)cp) ? custom : font_for_codepoint((int)cp);
   if(!info) {good=false;break;}
-  while(end<length) {size_t next=end;cp=text_codepoint(text,length,&next);if(font_for_codepoint((int)cp)!=info) break;end=next;}
+  int ascent,descent,gap;
+  stbtt_GetFontVMetrics(info,&ascent,&descent,&gap);
+  float metric_scale=stbtt_ScaleForMappingEmToPixels(info,px);
+  out->ascent=fminf(out->ascent,-ascent*metric_scale);
+  out->descent=fmaxf(out->descent,-descent*metric_scale);
+  while(end<limit) {size_t next=end;cp=text_codepoint(text,limit,&next);if((custom && stbtt_FindGlyphIndex(custom,(int)cp) ? custom : font_for_codepoint((int)cp))!=info) break;end=next;}
   void *font=text_hb_font(info),*buffer=text_hb.buffer_create();
   if(!font || !buffer) {if(buffer) text_hb.buffer_destroy(buffer);good=false;break;}
   int scale=(int)floorf(px*64+.5f);text_hb.font_set_scale(font,scale,scale);
   text_hb.buffer_add_utf16(buffer,text,(int)length,(unsigned)begin,(int)(end-begin));
+  if(direction) text_hb.buffer_set_direction(buffer,direction==2 ? 5 : 4);
   text_hb.buffer_guess_segment_properties(buffer);text_hb.shape(font,buffer,NULL,0);
   unsigned count=0,positions_count=0;
   struct text_hb_info *glyphs=text_hb.buffer_get_glyph_infos(buffer,&count);
@@ -1610,7 +1663,7 @@ static bool text_shape_locked(const uint16_t *text,size_t length,float px,bool b
   }
   for(unsigned i=0;good && i<count;++i) {
    struct luna_text_glyph *g=&out->glyphs[out->count++];
-   *g=(struct luna_text_glyph){.font=info,.font_data=info->data,.glyph=glyphs[i].glyph,.cluster=glyphs[i].cluster,
+   *g=(struct luna_text_glyph){.font=info,.font_data=info->data,.glyph=glyphs[i].glyph,.cluster=(uint32_t)(glyphs[i].cluster-start),
       .x=out->width+positions[i].x_offset/64.f,.y=-positions[i].y_offset/64.f,.advance=positions[i].x_advance/64.f};
    out->width+=g->advance;out->missing=out->missing || !g->glyph;
   }
@@ -1628,15 +1681,61 @@ bool luna_overlay_text_breaks(const uint16_t *text,size_t length,const char *loc
  return luna_uc_breaks_utf16(text,length,breaks);
 }
 
-bool luna_overlay_shape_text(const uint16_t *text,size_t length,float px,bool bold,struct luna_text_run *run)
+/* Check the SFNT directory and every table range before handing data to stb.
+ * Font parsing follows the same trusted-font model as the platform fonts. */
+uint32_t luna_overlay_font_load(const void *data,size_t size,int index)
+{
+ if(!data || size<12 || size>INT_MAX || index<0) return 0;
+ const unsigned char *bytes=data;size_t offset=0;
+ if(!memcmp(bytes,"ttcf",4)) {
+  uint32_t count=text_be32(bytes+8);
+  if(count>(size-12)/4 || (uint32_t)index>=count) return 0;
+  offset=text_be32(bytes+12+4*(size_t)index);
+ } else if(index) return 0;
+ if(offset>size-12) return 0;
+ const unsigned char *dir=bytes+offset;
+ if(text_be32(dir)!=0x00010000 && memcmp(dir,"OTTO",4) && memcmp(dir,"true",4)) return 0;
+ unsigned count=((unsigned)dir[4]<<8)|dir[5];
+ if(!count || count>(size-offset-12)/16) return 0;
+ for(unsigned i=0;i<count;++i) {
+  const unsigned char *t=dir+12+16*i;size_t pos=text_be32(t+8),length=text_be32(t+12);
+  if(pos>size || length>size-pos) return 0;
+ }
+ pthread_mutex_lock(&g_present_lock);
+ for(struct text_custom_face *f=text_custom_faces;f;f=f->next)
+  if(f->size==size && f->index==index && !memcmp(f->bytes,data,size)) {
+   uint32_t handle=f->handle;pthread_mutex_unlock(&g_present_lock);return handle;
+  }
+ struct text_custom_face *f=calloc(1,sizeof *f);
+ if(!f || !text_hb_load() || text_custom_count==UINT32_MAX) {free(f);pthread_mutex_unlock(&g_present_lock);return 0;}
+ f->bytes=malloc(size);
+ if(!f->bytes) {free(f);pthread_mutex_unlock(&g_present_lock);return 0;}
+ memcpy(f->bytes,data,size);
+ if(!stbtt_InitFont(&f->info,f->bytes,(int)offset)) {
+  free(f->bytes);free(f);pthread_mutex_unlock(&g_present_lock);return 0;
+ }
+ f->size=size;f->index=index;f->hb.size=(long)size;f->handle=++text_custom_count;
+ f->next=text_custom_faces;text_custom_faces=f;
+ uint32_t handle=f->handle;pthread_mutex_unlock(&g_present_lock);return handle;
+}
+
+bool luna_overlay_shape_font_context(uint32_t handle,const uint16_t *text,size_t length,size_t start,size_t count,float px,bool bold,int direction,struct luna_text_run *run)
 {
  if(!run) return false;
  pthread_mutex_lock(&g_present_lock);
  if(!g_ready) luna_overlay_prepare_platform();
- bool good=luna_prepare_font_metrics() && text_shape_locked(text,length,px,bold,run);
+ struct text_custom_face *face=text_custom_find(handle);
+ bool good=(!handle || face) && luna_prepare_font_metrics() &&
+  text_shape_locked(text,length,start,count,px,bold,face ? &face->info : NULL,direction,run);
  if(!good) memset(run,0,sizeof *run);
  pthread_mutex_unlock(&g_present_lock);return good;
 }
+bool luna_overlay_shape_font_direction(uint32_t handle,const uint16_t *text,size_t length,float px,bool bold,int direction,struct luna_text_run *run)
+{return luna_overlay_shape_font_context(handle,text,length,0,length,px,bold,direction,run);}
+bool luna_overlay_shape_font(uint32_t handle,const uint16_t *text,size_t length,float px,bool bold,struct luna_text_run *run)
+{return luna_overlay_shape_font_direction(handle,text,length,px,bold,0,run);}
+bool luna_overlay_shape_text(const uint16_t *text,size_t length,float px,bool bold,struct luna_text_run *run)
+{return luna_overlay_shape_font(0,text,length,px,bold,run);}
 bool luna_overlay_raster_glyph(const struct luna_text_glyph *glyph,float px,struct luna_text_bitmap *bitmap)
 {
  if(!glyph || !bitmap || !isfinite(px) || px<0 || px>32768) return false;
@@ -1673,16 +1772,25 @@ float luna_overlay_line_height(float px)
    return luna_line_height(px > 0.f ? px : 14.f);
 }
 
-bool luna_overlay_get_font_metrics(float px, bool bold,
+bool luna_overlay_font_metrics(uint32_t handle,float px, bool bold,
                                   struct luna_overlay_font_metrics *metrics)
 {
-   if (!metrics) return false;
+   if (!metrics || !isfinite(px) || px<0 || px>32768) return false;
    memset(metrics, 0, sizeof *metrics);
    pthread_mutex_lock(&g_present_lock);
    if (!g_ready) luna_overlay_prepare_platform();
    LunaFontMetrics face;
-   bool ready = luna_prepare_font_metrics() &&
-                luna_get_font_metrics(px, bold ? 1 : 0, &face);
+   struct text_custom_face *custom=text_custom_find(handle);
+   bool ready=false;
+   if(custom) {
+      int ascent,descent,gap,x0,y0,x1,y1;
+      stbtt_GetFontVMetrics(&custom->info,&ascent,&descent,&gap);
+      stbtt_GetFontBoundingBox(&custom->info,&x0,&y0,&x1,&y1);
+      float scale=stbtt_ScaleForMappingEmToPixels(&custom->info,px);
+      face=(LunaFontMetrics){.top=-y1*scale,.ascent=-ascent*scale,.descent=-descent*scale,
+                            .bottom=-y0*scale,.leading=gap*scale};
+      ready=true;
+   } else if(!handle) ready=luna_prepare_font_metrics() && luna_get_font_metrics(px,bold ? 1 : 0,&face);
    if (ready) {
       metrics->top = face.top;
       metrics->ascent = face.ascent;
@@ -1693,6 +1801,9 @@ bool luna_overlay_get_font_metrics(float px, bool bold,
    pthread_mutex_unlock(&g_present_lock);
    return ready;
 }
+
+bool luna_overlay_get_font_metrics(float px,bool bold,struct luna_overlay_font_metrics *metrics)
+{return luna_overlay_font_metrics(0,px,bold,metrics);}
 
 /* ======================================================================== *
  * The emulator's menu (right click)

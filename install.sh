@@ -187,6 +187,19 @@ install_linux() {
   chmod 0755 "${share_dir}/lunaria"
   ln -sfn "${share_dir}/lunaria" "${bin_dir}/lunaria"
   log "Symlink: ${bin_dir}/lunaria → ${share_dir}/lunaria"
+  if [ -f "${share_dir}/scripts/lunaria-server.sh" ]; then
+    chmod 0755 "${share_dir}/scripts/lunaria-server.sh"
+    ln -sfn "${share_dir}/scripts/lunaria-server.sh" "${bin_dir}/lunaria-server"
+    log "Symlink: ${bin_dir}/lunaria-server → ${share_dir}/scripts/lunaria-server.sh"
+  fi
+  if [ -f "${share_dir}/systemd/lunaria@.service" ] && [ -d /etc/systemd/system ]; then
+    if [ -w /etc/systemd/system ]; then
+      cp -f "${share_dir}/systemd/lunaria@.service" /etc/systemd/system/lunaria@.service
+      log "Installed systemd unit: lunaria@.service"
+    else
+      warn "systemd unit present at ${share_dir}/systemd/lunaria@.service (install as root to enable)"
+    fi
+  fi
 
   case ":${PATH}:" in
     *":${bin_dir}:"*) ;;
@@ -204,6 +217,7 @@ install_linux() {
   Run:
     lunaria /path/to/app.apk
     lunaria                  # graphical launcher
+    lunaria-server 1         # headless launcher over qfkey (needs qberry RDP)
 
 EOF
 }

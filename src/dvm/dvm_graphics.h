@@ -87,6 +87,32 @@ static dvm_ref bitmap_new(struct dvm *vm, int32_t w, int32_t h)
    return b;
 }
 
+/* The UI thread is the window BufferQueue consumer. lm_sink_take owns its
+ * front buffer until this consumer takes another one, even with an async
+ * decoder producer. Keep pixels in memory and reuse the Bitmap for each size. */
+static bool surface_refresh_bitmap(struct dvm *vm, dvm_ref surface)
+{
+   struct lm_sink *sink = surface_sink(vm, surface);
+   const uint8_t *rgba = NULL;
+   int w = 0, h = 0;
+   if (!sink || !lm_sink_take(sink, &rgba, &w, &h)) return false;
+   dvm_ref bitmap = ui_obj(vm, surface, "bufferBitmap", "Landroid/graphics/Bitmap;");
+   struct rt_bitmap *bm = bitmap_of(vm, bitmap);
+   if (!bm || bm->w != w || bm->h != h) {
+      bitmap = bitmap_new(vm, w, h);
+      if (!bitmap) return false;
+      bm = bitmap_of(vm, bitmap);
+      (void)dvm_set_field(vm, surface, "bufferBitmap", "Landroid/graphics/Bitmap;",
+                          (union dvm_value){.l=bitmap});
+   }
+   for (size_t i = 0, count = (size_t)w * h; i < count; ++i)
+      bm->px[i] = ((uint32_t)rgba[4*i+3] << 24) |
+                  ((uint32_t)rgba[4*i] << 16) |
+                  ((uint32_t)rgba[4*i+1] << 8) | rgba[4*i+2];
+   ++bm->gen;
+   return true;
+}
+
 static bool bitmap_live(struct dvm *vm, struct rt_bitmap *bm)
 {
    if (bm && !bm->recycled) return true;
@@ -563,14 +589,98 @@ static bool bm_getHeight(struct dvm *vm, dvm_ref self,
    RETI(bm ? bm->h : 0);
 }
 
+static size_t bitmap_pixel_bytes(const struct rt_bitmap *bm)
+{
+   return bm->config_index == 0 ? 1 : bm->config_index == 1 ? 2 :
+          bm->config_index == 4 ? 8 : 4;
+}
+
 static bool bm_getByteCount(struct dvm *vm, dvm_ref self,
                             const union dvm_value *args, int nargs,
                             union dvm_value *out)
 {
    (void)args; (void)nargs;
    struct rt_bitmap *bm = bitmap_of(vm, self);
-   if (!strcmp(builtin_name(), "getRowBytes")) RETI(bm ? bm->w * 4 : 0);
-   RETI(bm && !bm->recycled ? bm->w * bm->h * 4 : 0);
+   if (!strcmp(builtin_name(), "getRowBytes")) RETI(bm ? bm->w * bitmap_pixel_bytes(bm) : 0);
+   RETI(bm && !bm->recycled ? bm->w * bm->h * bitmap_pixel_bytes(bm) : 0);
+}
+
+/* Encode a unit-range colour component as binary16, rounding ties to even.
+ * The bitmap's CPU colour storage is unpremultiplied ARGB; Android's buffer
+ * API exposes native pixel storage, which is premultiplied RGBA on ARM. */
+static uint16_t bitmap_half(float value)
+{
+   uint32_t bits;
+   memcpy(&bits, &value, sizeof bits);
+   int exponent = (int)(bits >> 23) - 127 + 15;
+   uint32_t mantissa = bits & 0x7fffffu;
+   if (exponent <= 0) {
+      if (exponent < -10) return 0;
+      mantissa |= 0x800000u;
+      unsigned shift = (unsigned)(14 - exponent);
+      uint32_t rounded = mantissa >> shift;
+      uint32_t rest = mantissa & ((1u << shift) - 1);
+      uint32_t halfway = 1u << (shift - 1);
+      return (uint16_t)(rounded + (rest > halfway || (rest == halfway && (rounded & 1))));
+   }
+   uint32_t rounded = ((uint32_t)exponent << 10) | (mantissa >> 13);
+   uint32_t rest = mantissa & 8191;
+   return (uint16_t)(rounded + (rest > 4096 || (rest == 4096 && (rounded & 1))));
+}
+
+static bool bm_copyPixelsToBuffer(struct dvm *vm, dvm_ref self,
+                                 const union dvm_value *args, int nargs,
+                                 union dvm_value *out)
+{
+   (void)nargs;
+   struct rt_bitmap *bm = bitmap_of(vm, self);
+   if (!bitmap_live(vm, bm)) return false;
+   if (bm->config_index == 5) {
+      dvm__throw(vm, "java/lang/IllegalStateException", "Hardware bitmap pixel access");
+      return false;
+   }
+   dvm_ref buffer = ARG(0).l;
+   if (!buffer) { dvm__throw(vm, "java/lang/NullPointerException", "buffer"); return false; }
+   struct dvm_class *cls = dvm_object_class(vm, buffer);
+   if (!dvm__class_assignable(vm, cls, dvm_find_class(vm, "java/nio/ByteBuffer"))) {
+      dvm__throw(vm, "java/lang/RuntimeException", "unsupported Buffer subclass");
+      return false;
+   }
+   uint8_t *data = NULL;
+   int32_t pos = 0, remaining = 0;
+   size_t pixels = (size_t)bm->w * bm->h, width = bitmap_pixel_bytes(bm);
+   if (!chan_buffer_window(vm, buffer, &data, &pos, &remaining) ||
+       (size_t)remaining < pixels * width) {
+      dvm__throw(vm, "java/lang/RuntimeException", "Buffer not large enough for pixels");
+      return false;
+   }
+   if (!bb_writable(vm, buffer)) return false;
+   uint8_t *dst = data + pos;
+   for (size_t i = 0; i < pixels; ++i, dst += width) {
+      uint32_t color = bm->px[i];
+      unsigned a = bm->has_alpha ? color >> 24 : 255;
+      unsigned r = (color >> 16) & 255, g = (color >> 8) & 255, b = color & 255;
+      if (bm->config_index == 0) { dst[0] = (uint8_t)a; continue; }
+      if (bm->config_index == 1) {
+         uint16_t packed = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+         dst[0] = (uint8_t)packed; dst[1] = (uint8_t)(packed >> 8);
+      } else if (bm->config_index == 4) {
+         float alpha = (float)a / 255.0f;
+         uint16_t half[4] = { bitmap_half((float)r / 255.0f * alpha),
+                             bitmap_half((float)g / 255.0f * alpha),
+                             bitmap_half((float)b / 255.0f * alpha), bitmap_half(alpha) };
+         for (int c = 0; c < 4; ++c) {
+            dst[c*2] = (uint8_t)half[c]; dst[c*2+1] = (uint8_t)(half[c] >> 8);
+         }
+      } else {
+         dst[0] = (uint8_t)((r*a + 127) / 255);
+         dst[1] = (uint8_t)((g*a + 127) / 255);
+         dst[2] = (uint8_t)((b*a + 127) / 255);
+         dst[3] = (uint8_t)a;
+      }
+   }
+   stream_set_field(vm, buffer, "pos", pos + (int32_t)(pixels * width));
+   RETV();
 }
 
 static bool bm_getPixel(struct dvm *vm, dvm_ref self,
@@ -1057,7 +1167,7 @@ static const struct rt_method rt_matrix[] = {
  * operate on premultiplied colours so transparent texels cannot bleed RGB. */
 struct canvas_clip {
    float inverse[9], rect[4];
-   unsigned char *mask;int mask_width,mask_height;
+   unsigned char *mask;int mask_width,mask_height,mask_x,mask_y; /* mask covers [mask_x,+mask_width) x [mask_y,+mask_height) */
    float bounds[4]; /* conservative device bounds for finite affine maps */
    int operation; /* Region.Op: difference, intersect, union, xor, reverse difference, replace */
    bool singular, bounded, simple;
@@ -1065,26 +1175,43 @@ struct canvas_clip {
 struct canvas_save {
    float matrix[9];
    size_t clips;
+   struct rt_bitmap *layer,*parent;
+   struct color_filter_state filter;
+   unsigned alpha;
+   int mode;
 };
-struct render_command;
+struct render_command {
+   struct dvm_method *method; /* NULL: an immutable shaped text run. */
+   union dvm_value args[8];
+   int nargs;
+   struct luna_text_run text;
+};
 struct canvas_state {
    struct render_command *commands;
    size_t command_count, command_capacity;
    bool recording, recording_active;
    int32_t viewport_width, viewport_height;
    struct canvas_save *saved;
+   struct rt_bitmap *target;
    struct canvas_clip *clip;
    size_t count, capacity, clips, clip_capacity;
    bool clip_cache_valid,clip_simple;
    float clip_bounds[4];
+   bool query_clip_valid;
+   int query_clip[4],query_width,query_height;
 };
+
+static void canvas_layer_free(struct rt_bitmap *layer)
+{if(layer) {free(layer->px);free(layer);}}
 
 static void canvas_destroy(void *data)
 {
    struct canvas_state *s = data;
    if (!s) return;
    for(size_t i=0;i<s->clips;++i) free(s->clip[i].mask);
+   for(size_t i=0;i<s->command_count;++i) free(s->commands[i].text.glyphs);
    free(s->commands);
+   for(size_t i=0;i<s->count;++i) if(s->saved[i].layer) canvas_layer_free(s->saved[i].layer);
    free(s->saved); free(s->clip); free(s);
 }
 
@@ -1099,6 +1226,17 @@ static struct canvas_state *canvas_state(struct dvm *vm, dvm_ref self)
    }
    return o->data;
 }
+
+/* Native layers share device coordinates with the base bitmap. No temporary
+ * Java Bitmap is created, and native storage is released on restore/reset. */
+static struct rt_bitmap *canvas_bitmap(struct dvm *vm,dvm_ref self)
+{
+   struct canvas_state *state=canvas_state(vm,self);
+   if(state && state->target) return state->target;
+   union dvm_value bitmap={0};dvm_get_field(vm,self,"bitmap","Landroid/graphics/Bitmap;",&bitmap);
+   return bitmap_of(vm,bitmap.l);
+}
+static void canvas_restore_layer(struct dvm *,dvm_ref,struct canvas_state *,struct canvas_save *);
 
 static void canvas_read_matrix(struct dvm *vm, dvm_ref self, float matrix[9])
 {
@@ -1124,6 +1262,23 @@ static bool canvas_write_matrix(struct dvm *vm, dvm_ref self, const float matrix
    return true;
 }
 
+static bool canvas_push_state(struct dvm *vm,dvm_ref self,struct canvas_state *s)
+{
+   if(s->count==s->capacity) {
+      size_t capacity=s->capacity ? s->capacity*2 : 8;
+      if(capacity<s->capacity || capacity>SIZE_MAX/sizeof *s->saved) {
+         dvm__throw(vm,"java/lang/OutOfMemoryError","Canvas save stack");return false;
+      }
+      struct canvas_save *grown=realloc(s->saved,capacity*sizeof *grown);
+      if(!grown) {dvm__throw(vm,"java/lang/OutOfMemoryError","Canvas save stack");return false;}
+      s->saved=grown;s->capacity=capacity;
+   }
+   memset(&s->saved[s->count],0,sizeof *s->saved);
+   canvas_read_matrix(vm,self,s->saved[s->count].matrix);
+   s->saved[s->count].clips=s->clips;
+   ++s->count;return true;
+}
+
 static bool canvas_save_api(struct dvm *vm, dvm_ref self,
                             const union dvm_value *args, int nargs,
                             union dvm_value *out)
@@ -1134,27 +1289,22 @@ static bool canvas_save_api(struct dvm *vm, dvm_ref self,
    const char *name = builtin_name();
    if (!strcmp(name, "getSaveCount")) RETI((int32_t)s->count+1);
    if (!strcmp(name, "save")) {
-      if (s->count == s->capacity) {
-         size_t capacity = s->capacity ? s->capacity*2 : 8;
-         struct canvas_save *grown = realloc(s->saved, capacity*sizeof *grown);
-         if (!grown) { dvm__throw(vm,"java/lang/OutOfMemoryError","Canvas save stack"); return false; }
-         s->saved = grown; s->capacity = capacity;
-      }
-      canvas_read_matrix(vm, self, s->saved[s->count].matrix);
-      s->saved[s->count].clips = s->clips;
-      RETI((int32_t)++s->count);
+      if(!canvas_push_state(vm,self,s)) return false;
+      RETI((int32_t)s->count);
    }
    int32_t target = !strcmp(name,"restoreToCount") ? ARG(0).i : (int32_t)s->count;
    if (target < 1) {
       dvm__throw(vm,"java/lang/IllegalStateException","Underflow in restore"); return false;
    }
    if ((size_t)target > s->count) RETV();
-   struct canvas_save *saved = &s->saved[target-1];
-   if (!canvas_write_matrix(vm,self,saved->matrix)) return false;
-   for(size_t i=saved->clips;i<s->clips;++i) {free(s->clip[i].mask);s->clip[i].mask=NULL;}
-   s->clips = saved->clips;
-   s->clip_cache_valid=false;
-   s->count = (size_t)target-1;
+   while(s->count>=(size_t)target) {
+      struct canvas_save *saved=&s->saved[s->count-1];
+      if(!canvas_write_matrix(vm,self,saved->matrix)) return false;
+      for(size_t i=saved->clips;i<s->clips;++i) {free(s->clip[i].mask);s->clip[i].mask=NULL;}
+      s->clips=saved->clips;s->clip_cache_valid=false;s->query_clip_valid=false;
+      if(saved->layer) canvas_restore_layer(vm,self,s,saved);
+      --s->count;
+   }
    RETV();
 }
 
@@ -1211,8 +1361,10 @@ static bool canvas_clip_contains(struct canvas_state *s, float x, float y)
       float lx=0,ly=0;
       if (!c->singular) mat_map(c->inverse,x,y,&lx,&ly);
       bool inside;
-      if(c->mask) {
-         int px=(int)floorf(x),py=(int)floorf(y);
+      if(c->simple) {
+         inside=x>=c->bounds[0] && y>=c->bounds[1] && x<c->bounds[2] && y<c->bounds[3];
+      } else if(c->mask) {
+         int px=(int)floorf(x)-c->mask_x,py=(int)floorf(y)-c->mask_y;
          inside=px>=0 && py>=0 && px<c->mask_width && py<c->mask_height &&
             c->mask[4*((size_t)py*c->mask_width+px)+3]!=0;
       } else inside=!c->singular && isfinite(lx) && isfinite(ly) &&
@@ -1256,6 +1408,64 @@ static void canvas_clip_limits(struct canvas_state *s,
    }
    limits[0] = (int)floorf(bounds[0]); limits[1] = (int)floorf(bounds[1]);
    limits[2] = (int)ceilf(bounds[2]); limits[3] = (int)ceilf(bounds[3]);
+}
+
+static bool canvas_clip_edge(struct canvas_state *s,int begin,int end,int fixed,bool vertical)
+{
+   for(int i=begin;i<end;++i)
+      if(canvas_clip_contains(s,(vertical?fixed:i)+.5f,(vertical?i:fixed)+.5f)) return true;
+   return false;
+}
+
+/* Device clip bounds are independent of later matrix changes. Rectangular
+ * intersections are constant-time; complex clips only search their edges,
+ * caching the tight device bounds until the clip stack or viewport changes. */
+static bool canvas_device_clip_bounds(struct canvas_state *s,const struct rt_bitmap *bm,int bounds[4])
+{
+   if(!bm || bm->w<=0 || bm->h<=0) {memset(bounds,0,4*sizeof *bounds);return false;}
+   if(!s->query_clip_valid || s->query_width!=bm->w || s->query_height!=bm->h) {
+      int limits[4];canvas_clip_limits(s,bm,limits);canvas_prepare_clip(s);
+      memcpy(s->query_clip,limits,sizeof limits);
+      if(!s->clip_simple) {
+         int left=limits[0],top=limits[1],right=limits[2],bottom=limits[3];
+         while(top<bottom && !canvas_clip_edge(s,left,right,top,false)) ++top;
+         while(top<bottom && !canvas_clip_edge(s,left,right,bottom-1,false)) --bottom;
+         while(left<right && top<bottom && !canvas_clip_edge(s,top,bottom,left,true)) ++left;
+         while(left<right && top<bottom && !canvas_clip_edge(s,top,bottom,right-1,true)) --right;
+         if(left>=right || top>=bottom) memset(s->query_clip,0,sizeof s->query_clip);
+         else {s->query_clip[0]=left;s->query_clip[1]=top;s->query_clip[2]=right;s->query_clip[3]=bottom;}
+      }
+      s->query_width=bm->w;s->query_height=bm->h;s->query_clip_valid=true;
+   }
+   memcpy(bounds,s->query_clip,sizeof s->query_clip);
+   return bounds[0]<bounds[2] && bounds[1]<bounds[3];
+}
+
+static bool canvas_get_clip_bounds(struct dvm *vm,dvm_ref self,
+ const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   struct canvas_state *s=canvas_state(vm,self);if(!s) return false;
+   struct rt_bitmap viewport={.w=s->viewport_width,.h=s->viewport_height};
+   struct rt_bitmap *bm=canvas_bitmap(vm,self);
+   if(!bm && s->recording) bm=&viewport;
+   int device[4],edges[4]={0};float matrix[9],inverse[9],local[4]={0};
+   canvas_read_matrix(vm,self,matrix);
+   bool nonempty=canvas_device_clip_bounds(s,bm,device) && mat_invert(matrix,inverse);
+   for(int i=0;nonempty && i<4;++i) {
+      float x,y;mat_map(inverse,(float)device[(i&1)?2:0],(float)device[(i&2)?3:1],&x,&y);
+      if(!isfinite(x) || !isfinite(y)) {nonempty=false;break;}
+      if(!i) {local[0]=local[2]=x;local[1]=local[3]=y;}
+      else {local[0]=fminf(local[0],x);local[1]=fminf(local[1],y);local[2]=fmaxf(local[2],x);local[3]=fmaxf(local[3],y);}
+   }
+   if(nonempty) for(int i=0;i<4;++i) edges[i]=paint_metric_int(floorf(local[i]+.5f));
+   dvm_ref rect=nargs ? args[0].l : dvm_new_object(vm,dvm_find_class(vm,"android/graphics/Rect"));
+   if(!nargs && !rect) return false;
+   if(rect) {
+      union dvm_value values[4]={{0}};for(int i=0;i<4;++i) values[i].i=edges[i];
+      union dvm_value ignored={0};if(!rect_set(vm,rect,values,4,&ignored)) return false;
+   }
+   if(nargs) RETI(nonempty);
+   RETL(rect);
 }
 
 static bool canvas_rect_args(struct dvm *vm, const union dvm_value *args,
@@ -1324,6 +1534,7 @@ static bool canvas_clip_rect(struct dvm *vm, dvm_ref self,
        * exact per-clip test. Common nested widget clips reduce to four compares. */
       clip.simple=clip.bounded && matrix[1]==0 && matrix[3]==0 &&
          matrix[0]/matrix[8]>0 && matrix[4]/matrix[8]>0;
+      if(clip.simple) for(int i=0;i<4;++i) clip.bounds[i]=floorf(clip.bounds[i]+.5f);
    }
    if (s->clips==s->clip_capacity) {
       size_t cap=s->clip_capacity ? s->clip_capacity*2 : 8;
@@ -1332,10 +1543,8 @@ static bool canvas_clip_rect(struct dvm *vm, dvm_ref self,
       s->clip=grown; s->clip_capacity=cap;
    }
    s->clip[s->clips++]=clip;
-   s->clip_cache_valid=false;
-   union dvm_value target={0};
-   (void)dvm_get_field(vm,self,"bitmap","Landroid/graphics/Bitmap;",&target);
-   struct rt_bitmap *bm=bitmap_of(vm,target.l);
+   s->clip_cache_valid=false;s->query_clip_valid=false;
+   struct rt_bitmap *bm=canvas_bitmap(vm,self);
    struct rt_bitmap viewport={.w=s->viewport_width,.h=s->viewport_height};
    if(!bm && s->recording) bm=&viewport;
    if (bm) {
@@ -1369,6 +1578,16 @@ static uint32_t canvas_blend(uint32_t src,uint32_t dst,int mode,unsigned coverag
       src=(src&0xffffffu)|((((src>>24)*coverage+127)/255)<<24);
       return canvas_src_over(src,dst,opaque);
    }
+   if(!opaque && (mode==6 || mode==8)) {
+      /* DST_IN / DST_OUT scale the destination's alpha and leave its colour:
+       * rounded-corner masks over every thumbnail, integers rather than the
+       * general float blend. */
+      unsigned sa=src>>24,da=dst>>24;
+      unsigned ra=mode==6 ? (da*sa+127)/255 : (da*(255-sa)+127)/255;
+      unsigned alpha=ra*coverage+da*(255-coverage);
+      if(!alpha) return 0;
+      return (dst&0xffffffu)|(((alpha+127)/255)<<24);
+   }
    if(opaque) dst|=0xff000000u;
    uint32_t result=luna_blend_argb(src,dst,mode);
    unsigned ra=result>>24,da=dst>>24;
@@ -1398,6 +1617,58 @@ static bool canvas_paint_mode(struct dvm *vm,dvm_ref paint,int *mode)
    *mode=xfermode_value(vm,xfer.l);
    if(*mode<0 || *mode>28) {dvm__throw(vm,"java/lang/IllegalArgumentException","Blend mode");return false;}
    return true;
+}
+
+/* saveLayer bounds are an allocation hint, not an extra clip. Keeping device
+ * coordinates shared allows every raster primitive to use the same matrices.
+ * Only the parent clip is composited; child clips/matrices are already popped. */
+static void canvas_restore_layer(struct dvm *vm,dvm_ref self,struct canvas_state *s,struct canvas_save *saved)
+{
+   struct rt_bitmap *layer=saved->layer;s->target=saved->parent;
+   struct rt_bitmap *dst=canvas_bitmap(vm,self);
+   if(dst && !dst->recycled) {
+      int limits[4];canvas_clip_limits(s,dst,limits);
+      for(int y=limits[1];y<limits[3];++y) for(int x=limits[0];x<limits[2];++x) {
+         if(!canvas_clip_contains(s,x+.5f,y+.5f)) continue;
+         size_t at=(size_t)y*dst->w+x;uint32_t source=layer->px[at];
+         source=(source&0xffffffu)|((((source>>24)*saved->alpha+127)/255)<<24);
+         source=color_filter_pixel(&saved->filter,source);
+         dst->px[at]=canvas_blend(source,dst->px[at],saved->mode,255,!dst->has_alpha);
+      }
+      ++dst->gen;
+   }
+   canvas_layer_free(layer);saved->layer=NULL;saved->parent=NULL;
+}
+static bool canvas_save_layer(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   struct canvas_state *s=canvas_state(vm,self);if(!s) return false;
+   bool alpha_only=!strcmp(builtin_name(),"saveLayerAlpha"),rect=builtin_sig()[1]=='L';
+   int paint_index=rect ? 1 : 4,plain_count=paint_index+1;
+   if(nargs>plain_count && lunaria_app_target_sdk()>=28 && args[nargs-1].i!=31) {
+      dvm__throw(vm,"java/lang/IllegalArgumentException","Invalid Layer Save Flag - only ALL_SAVE_FLAGS is allowed");return false;
+   }
+   unsigned alpha=255;int mode=3;struct color_filter_state filter={0};
+   if(alpha_only) alpha=(unsigned)(args[paint_index].i<0 ? 0 : args[paint_index].i>255 ? 255 : args[paint_index].i);
+   else if(args[paint_index].l) {
+      dvm_ref paint=args[paint_index].l;union dvm_value color={0},ref={0};
+      dvm__get_field_from(vm,paint,dvm_find_class(vm,"android/graphics/Paint"),"color","I",&color);alpha=color.u>>24;
+      dvm__get_field_from(vm,paint,dvm_find_class(vm,"android/graphics/Paint"),"colorFilter","Landroid/graphics/ColorFilter;",&ref);
+      if(!color_filter_prepare(vm,ref.l,&filter) || !canvas_paint_mode(vm,paint,&mode)) return false;
+   }
+   struct rt_bitmap *parent=canvas_bitmap(vm,self),*layer=NULL;
+   if(parent && !s->recording) {
+      if(!bitmap_live(vm,parent)) return false;
+      layer=calloc(1,sizeof *layer);
+      if(layer) {layer->w=parent->w;layer->h=parent->h;layer->density=parent->density;layer->has_alpha=true;layer->is_mutable=true;layer->config_index=3;layer->gen=1;
+         layer->px=calloc((size_t)parent->w*parent->h,sizeof *layer->px);}
+      if(!layer || !layer->px) {canvas_layer_free(layer);dvm__throw(vm,"java/lang/OutOfMemoryError","Canvas layer");return false;}
+   }
+   if(!canvas_push_state(vm,self,s)) {canvas_layer_free(layer);return false;}
+   if(layer) {
+      struct canvas_save *saved=&s->saved[s->count-1];saved->layer=layer;saved->parent=s->target;
+      saved->alpha=alpha;saved->mode=mode;saved->filter=filter;s->target=layer;
+   }
+   RETI((int32_t)s->count);
 }
 
 /* General path drawing uses a local coverage texture; inverse mapping preserves
@@ -1509,14 +1780,82 @@ static uint32_t canvas_shader_sample(const struct canvas_shader *s,float x,float
    return color_filter_pixel(&s->filter,color);
 }
 
+/* Coverage masks of recently drawn paths.  A screen of rounded thumbnails
+ * redraws the same few rounded rectangles every frame (each a DST_IN mask over
+ * its image), and rasterising one costs more than blending it.  Keyed by the
+ * path's geometry and every rasterisation parameter; evicts least recently
+ * used, bounded in bytes.  Drawing runs under the interpreter lock, so the
+ * cache needs none of its own. */
+struct mask_cache_entry {
+   uint64_t key[2];
+   unsigned char *pixels;
+   size_t bytes;
+   uint64_t used;
+};
+#define MASK_CACHE_ENTRIES 24
+#define MASK_CACHE_BYTES (24u<<20)
+#define MASK_CACHE_MAX_ENTRY (4u<<20)
+static struct mask_cache_entry g_mask_cache[MASK_CACHE_ENTRIES];
+static size_t g_mask_cache_bytes;
+static uint64_t g_mask_cache_tick;
+
+static void mask_hash(uint64_t h[2],const void *data,size_t n)
+{
+   const unsigned char *p=data;
+   for(size_t i=0;i<n;++i) {h[0]=(h[0]^p[i])*UINT64_C(1099511628211);h[1]=(h[1]+p[i]+1)*UINT64_C(0x9e3779b97f4a7c15);h[1]^=h[1]>>29;}
+}
+
+/* Like luna_path_mask(); *cached tells the caller whether the result is the
+ * cache's (do not free) or its own. */
+static unsigned char *canvas_mask_cached(const luna_path *path,int w,int h,const float matrix[9],
+                                         int style,float stroke,int cap,int join,float miter,bool aa,bool *cached)
+{
+   uint64_t key[2]={UINT64_C(14695981039346656037),UINT64_C(0x1234567)};
+   const int params[]={w,h,style,cap,join,aa,path->fill};
+   mask_hash(key,params,sizeof params);mask_hash(key,matrix,9*sizeof(float));
+   mask_hash(key,&stroke,sizeof stroke);mask_hash(key,&miter,sizeof miter);
+   for(const NSVGpath *n=path->first;n;n=n->next) {
+      mask_hash(key,&n->npts,sizeof n->npts);mask_hash(key,&n->closed,sizeof n->closed);
+      if(n->pts) mask_hash(key,n->pts,(size_t)n->npts*2*sizeof(float));
+   }
+   const size_t bytes=(size_t)w*(size_t)h*4u;
+   *cached=false;
+   for(int i=0;i<MASK_CACHE_ENTRIES;++i) {
+      struct mask_cache_entry *e=&g_mask_cache[i];
+      if(e->pixels && e->key[0]==key[0] && e->key[1]==key[1] && e->bytes==bytes) {
+         e->used=++g_mask_cache_tick;*cached=true;return e->pixels;
+      }
+   }
+   unsigned char *pixels=luna_path_mask(path,w,h,matrix,style,stroke,cap,join,miter,aa);
+   if(!pixels || bytes>MASK_CACHE_MAX_ENTRY) return pixels;
+   /* Make room: least recently used first, until the entry and the byte budget fit. */
+   for(;;) {
+      struct mask_cache_entry *victim=NULL;
+      bool slot=false;
+      for(int i=0;i<MASK_CACHE_ENTRIES;++i) {
+         struct mask_cache_entry *e=&g_mask_cache[i];
+         if(!e->pixels) {slot=true;if(g_mask_cache_bytes+bytes<=MASK_CACHE_BYTES) {victim=e;break;}}
+         else if(!victim || e->used<victim->used) victim=e;
+      }
+      if(!victim) return pixels;
+      if(victim->pixels) {
+         g_mask_cache_bytes-=victim->bytes;free(victim->pixels);victim->pixels=NULL;
+         if(g_mask_cache_bytes+bytes>MASK_CACHE_BYTES) continue;
+      }
+      (void)slot;
+      victim->key[0]=key[0];victim->key[1]=key[1];victim->pixels=pixels;victim->bytes=bytes;
+      victim->used=++g_mask_cache_tick;g_mask_cache_bytes+=bytes;*cached=true;
+      return pixels;
+   }
+}
+
 static bool canvas_path_color(struct dvm *vm,dvm_ref self,const luna_path *path,uint32_t color,
                                  int style,float stroke,int cap,int join,float miter,bool aa,
                                  dvm_ref paint,union dvm_value *out)
 {
    int mode;if(!canvas_paint_mode(vm,paint,&mode)) return false;
    struct canvas_shader shader;if(!canvas_shader_prepare(vm,paint,&shader)) return false;
-   union dvm_value target={0};(void)dvm_get_field(vm,self,"bitmap","Landroid/graphics/Bitmap;",&target);
-   struct rt_bitmap *dst=bitmap_of(vm,target.l);if(!dst) RETV();
+   struct rt_bitmap *dst=canvas_bitmap(vm,self);if(!dst) RETV();
    if(!bitmap_live(vm,dst)) return false;
    struct canvas_state *state=canvas_state(vm,self);if(!state) return false;
    float matrix[9],inverse[9];canvas_read_matrix(vm,self,matrix);
@@ -1558,11 +1897,17 @@ static bool canvas_path_color(struct dvm *vm,dvm_ref self,const luna_path *path,
          limits[3]=(int)fminf(limits[3],fmaxf(0,ceilf(box[3])));
       }
    }
-   unsigned char *mask=luna_path_mask(path,width,height,local,style,
-      hairline ? 1 : stroke*scale,cap,join,miter,aa);
+   bool mask_cached=false;
+   unsigned char *mask=canvas_mask_cached(path,width,height,local,style,
+      hairline ? 1 : stroke*scale,cap,join,miter,aa,&mask_cached);
    if(!mask) {dvm__throw(vm,"java/lang/OutOfMemoryError","Path mask");return false;}
+   /* A rectangular clip is a bounds test; only a complex one needs the per-pixel query. */
+   canvas_prepare_clip(state);
+   const bool simple_clip=state->clip_simple;
+   const float *cb=state->clip_bounds;
    for(int y=limits[1];y<limits[3];++y) for(int x=limits[0];x<limits[2];++x) {
-      if(!canvas_clip_contains(state,x+.5f,y+.5f)) continue;
+      if(simple_clip ? !(x+.5f>=cb[0] && y+.5f>=cb[1] && x+.5f<cb[2] && y+.5f<cb[3]) :
+         !canvas_clip_contains(state,x+.5f,y+.5f)) continue;
       float u=x+.5f,v=y+.5f;
       if(!device_coverage) {float px,py;mat_map(inverse,u,v,&px,&py);u=px*scale-bounds[0];v=py*scale-bounds[1];}
       if(!isfinite(u) || !isfinite(v) || u<0 || v<0 || u>=width || v>=height) continue;
@@ -1571,7 +1916,8 @@ static bool canvas_path_color(struct dvm *vm,dvm_ref self,const luna_path *path,
       uint32_t sample=canvas_shader_sample(&shader,lx,ly,color);
       size_t index=(size_t)y*dst->w+x;dst->px[index]=canvas_blend(sample,dst->px[index],mode,coverage,!dst->has_alpha);
    }
-   free(mask);++dst->gen;RETV();
+   if(!mask_cached) free(mask);
+   ++dst->gen;RETV();
 }
 static bool canvas_path_paint(struct dvm *vm,dvm_ref self,const luna_path *path,dvm_ref paint,union dvm_value *out)
 {
@@ -1610,15 +1956,36 @@ static bool canvas_clip_path(struct dvm *vm,dvm_ref self,const union dvm_value *
    int operation;if(!canvas_clip_operation(vm,args,nargs,&operation)) return false;
    luna_path *path=path_of(vm,ARG(0).l);if(!path) return false;
    struct canvas_state *state=canvas_state(vm,self);if(!state) return false;
-   union dvm_value target={0};(void)dvm_get_field(vm,self,"bitmap","Landroid/graphics/Bitmap;",&target);
-   struct rt_bitmap *bitmap=bitmap_of(vm,target.l);
+   struct rt_bitmap *bitmap=canvas_bitmap(vm,self);
    struct rt_bitmap viewport={.w=state->viewport_width,.h=state->viewport_height};
    if(!bitmap && state->recording) bitmap=&viewport;
    if(!bitmap || bitmap->w<=0 || bitmap->h<=0) RETI(0);
    float matrix[9];canvas_read_matrix(vm,self,matrix);
    struct canvas_clip clip={.mask_width=bitmap->w,.mask_height=bitmap->h,
       .operation=operation};
-   clip.mask=luna_path_mask(path,bitmap->w,bitmap->h,matrix,0,0,0,0,4,false);
+   /* The mask only has to cover where the path can be: a rounded thumbnail
+    * clips a screenful of pixels the path never touches, and rasterising and
+    * scanning the whole bitmap for each one is what made list screens crawl.
+    * Anything outside the window reads as outside the clip, which is what an
+    * (unfilled-outside) path mask says there anyway.  An inverse fill covers
+    * the whole plane and keeps the full-size mask. */
+   float shifted[9];memcpy(shifted,matrix,sizeof shifted);
+   if(!(path->fill&2) && path->first && matrix[6]==0 && matrix[7]==0 && matrix[8]==1) {
+      float local[4],box[4]={0};luna_path_bounds(path,local);
+      for(int i=0;i<4;++i) {
+         float x,y;mat_map(matrix,local[(i&1) ? 2 : 0],local[(i&2) ? 3 : 1],&x,&y);
+         if(!i) {box[0]=box[2]=x;box[1]=box[3]=y;}
+         else {box[0]=fminf(box[0],x);box[1]=fminf(box[1],y);box[2]=fmaxf(box[2],x);box[3]=fmaxf(box[3],y);}
+      }
+      if(isfinite(box[0]) && isfinite(box[1]) && isfinite(box[2]) && isfinite(box[3])) {
+         int x0=(int)fmaxf(0,floorf(box[0])-2),y0=(int)fmaxf(0,floorf(box[1])-2);
+         int x1=(int)fminf((float)bitmap->w,ceilf(box[2])+2),y1=(int)fminf((float)bitmap->h,ceilf(box[3])+2);
+         if(x1<=x0 || y1<=y0) {x0=y0=0;x1=y1=1;}   /* nowhere on the bitmap: a 1x1 mask of whatever is at 0,0 */
+         clip.mask_x=x0;clip.mask_y=y0;clip.mask_width=x1-x0;clip.mask_height=y1-y0;
+         shifted[2]-=(float)x0;shifted[5]-=(float)y0;
+      }
+   }
+   clip.mask=luna_path_mask(path,clip.mask_width,clip.mask_height,shifted,0,0,0,0,4,false);
    if(!clip.mask) {dvm__throw(vm,"java/lang/OutOfMemoryError","Path clip");return false;}
    if(state->clips==state->clip_capacity) {
       size_t capacity=state->clip_capacity ? state->clip_capacity*2 : 8;
@@ -1629,12 +1996,13 @@ static bool canvas_clip_path(struct dvm *vm,dvm_ref self,const union dvm_value *
    /* Bounds describe this path's device mask independently of the previous
     * clip: legacy UNION/REPLACE may expose pixels outside the previous clip. */
    int minx=bitmap->w,miny=bitmap->h,maxx=0,maxy=0;
-   for(int y=0;y<bitmap->h;++y) for(int x=0;x<bitmap->w;++x) {
-      if(!clip.mask[4*((size_t)y*bitmap->w+x)+3]) continue;
-      minx=x<minx ? x : minx;miny=y<miny ? y : miny;maxx=x+1>maxx ? x+1 : maxx;maxy=y+1>maxy ? y+1 : maxy;
+   for(int y=0;y<clip.mask_height;++y) for(int x=0;x<clip.mask_width;++x) {
+      if(!clip.mask[4*((size_t)y*clip.mask_width+x)+3]) continue;
+      int dx=x+clip.mask_x,dy=y+clip.mask_y;
+      minx=dx<minx ? dx : minx;miny=dy<miny ? dy : miny;maxx=dx+1>maxx ? dx+1 : maxx;maxy=dy+1>maxy ? dy+1 : maxy;
    }
    clip.bounded=true;clip.bounds[0]=minx;clip.bounds[1]=miny;clip.bounds[2]=maxx;clip.bounds[3]=maxy;
-   state->clip[state->clips++]=clip;state->clip_cache_valid=false;
+   state->clip[state->clips++]=clip;state->clip_cache_valid=false;state->query_clip_valid=false;
    int limits[4];canvas_clip_limits(state,bitmap,limits);bool any=false;
    for(int y=limits[1];!any && y<limits[3];++y) for(int x=limits[0];x<limits[2];++x)
       if(canvas_clip_contains(state,x+.5f,y+.5f)) {any=true;break;}
@@ -1655,15 +2023,14 @@ static bool canvas_fill_color(struct dvm *vm,dvm_ref self,const float *rect,
          half_y=0.5f*hypotf(inverse[3],inverse[4]);
       }
    }
-   union dvm_value target={0};
-   (void)dvm_get_field(vm,self,"bitmap","Landroid/graphics/Bitmap;",&target);
-   struct rt_bitmap *dst=bitmap_of(vm,target.l);
+   struct rt_bitmap *dst=canvas_bitmap(vm,self);
    if (!dst) RETV();
    if (!bitmap_live(vm,dst)) return false;
    struct canvas_state *state=canvas_state(vm,self);
    if (!state) return false;
    int limits[4]; canvas_clip_limits(state, dst, limits);
    int x0=limits[0],y0=limits[1],x1=limits[2],y1=limits[3];
+   bool full_pixels=!rect;
    if (rect && matrix[6]==0 && matrix[7]==0 && matrix[8]!=0) {
       float l=rect[0]-(style ? half_x : 0),r=rect[2]+(style ? half_x : 0);
       float t=rect[1]-(style ? half_y : 0),b=rect[3]+(style ? half_y : 0);
@@ -1678,11 +2045,33 @@ static bool canvas_fill_color(struct dvm *vm,dvm_ref self,const float *rect,
          miny=fminf(miny,py[i]); maxy=fmaxf(maxy,py[i]);
       }
       if (finite) {
+         full_pixels=style==0 && matrix[1]==0 && matrix[3]==0 &&
+            floorf(minx)==minx && floorf(maxx)==maxx &&
+            floorf(miny)==miny && floorf(maxy)==maxy;
          x0=(int)fmaxf(x0,fminf(dst->w,floorf(minx)));
          y0=(int)fmaxf(y0,fminf(dst->h,floorf(miny)));
          x1=(int)fminf(x1,fmaxf(0,ceilf(maxx)));
          y1=(int)fminf(y1,fmaxf(0,ceilf(maxy)));
       }
+   }
+   canvas_prepare_clip(state);
+   if(full_pixels && state->clip_simple) {
+      /* Integer-aligned axis rectangles cover complete pixels even with AA.
+       * Rectangular clip membership depends on pixel centers, so fractional
+       * clips can be resolved once per span rather than once per pixel. */
+      x0=(int)fmaxf(x0,fminf(dst->w,ceilf(state->clip_bounds[0]-.5f)));
+      y0=(int)fmaxf(y0,fminf(dst->h,ceilf(state->clip_bounds[1]-.5f)));
+      x1=(int)fminf(x1,fmaxf(0,ceilf(state->clip_bounds[2]-.5f)));
+      y1=(int)fminf(y1,fmaxf(0,ceilf(state->clip_bounds[3]-.5f)));
+      bool replace=mode==0 || ((mode==1 || mode==3) && (color>>24)==255);
+      uint32_t value=mode==0 ? 0 : color;
+      if(!dst->has_alpha) value|=0xff000000u;
+      for(int y=y0;y<y1;++y) {
+         uint32_t *row=dst->px+(size_t)y*dst->w;
+         if(replace) for(int x=x0;x<x1;++x) row[x]=value;
+         else for(int x=x0;x<x1;++x) row[x]=canvas_blend(color,row[x],mode,255,!dst->has_alpha);
+      }
+      ++dst->gen;RETV();
    }
    for(int y=y0;y<y1;++y) for(int x=x0;x<x1;++x) {
       if (!canvas_clip_contains(state,x+0.5f,y+0.5f)) continue;
@@ -1768,8 +2157,9 @@ static bool canvas_set_bitmap(struct dvm *vm, dvm_ref self,
    struct canvas_state *state=canvas_state(vm,self);
    if (!state) return false;
    for(size_t i=0;i<state->clips;++i) {free(state->clip[i].mask);state->clip[i].mask=NULL;}
-   state->count=state->clips=0;
-   state->clip_cache_valid=false;
+   for(size_t i=0;i<state->count;++i) if(state->saved[i].layer) {canvas_layer_free(state->saved[i].layer);state->saved[i].layer=NULL;}
+   state->target=NULL;state->count=state->clips=0;
+   state->clip_cache_valid=false;state->query_clip_valid=false;
    RETV();
 }
 
@@ -1832,6 +2222,9 @@ static void canvas_sample(const struct rt_bitmap *src, float x, float y,
       ys[0] = ys[1] = iy; ys[2] = ys[3] = iy + 1;
       weights[0] = (1-fx)*(1-fy); weights[1] = fx*(1-fy);
       weights[2] = (1-fx)*fy; weights[3] = fx*fy;
+      /* At an exact texel centre the other three weights are zero.
+       * Reuse the fractions above so subpixel sampling adds no floor calls. */
+      if (fx == 0 && fy == 0) count = 1;
    } else { xs[0] = (int)floorf(x); ys[0] = (int)floorf(y); }
    for (int i = 0; i < count; ++i) {
       int ix=xs[i]<subset[0] ? subset[0] : xs[i]>=subset[2] ? subset[2]-1 : xs[i];
@@ -1841,6 +2234,104 @@ static void canvas_sample(const struct rt_bitmap *src, float x, float y,
       sample[3] += alpha * weights[i];
       for (int c = 0; c < 3; ++c)
          sample[c] += (float)((pixel >> (16 - 8*c)) & 255) / 255.f * alpha * weights[i];
+   }
+}
+
+/* Source-over of one straight-alpha pixel at 8-bit paint alpha `pa`. */
+static inline uint32_t canvas_over_pixel(uint32_t s, uint32_t old, bool dst_alpha)
+{
+   unsigned sa = s >> 24;
+   if (sa == 0) return old;
+   if (sa == 255) return s;
+   unsigned da = dst_alpha ? old >> 24 : 255;
+   unsigned keep = da * (255 - sa);                 /* dst weight, scale 255*255 */
+   unsigned total = sa * 255 + keep;                /* alpha, scale 255*255 */
+   unsigned out_a = (total + 127) / 255;
+   uint32_t r = (uint32_t)((out_a > 255 ? 255 : out_a)) << 24;
+   for (int sh = 16; sh >= 0; sh -= 8) {
+      unsigned v = (((s >> sh) & 255) * sa * 255 + ((old >> sh) & 255) * keep + total / 2) / total;
+      r |= (v > 255 ? 255 : v) << sh;
+   }
+   return r;
+}
+
+/* One tap of a bilinear sample, weighted by coverage and straight alpha. */
+static inline void canvas_tap(const struct rt_bitmap *src, int x, int y, unsigned w,
+                              unsigned *a, unsigned *c0, unsigned *c1, unsigned *c2)
+{
+   if (!w) return;
+   uint32_t p = src->px[(size_t)y * src->w + x];
+   /* Opaque samples use coverage units; their fast normalization divides by
+    * 65536. Alpha-bearing samples use coverage * alpha and divide by a. */
+   unsigned pa = src->has_alpha ? p >> 24 : 1, wa = w * pa;
+   *a += wa;
+   *c0 += wa * ((p >> 16) & 255);
+   *c1 += wa * ((p >> 8) & 255);
+   *c2 += wa * (p & 255);
+}
+
+static void canvas_blit_scaled(const struct rt_bitmap *src, struct rt_bitmap *dst,
+                               const int subset[4], const float inverse[9],
+                               const float clip[4], int x0, int y0, int x1, int y1,
+                               bool filter, unsigned paint_alpha)
+{
+   /* Pixel centres inside the clip, and the source rectangle in destination x. */
+   /* An unclipped axis has infinite bounds: compare as floats before casting. */
+   float edge;
+   if ((edge = ceilf(clip[0] - .5f)) > (float)x0) x0 = (int)edge;
+   if ((edge = ceilf(clip[2] - .5f)) < (float)x1) x1 = (int)edge;
+   if ((edge = ceilf(clip[1] - .5f)) > (float)y0) y0 = (int)edge;
+   if ((edge = ceilf(clip[3] - .5f)) < (float)y1) y1 = (int)edge;
+   if (x0 >= x1 || y0 >= y1) return;
+   const int64_t one = 65536;
+   const int64_t du = (int64_t)llroundf(inverse[0] * 65536.f);
+   for (int y = y0; y < y1; ++y) {
+      float fy = inverse[4] * (y + .5f) + inverse[5];
+      if (!(fy >= subset[1] && fy < subset[3])) continue;
+      int64_t v = (int64_t)llroundf((fy - (filter ? .5f : 0.f)) * 65536.f);
+      int iy0 = (int)(v >> 16), iy1 = iy0 + 1;
+      unsigned wy = (unsigned)((v & 0xffff) >> 8);   /* 0..255 */
+      if (!filter) wy = 0;
+      iy0 = iy0 < subset[1] ? subset[1] : iy0 >= subset[3] ? subset[3] - 1 : iy0;
+      iy1 = iy1 < subset[1] ? subset[1] : iy1 >= subset[3] ? subset[3] - 1 : iy1;
+      int64_t u = (int64_t)llroundf((inverse[0] * (x0 + .5f) + inverse[2] - (filter ? .5f : 0.f)) * 65536.f);
+      uint32_t *row = &dst->px[(size_t)y * dst->w];
+      for (int x = x0; x < x1; ++x, u += du) {
+         /* u is the sample position, less half a texel when filtering. */
+         int64_t centre = filter ? u + 32768 : u;
+         if (centre < (int64_t)subset[0] * one || centre >= (int64_t)subset[2] * one) continue;
+         int ix0 = (int)(u >> 16);
+         uint32_t s;
+         if (!filter || (!(u & 0xffff) && !wy)) {
+            int px = ix0 < subset[0] ? subset[0] : ix0 >= subset[2] ? subset[2] - 1 : ix0;
+            uint32_t p = src->px[(size_t)iy0 * src->w + px];
+            s = src->has_alpha ? p : (p | 0xff000000u);
+         } else {
+            int ix1 = ix0 + 1;
+            unsigned wx = (unsigned)((u & 0xffff) >> 8);
+            ix0 = ix0 < subset[0] ? subset[0] : ix0 >= subset[2] ? subset[2] - 1 : ix0;
+            ix1 = ix1 < subset[0] ? subset[0] : ix1 >= subset[2] ? subset[2] - 1 : ix1;
+            unsigned a = 0, c0 = 0, c1 = 0, c2 = 0;
+            canvas_tap(src, ix0, iy0, (256 - wx) * (256 - wy), &a, &c0, &c1, &c2);
+            canvas_tap(src, ix1, iy0, wx * (256 - wy), &a, &c0, &c1, &c2);
+            canvas_tap(src, ix0, iy1, (256 - wx) * wy, &a, &c0, &c1, &c2);
+            canvas_tap(src, ix1, iy1, wx * wy, &a, &c0, &c1, &c2);
+            if (!a) continue;
+            if (!src->has_alpha) {
+               /* Opaque texels: the weights sum to 65536, so no division. */
+               s = 0xff000000u | ((c0 + 32768) >> 16) << 16 | ((c1 + 32768) >> 16) << 8 | ((c2 + 32768) >> 16);
+            } else {
+               unsigned alpha = (a + 32768) >> 16;      /* weights sum to 65536 */
+               s = (alpha > 255 ? 255u : alpha) << 24 | ((c0 + a / 2) / a) << 16 |
+                   ((c1 + a / 2) / a) << 8 | ((c2 + a / 2) / a);
+            }
+         }
+         if (paint_alpha != 255) {
+            unsigned sa = ((s >> 24) * paint_alpha + 127) / 255;
+            s = (s & 0x00ffffffu) | sa << 24;
+         }
+         row[x] = canvas_over_pixel(s, row[x], dst->has_alpha);
+      }
    }
 }
 
@@ -1875,15 +2366,14 @@ static bool canvas_draw_bitmap(struct dvm *vm, dvm_ref self,
       memcpy(transform,m,sizeof transform);
    }
    dvm_ref paint=args[nargs-1].l;
-   union dvm_value target = {0}, current = {0};
-   (void)dvm_get_field(vm, self, "bitmap", "Landroid/graphics/Bitmap;", &target);
+   union dvm_value current = {0};
    (void)dvm_get_field(vm, self, "matrix", "Landroid/graphics/Matrix;", &current);
    if (current.l) {
       m = matrix_values(vm, current.l);
       if (!m) return false;
       mat_mul(transform, m, transform);
    }
-   struct rt_bitmap *dst = bitmap_of(vm, target.l);
+   struct rt_bitmap *dst = canvas_bitmap(vm,self);
    if (!dst) RETV();
    if (!bitmap_live(vm, dst)) return false;
    if (!mat_invert(transform, inverse)) RETV();
@@ -1929,6 +2419,18 @@ static bool canvas_draw_bitmap(struct dvm *vm, dvm_ref self,
          y1=(int)ceilf(fminf(y1,fmaxf(0,max_y)));
       }
    }
+   /* The ordinary case -- an image scaled and translated onto a rectangular
+    * clip, drawn source-over with no colour filter -- needs no per-pixel
+    * matrix, clip query or float blend: the source row and column are linear
+    * in the destination, so they are stepped in 16.16 fixed point and the
+    * pixel is blended in integers.  Everything else takes the general loop. */
+   canvas_prepare_clip(state);
+   if (state->clip_simple && mode==3 && !filter_state.active &&
+       transform[1]==0 && transform[3]==0 && transform[6]==0 && transform[7]==0 && transform[8]==1) {
+      canvas_blit_scaled(src,dst,subset,inverse,state->clip_bounds,x0,y0,x1,y1,
+                         (flags.i&2)!=0,(unsigned)lroundf(paint_alpha*255.f));
+      goto drawn;
+   }
    for (int y=y0;y<y1;++y) for (int x=x0;x<x1;++x) {
       if (!canvas_clip_contains(state,x+0.5f,y+0.5f)) continue;
       float sx, sy;
@@ -1966,6 +2468,7 @@ static bool canvas_draw_bitmap(struct dvm *vm, dvm_ref self,
       }
       *pixel = result;
    }
+drawn:
    if (src == &snapshot) free(snapshot.px);
    ++dst->gen;
    RETV();
@@ -1986,13 +2489,16 @@ static unsigned text_mask_sample(const struct luna_text_bitmap *mask,float x,flo
 
 /* Rasterize at the Canvas scale, then inverse-map the glyph's coverage. Font
  * coordinates are relative to the baseline, not to the top of a text box. */
+static bool recording_text_run(struct dvm *,dvm_ref,dvm_ref,const struct luna_text_run *,float,float,bool,union dvm_value *);
 static bool canvas_text_run(struct dvm *vm,dvm_ref canvas,dvm_ref paint,
                              const struct luna_text_run *run,float x,float baseline,
                              bool apply_align,union dvm_value *out)
 {
+   struct canvas_state *recording=canvas_state(vm,canvas);
+   if(!recording) return false;
+   if(recording->recording) return recording_text_run(vm,canvas,paint,run,x,baseline,apply_align,out);
    union dvm_value target={0},size={0},scale={0},skew={0},flags={0},color={0},align={0},style={0},xfer={0};
-   (void)dvm_get_field(vm,canvas,"bitmap","Landroid/graphics/Bitmap;",&target);
-   struct rt_bitmap *dst=bitmap_of(vm,target.l);
+   struct rt_bitmap *dst=canvas_bitmap(vm,canvas);
    (void)dvm_get_field(vm,paint,"textSize","F",&size);
    (void)dvm_get_field(vm,paint,"textScaleX","F",&scale);
    (void)dvm_get_field(vm,paint,"textSkewX","F",&skew);
@@ -2058,6 +2564,63 @@ static bool canvas_text_run(struct dvm *vm,dvm_ref canvas,dvm_ref paint,
    ++dst->gen;RETV();
 }
 
+static bool canvas_draw_text_run(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                                 int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   if(!args[0].l || !args[8].l) {
+      dvm__throw(vm,"java/lang/NullPointerException",!args[0].l ? "text" : "paint");return false;
+   }
+   bool array=builtin_sig()[1]=='[';
+   struct rt_text_units text={0};
+   if(!text_read_units(vm,args[0].l,array,"java/lang/NullPointerException",&text)) return false;
+   int64_t start=args[1].i,end=array ? start+(int64_t)args[2].i : args[2].i;
+   int64_t context_start=args[3].i,context_end=array ? context_start+(int64_t)args[4].i : args[4].i;
+   if(context_start<0 || start<context_start || end<start || context_end<end || (uint64_t)context_end>text.length) {
+      free(text.owned);dvm__throw(vm,"java/lang/IndexOutOfBoundsException","text run or context range");return false;
+   }
+   if(start==end) {free(text.owned);RETV();}
+   struct luna_text_run run={0};
+   bool good=paint_shape_context(vm,args[8].l,text.data+context_start,(size_t)(context_end-context_start),
+      (size_t)(start-context_start),(size_t)(end-start),args[7].i ? 2 : 1,&run);
+   free(text.owned);
+   if(good) good=canvas_text_run(vm,self,args[8].l,&run,args[5].f,args[6].f,true,out);
+   free(run.glyphs);return good;
+}
+
+static bool layout_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   if(!ARG(0).l) {dvm__throw(vm,"java/lang/NullPointerException","canvas");return false;}
+   struct textview_layout *layout=layout_data(vm,self);
+   if(!layout) {dvm__throw(vm,"java/lang/IllegalStateException","uninitialized Layout");return false;}
+   struct dvm_class *cls=dvm_object_class(vm,args[0].l);
+   struct dvm_method *draw=cls ? dvm_find_method(vm,cls,"drawTextRun","([CIIIIFFZLandroid/graphics/Paint;)V") : NULL;
+   if(!draw) {dvm__throw(vm,"java/lang/NoSuchMethodError","Canvas.drawTextRun");return false;}
+   bool native=draw->builtin==canvas_draw_text_run;
+   if(!native && !layout->draw_units) {
+      if(layout->text.length>INT_MAX) {dvm__throw(vm,"java/lang/OutOfMemoryError","Layout text");return false;}
+      layout->draw_units=dvm_new_array(vm,'C',NULL,(uint32_t)layout->text.length);
+      if(!layout->draw_units) return false;
+      if(layout->text.length) memcpy(dvm_array_data(vm,layout->draw_units),layout->text.data,layout->text.length*sizeof(uint16_t));
+   }
+   for(size_t i=0;i<layout->count;++i) {
+      struct textview_line *line=&layout->lines[i];
+      if(native) {
+         if(!canvas_text_run(vm,args[0].l,layout->paint,&line->run,line->left,line->baseline,false,out)) return false;
+      } else {
+         size_t end=line->end;
+         while(end>line->start && (layout->text.data[end-1]=='\n' || layout->text.data[end-1]=='\r' ||
+            layout->text.data[end-1]==0x2028 || layout->text.data[end-1]==0x2029)) --end;
+         union dvm_value input[]={{.l=layout->draw_units},{.i=(int32_t)line->start},{.i=(int32_t)(end-line->start)},
+            {.i=(int32_t)line->start},{.i=(int32_t)(end-line->start)},{.f=line->left},{.f=line->baseline},
+            {.i=line->direction==2},{.l=layout->paint}};
+         if(!dvm_call(vm,draw,args[0].l,input,9,out)) return false;
+      }
+   }
+   RETV();
+}
+
 static bool canvas_draw_text(struct dvm *vm,dvm_ref self,const union dvm_value *args,
                               int nargs,union dvm_value *out)
 {
@@ -2116,7 +2679,7 @@ static bool text_on_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args
       if(horizontal==1) x+=(width-pad[0]-pad[2]-line_width)/2;
       else if(horizontal==5) x+=width-pad[0]-pad[2]-line_width;
       good=canvas_text_run(vm,canvas,layout->paint,&layout->lines[i].run,x,
-         y+layout->baseline+i*layout->line_height,false,out);
+         y+layout->lines[i].baseline,false,out);
    }
    dvm_ref raised=vm->exception;
    if(raised) {dvm_pin(vm,raised);dvm_clear_exception(vm);}
@@ -2145,6 +2708,18 @@ static const struct rt_field rt_canvas_fields[] = {
 };
 static bool canvas_draw_render_node(struct dvm *,dvm_ref,const union dvm_value *,int,union dvm_value *);
 static const struct rt_method rt_canvas[] = {
+   M("saveLayer", "(Landroid/graphics/RectF;Landroid/graphics/Paint;)I", canvas_save_layer),
+   M("saveLayer", "(Landroid/graphics/RectF;Landroid/graphics/Paint;I)I", canvas_save_layer),
+   M("saveLayer", "(FFFFLandroid/graphics/Paint;)I", canvas_save_layer),
+   M("saveLayer", "(FFFFLandroid/graphics/Paint;I)I", canvas_save_layer),
+   M("saveLayerAlpha", "(Landroid/graphics/RectF;I)I", canvas_save_layer),
+   M("saveLayerAlpha", "(Landroid/graphics/RectF;II)I", canvas_save_layer),
+   M("saveLayerAlpha", "(FFFFI)I", canvas_save_layer),
+   M("saveLayerAlpha", "(FFFFII)I", canvas_save_layer),
+   M("drawTextRun","([CIIIIFFZLandroid/graphics/Paint;)V",canvas_draw_text_run),
+   M("drawTextRun","(Ljava/lang/CharSequence;IIIIFFZLandroid/graphics/Paint;)V",canvas_draw_text_run),
+   M("getClipBounds","(Landroid/graphics/Rect;)Z",canvas_get_clip_bounds),
+   M("getClipBounds","()Landroid/graphics/Rect;",canvas_get_clip_bounds),
    M("clipRect","(FFFFLandroid/graphics/Region$Op;)Z",canvas_clip_rect),
    M("clipRect","(IIIILandroid/graphics/Region$Op;)Z",canvas_clip_rect),
    M("clipRect","(Landroid/graphics/Rect;Landroid/graphics/Region$Op;)Z",canvas_clip_rect),
@@ -2201,17 +2776,15 @@ static const struct rt_method rt_canvas[] = {
 };
 /* RecordingCanvas retains immutable command arguments, while RenderNode child
  * references remain live so a parent's display list follows child updates. */
-struct render_command {
-   struct dvm_method *method;
-   union dvm_value args[8];
-   int nargs;
-};
 static dvm_ref recording_snapshot(struct dvm *vm,dvm_ref ref)
 {
    struct dvm_object *src=dvm__obj(vm,ref);
    if(!src) return 0;
    const char *name=src->cls->name;
-   bool copy=src->kind==DVM_OBJ_ARRAY || !strcmp(name,"android/graphics/Paint") ||
+   bool paint=false;
+   for(struct dvm_class *c=src->cls;c;c=c->super)
+      if(!strcmp(c->name,"android/graphics/Paint")) {paint=true;break;}
+   bool copy=src->kind==DVM_OBJ_ARRAY || paint ||
       !strcmp(name,"android/graphics/Matrix") || !strcmp(name,"android/graphics/Path") ||
       !strcmp(name,"android/graphics/Rect") || !strcmp(name,"android/graphics/RectF");
    if(!copy) return ref;
@@ -2238,6 +2811,43 @@ static dvm_ref recording_snapshot(struct dvm *vm,dvm_ref ref)
    }
    return result;
 }
+static bool recording_reserve(struct dvm *vm,struct canvas_state *state)
+{
+   if(!state || !state->recording_active) {
+      dvm__throw(vm,"java/lang/IllegalStateException","RecordingCanvas is not recording");return false;
+   }
+   if(state->command_count==state->command_capacity) {
+      size_t cap=state->command_capacity ? state->command_capacity*2 : 32;
+      if(cap<state->command_capacity || cap>SIZE_MAX/sizeof(struct render_command)) {
+         dvm__throw(vm,"java/lang/OutOfMemoryError","Display list");return false;
+      }
+      struct render_command *grown=realloc(state->commands,cap*sizeof(*grown));
+      if(!grown) {dvm__throw(vm,"java/lang/OutOfMemoryError","Display list");return false;}
+      state->commands=grown;state->command_capacity=cap;
+   }
+   return true;
+}
+static bool recording_text_run(struct dvm *vm,dvm_ref canvas,dvm_ref paint,
+ const struct luna_text_run *run,float x,float baseline,bool apply_align,union dvm_value *out)
+{
+   struct canvas_state *state=canvas_state(vm,canvas);
+   if(!recording_reserve(vm,state)) return false;
+   struct render_command command={.text=*run};
+   command.text.glyphs=NULL;
+   if(run->count) {
+      if(run->count>SIZE_MAX/sizeof(*run->glyphs) ||
+         !(command.text.glyphs=malloc(run->count*sizeof(*run->glyphs)))) {
+         dvm__throw(vm,"java/lang/OutOfMemoryError","Recorded glyphs");return false;
+      }
+      memcpy(command.text.glyphs,run->glyphs,run->count*sizeof(*run->glyphs));
+   }
+   dvm_ref snapshot=recording_snapshot(vm,paint);
+   if(!snapshot) {free(command.text.glyphs);return false;}
+   command.args[0].l=snapshot;command.args[1].f=x;
+   command.args[2].f=baseline;command.args[3].i=apply_align;
+   state->commands[state->command_count++]=command;
+   RETV();
+}
 static bool recording_canvas_call(struct dvm *vm,dvm_ref self,
    const union dvm_value *args,int nargs,union dvm_value *out)
 {
@@ -2255,12 +2865,7 @@ static bool recording_canvas_call(struct dvm *vm,dvm_ref self,
       dvm__throw(vm,"java/lang/RuntimeException","Cannot set a bitmap on a RecordingCanvas");return false;
    }
    if(nargs>8) {dvm__throw(vm,"java/lang/IllegalArgumentException","Canvas argument count");return false;}
-   if(state->command_count==state->command_capacity) {
-      size_t cap=state->command_capacity ? state->command_capacity*2 : 32;
-      struct render_command *grown=realloc(state->commands,cap*sizeof(*grown));
-      if(!grown) {dvm__throw(vm,"java/lang/OutOfMemoryError","Display list");return false;}
-      state->commands=grown;state->command_capacity=cap;
-   }
+   if(!recording_reserve(vm,state)) return false;
    struct render_command command={.method=method,.nargs=nargs};
    memcpy(command.args,args,(size_t)nargs*sizeof(*args));
    const char *type=sig+1;
@@ -2287,6 +2892,18 @@ static bool recording_canvas_call(struct dvm *vm,dvm_ref self,
    return true;
 }
 static const struct rt_method rt_recording_canvas[] = {
+   M("saveLayer", "(Landroid/graphics/RectF;Landroid/graphics/Paint;)I", recording_canvas_call),
+   M("saveLayer", "(Landroid/graphics/RectF;Landroid/graphics/Paint;I)I", recording_canvas_call),
+   M("saveLayer", "(FFFFLandroid/graphics/Paint;)I", recording_canvas_call),
+   M("saveLayer", "(FFFFLandroid/graphics/Paint;I)I", recording_canvas_call),
+   M("saveLayerAlpha", "(Landroid/graphics/RectF;I)I", recording_canvas_call),
+   M("saveLayerAlpha", "(Landroid/graphics/RectF;II)I", recording_canvas_call),
+   M("saveLayerAlpha", "(FFFFI)I", recording_canvas_call),
+   M("saveLayerAlpha", "(FFFFII)I", recording_canvas_call),
+   M("drawTextRun","([CIIIIFFZLandroid/graphics/Paint;)V",canvas_draw_text_run),
+   M("drawTextRun","(Ljava/lang/CharSequence;IIIIFFZLandroid/graphics/Paint;)V",canvas_draw_text_run),
+   M("getClipBounds","(Landroid/graphics/Rect;)Z",recording_canvas_call),
+   M("getClipBounds","()Landroid/graphics/Rect;",recording_canvas_call),
    M("clipRect","(FFFFLandroid/graphics/Region$Op;)Z",recording_canvas_call),
    M("clipRect","(IIIILandroid/graphics/Region$Op;)Z",recording_canvas_call),
    M("clipRect","(Landroid/graphics/Rect;Landroid/graphics/Region$Op;)Z",recording_canvas_call),
@@ -2475,6 +3092,11 @@ static bool canvas_draw_render_node(struct dvm *vm,dvm_ref self,const union dvm_
    float replay_base[9];canvas_read_matrix(vm,self,replay_base);
    for(size_t i=0;good && i<recording->command_count;++i) {
       struct render_command *command=&recording->commands[i];
+      if(!command->method) {
+         good=canvas_text_run(vm,self,command->args[0].l,&command->text,
+            command->args[1].f,command->args[2].f,command->args[3].i!=0,&ignored);
+         continue;
+      }
       union dvm_value values[8];memcpy(values,command->args,sizeof(values));
       if(!strcmp(command->method->name,"restoreToCount")) values[0].i+=saved.i;
       if(!strcmp(command->method->name,"setMatrix")) {
@@ -2533,6 +3155,25 @@ static bool view_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
    const struct ui_node *node=ui_node(vm,self);
    int32_t width=node ? node->w : ui_int(vm,self,"right")-ui_int(vm,self,"left");
    int32_t height=node ? node->h : ui_int(vm,self,"bottom")-ui_int(vm,self,"top");
+   if (ui_is_a(vm,self,"android/view/SurfaceView")) {
+      dvm_ref holder=ui_obj(vm,self,"holder","Landroid/view/SurfaceHolder;");
+      dvm_ref surface=ui_obj(vm,holder,"surface","Landroid/view/Surface;");
+      dvm_ref bitmap=ui_obj(vm,surface,"bufferBitmap","Landroid/graphics/Bitmap;");
+      if (bitmap) {
+         dvm_ref rect=ui_obj(vm,surface,"bufferRect","Landroid/graphics/Rect;");
+         if (!rect) {
+            rect=dvm_new_object(vm,dvm_find_class(vm,"android/graphics/Rect"));
+            if (!rect) return false;
+            (void)dvm_set_field(vm,surface,"bufferRect","Landroid/graphics/Rect;",(union dvm_value){.l=rect});
+         }
+         rt_set_int(vm,rect,"left",0); rt_set_int(vm,rect,"top",0);
+         rt_set_int(vm,rect,"right",width); rt_set_int(vm,rect,"bottom",height);
+         float bounds[]={0,0,(float)width,(float)height};
+         if (!canvas_fill_color(vm,canvas,bounds,0,0,0,false,0,out)) return false;
+         union dvm_value draw[]={{.l=bitmap},{0},{.l=rect},{0}};
+         if (!canvas_draw_bitmap(vm,canvas,draw,4,out)) return false;
+      }
+   }
    dvm_ref bg=ui_obj(vm,self,"background","Landroid/graphics/drawable/Drawable;");
    if (bg) {
       union dvm_value bounds[]={{.i=0},{.i=0},{.i=width},{.i=height}},ignored={0};
@@ -2591,8 +3232,29 @@ static bool vg_draw_child(struct dvm *vm,dvm_ref self,const union dvm_value *arg
       good=am_vcall(vm,canvas,"clipRect","(IIII)Z",clip,4,&ignored);
       visible=ignored.i!=0;
    }
+   bool trace=g_ui_draw_trace_budget!=0;
+   uint32_t before=0;struct rt_bitmap *trace_bitmap=NULL;
+   if(trace) {
+      --g_ui_draw_trace_budget;
+      trace_bitmap=bitmap_of(vm,ui_obj(vm,canvas,"bitmap","Landroid/graphics/Bitmap;"));
+      if(trace_bitmap && trace_bitmap->px && trace_bitmap->w>0 && trace_bitmap->h>0)
+         before=trace_bitmap->px[(size_t)(trace_bitmap->h/2)*trace_bitmap->w+trace_bitmap->w/2];
+      int clip[4]={0};struct canvas_state *state=canvas_state(vm,canvas);
+      if(state && trace_bitmap) canvas_clip_limits(state,trace_bitmap,clip);
+      fprintf(stderr,"[view-draw] begin p=%u %s c=%u %s id=%08x vis=%d box=%d,%d %dx%d visible=%d good=%d clip=%d,%d,%d,%d matrix=%g,%g,%g,%g,%g,%g,%g,%g,%g center=%08x\n",
+         (unsigned)self,ui_class_simple_name(vm,self),(unsigned)child,ui_class_simple_name(vm,child),
+         (unsigned)ui_int(vm,child,"id"),ui_int(vm,child,"visibility"),node ? node->x : 0,node ? node->y : 0,
+         node ? node->w : 0,node ? node->h : 0,visible,good,clip[0],clip[1],clip[2],clip[3],
+         matrix[0],matrix[1],matrix[2],matrix[3],matrix[4],matrix[5],matrix[6],matrix[7],matrix[8],before);
+   }
    union dvm_value argument={.l=canvas};
    if (good && (visible || more)) good=am_vcall(vm,child,"draw","(Landroid/graphics/Canvas;)V",&argument,1,&ignored);
+   if(trace) {
+      uint32_t after=0;
+      if(trace_bitmap && trace_bitmap->px && trace_bitmap->w>0 && trace_bitmap->h>0)
+         after=trace_bitmap->px[(size_t)(trace_bitmap->h/2)*trace_bitmap->w+trace_bitmap->w/2];
+      fprintf(stderr,"[view-draw] end p=%u c=%u good=%d center=%08x -> %08x\n",(unsigned)self,(unsigned)child,good,before,after);
+   }
    /* Restore host Canvas state even if an app drawing callback throws. */
    dvm_ref raised=vm->exception;
    if (raised) {dvm_pin(vm,raised); dvm_clear_exception(vm);}
@@ -2728,33 +3390,38 @@ static bool vector_render_nodes(const struct vector_node *node,int width,int hei
 }
 static bool vector_property(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   (void)nargs;struct dvm_object *object=dvm__obj(vm,self);struct vector_data *vector=object ? object->data : NULL;
+   (void)nargs;struct vector_data *vector=vector_of(vm,self);
    const char *name=builtin_name();
    if(!strcmp(name,"<init>")) {
       if(!vector) {vector=calloc(1,sizeof *vector);if(!vector) {dvm__throw(vm,"java/lang/OutOfMemoryError","Vector");return false;}
-         object->data=vector;object->data_destroy=vector_destroy;vector->alpha=1;vector->width=vector->height=-1;}
+         if (!vector_attach(vm,self,vector)) return false;vector->alpha=1;vector->width=vector->height=-1;}
       return drawable_init(vm,self,NULL,0,out);
    }
-   if(!strcmp(name,"getIntrinsicWidth")) RETI(vector ? vector->width : -1);
-   if(!strcmp(name,"getIntrinsicHeight")) RETI(vector ? vector->height : -1);
+   if(!strcmp(name,"getIntrinsicWidth") || !strcmp(name,"getIntrinsicHeight")) {
+      int value=vector ? (!strcmp(name,"getIntrinsicWidth") ? vector->width : vector->height) : -1;
+      int target=ui_int(vm,self,"vectorDensity");
+      if (vector && value>0 && target>0 && vector->density>0)
+         value=(int)(((int64_t)value*target+vector->density/2)/vector->density);
+      RETI(value);
+   }
    if(!strcmp(name,"getAlpha")) RETI(vector ? (int)(fmaxf(0,fminf(1,vector->alpha))*255) : 255);
    if(!strcmp(name,"setAlpha")) {if(vector) vector->alpha=fmaxf(0,fminf(1,ARG(0).i/255.f));ui_invalidate();RETV();}
    if(!strcmp(name,"isAutoMirrored")) RETI(vector && vector->mirrored);
    if(!strcmp(name,"setAutoMirrored")) {if(vector) vector->mirrored=ARG(0).i!=0;ui_invalidate();RETV();}
    if(!strcmp(name,"setTint")) {
       if(vector) {vector->tint=true;vector->tint_color=ARG(0).u;}
-      (void)dvm_set_field(vm,self,"vectorTint","Landroid/content/res/ColorStateList;",(union dvm_value){0});
+      (void)dvm_set_field(vm,vector_state_ref(vm,self),"vectorTint","Landroid/content/res/ColorStateList;",(union dvm_value){0});
    } else if(!strcmp(name,"setTintList")) {
       if(vector) vector->tint=ARG(0).l!=0;
-      (void)dvm_set_field(vm,self,"vectorTint","Landroid/content/res/ColorStateList;",ARG(0));
+      (void)dvm_set_field(vm,vector_state_ref(vm,self),"vectorTint","Landroid/content/res/ColorStateList;",ARG(0));
    } else if(!strcmp(name,"setTintMode")) {
-      (void)dvm_set_field(vm,self,"vectorTintMode","Landroid/graphics/PorterDuff$Mode;",ARG(0));
+      (void)dvm_set_field(vm,vector_state_ref(vm,self),"vectorTintMode","Landroid/graphics/PorterDuff$Mode;",ARG(0));
    }
    ui_invalidate();RETV();
 }
 static bool vector_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   (void)nargs;struct dvm_object *object=dvm__obj(vm,self);struct vector_data *vector=object ? object->data : NULL;
+   (void)nargs;struct vector_data *vector=vector_of(vm,self);
    if(!vector || !vector->root.children) RETV();
    dvm_ref bounds=ui_obj(vm,self,"bounds","Landroid/graphics/Rect;");if(!bounds) RETV();
    int left=ui_int(vm,bounds,"left"),top=ui_int(vm,bounds,"top");
@@ -2783,8 +3450,8 @@ static bool vector_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
    /* Tint/filter affect the completed vector, rather than each overlapping path. */
    union dvm_value tint_list={0},mode={0},filter={0};
    dvm_get_field(vm,self,"colorFilter","Landroid/graphics/ColorFilter;",&filter);
-   (void)dvm_get_field(vm,self,"vectorTint","Landroid/content/res/ColorStateList;",&tint_list);
-   (void)dvm_get_field(vm,self,"vectorTintMode","Landroid/graphics/PorterDuff$Mode;",&mode);
+   (void)dvm_get_field(vm,vector_state_ref(vm,self),"vectorTint","Landroid/content/res/ColorStateList;",&tint_list);
+   (void)dvm_get_field(vm,vector_state_ref(vm,self),"vectorTintMode","Landroid/graphics/PorterDuff$Mode;",&mode);
    uint32_t tint=vector->tint_color;
    if(tint_list.l) {
       dvm_ref states=ui_obj(vm,self,"stateSet","[I");struct dvm_object *array=states ? dvm__obj(vm,states) : NULL;
@@ -2800,12 +3467,12 @@ static bool vector_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
       if(!tinted || tinted->w!=cache_w || tinted->h!=cache_h || tinted->recycled) {
          shown=bitmap_new(vm,cache_w,cache_h);if(!shown) return false;
          (void)dvm_set_field(vm,self,"vectorTintCache","Landroid/graphics/Bitmap;",(union dvm_value){.l=shown});
-         tinted=bitmap_of(vm,shown);tinted->is_mutable=true;tinted->density=0;vector->cached_tint_gen=0;
+         tinted=bitmap_of(vm,shown);tinted->is_mutable=true;tinted->density=0;rt_set_int(vm,self,"vectorTintGeneration",0);
       }
-      if(vector->cached_tint_gen!=bitmap->gen || vector->cached_tint_color!=tint) {
+      if((unsigned)ui_int(vm,self,"vectorTintGeneration")!=bitmap->gen || (uint32_t)ui_int(vm,self,"vectorTintColor")!=tint) {
          for(size_t i=0;i<(size_t)cache_w*cache_h;++i)
             tinted->px[i]=(tint&0xffffffu)|((((tint>>24)*(bitmap->px[i]>>24)+127)/255)<<24);
-         vector->cached_tint_gen=bitmap->gen;vector->cached_tint_color=tint;++tinted->gen;
+         rt_set_int(vm,self,"vectorTintGeneration",(int32_t)bitmap->gen);++tinted->gen;
          rt_set_int(vm,self,"vectorTintColor",(int32_t)tint);
       }
    }
@@ -2828,7 +3495,75 @@ static bool vector_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
    union dvm_value draw[]={{.l=shown},{.l=transform},{.l=paint}};
    return canvas_draw_bitmap(vm,ARG(0).l,draw,3,out);
 }
+static bool vector_constant_state(struct dvm *vm,dvm_ref self,
+                                   const union dvm_value *args,int nargs,union dvm_value *out)
+{ (void)args;(void)nargs;RETL(vector_state_ref(vm,self)); }
+
+static bool vector_mutate(struct dvm *vm,dvm_ref self,
+                          const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   struct vector_data *source=vector_of(vm,self);
+   if (source && !ui_int(vm,self,"vectorMutated")) {
+      dvm_ref old=vector_state_ref(vm,self);
+      dvm_pin(vm,old);
+      struct vector_data *copy=vector_copy(source);
+      if (!copy) {dvm_unpin(vm,old);dvm__throw(vm,"java/lang/OutOfMemoryError","Vector state copy");return false;}
+      int density=source->density;
+      if (!vector_attach(vm,self,copy)) {dvm_unpin(vm,old);return false;}
+      copy->density=density;
+      const char *names[]={"vectorTint","vectorTintMode"};
+      const char *sigs[]={"Landroid/content/res/ColorStateList;","Landroid/graphics/PorterDuff$Mode;"};
+      for (int i=0;i<2;++i) {
+         union dvm_value value={0};dvm_get_field(vm,old,names[i],sigs[i],&value);
+         dvm_set_field(vm,vector_state_ref(vm,self),names[i],sigs[i],value);
+      }
+      dvm_unpin(vm,old);rt_set_int(vm,self,"vectorMutated",1);
+   }
+   RETL(self);
+}
+
+static bool vector_new_drawable(struct dvm *vm,dvm_ref self,
+                                const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   dvm_ref drawable=dvm_new_object(vm,dvm_find_class(vm,"android/graphics/drawable/VectorDrawable"));
+   if (!drawable) return false;
+   dvm_pin(vm,drawable);
+   bool good=dvm_set_field(vm,drawable,"vectorState","Landroid/graphics/drawable/VectorDrawable$VectorDrawableState;",
+                           (union dvm_value){.l=self});
+   if (good && nargs>0 && ARG(0).l) {
+      union dvm_value metrics={0};
+      good=am_vcall(vm,ARG(0).l,"getDisplayMetrics","()Landroid/util/DisplayMetrics;",NULL,0,&metrics);
+      if (good && metrics.l) rt_set_int(vm,drawable,"vectorDensity",ui_int(vm,metrics.l,"densityDpi"));
+   }
+   if (good) good=drawable_init(vm,drawable,NULL,0,out);
+   dvm_unpin(vm,drawable);
+   if (!good) return false;
+   RETL(drawable);
+}
+/* ConstantState's concrete overloads dispatch to the subclass factory. */
+static bool drawable_state_new(struct dvm *vm,dvm_ref self,
+                               const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   if (nargs>1) return am_vcall(vm,self,"newDrawable","(Landroid/content/res/Resources;)Landroid/graphics/drawable/Drawable;",args,1,out);
+   return am_vcall(vm,self,"newDrawable","()Landroid/graphics/drawable/Drawable;",NULL,0,out);
+}
+static const struct rt_method rt_drawable_constant_state[]={
+ {"newDrawable","()Landroid/graphics/drawable/Drawable;",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
+ M("newDrawable","(Landroid/content/res/Resources;)Landroid/graphics/drawable/Drawable;",drawable_state_new),
+ M("newDrawable","(Landroid/content/res/Resources;Landroid/content/res/Resources$Theme;)Landroid/graphics/drawable/Drawable;",drawable_state_new),
+ M("<init>","()V",nop_void),M("getChangingConfigurations","()I",ret_zero),
+ M("canApplyTheme","()Z",ret_false),M_END};
+static const struct rt_method rt_vector_state[]={
+ M("newDrawable","()Landroid/graphics/drawable/Drawable;",vector_new_drawable),
+ M("newDrawable","(Landroid/content/res/Resources;)Landroid/graphics/drawable/Drawable;",vector_new_drawable),
+ M("newDrawable","(Landroid/content/res/Resources;Landroid/content/res/Resources$Theme;)Landroid/graphics/drawable/Drawable;",vector_new_drawable),M_END};
+static const struct rt_field rt_vector_state_fields[]={
+ {"vectorTint","Landroid/content/res/ColorStateList;"},{"vectorTintMode","Landroid/graphics/PorterDuff$Mode;"},F_END};
+
 static const struct rt_method rt_vector_drawable[]={
+ M("getConstantState","()Landroid/graphics/drawable/Drawable$ConstantState;",vector_constant_state),
+ M("mutate","()Landroid/graphics/drawable/Drawable;",vector_mutate),
  M("<init>","()V",vector_property),M("draw","(Landroid/graphics/Canvas;)V",vector_draw),
  M("getIntrinsicWidth","()I",vector_property),M("getIntrinsicHeight","()I",vector_property),
  M("getAlpha","()I",vector_property),M("setAlpha","(I)V",vector_property),
@@ -2838,8 +3573,8 @@ static const struct rt_method rt_vector_drawable[]={
 static const struct rt_field rt_vector_drawable_fields[]={
  {"vectorCache","Landroid/graphics/Bitmap;"},{"vectorTintCache","Landroid/graphics/Bitmap;"},
  {"vectorPaint","Landroid/graphics/Paint;"},{"vectorMatrix","Landroid/graphics/Matrix;"},
- {"vectorTint","Landroid/content/res/ColorStateList;"},{"vectorTintMode","Landroid/graphics/PorterDuff$Mode;"},
- {"vectorTintColor","I"},F_END};
+ {"vectorState","Landroid/graphics/drawable/VectorDrawable$VectorDrawableState;"},
+ {"vectorMutated","I"},{"vectorDensity","I"},{"vectorTintGeneration","I"},{"vectorTintColor","I"},F_END};
 
 /* ImageView placement follows configureBounds; endpoint rounding is Java's
  * floor(x + .5), including negative center/crop translations. */
@@ -2947,6 +3682,11 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
    for(size_t i=0;i<sizeof hooks/sizeof *hooks;++i) {
       struct dvm_method *m=cls ? dvm_find_method(vm,cls,hooks[i],"(Landroid/graphics/Canvas;)V") : NULL;
       if (m && m->has_code) custom=true;
+   }
+   if (ui_is_a(vm,view,"android/view/SurfaceView")) {
+      dvm_ref holder=ui_obj(vm,view,"holder","Landroid/view/SurfaceHolder;");
+      dvm_ref surface=ui_obj(vm,holder,"surface","Landroid/view/Surface;");
+      if (ui_obj(vm,surface,"bufferBitmap","Landroid/graphics/Bitmap;")) custom=true;
    }
    const struct ui_node *node=ui_node(vm,view);
    if (!custom || !node || node->w<=0 || node->h<=0 || ui_int(vm,view,"visibility")) return NULL;
@@ -3265,6 +4005,7 @@ static bool bm_compress(struct dvm *vm, dvm_ref self,
 }
 
 static const struct rt_method rt_bitmap[] = {
+   M("copyPixelsToBuffer", "(Ljava/nio/Buffer;)V", bm_copyPixelsToBuffer),
    M("getWidth", "()I", bm_getWidth),
    M("getHeight", "()I", bm_getHeight),
    M("getByteCount", "()I", bm_getByteCount),
@@ -4071,7 +4812,7 @@ static uint32_t gd_sample(const uint32_t *colors,uint32_t count,const float *pos
    uint32_t color=0;
    for (int shift=0;shift<=24;shift+=8) {
       float a=(float)((colors[i]>>shift)&255),b=(float)((colors[i+1]>>shift)&255);
-      color|=(uint32_t)lroundf(a+(b-a)*f)<<shift;
+      color|=(uint32_t)(a+(b-a)*f+0.5f)<<shift;   /* channels are 0..255: round half up, no libm call */
    }
    return color;
 }
@@ -4125,8 +4866,7 @@ static bool gd_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
    float x0=box[0]+endpoints[ord][0]*w,y0=box[1]+endpoints[ord][1]*h;
    float dx=(endpoints[ord][2]-endpoints[ord][0])*w,dy=(endpoints[ord][3]-endpoints[ord][1])*h;
    if (colors && type!=0) {dvm__throw(vm,"java/lang/UnsupportedOperationException","Canvas radial or sweep GradientDrawable rendering is not implemented"); return false;}
-   (void)dvm_get_field(vm,canvas,"bitmap","Landroid/graphics/Bitmap;",&target);
-   struct rt_bitmap *dst=bitmap_of(vm,target.l);
+   struct rt_bitmap *dst=canvas_bitmap(vm,canvas);
    if (!dst) RETV();
    if (!bitmap_live(vm,dst)) return false;
    struct canvas_state *clip=canvas_state(vm,canvas); if (!clip) return false;
@@ -4152,8 +4892,35 @@ static bool gd_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
    uint32_t solid=(uint32_t)rt_get_int(vm,self,"color"),line=(uint32_t)rt_get_int(vm,self,"strokeColor");
    bool layer=shape!=2 && stroke>0 && (gd_alpha(line,alpha)>>24)>0 && (gd_alpha(line,alpha)>>24)<255 && alpha<255;
    uint32_t paint_line=color_filter_pixel(&filter_state,layer ? line : gd_alpha(line,alpha));
+   /* The union of the two central strips lies entirely inside a rounded
+    * rectangle. If a whole device pixel maps inside either strip, all 16
+    * coverage samples have the same solid color; evaluate/blend it once.
+    * Perspective and boundary pixels retain the exact sampling path below. */
+   const bool solid_interior=shape==0 && !colors && stroke<=0 &&
+      inverse[6]==0 && inverse[7]==0 && inverse[8]!=0;
+   float half_x=0,half_y=0;
+   if(solid_interior) {
+      half_x=(fabsf(inverse[0])+fabsf(inverse[1]))/(2*fabsf(inverse[8]));
+      half_y=(fabsf(inverse[3])+fabsf(inverse[4]))/(2*fabsf(inverse[8]));
+   }
+   const float inner_left=box[0]+fmaxf(radii[0],radii[6]);
+   const float inner_right=box[2]-fmaxf(radii[2],radii[4]);
+   const float inner_top=box[1]+fmaxf(radii[1],radii[3]);
+   const float inner_bottom=box[3]-fmaxf(radii[5],radii[7]);
+   const uint32_t paint_solid=color_filter_pixel(&filter_state,gd_alpha(solid,alpha));
    for (int y=top;y<bottom;++y) for (int x=left;x<right;++x) {
       if (!canvas_clip_contains(clip,x+0.5f,y+0.5f)) continue;
+      if(solid_interior) {
+         float lx,ly;mat_map(inverse,x+.5f,y+.5f,&lx,&ly);
+         if(lx-half_x>=box[0] && lx+half_x<=box[2] &&
+            ly-half_y>=box[1] && ly+half_y<=box[3] &&
+            ((lx-half_x>=inner_left && lx+half_x<=inner_right) ||
+             (ly-half_y>=inner_top && ly+half_y<=inner_bottom))) {
+            size_t pixel=(size_t)y*dst->w+x;
+            dst->px[pixel]=canvas_src_over(paint_solid,dst->px[pixel],!dst->has_alpha);
+            continue;
+         }
+      }
       float accum[4]={0};
       for (int sy=0;sy<4;++sy) for (int sx=0;sx<4;++sx) {
          float lx,ly; mat_map(inverse,x+(sx+0.5f)*0.25f,y+(sy+0.5f)*0.25f,&lx,&ly);

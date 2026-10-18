@@ -61,7 +61,7 @@ build/luna-browser.o: luna-browser.c build/luna-browser.js.h build/run_cat.png.h
 luna-browser: build/luna-browser.o $(QJS_OBJ)
 	$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
 
-test: script-dom-test http-framing-test document-layout-test css-robust-test text-edit-test
+test: script-dom-test http-framing-test document-layout-test css-robust-test text-edit-test image-loading-test
 
 script-dom-test: luna-browser
 	python3 test/script_dom.py
@@ -78,7 +78,10 @@ css-robust-test: luna-browser
 http-framing-test: luna-browser
 	python3 test/http_framing.py
 
+image-loading-test: luna-browser
+	python3 test/image_loading.py
+
 clean:
 	rm -rf build luna-browser
 
-.PHONY: all test script-dom-test http-framing-test document-layout-test css-robust-test text-edit-test clean
+.PHONY: all test script-dom-test http-framing-test document-layout-test css-robust-test text-edit-test image-loading-test clean

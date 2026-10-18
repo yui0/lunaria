@@ -639,18 +639,17 @@ int dex_class_annotations(struct dex_file *d, uint32_t class_def_idx,
  * the field_annotation[] table of {field_idx, annotations_off} pairs.  The
  * field is named rather than indexed because struct dvm_field does not carry
  * its dex index, and a class cannot declare the same field name twice. */
-bool dex_field_annotation(struct dex_file *d, uint32_t class_def_idx,
-                          const char *field_name, const char *annotation_desc,
-                          uint32_t *encoded_off)
+static uint32_t dex_field_entry(struct dex_file *d, uint32_t class_def_idx,
+                                  const char *field_name)
 {
    struct dex_class_def cd;
    if (!d || !field_name ||
        !dex_class_def(d, class_def_idx, &cd) || !cd.annotations_off ||
        (uint64_t)cd.annotations_off + 16u > d->len)
-      return false;
+      return 0;
    uint32_t fields = dex_u32_at(d, cd.annotations_off + 4u);
    size_t table = (size_t)cd.annotations_off + 16u;
-   if ((uint64_t)table + (uint64_t)fields * 8u > d->len) return false;
+   if ((uint64_t)table + (uint64_t)fields * 8u > d->len) return 0;
    for (uint32_t i = 0; i < fields; ++i) {
       uint32_t field_idx = dex_u32_at(d, table + (size_t)i * 8u);
       uint32_t set_off   = dex_u32_at(d, table + (size_t)i * 8u + 4u);
@@ -658,10 +657,17 @@ bool dex_field_annotation(struct dex_file *d, uint32_t class_def_idx,
       if (!dex_field_id(d, field_idx, &fid)) continue;
       const char *name = dex_string(d, fid.name_idx);
       if (!name || strcmp(name, field_name)) continue;
-      return dex_annotation_set_find(d, set_off, annotation_desc, true,
-                                     encoded_off);
+      return set_off;
    }
-   return false;
+   return 0;
+}
+
+bool dex_field_annotation(struct dex_file *d, uint32_t class_def_idx,
+                          const char *field_name, const char *annotation_desc,
+                          uint32_t *encoded_off)
+{
+   uint32_t set_off=dex_field_entry(d,class_def_idx,field_name);
+   return set_off && dex_annotation_set_find(d,set_off,annotation_desc,true,encoded_off);
 }
 
 static bool dex_signature_text(struct dex_file *d, uint32_t signature_off,
@@ -742,6 +748,14 @@ static int dex_annotation_set_list(struct dex_file *d, uint32_t set_off,
       ++n;
    }
    return n;
+}
+
+int dex_field_annotations(struct dex_file *d, uint32_t class_def_idx,
+                           const char *field_name, uint32_t *encoded_offs,
+                           const char **types, int max)
+{
+   uint32_t set_off=dex_field_entry(d,class_def_idx,field_name);
+   return set_off ? dex_annotation_set_list(d,set_off,encoded_offs,types,max) : 0;
 }
 
 int dex_method_annotations(struct dex_file *d, uint32_t class_def_idx,
@@ -988,6 +1002,73 @@ bool dex_field_signature(struct dex_file *d, uint32_t class_def_idx,
    }
    if (!signature_off) return false;
    return dex_signature_text(d, signature_off, out, out_sz);
+}
+
+static bool dex_class_inner_element(struct dex_file *d, uint32_t class_def_idx,
+                                     const char *element, struct dex_value *value)
+{
+   struct dex_class_def cd;
+   if (!d || !dex_class_def(d, class_def_idx, &cd) || !cd.annotations_off ||
+       (uint64_t)cd.annotations_off + 16u > d->len) return false;
+   uint32_t annotation;
+   return dex_annotation_set_find(d, dex_u32_at(d, cd.annotations_off),
+                                   "Ldalvik/annotation/InnerClass;", false,
+                                   &annotation) &&
+      dex_annotation_element(d, annotation, element, value);
+}
+
+bool dex_class_inner_name(struct dex_file *d, uint32_t class_def_idx,
+                           const char **name)
+{
+   if (name) *name = NULL;
+   struct dex_value value;
+   if (!dex_class_inner_element(d, class_def_idx, "name", &value)) return false;
+   if (value.type == DEX_VALUE_NULL) return true;
+   if (value.type != DEX_VALUE_STRING || value.bits >= d->string_ids_size) return false;
+   const char *text = dex_string(d, (uint32_t)value.bits);
+   if (!text) return false;
+   if (name) *name = text;
+   return true;
+}
+
+bool dex_class_inner_flags(struct dex_file *d, uint32_t class_def_idx,
+                            uint32_t *flags)
+{
+   struct dex_value value;
+   if (!dex_class_inner_element(d, class_def_idx, "accessFlags", &value) ||
+       value.type != DEX_VALUE_INT) return false;
+   if (flags) *flags = (uint32_t)value.bits;
+   return true;
+}
+
+int dex_class_member_types(struct dex_file *d, uint32_t class_def_idx,
+                            const char **types, int max)
+{
+   struct dex_class_def cd;
+   if (!d || !dex_class_def(d, class_def_idx, &cd)) return -1;
+   if (!cd.annotations_off) return 0;
+   if ((uint64_t)cd.annotations_off + 16u > d->len) return -1;
+   uint32_t annotation;
+   if (!dex_annotation_set_find(d, dex_u32_at(d, cd.annotations_off),
+                                "Ldalvik/annotation/MemberClasses;", false,
+                                &annotation)) return 0;
+   struct dex_value array;
+   if (!dex_annotation_element(d, annotation, "value", &array) ||
+       array.type != DEX_VALUE_ARRAY || array.bits >= d->len) return -1;
+   uint32_t count;
+   size_t p = dex_uleb(d, (size_t)array.bits, &count);
+   if (p <= array.bits || p > d->len || count > INT_MAX) return -1;
+   for (uint32_t i = 0; i < count; ++i) {
+      struct dex_value value;
+      size_t next = dex_read_value(d, p, &value);
+      if (next <= p || next > d->len || value.type != DEX_VALUE_TYPE ||
+          value.bits >= d->type_ids_size) return -1;
+      const char *desc = dex_type(d, (uint32_t)value.bits);
+      if (!desc || desc[0] != 'L') return -1;
+      if (types && (int)i < max) types[i] = desc;
+      p = next;
+   }
+   return (int)count;
 }
 
 static const char *class_enclosing_type(struct dex_file *d,

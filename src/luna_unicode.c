@@ -7,7 +7,20 @@
 #include <limits.h>
 #include "unicode/character_data.h"
 #include "unicode/numeric_data.h"
+#include "unicode/bidi_data.h"
 #define COUNT(a) (sizeof(a)/sizeof((a)[0]))
+int luna_uc_directionality(int32_t cp)
+{
+   if (cp < 0 || cp > 0x10ffff) return -1;
+   size_t lo=0,hi=COUNT(uc_bidi_ranges);
+   while(lo<hi) {
+      size_t m=lo+(hi-lo)/2;
+      if(uc_bidi_ranges[m].last<(uint32_t)cp) lo=m+1; else hi=m;
+   }
+   return lo<COUNT(uc_bidi_ranges) && uc_bidi_ranges[lo].first<=(uint32_t)cp
+      ? uc_bidi_ranges[lo].direction : -1;
+}
+
 static const struct uc_range *property(int32_t cp)
 {
    size_t lo = 0, hi = COUNT(uc_ranges);

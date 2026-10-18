@@ -7,6 +7,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <float.h>
 
 struct path_contour {NSVGpath node;size_t capacity;};
 
@@ -334,4 +335,140 @@ unsigned char *luna_path_mask(const luna_path *p,int w,int h,const float matrix[
       }
    }
    nsvgDeleteRasterizer(r);luna_path_clear(&copy,true);return pixels;
+}
+
+/* Arc-length lookup retains cubic pieces, so sampling and extraction evaluate
+ * curves rather than the straight chords used to estimate their lengths.
+ * Android 12 Skia uses a half-pixel control-point tolerance at resolution 1. */
+struct measure_piece {float curve[8];double start,end,t0,t1;};
+struct luna_path_measure {
+   luna_path path;
+   const NSVGpath *contour;
+   struct measure_piece *pieces;
+   size_t count,capacity;
+   double length;
+   bool force_closed;
+};
+static void measure_split(const float curve[8],double t,float left[8],float right[8])
+{
+   double points[8];for(int i=0;i<8;++i) points[i]=curve[i];
+   for(int level=0;level<4;++level) {
+      for(int axis=0;axis<2;++axis) {
+         left[2*level+axis]=(float)points[axis];
+         right[2*(3-level)+axis]=(float)points[2*(3-level)+axis];
+      }
+      for(int i=0;i<3-level;++i) for(int axis=0;axis<2;++axis)
+         points[2*i+axis]+=t*(points[2*i+2+axis]-points[2*i+axis]);
+   }
+}
+static bool measure_add_curve(luna_path_measure *m,const float original[8],const float curve[8],double t0,double t1,unsigned depth)
+{
+   double deviation=0;
+   for(int i=1;i<3;++i) for(int axis=0;axis<2;++axis) {
+      double linear=(double)curve[axis]+((double)curve[6+axis]-curve[axis])*i/3;
+      deviation=fmax(deviation,fabs(curve[2*i+axis]-linear));
+   }
+   if(deviation>0.5 && depth<20) {
+      float left[8],right[8];measure_split(curve,0.5,left,right);
+      double middle=(t0+t1)*0.5;
+      return measure_add_curve(m,original,left,t0,middle,depth+1) && measure_add_curve(m,original,right,middle,t1,depth+1);
+   }
+   double length=hypot((double)curve[6]-curve[0],(double)curve[7]-curve[1]);
+   if(!(length>0) || !(m->length+length>m->length)) return true;
+   if(m->count==m->capacity) {
+      size_t capacity=m->capacity ? m->capacity*2 : 32;
+      if(capacity<m->capacity || capacity>SIZE_MAX/sizeof *m->pieces) return false;
+      void *pieces=realloc(m->pieces,capacity*sizeof *m->pieces);if(!pieces) return false;
+      m->pieces=pieces;m->capacity=capacity;
+   }
+   struct measure_piece *piece=&m->pieces[m->count++];memcpy(piece->curve,original,sizeof piece->curve);piece->t0=t0;piece->t1=t1;
+   piece->start=m->length;piece->end=m->length+length;m->length=piece->end;return true;
+}
+static int measure_contour(luna_path_measure *m,const NSVGpath *contour)
+{
+   for(;contour;contour=contour->next) {
+      m->count=0;m->length=0;m->contour=contour;
+      for(int i=0;i+3<contour->npts;i+=3)
+         if(!measure_add_curve(m,contour->pts+2*i,contour->pts+2*i,0,1,0)) return -1;
+      if((contour->closed || m->force_closed) && contour->npts) {
+         float curve[8];
+         for(int i=0;i<4;++i) for(int axis=0;axis<2;++axis) {
+            double from=contour->pts[2*(contour->npts-1)+axis],to=contour->pts[axis];
+            curve[2*i+axis]=(float)(from+(to-from)*i/3);
+         }
+         if(!measure_add_curve(m,curve,curve,0,1,0)) return -1;
+      }
+      if(m->length>FLT_MAX) {m->count=0;m->length=0;m->contour=NULL;return 0;}
+      if(m->count) return 1;
+   }
+   m->count=0;m->length=0;m->contour=NULL;return 0;
+}
+luna_path_measure *luna_path_measure_new(void)
+{return calloc(1,sizeof(luna_path_measure));}
+void luna_path_measure_free(void *data)
+{
+   luna_path_measure *m=data;if(!m) return;
+   luna_path_clear(&m->path,true);free(m->pieces);free(m);
+}
+bool luna_path_measure_set(luna_path_measure *m,const luna_path *path,bool force_closed)
+{
+   luna_path_clear(&m->path,true);m->count=0;m->length=0;m->contour=NULL;m->force_closed=force_closed;
+   if(!path) return true;
+   for(const NSVGpath *p=path->first;p;p=p->next)
+      for(size_t i=0;i<(size_t)p->npts*2;++i) if(!isfinite(p->pts[i])) return true;
+   if(!luna_path_append(&m->path,path,NULL)) return false;
+   return measure_contour(m,m->path.first)>=0;
+}
+float luna_path_measure_length(const luna_path_measure *m)
+{return (float)m->length;}
+bool luna_path_measure_closed(const luna_path_measure *m)
+{return m->contour && (m->force_closed || m->contour->closed);}
+int luna_path_measure_next(luna_path_measure *m)
+{return measure_contour(m,m->contour ? m->contour->next : NULL);}
+static size_t measure_find(const luna_path_measure *m,double distance)
+{
+   size_t lo=0,hi=m->count-1;
+   while(lo<hi) {size_t middle=lo+(hi-lo)/2;if(m->pieces[middle].end<distance) lo=middle+1;else hi=middle;}
+   return lo;
+}
+static void measure_evaluate(const float curve[8],double t,float pos[2],float tangent[2])
+{
+   double v=1-t,dx=0,dy=0;
+   for(int axis=0;axis<2;++axis) {
+      if(pos) pos[axis]=(float)(v*v*v*curve[axis]+3*v*v*t*curve[2+axis]+3*v*t*t*curve[4+axis]+t*t*t*curve[6+axis]);
+      double d=v*v*((double)curve[2+axis]-curve[axis])+2*v*t*((double)curve[4+axis]-curve[2+axis])+t*t*((double)curve[6+axis]-curve[4+axis]);
+      if(t==0 && curve[2]==curve[0] && curve[3]==curve[1])
+         d=(double)curve[4+axis]-curve[axis];
+      if(t==1 && curve[4]==curve[6] && curve[5]==curve[7])
+         d=(double)curve[6+axis]-curve[2+axis];
+      if(axis) dy=d;else dx=d;
+   }
+   if(dx==0 && dy==0 && (t==0 || t==1)) {dx=(double)curve[6]-curve[0];dy=(double)curve[7]-curve[1];}
+   if(tangent) {double length=hypot(dx,dy);tangent[0]=length>0 ? (float)(dx/length) : 0;tangent[1]=length>0 ? (float)(dy/length) : 0;}
+}
+bool luna_path_measure_sample(const luna_path_measure *m,float distance,float pos[2],float tangent[2])
+{
+   if(!m->count || isnan(distance)) return false;
+   double at=fmax(0,fmin(distance,m->length));const struct measure_piece *piece=&m->pieces[measure_find(m,at)];
+   double t=piece->t0+(piece->t1-piece->t0)*(at-piece->start)/(piece->end-piece->start);
+   measure_evaluate(piece->curve,t,pos,tangent);return true;
+}
+int luna_path_measure_segment(const luna_path_measure *m,float start,float stop,luna_path *dst,bool move)
+{
+   double from=fmax(0,start),to=fmin(stop,m->length);
+   if(isnan(start) || isnan(stop) || !m->count || !(from<to)) return 0;
+   size_t index=measure_find(m,from);bool first=true;
+   for(;index<m->count && m->pieces[index].start<to;++index) {
+      const struct measure_piece *piece=&m->pieces[index];
+      double lo=fmax(from,piece->start),hi=fmin(to,piece->end),length=piece->end-piece->start;
+      if(!(lo<hi)) continue;
+      double a=piece->t0+(piece->t1-piece->t0)*(lo-piece->start)/length;
+      double b=piece->t0+(piece->t1-piece->t0)*(hi-piece->start)/length;
+      float curve[8],left[8],right[8];memcpy(curve,piece->curve,sizeof curve);
+      if(b<1) {measure_split(curve,b,left,right);memcpy(curve,left,sizeof curve);}
+      if(a>0) {measure_split(curve,a/b,left,right);memcpy(curve,right,sizeof curve);}
+      if(first && move && !luna_path_move(dst,curve[0],curve[1])) return -1;
+      first=false;if(!luna_path_cubic(dst,curve+2)) return -1;
+   }
+   return 1;
 }

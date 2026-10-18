@@ -237,6 +237,8 @@ g.reportError = reportError;
 
 /* ------------------------------------------------------------------ nodes */
 
+const ceRegistry = new Map(), ceWaiters = new Map();
+let ceUpgrading = null;
 const wrappers = new Map();
 function W(uid) {
    if (!uid) return null;
@@ -244,7 +246,8 @@ function W(uid) {
    if (!w) {
       const tag = L.tag(uid) || 'div';
       const C = tag === '#text' ? Text : TAGS[tag] || HTMLElement;
-      w = Object.create(C.prototype);
+      const ce = tag.indexOf('-') > 0 ? ceRegistry.get(tag) : null;
+      w = Object.create(ce ? ce.ctor.prototype : C.prototype);
       hide(w, '_uid', uid);
       wrappers.set(uid, w);
    }
@@ -370,9 +373,54 @@ function detach(c) {
    if (c._uid) L.remove(c._uid);
 }
 
+/* Custom elements: define() upgrades what is already in the document; elements
+ * seen later take the class when first wrapped.  The constructor runs on the element itself. */
+function ceCall(el, name, ...args) {
+   if (typeof el[name] !== 'function') return;
+   try { el[name](...args); } catch (e) { reportError(e); }
+}
+
+function ceUpgrade(el) {
+   const d = ceRegistry.get(el.localName);
+   if (!d || el._ceUp) return;
+   hide(el, '_ceUp', true);
+   Object.setPrototypeOf(el, d.ctor.prototype);
+   ceUpgrading = el;
+   try { new d.ctor(); } catch (e) { reportError(e); }      /* runs the field initialisers and constructor on el */
+   ceUpgrading = null;
+   for (const a of d.observed) if (el.hasAttribute(a)) ceCall(el, 'attributeChangedCallback', a, null, el.getAttribute(a));
+   if (el.isConnected) ceCall(el, 'connectedCallback');
+}
+
+class CustomElementRegistry {
+   define(name, ctor) {
+      name = String(name).toLowerCase();
+      if (name.indexOf('-') <= 0) throw new DOMException(`'${name}' is not a valid custom element name`, 'SyntaxError');
+      if (ceRegistry.has(name)) throw new DOMException(`'${name}' has already been defined`, 'NotSupportedError');
+      ceRegistry.set(name, { ctor, observed: Array.from(ctor.observedAttributes || []) });
+      for (const el of document.querySelectorAll(name)) ceUpgrade(el);
+      const w = ceWaiters.get(name);
+      if (w) { ceWaiters.delete(name); for (const r of w) r(ctor); }
+   }
+   get(name) { const d = ceRegistry.get(String(name).toLowerCase()); return d ? d.ctor : undefined; }
+   getName(ctor) { for (const [n, d] of ceRegistry) if (d.ctor === ctor) return n; return null; }
+   whenDefined(name) {
+      name = String(name).toLowerCase();
+      const d = ceRegistry.get(name);
+      if (d) return Promise.resolve(d.ctor);
+      return new Promise(r => { const w = ceWaiters.get(name) || []; w.push(r); ceWaiters.set(name, w); });
+   }
+   upgrade(root) { if (root && root.querySelectorAll) for (const el of root.querySelectorAll('*')) if (el.localName.indexOf('-') > 0) ceUpgrade(el); }
+}
+g.customElements = new CustomElementRegistry();
+g.CustomElementRegistry = CustomElementRegistry;
+
 /* A node just joined the document: run what a browser runs on insertion. */
 function connected(n) {
    if (!n.isConnected) return;
+   if (n.nodeType === 1 && n.localName.indexOf('-') > 0) {
+      if (!n._ceUp) ceUpgrade(n); else ceCall(n, 'connectedCallback');
+   }
    if (n.localName === 'script' && !n._uid && !n._started) {
       n._started = true;
       const type = (n.getAttribute('type') || '').toLowerCase();
@@ -455,7 +503,7 @@ class Comment extends CharacterData {
    get nodeName() { return '#comment'; }
    get parentNode() { return this._vparent || null; }
    get childNodes() { return list([]); }
-   get textContent() { return this.data; }
+   get textContent() { return this.data; } set textContent(v) { this.data = v; }
 }
 
 class DOMTokenList {
@@ -774,16 +822,23 @@ function insertAdjacent(el, pos, nodes) {
    }
 }
 function vquery(root, sel, all) {
+   if (root._uid) {
+      const result = L.query(root._uid, String(sel), !!all);
+      if (!root._vkids || !all && result) return all ? result.map(W) : result ? [W(result)] : [];
+   }
    /* Virtual subtrees: type selectors and [attr] only, plus rendered
     * descendants. */
-   const out = [];
+   const out = root._uid && all ? L.query(root._uid, String(sel), true).map(W) : [];
    const walk = n => {
-      for (const k of n.childNodes) {
+      for (const k of (n._uid ? n._vkids || [] : n.childNodes)) {
          if (k.nodeType !== 1) continue;
-         if (vmatch(k, sel)) out.push(k);
-         if (k._uid) out.push(...L.query(k._uid, String(sel), true).map(W));
-         else walk(k);
+         if (vmatch(k, sel)) { out.push(k); if (!all) return true; }
+         if (k._uid) {
+            if (all) out.push(...L.query(k._uid, String(sel), true).map(W));
+            else { const hit = L.query(k._uid, String(sel), false); if (hit) { out.push(W(hit)); return true; } }
+         } else if (walk(k) && !all) return true;
       }
+      return false;
    };
    walk(root);
    return all ? out : out.slice(0, 1);
@@ -808,7 +863,21 @@ function vmatch(el, sel) {
    });
 }
 
-class HTMLElement extends Element {}
+class HTMLElement extends Element {
+   constructor() {
+      super();
+      if (ceUpgrading) { const el = ceUpgrading; ceUpgrading = null; return el; }   /* the element being upgraded is `this` */
+      for (const [tag, d] of ceRegistry) {          /* new MyElement() for a defined custom element */
+         if (d.ctor === new.target) {
+            const uid = L.create(tag, null);
+            const el = uid ? W(uid) : virtual(tag);
+            Object.setPrototypeOf(el, new.target.prototype);
+            hide(el, '_ceUp', true);
+            return el;
+         }
+      }
+   }
+}
 const reflect = (C, props) => {
    for (const p of props) {
       const [name, attr, kind] = Array.isArray(p) ? p : [p, p.toLowerCase(), 's'];
@@ -1003,6 +1072,10 @@ class DocumentFragment extends Node {
    get children() { return list(this.childNodes.filter(n => n.nodeType === 1)); }
    get firstElementChild() { return this.children[0] || null; }
    get textContent() { return this.childNodes.map(k => k.textContent).join(''); }
+   set textContent(v) {
+      for (const c of this.childNodes.slice()) this.removeChild(c);
+      if (v !== null && v !== undefined && String(v) !== '') this.appendChild(document.createTextNode(String(v)));
+   }
    querySelector(s) { return vquery(this, s, false)[0] || null; }
    querySelectorAll(s) { return list(vquery(this, s, true)); }
    getElementById(id) { return this.querySelector('#' + CSS.escape(id)); }
@@ -1080,7 +1153,8 @@ class Document extends Node {
    querySelector(s) { return W(L.query(0, String(s), false)) || vquery(this._html, s, false)[0] || null; }
    querySelectorAll(s) {
       const r = L.query(0, String(s), true).map(W);
-      for (const v of vquery(this.head, s, true)) if (!r.includes(v)) r.push(v);
+      const head = this.head;
+      if (!head._uid || head._vkids) for (const v of vquery(head, s, true)) if (!r.includes(v)) r.push(v);
       return list(r);
    }
    getElementsByClassName(c) { return this.querySelectorAll(String(c).trim().split(/\s+/).map(x => '.' + CSS.escape(x)).join('')); }
@@ -1093,7 +1167,9 @@ class Document extends Node {
    createElement(tag) {
       tag = String(tag).toLowerCase();
       const uid = L.create(tag, null);
-      return uid ? W(uid) : virtual(tag);
+      const el = uid ? W(uid) : virtual(tag);
+      if (tag.indexOf('-') > 0) ceUpgrade(el);
+      return el;
    }
    createElementNS(ns, tag) { return this.createElement(String(tag).replace(/^.*:/, '')); }
    createTextNode(t) { return new Text(t); }
@@ -1420,8 +1496,10 @@ g.__lb_tick = function (now) {
    /* Only what was due when this tick began: a timer that re-arms itself at
     * 0ms runs on the next tick, not in a loop here. */
    const due = [...timers.entries()].filter(([, t]) => t.due <= now).sort((a, b) => a[1].due - b[1].due || a[1].seq - b[1].seq);
+   const timerEnd = L.now() + 8;
    for (const [id, t] of due) {
       if (!timers.has(id)) continue;
+      if (L.now() >= timerEnd) break;
       if (t.ms) t.due = now + t.ms; else timers.delete(id);
       const t0 = L.verbose ? L.now() : 0;
       try {
@@ -1790,6 +1868,13 @@ class ResizeObserver {
    observe(el) { setTimeout(() => { const r = el.getBoundingClientRect(); try { this._cb([{ target: el, contentRect: r, borderBoxSize: [{ inlineSize: r.width, blockSize: r.height }], contentBoxSize: [{ inlineSize: r.width, blockSize: r.height }] }], this); } catch (e) { reportError(e); } }, 0); }
    unobserve() {} disconnect() {}
 }
+/* Nothing is measured; pages only need the constructor and the calls to exist. */
+class PerformanceObserver {
+   constructor(cb) { this._cb = cb; }
+   observe() {} disconnect() {} takeRecords() { return []; }
+   static get supportedEntryTypes() { return []; }
+}
+
 class IntersectionObserver {
    constructor(cb, opt = {}) { this._cb = cb; this.root = opt.root || null; this.rootMargin = opt.rootMargin || '0px'; this.thresholds = [].concat(opt.threshold || 0); }
    observe(el) { setTimeout(() => { const r = el.getBoundingClientRect(); try { this._cb([{ target: el, isIntersecting: true, intersectionRatio: 1, boundingClientRect: r, intersectionRect: r, rootBounds: null, time: performance.now() }], this); } catch (e) { reportError(e); } }, 0); }
@@ -1836,7 +1921,7 @@ Object.assign(g, {
    HTMLSpanElement, HTMLParagraphElement, HTMLUListElement, HTMLLIElement, HTMLTitleElement, SVGElement,
    URL, URLSearchParams, TextEncoder, TextDecoder, Blob, File, FileReader, FormData, Headers, Request, Response,
    AbortController, AbortSignal, XMLHttpRequest, WebSocket, Storage,
-   MutationObserver, ResizeObserver, IntersectionObserver, Image, Audio, DOMParser, XMLSerializer, Window: Object,
+   MutationObserver, ResizeObserver, IntersectionObserver, PerformanceObserver, Image, Audio, DOMParser, XMLSerializer, Window: Object,
 });
 
 /* -------------------------------------------------------------- input */

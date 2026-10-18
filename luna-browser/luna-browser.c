@@ -36,6 +36,8 @@
 #include "luna-ui.h"
 
 #include "quickjs.h"
+#include <dlfcn.h>
+#include <pthread.h>
 
 /* WebP, which stb_image does not read (Bing's picture of the day, among others). */
 #define SIMPLEWEBP_DISABLE_STDIO
@@ -47,9 +49,43 @@ static int is_webp(const unsigned char *b, size_t n)
    return n > 12 && !memcmp(b, "RIFF", 4) && !memcmp(b + 8, "WEBP", 4);
 }
 
+static pthread_once_t g_webp_once = PTHREAD_ONCE_INIT;
+static int (*g_webp_info)(const unsigned char *, size_t, int *, int *);
+static unsigned char *(*g_webp_decode)(const unsigned char *, size_t, unsigned char *, size_t, int);
+
+static void webp_decoder_init(void)
+{
+   if (getenv("LUNA_BROWSER_SOFTWARE_WEBP")) return;
+   static const char *names[] = { "libwebp.so.7", "libwebp.so", NULL };
+   for (int i = 0; names[i]; ++i) {
+      void *lib = dlopen(names[i], RTLD_LAZY | RTLD_LOCAL);
+      if (!lib) continue;
+      g_webp_info = dlsym(lib, "WebPGetInfo");
+      g_webp_decode = dlsym(lib, "WebPDecodeRGBAInto");
+      if (g_webp_info && g_webp_decode) return; /* keep the library loaded */
+      g_webp_info = NULL; g_webp_decode = NULL;
+      dlclose(lib);
+   }
+}
+
 static unsigned char *lb_decode_webp(const unsigned char *bytes, size_t len, int *w, int *h)
 {
    if (!is_webp(bytes, len)) return NULL;
+   /* Use the system's SIMD decoder when installed, retaining the bundled
+    * decoder for systems without libwebp. Decode into malloc-owned memory so
+    * the renderer keeps its existing free() ownership contract. */
+   pthread_once(&g_webp_once, webp_decoder_init);
+   int nw = 0, nh = 0;
+   if (g_webp_info && g_webp_info(bytes, len, &nw, &nh) && nw > 0 && nh > 0 &&
+       nw <= 16384 && nh <= 16384 && (size_t)nw * nh <= ((size_t)1 << 27)) {
+      size_t size = (size_t)nw * nh * 4;
+      unsigned char *pixels = malloc(size);
+      if (pixels && g_webp_decode(bytes, len, pixels, size, nw * 4)) {
+         *w = nw; *h = nh;
+         return pixels;
+      }
+      free(pixels);
+   }
    simplewebp *dec = NULL;
    if (simplewebp_load_from_memory((void *)bytes, len, NULL, &dec) != SIMPLEWEBP_NO_ERROR) return NULL;
    size_t pw = 0, ph = 0;
@@ -68,13 +104,14 @@ static unsigned char *lb_decode_webp(const unsigned char *bytes, size_t len, int
 #include <EGL/eglext.h>
 
 #include <ctype.h>
-#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
 #include <netdb.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
-#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -851,6 +888,9 @@ static char *cookie_header(const char *url)
 struct conn {
    int fd;
    struct conn *network_next;
+   struct conn *idle_next;           /* the keep-alive pool */
+   char key[300];                    /* scheme://host:port the connection is to */
+   double idle_since;
 #ifndef LB_NO_TLS
    SSL *ssl;
 #endif
@@ -883,15 +923,56 @@ static void conn_close_fd(struct conn *c)
 
 #ifndef LB_NO_TLS
 static SSL_CTX *g_ssl_ctx;
-static SSL_CTX *tls_context(void)
+
+/* The last session per host: a new connection to a host seen before resumes
+ * it and skips the full handshake. */
+static struct { char host[256]; SSL_SESSION *sess; } g_tls_sessions[32];
+static pthread_mutex_t g_tls_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int tls_new_session(SSL *ssl, SSL_SESSION *sess)
 {
-   if (g_ssl_ctx) return g_ssl_ctx;
+   const char *host = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+   if (!host || !*host) return 0;
+   pthread_mutex_lock(&g_tls_lock);
+   int slot = -1;
+   static int next;
+   for (int i = 0; i < 32; ++i) if (g_tls_sessions[i].sess && !strcmp(g_tls_sessions[i].host, host)) slot = i;
+   if (slot < 0) slot = next++ & 31;
+   if (g_tls_sessions[slot].sess) SSL_SESSION_free(g_tls_sessions[slot].sess);
+   snprintf(g_tls_sessions[slot].host, sizeof g_tls_sessions[slot].host, "%s", host);
+   g_tls_sessions[slot].sess = sess;
+   pthread_mutex_unlock(&g_tls_lock);
+   return 1;                                 /* the cache owns the session now */
+}
+
+static void tls_resume(SSL *ssl, const char *host)
+{
+   pthread_mutex_lock(&g_tls_lock);
+   for (int i = 0; i < 32; ++i)
+      if (g_tls_sessions[i].sess && !strcmp(g_tls_sessions[i].host, host)) {
+         SSL_set_session(ssl, g_tls_sessions[i].sess);
+         break;
+      }
+   pthread_mutex_unlock(&g_tls_lock);
+}
+
+static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
+
+static void tls_context_init(void)
+{
    g_ssl_ctx = SSL_CTX_new(TLS_client_method());
-   if (!g_ssl_ctx) return NULL;
+   if (!g_ssl_ctx) return;
+   SSL_CTX_set_session_cache_mode(g_ssl_ctx, SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
+   SSL_CTX_sess_set_new_cb(g_ssl_ctx, tls_new_session);
    SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
    SSL_CTX_set_default_verify_paths(g_ssl_ctx);
    SSL_CTX_set_verify(g_ssl_ctx, getenv("LUNA_BROWSER_INSECURE") ? SSL_VERIFY_NONE
                                                                  : SSL_VERIFY_PEER, NULL);
+}
+
+static SSL_CTX *tls_context(void)
+{
+   pthread_once(&g_tls_once, tls_context_init);
    return g_ssl_ctx;
 }
 #endif
@@ -927,6 +1008,66 @@ static void conn_close(struct conn *c)
    conn_close_fd(c);
 }
 
+/* Resolved addresses are kept for a minute: a page's dozens of requests to the
+ * same few hosts must not each wait for the resolver. */
+struct dns_addr { int family, proto; socklen_t len; struct sockaddr_storage addr; };
+struct dns_entry { char host[256]; char port[16]; double when; int n; struct dns_addr a[8]; };
+static struct dns_entry g_dns[32];
+static pthread_mutex_t g_dns_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int dns_resolve(const char *host, const char *port, struct dns_entry *out)
+{
+   double now = lb_now_ms();
+   pthread_mutex_lock(&g_dns_lock);
+   for (int i = 0; i < 32; ++i)
+      if (g_dns[i].n && now - g_dns[i].when < 60000 && !strcmp(g_dns[i].host, host) && !strcmp(g_dns[i].port, port)) {
+         *out = g_dns[i];
+         pthread_mutex_unlock(&g_dns_lock);
+         return 0;
+      }
+   pthread_mutex_unlock(&g_dns_lock);
+   struct addrinfo hints = { 0 }, *res = NULL;
+   hints.ai_family = AF_UNSPEC;
+   hints.ai_socktype = SOCK_STREAM;
+   int rc = getaddrinfo(host, port, &hints, &res);
+   if (rc != 0) return rc;
+   memset(out, 0, sizeof *out);
+   snprintf(out->host, sizeof out->host, "%s", host);
+   snprintf(out->port, sizeof out->port, "%s", port);
+   out->when = now;
+   /* Interleave before imposing the cache limit. A resolver can return more
+    * than eight IPv6 addresses ahead of its first IPv4 address (or vice versa). */
+   struct addrinfo *v4 = res, *v6 = res;
+   int family = res && res->ai_family == AF_INET6 ? AF_INET6 : AF_INET;
+   while (out->n < 8) {
+      while (v4 && (v4->ai_family != AF_INET || v4->ai_addrlen > sizeof out->a[0].addr)) v4 = v4->ai_next;
+      while (v6 && (v6->ai_family != AF_INET6 || v6->ai_addrlen > sizeof out->a[0].addr)) v6 = v6->ai_next;
+      struct addrinfo *a = family == AF_INET6 ? (v6 ? v6 : v4) : (v4 ? v4 : v6);
+      if (!a) break;
+      if (a == v4) v4 = v4->ai_next;
+      else v6 = v6->ai_next;
+      struct dns_addr *d = &out->a[out->n++];
+      d->family = a->ai_family; d->proto = a->ai_protocol; d->len = a->ai_addrlen;
+      memcpy(&d->addr, a->ai_addr, a->ai_addrlen);
+      family = a->ai_family == AF_INET6 ? AF_INET : AF_INET6;
+   }
+   freeaddrinfo(res);
+   if (!out->n) return EAI_NONAME;
+   pthread_mutex_lock(&g_dns_lock);
+   static int next;
+   g_dns[next++ & 31] = *out;
+   pthread_mutex_unlock(&g_dns_lock);
+   return 0;
+}
+
+static void dns_forget(const char *host, const char *port)
+{
+   pthread_mutex_lock(&g_dns_lock);
+   for (int i = 0; i < 32; ++i)
+      if (g_dns[i].n && !strcmp(g_dns[i].host, host) && !strcmp(g_dns[i].port, port)) g_dns[i].n = 0;
+   pthread_mutex_unlock(&g_dns_lock);
+}
+
 static int conn_open(struct conn *c, const struct url *u, char **error)
 {
    c->fd = -1;
@@ -943,39 +1084,88 @@ static int conn_open(struct conn *c, const struct url *u, char **error)
    char host[256];
    snprintf(host, sizeof host, "%s", u->host);
    if (host[0] == '[') { memmove(host, host + 1, strlen(host)); host[strcspn(host, "]")] = 0; }
-   struct addrinfo hints = { 0 }, *res = NULL;
-   hints.ai_socktype = SOCK_STREAM;
-   int rc = getaddrinfo(host, port, &hints, &res);
+   struct dns_entry addrs;
+   int rc = dns_resolve(host, port, &addrs);
    if (rc != 0) { *error = lb_strdup(gai_strerror(rc)); return -1; }
-   int dead_family = AF_UNSPEC;         /* one timeout per family, not per address */
-   for (struct addrinfo *a = res; a; a = a->ai_next) {
-      if (a->ai_family == dead_family) continue;
-      c->fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
-      if (c->fd < 0) continue;
-      fcntl(c->fd, F_SETFD, FD_CLOEXEC);
-      pthread_mutex_lock(&g_network_lock);
-      if (!atomic_load(&g_network_online)) {
-         close(c->fd); c->fd = -1;
-         pthread_mutex_unlock(&g_network_lock);
-         break;
-      }
-      c->network_next = g_network_connections; g_network_connections = c;
-      pthread_mutex_unlock(&g_network_lock);
-      /* SO_SNDTIMEO also bounds connect(): an unreachable address (a dead
-       * IPv6 route, say) costs seconds, not the whole I/O timeout, before the
-       * next one is tried. */
-      struct timeval tv = { 30, 0 }, ctv = { 4, 0 };
-      setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-      setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &ctv, sizeof ctv);
-      if (connect(c->fd, a->ai_addr, a->ai_addrlen) == 0) {
-         setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-         break;
-      }
-      if (errno == EINPROGRESS || errno == EAGAIN || errno == ENETUNREACH || errno == EHOSTUNREACH)
-         dead_family = a->ai_family;
-      conn_close_fd(c);
+   /* Stagger nonblocking attempts, alternating families. A blackholed IPv6
+    * route must not hold IPv4 (or another address) behind a connect timeout. */
+   struct conn attempts[8] = { 0 };
+   struct pollfd pf[8];
+   int order[8], used[8] = { 0 }, count = 0;
+   int family = addrs.a[0].family;
+   for (int n = 0; n < addrs.n; ++n) {
+      int pick = -1;
+      for (int i = 0; i < addrs.n; ++i)
+         if (!used[i] && addrs.a[i].family == family) { pick = i; break; }
+      if (pick < 0) for (int i = 0; i < addrs.n; ++i)
+         if (!used[i]) { pick = i; break; }
+      order[n] = pick; used[pick] = 1;
+      family = addrs.a[pick].family == AF_INET6 ? AF_INET : AF_INET6;
+      attempts[n].fd = pf[n].fd = -1;
+      pf[n].events = POLLOUT;
    }
-   freeaddrinfo(res);
+   double deadline = lb_now_ms() + 4000, launch = 0;
+   int winner = -1;
+   while (lb_now_ms() < deadline && atomic_load(&g_network_online)) {
+      double now = lb_now_ms();
+      int active = 0;
+      for (int i = 0; i < count; ++i) active += pf[i].fd >= 0;
+      if (count < addrs.n && (!active || now >= launch)) {
+         int i = count++;
+         const struct dns_addr *a = &addrs.a[order[i]];
+         struct conn *candidate = &attempts[i];
+         candidate->fd = socket(a->family, SOCK_STREAM, a->proto);
+         if (candidate->fd < 0) continue;
+         fcntl(candidate->fd, F_SETFD, FD_CLOEXEC);
+         fcntl(candidate->fd, F_SETFL, O_NONBLOCK);
+         pthread_mutex_lock(&g_network_lock);
+         candidate->network_next = g_network_connections;
+         g_network_connections = candidate;
+         if (!atomic_load(&g_network_online)) shutdown(candidate->fd, SHUT_RDWR);
+         pthread_mutex_unlock(&g_network_lock);
+         int result = connect(candidate->fd, (const struct sockaddr *)&a->addr, a->len);
+         if (result == 0) { winner = i; break; }
+         if (errno != EINPROGRESS) { conn_close_fd(candidate); continue; }
+         pf[i].fd = candidate->fd;
+         launch = now + 250;
+      }
+      active = 0;
+      for (int i = 0; i < count; ++i) active += pf[i].fd >= 0;
+      if (!active && count == addrs.n) break;
+      now = lb_now_ms();
+      double until = count < addrs.n && launch < deadline ? launch : deadline;
+      int wait = until > now ? (int)ceil(until - now) : 0;
+      int result = poll(pf, (nfds_t)count, wait);
+      if (result < 0 && errno != EINTR) break;
+      for (int i = 0; result > 0 && i < count; ++i) {
+         if (pf[i].fd < 0 || !pf[i].revents) continue;
+         int err = 0; socklen_t len = sizeof err;
+         if (getsockopt(pf[i].fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && !err) {
+            winner = i; break;
+         }
+         conn_close_fd(&attempts[i]); pf[i].fd = -1;
+      }
+      if (winner >= 0) break;
+   }
+   if (winner >= 0) {
+      pthread_mutex_lock(&g_network_lock);
+      struct conn **at = &g_network_connections;
+      while (*at && *at != &attempts[winner]) at = &(*at)->network_next;
+      c->fd = attempts[winner].fd;
+      c->network_next = attempts[winner].network_next;
+      if (*at) *at = c;
+      attempts[winner].fd = -1;
+      pthread_mutex_unlock(&g_network_lock);
+      fcntl(c->fd, F_SETFL, 0);
+      struct timeval tv = { 30, 0 };
+      setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+      setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+      int one = 1;
+      setsockopt(c->fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+   }
+   for (int i = 0; i < count; ++i)
+      if (attempts[i].fd >= 0) conn_close_fd(&attempts[i]);
+   if (winner < 0) dns_forget(host, port);
    if (c->fd < 0) { *error = lb_strdup("connection failed"); return -1; }
    if (!tls) return 0;
 #ifdef LB_NO_TLS
@@ -987,8 +1177,14 @@ static int conn_open(struct conn *c, const struct url *u, char **error)
    c->ssl = ctx ? SSL_new(ctx) : NULL;
    if (!c->ssl) { *error = lb_strdup("TLS unavailable"); conn_close(c); return -1; }
    SSL_set_fd(c->ssl, c->fd);
-   SSL_set_tlsext_host_name(c->ssl, host);
-   if (!getenv("LUNA_BROWSER_INSECURE")) SSL_set1_host(c->ssl, host);
+   unsigned char ip[16];
+   int numeric = inet_pton(AF_INET, host, ip) == 1 || inet_pton(AF_INET6, host, ip) == 1;
+   if (!numeric) SSL_set_tlsext_host_name(c->ssl, host);
+   tls_resume(c->ssl, host);
+   if (!getenv("LUNA_BROWSER_INSECURE")) {
+      if (numeric) X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(c->ssl), host);
+      else SSL_set1_host(c->ssl, host);
+   }
    if (SSL_connect(c->ssl) != 1) {
       char msg[256];
       ERR_error_string_n(ERR_get_error(), msg, sizeof msg);
@@ -1004,21 +1200,77 @@ static int conn_open(struct conn *c, const struct url *u, char **error)
  * headers a browser sends for one (some sites tell scripted clients apart by them). */
 static __thread int t_fetch_navigation;
 
+/* Idle keep-alive connections, per scheme://host:port.  A connection is taken
+ * out of the pool while a request uses it and put back if the response left it
+ * clean; one the server closed meanwhile is noticed on use and retried. */
+#define POOL_MAX 24
+#define POOL_IDLE_MS 20000
+static struct conn *g_idle;
+static int g_idle_n;
+static pthread_mutex_t g_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void conn_destroy(struct conn *c)
+{
+   conn_close(c);
+   free(c);
+}
+
+static struct conn *pool_take(const char *key)
+{
+   double now = lb_now_ms();
+   struct conn *got = NULL, *stale = NULL;
+   pthread_mutex_lock(&g_pool_lock);
+   for (struct conn **at = &g_idle; *at; ) {
+      struct conn *c = *at;
+      if (now - c->idle_since > POOL_IDLE_MS) { *at = c->idle_next; g_idle_n--; c->idle_next = stale; stale = c; continue; }
+      if (!got && !strcmp(c->key, key)) { *at = c->idle_next; g_idle_n--; got = c; continue; }
+      at = &c->idle_next;
+   }
+   pthread_mutex_unlock(&g_pool_lock);
+   while (stale) { struct conn *n = stale->idle_next; conn_destroy(stale); stale = n; }
+   if (got) got->idle_next = NULL;
+   return got;
+}
+
+static void pool_put(struct conn *c)
+{
+   struct conn *drop = NULL;
+   c->idle_since = lb_now_ms();
+   pthread_mutex_lock(&g_pool_lock);
+   c->idle_next = g_idle; g_idle = c; g_idle_n++;
+   if (g_idle_n > POOL_MAX) {                       /* the oldest goes */
+      struct conn **at = &g_idle;
+      while ((*at)->idle_next) at = &(*at)->idle_next;
+      drop = *at; *at = NULL; g_idle_n--;
+   }
+   pthread_mutex_unlock(&g_pool_lock);
+   if (drop) conn_destroy(drop);
+}
+
 /* One request/response exchange, no redirects. */
 static int http_exchange(const char *url, const char *method, const char *extra_headers,
                          const unsigned char *body, size_t body_len, struct response *r)
 {
    struct url u;
    if (url_parse(url, &u) != 0 || !u.host) { url_free(&u); r->error = lb_strdup("bad URL"); return -1; }
-   struct conn c;
-   if (conn_open(&c, &u, &r->error) != 0) { url_free(&u); return -1; }
+   char key[300];
+   snprintf(key, sizeof key, "%s://%s:%d", u.scheme, u.host, u.port >= 0 ? u.port : !strcmp(u.scheme, "https") ? 443 : 80);
+   int reused = 0;
+   struct conn *c = pool_take(key);
+   if (c) reused = 1;
+retry:
+   if (!c) {
+      c = calloc(1, sizeof *c);
+      if (!c || conn_open(c, &u, &r->error) != 0) { free(c); url_free(&u); return -1; }
+      snprintf(c->key, sizeof c->key, "%s", key);
+   }
    char *cookies = cookie_header(url);
    struct buf req = { 0 };
    buf_printf(&req, "%s %s%s%s HTTP/1.1\r\nHost: %s", method, u.path && u.path[0] ? u.path : "/",
               u.query ? "?" : "", u.query ? u.query : "", u.host);
    if (u.port >= 0) buf_printf(&req, ":%d", u.port);
    buf_printf(&req, "\r\nUser-Agent: %s\r\nAccept-Encoding: %s\r\n"
-              "Connection: close\r\n", g_user_agent,
+              "Connection: keep-alive\r\n", g_user_agent,
 #ifndef LB_NO_ZLIB
               "gzip, deflate"
 #else
@@ -1041,13 +1293,15 @@ static int http_exchange(const char *url, const char *method, const char *extra_
    if (body && body_len) buf_put(&req, body, body_len);
    ptrdiff_t sent = 0;
    while ((size_t)sent < req.len) {
-      ptrdiff_t n = conn_write(&c, req.p + sent, req.len - (size_t)sent);
+      ptrdiff_t n = conn_write(c, req.p + sent, req.len - (size_t)sent);
       if (n <= 0) break;
       sent += n;
    }
    free(req.p);
    if ((size_t)sent < req.len) {
-      conn_close(&c); url_free(&u);
+      conn_destroy(c); c = NULL;
+      if (reused) { reused = 0; goto retry; }       /* the server had closed it */
+      url_free(&u);
       r->error = lb_strdup("HTTP request send failed");
       return -1;
    }
@@ -1056,13 +1310,33 @@ static int http_exchange(const char *url, const char *method, const char *extra_
    int framing = 0, received_eof = 0;
    char chunk[16384];
    for (;;) {
-      ptrdiff_t n = conn_read(&c, chunk, sizeof chunk);
+      ptrdiff_t n = conn_read(c, chunk, sizeof chunk);
       if (n <= 0) { received_eof = n == 0; break; }
       buf_put(&in, chunk, (size_t)n);
       framing = http_frame_feed(&frame, in.p, in.len, method);
       if (framing) break;
    }
-   conn_close(&c);
+   if (!in.len && reused) {                         /* closed before it answered: try a fresh one */
+      conn_destroy(c); c = NULL; reused = 0;
+      free(in.p);
+      goto retry;
+   }
+   /* Kept for the next request when the response ended by its own framing
+    * and neither side asked to close. */
+   int keep = framing > 0 && frame.complete && !frame.close_delimited && in.len >= 12 &&
+              !strncmp(in.p, "HTTP/1.1", 8);
+   if (keep) {
+      const char *he = memmem(in.p, in.len, "\r\n\r\n", 4);
+      for (const char *l = in.p; he && l < he && keep; l = strstr(l, "\r\n") + 2) {
+         if (!strncasecmp(l, "connection:", 11)) {
+            const char *eol = strstr(l, "\r\n");
+            for (const char *q = l + 11; q + 5 <= eol; ++q) if (!strncasecmp(q, "close", 5)) { keep = 0; break; }
+         }
+         if (!strstr(l, "\r\n")) break;
+      }
+   }
+   if (keep && atomic_load(&g_network_online)) pool_put(c); else conn_destroy(c);
+   c = NULL;
    url_free(&u);
    if (framing < 0 || (!frame.complete &&
        !(received_eof && frame.headers && frame.close_delimited))) {
@@ -1188,6 +1462,108 @@ static const char *mime_of_path(const char *path)
    return "application/octet-stream";
 }
 
+/* Reuse explicitly fresh public subresources across document lifetimes.
+ * Documents and requests with custom headers bypass this cache. Cookie and UA
+ * are part of the key; redirects, Set-Cookie and arbitrary Vary are excluded. */
+#define HTTP_CACHE_SLOTS 128
+#define HTTP_CACHE_BYTES (32u * 1024u * 1024u)
+struct http_cached {
+   char *key;
+   double expires, used;
+   struct response r;
+};
+static struct http_cached g_http_cache[HTTP_CACHE_SLOTS];
+static size_t g_http_cache_bytes;
+static pthread_mutex_t g_http_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int response_copy(struct response *to, const struct response *from)
+{
+   memset(to, 0, sizeof *to);
+   to->status = from->status;
+   to->url = lb_strdup(from->url);
+   to->headers = lb_strdup(from->headers);
+   to->body = (unsigned char *)lb_strndup((const char *)from->body, from->length);
+   to->length = from->length;
+   if (to->url && to->headers && to->body) return 1;
+   response_free(to);
+   return 0;
+}
+
+static char *http_cache_key(const char *url)
+{
+   char *cookies = cookie_header(url);
+   struct buf key = { 0 };
+   buf_printf(&key, "%s\n%s\n%s", url, g_user_agent, cookies ? cookies : "");
+   free(cookies);
+   return buf_take(&key);
+}
+
+static void http_cache_drop(int i)
+{
+   g_http_cache_bytes -= g_http_cache[i].r.length;
+   free(g_http_cache[i].key);
+   response_free(&g_http_cache[i].r);
+   memset(&g_http_cache[i], 0, sizeof g_http_cache[i]);
+}
+
+static int http_cache_get(const char *key, struct response *r)
+{
+   int found = 0;
+   double now = lb_now_ms();
+   pthread_mutex_lock(&g_http_cache_lock);
+   for (int i = 0; i < HTTP_CACHE_SLOTS; ++i) {
+      if (!g_http_cache[i].key) continue;
+      if (g_http_cache[i].expires <= now) { http_cache_drop(i); continue; }
+      if (!strcmp(g_http_cache[i].key, key)) {
+         found = response_copy(r, &g_http_cache[i].r);
+         g_http_cache[i].used = now;
+         break;
+      }
+   }
+   pthread_mutex_unlock(&g_http_cache_lock);
+   return found;
+}
+
+static void http_cache_put(const char *key, const char *url, const struct response *r)
+{
+   if (r->status != 200 || !r->body || r->length > HTTP_CACHE_BYTES / 4 ||
+       !r->url || strcmp(url, r->url)) return;
+   char *cc = header_get(r->headers, "cache-control");
+   char *vary = header_get(r->headers, "vary");
+   char *cookie = header_get(r->headers, "set-cookie");
+   char *age = header_get(r->headers, "age");
+   const char *ma = cc ? strcasestr(cc, "max-age=") : NULL;
+   double ttl = ma ? strtod(ma + 8, NULL) : 0;
+   if (age) ttl -= strtod(age, NULL);
+   int usable = cc && strcasestr(cc, "public") && !strcasestr(cc, "no-store") &&
+      !strcasestr(cc, "no-cache") && !strcasestr(cc, "private") && !cookie &&
+      (!vary || !strcasecmp(vary, "accept-encoding")) && ttl > 0;
+   free(cc); free(vary); free(cookie); free(age);
+   if (!usable) return;
+   struct response copy;
+   if (!response_copy(&copy, r)) return;
+   char *saved_key = lb_strdup(key);
+   if (!saved_key) { response_free(&copy); return; }
+   pthread_mutex_lock(&g_http_cache_lock);
+   for (int i = 0; i < HTTP_CACHE_SLOTS; ++i)
+      if (g_http_cache[i].key && !strcmp(g_http_cache[i].key, key)) http_cache_drop(i);
+   int slot;
+   for (;;) {
+      slot = -1;
+      int oldest = -1;
+      for (int i = 0; i < HTTP_CACHE_SLOTS; ++i) {
+         if (!g_http_cache[i].key) { slot = i; continue; }
+         if (oldest < 0 || g_http_cache[i].used < g_http_cache[oldest].used) oldest = i;
+      }
+      if (slot >= 0 && g_http_cache_bytes + r->length <= HTTP_CACHE_BYTES) break;
+      if (oldest < 0) break;
+      http_cache_drop(oldest);
+   }
+   g_http_cache[slot] = (struct http_cached){ saved_key, lb_now_ms() + fmin(ttl, 86400) * 1000, lb_now_ms(), copy };
+   g_http_cache_bytes += copy.length;
+   pthread_mutex_unlock(&g_http_cache_lock);
+}
+
 static int lb_fetch_hops(const char *url, const char *method, const char *headers,
                          const unsigned char *body, size_t body_len, struct response *r,
                          char **frag);
@@ -1198,6 +1574,15 @@ static int lb_fetch_hops(const char *url, const char *method, const char *header
 static int lb_fetch(const char *url, const char *method, const char *headers,
                     const unsigned char *body, size_t body_len, struct response *r)
 {
+   int cacheable = !t_fetch_navigation && (!method || !strcmp(method, "GET")) &&
+      (!headers || !*headers) && !body_len && !strchr(url, '#') &&
+      (!strncmp(url, "https://", 8) || !strncmp(url, "http://", 7));
+   char *key = cacheable ? http_cache_key(url) : NULL;
+   if (key && atomic_load(&g_network_online) && http_cache_get(key, r)) {
+      LB_LOG("HTTP cache %s\n", url);
+      free(key);
+      return 0;
+   }
    const char *hash = strchr(url, '#');
    char *frag = hash ? lb_strdup(hash) : NULL;
    int rc = lb_fetch_hops(url, method, headers, body, body_len, r, &frag);
@@ -1209,6 +1594,8 @@ static int lb_fetch(const char *url, const char *method, const char *headers,
       r->url = buf_take(&b);
    }
    free(frag);
+   if (rc == 0 && key) http_cache_put(key, url, r);
+   free(key);
    return rc;
 }
 
@@ -1481,7 +1868,7 @@ static void cache_add(char *url, unsigned char *body, size_t len)
 /* Subresources named by the markup are fetched in parallel before parsing, so
  * a page costs the slowest request rather than the sum of all of them.
  * lb_read_resource and script loading then find them in the cache. */
-#define PF_MAX     96
+#define LB_PF_MAX  256
 #define PF_THREADS 12
 struct pf_job { char *url; struct response r; };
 struct pf_pool { struct pf_job *jobs; int n, next; };
@@ -1519,13 +1906,12 @@ static int tag_attr(const char *tag, const char *end, const char *name, char *ou
 static void page_prefetch(const char *html)
 {
    if (!strncmp(g_page.url, "file:", 5) || !strncmp(g_page.url, "about:", 6)) return;
-   struct pf_pool pool = { calloc(PF_MAX, sizeof(struct pf_job)), 0, 0 };
+   struct pf_pool pool = { calloc(LB_PF_MAX, sizeof(struct pf_job)), 0, 0 };
    if (!pool.jobs) return;
-   int images = 0;
-   for (const char *p = html; (p = strchr(p, '<')) != NULL && pool.n < PF_MAX; ) {
+   for (const char *p = html; (p = strchr(p, '<')) != NULL && pool.n < LB_PF_MAX; ) {
       if (!strncmp(p, "<!--", 4)) { const char *e = strstr(p, "-->"); if (!e) break; p = e + 3; continue; }
       int kind = !strncasecmp(p, "<link", 5) ? 1 : !strncasecmp(p, "<script", 7) ? 2 :
-                 !strncasecmp(p, "<img", 4) ? 3 : 0;
+                 0;
       if (!kind) { p++; continue; }
       const char *end = p + 1;
       for (char q = 0; *end && (q || *end != '>'); ++end)
@@ -1533,8 +1919,9 @@ static void page_prefetch(const char *html)
       char val[1024], rel[128];
       const char *attr = kind == 1 ? "href" : "src";
       int ok = tag_attr(p + 1, end, attr, val, sizeof val) && val[0];
-      if (ok && kind == 1) ok = tag_attr(p + 1, end, "rel", rel, sizeof rel) && strcasestr(rel, "stylesheet");
-      if (ok && kind == 3 && ++images > 40) ok = 0;
+      if (ok && kind == 1)       /* stylesheets, and modules the page says it will import */
+         ok = tag_attr(p + 1, end, "rel", rel, sizeof rel) &&
+              (strcasestr(rel, "stylesheet") || strcasestr(rel, "modulepreload"));
       if (ok && !strncasecmp(val, "data:", 5)) ok = 0;
       if (ok) {
          decode_html_entities(val);
@@ -1563,6 +1950,10 @@ static void page_prefetch(const char *html)
       if (j->r.body && j->r.status >= 200 && j->r.status < 300) {
          cache_add(j->url, j->r.body, j->r.length);
          j->r.body = NULL; j->url = NULL;
+      } else {
+         /* Parsing must not retry every failed preload synchronously. */
+         cache_add(j->url, NULL, 0);
+         j->url = NULL;
       }
       free(j->url);
       response_free(&j->r);
@@ -1581,10 +1972,10 @@ static void images_arrived(const char *abs)
 {
    for (int i = 0; i < elem_count; ++i) {
       if (!elements[i].has_bg_image || strcmp(elements[i].type, "img")) continue;
-      char *u = url_resolve(g_page.url, elements[i].bg_image_path);
+      char *u = url_resolve(g_page.url, luna_expand_path(elements[i].bg_image_path));
       int same = u && !strcmp(u, abs);
       free(u);
-      if (same) { LB_LOG("image arrived for element %d (%s)\n", i, elements[i].type); luna_update_element_style(i); LB_LOG("  css_w=%g css_h=%g has_w=%d has_h=%d pct_w=%d ar=%g tex=%u hasbg=%d\n", elements[i].css_width, elements[i].css_height, elements[i].has_css_width, elements[i].has_css_height, elements[i].pct_w, elements[i].aspect_ratio, (unsigned)elements[i].bg_image_tex, elements[i].has_bg_image); }
+      if (same) { LB_LOG("image arrived for element %d (%s)\n", i, elements[i].type); luna_image_arrived(i); LB_LOG("  css_w=%g css_h=%g has_w=%d has_h=%d pct_w=%d ar=%g tex=%u hasbg=%d\n", elements[i].css_width, elements[i].css_height, elements[i].has_css_width, elements[i].has_css_height, elements[i].pct_w, elements[i].aspect_ratio, (unsigned)elements[i].bg_image_tex, elements[i].has_bg_image); }
    }
 }
 
@@ -1621,6 +2012,9 @@ static unsigned char *lb_read_resource(const char *path, size_t *out_size)
       cache_add(abs, r.body, r.length);
       abs = NULL;
       r.body = NULL;
+   } else {
+      cache_add(abs, NULL, 0);
+      abs = NULL;
    }
    free(abs);
    response_free(&r);
@@ -1640,7 +2034,7 @@ void luna_app_request_redraw(void) { g_page.dirty = 1; }
 enum {
    PS_FIRST = 1, PS_LAST = 2, PS_ONLY = 4, PS_EMPTY = 8, PS_ROOT = 16,
    PS_CHECKED = 32, PS_DISABLED = 64, PS_ENABLED = 128, PS_FOCUS = 256,
-   PS_NTH = 512, PS_NTH_LAST = 1024, PS_NEVER = 2048,
+   PS_NTH = 512, PS_NTH_LAST = 1024, PS_NEVER = 2048, PS_TARGET = 4096,
 };
 
 struct sel_attr { char name[64]; char op; char val[192]; };
@@ -1779,6 +2173,7 @@ static int sel_compound(const char **pp, struct sel_simple *s)
          else if (!strcmp(name, "only-child")) s->ps |= PS_ONLY;
          else if (!strcmp(name, "empty")) s->ps |= PS_EMPTY;
          else if (!strcmp(name, "root")) s->ps |= PS_ROOT;
+         else if (!strcmp(name, "target")) s->ps |= PS_TARGET;
          else if (!strcmp(name, "checked")) s->ps |= PS_CHECKED;
          else if (!strcmp(name, "disabled")) s->ps |= PS_DISABLED;
          else if (!strcmp(name, "enabled")) s->ps |= PS_ENABLED;
@@ -1960,6 +2355,14 @@ static int sel_simple_match(const struct sel_simple *s, int i)
          int dis = luna_dom_get_attr(i, "disabled", v, sizeof v);
          if ((s->ps & PS_DISABLED) && !dis) return 0;
          if ((s->ps & PS_ENABLED) && dis) return 0;
+      }
+      if (s->ps & PS_TARGET) {
+         const char *hash = g_page.url ? strchr(g_page.url, '#') : NULL;
+         if (!hash || !hash[1] || !luna_dom_is_connected(i)) return 0;
+         char *target = percent_decode(hash + 1, strlen(hash + 1));
+         int matches = target && !strcmp(e->id, target);
+         free(target);
+         if (!matches) return 0;
       }
       if ((s->ps & PS_FOCUS) && luna_focused_element() != i) return 0;
       if (s->ps & (PS_NTH | PS_NTH_LAST)) {
@@ -2657,9 +3060,12 @@ static void js_run_jobs(void)
    }
 }
 
+static void module_prefetch(const char *root_url, const unsigned char *root_src, size_t root_len);
+
 static int js_eval(const char *code, size_t len, const char *filename, int module)
 {
    if (!g_page.ctx) return -1;
+   if (module) module_prefetch(filename, (const unsigned char *)code, len);
    js_arm();
    double t0 = lb_now_ms();
    JSValue v = JS_Eval(g_page.ctx, code, len, filename,
@@ -2680,7 +3086,7 @@ static int js_eval_url(const char *rel, int module)
    int hit = cache_find(url), ok;
    if (hit >= 0) {
       memset(&r, 0, sizeof r);
-      r.body = lb_strndup((const char *)g_page.cache[hit].data, g_page.cache[hit].len);
+      r.body = g_page.cache[hit].data ? (unsigned char *)lb_strndup((const char *)g_page.cache[hit].data, g_page.cache[hit].len) : NULL;
       r.length = g_page.cache[hit].len;
       ok = r.body != NULL;
    } else ok = lb_fetch(url, "GET", NULL, NULL, 0, &r) == 0 && r.status >= 200 && r.status < 300;
@@ -3190,6 +3596,219 @@ static void js_rejection(JSContext *ctx, JSValueConst promise, JSValueConst reas
    JS_FreeValue(ctx, stack);
 }
 
+/* ES modules: specifiers resolve against the importing module's URL or the page's
+ * import map; the source is fetched when first imported. */
+struct imap_entry { char *spec, *url; };
+static struct imap_entry *g_imap;
+static int g_nimap;
+
+static void importmap_clear(void)
+{
+   for (int i = 0; i < g_nimap; ++i) { free(g_imap[i].spec); free(g_imap[i].url); }
+   free(g_imap);
+   g_imap = NULL; g_nimap = 0;
+}
+
+/* <script type="importmap">{"imports":{"name":"url", "prefix/":"url/"}}</script> */
+static void importmap_add(const char *json)
+{
+   struct jv *root = json_parse(json);
+   const struct jv *imports = jget(root, "imports");
+   if (imports && imports->type == J_OBJ)
+      for (const struct jv *k = imports->kid; k; k = k->next) {
+         if (!k->key || k->type != J_STR) continue;
+         struct imap_entry *g = realloc(g_imap, sizeof *g * (size_t)(g_nimap + 1));
+         if (!g) break;
+         g_imap = g;
+         g_imap[g_nimap].spec = lb_strdup(k->key);
+         g_imap[g_nimap].url = url_resolve(g_page.url, k->str);
+         g_nimap++;
+      }
+   jv_free(root);
+}
+
+static char *lb_mod_normalize(JSContext *ctx, const char *base, const char *name, void *opaque)
+{
+   (void)opaque;
+   char *out = NULL;
+   if (strstr(name, "://") || name[0] == '/' || !strncmp(name, "./", 2) || !strncmp(name, "../", 3)) {
+      out = url_resolve(strstr(base, "://") ? base : g_page.url, name);
+   } else {
+      for (int i = 0; i < g_nimap && !out; ++i)
+         if (!strcmp(g_imap[i].spec, name)) out = lb_strdup(g_imap[i].url);
+      for (int i = 0; i < g_nimap && !out; ++i) {
+         size_t l = strlen(g_imap[i].spec);
+         if (l && g_imap[i].spec[l - 1] == '/' && !strncmp(name, g_imap[i].spec, l)) {
+            struct buf b = { 0 };
+            buf_puts(&b, g_imap[i].url);
+            buf_puts(&b, name + l);
+            out = buf_take(&b);
+         }
+      }
+   }
+   if (!out) out = lb_strdup(name);
+   char *r = js_strdup(ctx, out);
+   free(out);
+   return r;
+}
+
+/* A module's static imports are found in its source and fetched together, level
+ * by level, into the page cache: a graph of dozens of modules costs its depth in
+ * round trips, not its size. */
+static char **g_modscan;
+static int g_nmodscan;
+
+static int modscan_seen(const char *url)
+{
+   for (int i = 0; i < g_nmodscan; ++i) if (!strcmp(g_modscan[i], url)) return 1;
+   char **g = realloc(g_modscan, sizeof *g * (size_t)(g_nmodscan + 1));
+   if (!g) return 1;
+   g_modscan = g;
+   g_modscan[g_nmodscan++] = lb_strdup(url);
+   return 0;
+}
+
+static void modscan_clear(void)
+{
+   for (int i = 0; i < g_nmodscan; ++i) free(g_modscan[i]);
+   free(g_modscan);
+   g_modscan = NULL; g_nmodscan = 0;
+}
+
+/* The literal specifiers of `from "x"` and `import "x"` in source. */
+static void module_specs(const char *src, size_t n, const char *base, char ***out, int *count)
+{
+   for (size_t i = 0; i + 6 < n; ++i) {
+      /* Import-like text inside comments or strings is not a dependency. */
+      if (src[i] == '/' && src[i + 1] == '/') {
+         while (i < n && src[i] != '\n') i++;
+         continue;
+      }
+      if (src[i] == '/' && src[i + 1] == '*') {
+         i += 2;
+         while (i + 1 < n && !(src[i] == '*' && src[i + 1] == '/')) i++;
+         i++;
+         continue;
+      }
+      if (src[i] == '\'' || src[i] == '"' || src[i] == '`') {
+         char quote = src[i++];
+         while (i < n && src[i] != quote) { if (src[i] == '\\' && i + 1 < n) i++; i++; }
+         continue;
+      }
+      size_t k;
+      if (!strncmp(src + i, "from", 4) && (i == 0 || !isalnum((unsigned char)src[i - 1]))) k = i + 4;
+      else if (!strncmp(src + i, "import", 6) && (i == 0 || !isalnum((unsigned char)src[i - 1]))) k = i + 6;
+      else continue;
+      while (k < n && isspace((unsigned char)src[k])) k++;
+      if (k >= n || (src[k] != '"' && src[k] != '\'')) continue;
+      char q = src[k++];
+      size_t e = k;
+      while (e < n && src[e] != q && src[e] != '\n' && e - k < 1000) e++;
+      if (e >= n || src[e] != q || e == k) continue;
+      char *spec = lb_strndup(src + k, e - k);
+      char *abs = spec ? lb_mod_normalize(g_page.ctx, base, spec, NULL) : NULL;
+      free(spec);
+      if (!abs) continue;
+      if (strstr(abs, "://")) {
+         char **g = realloc(*out, sizeof **out * (size_t)(*count + 1));
+         if (g) { *out = g; (*out)[(*count)++] = lb_strdup(abs); }
+      }
+      js_free(g_page.ctx, abs);
+      i = e;
+   }
+}
+
+static void module_prefetch(const char *root_url, const unsigned char *root_src, size_t root_len)
+{
+   char **queue = NULL;
+   int nq = 0;
+   if (modscan_seen(root_url)) return;
+   module_specs((const char *)root_src, root_len, root_url, &queue, &nq);
+   LB_LOG("module imports of %s: %d\n", root_url, nq);
+   while (nq > 0) {
+      struct pf_job *jobs = calloc((size_t)nq, sizeof *jobs);
+      if (!jobs) {
+         for (int i = 0; i < nq; ++i) free(queue[i]);
+         free(queue);
+         return;  /* the module loader can still fetch imports on demand */
+      }
+      int nj = 0;
+      for (int i = 0; i < nq; ++i) {
+         if (cache_find(queue[i]) >= 0) { /* known: still walk its imports below */ }
+         else {
+            int duplicate = 0;
+            for (int j = 0; j < nj; ++j) if (!strcmp(jobs[j].url, queue[i])) { duplicate = 1; break; }
+            if (!duplicate) { jobs[nj].url = lb_strdup(queue[i]); if (jobs[nj].url) nj++; }
+         }
+      }
+      /* A slow import must not stop the next batch of otherwise ready work.
+       * Refill each worker from the queue as soon as its request finishes. */
+      struct pf_pool pool = { jobs, nj, 0 };
+      pthread_t th[PF_THREADS];
+      int started = 0;
+      for (int i = 1; i < nj && i < PF_THREADS; ++i)
+         if (pthread_create(&th[started], NULL, pf_worker, &pool) == 0) started++;
+      pf_worker(&pool);
+      for (int i = 0; i < started; ++i) pthread_join(th[i], NULL);
+      for (int i = 0; i < nj; ++i) {
+         if (jobs[i].r.body && jobs[i].r.status >= 200 && jobs[i].r.status < 300) {
+            cache_add(jobs[i].url, jobs[i].r.body, jobs[i].r.length);
+            jobs[i].url = NULL; jobs[i].r.body = NULL;
+         } else {
+            cache_add(jobs[i].url, NULL, 0);
+            jobs[i].url = NULL;
+         }
+         free(jobs[i].url);
+         response_free(&jobs[i].r);
+      }
+      free(jobs);
+      char **next = NULL;
+      int nn = 0;
+      for (int i = 0; i < nq; ++i) {
+         int hit = modscan_seen(queue[i]) ? -1 : cache_find(queue[i]);
+         if (hit >= 0 && g_page.cache[hit].data)
+            module_specs((const char *)g_page.cache[hit].data, g_page.cache[hit].len, queue[i], &next, &nn);
+         free(queue[i]);
+      }
+      free(queue);
+      queue = next; nq = nn;
+   }
+   free(queue);
+}
+
+static JSModuleDef *lb_mod_load(JSContext *ctx, const char *name, void *opaque)
+{
+   (void)opaque;
+   if (!strstr(name, "://")) {
+      JS_ThrowReferenceError(ctx, "cannot resolve module '%s'", name);
+      return NULL;
+   }
+   struct response r;
+   int hit = cache_find(name), ok;
+   if (hit >= 0) {
+      memset(&r, 0, sizeof r);
+      r.body = g_page.cache[hit].data ? (unsigned char *)lb_strndup((const char *)g_page.cache[hit].data, g_page.cache[hit].len) : NULL;
+      r.length = g_page.cache[hit].len;
+      ok = r.body != NULL;
+   } else ok = lb_fetch(name, "GET", NULL, NULL, 0, &r) == 0 && r.status >= 200 && r.status < 300;
+   LB_LOG("module %s -> %d\n", name, r.status);
+   JSModuleDef *m = NULL;
+   if (ok) module_prefetch(name, r.body, r.length);
+   if (!ok) JS_ThrowReferenceError(ctx, "could not load module '%s' (%d %s)", name, r.status, r.error ? r.error : "");
+   else {
+      JSValue f = JS_Eval(ctx, (const char *)r.body, r.length, name, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+      if (!JS_IsException(f)) {
+         m = JS_VALUE_GET_PTR(f);
+         JSValue meta = JS_GetImportMeta(ctx, m);
+         JS_DefinePropertyValueStr(ctx, meta, "url", JS_NewString(ctx, name), JS_PROP_C_W_E);
+         JS_FreeValue(ctx, meta);
+      }
+      JS_FreeValue(ctx, f);
+   }
+   response_free(&r);
+   return m;
+}
+
 static int js_open(void)
 {
    js_close();
@@ -3197,6 +3816,9 @@ static int js_open(void)
    if (!g_page.rt) return -1;
    JS_SetMaxStackSize(g_page.rt, 4u << 20);
    JS_SetInterruptHandler(g_page.rt, js_interrupt, NULL);
+   JS_SetModuleLoaderFunc(g_page.rt, lb_mod_normalize, lb_mod_load, NULL);
+   importmap_clear();
+   modscan_clear();
    JS_SetHostPromiseRejectionTracker(g_page.rt, js_rejection, NULL);
    g_page.ctx = JS_NewContext(g_page.rt);
    if (!g_page.ctx) return -1;
@@ -3278,6 +3900,12 @@ static int scan_scripts(const char *html, struct script_tag **out)
          src[k] = 0;
       }
       free(attrs);
+      if (!strcasecmp(type, "importmap")) {            /* before any module runs */
+         char *map = lb_strndup(gt + 1, (size_t)(end - gt - 1));
+         if (map) { importmap_add(map); free(map); }
+         p = close ? close + 8 : end;
+         continue;
+      }
       int js = !type[0] || !strcasecmp(type, "text/javascript") ||
                !strcasecmp(type, "application/javascript") || !strcasecmp(type, "module") ||
                !strcasecmp(type, "text/ecmascript") || !strcasecmp(type, "application/x-javascript");
@@ -3333,6 +3961,7 @@ static void page_teardown(void)
 }
 
 static double page_pump(void);
+static int g_page_loading;
 
 static void ready_state(int stage)
 {
@@ -3343,7 +3972,11 @@ static void ready_state(int stage)
 
 static void page_load_html(const char *html, const char *url)
 {
+   double stage = lb_now_ms(), total = stage;
+   g_page_loading++;
    page_teardown();
+   free(g_page.nav_url);
+   g_page.nav_url = NULL;
    free(g_page.url);
    g_page.url = lb_strdup(url && url[0] ? url : "about:blank");
    /* luna-ui joins relative references onto this base; lb_read_resource then
@@ -3359,6 +3992,7 @@ static void page_load_html(const char *html, const char *url)
    } else luna_set_html_base_dir(g_page.url);
    snprintf(luna_doc_title, sizeof luna_doc_title, "%s", "");
    page_prefetch(html);
+   LB_LOG("load prefetch %.0fms\n", lb_now_ms() - stage); stage = lb_now_ms();
    js_open();
    luna_parse_css(lb_ua_css);
    for (int i = 0; i < g_page.nboot; ++i) js_eval(g_page.boot_scripts[i], strlen(g_page.boot_scripts[i]), "boot", 0);
@@ -3371,6 +4005,7 @@ static void page_load_html(const char *html, const char *url)
       luna_parse_html(wrapped.p ? wrapped.p : "<body></body>");
       free(wrapped.p);
    } else luna_parse_html(html);
+   LB_LOG("load parse %.0fms (%d elements, %d rules)\n", lb_now_ms() - stage, elem_count, rule_count); stage = lb_now_ms();
    luna_inject_body_background();
    luna_resize((float)g_page.w, (float)g_page.h);
    struct script_tag *scripts = NULL;
@@ -3390,6 +4025,7 @@ static void page_load_html(const char *html, const char *url)
    JS_FreeValue(g_page.ctx, no_script);
    free(scripts);
    ready_state(1);
+   LB_LOG("load scripts %.0fms\n", lb_now_ms() - stage); stage = lb_now_ms();
    page_emit("Page.domContentEventFired", NULL);
    /* A browser paints a frame (animation callbacks, zero-delay timers) before the
     * load event, which waits for subresources.  Scripts such as Bing's bot check
@@ -3401,6 +4037,8 @@ static void page_load_html(const char *html, const char *url)
    }
    ready_state(2);
    g_page.dirty = 1;
+   g_page_loading--;
+   LB_LOG("load events %.0fms, total %.0fms\n", lb_now_ms() - stage, lb_now_ms() - total);
 }
 
 static int page_navigate(const char *url)
@@ -3521,6 +4159,9 @@ static int cdp_mods(int m)
 }
 
 /* action: 1 down, 0 up, -1 move. */
+static int g_page_cursor;
+static void page_set_cursor(int type) { g_page_cursor = type; }
+
 static void page_pointer(double x, double y, int action, int touch, int button, int mods)
 {
    luna_mouse_move(x, y);
@@ -3545,6 +4186,17 @@ static void page_pointer(double x, double y, int action, int touch, int button, 
             free(last);
             last = href;
          } else free(href);
+      }
+      /* The cursor the page under the pointer asks for.  Sent while it is not the
+       * arrow too: the window's own hover handling resets it on re-entry. */
+      {
+         static int sent;
+         if (g_page_cursor != sent || g_page_cursor) {
+            char c[40];
+            snprintf(c, sizeof c, "{\"type\":%d}", g_page_cursor);
+            cdp_emit("Lunaria.cursor", c);
+            sent = g_page_cursor;
+         }
       }
       g_page.dirty = 1;
       return;
@@ -3655,7 +4307,7 @@ static void cdp_navigate_now(const char *url);
 
 static double page_pump(void)
 {
-   if (g_page.nav_url) {             /* the page's own navigation (a link, location) */
+   if (!g_page_loading && g_page.nav_url) {             /* the page's own navigation (a link, location) */
       char *u = g_page.nav_url;
       g_page.nav_url = NULL;
       cdp_navigate_now(u);
@@ -4400,6 +5052,7 @@ static int headless_init(void)
    LunaInitConfig cfg = { (float)g_page.w, (float)g_page.h, gl_proc, 1 };
    if (!luna_init(&cfg)) { fprintf(stderr, "luna-browser: luna_init failed\n"); return -1; }
    luna_set_url_resolver(lb_resolve_href);
+   g_luna_platform.set_cursor = page_set_cursor;
    luna_set_mouse_press_hook(hook_press);
    luna_set_mouse_release_hook(hook_release);
    luna_set_web_compat(1);
@@ -4464,8 +5117,7 @@ static const char ui_html[] =
    "<div id=\"spin\"></div>"
    "<button id=\"pc\" title=\"Request desktop site\">PC</button>"
    "</div><div id=\"view\"></div>"
-   "<div id=\"cat\"><div class=\"cf on\" id=\"cf0\"></div><div class=\"cf\" id=\"cf1\"></div>"
-   "<div class=\"cf\" id=\"cf2\"></div><div class=\"cf\" id=\"cf3\"></div>"
+   "<div id=\"cat\"><div class=\"cf\" id=\"cf\"></div>"
    "<div id=\"cattext\">Loading as hard as I can...</div></div>"
    "<div id=\"findbox\"><input id=\"find\" type=\"text\" placeholder=\"Find in page\"><span id=\"fcnt\"></span></div>"
    "<div id=\"ctx\"></div><div id=\"status\"></div></body>";
@@ -4501,14 +5153,11 @@ static const char ui_css[] =
    "#bar #pc.on{background:#d2e3fc;color:#174ea6;}"
    "#view{position:fixed;left:0;top:78px;right:0;bottom:0;background-size:100% 100%;"
    "background-repeat:no-repeat;}"
-   "#cat{position:fixed;left:50%;top:50%;width:128px;height:128px;margin:-64px 0 0 -64px;display:none;}"
+   "#cat{position:fixed;left:50%;top:50%;width:128px;height:128px;margin:-25px 0 0 -64px;display:none;}"
    "#cat.on{display:block;}"
    "#cattext{position:absolute;left:-86px;top:134px;width:300px;text-align:center;font-size:15px;color:#5f6368;}"
-   ".cf{position:absolute;left:0;top:0;width:128px;height:128px;display:none;background-image:url(lb-cat);"
-   "background-repeat:no-repeat;background-size:512px 128px;}"
-   ".cf.on{display:block;}"
-   "#cf0{background-position:0px 0px;}#cf1{background-position:-128px 0px;}"
-   "#cf2{background-position:-256px 0px;}#cf3{background-position:-384px 0px;}"
+   ".cf{position:absolute;left:0;top:0;width:128px;height:128px;background-image:url(lb-cat);"
+   "background-repeat:no-repeat;background-size:512px 128px;background-position:0px 0px;}"
    "#ctx{position:fixed;left:0;top:0;display:none;min-width:210px;padding:4px 0;background:#ffffff;"
    "border:1px solid #dadce0;border-radius:6px;}"
    "#ctx.on{display:block;}"
@@ -4541,7 +5190,7 @@ struct ui_tab {
    char **hist;                      /* back/forward list and where we are */
    int nhist, cur, going;            /* going: index a back/forward is loading */
    int sent_w, sent_h;
-   int loading, desktop;             /* desktop: asked for the PC version of sites */
+   int loading, committed, desktop;             /* desktop: asked for the PC version of sites */
    char hover[1024];
    char title[256];
    char *start;                      /* loaded when the page process attaches */
@@ -4653,6 +5302,104 @@ static void ui_buttons(void)
    if (f >= 0) { if (g_ui.t->cur + 1 < g_ui.t->nhist) luna_remove_class(f, "off"); else luna_add_class(f, "off"); }
 }
 
+/* The page a new tab shows: a search box and the sites people go to most. */
+#define UI_HOME_PREFIX "data:text/html;charset=utf-8,"
+static const char ui_home_html[] =
+   "<!doctype html><html><head><meta charset=\"utf-8\"><title>New tab</title><style>\n"
+   "html,body{margin:0;height:100%;overflow:hidden;}\n"
+   "body{font-family:sans-serif;color:#eef3ff;text-align:center;background:linear-gradient(180deg,#070b1f 0%,#14224a 55%,#2b3f72 100%);}\n"
+   "#snow{position:absolute;left:0;top:0;right:0;bottom:0;overflow:hidden;}\n"
+   ".f{position:absolute;left:0;top:0;background:#fff;border-radius:50%;}\n"
+   "#hill{position:absolute;left:0;right:0;bottom:0;height:56px;background:linear-gradient(180deg,#2b3f72,#aebfe8 60%,#f2f6ff);}\n"
+   "#main{position:relative;z-index:2;width:100%;}\n"
+   "#time{margin:64px 0 0;font-size:84px;font-weight:200;letter-spacing:4px;}\n"
+   "#date{margin:2px 0 26px;font-size:17px;color:#aab8e0;}\n"
+   "form{margin:0 auto 30px;width:560px;max-width:90%;}\n"
+   "input{box-sizing:border-box;width:100%;height:48px;padding:0 22px;font-size:17px;color:#fff;\n"
+   "border:1px solid #5a6fa8;border-radius:24px;background:#1c2a55;text-align:center;}\n"
+   ".g{margin:0 auto;width:640px;max-width:94%;}\n"
+   ".g a{display:inline-block;box-sizing:border-box;width:140px;margin:7px;padding:16px 6px 12px;\n"
+   "background:#1c2a55;border:1px solid #34478a;border-radius:12px;text-decoration:none;color:#e6ecff;font-size:14px;}\n"
+   ".g b{display:block;margin:0 auto 8px;width:40px;height:40px;line-height:40px;border-radius:20px;color:#fff;font-size:20px;}\n"
+   "</style></head><body><div id=\"snow\"></div><div id=\"hill\"></div>\n"
+   "<div id=\"main\"><div id=\"time\"></div><div id=\"date\"></div>\n"
+   "<form action=\"https://www.bing.com/search\" method=\"get\"><input name=\"q\" type=\"text\" placeholder=\"Search or type a URL\"></form>\n"
+   "<div class=\"g\">\n"
+   "<a href=\"https://www.bing.com/\"><b style=\"background:#0078d4\">B</b>Bing</a>\n"
+   "<a href=\"https://www.yahoo.co.jp/\"><b style=\"background:#ff0033\">Y</b>Yahoo! JAPAN</a>\n"
+   "<a href=\"https://www.google.com/\"><b style=\"background:#4285f4\">G</b>Google</a>\n"
+   "<a href=\"https://en.wikipedia.org/\"><b style=\"background:#636466\">W</b>Wikipedia</a>\n"
+   "<a href=\"https://news.ycombinator.com/\"><b style=\"background:#ff6600\">H</b>Hacker News</a>\n"
+   "<a href=\"https://github.com/\"><b style=\"background:#24292f\">G</b>GitHub</a>\n"
+   "</div></div>\n"
+   "<script>\n"
+   "(function(){\n"
+   "var s=document.getElementById('snow'),r=7,F=[],W=window.innerWidth||1000,H=window.innerHeight||640;\n"
+   "function rnd(){r=(r*1103515245+12345)&0x7fffffff;return r/0x7fffffff;}\n"
+   "for(var i=0;i<50;i++){\n"
+   " var d=document.createElement('div'),z=2+Math.floor(rnd()*5);\n"
+   " d.className='f';\n"
+   " d.style.cssText='width:'+z+'px;height:'+z+'px;opacity:'+(0.45+rnd()*0.5).toFixed(2);\n"
+   " s.appendChild(d);\n"
+   " F.push({e:d,x:rnd()*W,y:rnd()*H,v:20+z*9+rnd()*20,a:6+rnd()*14,p:rnd()*6.28,w:0.5+rnd()});\n"
+   "}\n"
+   "var last=0;\n"
+   "function frame(t){\n"
+   " var dt=last?Math.min((t-last)/1000,0.1):0;last=t;\n"
+   " W=window.innerWidth||W;H=window.innerHeight||H;\n"
+   " for(var i=0;i<F.length;i++){var f=F[i];\n"
+   "  f.y+=f.v*dt;f.p+=f.w*dt;\n"
+   "  if(f.y>H+10){f.y=-10;f.x=rnd()*W;}\n"
+   "  f.e.style.transform='translate('+(f.x+Math.sin(f.p)*f.a).toFixed(1)+'px,'+f.y.toFixed(1)+'px)';\n"
+   " }\n"
+   " requestAnimationFrame(frame);\n"
+   "}\n"
+   "requestAnimationFrame(frame);\n"
+   "var D=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'],M=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];\n"
+   "function tick(){var n=new Date(),p=function(v){return(v<10?'0':'')+v;};\n"
+   " document.getElementById('time').textContent=p(n.getHours())+':'+p(n.getMinutes());\n"
+   " document.getElementById('date').textContent=D[n.getDay()]+', '+M[n.getMonth()]+' '+n.getDate();}\n"
+   "tick();setInterval(tick,10000);\n"
+   "})();\n"
+   "</script></body></html>\n";
+
+static char *ui_home_url(void)
+{
+   struct buf b = { 0 };
+   buf_puts(&b, UI_HOME_PREFIX);
+   for (const unsigned char *p = (const unsigned char *)ui_home_html; *p; ++p) {
+      if (isalnum(*p) || strchr("-_.~", *p)) buf_put(&b, (const char *)p, 1);
+      else buf_printf(&b, "%%%02X", *p);
+   }
+   return buf_take(&b);
+}
+
+/* A search for text, on the engine in LUNA_BROWSER_SEARCH (a URL ending in the
+ * query parameter) or Bing. */
+static char *ui_search_url(const char *t)
+{
+   const char *engine = getenv("LUNA_BROWSER_SEARCH");
+   struct buf b = { 0 };
+   buf_puts(&b, engine && strstr(engine, "://") ? engine : "https://www.bing.com/search?q=");
+   for (const unsigned char *p = (const unsigned char *)t; *p; ++p) {
+      if (isalnum(*p) || strchr("-_.~", *p)) buf_put(&b, (const char *)p, 1);
+      else buf_printf(&b, *p == ' ' ? "+" : "%%%02X", *p);
+   }
+   return buf_take(&b);
+}
+
+/* A host that is this machine or a bare address: plain http, not https. */
+static int ui_is_local_host(const char *t)
+{
+   size_t n = strcspn(t, "/:?#");
+   if (n >= 9 && !strncmp(t, "localhost", 9)) return 1;
+   int dots = 0, digits = 1;
+   for (size_t i = 0; i < n; ++i) {
+      if (t[i] == '.') ++dots; else if (!isdigit((unsigned char)t[i])) digits = 0;
+   }
+   return digits && dots == 3;
+}
+
 /* What was typed: a URL, a file, or else a search. */
 static char *ui_typed_url(const char *t)
 {
@@ -4660,18 +5407,13 @@ static char *ui_typed_url(const char *t)
    if (!*t) return NULL;
    if (strstr(t, "://") || !strncmp(t, "about:", 6) || !strncmp(t, "data:", 5)) return lb_strdup(t);
    if (t[0] == '/' || t[0] == '.' || t[0] == '~') return arg_url(t);
-   struct buf b = { 0 };
-   if (!strchr(t, ' ') && (strchr(t, '.') || !strncmp(t, "localhost", 9))) {
-      buf_puts(&b, "https://");
+   if (!strncmp(t, "www.", 4) || (!strchr(t, ' ') && (strchr(t, '.') || ui_is_local_host(t)))) {
+      struct buf b = { 0 };
+      buf_puts(&b, ui_is_local_host(t) ? "http://" : "https://");
       buf_puts(&b, t);
-   } else {
-      buf_puts(&b, "https://duckduckgo.com/html/?q=");
-      for (const unsigned char *p = (const unsigned char *)t; *p; ++p) {
-         if (isalnum(*p) || strchr("-_.~", *p)) buf_put(&b, (const char *)p, 1);
-         else buf_printf(&b, *p == ' ' ? "+" : "%%%02X", *p);
-      }
+      return buf_take(&b);
    }
-   return buf_take(&b);
+   return ui_search_url(t);
 }
 
 static void ui_navigate(const char *url)
@@ -4683,7 +5425,7 @@ static void ui_navigate(const char *url)
    buf_puts(&b, "}");
    ui_send("Page.navigate", b.p, 1);
    free(b.p);
-   g_ui.t->loading = 1;
+   g_ui.t->loading = 1; g_ui.t->committed = 0;
    ui_status("Loading\xe2\x80\xa6");
 }
 
@@ -4697,13 +5439,15 @@ static void ui_go(int delta)
 
 static void ui_on_back(LunaElement *e) { (void)e; ui_go(-1); }
 static void ui_on_fwd(LunaElement *e) { (void)e; ui_go(1); }
-static void ui_on_reload(LunaElement *e) { (void)e; ui_send("Page.reload", NULL, 1); g_ui.t->loading = 1; ui_status("Loading\xe2\x80\xa6"); }
+static void ui_on_reload(LunaElement *e) { (void)e; ui_send("Page.reload", NULL, 1); g_ui.t->loading = 1; g_ui.t->committed = 0; ui_status("Loading\xe2\x80\xa6"); }
 
 /* A page committed: the address bar, the history, then its title. */
 static void ui_committed(const char *url)
 {
    int u = ui_el("url");
-   if (ui_is_active() && u >= 0 && luna_focused_element() != u) luna_set_value(u, url);
+   g_ui.t->committed = 1;
+   if (ui_is_active() && u >= 0 && luna_focused_element() != u)
+      luna_set_value(u, strncmp(url, UI_HOME_PREFIX, sizeof UI_HOME_PREFIX - 1) ? url : "");
    if (g_ui.t->going >= 0) {
       g_ui.t->cur = g_ui.t->going;
       g_ui.t->going = -1;
@@ -4745,6 +5489,12 @@ static void ui_message(const char *text)
    } else if (method && !strcmp(method, "Lunaria.clipboard")) {
       const char *text = jstr(params, "text");
       if (text) luna_clipboard_set(text);
+   } else if (method && !strcmp(method, "Page.frameStartedLoading")) {
+      g_ui.t->loading = 1;
+      g_ui.t->committed = 0;
+      if (ui_is_active()) ui_status("Loading\xe2\x80\xa6");
+   } else if (method && !strcmp(method, "Lunaria.cursor")) {
+      if (ui_is_active() && g_luna_platform.set_cursor) g_luna_platform.set_cursor((int)jnum(params, "type", 0));
    } else if (method && !strcmp(method, "Page.frameNavigated")) {
       const char *url = jstr(jget(params, "frame"), "url");
       if (url) ui_committed(url);
@@ -4785,7 +5535,13 @@ static void ui_message(const char *text)
       ui_send("Page.enable", NULL, 1);
       ui_send("Runtime.enable", NULL, 1);
       ui_send("Page.startScreencast", "{\"format\":\"jpeg\",\"quality\":80}", 1);
-      if (g_ui.t->start) { ui_navigate(g_ui.t->start); free(g_ui.t->start); g_ui.t->start = NULL; }
+      if (g_ui.t->start) {
+         char *home = strcmp(g_ui.t->start, "about:blank") ? NULL : ui_home_url();
+         ui_navigate(home ? home : g_ui.t->start);
+         free(home);
+         free(g_ui.t->start);
+         g_ui.t->start = NULL;
+      }
    }
    jv_free(m);
 }
@@ -5061,7 +5817,7 @@ static void ui_toggle_desktop(void)
    ui_send("Emulation.setUserAgentOverride", b.p, 1);
    free(b.p);
    ui_send("Page.reload", NULL, 1);
-   t->loading = 1;
+   t->loading = 1; t->committed = 0;
    ui_status("Loading\xe2\x80\xa6");
    ui_buttons();
 }
@@ -5135,24 +5891,24 @@ static void ui_wheel_pump(void);
 /* The cat runs on the white page while the active tab loads. */
 static void ui_cat(void)
 {
-   int want = g_ntabs && g_tabs[g_active]->loading;
-   int frame = want ? (int)(lb_now_ms() / 110.0) & 3 : 0;
+   int busy = g_ntabs && g_tabs[g_active]->loading;
+   int want = busy && !g_tabs[g_active]->committed;
    int cat = ui_el("cat");
    if (cat < 0) return;
    if (want != g_ui.cat_on) {
       g_ui.cat_on = want;
       if (want) luna_add_class(cat, "on"); else luna_remove_class(cat, "on");
-      g_ui.cat_frame = -1;
    }
-   if (want && frame != g_ui.cat_frame) {
-      char id[8];
-      for (int i = 0; i < 4; ++i) {
-         snprintf(id, sizeof id, "cf%d", i);
-         if (i == frame) luna_add_class(ui_el(id), "on"); else luna_remove_class(ui_el(id), "on");
+   if (want) {                                      /* the next picture of the cat, one change of one box */
+      int frame = (int)(lb_now_ms() / 110.0) & 3;
+      if (frame != g_ui.cat_frame) {
+         char st[48];
+         snprintf(st, sizeof st, "background-position:-%dpx 0px", frame * 128);
+         luna_dom_set_attr(ui_el("cf"), "style", st);
+         g_ui.cat_frame = frame;
       }
-      g_ui.cat_frame = frame;
-      luna_app_request_redraw();
-   }
+   } else g_ui.cat_frame = -1;
+   if (busy) luna_app_request_redraw();            /* the spinners turn smoothly */
 }
 
 static void ui_init(void *user)
@@ -5354,14 +6110,9 @@ static void ui_menu_do(int i)
    case MC_LINK_COPY: case MC_IMG_COPY: case MC_SEL_COPY: if (arg) luna_clipboard_set(arg); break;
    case MC_SEL_SEARCH:
       if (arg) {
-         struct buf b = { 0 };
-         buf_puts(&b, "https://duckduckgo.com/html/?q=");
-         for (const unsigned char *p = (const unsigned char *)arg; *p; ++p) {
-            if (isalnum(*p) || strchr("-_.~", *p)) buf_put(&b, (const char *)p, 1);
-            else buf_printf(&b, *p == ' ' ? "+" : "%%%02X", *p);
-         }
-         ui_tab_open(b.p);
-         free(b.p);
+         char *u = ui_search_url(arg);
+         ui_tab_open(u);
+         free(u);
       }
       break;
    case MC_CUT: ui_key_chord("x", 88); break;
@@ -5734,6 +6485,13 @@ int main(int argc, char **argv)
    }
    if (shot) {
       size_t len = 0;
+      /* Background pictures are only asked for when first painted: paint once,
+       * wait for them, then take the picture. */
+      for (int pass = 0; pass < 5; ++pass) {      /* a paint can start more pictures: until none are left */
+         page_render();
+         if (g_jobs_out == 0) break;
+         settle(1500);
+      }
       unsigned char *png = page_capture(&len, 0);
       FILE *f = png ? fopen(shot, "wb") : NULL;
       if (f && fwrite(png, 1, len, f) == len) fprintf(stderr, "luna-browser: wrote %s (%dx%d)\n", shot, g_page.w, g_page.h);

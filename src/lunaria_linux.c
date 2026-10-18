@@ -41,7 +41,15 @@
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 #define GLFW_EXPOSE_NATIVE_X11
+#define GLFW_EXPOSE_NATIVE_WAYLAND
 #include <GLFW/glfw3native.h>
+/* Optional: Wayland window icon via the Luna compositor (lives in ../luna-shell/ui).
+ * Absent in standalone checkouts / cross builds; glfwSetWindowIcon is used then. */
+#if defined(__has_include) && __has_include("luna-wm-client.h")
+#define LUNA_WM_CLIENT_IMPLEMENTATION
+#include "luna-wm-client.h"
+#define HAVE_LUNA_WM_CLIENT 1
+#endif
 
 /* ---- virtual memory ---------------------------------------------------- */
 
@@ -564,6 +572,17 @@ int luna_os_set_window_icon(void *glfw_window, int w, int h,
                             const unsigned char *rgba)
 {
    if (!glfw_window || w <= 0 || h <= 0 || !rgba) return -1;
+   /* GLFW 3.4 has no Wayland icon support: ask the Luna compositor directly. */
+#ifdef HAVE_LUNA_WM_CLIENT
+   if (luna_wayland_backend()) {
+      static int bound;
+      if (!bound) {
+         luna_wm_client_init((GLFWwindow *)glfw_window);
+         bound = 1;
+      }
+      if (luna_wm_client_set_icon((GLFWwindow *)glfw_window, w, h, rgba)) return 0;
+   }
+#endif
    GLFWimage image = { w, h, (unsigned char *)rgba };
    glfwSetWindowIcon((GLFWwindow *)glfw_window, 1, &image);
    return 0;

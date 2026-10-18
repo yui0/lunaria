@@ -72,6 +72,42 @@ node.parentNode.removeChild(node);
         browser.call('Page.navigate', {'url': written.as_uri()})
         assert browser.eval("document.getElementById('writer').nextSibling.textContent") == 'Leading text'
         assert browser.eval("document.getElementById('box').textContent.includes('Leading text')") is True
+        assert browser.eval("""new Promise(resolve => {
+          const order = [];
+          setTimeout(() => { const end = performance.now() + 20; while (performance.now() < end) {} order.push('slow'); }, 0);
+          setTimeout(() => order.push('next'), 0);
+          requestAnimationFrame(() => order.push('paint'));
+          setTimeout(() => resolve(order), 80);
+        })""") == ['slow', 'paint', 'next'], 'timers must yield to rendering'
+        assert browser.eval("""(() => {
+          let built = 0, attached = 0;
+          class NavigationFrame extends HTMLElement {
+            constructor() { super(); built++; this.delegate = { ready: true }; }
+            connectedCallback() { attached++; }
+          }
+          customElements.define('navigation-frame', NavigationFrame);
+          const a = document.createElement('navigation-frame');
+          const b = new NavigationFrame();
+          if (built !== 2 || attached || !a.delegate.ready || !b.delegate.ready) return false;
+          document.body.appendChild(a);
+          return built === 2 && attached === 1 && a instanceof NavigationFrame;
+        })()""") is True, 'custom element constructors must run before insertion'
+        assert browser.eval("""(() => {
+          const style = document.createElement('style');
+          style.setAttribute('data-query-check', 'yes');
+          style.textContent = 'body{color:rgb(10,20,30)}';
+          document.head.appendChild(style);
+          const found = document.querySelectorAll('style[data-query-check="yes"]');
+          style.remove();
+          return found.length === 1 && found[0] === style;
+        })()""") is True, 'native head queries must retain virtual style nodes'
+        assert browser.eval("""(() => {
+          history.replaceState(null, '', '#n%65xt');
+          const target = document.querySelector(':target');
+          const ok = target && target.id === 'next' && document.querySelectorAll(':target').length === 1;
+          history.replaceState(null, '', '#missing');
+          return ok && document.querySelector(':target') === null;
+        })()""") is True, 'fragment targets must accept percent-encoded IDs'
         print('script DOM: PASS')
     finally:
         browser.close()

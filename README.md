@@ -693,7 +693,7 @@ Tick values accept `K`, `M`, and `G` suffixes—for example, `LUNARIA_ONLOAD_TIC
 | `src/arm.c` / `src/arm.h` | shared ARM execution lock and multi-engine helpers |
 | `src/dvm/` | Dalvik bytecode interpreter for the APK’s original `classes*.dex` |
 | `src/loader.c` | runtime entry point: Application, providers, launcher Activity, and the frame pump |
-| `src/dvm/audio_track.c` | Java `AudioTrack` queues shared with the output mixer |
+| `src/dvm/dvm_media.c` | Java `AudioTrack` queues shared with the output mixer |
 | `src/dvm/apk_signers.c` | APK signing-block parsing behind `PackageInfo` signatures |
 | `src/linker/` | Android ELF linker adapted for the host |
 | `src/jvm/` | lightweight JVM/JNI object model and stubs |
@@ -785,3 +785,15 @@ Distribution builds use `-O3`, `-DNDEBUG`, and LTO. Dynarmic is rebuilt separate
 Licensed under the [Mozilla Public License 2.0](LICENSE).
 
 Project Lunaria © 2026 Yuichiro Nakada.
+
+Android framework theme inheritance uses the actual SDK Platform 31 resources:
+
+```sh
+curl -fL https://dl.google.com/android/repository/platform-31_r01.zip -o /tmp/platform-31_r01.zip
+python3 scripts/install-framework.py /tmp/platform-31_r01.zip
+```
+
+The installer verifies Google's SHA-1 and copies the resources and notices from
+`android.jar` unchanged into `runtime/framework-res/`. Application APKs are not
+modified. Set `LUNARIA_FRAMEWORK_RES` to use another directory containing
+`resources.arsc` and `res/`. The default directory is relative to the executable.

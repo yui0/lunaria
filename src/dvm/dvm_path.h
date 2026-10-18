@@ -25,6 +25,16 @@ bool luna_path_round_rect(luna_path *path,const float rect[4],const float radii[
 bool luna_path_parse(luna_path *path,const char *data);
 bool luna_path_trim(luna_path *out,const luna_path *path,float start,float end,float offset);
 void luna_path_bounds(const luna_path *path,float bounds[4]);
+typedef struct luna_path_measure luna_path_measure;
+luna_path_measure *luna_path_measure_new(void);
+void luna_path_measure_free(void *measure);
+bool luna_path_measure_set(luna_path_measure *measure,const luna_path *path,bool force_closed);
+float luna_path_measure_length(const luna_path_measure *measure);
+bool luna_path_measure_closed(const luna_path_measure *measure);
+/* next/segment return -1 for allocation failure, 0 for no result, 1 for success. */
+int luna_path_measure_next(luna_path_measure *measure);
+bool luna_path_measure_sample(const luna_path_measure *measure,float distance,float pos[2],float tangent[2]);
+int luna_path_measure_segment(const luna_path_measure *measure,float start,float stop,luna_path *dst,bool move);
 /* Fraction/x/y triples, owned by caller. Moves retain the same fraction. */
 float *luna_path_approximate(const luna_path *path,float error,size_t *count);
 /* RGBA mask, with top-left origin; free() by caller. Matrix is row-major. */

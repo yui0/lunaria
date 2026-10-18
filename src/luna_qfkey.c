@@ -222,8 +222,7 @@ static const char *sock_path(char *buf, size_t n)
 {
    const char *e = getenv("LUNARIA_QFKEY");
    if (e && e[0] == '/') return e;
-   const char *rt = getenv("XDG_RUNTIME_DIR");
-   if (rt && rt[0]) { snprintf(buf, n, "%s/qfkey-lunaria.sock", rt); return buf; }
+   (void)buf; (void)n;
    return "/tmp/qfkey-lunaria.sock";
 }
 
@@ -311,14 +310,26 @@ static void send_hello(void)
    send_msg(M_HELLO, b, (uint16_t)o);
 }
 
-/* Input arrives on the connector thread, but the emulator's input queues are
- * only touched from its pump thread (arm_exec_glfw_poll).  A single-producer /
- * single-consumer ring hands events across; luna_qfkey_pump_input() drains it
- * on the pump thread.  Full ring = drop (a stalled guest must not block us). */
+/* Input arrives on the connector thread, but host/guest input queues are only
+ * touched from the pump thread.  A single-producer / single-consumer ring hands
+ * events across; luna_qfkey_pump_input() drains it.  Full ring = drop. */
 #define QK_RING 128
-typedef struct qk_in { uint8_t kind; int a; float x, y; } qk_in; /* kind 1 touch(a=action), 2 key(a=android code) */
+typedef struct qk_in {
+   uint8_t kind; /* 1 touch, 2 key */
+   int a;        /* touch: action; key: HID usage */
+   int down;     /* key only */
+   float x, y;   /* touch coords */
+} qk_in;
 static qk_in g_ring[QK_RING];
 static _Atomic unsigned g_head, g_tail;
+static luna_qfkey_touch_fn g_host_touch;
+static luna_qfkey_key_fn g_host_key;
+
+void luna_qfkey_set_host_handlers(luna_qfkey_touch_fn touch, luna_qfkey_key_fn key)
+{
+   g_host_touch = touch;
+   g_host_key = key;
+}
 
 static void ring_push(qk_in e)
 {
@@ -326,6 +337,16 @@ static void ring_push(qk_in e)
    if (h - atomic_load_explicit(&g_tail, memory_order_acquire) >= QK_RING) return;
    g_ring[h % QK_RING] = e;
    atomic_store_explicit(&g_head, h + 1, memory_order_release);
+}
+
+static int hid_to_android(int hid)
+{
+   switch (hid) { /* USB HID keyboard usage -> Android keycode */
+   case 0x29: return 4;   /* Esc -> BACK */
+   case 0x28: return 66;  /* Enter */
+   case 0x2a: return 67;  /* Backspace -> DEL */
+   default: return 0;
+   }
 }
 
 void luna_qfkey_pump_input(void)
@@ -336,31 +357,34 @@ void luna_qfkey_pump_input(void)
       ++t;
       atomic_store_explicit(&g_tail, t, memory_order_release);
       if (getenv("LUNARIA_QFKEY_DEBUG"))
-         fprintf(stderr, "[qfkey] input kind=%d a=%d x=%.1f y=%.1f\n", e.kind, e.a, e.x, e.y);
-      if (e.kind == 1) arm_exec_touch_push(e.a, e.x, e.y);
-      else if (e.kind == 2) arm_exec_android_key(e.a);
+         fprintf(stderr, "[qfkey] input kind=%d a=%d down=%d x=%.1f y=%.1f\n",
+                 e.kind, e.a, e.down, e.x, e.y);
+      if (e.kind == 1) {
+         if (g_host_touch) g_host_touch(e.a, e.x, e.y);
+         else arm_exec_touch_push(e.a, e.x, e.y);
+      } else if (e.kind == 2) {
+         if (g_host_key) g_host_key(e.a, e.down);
+         else if (e.down) {
+            int code = hid_to_android(e.a);
+            if (code) arm_exec_android_key(code);
+         }
+      }
    }
 }
 
 static void on_touch(const uint8_t *p, uint16_t len)
 {
    if (len < 9) return;
-   qk_in e = { 1, p[0], 0, 0 }; /* action: 0 down, 1 up, 2 move */
+   qk_in e = { 1, p[0], 0, 0, 0 }; /* action: 0 down, 1 up, 2 move */
    memcpy(&e.x, p + 1, 4); memcpy(&e.y, p + 5, 4);
    if (e.a <= 2) ring_push(e);
 }
 
 static void on_key(const uint8_t *p, uint16_t len)
 {
-   if (len < 2 || !p[1]) return;
-   int code = 0;
-   switch (p[0]) { /* HID usage -> Android keycode, only the basics for now */
-   case 0x29: code = 4; break;    /* Esc -> BACK */
-   case 0x28: code = 66; break;   /* Enter */
-   case 0x2a: code = 67; break;   /* Backspace -> DEL */
-   default: break;
-   }
-   if (code) { qk_in e = { 2, code, 0, 0 }; ring_push(e); }
+   if (len < 2) return;
+   qk_in e = { 2, p[0], p[1] ? 1 : 0, 0, 0 }; /* a = HID usage */
+   ring_push(e);
 }
 
 static void session(void)
@@ -414,7 +438,13 @@ void luna_qfkey_start(const char *title, int width, int height)
    if (e && (!strcmp(e, "off") || !strcmp(e, "0"))) return;
    int expected = 0;
    if (!atomic_compare_exchange_strong(&g_started, &expected, 1)) return;
-   if (title && title[0]) snprintf(g_title, sizeof g_title, "%s", title);
+   {
+      const char *inst = getenv("LUNARIA_INSTANCE");
+      if (inst && *inst && (!title || !title[0] || !strcmp(title, "lunaria")))
+         snprintf(g_title, sizeof g_title, "lunaria-%s", inst);
+      else if (title && title[0])
+         snprintf(g_title, sizeof g_title, "%s", title);
+   }
    g_w = width > 0 ? width : 1280; g_h = height > 0 ? height : 720;
 #ifndef _WIN32
    shm_reap_stale();

@@ -92,7 +92,8 @@ struct dvm_class {
    int nmethods;
 
    int islots;                 /* instance slots including the superclass */
-   int init_state;             /* 0 unloaded, 1 running <clinit>, 2 done */
+   int init_state;             /* 0 unloaded, 1 running <clinit>, 2 done, 3 erroneous */
+   uint64_t init_owner;        /* logical Java Thread while initialising */
 
    bool is_array;
    bool is_primitive;
@@ -212,6 +213,9 @@ struct dvm {
    dvm_ref content_providers; /* attached local providers, under GIL */
    struct dvm_network_callback *network_callbacks;
    size_t nnetwork_callbacks;
+   dvm_ref *layout_observers;
+   size_t nlayout_observers,layout_observer_capacity;
+   bool insets_pass_pending;
    bool network_dispatching;
 
    /* Each dex is its own allocation.  Methods and classes keep a

@@ -47,10 +47,59 @@ table{border-spacing:0} td{padding:0}
         shown = browser.eval('''Array.from(document.querySelectorAll("div"))
           .filter(d => d.getBoundingClientRect().height > 0).map(d => d.id || d.className)''')
         assert shown == ['a1', 'a2', 'h', 'card', 'in'], shown
+        assert browser.eval("""(() => {
+          const a=document.createElement('style');
+          a.textContent='#a1{height:33px}'; document.head.appendChild(a);
+          const b=document.createElement('style');
+          b.textContent='#a2{height:47px}'; document.head.appendChild(b);
+          return document.getElementById('a1').offsetHeight===33 && document.getElementById('a2').offsetHeight===47;
+        })()""") is True, 'geometry must flush batched stylesheet updates'
         cells = browser.eval('''["c11","c12","c21","c22"].map(i => {const r=document.getElementById(i).getBoundingClientRect(); return [r.left, r.top, r.width]})''')
         assert cells[0][0] == cells[2][0] and cells[1][0] == cells[3][0], cells   # columns line up
         assert cells[0][1] == cells[1][1] and cells[2][1] > cells[0][1], cells   # rows
         assert abs(cells[0][2] - 100) < 1 and abs(cells[0][2] + cells[1][2] - 300) < 1, cells
+        memo = Path(directory) / 'ancestor-sweep.html'
+        memo.write_text("""<body class="scope leaf"><style>
+.leaf{height:10px}.scope .leaf{height:31px}.scope .leaf+.leaf{height:35px}
+.scope .branch>.leaf{height:43px}
+</style><div id="first" class="leaf"></div><div id="second" class="leaf"></div>
+<section class="branch"><div id="nested" class="leaf"></div></section></body>""")
+        browser.call('Page.navigate', {'url': memo.as_uri()})
+        def heights():
+            return browser.eval("[document.body, ...['first','second','nested'].map(id=>document.getElementById(id))].map(n=>n.offsetHeight)")
+        assert heights()[1:] == [31,35,43], heights()
+        browser.eval("document.body.className='leaf'")
+        assert heights()[1:] == [10,10,10], heights()
+        browser.eval("document.body.className='scope leaf'")
+        assert heights()[1:] == [31,35,43], heights()
+        compound = Path(directory) / 'compound.html'
+        compound.write_text('''<head><style>
+div.card{--size:21px;height:var(--size)}span.card{display:block;height:7px}
+section .card{--size:29px}#target.card{height:var(--size)}
+div.card.active{--size:37px}div.card::before{content:'x';display:block;height:3px}
+</style></head><body><section><div id="target" class="card"></div></section>
+<span class="card" id="other">Other</span></body>''')
+        browser.call('Page.navigate', {'url': compound.as_uri()})
+        assert browser.eval('document.getElementById("target").offsetHeight') == 29
+        assert browser.eval('document.getElementById("other").offsetHeight') == 7
+        browser.eval('document.getElementById("target").classList.add("active")')
+        assert browser.eval('document.getElementById("target").offsetHeight') == 37
+        browser.eval('document.getElementById("target").className=""')
+        assert browser.eval('document.getElementById("target").offsetHeight') != 37
+        cascade = Path(directory) / 'many-sheets.html'
+        cascade.write_text('<head><style>#pinned{height:13px!important}</style>' +
+                           ''.join(f'<style>div.shared{{--height:{i}px;height:var(--height)}}</style>'
+                                   for i in range(1, 41)) +
+                           '</head><body><div id="ordered" class="shared"></div>'
+                           '<div id="pinned" class="shared"></div></body>')
+        browser.call('Page.navigate', {'url': cascade.as_uri()})
+        assert browser.eval('document.getElementById("ordered").offsetHeight') == 40
+        assert browser.eval('document.getElementById("pinned").offsetHeight') == 13
+        browser.eval('''const sheet=document.createElement('style');
+          sheet.textContent='#pinned{height:17px!important}div.shared{height:43px}';
+          document.head.appendChild(sheet)''')
+        assert browser.eval('document.getElementById("ordered").offsetHeight') == 43
+        assert browser.eval('document.getElementById("pinned").offsetHeight') == 17
     finally:
         browser.close()
 print('css robustness: PASS')

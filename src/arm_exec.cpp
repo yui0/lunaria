@@ -338,7 +338,6 @@ extern "C" void dynarmic_a64_set_progress_hook(void (*fn)(uint64_t compiles,
 
 extern "C" {
 #include "arm_exec.h"
-#include "dvm/audio_track.h"
 #include "luna_input.h"
 #include "luna_qfkey.h"
 #include "linker64.h"
@@ -2624,6 +2623,22 @@ static uint32_t lookup_direct_va_fast64(const char *name)
     const auto &map = fast64_direct_va_map();
     auto it = map.find(name);
     return it != map.end() ? it->second() : 0;
+}
+
+static uint32_t lookup_symbol_svc(const char *name);
+
+/* Pure libc supplies only audited functions, including through dlsym.
+ * It is present in linker dependency scopes but owns no process pthread state. */
+static bool usable_dynamic_definition(const char *name, const ln64_sym &symbol) {
+    const char *path = ln64_module_path(symbol.owner);
+    const char *base = path ? std::strrchr(path, '/') : nullptr;
+    base = base ? base + 1 : path;
+    const char *dir = std::getenv("LUNARIA_SYSLIB_DIR");
+    const size_t len = dir ? std::strlen(dir) : 0;
+    const bool pure = base && (!std::strcmp(base, "libc-pure.so") ||
+        (len && !std::strcmp(base, "libc.so") &&
+         !std::strncmp(path, dir, len) && path[len] == '/'));
+    return !pure || svc_prefers_guest_export(name, lookup_symbol_svc(name));
 }
 
 // Symbols resolved to a direct guest VA instead of an SVC trampoline
@@ -15135,8 +15150,6 @@ static void glfw_scroll_cb(GLFWwindow *w, double dx, double dy) {
         /* An Android UI of the emulator's own (a Java app's views) takes its
          * touches through the overlay, which turns a drag into a scroll; the
          * slide drives that pointer instead of a guest contact. */
-        const bool overlay_slide = g_slide_active ? g_slide_overlay
-                                                  : luna_overlay_guest_window_up();
         int sw, sh;
         view_size_load(sw, sh);
         if (sw <= 0 || sh <= 0) { sw = g_fb_w; sh = g_fb_h; }
@@ -15149,9 +15162,11 @@ static void glfw_scroll_cb(GLFWwindow *w, double dx, double dy) {
         if (!g_slide_active) {
             cx = std::min<double>(std::max<double>(cx, 8), sw - 8);
             cy = std::min<double>(std::max<double>(cy, 8), sh - 8);
-            g_slide_overlay = overlay_slide;
-            if (overlay_slide) luna_overlay_pointer(cx, cy, 1);
-            else touch_contact(29, 0, (float)cx, (float)cy);
+            /* A Java window can contain a native SurfaceView. Its document
+             * remains visible while framework/native input owns the touch;
+             * route the slide by acceptance, not document visibility. */
+            g_slide_overlay = luna_overlay_pointer(cx, cy, 1);
+            if (!g_slide_overlay) touch_contact(29, 0, (float)cx, (float)cy);
             g_slide_x = (float)cx;
             g_slide_y = (float)cy;
             g_slide_active = true;
@@ -17329,12 +17344,14 @@ static bool axml_load_strings(const uint8_t *data, size_t len,
  * broken. Only the default configuration is needed: these are plain
  * integers/strings with no qualifiers. */
 static std::vector<uint8_t> g_arsc;
+static struct arsc_index g_arsc_index;
 /* Each installed split has its own value string pool. Retain its bytes for
  * styled-string spans and give its strings a stable range in the host pool. */
 struct arsc_source {
     struct arsc_source *next;
     uint8_t *bytes;
     size_t size, string_base, string_count;
+    struct arsc_index index;
 };
 static struct arsc_source *g_arsc_splits;
 static bool g_arsc_tried = false;
@@ -17363,6 +17380,60 @@ static void arsc_read_pool(const uint8_t *p, size_t len,
         if (!res_pool_string(p, len, q, utf8, t)) break;
         out.push_back(std::move(t));
     }
+}
+
+/* The framework is a separate package, never an application overlay. Its
+ * compiled resources are installed unmodified from SDK Platform 31. */
+static char g_framework_res_root[PATH_MAX];
+static void arsc_load_framework(struct arsc_source **tail)
+{
+    const char *configured=lunaria_env("LUNARIA_FRAMEWORK_RES");
+    if(configured && *configured) {
+        if(strlen(configured)>=sizeof g_framework_res_root) return;
+        memcpy(g_framework_res_root,configured,strlen(configured)+1);
+    } else {
+        if(luna_os_executable_path(g_framework_res_root,sizeof g_framework_res_root)!=0) return;
+        char *slash=strrchr(g_framework_res_root,'/');
+#ifdef _WIN32
+        char *back=strrchr(g_framework_res_root,'\\');
+        if(back && (!slash || back>slash)) slash=back;
+#endif
+        if(!slash) return;
+        size_t offset=(size_t)(slash-g_framework_res_root);
+        const char suffix[]="/runtime/framework-res";
+        if(offset+sizeof suffix>sizeof g_framework_res_root) return;
+        memcpy(g_framework_res_root+offset,suffix,sizeof suffix);
+    }
+    char path[PATH_MAX];
+    if(snprintf(path,sizeof path,"%s/resources.arsc",g_framework_res_root)>=(int)sizeof path) return;
+    FILE *file=luna_file_fopen(path,"rb");
+    if(!file) {
+        fprintf(stderr,"[framework] resources unavailable: %s (scripts/install-framework.py installs SDK Platform 31)\n",path);
+        return;
+    }
+    long length=0;
+    if(fseek(file,0,SEEK_END)==0) length=ftell(file);
+    bool good=length>=12 && length<128*1024*1024 && fseek(file,0,SEEK_SET)==0;
+    uint8_t *bytes=good ? (uint8_t *)malloc((size_t)length) : NULL;
+    good=bytes && fread(bytes,1,(size_t)length,file)==(size_t)length;
+    fclose(file);
+    if(!good || arsc_u16(bytes)!=2 || arsc_u32(bytes+4)>(size_t)length ||
+       arsc_u16(bytes+2)<12 || arsc_u16(bytes+2)>(size_t)length-8) {free(bytes);return;}
+    struct arsc_source *source=(struct arsc_source *)calloc(1,sizeof *source);
+    if(!source) {free(bytes);return;}
+    source->bytes=bytes;source->size=(size_t)length;
+    arsc_index_build(bytes,source->size,&source->index);
+    source->string_base=g_arsc_strings.size();
+    size_t header=arsc_u16(bytes+2);
+    arsc_read_pool(bytes+header,source->size-header,g_arsc_strings);
+    source->string_count=g_arsc_strings.size()-source->string_base;
+    /* File resources need an asset namespace as well as a numeric package ID:
+     * framework res/color/foo.xml must never open the app's res/color/foo.xml. */
+    for(size_t i=source->string_base;i<g_arsc_strings.size();++i)
+        if(g_arsc_strings[i].compare(0,4,"res/")==0)
+            g_arsc_strings[i].insert(0,"@android/");
+    *tail=source;
+    fprintf(stderr,"[framework] loaded %s (%zu bytes, %zu strings)\n",path,source->size,source->string_count);
 }
 
 static void arsc_ensure_loaded() {
@@ -17405,6 +17476,7 @@ static void arsc_ensure_loaded() {
         if (hs + 8u <= g_arsc.size())
             arsc_read_pool(g_arsc.data() + hs, g_arsc.size() - hs, g_arsc_strings);
     }
+    arsc_index_build(g_arsc.data(), g_arsc.size(), &g_arsc_index);
     const char *splits = lunaria_env("ANDROID_SPLIT_APKS");
     struct arsc_source **tail = &g_arsc_splits;
     for (const char *p = splits; p && *p;) {
@@ -17423,6 +17495,7 @@ static void arsc_ensure_loaded() {
                 struct arsc_source *source = (struct arsc_source *)calloc(1, sizeof *source);
                 if (source) {
                     source->bytes=bytes; source->size=size;
+                    arsc_index_build(bytes,size,&source->index);
                     source->string_base=g_arsc_strings.size();
                     size_t hs=arsc_u16(bytes+2);
                     arsc_read_pool(bytes+hs,size-hs,g_arsc_strings);
@@ -17436,6 +17509,7 @@ static void arsc_ensure_loaded() {
         }
         p = *end ? end+1 : end;
     }
+    arsc_load_framework(tail);
     fprintf(stderr, "[apk-meta] resources.arsc: %zu bytes, %zu strings\n",
             g_arsc.size(), g_arsc_strings.size());
 }
@@ -17594,125 +17668,102 @@ static std::string arsc_best_bitmap_path(uint32_t resid)
     return best;
 }
 
-static uint8_t arsc_lookup(uint32_t resid, uint32_t *data_out) {
+static bool arsc_select_entry(uint32_t resid,struct arsc_entry_view *best,
+                               size_t *string_base,size_t *string_count)
+{
     arsc_ensure_loaded();
-    struct arsc_entry_view best = {0}, candidate = {0};
-    size_t string_base = 0;
-    size_t string_count = g_arsc.size() >= 12 && arsc_u16(g_arsc.data()+2)+12u <= g_arsc.size()
+    struct arsc_entry_view candidate={0};
+    *string_base=0;
+    *string_count=g_arsc.size()>=12 && arsc_u16(g_arsc.data()+2)+12u<=g_arsc.size()
         ? arsc_u32(g_arsc.data()+arsc_u16(g_arsc.data()+2)+8) : 0;
-    const uint8_t orientation = arsc_device_orientation();
-    bool found = arsc_find_entry(g_arsc.data(),g_arsc.size(),resid,
-                                 orientation,arsc_config_score,&best) != 0;
-    for (struct arsc_source *source=g_arsc_splits;source;source=source->next) {
-        if (arsc_find_entry(source->bytes,source->size,resid,orientation,
-                            arsc_config_score,&candidate) &&
-            (!found || candidate.score >= best.score)) {
-            best=candidate; found=true; string_base=source->string_base;
-            string_count=source->string_count;
+    const uint8_t orientation=arsc_device_orientation();
+    bool found=arsc_find_entry_indexed(&g_arsc_index,g_arsc.data(),g_arsc.size(),resid,
+                               orientation,arsc_config_score,best)!=0;
+    for(struct arsc_source *source=g_arsc_splits;source;source=source->next) {
+        if(arsc_find_entry_indexed(&source->index,source->bytes,source->size,resid,orientation,arsc_config_score,&candidate) &&
+           (!found || candidate.score>=best->score)) {
+            *best=candidate;found=true;
+            *string_base=source->string_base;*string_count=source->string_count;
         }
     }
-    if (!found || (arsc_u16(best.entry+2)&1)) return 0;
+    return found;
+}
+
+static uint8_t arsc_lookup(uint32_t resid,uint32_t *data_out)
+{
+    struct arsc_entry_view best={0};size_t base=0,count=0;
+    if(!arsc_select_entry(resid,&best,&base,&count) || (arsc_u16(best.entry+2)&1)) return 0;
     size_t header=arsc_u16(best.entry);
-    if (best.available-header < 8 || arsc_u16(best.entry+header) != 8) return 0;
+    if(best.available-header<8 || arsc_u16(best.entry+header)!=8) return 0;
     const uint8_t *value=best.entry+header;
     uint32_t data=arsc_u32(value+4);
-    if (value[3]==3) {
-        if (data >= string_count || string_base > UINT32_MAX-data) return 0;
-        data+=(uint32_t)string_base;
+    if(value[3]==3) {
+        if(data>=count || base>UINT32_MAX-data) return 0;
+        data+=(uint32_t)base;
     }
-    if (data_out) *data_out=data;
+    if(data_out) *data_out=data;
     return value[3];
 }
 
-/* A style is looked up in the type chunk whose configuration fits this device
- * best (arsc_config_score): a theme has -v21, -v23, -night ... variants of the
- * same entry, and taking the first chunk found read the wrong one. */
-static uint8_t arsc_style_lookup(uint32_t style, uint32_t attr,
-                                 uint32_t *data_out, int depth) {
-    arsc_ensure_loaded();
-    if (depth > 16 || g_arsc.size() < 12 || !style || !attr) return 0;
-    const uint8_t *b = g_arsc.data(); size_t n = g_arsc.size();
-    uint8_t want_pkg = (uint8_t)(style >> 24);
-    uint8_t want_type = (uint8_t)((style >> 16) & 0xff);
-    uint16_t want_entry = (uint16_t)style;
-    const uint8_t want_orient = arsc_device_orientation();
-    uint16_t table_hs; memcpy(&table_hs, b + 2, 2);
-    for (size_t i = table_hs; i + 8 <= n;) {
-        uint16_t ct, hs; uint32_t cs;
-        memcpy(&ct,b+i,2); memcpy(&hs,b+i+2,2); memcpy(&cs,b+i+4,4);
-        if (cs < 8 || i + cs > n) break;
-        uint32_t pkg = 0; if (ct == 0x0200) memcpy(&pkg,b+i+8,4);
-        if (ct != 0x0200 || (uint8_t)pkg != want_pkg) { i += cs; continue; }
-        size_t best_entry = 0; size_t best_end = 0; int best_score = -1;
-        for (size_t j = i + hs; j + 8 <= i + cs;) {
-            uint16_t t2,h2; uint32_t s2;
-            memcpy(&t2,b+j,2); memcpy(&h2,b+j+2,2); memcpy(&s2,b+j+4,4);
-            if (s2 < 8 || j + s2 > i + cs) break;
-            if (t2 != 0x0201 || b[j+8] != want_type) { j += s2; continue; }
-            uint32_t count,start; memcpy(&count,b+j+12,4); memcpy(&start,b+j+16,4);
-            if (want_entry >= count) { j += s2; continue; }
-            uint32_t off; memcpy(&off,b+j+h2+(size_t)want_entry*4,4);
-            if (off == 0xffffffffu) { j += s2; continue; }
-            size_t e=j+start+off; if (e+16 > j+s2) { j += s2; continue; }
-            uint16_t esize, flags; memcpy(&esize,b+e,2); memcpy(&flags,b+e+2,2);
-            if (!(flags & 1u) || esize < 16) { j += s2; continue; }
-            const int score = h2 >= 20 ? arsc_config_score(b + j + 20, (size_t)h2 - 20u, want_orient) : 0;
-            if (score > best_score) { best_score = score; best_entry = e; best_end = j + s2; }
-            j += s2;
-        }
-        if (best_score < 0) return 0;
-        const size_t e = best_entry;
-        uint16_t esize; memcpy(&esize,b+e,2);
-        uint32_t parent,maps; memcpy(&parent,b+e+8,4); memcpy(&maps,b+e+12,4);
-        size_t m=e+esize;
-        for (uint32_t k=0; k<maps && m+12<=best_end; ++k,m+=12) {
-            uint32_t name,val; memcpy(&name,b+m,4); memcpy(&val,b+m+8,4);
-            if (name == attr) {
-                if (data_out) *data_out=val;
-                return b[m+7];
-            }
-        }
-        if (getenv("LUNARIA_TRACE_TA"))
-            fprintf(stderr, "[style] 0x%08x (score %d) -> parent 0x%08x\n", style, best_score, parent);
-        return parent ? arsc_style_lookup(parent, attr, data_out, depth+1) : 0;
+/* Resource IDs returned by a resolved TypedArray refer to the final target,
+ * including when that target is a complex style. Manifest theme attributes
+ * use this contract before ActivityThread calls Activity.setTheme(). */
+static uint32_t arsc_resolved_resource_id(uint32_t id)
+{
+    for(unsigned hop=0;id && hop<32;++hop) {
+        struct arsc_entry_view view={0};size_t base=0,count=0;
+        if(!arsc_select_entry(id,&view,&base,&count)) return 0;
+        if(arsc_u16(view.entry+2)&1) return id;
+        uint16_t header=arsc_u16(view.entry);
+        if(view.available-header<8 || arsc_u16(view.entry+header)!=8) return 0;
+        if(view.entry[header+3]!=1) return id;
+        uint32_t target=arsc_u32(view.entry+header+4);
+        if(target==id) return 0;
+        id=target;
     }
-    if (getenv("LUNARIA_TRACE_TA")) fprintf(stderr, "[style] 0x%08x not in the table\n", style);
     return 0;
 }
 
-/* The parent a style bag names (0 when it has none or is not in the table). */
-static uint32_t arsc_style_parent(uint32_t style) {
-    arsc_ensure_loaded();
-    if (g_arsc.size() < 12 || !style) return 0;
-    const uint8_t *b = g_arsc.data(); size_t n = g_arsc.size();
-    uint8_t want_pkg = (uint8_t)(style >> 24);
-    uint8_t want_type = (uint8_t)((style >> 16) & 0xff);
-    uint16_t want_entry = (uint16_t)style;
-    uint16_t table_hs; memcpy(&table_hs, b + 2, 2);
-    for (size_t i = table_hs; i + 8 <= n;) {
-        uint16_t ct, hs; uint32_t cs;
-        memcpy(&ct,b+i,2); memcpy(&hs,b+i+2,2); memcpy(&cs,b+i+4,4);
-        if (cs < 8 || i + cs > n) break;
-        uint32_t pkg = 0; if (ct == 0x0200) memcpy(&pkg,b+i+8,4);
-        if (ct != 0x0200 || (uint8_t)pkg != want_pkg) { i += cs; continue; }
-        for (size_t j = i + hs; j + 8 <= i + cs;) {
-            uint16_t t2,h2; uint32_t s2;
-            memcpy(&t2,b+j,2); memcpy(&h2,b+j+2,2); memcpy(&s2,b+j+4,4);
-            if (s2 < 8 || j + s2 > i + cs) break;
-            if (t2 != 0x0201 || b[j+8] != want_type) { j += s2; continue; }
-            uint32_t count,start; memcpy(&count,b+j+12,4); memcpy(&start,b+j+16,4);
-            if (want_entry >= count) { j += s2; continue; }
-            uint32_t off; memcpy(&off,b+j+h2+(size_t)want_entry*4,4);
-            if (off == 0xffffffffu) { j += s2; continue; }
-            size_t e=j+start+off; if (e+16 > j+s2) { j += s2; continue; }
-            uint16_t esize, flags; memcpy(&esize,b+e,2); memcpy(&flags,b+e+2,2);
-            if (!(flags & 1u) || esize < 16) { j += s2; continue; }
-            uint32_t parent; memcpy(&parent,b+e+8,4);
-            return parent;
+/* Styles use exactly the same table/configuration selection as scalar values.
+ * Following their parent may cross from the app package into Android. */
+static bool arsc_selected_bag(uint32_t id,struct arsc_bag_view *bag,
+                              size_t *string_base,size_t *string_count)
+{
+    struct arsc_entry_view view={0};
+    if(!arsc_select_entry(id,&view,string_base,string_count)) return false;
+    uint16_t header=arsc_u16(view.entry),flags=arsc_u16(view.entry+2);
+    if(!(flags&1) || header<16) return false;
+    uint32_t count=arsc_u32(view.entry+12);
+    if(count>(view.available-header)/12) return false;
+    for(uint32_t i=0;i<count;++i)
+        if(arsc_u16(view.entry+header+(size_t)i*12+4)!=8) return false;
+    bag->maps=view.entry+header;bag->count=count;bag->parent=arsc_u32(view.entry+8);
+    return true;
+}
+
+static uint8_t arsc_style_lookup(uint32_t style,uint32_t attr,uint32_t *data_out,int depth)
+{
+    if(depth>32 || !style || !attr) return 0;
+    struct arsc_bag_view bag={0};size_t base=0,strings=0;
+    if(!arsc_selected_bag(style,&bag,&base,&strings)) return 0;
+    for(uint32_t i=0;i<bag.count;++i) {
+        const uint8_t *map=bag.maps+(size_t)i*12;
+        if(arsc_u32(map)!=attr) continue;
+        uint32_t data=arsc_u32(map+8);
+        if(map[7]==3) {
+            if(data>=strings || base>UINT32_MAX-data) return 0;
+            data+=(uint32_t)base;
         }
-        i += cs;
+        if(data_out) *data_out=data;
+        return map[7];
     }
-    return 0;
+    return bag.parent ? arsc_style_lookup(bag.parent,attr,data_out,depth+1) : 0;
+}
+
+static uint32_t arsc_style_parent(uint32_t style)
+{
+    struct arsc_bag_view bag={0};size_t base=0,strings=0;
+    return arsc_selected_bag(style,&bag,&base,&strings) ? bag.parent : 0;
 }
 
 /* Resolve a Resources.getIdentifier(type/name) through the package's type and
@@ -17895,10 +17946,8 @@ extern "C" int arm_exec_apk_resource_span(uint32_t id, size_t index,
 struct arsc_bag_item { uint32_t key, data; uint8_t type; };
 extern "C" int arm_exec_apk_resource_is_bag(uint32_t id)
 {
-    arsc_ensure_loaded();
-    struct arsc_bag_view bag;
-    return arsc_find_bag(g_arsc.data(), g_arsc.size(), id,
-                         arsc_device_orientation(), arsc_config_score, &bag);
+    struct arsc_bag_view bag={0};size_t base=0,strings=0;
+    return arsc_selected_bag(id,&bag,&base,&strings);
 }
 
 static int arsc_bag_item_compare(const void *a, const void *b)
@@ -17911,9 +17960,8 @@ static int arsc_resolve_bag(uint32_t id, unsigned depth,
                             struct arsc_bag_item **items, size_t *count)
 {
     if (depth > 32) return 0;
-    struct arsc_bag_view bag;
-    if (!arsc_find_bag(g_arsc.data(),g_arsc.size(),id,arsc_device_orientation(),
-                       arsc_config_score,&bag)) {
+    struct arsc_bag_view bag={0};size_t string_base=0,string_count=0;
+    if (!arsc_selected_bag(id,&bag,&string_base,&string_count)) {
         uint32_t target=0;
         return arsc_lookup(id,&target)==1 && target
             ? arsc_resolve_bag(target,depth+1,items,count) : 0;
@@ -17936,6 +17984,10 @@ static int arsc_resolve_bag(uint32_t id, unsigned depth,
         while (at<inherited && p[at].key!=key) ++at;
         if (at==inherited) ++inherited;
         p[at].key=key; p[at].type=m[7]; p[at].data=arsc_u32(m+8);
+        if(m[7]==3) {
+            if(p[at].data>=string_count || string_base>UINT32_MAX-p[at].data) {free(p);return 0;}
+            p[at].data+=(uint32_t)string_base;
+        }
     }
     if (inherited > 1) qsort(p,inherited,sizeof *p,arsc_bag_item_compare);
     *items=p; *count=inherited;
@@ -18373,9 +18425,9 @@ extern "C" uint32_t arm_exec_activity_theme(const char *cls)
         std::string dotted(cls);
         for (char &ch : dotted) if (ch == '/') ch = '.';
         auto it = g_apk_activity_theme.find(dotted);
-        if (it != g_apk_activity_theme.end()) return it->second;
+        if (it != g_apk_activity_theme.end()) return arsc_resolved_resource_id(it->second);
     }
-    return g_apk_app_theme;
+    return arsc_resolved_resource_id(g_apk_app_theme);
 }
 
 /* Whether a theme makes a floating window (android:windowIsFloating), from
@@ -20842,6 +20894,24 @@ static int aasset_open_file_descriptor(GuestAsset &a, int64_t *start,
 /* Same lookup, for callers outside the JNI SVC path — the bytecode
  * interpreter's AssetManager, which cannot reach the C++ helper directly. */
 extern "C" unsigned char *arm_exec_asset_read(const char *name, size_t *len) {
+    if(name && !strncmp(name,"@android/",9)) {
+        arsc_ensure_loaded();
+        const char *relative=name+9;
+        if(strncmp(relative,"res/",4) || strstr(relative,"..") || strchr(relative,'\\')) return NULL;
+        char path[PATH_MAX];
+        if(snprintf(path,sizeof path,"%s/%s",g_framework_res_root,relative)>=(int)sizeof path) return NULL;
+        FILE *file=luna_file_fopen(path,"rb");
+        if(!file) return NULL;
+        long size=0;
+        if(fseek(file,0,SEEK_END)==0) size=ftell(file);
+        bool good=size>=0 && size<128*1024*1024 && fseek(file,0,SEEK_SET)==0;
+        unsigned char *data=good ? (unsigned char *)malloc(size ? (size_t)size : 1) : NULL;
+        good=data && fread(data,1,(size_t)size,file)==(size_t)size;
+        fclose(file);
+        if(!good) {free(data);return NULL;}
+        if(len) *len=(size_t)size;
+        return data;
+    }
     std::vector<uint8_t> data;
     if (!aasset_load_bytes(name, data)) return nullptr;
     unsigned char *buf = (unsigned char *)malloc(data.size() ? data.size() : 1);
@@ -25538,6 +25608,10 @@ struct GlDebugBinding {
 };
 /* std::map nodes remain stable while a driver holds the user pointer. */
 static std::map<EGLContext, GlDebugBinding> g_gl_debug;
+/* Most applications never register debug output. Avoid querying EGL after
+ * every libc/JNI call until a guest has actually registered a callback. Once
+ * enabled, keep the normal per-context checks even if it is later removed. */
+static std::atomic<bool> g_gl_debug_registered{false};
 static void gl_debug_capture(GLenum source, GLenum type, GLuint id,
                               GLenum severity, GLsizei length,
                               const GLchar *message, const void *user)
@@ -25551,6 +25625,7 @@ struct GlDebugDelivery {
     ArmExecCtx &ctx;
     std::array<uint64_t, 16> &regs;
     ~GlDebugDelivery() {
+        if (!g_gl_debug_registered.load(std::memory_order_acquire)) return;
         static thread_local bool delivering = false;
         if (delivering) return;
         EGLContext current = eglGetCurrentContext();
@@ -30796,13 +30871,16 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         /* Get/Set<Type>ArrayRegion(env, array, start, len, buf) */
         uint32_t start = r2, count = r3;
         GuestVA buf = ctx.is_arm64 ? g_svc_args64[4] : (GuestVA)arg32(4);
-        if ((uint64_t)start + count > alen || !buf) {
-            fprintf(stderr, "[arm_jni] %sArrayRegion out of bounds: "
-                    "start=%u len=%u of %u\n",
-                    group == 3 ? "Get" : "Set", start, count, alen);
+        if ((int32_t)start < 0 || (int32_t)count < 0 ||
+            (uint64_t)start + count > alen) {
+            jvm_throw_new(jvm, "java/lang/ArrayIndexOutOfBoundsException",
+                          "JNI array region");
             ret32(0);
             break;
         }
+        /* An empty region at the array end is valid and touches no buffer. */
+        if (!count) { ret32(0); break; }
+        if (!buf) { ret32(0); break; }
         uint8_t *p = ctx.mem.ptr(buf);
         if (p) {
             if (group == 3) memcpy(p, host + (size_t)start * width, (size_t)count * width);
@@ -31182,7 +31260,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             } else if (opened && !opened->path[0]) {
                 allow_host = true; /* dlopen(NULL): the main program's scope */
             }
-            if (found_guest) {
+            if (found_guest && usable_dynamic_definition(dsym, found)) {
                 if (ctx.is_arm64) ret64(a64_guest_va(found.value)); else ret32(found.value);
                 break;
             }
@@ -31198,7 +31276,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             bool trace = seen_dlsym.emplace(dsym, 0).second || lunaria_env("LUNARIA_TRACE_DLSYM");
             struct ln64_sym guest_symbol;
             if ((!opened || !opened->path[0]) && handle != next_handle &&
-                ln64_lookup_global(dsym, &guest_symbol)) {
+                ln64_lookup_global(dsym, &guest_symbol) &&
+                usable_dynamic_definition(dsym, guest_symbol)) {
                 if (trace)
                     fprintf(stderr, "[arm_exec] dlsym: %s -> guest 0x%08x\n",
                             dsym, guest_symbol.value);
@@ -41547,6 +41626,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         static pfn_t f = (pfn_t)host_gl_proc({"glDebugMessageCallback", "glDebugMessageCallbackKHR"});
         auto &binding = g_gl_debug[eglGetCurrentContext()];
         binding.callback = argp(0); binding.user = argp(1);
+        if (binding.callback)
+            g_gl_debug_registered.store(true, std::memory_order_release);
         { std::lock_guard<std::mutex> lock(binding.mutex); binding.messages.clear(); }
         if (f) f(binding.callback ? gl_debug_capture : nullptr,
                  binding.callback ? &binding : nullptr);
