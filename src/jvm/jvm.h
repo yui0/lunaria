@@ -143,7 +143,7 @@ const char *lunaria_android_property(const char *name);
  * canonical spelling opens as well as the host one did. */
 const char *lunaria_android_apk_path(void);        /* .../base.apk */
 const char *lunaria_android_apk_dir(void);         /* opaque installd directory */
-const char *lunaria_android_native_lib_path(void); /* .../lib/arm64 */
+const char *lunaria_android_native_lib_path(void); /* .../lib/arm64, or lib/arm for a 32-bit app */
 const char *lunaria_android_data_path(void);       /* /data/data/<pkg> */
 
 /* The installed-package registry of the Android device Lunaria presents.
@@ -372,6 +372,10 @@ jvm_get_class_name(struct jvm *jvm, jobject object);
  * not a Class.  Distinct from GetObjectClass(instance) → class name. */
 const char *
 jvm_described_class_name(struct jvm *jvm, jobject object);
+
+/* Internal Class transfer: primitive Class objects have descriptors but are
+ * not loadable through JNI FindClass or Java Class.forName. */
+jclass jvm_primitive_class(struct jvm *jvm, const char *descriptor);
 
 /* Whether the stub layer actually implements `method` — i.e. whether a stub
  * symbol resolves for it, here or on one of its superclasses.  Without this a

@@ -711,6 +711,22 @@ inline GuestVA a64_va_mmap_file(GuestVA hint, uint64_t len, uint32_t prot,
  * through an interned 64 KiB "pointer token", which truncated every jlong and
  * broke any handler that did arithmetic across a segment boundary.) */
 
+/* What A32 guest mmap() has handed out, with its current protection.  One
+ * table for mmap/munmap/mprotect and /proc/self/maps; changes are made under
+ * the ARM execution lock, so it needs none of its own.  g_a32_vma_gen lets
+ * the maps renderer know when its cached text is stale. */
+inline struct luna_vma_table g_a32_vmas = {};
+/* Protection the guest has set on library image pages with mprotect().  The
+ * image's ELF permissions (g_loaded_regions) steer the translator and stay
+ * as loaded; this is only what the guest is told it did. */
+inline struct luna_vma_table g_a32_image_prot = {};
+inline uint64_t g_a32_vma_gen = 0;
+inline void a32_vma_map(uint64_t lo, uint64_t hi, bool set, uint32_t prot,
+                        bool file_backed = false) {
+    luna_vma_map(&g_a32_vmas, lo, hi, set, prot, file_backed);
+    ++g_a32_vma_gen;
+}
+
 // Successful anon mmap slabs [lo,hi).
 struct MmapSlab { uint32_t lo, hi; };
 inline std::vector<MmapSlab> g_mmap_slabs;
@@ -1290,6 +1306,7 @@ inline void guest_va_layout_arm64(void) {
     SENTINEL_ADDR     = 0x0E200000u; /* must not alias CB nest stacks */
     /* 0x0E300000: FAST_SYNC64_PAGE (arm_exec.cpp), 8 KiB of stubs. */
     DIRECT_BB_BASE    = 0x0E400000u; /* .. 0x0EC00000, below MMAP_BASE */
+    /* 0x0F000000..0x0F040000: RX host-call code (arm_exec.cpp). */
     // Guest thread stacks: [0x40000000, HEAP_BASE) — 256 MiB, i.
     THREAD_STACK_BASE = 0x40000000u;
     // ELF images: [0x10000000,0x50000000).

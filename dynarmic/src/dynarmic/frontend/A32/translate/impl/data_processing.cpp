@@ -22,7 +22,10 @@ bool TranslatorVisitor::arm_ADC_imm(Cond cond, bool S, Reg n, Reg d, int rotate,
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -48,7 +51,10 @@ bool TranslatorVisitor::arm_ADC_reg(Cond cond, bool S, Reg n, Reg d, Imm<5> imm5
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -98,7 +104,10 @@ bool TranslatorVisitor::arm_ADD_imm(Cond cond, bool S, Reg n, Reg d, int rotate,
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -125,7 +134,10 @@ bool TranslatorVisitor::arm_ADD_reg(Cond cond, bool S, Reg n, Reg d, Imm<5> imm5
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -175,7 +187,10 @@ bool TranslatorVisitor::arm_AND_imm(Cond cond, bool S, Reg n, Reg d, int rotate,
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -203,7 +218,10 @@ bool TranslatorVisitor::arm_AND_reg(Cond cond, bool S, Reg n, Reg d, Imm<5> imm5
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
     ir.SetRegister(d, result);
@@ -252,7 +270,10 @@ bool TranslatorVisitor::arm_BIC_imm(Cond cond, bool S, Reg n, Reg d, int rotate,
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -280,7 +301,10 @@ bool TranslatorVisitor::arm_BIC_reg(Cond cond, bool S, Reg n, Reg d, Imm<5> imm5
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -420,7 +444,10 @@ bool TranslatorVisitor::arm_EOR_imm(Cond cond, bool S, Reg n, Reg d, int rotate,
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -448,7 +475,10 @@ bool TranslatorVisitor::arm_EOR_reg(Cond cond, bool S, Reg n, Reg d, Imm<5> imm5
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -498,7 +528,10 @@ bool TranslatorVisitor::arm_MOV_imm(Cond cond, bool S, Reg d, int rotate, Imm<8>
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -526,7 +559,10 @@ bool TranslatorVisitor::arm_MOV_reg(Cond cond, bool S, Reg d, Imm<5> imm5, Shift
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -574,7 +610,10 @@ bool TranslatorVisitor::arm_MVN_imm(Cond cond, bool S, Reg d, int rotate, Imm<8>
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -602,7 +641,10 @@ bool TranslatorVisitor::arm_MVN_reg(Cond cond, bool S, Reg d, Imm<5> imm5, Shift
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -652,7 +694,10 @@ bool TranslatorVisitor::arm_ORR_imm(Cond cond, bool S, Reg n, Reg d, int rotate,
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -680,7 +725,10 @@ bool TranslatorVisitor::arm_ORR_reg(Cond cond, bool S, Reg n, Reg d, Imm<5> imm5
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -730,7 +778,10 @@ bool TranslatorVisitor::arm_RSB_imm(Cond cond, bool S, Reg n, Reg d, int rotate,
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -757,7 +808,10 @@ bool TranslatorVisitor::arm_RSB_reg(Cond cond, bool S, Reg n, Reg d, Imm<5> imm5
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -807,7 +861,10 @@ bool TranslatorVisitor::arm_RSC_imm(Cond cond, bool S, Reg n, Reg d, int rotate,
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -833,7 +890,10 @@ bool TranslatorVisitor::arm_RSC_reg(Cond cond, bool S, Reg n, Reg d, Imm<5> imm5
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -883,7 +943,10 @@ bool TranslatorVisitor::arm_SBC_imm(Cond cond, bool S, Reg n, Reg d, int rotate,
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -910,7 +973,10 @@ bool TranslatorVisitor::arm_SBC_reg(Cond cond, bool S, Reg n, Reg d, Imm<5> imm5
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -960,7 +1026,10 @@ bool TranslatorVisitor::arm_SUB_imm(Cond cond, bool S, Reg n, Reg d, int rotate,
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 
@@ -987,7 +1056,10 @@ bool TranslatorVisitor::arm_SUB_reg(Cond cond, bool S, Reg n, Reg d, Imm<5> imm5
         }
 
         ir.ALUWritePC(result);
-        ir.SetTerm(IR::Term::ReturnToDispatch{});
+        /* A computed jump (`add pc, ...` is how compilers lay out a switch): the
+         * fast dispatch table finds the next block without leaving the JIT.
+         * ReturnToDispatch exits to the C++ block lookup on every one. */
+        ir.SetTerm(IR::Term::FastDispatchHint{});
         return false;
     }
 

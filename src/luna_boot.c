@@ -25,6 +25,7 @@
 #include "luna_boot.h"
 #include "luna_overlay.h"
 #include "luna_qfkey.h"
+#include "apkpure.h"
 #include "lunaria_os.h"
 #include "jvm/jvm.h"
 #include <GLFW/glfw3.h>
@@ -33,6 +34,7 @@
 #include <GLES3/gl3.h>
 
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -583,11 +585,16 @@ static void cursor(GLFWwindow *w, double x, double y)
 static void mouse(GLFWwindow *w, int button, int action, int mods)
 { double x,y; glfwGetCursorPos(w,&x,&y); pointer_position(w,&x,&y); luna_mouse_button(button, action, mods, x,y); }
 static int pick_select_for = -1;
+static void pick_store_search(LunaElement *element);
 static void key(GLFWwindow *w, int k, int scan, int action, int mods)
 {
     (void)w;
     /* An open file dialog owns the keyboard, Escape included. */
     if (luna_file_dialog_handle_key(k, scan, action, mods)) return;
+    if (choosing && k==GLFW_KEY_ENTER && action==GLFW_PRESS &&
+        luna_focused_element()>=0 && luna_focused_element()==luna_get_element_by_id("store-query")) {
+        pick_store_search(NULL);return;
+    }
     if (k == GLFW_KEY_ESCAPE && action == GLFW_PRESS && pick_select_for < 0) cancelled = 1;
     luna_key(k, scan, action, mods);
 }
@@ -900,6 +907,139 @@ static int pick_chosen;
 static char pick_folder[4096];
 static int pick_folder_for = -1;       /* which field the folder dialog answers */
 
+/* Only the presenter touches the DOM. The worker publishes its results with
+ * release/acquire; progress counters do not need to hold up either thread. */
+static struct {
+    pthread_t thread;
+    int active, downloading, count;
+    atomic_bool done, cancel;
+    atomic_uint_fast64_t bytes,total;
+    char query[512],directory[4096],path[4096],error[512];
+    struct apkpure_result results[APKPURE_RESULTS];
+    int result;
+} pick_store;
+static int pick_read_fields(void);
+static int pick_folder_usable(const char *dir);
+
+static int pick_store_progress(void *context,uint64_t bytes,uint64_t total)
+{
+    (void)context;
+    atomic_store(&pick_store.bytes,bytes);atomic_store(&pick_store.total,total);
+    return atomic_load(&pick_store.cancel);
+}
+static void *pick_store_worker(void *context)
+{
+    (void)context;
+    if (pick_store.downloading)
+        pick_store.result=apkpure_download(pick_store.query,pick_store.directory,
+            pick_store.path,sizeof pick_store.path,pick_store.error,sizeof pick_store.error,
+            pick_store_progress,NULL);
+    else pick_store.result=apkpure_search(pick_store.query,pick_store.results,APKPURE_RESULTS,
+            pick_store.error,sizeof pick_store.error,pick_store_progress,NULL);
+    atomic_store_explicit(&pick_store.done,true,memory_order_release);
+    return NULL;
+}
+static void pick_store_start(void)
+{
+    pick_store.error[0]=0;pick_store.path[0]=0;
+    atomic_store(&pick_store.done,false);atomic_store(&pick_store.cancel,false);
+    atomic_store(&pick_store.bytes,0);atomic_store(&pick_store.total,0);
+    if (pthread_create(&pick_store.thread,NULL,pick_store_worker,NULL)) {
+        luna_set_text(luna_get_element_by_id("error"),"Cannot start APKPure request.");return;
+    }
+    pick_store.active=1;
+    luna_set_text(luna_get_element_by_id("error"),"");
+    luna_remove_class(luna_get_element_by_id("store-cancel"),"hidden");
+    luna_update_element_style(luna_get_element_by_id("store-cancel"));
+}
+static void pick_store_search(LunaElement *element)
+{
+    (void)element;if (pick_store.active) return;
+    const char *value=luna_get_value(luna_get_element_by_id("store-query"));
+    if (!value) return;
+    while (*value==' ' || *value=='\t') ++value;
+    size_t len=strlen(value);while (len && (value[len-1]==' ' || value[len-1]=='\t')) --len;
+    if (!len || len>=sizeof pick_store.query) {
+        luna_set_text(luna_get_element_by_id("error"),"Enter an application name (up to 511 bytes).");return;
+    }
+    memcpy(pick_store.query,value,len);pick_store.query[len]=0;
+    pick_store.downloading=0;pick_store.count=0;
+    for (int i=0;i<APKPURE_RESULTS;++i) {
+        char id[32];snprintf(id,sizeof id,"store-result%d",i);
+        luna_add_class(luna_get_element_by_id(id),"hidden");luna_update_element_style(luna_get_element_by_id(id));
+    }
+    pick_store_start();
+}
+static void pick_store_download(LunaElement *element)
+{
+    if (pick_store.active || pick_read_fields()) return;
+    int selected=-1;
+    for (int i=0;i<pick_store.count;++i) {
+        char id[32];snprintf(id,sizeof id,"store-result%d",i);
+        if (luna_element_at(luna_get_element_by_id(id))==element) {selected=i;break;}
+    }
+    if (selected<0) return;
+    const char *root=NULL;
+    for (size_t i=0;i<pick_count;++i)
+        if (!strcmp(pick_settings[i].key,"LUNARIA_CACHE_DIR") && pick_settings[i].value[0]) root=pick_settings[i].value;
+    int n;
+    if (root) n=snprintf(pick_store.directory,sizeof pick_store.directory,"%s/downloads",root);
+    else {
+        for (size_t i=0;i<pick_count;++i)
+            if (!strcmp(pick_settings[i].key,"LUNARIA_DATA_ROOT") && pick_settings[i].value[0]) root=pick_settings[i].value;
+        if (root) n=snprintf(pick_store.directory,sizeof pick_store.directory,"%s/cache/packages/downloads",root);
+        else {
+            root=getenv("HOME");
+#ifdef _WIN32
+            if (!root) root=getenv("USERPROFILE");
+#endif
+            if (!root) {luna_set_text(luna_get_element_by_id("error"),"Choose a package cache folder first.");return;}
+            n=snprintf(pick_store.directory,sizeof pick_store.directory,"%s/Downloads/Lunaria",root);
+        }
+    }
+    if (n<0 || (size_t)n>=sizeof pick_store.directory || !pick_folder_usable(pick_store.directory)) {
+        luna_set_text(luna_get_element_by_id("error"),"Cannot write to the download folder.");return;
+    }
+    snprintf(pick_store.query,sizeof pick_store.query,"%s",pick_store.results[selected].package);
+    pick_store.downloading=1;pick_store_start();
+}
+static void pick_store_cancel(LunaElement *element)
+{ (void)element;atomic_store(&pick_store.cancel,true); }
+
+static void pick_store_tick(void)
+{
+    if (!pick_store.active) return;
+    char status[512];
+    if (!atomic_load_explicit(&pick_store.done,memory_order_acquire)) {
+        uint64_t bytes=atomic_load(&pick_store.bytes),total=atomic_load(&pick_store.total);
+        if (atomic_load(&pick_store.cancel)) snprintf(status,sizeof status,"Cancelling…");
+        else if (!pick_store.downloading) snprintf(status,sizeof status,"Searching APKPure…");
+        else if (total) snprintf(status,sizeof status,"Downloading %s — %.1f / %.1f MiB",pick_store.query,bytes/1048576.0,total/1048576.0);
+        else snprintf(status,sizeof status,"Downloading %s — %.1f MiB",pick_store.query,bytes/1048576.0);
+        luna_set_text(luna_get_element_by_id("store-status"),status);return;
+    }
+    pthread_join(pick_store.thread,NULL);pick_store.active=0;
+    luna_add_class(luna_get_element_by_id("store-cancel"),"hidden");
+    luna_update_element_style(luna_get_element_by_id("store-cancel"));
+    luna_set_text(luna_get_element_by_id("store-status"),"");
+    if (atomic_load(&pick_store.cancel)) return;
+    if (pick_store.result<0 || (!pick_store.downloading && !pick_store.result)) {
+        luna_set_text(luna_get_element_by_id("error"),pick_store.error);return;
+    }
+    if (pick_store.downloading) {
+        fprintf(stderr,"[apk-ui] downloaded %s to %s\n",pick_store.query,pick_store.path);
+        snprintf(dropped,sizeof dropped,"%s",pick_store.path);return;
+    }
+    pick_store.count=pick_store.result;
+    luna_set_text(luna_get_element_by_id("store-status"),"Select an application to download and open.");
+    for (int i=0;i<pick_store.count;++i) {
+        char id[32];snprintf(id,sizeof id,"store-result%d",i);
+        snprintf(status,sizeof status,"%.230s  ·  %s",pick_store.results[i].title,pick_store.results[i].package);
+        int node=luna_get_element_by_id(id);luna_set_text(node,status);
+        luna_remove_class(node,"hidden");luna_update_element_style(node);
+    }
+}
+
 static void pick_select_label(size_t i)
 {
     char id[32], label[1100];
@@ -1190,6 +1330,9 @@ static const char pick_css_extra[] =
     "#launcher-card .select-panel.hidden{display:none;}"
     "#launcher-card .hint{margin:0 0 2px 0;font-size:12px;color:#6f8ca2;}"
     "#launcher-card #error{color:#c0392b;margin:10px 0 0 0;min-height:18px;font-size:13px;}"
+    "#launcher-card .store-result{display:block;width:100%;padding:9px 12px;margin:4px 0;text-align:left;font-size:13px;}"
+    "#launcher-card .hidden{display:none;}"
+    "#launcher-card #store-cancel{padding:6px 12px;margin:4px 0;}"
     "#launcher-card .bar{position:absolute;left:0;right:0;bottom:0;height:68px;"
     "border-top:1px solid #d6e6f2;border-radius:0 0 16px 16px;background:rgba(255,255,255,0.97);}"
     "#launcher-card .bar .note{position:absolute;left:32px;top:25px;font-size:12px;color:#6f8ca2;}"
@@ -1209,7 +1352,7 @@ static int launcher_form(char *path, size_t capacity,
     /* luna-ui's file dialog is part of the document, hidden until Browse. */
     const char *dialog_html = luna_file_dialog_overlay_html();
     const char *dialog_css = luna_file_dialog_css();
-    size_t html_size = 6144 + count * 768 + strlen(dialog_html);
+    size_t html_size = 8192 + count * 768 + strlen(dialog_html);
     for (size_t i = 0; i < count; ++i) {
         if (!settings[i].choices) continue;
         for (size_t k = 0; settings[i].choices[k]; ++k) {
@@ -1232,8 +1375,18 @@ static int launcher_form(char *path, size_t capacity,
         "</div><div class=\"mark\">LUNARIA</div>"
         "<div class=\"card\" id=\"launcher-card\"><div class=\"main\"><h1 id=\"launcher-title\"></h1>"
         "<p class=\"sub\" id=\"launcher-sub\"></p>");
-    if (!package) at += (size_t)snprintf(html + at, html_size - at,
-        "<button class=\"drop\" id=\"drop\">Drop a package file here or click to browse…</button>");
+    if (!package) {
+        at += (size_t)snprintf(html + at, html_size - at,
+            "<button class=\"drop\" id=\"drop\">Drop a package file here or click to browse…</button>"
+            "<div class=\"lbl\">Find an app on APKPure</div>"
+            "<div class=\"row\"><input id=\"store-query\" placeholder=\"Application name, e.g. ni no kuni\" aria-label=\"Application name\">"
+            "<button id=\"store-search\">Search</button></div>"
+            "<div class=\"hint\" id=\"store-status\"></div>"
+            "<button id=\"store-cancel\" class=\"hidden\">Cancel</button>");
+        for (int i=0;i<APKPURE_RESULTS;++i)
+            at += (size_t)snprintf(html + at, html_size - at,
+                "<button class=\"store-result hidden\" id=\"store-result%d\"></button>",i);
+    }
     at += (size_t)snprintf(html + at, html_size - at, "<h2>%s</h2>", package ? "PROFILE" : "SETTINGS");
     for (size_t i = 0; i < count; ++i) {
         if (settings[i].compact) {
@@ -1288,7 +1441,16 @@ static int launcher_form(char *path, size_t capacity,
     free(html); free(css);
     luna_set_text(luna_get_element_by_id("launcher-title"), package ? "Open a profile" : "Open an application");
     luna_set_text(luna_get_element_by_id("launcher-sub"), package ? package : "Choose an APK, XAPK, APKS or AAB package.");
-    if (!package) luna_set_on_click(luna_get_element_by_id("drop"), pick_browse);
+    if (!package) {
+        pick_store.count=0;
+        luna_set_on_click(luna_get_element_by_id("drop"), pick_browse);
+        luna_set_on_click(luna_get_element_by_id("store-search"),pick_store_search);
+        luna_set_on_click(luna_get_element_by_id("store-cancel"),pick_store_cancel);
+        for (int i=0;i<APKPURE_RESULTS;++i) {
+            char id[32];snprintf(id,sizeof id,"store-result%d",i);
+            luna_set_on_click(luna_get_element_by_id(id),pick_store_download);
+        }
+    }
     luna_set_on_click(luna_get_element_by_id("continue"), pick_continue);
     for (size_t i = 0; i < count; ++i) {
         char id[32]; snprintf(id, sizeof id, "browse%zu", i);
@@ -1311,6 +1473,7 @@ static int launcher_form(char *path, size_t capacity,
     char selected_path[4096] = "";
     while (!cancelled) {
         frame(1);
+        if (!package) pick_store_tick();
         if (pick_folder[0] && pick_folder_for >= 0) {
             pick_set_field((size_t)pick_folder_for, pick_folder);
             pick_folder[0] = 0; pick_folder_for = -1;
@@ -1358,6 +1521,10 @@ static int launcher_form(char *path, size_t capacity,
         } else {
             glfwWaitEventsTimeout(.02);
         }
+    }
+    if (pick_store.active) {
+        atomic_store(&pick_store.cancel,true);
+        pthread_join(pick_store.thread,NULL);pick_store.active=0;
     }
     choosing = 0;
     if (pick_select_for >= 0) {

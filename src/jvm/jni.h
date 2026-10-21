@@ -15,6 +15,10 @@
 #include <stdarg.h>
 #include <stdint.h>
 
+/* A Java method descriptor permits at most 255 parameter slots. Keep every
+ * JNI A/V/variadic adapter large enough for the complete argument list. */
+#define LUNARIA_JNI_MAX_ARGS 255
+
 typedef uint8_t  jboolean;
 typedef int8_t   jbyte;
 typedef uint16_t jchar;

@@ -1087,7 +1087,15 @@ pump_run_frame(void (*run_threads)(void))
       long v = (e && *e) ? atol(e) : 16000;
       budget_us = v > 0 ? (uint64_t)v : 16000;
    }
-   const uint64_t deadline = pump_now_us() + budget_us;
+   /* The Java half of the frame runs after the guest's share, so the share
+    * is whatever the budget leaves once last frame's Java half is paid for;
+    * otherwise every frame is budget + Java, and a light screen that costs
+    * 9 ms to draw is held to 40 frames a second by the 16 ms before it.
+    * Never less than 2 ms, so the guest still runs when the Java half alone
+    * is over budget. */
+   static uint64_t java_us;
+   const uint64_t guest_us = budget_us > java_us + 2000ull ? budget_us - java_us : 2000ull;
+   const uint64_t deadline = pump_now_us() + guest_us;
    for (;;) {
       const uint64_t before = arm_exec_sched_ticks();
       const uint64_t t_sched = frame_now_ns();
@@ -1105,7 +1113,9 @@ pump_run_frame(void (*run_threads)(void))
       usleep((deadline - now > 1000ull) ? 1000u : (useconds_t)(deadline - now));
       frame_stage_add(FRAME_STAGE_IDLE, t_idle);
    }
+   const uint64_t java_start = pump_now_us();
    pump_java_frame();
+   java_us = pump_now_us() - java_start;
 }
 
 /* --- dex startup --------------------------------------------------------
@@ -1429,14 +1439,19 @@ run_dex_activity(struct jvm *jvm, int is_a64)
       }
    }
 
+   dvm_jni_main_transaction(&jvm->env, true);
    dvm_jni_activity_dispatch(&jvm->env, activity, "Created", 0);
    if (!dex_call_lifecycle(jvm, activity, cls, "onCreate",
                            "(Landroid/os/Bundle;)V", 1)) {
       fprintf(stderr, "[loader] dex startup: %s has no onCreate\n", cls);
+      dvm_jni_main_transaction(&jvm->env, false);
       return EXIT_FAILURE;
    }
    dvm_jni_activity_dispatch(&jvm->env, activity, "Created", 1);
-   run_threads();
+   /* The initial create/start/resume sequence is one main-thread lifecycle
+    * transaction. A startActivity request made by onCreate is queued until
+    * this transaction has attached its window; draining it between callbacks
+    * would resume the child first and then put the launcher above it. */
    /* onStart/onResume are what make an Activity visible and running; an app
     * that starts its render thread in onResume never starts without them. */
    /* A launcher that called finish() from onCreate (a splash that starts the
@@ -1463,7 +1478,6 @@ run_dex_activity(struct jvm *jvm, int is_a64)
    if (!dvm_jni_activity_finishing(&jvm->env, activity)) {
       dex_call_lifecycle(jvm, activity, cls, "onPostResume", "()V", 0);
       dvm_jni_activity_dispatch(&jvm->env, activity, "Resumed", 1);
-      run_threads();
 
       /* Attach the resumed Activity to its window before running its renderer.
        * SurfaceView dispatches its lifecycle callbacks through the main Looper;
@@ -1471,6 +1485,8 @@ run_dex_activity(struct jvm *jvm, int is_a64)
       if (!dvm_jni_activity_finishing(&jvm->env, activity))
          dvm_jni_show_activity(&jvm->env, activity);
    }
+   dvm_jni_main_transaction(&jvm->env, false);
+   run_threads();
    pump_java_frame();
 
    int max_frames = 0;
@@ -1531,6 +1547,11 @@ run_jni_game_arm64(struct jvm *jvm)
 static int
 run_jni_game_arm(struct jvm *jvm)
 {
+   const char *launcher = getenv("ANDROID_LAUNCH_ACTIVITY");
+   if (launcher && *launcher) {
+      int result = run_dex_activity(jvm, 0), status = 0;
+      return process_exit_status(&status) ? status : result;
+   }
 
    /* Unity <= 2019: all methods on UnityPlayer.
     * Unity 2020+:  render/lifecycle moved to UnityPlayerForActivityOrService. */

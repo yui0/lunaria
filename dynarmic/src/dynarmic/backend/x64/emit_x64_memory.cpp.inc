@@ -89,7 +89,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(args[1]);
     const int value_idx = bitsize == 128 ? ctx.reg_alloc.ScratchXmm().getIdx() : ctx.reg_alloc.ScratchGpr().getIdx();
 
-    const auto wrapped_fn = read_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value_idx)];
+    const auto wrapped_fn = read_fallbacks[ordered][FastmemFallbackSizeIndex(bitsize)][vaddr.getIdx()][value_idx];
 
     SharedLabel abort = GenSharedLabel(), end = GenSharedLabel();
 
@@ -176,7 +176,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
                             ? ctx.reg_alloc.UseXmm(args[2]).getIdx()
                             : (ordered ? ctx.reg_alloc.UseScratchGpr(args[2]).getIdx() : ctx.reg_alloc.UseGpr(args[2]).getIdx());
 
-    const auto wrapped_fn = write_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value_idx)];
+    const auto wrapped_fn = write_fallbacks[ordered][FastmemFallbackSizeIndex(bitsize)][vaddr.getIdx()][value_idx];
 
     SharedLabel abort = GenSharedLabel(), end = GenSharedLabel();
 
@@ -370,7 +370,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
     const Xbyak::Reg64 tmp = ctx.reg_alloc.ScratchGpr();
     const Xbyak::Reg64 tmp2 = ctx.reg_alloc.ScratchGpr();
 
-    const auto wrapped_fn = read_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value_idx)];
+    const auto wrapped_fn = read_fallbacks[ordered][FastmemFallbackSizeIndex(bitsize)][vaddr.getIdx()][value_idx];
 
     EmitExclusiveLock(code, conf, tmp, tmp2.cvt32());
 
@@ -454,7 +454,7 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
     const Xbyak::Reg32 status = ctx.reg_alloc.ScratchGpr().cvt32();
     const Xbyak::Reg64 tmp = ctx.reg_alloc.ScratchGpr();
 
-    const auto wrapped_fn = exclusive_write_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value.getIdx())];
+    const auto wrapped_fn = exclusive_write_fallbacks[ordered][FastmemFallbackSizeIndex(bitsize)][vaddr.getIdx()][value.getIdx()];
 
     EmitExclusiveLock(code, conf, tmp, eax);
 

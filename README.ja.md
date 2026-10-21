@@ -271,6 +271,12 @@ Unreal Engine 4を採用した商用タイトルです。ログイン、サー�
 Lunariaを引数なしで起動すると、パッケージを選ぶランチャーが開きます。`.apk`、`.xapk`、`.apks`、`.aab`を
 ドラッグ＆ドロップするだけで読み込めます。保存先や端末プロファイルなどの設定は、`lunaria.conf`に記録できます。
 
+「Find an app on APKPure」にアプリ名を入力してEnterまたはSearchを押すと、APKPureを検索できます。
+候補のアプリ名とパッケージ名を確認して選ぶと、最新版のXAPKをダウンロードして開きます。
+保存先はPackage cache folder配下の`downloads`です。キャッシュ先が空ならData folder配下の
+`cache/packages/downloads`、両方とも空ならホームの`Downloads/Lunaria`を使います。
+Cancelで中止でき、通信失敗や中断時の一時ファイルは削除します。サイトがアクセスを拒否した場合はHTTPエラーを表示します。
+
 大規模なゲームでは、ライブラリの読み込みやARMコードの変換、dexのコンパイルに時間がかかることがあります。
 その間は専用の起動画面に進行状況が表示されます。
 

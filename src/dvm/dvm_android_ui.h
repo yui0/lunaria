@@ -1310,6 +1310,13 @@ static dvm_ref context_path_file(struct dvm *vm, const char *env_name,
    if (f) {
       union dvm_value v = { .l = dvm_new_string(vm, path) };
       (void)dvm_set_field(vm, f, "path", "Ljava/lang/String;", v);
+      /* The system creates an app's own directories before handing them out
+       * (getCacheDir, getExternalCacheDir, ...): callers StatFs them and write
+       * into them without a mkdirs() of their own. */
+      if (!child || !*child) {
+         union dvm_value made = { 0 };
+         (void)file_mkdir_impl(vm, f, true, &made);
+      }
    }
    return f;
 }
@@ -1691,7 +1698,7 @@ static bool context_get_package_name(struct dvm *vm, dvm_ref self,
    (void)self; (void)args; (void)nargs;
    const char *pkg = getenv("ANDROID_PACKAGE_NAME");
    dvm_ref r = dvm_new_string(vm, pkg && *pkg ? pkg : "com.lunaria.app");
-   if (getenv("LUNARIA_DVM_TRACE"))
+   if (dvm__env("LUNARIA_DVM_TRACE"))
       fprintf(stderr, "[dvm] Context.getPackageName: @%x \\\"%s\\\"\n", r,
               r ? dvm_string_utf8(vm, r) : "");
    RETL(r);
@@ -1818,6 +1825,9 @@ static const struct rt_method rt_context[] = {
    M("getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;",
      context_get_application_info),
    M("getPackageName", "()Ljava/lang/String;", context_get_package_name),
+   /* A restricted context is the one a sandboxed host (an unlocked-credential
+    * preview, a lock-screen widget) hands out; an app's own is never. */
+   M("isRestricted", "()Z", ret_false),
    M("checkSelfPermission", "(Ljava/lang/String;)I", ctx_check_permission),
    M("checkCallingOrSelfPermission", "(Ljava/lang/String;)I",
      ctx_check_permission),
@@ -2142,7 +2152,7 @@ static bool image_set_drawable(struct dvm *vm, dvm_ref self,
    if (resource.i || dimensions[0][0] != dimensions[1][0] || dimensions[0][1] != dimensions[1][1])
       (void)view_request_layout(vm,self,NULL,0,out);
    ui_invalidate();
-   if (getenv("LUNARIA_TRACE_DRAWABLE"))
+   if (dvm__env("LUNARIA_TRACE_DRAWABLE"))
       fprintf(stderr,"[image] view=%x drawable=%x intrinsic=%dx%d\n",self,drawable.l,
          dimensions[1][0],dimensions[1][1]);
    RETV();
@@ -2333,6 +2343,8 @@ static const struct rt_field rt_text_view_fields[] = {
    { "editableFactory", "Landroid/text/Editable$Factory;" },
    { "filters", "[Landroid/text/InputFilter;" },
    { "transformationMethod", "Landroid/text/method/TransformationMethod;" },
+   { "allCaps", "Z" }, { "capsFrom", "Ljava/lang/CharSequence;" }, { "capsTo", "Ljava/lang/CharSequence;" },
+   { "ellipsize", "Landroid/text/TextUtils$TruncateAt;" },
    F_END
 };
 
@@ -2787,6 +2799,7 @@ static bool text_font_padding(struct dvm *vm,dvm_ref self,const union dvm_value 
 }
 
 static const struct rt_method rt_text_view[] = {
+   M("onTouchEvent","(Landroid/view/MotionEvent;)Z",text_on_touch),
    M("onDraw","(Landroid/graphics/Canvas;)V",text_on_draw),
    M("setIncludeFontPadding","(Z)V",text_font_padding),
    M("getIncludeFontPadding","()Z",text_font_padding),
@@ -2882,7 +2895,10 @@ static const struct rt_method rt_text_view[] = {
 static const struct rt_field rt_image_view_fields[] = {
    { "drawable", "Landroid/graphics/drawable/Drawable;" },
    { "imageResource", "I" }, { "imageMatrix", "Landroid/graphics/Matrix;" },
-   { "cropToPadding", "Z" }, F_END
+   { "cropToPadding", "Z" },
+   { "imageAlpha", "I" }, { "imageAlphaSet", "Z" },
+   { "imageTintList", "Landroid/content/res/ColorStateList;" }, { "imageTintMode", "Landroid/graphics/PorterDuff$Mode;" },
+   F_END
 };
 static bool image_set_resource(struct dvm *vm, dvm_ref self,
                                const union dvm_value *args, int nargs,
@@ -3049,6 +3065,7 @@ static const struct rt_method rt_image_view[] = {
  * terms dialog is a list of exactly these, and it will not enable its Confirm
  * button until each required one reports itself checked.
  */
+static bool radio_group_child_changed(struct dvm *,dvm_ref,dvm_ref);
 static bool compound_set_checked(struct dvm *vm, dvm_ref self,
                                  const union dvm_value *args, int nargs,
                                  union dvm_value *out);
@@ -3096,8 +3113,14 @@ static bool compound_set_checked(struct dvm *vm, dvm_ref self,
               dvm_class_name(dvm_object_class(vm, self)));
    ui_invalidate();
    if (!view_refresh_drawable_state(vm, self, NULL, 0, out)) return false;
-   if (!compound_notify(vm, self, want != 0)) return false;
-   RETV();
+   if(rt_get_int(vm,self,"broadcastingChecked")) RETV();
+   (void)dvm_set_field(vm,self,"broadcastingChecked","Z",(union dvm_value){.i=1});
+   bool good=compound_notify(vm,self,want!=0);
+   union dvm_value group={0};
+   (void)dvm_get_field(vm,self,"radioGroup","Landroid/widget/RadioGroup;",&group);
+   if(good && group.l) good=radio_group_child_changed(vm,group.l,self);
+   (void)dvm_set_field(vm,self,"broadcastingChecked","Z",(union dvm_value){.i=0});
+   return good;
 }
 
 static bool compound_toggle(struct dvm *vm, dvm_ref self,
@@ -3139,14 +3162,74 @@ static const struct rt_method rt_radio_button[]={
 };
 #undef COMPOUND_WIDGET_CTORS
 
+static bool radio_group_set_id(struct dvm *vm,dvm_ref group,int32_t id)
+{
+   rt_set_int(vm,group,"checkedId",id);
+   union dvm_value listener={0},ignored={0},a[]={{.l=group},{.i=id}};
+   (void)dvm_get_field(vm,group,"groupCheckedListener","Landroid/widget/RadioGroup$OnCheckedChangeListener;",&listener);
+   return !listener.l || am_vcall(vm,listener.l,"onCheckedChanged","(Landroid/widget/RadioGroup;I)V",a,2,&ignored);
+}
+static bool radio_group_set_button(struct dvm *vm,dvm_ref group,int32_t id,bool checked)
+{
+   union dvm_value a={.i=id},button={0},ignored={0};
+   if(!view_find_by_id(vm,group,&a,1,&button)) return false;
+   if(button.l && ui_is_a(vm,button.l,"android/widget/RadioButton")) {
+      a.i=checked;return am_vcall(vm,button.l,"setChecked","(Z)V",&a,1,&ignored);
+   }
+   return true;
+}
+static bool radio_group_child_changed(struct dvm *vm,dvm_ref group,dvm_ref child)
+{
+   if(rt_get_int(vm,group,"protectChecked")) return true;
+   (void)dvm_set_field(vm,group,"protectChecked","Z",(union dvm_value){.i=1});
+   int32_t old=rt_get_int(vm,group,"checkedId");
+   bool good=old==-1 || radio_group_set_button(vm,group,old,false);
+   (void)dvm_set_field(vm,group,"protectChecked","Z",(union dvm_value){.i=0});
+   return good && radio_group_set_id(vm,group,rt_get_int(vm,child,"id"));
+}
+static bool radio_group_before_add(struct dvm *vm,dvm_ref group,dvm_ref child)
+{
+   if(!ui_is_a(vm,group,"android/widget/RadioGroup") || !ui_is_a(vm,child,"android/widget/RadioButton") ||
+      !rt_get_int(vm,child,"checked")) return true;
+   return radio_group_child_changed(vm,group,child);
+}
+static bool radio_group_hierarchy(struct dvm *vm,dvm_ref group,dvm_ref child,bool added)
+{
+   if(!ui_is_a(vm,group,"android/widget/RadioGroup") || !ui_is_a(vm,child,"android/widget/RadioButton")) return true;
+   if(added && rt_get_int(vm,child,"id")==-1) rt_set_int(vm,child,"id",view_new_id());
+   return dvm_set_field(vm,child,"radioGroup","Landroid/widget/RadioGroup;",(union dvm_value){.l=added ? group : 0});
+}
+static bool radio_group_check(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   int32_t id=nargs ? ARG(0).i : -1,old=rt_get_int(vm,self,"checkedId");
+   if(id!=-1 && id==old) RETV();
+   if(old!=-1 && !radio_group_set_button(vm,self,old,false)) return false;
+   if(id!=-1 && !radio_group_set_button(vm,self,id,true)) return false;
+   return radio_group_set_id(vm,self,id);
+}
+static bool radio_group_get_checked(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{ (void)args;(void)nargs;RETI(rt_get_int(vm,self,"checkedId")); }
+static bool radio_group_listener(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;(void)out;
+   return dvm_set_field(vm,self,"groupCheckedListener","Landroid/widget/RadioGroup$OnCheckedChangeListener;",ARG(0));
+}
 static bool radio_group_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,
                               int nargs,union dvm_value *out)
 {
    if (!view_init_context(vm,self,args,nargs,out)) return false;
    (void)dvm_set_field(vm,self,"orientation","I",(union dvm_value){.i=1});
+   rt_set_int(vm,self,"checkedId",-1);
    RETV();
 }
+static const struct rt_field rt_radio_group_fields[]={
+   {"checkedId","I"},{"protectChecked","Z"},
+   {"groupCheckedListener","Landroid/widget/RadioGroup$OnCheckedChangeListener;"},F_END,
+};
 static const struct rt_method rt_radio_group_constructors[]={
+   M("check","(I)V",radio_group_check),M("clearCheck","()V",radio_group_check),
+   M("getCheckedRadioButtonId","()I",radio_group_get_checked),
+   M("setOnCheckedChangeListener","(Landroid/widget/RadioGroup$OnCheckedChangeListener;)V",radio_group_listener),
    M("<init>","(Landroid/content/Context;)V",radio_group_init),
    M("<init>","(Landroid/content/Context;Landroid/util/AttributeSet;)V",radio_group_init),
    M_END,
@@ -3165,6 +3248,8 @@ static bool compound_set_listener(struct dvm *vm, dvm_ref self,
 }
 
 static const struct rt_field rt_compound_fields[] = {
+   { "broadcastingChecked", "Z" },
+   { "radioGroup", "Landroid/widget/RadioGroup;" },
    { "checked", "Z" },
    { "checkedListener",
      "Landroid/widget/CompoundButton$OnCheckedChangeListener;" },
@@ -3403,6 +3488,470 @@ static bool res_getString(struct dvm *vm, dvm_ref self,
    const char *value=rt_charseq_utf8(vm,text.l);
    if (!value) return false;
    RETL(dvm_new_string(vm,value));
+}
+
+/* BEGIN GENERATED INTEGER PLURALS */
+/* Generated by test/generate_integer_plurals.py; do not edit.
+ * Unicode CLDR 40 cardinal data: test/data/plurals-cldr40.xml.
+ * Unicode data license: https://www.unicode.org/license.txt
+ * Only integer quantities: i=n, v=w=f=t=c=e=0. */
+static uint32_t integer_plural_attr(const char *locale, int32_t quantity)
+{
+   static const struct { const char *locale; unsigned char group; } table[] = {
+      {"af",7},
+      {"ak",5},
+      {"am",1},
+      {"an",7},
+      {"ar",37},
+      {"ars",37},
+      {"as",1},
+      {"asa",7},
+      {"ast",3},
+      {"az",7},
+      {"bal",7},
+      {"be",29},
+      {"bem",7},
+      {"bez",7},
+      {"bg",7},
+      {"bho",5},
+      {"bm",0},
+      {"bn",1},
+      {"bo",0},
+      {"br",33},
+      {"brx",7},
+      {"bs",18},
+      {"ca",3},
+      {"ce",7},
+      {"ceb",11},
+      {"cgg",7},
+      {"chr",7},
+      {"ckb",7},
+      {"cs",27},
+      {"cy",38},
+      {"da",8},
+      {"de",3},
+      {"doi",1},
+      {"dsb",25},
+      {"dv",7},
+      {"dz",0},
+      {"ee",7},
+      {"el",7},
+      {"en",3},
+      {"eo",7},
+      {"es",22},
+      {"et",3},
+      {"eu",7},
+      {"fa",1},
+      {"ff",2},
+      {"fi",3},
+      {"fil",11},
+      {"fo",7},
+      {"fr",19},
+      {"fur",7},
+      {"fy",3},
+      {"ga",34},
+      {"gd",23},
+      {"gl",3},
+      {"gsw",7},
+      {"gu",1},
+      {"guw",5},
+      {"gv",35},
+      {"ha",7},
+      {"haw",7},
+      {"he",26},
+      {"hi",1},
+      {"hnj",0},
+      {"hr",18},
+      {"hsb",25},
+      {"hu",7},
+      {"hy",2},
+      {"ia",3},
+      {"id",0},
+      {"ig",0},
+      {"ii",0},
+      {"in",0},
+      {"io",3},
+      {"is",9},
+      {"it",21},
+      {"iu",15},
+      {"iw",26},
+      {"ja",0},
+      {"jbo",0},
+      {"jgo",7},
+      {"ji",3},
+      {"jmc",7},
+      {"jv",0},
+      {"jw",0},
+      {"ka",7},
+      {"kab",2},
+      {"kaj",7},
+      {"kcg",7},
+      {"kde",0},
+      {"kea",0},
+      {"kk",7},
+      {"kkj",7},
+      {"kl",7},
+      {"km",0},
+      {"kn",1},
+      {"ko",0},
+      {"ks",7},
+      {"ksb",7},
+      {"ksh",14},
+      {"ku",7},
+      {"kw",36},
+      {"ky",7},
+      {"lag",13},
+      {"lb",7},
+      {"lg",7},
+      {"lij",3},
+      {"lkt",0},
+      {"ln",5},
+      {"lo",0},
+      {"lt",30},
+      {"lv",12},
+      {"mas",7},
+      {"mg",5},
+      {"mgo",7},
+      {"mk",10},
+      {"ml",7},
+      {"mn",7},
+      {"mo",17},
+      {"mr",7},
+      {"ms",0},
+      {"mt",31},
+      {"my",0},
+      {"nah",7},
+      {"naq",15},
+      {"nb",7},
+      {"nd",7},
+      {"ne",7},
+      {"nl",3},
+      {"nn",7},
+      {"nnh",7},
+      {"no",7},
+      {"nqo",0},
+      {"nr",7},
+      {"nso",5},
+      {"ny",7},
+      {"nyn",7},
+      {"om",7},
+      {"or",7},
+      {"os",7},
+      {"osa",0},
+      {"pa",5},
+      {"pap",7},
+      {"pcm",1},
+      {"pl",28},
+      {"prg",12},
+      {"ps",7},
+      {"pt",20},
+      {"pt_PT",21},
+      {"rm",7},
+      {"ro",17},
+      {"rof",7},
+      {"root",0},
+      {"ru",32},
+      {"rwk",7},
+      {"sah",0},
+      {"saq",7},
+      {"sat",15},
+      {"sc",3},
+      {"scn",3},
+      {"sd",7},
+      {"sdh",7},
+      {"se",15},
+      {"seh",7},
+      {"ses",0},
+      {"sg",0},
+      {"sh",18},
+      {"shi",16},
+      {"si",4},
+      {"sk",27},
+      {"sl",24},
+      {"sma",15},
+      {"smi",15},
+      {"smj",15},
+      {"smn",15},
+      {"sms",15},
+      {"sn",7},
+      {"so",7},
+      {"sq",7},
+      {"sr",18},
+      {"ss",7},
+      {"ssy",7},
+      {"st",7},
+      {"su",0},
+      {"sv",3},
+      {"sw",3},
+      {"syr",7},
+      {"ta",7},
+      {"te",7},
+      {"teo",7},
+      {"th",0},
+      {"ti",5},
+      {"tig",7},
+      {"tk",7},
+      {"tl",11},
+      {"tn",7},
+      {"to",0},
+      {"tpi",0},
+      {"tr",7},
+      {"ts",7},
+      {"tzm",6},
+      {"ug",7},
+      {"uk",32},
+      {"ur",3},
+      {"uz",7},
+      {"ve",7},
+      {"vi",0},
+      {"vo",7},
+      {"vun",7},
+      {"wa",5},
+      {"wae",7},
+      {"wo",0},
+      {"xh",7},
+      {"xog",7},
+      {"yi",3},
+      {"yo",0},
+      {"yue",0},
+      {"zh",0},
+      {"zu",1},
+   };
+   char name[96]; snprintf(name,sizeof name,"%s",locale ? locale : "root");
+   for(char *p=name; *p; ++p) if(*p=='-') *p='_';
+   unsigned group=0;
+   for(;;) {
+      size_t low=0,high=sizeof table/sizeof table[0];
+      while(low<high) {size_t mid=low+(high-low)/2; int c=strcmp(name,table[mid].locale);
+         if(c>0)low=mid+1;else high=mid;}
+      if(low<sizeof table/sizeof table[0] && !strcmp(name,table[low].locale)) {group=table[low].group;break;}
+      char *last=strrchr(name,'_'); if(!last)break; *last=0;
+   }
+   uint64_t n=quantity<0 ? (uint64_t)(-(int64_t)quantity) : (uint64_t)quantity;
+   switch(group) {
+   case 1:
+      if ((((n == 0))) || (((n == 1)))) return 0x01000006u;
+      break;
+   case 2:
+      if ((((n == 0) || (n == 1)))) return 0x01000006u;
+      break;
+   case 3:
+      if ((((n == 1)) && ((0 == 0)))) return 0x01000006u;
+      break;
+   case 4:
+      if ((((n == 0) || (n == 1))) || (((n == 0)) && ((0 == 1)))) return 0x01000006u;
+      break;
+   case 5:
+      if ((((n >= 0 && n <= 1)))) return 0x01000006u;
+      break;
+   case 6:
+      if ((((n >= 0 && n <= 1))) || (((n >= 11 && n <= 99)))) return 0x01000006u;
+      break;
+   case 7:
+      if ((((n == 1)))) return 0x01000006u;
+      break;
+   case 8:
+      if ((((n == 1))) || (!((0 == 0)) && ((n == 0) || (n == 1)))) return 0x01000006u;
+      break;
+   case 9:
+      if ((((0 == 0)) && (((n % 10) == 1)) && !(((n % 100) == 11))) || (!((0 == 0)))) return 0x01000006u;
+      break;
+   case 10:
+      if ((((0 == 0)) && (((n % 10) == 1)) && !(((n % 100) == 11))) || ((((0 % 10) == 1)) && !(((0 % 100) == 11)))) return 0x01000006u;
+      break;
+   case 11:
+      if ((((0 == 0)) && ((n == 1) || (n == 2) || (n == 3))) || (((0 == 0)) && !(((n % 10) == 4) || ((n % 10) == 6) || ((n % 10) == 9))) || (!((0 == 0)) && !(((0 % 10) == 4) || ((0 % 10) == 6) || ((0 % 10) == 9)))) return 0x01000006u;
+      break;
+   case 12:
+      if (((((n % 10) == 0))) || ((((n % 100) >= 11 && (n % 100) <= 19))) || (((0 == 2)) && (((0 % 100) >= 11 && (0 % 100) <= 19)))) return 0x01000005u;
+      if (((((n % 10) == 1)) && !(((n % 100) == 11))) || (((0 == 2)) && (((0 % 10) == 1)) && !(((0 % 100) == 11))) || (!((0 == 2)) && (((0 % 10) == 1)))) return 0x01000006u;
+      break;
+   case 13:
+      if ((((n == 0)))) return 0x01000005u;
+      if ((((n == 0) || (n == 1)) && !((n == 0)))) return 0x01000006u;
+      break;
+   case 14:
+      if ((((n == 0)))) return 0x01000005u;
+      if ((((n == 1)))) return 0x01000006u;
+      break;
+   case 15:
+      if ((((n == 1)))) return 0x01000006u;
+      if ((((n == 2)))) return 0x01000007u;
+      break;
+   case 16:
+      if ((((n == 0))) || (((n == 1)))) return 0x01000006u;
+      if ((((n >= 2 && n <= 10)))) return 0x01000008u;
+      break;
+   case 17:
+      if ((((n == 1)) && ((0 == 0)))) return 0x01000006u;
+      if ((!((0 == 0))) || (((n == 0))) || ((((n % 100) >= 2 && (n % 100) <= 19)))) return 0x01000008u;
+      break;
+   case 18:
+      if ((((0 == 0)) && (((n % 10) == 1)) && !(((n % 100) == 11))) || ((((0 % 10) == 1)) && !(((0 % 100) == 11)))) return 0x01000006u;
+      if ((((0 == 0)) && (((n % 10) >= 2 && (n % 10) <= 4)) && !(((n % 100) >= 12 && (n % 100) <= 14))) || ((((0 % 10) >= 2 && (0 % 10) <= 4)) && !(((0 % 100) >= 12 && (0 % 100) <= 14)))) return 0x01000008u;
+      break;
+   case 19:
+      if ((((n == 0) || (n == 1)))) return 0x01000006u;
+      if ((((0 == 0)) && !((n == 0)) && (((n % 1000000) == 0)) && ((0 == 0))) || (!((0 >= 0 && 0 <= 5)))) return 0x01000009u;
+      break;
+   case 20:
+      if ((((n >= 0 && n <= 1)))) return 0x01000006u;
+      if ((((0 == 0)) && !((n == 0)) && (((n % 1000000) == 0)) && ((0 == 0))) || (!((0 >= 0 && 0 <= 5)))) return 0x01000009u;
+      break;
+   case 21:
+      if ((((n == 1)) && ((0 == 0)))) return 0x01000006u;
+      if ((((0 == 0)) && !((n == 0)) && (((n % 1000000) == 0)) && ((0 == 0))) || (!((0 >= 0 && 0 <= 5)))) return 0x01000009u;
+      break;
+   case 22:
+      if ((((n == 1)))) return 0x01000006u;
+      if ((((0 == 0)) && !((n == 0)) && (((n % 1000000) == 0)) && ((0 == 0))) || (!((0 >= 0 && 0 <= 5)))) return 0x01000009u;
+      break;
+   case 23:
+      if ((((n == 1) || (n == 11)))) return 0x01000006u;
+      if ((((n == 2) || (n == 12)))) return 0x01000007u;
+      if ((((n >= 3 && n <= 10) || (n >= 13 && n <= 19)))) return 0x01000008u;
+      break;
+   case 24:
+      if ((((0 == 0)) && (((n % 100) == 1)))) return 0x01000006u;
+      if ((((0 == 0)) && (((n % 100) == 2)))) return 0x01000007u;
+      if ((((0 == 0)) && (((n % 100) >= 3 && (n % 100) <= 4))) || (!((0 == 0)))) return 0x01000008u;
+      break;
+   case 25:
+      if ((((0 == 0)) && (((n % 100) == 1))) || ((((0 % 100) == 1)))) return 0x01000006u;
+      if ((((0 == 0)) && (((n % 100) == 2))) || ((((0 % 100) == 2)))) return 0x01000007u;
+      if ((((0 == 0)) && (((n % 100) >= 3 && (n % 100) <= 4))) || ((((0 % 100) >= 3 && (0 % 100) <= 4)))) return 0x01000008u;
+      break;
+   case 26:
+      if ((((n == 1)) && ((0 == 0)))) return 0x01000006u;
+      if ((((n == 2)) && ((0 == 0)))) return 0x01000007u;
+      if ((((0 == 0)) && !((n >= 0 && n <= 10)) && (((n % 10) == 0)))) return 0x01000009u;
+      break;
+   case 27:
+      if ((((n == 1)) && ((0 == 0)))) return 0x01000006u;
+      if ((((n >= 2 && n <= 4)) && ((0 == 0)))) return 0x01000008u;
+      if ((!((0 == 0)))) return 0x01000009u;
+      break;
+   case 28:
+      if ((((n == 1)) && ((0 == 0)))) return 0x01000006u;
+      if ((((0 == 0)) && (((n % 10) >= 2 && (n % 10) <= 4)) && !(((n % 100) >= 12 && (n % 100) <= 14)))) return 0x01000008u;
+      if ((((0 == 0)) && !((n == 1)) && (((n % 10) >= 0 && (n % 10) <= 1))) || (((0 == 0)) && (((n % 10) >= 5 && (n % 10) <= 9))) || (((0 == 0)) && (((n % 100) >= 12 && (n % 100) <= 14)))) return 0x01000009u;
+      break;
+   case 29:
+      if (((((n % 10) == 1)) && !(((n % 100) == 11)))) return 0x01000006u;
+      if (((((n % 10) >= 2 && (n % 10) <= 4)) && !(((n % 100) >= 12 && (n % 100) <= 14)))) return 0x01000008u;
+      if (((((n % 10) == 0))) || ((((n % 10) >= 5 && (n % 10) <= 9))) || ((((n % 100) >= 11 && (n % 100) <= 14)))) return 0x01000009u;
+      break;
+   case 30:
+      if (((((n % 10) == 1)) && !(((n % 100) >= 11 && (n % 100) <= 19)))) return 0x01000006u;
+      if (((((n % 10) >= 2 && (n % 10) <= 9)) && !(((n % 100) >= 11 && (n % 100) <= 19)))) return 0x01000008u;
+      if ((!((0 == 0)))) return 0x01000009u;
+      break;
+   case 31:
+      if ((((n == 1)))) return 0x01000006u;
+      if ((((n == 0))) || ((((n % 100) >= 2 && (n % 100) <= 10)))) return 0x01000008u;
+      if (((((n % 100) >= 11 && (n % 100) <= 19)))) return 0x01000009u;
+      break;
+   case 32:
+      if ((((0 == 0)) && (((n % 10) == 1)) && !(((n % 100) == 11)))) return 0x01000006u;
+      if ((((0 == 0)) && (((n % 10) >= 2 && (n % 10) <= 4)) && !(((n % 100) >= 12 && (n % 100) <= 14)))) return 0x01000008u;
+      if ((((0 == 0)) && (((n % 10) == 0))) || (((0 == 0)) && (((n % 10) >= 5 && (n % 10) <= 9))) || (((0 == 0)) && (((n % 100) >= 11 && (n % 100) <= 14)))) return 0x01000009u;
+      break;
+   case 33:
+      if (((((n % 10) == 1)) && !(((n % 100) == 11) || ((n % 100) == 71) || ((n % 100) == 91)))) return 0x01000006u;
+      if (((((n % 10) == 2)) && !(((n % 100) == 12) || ((n % 100) == 72) || ((n % 100) == 92)))) return 0x01000007u;
+      if (((((n % 10) >= 3 && (n % 10) <= 4) || ((n % 10) == 9)) && !(((n % 100) >= 10 && (n % 100) <= 19) || ((n % 100) >= 70 && (n % 100) <= 79) || ((n % 100) >= 90 && (n % 100) <= 99)))) return 0x01000008u;
+      if ((!((n == 0)) && (((n % 1000000) == 0)))) return 0x01000009u;
+      break;
+   case 34:
+      if ((((n == 1)))) return 0x01000006u;
+      if ((((n == 2)))) return 0x01000007u;
+      if ((((n >= 3 && n <= 6)))) return 0x01000008u;
+      if ((((n >= 7 && n <= 10)))) return 0x01000009u;
+      break;
+   case 35:
+      if ((((0 == 0)) && (((n % 10) == 1)))) return 0x01000006u;
+      if ((((0 == 0)) && (((n % 10) == 2)))) return 0x01000007u;
+      if ((((0 == 0)) && (((n % 100) == 0) || ((n % 100) == 20) || ((n % 100) == 40) || ((n % 100) == 60) || ((n % 100) == 80)))) return 0x01000008u;
+      if ((!((0 == 0)))) return 0x01000009u;
+      break;
+   case 36:
+      if ((((n == 0)))) return 0x01000005u;
+      if ((((n == 1)))) return 0x01000006u;
+      if (((((n % 100) == 2) || ((n % 100) == 22) || ((n % 100) == 42) || ((n % 100) == 62) || ((n % 100) == 82))) || ((((n % 1000) == 0)) && (((n % 100000) >= 1000 && (n % 100000) <= 20000) || ((n % 100000) == 40000) || ((n % 100000) == 60000) || ((n % 100000) == 80000))) || (!((n == 0)) && (((n % 1000000) == 100000)))) return 0x01000007u;
+      if (((((n % 100) == 3) || ((n % 100) == 23) || ((n % 100) == 43) || ((n % 100) == 63) || ((n % 100) == 83)))) return 0x01000008u;
+      if ((!((n == 1)) && (((n % 100) == 1) || ((n % 100) == 21) || ((n % 100) == 41) || ((n % 100) == 61) || ((n % 100) == 81)))) return 0x01000009u;
+      break;
+   case 37:
+      if ((((n == 0)))) return 0x01000005u;
+      if ((((n == 1)))) return 0x01000006u;
+      if ((((n == 2)))) return 0x01000007u;
+      if (((((n % 100) >= 3 && (n % 100) <= 10)))) return 0x01000008u;
+      if (((((n % 100) >= 11 && (n % 100) <= 99)))) return 0x01000009u;
+      break;
+   case 38:
+      if ((((n == 0)))) return 0x01000005u;
+      if ((((n == 1)))) return 0x01000006u;
+      if ((((n == 2)))) return 0x01000007u;
+      if ((((n == 3)))) return 0x01000008u;
+      if ((((n == 6)))) return 0x01000009u;
+      break;
+   default: break;
+   }
+   return 0x01000004u;
+}
+/* END GENERATED INTEGER PLURALS */
+
+/* Resources uses the configuration locale, not Locale.getDefault(), to pick
+ * cardinal bag entries. Integer rules are generated from Unicode CLDR. */
+static bool res_quantity_locale(struct dvm *vm,dvm_ref resources,union dvm_value *locale)
+{
+   union dvm_value config={0},locales={0},index={.i=0};
+   return am_vcall(vm,resources,"getConfiguration","()Landroid/content/res/Configuration;",NULL,0,&config) &&
+      am_vcall(vm,config.l,"getLocales","()Landroid/os/LocaleList;",NULL,0,&locales) &&
+      am_vcall(vm,locales.l,"get","(I)Ljava/util/Locale;",&index,1,locale);
+}
+static bool res_quantity_text(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                              int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value locale={0},name={0};
+   if (!res_quantity_locale(vm,self,&locale) ||
+       !am_vcall(vm,locale.l,"toString","()Ljava/lang/String;",NULL,0,&name)) return false;
+   uint32_t attr=integer_plural_attr(dvm_string_utf8(vm,name.l),ARG(1).i);
+   ArmExecResourceValue *entries=NULL;size_t count=0;
+   int status=arm_exec_apk_resource_bag(ARG(0).u,&entries,&count);
+   if (status<0) {free(entries);dvm__throw(vm,"java/lang/OutOfMemoryError","Plural resource");return false;}
+   const char *text=NULL; uint32_t text_id=0;
+   for(unsigned pass=0;status==1 && pass<2 && !text;++pass) {
+      uint32_t wanted=pass ? 0x01000004u : attr;
+      for(size_t i=0;i<count;++i) if(entries[i].key==wanted) {
+         if(entries[i].type=='L') text=entries[i].text;
+         else if(entries[i].type==1) {
+            int32_t ignored=0;
+            if(arm_exec_apk_resource_value(entries[i].data,&ignored,&text)=='L') text_id=entries[i].data;
+            else text=NULL;
+         }
+         break;
+      }
+   }
+   dvm_ref result=text ? (text_id ? resource_styled_text(vm,text_id,text) : dvm_new_string(vm,text)) : 0;
+   free(entries);
+   if(!text) {dvm__throw(vm,"android/content/res/Resources$NotFoundException",
+      "Plural resource #0x%08x quantity=%d",ARG(0).u,ARG(1).i);return false;}
+   if(dvm_exception(vm))return false;
+   RETL(result);
+}
+static bool res_quantity_string(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                                int nargs,union dvm_value *out)
+{
+   union dvm_value text={0};
+   if(!res_quantity_text(vm,self,args,2,&text))return false;
+   union dvm_value format={.l=dvm_new_string(vm,rt_charseq_utf8(vm,text.l))};
+   if(nargs<3)RETL(format.l);
+   union dvm_value locale={0};
+   if(!res_quantity_locale(vm,self,&locale))return false;
+   union dvm_value values[]={locale,format,ARG(2)};
+   return s_format(vm,0,values,3,out);
 }
 
 /* Expand the compiled bag; a scalar or absent resource is NotFoundException. */
@@ -3699,7 +4248,7 @@ static bool res_get_color_state_list(struct dvm *vm, dvm_ref self,
 {
    (void)self;
    dvm_ref colors=color_value_list(vm,1,ARG(0).i,NULL,nargs>1 ? ARG(1).l : 0,0);
-   if (getenv("LUNARIA_TRACE_TA"))
+   if (dvm__env("LUNARIA_TRACE_TA"))
       fprintf(stderr,"[ta-color] Resources self=%u id=0x%08x theme=%u -> ref=%u exception=%u\n",
               self,ARG(0).u,nargs>1 ? ARG(1).l : 0,colors,dvm_exception(vm));
    if (!colors) return false;
@@ -3750,6 +4299,8 @@ static const char *drawable_class_of_xml(const unsigned char *bytes, size_t n)
       { "clip", "Landroid/graphics/drawable/ClipDrawable;" },
       { "ripple", "Landroid/graphics/drawable/RippleDrawable;" },
       { "inset", "Landroid/graphics/drawable/InsetDrawable;" },
+      { "rotate", "Landroid/graphics/drawable/RotateDrawable;" },
+      { "animated-rotate", "Landroid/graphics/drawable/AnimatedRotateDrawable;" },
       { "level-list", "Landroid/graphics/drawable/LevelListDrawable;" },
       { "animation-list", "Landroid/graphics/drawable/AnimationDrawable;" },
       { "color", "Landroid/graphics/drawable/ColorDrawable;" },
@@ -3965,6 +4516,10 @@ static const struct rt_method rt_resources[] = {
    M("openRawResource", "(I)Ljava/io/InputStream;", res_open_raw_resource),
    M("openRawResource", "(ILandroid/util/TypedValue;)Ljava/io/InputStream;", res_open_raw_resource),
    M("getString", "(I)Ljava/lang/String;", res_getString),
+   M("getString", "(I[Ljava/lang/Object;)Ljava/lang/String;", context_get_string),
+   M("getQuantityText", "(II)Ljava/lang/CharSequence;", res_quantity_text),
+   M("getQuantityString", "(II)Ljava/lang/String;", res_quantity_string),
+   M("getQuantityString", "(II[Ljava/lang/Object;)Ljava/lang/String;", res_quantity_string),
    M("getText", "(I)Ljava/lang/CharSequence;", res_get_text),
    M("getText", "(ILjava/lang/CharSequence;)Ljava/lang/CharSequence;", res_get_text),
    M("getResourceEntryName", "(I)Ljava/lang/String;", res_getResourceEntryName),
@@ -4022,7 +4577,7 @@ static bool theme_apply_style(struct dvm *vm, dvm_ref self,
                               union dvm_value *out)
 {
    (void)nargs;
-   if (getenv("LUNARIA_TRACE_TA"))
+   if (dvm__env("LUNARIA_TRACE_TA"))
       fprintf(stderr, "[theme] apply theme=%x style=%08x force=%d\n",
               self, (unsigned)ARG(0).i, ARG(1).i != 0);
    if (!ARG(0).i) RETV();
@@ -4103,7 +4658,7 @@ static bool theme_resolve_attribute(struct dvm *vm, dvm_ref self,
          }
       }
    }
-   if (getenv("LUNARIA_TRACE_TA"))
+   if (dvm__env("LUNARIA_TRACE_TA"))
       fprintf(stderr, "[theme] resolve theme=%x attr=%08x kind=%x value=%08x\n",
               self, (unsigned)ARG(0).i, kind, (unsigned)value);
    if (kind && nargs > 1) {
@@ -4120,7 +4675,9 @@ static bool xml_as_attribute_set(struct dvm *vm, dvm_ref self,
                                  union dvm_value *out)
 { (void)vm; (void)self; RETL(nargs ? ARG(0).l : 0); }
 
+static bool xml_new_pull(struct dvm *,dvm_ref,const union dvm_value *,int,union dvm_value *);
 static const struct rt_method rt_xml[] = {
+   SM("newPullParser","()Lorg/xmlpull/v1/XmlPullParser;",xml_new_pull),
    SM("asAttributeSet",
       "(Lorg/xmlpull/v1/XmlPullParser;)Landroid/util/AttributeSet;",
       xml_as_attribute_set), M_END,
@@ -4220,7 +4777,7 @@ static const struct rt_field rt_typed_value_fields[] = {
 };
 
 static const struct rt_field rt_xml_parser_fields[] = {
-   {"encoding","Ljava/lang/String;"}, { "input", "Ljava/lang/Object;" }, {"reader","I"}, {"namespaceAware","Z"}, {"validating","Z"}, {"empty","I"},
+   {"encoding","Ljava/lang/String;"}, { "input", "Ljava/lang/Object;" }, {"reader","I"}, {"namespaceAware","Z"}, {"processDocDecl","Z"}, {"validating","Z"}, {"empty","I"},
    {"namespace","Ljava/lang/String;"}, {"prefix","Ljava/lang/String;"},
    {"attributeNamespaces","[Ljava/lang/String;"}, {"attributePrefixes","[Ljava/lang/String;"},
    { "resourceId", "I" }, { "eventIndex", "I" }, { "eventType", "I" },
@@ -4273,12 +4830,19 @@ static dvm_ref ax_value_string(struct dvm *vm, int32_t type, int32_t data)
  * storage. No host library or DOM: names, attributes and coalesced text only. */
 struct pull_event {int type,depth;char *name,*text;char **attrs;size_t count;bool empty;};
 struct pull_binding {struct pull_binding *next;char *prefix,*uri;int depth;};
+struct pull_entity {struct pull_entity *next;char *name,*value;bool active;};
+struct pull_default {struct pull_default *next;char *element,*name,*value;};
+struct pull_source {struct pull_source *next;char *bytes;size_t length,pos;int depth;struct pull_entity *entity;};
 struct pull_state {
  struct pull_event *events;size_t count,capacity,index;
  char *bytes;size_t length,pos;
  char **stack;size_t stack_cap;int depth;
  struct pull_binding *bindings;
- const char *error;bool oom,parsed,namespaces,root;
+ struct pull_entity *entities;
+ struct pull_default *defaults;
+ struct pull_source *sources;
+ const char *error;bool oom,parsed,namespaces,root,docdecl,doctype,external;
+
 };
 static void pull_event_free(struct pull_event *e)
 {
@@ -4293,6 +4857,9 @@ static void pull_destroy(void *data)
  struct pull_state *s=data;if(!s)return;
  for(size_t i=0;i<s->count;++i)pull_event_free(&s->events[i]);
  for(int i=0;i<s->depth;++i)free(s->stack[i]);
+ while(s->sources){struct pull_source *p=s->sources;s->sources=p->next;s->bytes=p->bytes;free(p);}
+ while(s->entities){struct pull_entity *p=s->entities;s->entities=p->next;free(p->name);free(p->value);free(p);}
+ while(s->defaults){struct pull_default *p=s->defaults;s->defaults=p->next;free(p->element);free(p->name);free(p->value);free(p);}
  pull_bindings_pop(s,0);free(s->stack);free(s->events);free(s->bytes);free(s);
 }
 static struct pull_event *pull_event_add(struct pull_state *s,int type)
@@ -4350,28 +4917,62 @@ static bool pull_codepoint(struct pull_state *s,char **text,size_t *length,uint3
  if(!pull_xml_char(cp)){s->error="Invalid XML character reference";return false;}
  char bytes[4];size_t n=pull_encode(bytes,cp);return pull_append(s,text,length,bytes,n);
 }
-static char *pull_decode(struct pull_state *s,const char *bytes,size_t n,bool attribute,bool entities)
+static struct pull_entity *pull_entity_find(struct pull_state *s,const char *name,size_t length)
 {
- char *text=malloc(n+1);size_t length=0;if(!text){s->oom=true;return NULL;}
+ for(struct pull_entity *e=s->entities;e;e=e->next)if(strlen(e->name)==length && !memcmp(e->name,name,length))return e;
+ return NULL;
+}
+static bool pull_entity_store(struct pull_state *s,char *name,char *value)
+{
+ if(!name || !value){free(name);free(value);return false;}
+ struct pull_entity *e=pull_entity_find(s,name,strlen(name));
+ if(e){free(name);free(e->value);e->value=value;return true;}
+ e=calloc(1,sizeof *e);if(!e){free(name);free(value);s->oom=true;return false;}
+ e->name=name;e->value=value;e->next=s->entities;s->entities=e;return true;
+}
+static char *pull_decode_mode(struct pull_state *s,const char *bytes,size_t n,bool attribute,bool entities,bool declaration)
+{
+ /* Most input shrinks when decoded. Grow only for declared replacements. */
+ char *text=malloc(n+1);size_t length=0,capacity=n+1;if(!text){s->oom=true;return NULL;}
  for(size_t i=0;i<n && !s->error && !s->oom;){
+  const char *replacement=NULL;char *owned=NULL;size_t count=0;char encoded[4];uint32_t cp=0;
   if(bytes[i]=='&' && entities){size_t end=i+1;while(end<n && bytes[end]!=';')++end;if(end==n){s->error="Unterminated XML entity";break;}
-   const char *name=bytes+i+1;size_t size=end-i-1;uint32_t cp=0;
-   if(size==2 && !memcmp(name,"lt",2))cp='<';else if(size==2 && !memcmp(name,"gt",2))cp='>';
+   const char *name=bytes+i+1;size_t size=end-i-1;
+   if(declaration && (!size || name[0]!='#')){replacement=bytes+i;count=end-i+1;}
+   else if(size==2 && !memcmp(name,"lt",2))cp='<';else if(size==2 && !memcmp(name,"gt",2))cp='>';
    else if(size==3 && !memcmp(name,"amp",3))cp='&';else if(size==4 && !memcmp(name,"quot",4))cp='"';else if(size==4 && !memcmp(name,"apos",4))cp='\'';
    else if(size && name[0]=='#'){size_t at=1;unsigned base=10;if(at<size && name[at]=='x'){base=16;++at;}bool digit=false;
     for(;at<size;++at){unsigned char c=(unsigned char)name[at];unsigned v=c>='0' && c<='9' ? c-'0' : base==16 && c>='a' && c<='f' ? c-'a'+10 : base==16 && c>='A' && c<='F' ? c-'A'+10 : 16;
      if(v>=base || cp>(0x10ffff-v)/base){s->error="Invalid XML character reference";break;}cp=cp*base+v;digit=true;}if(!digit)s->error="Empty XML character reference";}
-   else s->error="Undefined XML entity";
-   if(!s->error){if(!pull_xml_char(cp))s->error="Invalid XML character reference";else length+=pull_encode(text+length,cp);}i=end+1;
-  }else {size_t at=i;uint32_t cp;if(!pull_utf8(bytes,n,&at,&cp) || !pull_xml_char(cp)){s->error="Invalid XML character";break;}
+   else {struct pull_entity *e=pull_entity_find(s,name,size);
+    if(e){
+     if(e->active){s->error="Recursive XML entity";break;}
+     if(s->docdecl){e->active=true;owned=pull_decode_mode(s,e->value,strlen(e->value),attribute,true,false);e->active=false;replacement=owned;}
+     else replacement=e->value;
+     if(replacement)count=strlen(replacement);
+    }else if(s->external){replacement="";}else s->error="Undefined XML entity";
+   }
+   i=end+1;
+  }else {size_t at=i;if(!pull_utf8(bytes,n,&at,&cp) || !pull_xml_char(cp)){s->error="Invalid XML character";break;}
    if(attribute && cp=='<'){s->error="Less-than in XML attribute";break;}
+   if(declaration && cp=='%'){s->error="Parameter entity references are unsupported";break;}
    if(cp=='\r'){if(at<n && bytes[at]=='\n')++at;cp='\n';}
-   if(attribute && pull_space((unsigned char)cp) && cp<128)cp=' ';
-   length+=pull_encode(text+length,cp);i=at;
+   if(attribute && cp<128 && pull_space((unsigned char)cp))cp=' ';
+   i=at;
   }
+  if(!replacement && !s->error && !s->oom){if(!pull_xml_char(cp))s->error="Invalid XML character reference";else {count=pull_encode(encoded,cp);replacement=encoded;}}
+  if(!s->error && !s->oom && replacement){
+   if(count>SIZE_MAX-length-1)s->oom=true;
+   else if(length+count+1>capacity){size_t need=length+count+1,cap=capacity<=SIZE_MAX/2 ? capacity*2 : need;if(cap<need)cap=need;char *q=realloc(text,cap);if(q){text=q;capacity=cap;}else s->oom=true;}
+   if(!s->oom){memcpy(text+length,replacement,count);length+=count;}
+  }
+  free(owned);
  }
  text[length]=0;return text;
 }
+static char *pull_decode(struct pull_state *s,const char *bytes,size_t n,bool attribute,bool entities)
+{return pull_decode_mode(s,bytes,n,attribute,entities,false);}
+
 static bool pull_bind(struct pull_state *s,const char *prefix,const char *uri)
 {
  if(!strcmp(prefix,"xmlns") || !strcmp(uri,"http://www.w3.org/2000/xmlns/") ||
@@ -4398,21 +4999,162 @@ static bool pull_skip_markup(struct pull_state *s,const char *end,bool comment)
  if(comment){const char *dash=strstr(s->bytes+s->pos,"--");if(dash && dash<p){s->error="Double hyphen in XML comment";return false;}}
  char *checked=pull_decode(s,s->bytes+s->pos,n,false,false);free(checked);s->pos=(size_t)(p-s->bytes)+strlen(end);return !s->error && !s->oom;
 }
+/* Non-validating DTD parsing: Android keeps internal general entities and
+ * attribute defaults, skips external content, and rejects parameter references. */
+static bool pull_take(struct pull_state *s,const char *token)
+{
+ if(!pull_at(s,token)){s->error="Unexpected XML declaration token";return false;}
+ s->pos+=strlen(token);return true;
+}
+static char *pull_quoted(struct pull_state *s,int mode)
+{
+ if(s->pos>=s->length || (s->bytes[s->pos]!='\'' && s->bytes[s->pos]!='"')){s->error="Expected quoted XML declaration value";return NULL;}
+ char quote=s->bytes[s->pos++];size_t start=s->pos;
+ while(s->pos<s->length && s->bytes[s->pos]!=quote)++s->pos;
+ if(s->pos==s->length){s->error="Unterminated XML declaration value";return NULL;}
+ char *value=pull_decode_mode(s,s->bytes+start,s->pos-start,mode==1,mode!=0,mode==2);++s->pos;return value;
+}
+static bool pull_external_id(struct pull_state *s,bool system_required)
+{
+ bool public_id=pull_at(s,"PUBLIC");
+ if(!public_id && !pull_at(s,"SYSTEM"))return false;
+ s->pos+=6;pull_skip_space(s);
+ char *id=pull_quoted(s,0);free(id);if(s->error || s->oom)return false;
+ if(public_id){pull_skip_space(s);
+  if(system_required || pull_at(s,"\'") || pull_at(s,"\"")){id=pull_quoted(s,0);free(id);}
+ }
+ return !s->error && !s->oom;
+}
+static void pull_default_store(struct pull_state *s,const char *element,char *name,char *value)
+{
+ if(!name || !value){free(name);free(value);return;}
+ struct pull_default *d=s->defaults;
+ for(;d;d=d->next)if(!strcmp(d->element,element) && !strcmp(d->name,name))break;
+ if(d){free(name);free(d->value);d->value=value;return;}
+ d=calloc(1,sizeof *d);if(d)d->element=strdup(element);
+ if(!d || !d->element){free(d);free(name);free(value);s->oom=true;return;}
+ d->name=name;d->value=value;d->next=s->defaults;s->defaults=d;
+}
+static void pull_dtd_entity(struct pull_state *s)
+{
+ pull_skip_space(s);bool parameter=pull_at(s,"%");if(parameter){++s->pos;pull_skip_space(s);}
+ char *name=pull_name(s);pull_skip_space(s);char *value=NULL;
+ if(pull_at(s,"\'") || pull_at(s,"\""))value=pull_quoted(s,2);
+ else if(pull_external_id(s,true)){
+  value=strdup("");if(!value)s->oom=true;pull_skip_space(s);
+  if(pull_at(s,"NDATA")){s->pos+=5;pull_skip_space(s);char *notation=pull_name(s);free(notation);}
+ }else if(!s->error)s->error="Expected XML entity value";
+ pull_skip_space(s);if(!s->error)pull_take(s,">");
+ if(!s->error && !s->oom && !parameter && s->docdecl)pull_entity_store(s,name,value);
+ else {free(name);free(value);}
+}
+static void pull_dtd_attributes(struct pull_state *s)
+{
+ pull_skip_space(s);char *element=pull_name(s);
+ while(element && !s->error && !s->oom){
+  pull_skip_space(s);if(pull_at(s,">")){++s->pos;break;}
+  char *name=pull_name(s);pull_skip_space(s);
+  if(pull_at(s,"NOTATION")){s->pos+=8;pull_skip_space(s);}
+  if(pull_at(s,"(")){
+   ++s->pos;for(;;){pull_skip_space(s);char *item=pull_name(s);free(item);pull_skip_space(s);
+    if(s->error || s->oom)break;if(pull_at(s,")")){++s->pos;break;}if(!pull_take(s,"|"))break;}
+  }else {char *type=pull_name(s);free(type);}
+  pull_skip_space(s);bool required=false;
+  if(pull_at(s,"#")){++s->pos;
+   if(pull_at(s,"REQUIRED")){s->pos+=8;required=true;}else if(pull_at(s,"IMPLIED")){s->pos+=7;required=true;}else pull_take(s,"FIXED");pull_skip_space(s);}
+  char *value=NULL;
+  if(!s->error && !s->oom && !required)value=pull_quoted(s,1);
+  if(value && !s->error && !s->oom)pull_default_store(s,element,name,value);else {free(name);free(value);}
+ }
+ free(element);
+}
+static void pull_dtd_element(struct pull_state *s)
+{
+ pull_skip_space(s);char *name=pull_name(s);free(name);pull_skip_space(s);
+ if(pull_at(s,"(")){
+  int nesting=0;do {char c=s->bytes[s->pos++];if(c=='(')++nesting;else if(c==')')--nesting;}while(s->pos<s->length && nesting);
+  if(nesting){s->error="Unterminated XML content specification";return;}
+  if(pull_at(s,"?") || pull_at(s,"*") || pull_at(s,"+"))++s->pos;
+ }else if(pull_at(s,"EMPTY"))s->pos+=5;else pull_take(s,"ANY");
+ pull_skip_space(s);if(!s->error)pull_take(s,">");
+}
+static void pull_doctype(struct pull_state *s)
+{
+ if(s->root || s->doctype){s->error="Invalid XML document declaration";return;}s->doctype=true;
+ s->pos+=9;pull_skip_space(s);char *name=pull_name(s);free(name);pull_skip_space(s);
+ s->external=pull_external_id(s,true);pull_skip_space(s);
+ if(pull_at(s,"[")){
+  ++s->pos;
+  while(!s->error && !s->oom){pull_skip_space(s);
+   if(pull_at(s,"]")){++s->pos;break;}
+   if(pull_at(s,"<!--")){s->pos+=4;pull_skip_markup(s,"-->",true);}
+   else if(pull_at(s,"<?")){s->pos+=2;pull_skip_markup(s,"?>",false);}
+   else if(pull_at(s,"<!ENTITY")){s->pos+=8;pull_dtd_entity(s);}
+   else if(pull_at(s,"<!ATTLIST")){s->pos+=9;pull_dtd_attributes(s);}
+   else if(pull_at(s,"<!ELEMENT")){s->pos+=9;pull_dtd_element(s);}
+   else if(pull_at(s,"<!NOTATION")){s->pos+=10;pull_skip_space(s);char *notation=pull_name(s);free(notation);pull_skip_space(s);
+    if(!pull_external_id(s,false) && !s->error)s->error="Expected XML notation identifier";pull_skip_space(s);if(!s->error)pull_take(s,">");}
+   else {s->error=pull_at(s,"%") ? "Parameter entity references are unsupported" : "Invalid XML internal subset";}
+  }
+ }
+ pull_skip_space(s);if(!s->error)pull_take(s,">");
+}
+static struct pull_entity *pull_text_entity(struct pull_state *s,size_t pos,size_t *end)
+{
+ if(!s->docdecl || s->bytes[pos]!='&')return NULL;
+ size_t at=pos+1;while(at<s->length && s->bytes[at]!=';' && s->bytes[at]!='<' && !pull_space((unsigned char)s->bytes[at]))++at;
+ if(at==s->length || s->bytes[at]!=';')return NULL;
+ *end=at+1;
+ /* Predefined entities are always literal characters, even if redeclared. */
+ const char *name=s->bytes+pos+1;size_t n=at-pos-1;
+ if((n==2 && (!memcmp(name,"lt",2) || !memcmp(name,"gt",2))) || (n==3 && !memcmp(name,"amp",3)) || (n==4 && (!memcmp(name,"quot",4) || !memcmp(name,"apos",4))))return NULL;
+ return pull_entity_find(s,name,n);
+}
+static bool pull_source_push(struct pull_state *s,struct pull_entity *entity)
+{
+ if(entity->active){s->error="Recursive XML entity";return false;}
+ struct pull_source *p=malloc(sizeof *p);if(!p){s->oom=true;return false;}
+ *p=(struct pull_source){.next=s->sources,.bytes=s->bytes,.length=s->length,.pos=s->pos,.depth=s->depth,.entity=entity};
+ s->sources=p;s->bytes=entity->value;s->length=strlen(s->bytes);s->pos=0;entity->active=true;return true;
+}
+static bool pull_source_pop(struct pull_state *s)
+{
+ struct pull_source *p=s->sources;
+ if(!p)return false;
+ if(s->depth!=p->depth){s->error="Unbalanced XML entity replacement";return false;}
+ p->entity->active=false;s->bytes=p->bytes;s->length=p->length;s->pos=p->pos;s->sources=p->next;free(p);return true;
+}
+static void pull_default_attributes(struct pull_state *s,struct pull_event *e)
+{
+ const char *name=strchr(e->name,'\x1f');name=name ? name+1 : e->name;
+ size_t length=strcspn(name,"\x1f");
+ for(struct pull_default *d=s->defaults;d && !s->oom;d=d->next){
+  if(strlen(d->element)!=length || memcmp(d->element,name,length))continue;
+  bool exists=false;for(size_t i=0;i<e->count;++i)if(!strcmp(e->attrs[i*2],d->name)){exists=true;break;}
+  if(exists)continue;
+  char *key=strdup(d->name),*value=strdup(d->value);
+  char **attrs=realloc(e->attrs,(e->count+1)*2*sizeof *attrs);
+  if(!key || !value || !attrs){free(key);free(value);if(attrs)e->attrs=attrs;s->oom=true;break;}
+  e->attrs=attrs;e->attrs[2*e->count]=key;e->attrs[2*e->count+1]=value;++e->count;
+ }
+}
+
 static void pull_parse_document(struct pull_state *s)
 {
  size_t valid_count=0;
  if(s->length>=3 && !memcmp(s->bytes,"\xef\xbb\xbf",3))s->pos=3;
- while(s->pos<s->length && !s->error && !s->oom){
+ while(!s->error && !s->oom){
+  if(s->pos==s->length){if(pull_source_pop(s))continue;break;}
   valid_count=s->count;
+  size_t reference_end=0;struct pull_entity *entity=pull_text_entity(s,s->pos,&reference_end);
+  if(entity){s->pos=reference_end;if(!pull_source_push(s,entity))break;continue;}
   if(pull_at(s,"<!--")){s->pos+=4;pull_skip_markup(s,"-->",true);continue;}
   if(pull_at(s,"<?")){s->pos+=2;pull_skip_markup(s,"?>",false);continue;}
-  if(pull_at(s,"<!DOCTYPE")){s->pos+=9;int bracket=0;char quote=0;bool done=false;
-   while(s->pos<s->length){char c=s->bytes[s->pos++];if(quote){if(c==quote)quote=0;}else if(c=='\'' || c=='"')quote=c;else if(c=='[')++bracket;else if(c==']')--bracket;else if(c=='>' && !bracket){done=true;break;}}
-   if(!done || s->root)s->error="Invalid XML document declaration";continue;}
+  if(pull_at(s,"<!DOCTYPE")){pull_doctype(s);continue;}
   if(pull_at(s,"<![CDATA[") || s->bytes[s->pos]!='<'){
    bool cdata=pull_at(s,"<![CDATA[");if(cdata)s->pos+=9;size_t start=s->pos,end=start;
    if(cdata){const char *p=strstr(s->bytes+start,"]]>");if(!p){s->error="Unterminated CDATA";break;}end=(size_t)(p-s->bytes);s->pos=end+3;}
-   else {while(end<s->length && s->bytes[end]!='<')++end;s->pos=end;}
+   else {size_t ignored=0;while(end<s->length && s->bytes[end]!='<' && !pull_text_entity(s,end,&ignored))++end;s->pos=end;}
    char *text=pull_decode(s,s->bytes+start,end-start,false,!cdata);if(!text)break;
    if(!s->depth){for(char *p=text;*p;++p)if(!pull_space((unsigned char)*p)){s->error="Text outside XML root";break;}if(cdata)s->error="CDATA outside XML root";free(text);continue;}
    if(!cdata && strstr(s->bytes+start,"]]>") && (size_t)(strstr(s->bytes+start,"]]>")-s->bytes)<end){free(text);s->error="CDATA close in text";break;}
@@ -4420,7 +5162,9 @@ static void pull_parse_document(struct pull_state *s)
    if(e){size_t n=e->text ? strlen(e->text) : 0;pull_append(s,&e->text,&n,text,strlen(text));}free(text);continue;
   }
   ++s->pos;
-  if(pull_at(s,"/")){++s->pos;char *name=pull_name(s);pull_skip_space(s);
+  if(pull_at(s,"/")){
+   if(s->sources && s->depth<=s->sources->depth){s->error="XML entity closes an enclosing element";break;}
+   ++s->pos;char *name=pull_name(s);pull_skip_space(s);
    if(!name || !s->depth || strcmp(s->stack[s->depth-1],name) || s->pos>=s->length || s->bytes[s->pos]!='>'){free(name);s->error="Mismatched XML end tag";break;}++s->pos;
    struct pull_event *e=pull_event_add(s,3);if(e)e->name=pull_expand(s,name,false);free(name);free(s->stack[--s->depth]);pull_bindings_pop(s,s->depth+1);continue;
   }
@@ -4445,7 +5189,7 @@ static void pull_parse_document(struct pull_state *s)
     char *expanded=pull_expand(s,key,true);free(key);e->attrs[keep*2]=expanded;e->attrs[keep*2+1]=value;++keep;}e->count=keep;
    for(size_t i=0;i<e->count && !s->error && !s->oom;++i)for(size_t j=0;j<i;++j){const char *a=e->attrs[i*2],*b=e->attrs[j*2];const char *as=strchr(a,'\x1f'),*bs=strchr(b,'\x1f');size_t an=as && strchr(as+1,'\x1f') ? (size_t)(strchr(as+1,'\x1f')-a) : strlen(a),bn=bs && strchr(bs+1,'\x1f') ? (size_t)(strchr(bs+1,'\x1f')-b) : strlen(b);if(an==bn && !memcmp(a,b,an))s->error="Duplicate expanded XML attribute";}
   }
-  if(s->error || s->oom)break;e->name=pull_expand(s,name,false);if(!e->name)break;
+  if(s->error || s->oom)break;e->name=pull_expand(s,name,false);if(!e->name)break;pull_default_attributes(s,e);if(s->oom)break;
   bool empty=pull_at(s,"/>");e->empty=empty;s->pos+=empty ? 2 : 1;
   if(empty){struct pull_event *end=pull_event_add(s,3);if(end)end->name=pull_expand(s,name,false);free(s->stack[--s->depth]);pull_bindings_pop(s,s->depth+1);}
  }
@@ -4457,10 +5201,14 @@ static bool pull_feature(struct dvm *vm,dvm_ref self,const union dvm_value *args
 {
  const char *name=dvm_string_utf8(vm,ARG(0).l);
  if(!name){dvm__throw(vm,"java/lang/IllegalArgumentException","null XML feature");return false;}
- bool ns=!strcmp(name,"http://xmlpull.org/v1/doc/features.html#process-namespaces");
- if(!ns && nargs>1 && ARG(1).i){dvm__throw(vm,"org/xmlpull/v1/XmlPullParserException","Unsupported XML feature: %s",name);return false;}
- if(nargs>1){if(ns){struct dvm_object *o=dvm__obj(vm,self);if(o && o->data){dvm__throw(vm,"org/xmlpull/v1/XmlPullParserException","Cannot change namespaces after setInput");return false;}dvm_set_field(vm,self,"namespaceAware","Z",ARG(1));}RETV();}
- union dvm_value v={0};if(ns)dvm_get_field(vm,self,"namespaceAware","Z",&v);RETI(v.i);
+ const char *field=!strcmp(name,"http://xmlpull.org/v1/doc/features.html#process-namespaces") ? "namespaceAware" :
+    !strcmp(name,"http://xmlpull.org/v1/doc/features.html#process-docdecl") ? "processDocDecl" : NULL;
+ if(!field && nargs>1 && ARG(1).i){dvm__throw(vm,"org/xmlpull/v1/XmlPullParserException","Unsupported XML feature: %s",name);return false;}
+ if(nargs>1){if(field){struct dvm_object *o=dvm__obj(vm,self);struct pull_state *s=o && o->data_destroy==pull_destroy ? o->data : NULL;
+   if(s && s->parsed){dvm__throw(vm,"org/xmlpull/v1/XmlPullParserException","Cannot change XML features during parsing");return false;}
+   dvm_set_field(vm,self,field,"Z",ARG(1));if(s){if(!strcmp(field,"namespaceAware"))s->namespaces=ARG(1).i!=0;else s->docdecl=ARG(1).i!=0;}}
+  RETV();}
+ union dvm_value v={0};if(field)dvm_get_field(vm,self,field,"Z",&v);RETI(v.i);
 }
 static bool pull_factory_flag(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
@@ -4476,11 +5224,18 @@ static bool pull_factory_new(struct dvm *vm,dvm_ref self,const union dvm_value *
  if(!factory){union dvm_value ns={0};dvm_get_field(vm,self,"namespaceAware","Z",&ns);dvm_set_field(vm,ref,"namespaceAware","Z",ns);rt_set_int(vm,ref,"attributeCount",-1);}
  RETL(ref);
 }
+static bool xml_new_pull(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+ (void)self;(void)args;(void)nargs;
+ dvm_ref parser=dvm_new_object(vm,dvm_find_class(vm,"org/kxml2/io/KXmlParser"));if(!parser)return false;
+ dvm_set_field(vm,parser,"namespaceAware","Z",(union dvm_value){.i=1});
+ dvm_set_field(vm,parser,"processDocDecl","Z",(union dvm_value){.i=1});rt_set_int(vm,parser,"attributeCount",-1);RETL(parser);
+}
 static bool pull_set_input(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
  if(!ARG(0).l){dvm__throw(vm,"java/lang/IllegalArgumentException","null XML input");return false;}
  struct pull_state *s=calloc(1,sizeof *s);if(!s){dvm__throw(vm,"java/lang/OutOfMemoryError","XML parser");return false;}
- union dvm_value ns={0};dvm_get_field(vm,self,"namespaceAware","Z",&ns);s->namespaces=ns.i!=0;
+ union dvm_value ns={0};dvm_get_field(vm,self,"namespaceAware","Z",&ns);s->namespaces=ns.i!=0;dvm_get_field(vm,self,"processDocDecl","Z",&ns);s->docdecl=ns.i!=0;
  dvm_set_field(vm,self,"encoding","Ljava/lang/String;",nargs>1 ? ARG(1) : (union dvm_value){0});
  struct dvm_object *o=dvm__obj(vm,self);if(o->data_destroy)o->data_destroy(o->data);o->data=s;o->data_destroy=pull_destroy;
  dvm_set_field(vm,self,"input","Ljava/lang/Object;",ARG(0));rt_set_int(vm,self,"reader",nargs==1);rt_set_int(vm,self,"eventType",0);rt_set_int(vm,self,"depth",0);rt_set_int(vm,self,"attributeCount",-1);
@@ -5468,6 +6223,18 @@ static void content_install_params(struct dvm *vm, dvm_ref view,
                        "Landroid/view/ViewGroup$LayoutParams;", lp);
 }
 
+static bool act_set_content_resource(struct dvm *vm, dvm_ref self,
+                                     const union dvm_value *args, int nargs,
+                                     union dvm_value *out)
+{
+   union dvm_value window = {0}, content = {0};
+   if (!act_get_window(vm, self, NULL, 0, &window) || !window.l) return false;
+   if (!am_vcall(vm, window.l, "setContentView", "(I)V", args, nargs, out)) return false;
+   (void)dvm_get_field(vm, window.l, "contentView", "Landroid/view/View;", &content);
+   (void)dvm_set_field(vm, self, "contentView", "Landroid/view/View;", content);
+   RETV();
+}
+
 static bool act_set_content_view(struct dvm *vm, dvm_ref self,
                                  const union dvm_value *args, int nargs,
                                  union dvm_value *out)
@@ -6148,6 +6915,7 @@ struct act_rec {
    dvm_ref caller;        /* startActivityForResult: who gets the result */
    int32_t request_code;
    bool for_result;
+   bool stopped, visible;
 };
 static struct act_rec g_acts[ACT_MAX];
 static int g_nacts;
@@ -6167,6 +6935,9 @@ static bool g_task_background, g_task_move_back;
 
 static void ui_window_shown(struct dvm *vm, dvm_ref window);
 static void ui_window_hidden(struct dvm *vm, dvm_ref window);
+static dvm_ref ui_window_content(struct dvm *, dvm_ref);
+static dvm_ref ui_window_root(struct dvm *, dvm_ref);
+static void act_reconcile_visibility(struct dvm *);
 
 #define ACT_FLAG_NEW_TASK 0x10000000
 
@@ -6184,10 +6955,13 @@ void dvm__activity_visible(struct dvm *vm, dvm_ref activity)
 {
    if (act_index(activity) < 0 && g_nacts < ACT_MAX) {
       dvm_pin(vm, activity);
-      g_acts[g_nacts++] = (struct act_rec){ .activity = activity };
+      if(g_nacts && !g_task_background)
+         act_perform(vm,g_acts[g_nacts-1].activity,"Paused","onPause","()V",NULL,0);
+      g_acts[g_nacts++] = (struct act_rec){ .activity = activity, .visible = true };
    }
    g_task_background = false;
    ui_window_shown(vm, activity);
+   act_reconcile_visibility(vm);
 }
 
 /* A lifecycle method, called virtually so the app's override runs (and, via
@@ -6243,7 +7017,7 @@ static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
     * launcher, which the loader started before this stack existed. */
    if (from_activity && g_nacts == 0) {
       dvm_pin(vm, self);
-      g_acts[g_nacts++] = (struct act_rec){ .activity = self };
+      g_acts[g_nacts++] = (struct act_rec){ .activity = self, .visible = true };
    }
    dvm_pin(vm, intent);
    if (self) dvm_pin(vm, self);
@@ -6349,6 +7123,75 @@ static bool act_setIntent(struct dvm *vm, dvm_ref self, const union dvm_value *a
    RETV();
 }
 
+/* A paused Activity remains visible behind floating/translucent windows.
+ * Keep its window attached when stopped; visibility is independent of the
+ * window registry and of the content retained for findViewById/returning. */
+static bool act_window_opaque(struct dvm *vm,dvm_ref activity)
+{
+   union dvm_value theme={0};
+   if(!context_get_theme(vm,activity,NULL,0,&theme)) return true;
+   const uint32_t attrs[]={0x01010057u,0x01010058u}; /* windowIsFloating/Translucent */
+   for(unsigned i=0;i<sizeof attrs/sizeof *attrs;++i) {
+      int32_t value=0;const char *text=NULL;
+      int kind=theme_style_value(vm,theme.l,attrs[i],&value,&text);
+      for(unsigned depth=0;kind==2 && depth<64;++depth)
+         kind=theme_style_value(vm,theme.l,(uint32_t)value,&value,&text);
+      if(kind==1) kind=res_value_resolved((uint32_t)value,&value,&text);
+      if(kind==0x12 && value) return false;
+   }
+   return true;
+}
+static bool act_window_present(struct dvm *vm,dvm_ref window)
+{
+   /* Dialogs and popups inherit their owning Activity's app visibility. */
+   for(unsigned depth=0;window && depth<64;++depth) {
+      int index=act_index(window);
+      if(index>=0) return g_acts[index].visible;
+      union dvm_value owner={0};
+      (void)dvm_get_field(vm,window,"ownerActivity","Landroid/app/Activity;",&owner);
+      if(!owner.l) (void)dvm_get_field(vm,window,"context","Landroid/content/Context;",&owner);
+      if(!owner.l) (void)dvm_get_field(vm,window,"mBase","Landroid/content/Context;",&owner);
+      if(owner.l==window) break;
+      window=owner.l;
+   }
+   return true;
+}
+static void act_restart(struct dvm *vm,int index)
+{
+   if(!g_acts[index].stopped) return;
+   g_acts[index].stopped=false;
+   act_call(vm,g_acts[index].activity,"onRestart","()V",NULL,0);
+   act_perform(vm,g_acts[index].activity,"Started","onStart","()V",NULL,0);
+}
+static void act_window_visibility(struct dvm *vm,int index,bool visible)
+{
+   struct act_rec *rec=&g_acts[index];
+   if(rec->visible==visible) return;
+   rec->visible=visible;
+   dvm_ref content=ui_window_root(vm,rec->activity);
+   union dvm_value attached={0},value={.i=visible ? 0 : 8},ignored={0};
+   if(content) (void)dvm_get_field(vm,content,"attachedToWindow","Z",&attached);
+   if(attached.i && !am_vcall(vm,content,"dispatchWindowVisibilityChanged","(I)V",&value,1,&ignored))
+      ui_report_exception(vm,"dispatchWindowVisibilityChanged");
+   if(visible) ui_layout_changed(); else ui_invalidate();
+}
+static void act_reconcile_visibility(struct dvm *vm)
+{
+   bool covered=g_task_background,wanted[ACT_MAX]={0};
+   for(int i=g_nacts;i-->0;) {
+      wanted[i]=!covered;
+      if(!covered && act_window_opaque(vm,g_acts[i].activity)) covered=true;
+   }
+   for(int i=0;i<g_nacts;++i) {
+      if(wanted[i]) act_restart(vm,i);
+      act_window_visibility(vm,i,wanted[i]);
+      if(!wanted[i] && !g_acts[i].stopped) {
+         g_acts[i].stopped=true;
+         act_perform(vm,g_acts[i].activity,"Stopped","onStop","()V",NULL,0);
+      }
+   }
+}
+
 static void act_do_launch(struct dvm *vm, const struct act_launch *l)
 {
    dvm_ref obj = dvm_new_object(vm, l->cls);
@@ -6408,6 +7251,7 @@ static void act_do_launch(struct dvm *vm, const struct act_launch *l)
    act_call(vm, obj, "onPostCreate", "(Landroid/os/Bundle;)V", &bundle, 1);
    act_perform(vm, obj, "Resumed", "onResume", "()V", NULL, 0);
    ui_window_shown(vm, obj);
+   act_reconcile_visibility(vm);
    fprintf(stderr, "[activity] %s resumed (%d on the stack)\n",
            l->cls->name ? l->cls->name : "?", g_nacts);
 }
@@ -6419,12 +7263,13 @@ static void act_do_finish(struct dvm *vm, dvm_ref activity)
    const bool top = i == g_nacts - 1;
    struct act_rec rec = g_acts[i];
    if (top && !g_task_background) act_perform(vm, activity, "Paused", "onPause", "()V", NULL, 0);
-   act_perform(vm, activity, "Stopped", "onStop", "()V", NULL, 0);
+   if(!rec.stopped) act_perform(vm, activity, "Stopped", "onStop", "()V", NULL, 0);
    act_perform(vm, activity, "Destroyed", "onDestroy", "()V", NULL, 0);
    ui_window_hidden(vm, activity);
    memmove(&g_acts[i], &g_acts[i + 1], (size_t)(g_nacts - i - 1) * sizeof g_acts[0]);
    --g_nacts;
    if (!g_nacts) g_task_background=false;
+   act_reconcile_visibility(vm);
    if (rec.for_result && rec.caller) {
       union dvm_value code = { 0 }, data = { 0 };
       (void)dvm_get_field(vm, activity, "resultCode", "I", &code);
@@ -6457,9 +7302,8 @@ static void act_tick(struct dvm *vm)
       if (g_nacts && !g_task_background) {
          dvm_ref top=g_acts[g_nacts-1].activity;
          act_perform(vm,top,"Paused","onPause","()V",NULL,0);
-         act_perform(vm,top,"Stopped","onStop","()V",NULL,0);
-         for(int i=g_nacts;i-->0;) ui_window_hidden(vm,g_acts[i].activity);
          g_task_background=true;
+         act_reconcile_visibility(vm);
       }
    }
    while (g_nact_launches) {
@@ -6839,6 +7683,7 @@ static const struct rt_method rt_activity[] = {
    M("setContentView", "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
      act_set_content_view),
    M("setContentView", "(Landroid/view/View;)V", act_set_content_view),
+   M("setContentView", "(I)V", act_set_content_resource),
    M("addContentView",
      "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
      act_add_content_view),
@@ -6873,6 +7718,7 @@ static const struct rt_method rt_activity[] = {
    M("onConfigurationChanged", "(Landroid/content/res/Configuration;)V", empty_void),
    M("onWindowFocusChanged", "(Z)V", empty_void),
    M("onCreate", "(Landroid/os/Bundle;)V", act_on_create),
+   M("onRestart", "()V", nop_void),
    M("onStart", "()V", act_on_start),
    M("onResume", "()V", act_on_resume),
    M("onPause", "()V", act_on_pause),
@@ -7736,7 +8582,7 @@ static dvm_ref dx_item_drawable(struct dvm *vm, struct dx *x, const struct dx_ta
       else dx_skip(x);
    }
    if (!d && !dvm_exception(vm)) {
-      if (getenv("LUNARIA_TRACE_DRAWABLE"))
+      if (dvm__env("LUNARIA_TRACE_DRAWABLE"))
          fprintf(stderr,"[drawable] missing item: theme=%x type=%x value=%08x depth=%u\n",
                  x->theme,type,data,depth);
       dvm__throw(vm,"org/xmlpull/v1/XmlPullParserException",
@@ -8254,13 +9100,16 @@ static dvm_ref dx_build(struct dvm *vm, struct dx *x, const struct dx_tag *t,
    const bool selector = !strcmp(t->name, "selector");
    const bool transition = !strcmp(t->name, "transition");
    const bool layers = transition || !strcmp(t->name, "layer-list") || !strcmp(t->name, "ripple");
-   const bool inset = !strcmp(t->name, "inset") || !strcmp(t->name, "rotate") ||
+   const bool animated_rotate=!strcmp(t->name,"animated-rotate");
+   const bool inset = animated_rotate || !strcmp(t->name, "inset") || !strcmp(t->name, "rotate") ||
                       !strcmp(t->name, "scale") || !strcmp(t->name, "clip");
    if (selector || layers || inset) {
       const char *cls = selector ? "Landroid/graphics/drawable/StateListDrawable;"
          : transition ? "Landroid/graphics/drawable/TransitionDrawable;"
          : !strcmp(t->name, "ripple") ? "Landroid/graphics/drawable/RippleDrawable;"
          : layers ? "Landroid/graphics/drawable/LayerDrawable;"
+         : animated_rotate ? "Landroid/graphics/drawable/AnimatedRotateDrawable;"
+         : !strcmp(t->name,"rotate") ? "Landroid/graphics/drawable/RotateDrawable;"
          : !strcmp(t->name,"clip") ? "Landroid/graphics/drawable/ClipDrawable;"
          : "Landroid/graphics/drawable/InsetDrawable;";
       dvm_ref list = dx_new(vm, cls);
@@ -8279,6 +9128,41 @@ static dvm_ref dx_build(struct dvm *vm, struct dx *x, const struct dx_tag *t,
       dvm_ref shown = 0, first = 0;
       if (inset) {
          shown = dx_item_drawable(vm, x, t, depth);
+         if(animated_rotate || !strcmp(t->name,"rotate")) {
+            union dvm_value ignored={0};
+            if(!shown || !(animated_rotate ? animated_rotate_init(vm,list,NULL,0,&ignored) : rotate_init(vm,list,NULL,0,&ignored))) {
+               if(!dvm_exception(vm)) dvm__throw(vm,"org/xmlpull/v1/XmlPullParserException","<%s> requires a drawable",t->name);
+               dvm_unpin(vm,list);return 0;
+            }
+            if(!animated_rotate) {
+               rotate_set_float(vm,list,"fromDegrees",dx_float(x,t,"fromDegrees",0.0f));
+               rotate_set_float(vm,list,"toDegrees",dx_float(x,t,"toDegrees",360.0f));
+               rotate_set_float(vm,list,"currentDegrees",rotate_float(vm,list,"fromDegrees"));
+            } else {
+               rt_set_int(vm,list,"framesCount",dx_int(x,t,"framesCount",12));
+               rt_set_int(vm,list,"frameDuration",dx_int(x,t,"frameDuration",150));
+            }
+            const char *pivots[]={"pivotX","pivotY"};
+            const char *relative[]={"pivotXRelative","pivotYRelative"};
+            for(int i=0;i<2;++i) {
+               uint8_t type;uint32_t data;
+               if(dx_attr(x,t,pivots[i],&type,&data)) {
+                  union dvm_value value={.i=(int32_t)data},decoded={0};
+                  if(type==AX_FRACTION) (void)typed_value_complexToFloat(vm,0,&value,1,&decoded);
+                  else decoded.f=dx_float(x,t,pivots[i],0.5f);
+                  rotate_set_float(vm,list,pivots[i],decoded.f);
+                  (void)dvm_set_field(vm,list,relative[i],"Z",(union dvm_value){.i=type==AX_FRACTION});
+               }
+            }
+            union dvm_value child={.l=shown};
+            if(!wrapper_set_drawable(vm,list,&child,1,&ignored)) {dvm_unpin(vm,list);return 0;}
+            if(animated_rotate) {
+               union dvm_value yes={.i=1};
+               if(!am_vcall(vm,shown,"setFilterBitmap","(Z)V",&yes,1,&ignored) ||
+                  (ui_is_a(vm,shown,"android/graphics/drawable/BitmapDrawable") &&
+                   !am_vcall(vm,shown,"setAntiAlias","(Z)V",&yes,1,&ignored))) {dvm_unpin(vm,list);return 0;}
+            }
+         }
          if(!strcmp(t->name,"clip") && shown) {
             union dvm_value input[3]={{.l=shown},{.i=dx_int(x,t,"gravity",3)},{.i=dx_int(x,t,"clipOrientation",1)}},ignored={0};
             if(!clip_drawable_init(vm,list,input,3,&ignored)) {dvm_unpin(vm,list);return 0;}
@@ -8345,7 +9229,7 @@ static dvm_ref drawable_from_resource(struct dvm *vm, uint32_t id, unsigned dept
    if (depth > 8 || !id || arm_exec_apk_resource_value(id, &iv, &path) != 'L' || !path)
       return 0;
    const size_t len = strlen(path);
-   if (getenv("LUNARIA_TRACE_DRAWABLE"))
+   if (dvm__env("LUNARIA_TRACE_DRAWABLE"))
       fprintf(stderr,"[drawable] resource=%08x theme=%x depth=%u path=%s\n",id,theme,depth,path);
    if (len <= 4 || strcasecmp(path + len - 4, ".xml")) return 0;
    size_t n = 0;
@@ -8427,6 +9311,52 @@ static void ax_apply_inset_shorthands(struct dvm *vm,dvm_ref view,const uint8_t 
 
 /* android:gravity and android:layout_gravity are bit masks, not enums; the
  * constants are the platform's. */
+/* View.DeclaredOnClickListener resolves a public (View) handler against the
+ * view's Context and its ContextWrapper chain on the first click. Inflating
+ * a view does not require its handler to exist yet. */
+static bool declared_click_on_click(struct dvm *vm,dvm_ref self,
+                                    const union dvm_value *args,int nargs,
+                                    union dvm_value *out)
+{
+   (void)args;(void)nargs;(void)out;
+   dvm_ref view=ui_obj(vm,self,"hostView","Landroid/view/View;");
+   dvm_ref named=ui_obj(vm,self,"methodName","Ljava/lang/String;");
+   const char *name=dvm_string_utf8(vm,named);
+   dvm_ref context=ui_obj(vm,self,"resolvedContext","Landroid/content/Context;");
+   if(!context)context=ui_obj(vm,view,"context","Landroid/content/Context;");
+   for(unsigned depth=0;context && depth<64;depth++) {
+      union dvm_value restricted={0};
+      if(!am_vcall(vm,context,"isRestricted","()Z",NULL,0,&restricted))return false;
+      struct dvm_class *cls=dvm_object_class(vm,context);
+      struct dvm_method *method=name && cls
+         ? dvm_find_method(vm,cls,name,"(Landroid/view/View;)V") : NULL;
+      if(!restricted.i && method && (method->access&DEX_ACC_PUBLIC)) {
+         (void)dvm_set_field(vm,self,"resolvedContext","Landroid/content/Context;",
+                            (union dvm_value){.l=context});
+         union dvm_value argument={.l=view},ignored={0};
+         return dvm_call(vm,method,(method->access&DEX_ACC_STATIC) ? 0 : context,
+                         &argument,1,&ignored);
+      }
+      if(!ui_is_a(vm,context,"android/content/ContextWrapper"))break;
+      union dvm_value base={0};
+      if(!am_vcall(vm,context,"getBaseContext","()Landroid/content/Context;",NULL,0,&base))return false;
+      if(base.l==context)break;
+      context=base.l;
+   }
+   dvm__throw(vm,"java/lang/IllegalStateException",
+              "Could not find public method %s(View) in a parent Context for android:onClick",
+              name ? name : "");
+   return false;
+}
+static const struct rt_field rt_declared_click_fields[]={
+   {"hostView","Landroid/view/View;"}, {"methodName","Ljava/lang/String;"},
+   {"resolvedContext","Landroid/content/Context;"}, F_END
+};
+static const struct rt_method rt_declared_click[]={
+   M("onClick","(Landroid/view/View;)V",declared_click_on_click),M_END
+};
+static const char *const rt_declared_click_ifaces[]={"Landroid/view/View$OnClickListener;",NULL};
+
 static void ax_apply_attribute(struct dvm *vm, dvm_ref view, const char *name,
                                uint8_t type, uint32_t data,
                                char *const *strings, uint32_t nstrings)
@@ -8504,6 +9434,24 @@ static void ax_apply_attribute(struct dvm *vm, dvm_ref view, const char *name,
       dvm_ref text = ax_string(vm, type, data, strings, nstrings);
       if (text)
          (void)dvm_set_field(vm, view, "tag", "Ljava/lang/Object;", (union dvm_value){ .l = text });
+      return;
+   }
+   if (!strcmp(name,"onClick")) {
+      dvm_ref method_name=ax_string(vm,type,data,strings,nstrings);
+      if(!method_name)return;
+      union dvm_value restricted={0};
+      if(context.l && !am_vcall(vm,context.l,"isRestricted","()Z",NULL,0,&restricted))return;
+      if(restricted.i) {
+         dvm__throw(vm,"java/lang/IllegalStateException",
+                    "android:onClick cannot be used within a restricted context");
+         return;
+      }
+      dvm_ref listener=dvm_new_object(vm,dvm_find_class(vm,"android/view/View$DeclaredOnClickListener"));
+      if(!listener)return;
+      (void)dvm_set_field(vm,listener,"hostView","Landroid/view/View;",(union dvm_value){.l=view});
+      (void)dvm_set_field(vm,listener,"methodName","Ljava/lang/String;",(union dvm_value){.l=method_name});
+      union dvm_value argument={.l=listener},ignored={0};
+      (void)am_vcall(vm,view,"setOnClickListener","(Landroid/view/View$OnClickListener;)V",&argument,1,&ignored);
       return;
    }
    if (!strcmp(name, "enabled"))
@@ -8645,7 +9593,7 @@ static dvm_ref li_inflate_resource(struct dvm *vm, dvm_ref inflater,dvm_ref cont
    int32_t iv = 0; const char *path = NULL;
    if (arm_exec_apk_resource_value(resource, &iv, &path) != 'L' || !path)
       return 0;
-   if (getenv("LUNARIA_DVM_TRACE_LAYOUT"))
+   if (dvm__env("LUNARIA_DVM_TRACE_LAYOUT"))
       fprintf(stderr, "[dvm] layout 0x%08x -> %s\n", resource, path);
    size_t n = 0;
    unsigned char *b = arm_exec_asset_read(path, &n);
@@ -8686,7 +9634,7 @@ static dvm_ref li_inflate_resource(struct dvm *vm, dvm_ref inflater,dvm_ref cont
             if (an && !strcmp(an, "layout") && value_type == 0x01)
                include = data;
          }
-         if (getenv("LUNARIA_DVM_TRACE_LAYOUT"))
+         if (dvm__env("LUNARIA_DVM_TRACE_LAYOUT"))
             fprintf(stderr, "[dvm] layout tag depth=%u %s id=0x%08x include=0x%08x\n",
                     sp, tag ? tag : "?", id, include);
          dvm_ref parent = sp ? stack[sp - 1] : root_parent;
@@ -8820,7 +9768,7 @@ static bool li_inflate(struct dvm *vm, dvm_ref self,
                        const union dvm_value *args, int nargs,
                        union dvm_value *out)
 {
-   if (getenv("LUNARIA_DVM_TRACE_LAYOUT") && nargs > 0) {
+   if (dvm__env("LUNARIA_DVM_TRACE_LAYOUT") && nargs > 0) {
       int32_t value = 0; const char *path = NULL;
       int kind = arm_exec_apk_resource_value((uint32_t)ARG(0).i,
                                               &value, &path);
@@ -8839,6 +9787,41 @@ static bool li_inflate(struct dvm *vm, dvm_ref self,
    if (dvm_exception(vm)) {li_wrap_error(vm,(uint32_t)ARG(0).i); return false;}
    if (attach) RETL(view ? parent : 0);
    RETL(view);
+}
+
+/* PhoneWindow installs content inside android.R.id.content. Passing that
+ * parent to the inflater creates the root's XML LayoutParams and supports
+ * <merge>; replacement removes only the content children, never the decor. */
+static bool window_set_content(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   union dvm_value parent = {0}, decor = {0}, ignored = {0};
+   if (!window_getDecorView(vm,self,NULL,0,&decor)) return false;
+   (void)dvm_get_field(vm,self,"contentParent","Landroid/view/ViewGroup;",&parent);
+   if (!parent.l) return false;
+   if (!vg_remove_all(vm,parent.l,NULL,0,&ignored)) return false;
+   const char *sig = builtin_sig();
+   if (sig && sig[1]=='I') {
+      union dvm_value context = {0}, inflater = {0};
+      (void)dvm_get_field(vm,self,"context","Landroid/content/Context;",&context);
+      if (!li_from(vm,0,&context,1,&inflater)) return false;
+      (void)li_inflate_resource(vm,inflater.l,context.l,(uint32_t)ARG(0).i,0,parent.l,true);
+      if (dvm_exception(vm)) {li_wrap_error(vm,(uint32_t)ARG(0).i); return false;}
+   } else {
+      if (!nargs || !ARG(0).l) {
+         dvm__throw(vm,"java/lang/IllegalArgumentException","Cannot add a null child view");return false;
+      }
+      content_install_params(vm,ARG(0).l,args,nargs);
+      if (!vg_add_view(vm,parent.l,args,1,&ignored)) return false;
+   }
+   (void)dvm_set_field(vm,self,"contentView","Landroid/view/View;",parent);
+   union dvm_value callback = {0};
+   (void)dvm_get_field(vm,self,"callback","Landroid/view/Window$Callback;",&callback);
+   struct dvm_method *changed = callback.l ? dvm_find_method(vm,
+      dvm_object_class(vm,callback.l),"onContentChanged","()V") : NULL;
+   if (changed && !dvm_call(vm,changed,callback.l,NULL,0,&ignored)) return false;
+   RETV();
 }
 
 static bool view_inflate(struct dvm *vm, dvm_ref self,
@@ -10997,7 +11980,7 @@ static void ui_measure_relative(struct dvm *vm, dvm_ref view, struct ui_ms ws,
    ui_pad(vm, view, pad);
    dvm_ref kids[UI_MAX_KIDS];
    const uint32_t nk = ui_children(vm, view, kids, UI_MAX_KIDS);
-   if (getenv("LUNARIA_UI_LAYOUT_TRACE"))
+   if (dvm__env("LUNARIA_UI_LAYOUT_TRACE"))
       fprintf(stderr, "[ui-relative] v%u has %u children\n", (unsigned)view, nk);
    struct ui_lp lps[UI_MAX_KIDS];
    const int32_t my_w = ws.mode == UI_MS_UNSPEC ? -1 : ws.size;
@@ -11006,7 +11989,7 @@ static void ui_measure_relative(struct dvm *vm, dvm_ref view, struct ui_ms ws,
    int32_t width = wrap_w ? 0 : my_w, height = wrap_h ? 0 : my_h;
    for (uint32_t i = 0; i < nk; ++i) {
       ui_read_lp(vm, kids[i], &lps[i]);
-      if (getenv("LUNARIA_UI_LAYOUT_TRACE"))
+      if (dvm__env("LUNARIA_UI_LAYOUT_TRACE"))
          fprintf(stderr, "[ui-relative]   child v%u %s lp=%dx%d parentBottom=%d above=%d below=%d\n",
                  (unsigned)kids[i], ui_class_simple_name(vm, kids[i]), lps[i].w, lps[i].h,
                  lps[i].rules[RL_ALIGN_PARENT_BOTTOM], lps[i].rules[RL_ABOVE], lps[i].rules[RL_BELOW]);
@@ -11151,7 +12134,7 @@ static void ui_measure_relative(struct dvm *vm, dvm_ref view, struct ui_ms ws,
       }
       c->x = c->l;
       c->y = c->t;
-      if (getenv("LUNARIA_UI_LAYOUT_TRACE"))
+      if (dvm__env("LUNARIA_UI_LAYOUT_TRACE"))
          fprintf(stderr, "[ui-relative]   placed v%u at %d,%d size %dx%d\n",
                  (unsigned)kids[i], c->x, c->y, c->w, c->h);
    }
@@ -11223,7 +12206,7 @@ static void ui_measure(struct dvm *vm, dvm_ref view, struct ui_ms ws,
       }
    }
    static int trace = -1;
-   if (trace < 0) trace = getenv("LUNARIA_UI_LAYOUT_TRACE") != NULL;
+   if (trace < 0) trace = dvm__env("LUNARIA_UI_LAYOUT_TRACE") != NULL;
    if (trace) {
       struct ui_lp lp;
       ui_read_lp(vm, view, &lp);
@@ -11246,7 +12229,7 @@ static void ui_measure_dispatch(struct dvm *vm, dvm_ref view, struct ui_ms ws,
                                 struct ui_ms hs, unsigned depth)
 {
    struct ui_node *n = ui_node(vm, view);
-   if (getenv("LUNARIA_UI_LAYOUT_TRACE"))
+   if (dvm__env("LUNARIA_UI_LAYOUT_TRACE"))
       fprintf(stderr, "[ui-dispatch] v%u %s node=%d gone=%d depth=%u\n", (unsigned)view,
               ui_class_simple_name(vm, view), n != NULL, ui_gone(vm, view), depth);
    if (!n) return;
@@ -11327,7 +12310,7 @@ static bool view_measure_api(struct dvm *vm, dvm_ref self,
    }
    view_measure_remember(vm,self,ARG(0).i,ARG(1).i,epoch);
    static int trace = -1;
-   if (trace < 0) trace = getenv("LUNARIA_UI_LAYOUT_TRACE") != NULL;
+   if (trace < 0) trace = dvm__env("LUNARIA_UI_LAYOUT_TRACE") != NULL;
    if (trace) {
       static const char mode[] = "UEA";
       const uint32_t ws = (uint32_t)args[0].i, hs = (uint32_t)args[1].i;
@@ -11337,7 +12320,7 @@ static bool view_measure_api(struct dvm *vm, dvm_ref self,
               mode[(hs >> 30) & 3], hs & 0x3fffffffu,
               rt_get_int(vm, self, "measuredWidth"), rt_get_int(vm, self, "measuredHeight"));
       static int params_trace = -1;
-      if (params_trace < 0) params_trace = getenv("LUNARIA_UI_PARAMS_TRACE") != NULL;
+      if (params_trace < 0) params_trace = dvm__env("LUNARIA_UI_PARAMS_TRACE") != NULL;
       if (params_trace) {
          dvm_ref params = ui_obj(vm, self, "layoutParams", "Landroid/view/ViewGroup$LayoutParams;");
          fprintf(stderr, "[ui-params] v%u id=%d params=v%u %s", (unsigned)self,
@@ -11519,7 +12502,7 @@ static bool view_layout_api(struct dvm *vm, dvm_ref self,
    }
    struct ui_node *n = ui_node(vm, self);
    if (n) {
-      if (getenv("LUNARIA_UI_LAYOUT_TRACE") && n->y != ARG(1).i)
+      if (dvm__env("LUNARIA_UI_LAYOUT_TRACE") && n->y != ARG(1).i)
          fprintf(stderr, "[ui-relayout] v%u %s y %d -> %d\n", (unsigned)self,
                  ui_class_simple_name(vm, self), n->y, ARG(1).i);
       n->x = ARG(0).i; n->y = ARG(1).i;
@@ -11529,7 +12512,7 @@ static bool view_layout_api(struct dvm *vm, dvm_ref self,
    union dvm_value required = {0};
    (void)dvm_get_field(vm, self, "layoutRequired", "Z", &required);
    if (changed || required.i) {
-      if (getenv("LUNARIA_UI_LAYOUT_TRACE"))
+      if (dvm__env("LUNARIA_UI_LAYOUT_TRACE"))
          fprintf(stderr, "[ui-layout-call] v%u %s changed=%d required=%d bounds=%d,%d,%d,%d\n",
                  (unsigned)self, ui_class_simple_name(vm, self), changed, required.i,
                  ARG(0).i, ARG(1).i, ARG(2).i, ARG(3).i);
@@ -11644,7 +12627,7 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
                           ui_is_a(vm, view, "androidx/core/widget/NestedScrollView");
 
    struct ui_buf *b2 = css;
-   if (getenv("LUNARIA_UI_LAYOUT_TRACE"))
+   if (dvm__env("LUNARIA_UI_LAYOUT_TRACE"))
       fprintf(stderr, "[ui-emit] v%u %s at %d,%d %dx%d\n", (unsigned)view, simple,
               n->x, n->y, n->w, n->h);
    /* The box the layout pass gave it, against the parent's top-left — moved by
@@ -11776,7 +12759,7 @@ static bool g_ui_measure_dirty = true;
 static struct {uint64_t builds,build_ns,draws,draw_ns,publish_ns,layout_ns,scroll_ns,emit_ns;} g_ui_render_prof;
 static uint64_t ui_render_ns(void)
 {
-   if(!getenv("LUNARIA_UI_RENDER_PROF")) return 0;
+   if(!dvm__env("LUNARIA_UI_RENDER_PROF")) return 0;
    struct timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);
    return (uint64_t)ts.tv_sec*1000000000u+(uint64_t)ts.tv_nsec;
 }
@@ -11858,6 +12841,16 @@ static dvm_ref ui_window_content(struct dvm *vm, dvm_ref window)
    return 0;
 }
 
+/* Content may be a subtree below PhoneWindow's content parent and DecorView.
+ * Attachment and window visibility belong to the complete root hierarchy. */
+static dvm_ref ui_window_root(struct dvm *vm,dvm_ref window)
+{
+   return view_hierarchy_root(vm,ui_window_content(vm,window));
+}
+
+static dvm_ref ui_presented_window_content(struct dvm *vm,dvm_ref window)
+{ return act_window_present(vm,window) ? ui_window_content(vm,window) : 0; }
+
 /* The WindowManager.LayoutParams a window was given, if it has any.  A Dialog
  * keeps its Window in a field; a Window carries them itself. */
 static dvm_ref ui_window_params(struct dvm *vm, dvm_ref window)
@@ -11894,7 +12887,7 @@ static bool ui_theme_color(int32_t theme, uint32_t attr, int32_t *argb)
    for (int hops = 0; hops < 6 && theme; ++hops) {
       int32_t value = 0; const char *string = NULL;
       int kind = arm_exec_apk_style_value((uint32_t)theme, attr, &value, &string);
-      if (getenv("LUNARIA_TRACE_TA"))
+      if (dvm__env("LUNARIA_TRACE_TA"))
          fprintf(stderr, "[theme] 0x%x attr 0x%x -> kind 0x%x value 0x%x\n", (unsigned)theme, (unsigned)attr, (unsigned)kind, (unsigned)value);
       if (kind >= AX_COLOR_ARGB8 && kind <= AX_COLOR_RGB4) { *argb = value; return true; }
       if (kind == AX_ATTRIBUTE) { attr = (uint32_t)value; continue; }   /* ?attr/name */
@@ -11948,10 +12941,10 @@ static void ui_emit_window_box(struct dvm *vm, struct ui_buf *css, dvm_ref windo
    struct ui_ms hs = h == -1 ? ui_ms_make(UI_MS_EXACT, sh)
                    : h == -2 ? ui_ms_make(UI_MS_ATMOST, sh)
                    : ui_ms_make(UI_MS_EXACT, h);
-   dvm_ref content = ui_window_content(vm, window);
+   dvm_ref content = ui_presented_window_content(vm, window);
    int32_t win_w = ws.size, win_h = hs.size;
    if (content) {
-      if (!view_dispatch_attachment(vm, content, true)) {
+      if (!view_dispatch_attachment(vm, ui_window_root(vm,window), true)) {
          ui_report_exception(vm, "onAttachedToWindow"); return;
       }
       struct ui_lp clp;
@@ -12106,7 +13099,7 @@ static void ui_rebuild(struct dvm *vm)
     * modal"). */
    int drawable = 0;
    for (int i = 0; i < g_ui_nwindows; ++i)
-      if (ui_window_content(vm, g_ui_windows[i])) ++drawable;
+      if (ui_presented_window_content(vm, g_ui_windows[i])) ++drawable;
    if (!drawable) {
       luna_overlay_set_document(NULL, NULL);
       return;
@@ -12134,18 +13127,18 @@ static void ui_rebuild(struct dvm *vm)
    bool dim = false;
    for (int i = 0; i < g_ui_nwindows; ++i)
       if (ui_window_dims(vm, g_ui_windows[i]) &&
-          ui_window_content(vm, g_ui_windows[i]))
+          ui_presented_window_content(vm, g_ui_windows[i]))
          dim = true;
    if (dim) ui_puts(&b, "<div id=\"scrim\" class=\"scrim\"></div>");
    for (int i = 0; i < g_ui_nwindows; ++i) {
-      dvm_ref content = ui_window_content(vm, g_ui_windows[i]);
+      dvm_ref content = ui_presented_window_content(vm, g_ui_windows[i]);
       if (!content) continue;
       ui_printf(&b, "<div id=\"win%u\" class=\"root\">", (unsigned)g_ui_windows[i]);
       uint64_t phase=started ? ui_render_ns() : 0;
       ui_emit_window_box(vm, &css, g_ui_windows[i]);
       /* Window layout has now measured and positioned this tree.  Dumping
        * before it reports stale boxes (or zeroes for newly added children). */
-      if (getenv("LUNARIA_UI_TREE")) ui_dump_tree(vm, content, 0);
+      if (dvm__env("LUNARIA_UI_TREE")) ui_dump_tree(vm, content, 0);
       if(started) {uint64_t now=ui_render_ns();g_ui_render_prof.layout_ns+=now-phase;phase=now;}
       if(!ui_compute_scroll(vm,content,0)) ui_report_exception(vm,"computeScroll");
       if(started) {uint64_t now=ui_render_ns();g_ui_render_prof.scroll_ns+=now-phase;phase=now;}
@@ -12381,7 +13374,7 @@ static void ui_window_hidden(struct dvm *vm, dvm_ref window)
 {
    for (int i = 0; i < g_ui_nwindows; ++i) {
       if (g_ui_windows[i] != window) continue;
-      dvm_ref content = ui_window_content(vm, window);
+      dvm_ref content = ui_window_root(vm, window);
       if (content && !view_dispatch_attachment(vm, content, false))
          ui_report_exception(vm, "onDetachedFromWindow");
       memmove(&g_ui_windows[i], &g_ui_windows[i + 1],

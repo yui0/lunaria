@@ -10,6 +10,7 @@
  */
 
 #include "dvm/dvm_internal.h"
+#include "dvm/platform_classes.h"
 #include "luna_boot.h"
 #include "luna_overlay.h"
 #include "arm_exec.h"
@@ -51,6 +52,32 @@ static const char *dvm__env_once(_Atomic(const char *) *slot, const char *name)
       atomic_store_explicit(slot, v, memory_order_relaxed);
    }
    return v;
+}
+
+/* The same idea for call sites that name the variable with a literal and have
+ * no slot of their own: a table keyed by the literal's address.  Only for
+ * the trace and profiling switches, which nothing changes after start-up;
+ * the ANDROID_* launch settings are rewritten while an app runs (and by the
+ * tests) and keep calling getenv().  Two threads racing on an empty entry both store the
+ * same pointers; the key is published last, so a reader never sees a value
+ * that is not its own. */
+#define DVM_ENV_SLOTS 256u
+static struct { _Atomic(const char *) key; _Atomic(const char *) val; } g_env_cache[DVM_ENV_SLOTS];
+
+const char *dvm__env(const char *name)
+{
+   unsigned i = (unsigned)(((uintptr_t)name >> 3) * 2654435761u >> 8) & (DVM_ENV_SLOTS - 1u);
+   for (unsigned n = 0; n < DVM_ENV_SLOTS; ++n, i = (i + 1u) & (DVM_ENV_SLOTS - 1u)) {
+      const char *k = atomic_load_explicit(&g_env_cache[i].key, memory_order_acquire);
+      if (k == name) return atomic_load_explicit(&g_env_cache[i].val, memory_order_relaxed);
+      if (!k) {
+         const char *v = getenv(name);
+         atomic_store_explicit(&g_env_cache[i].val, v, memory_order_relaxed);
+         atomic_store_explicit(&g_env_cache[i].key, name, memory_order_release);
+         return v;
+      }
+   }
+   return getenv(name);
 }
 
 /* The three the hot paths ask for. */
@@ -278,6 +305,11 @@ static void heap_free(struct dvm *vm, dvm_ref ref)
    memset(o, 0, sizeof *o);
    o->next_free = vm->free_head;
    vm->free_head = ref;
+}
+
+void dvm__discard_temporary(struct dvm *vm,dvm_ref ref)
+{
+   heap_free(vm,ref);
 }
 
 dvm_ref dvm_new_object(struct dvm *vm, struct dvm_class *cls)
@@ -608,7 +640,8 @@ static bool class_absent(struct dvm *vm, struct dvm_class *c)
 {
    if (!c || !c->synthesized || desc_is_platform(c->desc)) return false;
    char what[512];
-   snprintf(what, sizeof what, "class %s", c->name ? c->name : c->desc);
+   snprintf(what, sizeof what, "class not found in the APK or the platform, stubbed: %s",
+            c->name ? c->name : c->desc);
    note_missing(vm, what);
    return true;
 }
@@ -638,36 +671,27 @@ bool dvm_class_is_known(struct dvm *vm, const char *name)
    return c && !c->external;
 }
 
-/* Does this class exist on the device we present?
- *
- * The app's own classes are in its dexes and the platform's are in the
- * framework; a name in neither is one the device does not have either.  That
- * distinction is not cosmetic: app code *probes* for optional classes and
- * expects the absent ones to say so.  AppsFlyer asks
- * Class.forName("com.miui.referrer.api.GetAppsReferrerClient") to find out
- * whether it is running on a Xiaomi device, and every name resolving to a
- * usable class told it yes — so it went on to use a vendor SDK that is not
- * there, and GameActivity.afStart died before AppsFlyer was ever started.
- *
- * Framework names get the benefit of the doubt whether or not the emulator
- * models them: on a device they are present, and the stub layer answers for
- * them. */
+/* Existence comes from the app's DEX, provided VM classes, or the platform's
+ * class inventory. A package prefix is not a class definition: Android's
+ * Support Library, for example, ships in the app rather than the boot loader.
+ * An external placeholder created while resolving a reference is not proof
+ * that the referenced class exists. */
 bool dvm_class_exists(struct dvm *vm, const char *name)
 {
-   static const char *const framework[] = {
-      "java/", "javax/", "sun/", "jdk/", "libcore/", "dalvik/",
-      "android/", "com/android/", "org/json/", "org/w3c/", "org/xml/",
-      "org/apache/http/", "org/xmlpull/",
-   };
    if (!name || !*name) return false;
    char desc[512];
    name_to_desc(name, desc, sizeof desc);
-   if (desc[0] == '[') return true;   /* array of anything */
+   if (desc[0] == '[') {
+      const char *component = desc;
+      while (*component == '[') ++component;
+      if (component - desc > 255) return false;
+      if (*component == 'L') return dvm_class_exists(vm, component);
+      return component[0] && !component[1] && strchr("ZBCSIJFD", component[0]);
+   }
+   size_t length = strlen(desc);
+   if (length < 3 || desc[0] != 'L' || desc[length - 1] != ';') return false;
    if (dvm_class_is_known(vm, desc)) return true;
-   const char *n = desc[0] == 'L' ? desc + 1 : desc;
-   for (size_t i = 0; i < sizeof framework / sizeof *framework; ++i)
-      if (!strncmp(n, framework[i], strlen(framework[i]))) return true;
-   return false;
+   return dvm_platform_class_exists(desc);
 }
 
 const char *dvm_class_name(const struct dvm_class *c) { return c ? c->name : "?"; }
@@ -1029,29 +1053,65 @@ static struct dvm_field *class_find_field_slow(struct dvm_class *cls, const char
  * by the caller's name pointer (a literal at nearly every call site) and
  * validated against the field list itself, so a reused pointer or a field list
  * that grew since can only cost a slow search, never a wrong answer. */
-struct field_hit { struct dvm_class *cls, *owner; const char *name, *type, *field_name, *field_type; int index; bool statics; };
+struct field_hit { struct dvm_class *cls, *owner; const char *name, *type, *field_name, *field_type; int index; bool statics; bool miss; unsigned shape, namehash; };
+
+/* What a negative answer depends on: how many fields (and interfaces, for the
+ * constants) every class in the chain declares.  A class gets its field lists
+ * when it is defined, so the sum only moves if the chain does; integer reads,
+ * no string compares. */
+static unsigned class_chain_shape(const struct dvm_class *cls)
+{
+   unsigned sum = 0;
+   for (const struct dvm_class *c = cls; c; c = c->super)
+      sum = sum * 31u + (unsigned)c->nifields + 7u * (unsigned)c->nsfields + 13u * (unsigned)c->nifaces;
+   return sum;
+}
+
+static unsigned name_hash(const char *s)
+{
+   unsigned h = 2166136261u;
+   for (; *s; ++s) h = (h ^ (unsigned char)*s) * 16777619u;
+   return h;
+}
+
 static struct dvm_field *class_find_field(struct dvm_class *cls, const char *name,
                                           const char *type, bool statics)
 {
    static _Thread_local struct field_hit cache[2048];
-   const uintptr_t key = ((uintptr_t)cls >> 4) * 2654435761u ^ ((uintptr_t)name >> 3) ^ (statics ? 1u : 0u);
+   /* The type is part of the key: ui_int() asks for the same name as "I" and
+    * then "Z", and two entries fighting over one slot is a slow search each. */
+   const uintptr_t key = (((uintptr_t)cls >> 4) * 2654435761u ^ ((uintptr_t)name >> 3) ^
+                          ((uintptr_t)type >> 2) * 40503u ^ (statics ? 1u : 0u)) * 2246822519u >> 7;
    struct field_hit *h = &cache[key & 2047u];
-   if (h->cls == cls && h->name == name && h->statics == statics && h->owner) {
-      struct dvm_field *list = statics ? h->owner->sfields : h->owner->ifields;
-      int n = statics ? h->owner->nsfields : h->owner->nifields;
-      if (h->index < n) {
-         struct dvm_field *f = &list[h->index];
-         /* The same field entry, asked for with the same literals, as when it was
-          * found: nothing to compare. */
-         if (h->type == type && f->name == h->field_name && f->type == h->field_type) return f;
-         if (f->name && !strcmp(f->name, name) &&
-             (!type || !f->type || !strcmp(f->type, type)))
-            return f;
+   if (h->cls == cls && h->name == name && h->statics == statics) {
+      if (h->miss) {
+         /* Probing for a field the class does not have (a view helper asking
+          * every drawable for "shape") used to walk the whole chain with a
+          * strcmp per field, every time. */
+         if (h->type == type && h->shape == class_chain_shape(cls) &&
+             h->namehash == name_hash(name)) return NULL;
+      } else if (h->owner) {
+         struct dvm_field *list = statics ? h->owner->sfields : h->owner->ifields;
+         int n = statics ? h->owner->nsfields : h->owner->nifields;
+         if (h->index < n) {
+            struct dvm_field *f = &list[h->index];
+            /* The same field entry, asked for with the same literals, as when it was
+             * found: nothing to compare. */
+            if (h->type == type && f->name == h->field_name && f->type == h->field_type) return f;
+            if (f->name && !strcmp(f->name, name) &&
+                (!type || !f->type || !strcmp(f->type, type)))
+               return f;
+         }
       }
    }
    struct dvm_class *owner = NULL; int index = 0;
    struct dvm_field *f = class_find_field_slow(cls, name, type, statics, &owner, &index);
-   if (f) *h = (struct field_hit){ cls, owner, name, type, f->name, f->type, index, statics };
+   if (f) *h = (struct field_hit){ .cls = cls, .owner = owner, .name = name, .type = type,
+                                   .field_name = f->name, .field_type = f->type,
+                                   .index = index, .statics = statics };
+   else   *h = (struct field_hit){ .cls = cls, .name = name, .type = type, .statics = statics,
+                                   .miss = true, .shape = class_chain_shape(cls),
+                                   .namehash = name_hash(name) };
    return f;
 }
 
@@ -1594,8 +1654,18 @@ static struct dvm_method *virtual_target(struct dvm *vm, dvm_ref self,
 {
    struct dvm_object *o = dvm__obj(vm, self);
    if (!o || !o->cls || o->cls == decl->cls) return decl;
-   struct dvm_method *m = dvm_find_method(vm, o->cls, decl->name, decl->sig);
-   return m ? m : decl;
+   /* Inline cache on the declared method: a call site sees the same few
+    * receiver classes over and over, and the lookup below hashes the name and
+    * the signature on every call.  Method tables are fixed once a class is
+    * built, so a (receiver class, declared method) answer never goes stale. */
+   struct dvm_class *rc = o->cls;
+   if (decl->vt_cls[0] == rc) return decl->vt_m[0];
+   if (decl->vt_cls[1] == rc) return decl->vt_m[1];
+   struct dvm_method *m = dvm_find_method(vm, rc, decl->name, decl->sig);
+   if (!m) m = decl;
+   decl->vt_cls[1] = decl->vt_cls[0]; decl->vt_m[1] = decl->vt_m[0];
+   decl->vt_cls[0] = rc; decl->vt_m[0] = m;
+   return m;
 }
 
 /* --- external / native dispatch ----------------------------------------- */
@@ -1612,7 +1682,7 @@ static void note_missing(struct dvm *vm, const char *what)
       vm->missing_cap = cap;
    }
    vm->missing[vm->nmissing++] = strdup(what);
-   fprintf(stderr, "[dvm] unresolved: %s\n", what);
+   fprintf(stderr, "[dvm] WARNING: %s\n", what);
 }
 
 bool dvm__call_out(struct dvm *vm, struct dvm_class *cls, const char *name,
@@ -1664,8 +1734,13 @@ bool dvm__call_out(struct dvm *vm, struct dvm_class *cls, const char *name,
     * harmless optional-plugin probe from the cause of the next failure. */
    char what[512];
    struct dvm_method *from = vm->cur_method;
-   snprintf(what, sizeof what, "%s.%s%s (called from %s.%s) → 0", cls->name,
-            name, sig,
+   /* The declared class is what the dex names; the receiver's own class is
+    * what has to gain the method, and the two differ for every interface. */
+   struct dvm_class *receiver = self ? dvm_object_class(vm, self) : NULL;
+   snprintf(what, sizeof what,
+            "method not implemented, stub returns null/0: %s.%s%s (receiver %s, called from %s.%s)",
+            cls->name, name, sig,
+            receiver && receiver->name ? receiver->name : "-",
             from && from->cls && from->cls->name ? from->cls->name : "?",
             from && from->name ? from->name : "?");
    note_missing(vm, what);
@@ -2361,8 +2436,10 @@ static bool invoke_body(struct dvm *vm, struct dvm_method *m, dvm_ref self,
    bool trace_this = trace_call_enabled(vm, m,
       vm->invoke_frame ? vm->invoke_frame->previous : NULL);
    if (vm->trace && trace_this) {
-      fprintf(stderr, "[dvm] %*scall %s.%s%s\n", vm->depth * 2, "",
+      fprintf(stderr, "[dvm] %*scall %s.%s%s", vm->depth * 2, "",
               m->cls ? m->cls->name : "?", m->name, m->sig ? m->sig : "");
+      if (self) fprintf(stderr, " on @%x", (unsigned)self);
+      fputc('\n', stderr);
       /* What the reference arguments are: the declared type says little
        * when the caller passes a subclass (which Throwable reached an error
        * handler, which listener was registered). */
@@ -3749,6 +3826,7 @@ static int drain_pending(struct dvm *vm, bool nested)
 {
    if (dvm_is_stopping(vm)) return 0;
    dvm_nsd_poll(vm);
+   dvm_alarm_poll(vm);
    if (!vm->npending) return 0;
    if (!nested && vm->drain_depth) return 0;
    if (vm->drain_depth >= DVM_DRAIN_MAX_DEPTH) {
@@ -3793,6 +3871,8 @@ static int drain_pending(struct dvm *vm, bool nested)
           * them — whatever wait or call boundary brought another thread
           * here.  (Queued green threads belong to no Looper.) */
          if (!vm->pending_is_thread[i] && !dvm_on_main_thread())
+            continue;
+         if (!vm->pending_is_thread[i] && vm->main_transaction_depth)
             continue;
          if (vm->pending_due_ms[i] <= now) { pick = i; break; }
       }
@@ -3873,6 +3953,7 @@ static int drain_pending(struct dvm *vm, bool nested)
             dvm_ref saved_thread = vm->cur_thread;
             vm->cur_thread = is_thread[i] ? list[i] : vm->main_thread;
             bool ok;
+            if (!is_thread[i]) dvm_runtime_looper_log(vm, 0, true, list[i]);
             if (proxy_run) {
                struct dvm_class *iface =
                   dvm__class_by_desc(vm, "Ljava/lang/Runnable;");
@@ -3953,6 +4034,7 @@ static int drain_pending(struct dvm *vm, bool nested)
                              f->sig ? f->sig : "");
                }
             vm->nexc_trace = 0;
+            if (!is_thread[i]) dvm_runtime_looper_log(vm, 0, false, list[i]);
          }
          dvm_unpin(vm, list[i]);
       }
@@ -3997,6 +4079,10 @@ void dvm_main_looper_tick(struct dvm *vm)
    /* Same contract as dvm_media_pump_active(): called from the frame pump,
     * which does not carry the interpreter lock. */
    unsigned cookie = dvm_gil_enter_from_guest(vm);
+   if (vm->main_transaction_depth) {
+      dvm_gil_leave_to_guest(vm, cookie);
+      return;
+   }
    /* A pump turn belongs to Android's main Looper, not to the guest JNI
     * invocation that last used this host thread. That invocation may have
     * parked inside a modal wait with drain_depth > 0. Borrowing its state
@@ -4993,6 +5079,7 @@ void dvm_destroy(struct dvm *vm)
    /* A pending apply() must reach the disk before the process goes away. */
    dvm_prefs_finish(vm);
    dvm_nsd_finish(vm);
+   dvm_alarm_finish(vm);
    dvm_glsurface_finish(vm);
    luna_fd_close(vm->io_cancel[0]);
    luna_fd_close(vm->io_cancel[1]);

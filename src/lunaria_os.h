@@ -24,6 +24,7 @@
 #ifndef LUNARIA_OS_H
 #define LUNARIA_OS_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -1086,6 +1087,95 @@ static inline char *luna_strndup(const char *text, size_t limit)
    return copy;
 }
 
+/* ---- Guest thread deadlines (255 IDs; caller serializes) ---- */
+#include <string.h>
+
+struct luna_deadline_entry { uint64_t deadline_ns; uint8_t tid; };
+struct luna_deadline_heap {
+    struct luna_deadline_entry entries[256]; /* index zero is unused */
+    uint16_t positions[256];
+    uint16_t count;
+};
+
+static inline void luna_deadline_heap_clear(struct luna_deadline_heap *h)
+{
+    memset(h, 0, sizeof *h);
+}
+
+static inline bool luna_deadline_heap_contains(const struct luna_deadline_heap *h,
+                                               uint32_t tid)
+{
+    return tid > 0 && tid < 256 && h->positions[tid] != 0;
+}
+
+static inline bool luna_deadline_before(struct luna_deadline_entry a,
+                                        struct luna_deadline_entry b)
+{
+    return a.deadline_ns < b.deadline_ns ||
+           (a.deadline_ns == b.deadline_ns && a.tid < b.tid);
+}
+
+static inline void luna_deadline_swap(struct luna_deadline_heap *h,
+                                      uint16_t a, uint16_t b)
+{
+    struct luna_deadline_entry tmp = h->entries[a];
+    h->entries[a] = h->entries[b]; h->entries[b] = tmp;
+    h->positions[h->entries[a].tid] = a;
+    h->positions[h->entries[b].tid] = b;
+}
+
+static inline void luna_deadline_fix(struct luna_deadline_heap *h, uint16_t i)
+{
+    if (i > 1 && luna_deadline_before(h->entries[i], h->entries[i / 2])) {
+        do {
+            luna_deadline_swap(h, i, i / 2);
+            i /= 2;
+        } while (i > 1 && luna_deadline_before(h->entries[i], h->entries[i / 2]));
+    } else {
+        while (2u * i <= h->count) {
+            uint16_t child = (uint16_t)(2u * i);
+            if (child < h->count && luna_deadline_before(h->entries[child + 1], h->entries[child])) ++child;
+            if (!luna_deadline_before(h->entries[child], h->entries[i])) break;
+            luna_deadline_swap(h, i, child);
+            i = child;
+        }
+    }
+}
+
+static inline void luna_deadline_heap_remove(struct luna_deadline_heap *h,
+                                             uint32_t tid)
+{
+    if (!luna_deadline_heap_contains(h, tid)) return;
+    uint16_t i = h->positions[tid];
+    h->positions[tid] = 0;
+    if (i != h->count) {
+        h->entries[i] = h->entries[h->count];
+        h->positions[h->entries[i].tid] = i;
+    }
+    --h->count;
+    if (i <= h->count) luna_deadline_fix(h, i);
+}
+
+static inline void luna_deadline_heap_set(struct luna_deadline_heap *h,
+                                          uint32_t tid, uint64_t deadline_ns)
+{
+    if (!tid || tid >= 256) return;
+    if (!deadline_ns) { luna_deadline_heap_remove(h, tid); return; }
+    uint16_t i = h->positions[tid];
+    if (!i) { i = ++h->count; h->positions[tid] = i; }
+    h->entries[i].tid = (uint8_t)tid;
+    h->entries[i].deadline_ns = deadline_ns;
+    luna_deadline_fix(h, i);
+}
+
+static inline bool luna_deadline_heap_peek(const struct luna_deadline_heap *h,
+                                           struct luna_deadline_entry *entry)
+{
+    if (!h->count) return false;
+    *entry = h->entries[1];
+    return true;
+}
+
 /* ---- Guest run queue ---- */
 #include <stddef.h>
 #include <stdint.h>
@@ -1381,6 +1471,118 @@ uint64_t luna_os_realtime_ns(void);
 uint64_t luna_os_boottime_ns(void);
 uint64_t luna_os_uptime_ns(void);
 
+/* Guest POSIX timer deadlines and coalesced notifications. The caller
+ * serializes access and supplies wall, monotonic and guest CPU clocks. */
+struct luna_posix_timer {
+    uint32_t id,owner,clock_tid,target_tid,notified_tid;
+    int clock,armed_clock,notify,signo,overrun;
+    uint64_t value,callback,due,interval,pending;
+    bool armed,published,deleted;
+};
+struct luna_posix_timers {
+    struct luna_posix_timer *items;
+    size_t count,capacity;
+    uint32_t sequence;
+};
+struct luna_timer_spec { uint64_t interval,value; };
+typedef uint64_t (*luna_timer_clock)(void *,int,uint32_t);
+static inline struct luna_posix_timer *luna_timer_find(struct luna_posix_timers *s,uint32_t owner,uint32_t id)
+{
+    if(!id)return NULL;
+    for(size_t i=0;i<s->count;++i)if(s->items[i].id==id && !s->items[i].deleted && s->items[i].owner==owner)return s->items+i;
+    return NULL;
+}
+static inline int luna_timer_create(struct luna_posix_timers *s,uint32_t owner,int clock,int notify,int signo,
+                      uint64_t value,uint64_t callback,uint32_t tid,uint32_t *id)
+{
+    if(clock!=0 && clock!=1 && clock!=2 && clock!=3 && clock!=7)return EINVAL;
+    if(notify!=0 && notify!=1 && notify!=2 && notify!=4)return EINVAL;
+    if(((notify==0 || notify==4) && (signo<1 || signo>64)) || (notify==2 && !callback))return EINVAL;
+    if(s->sequence==UINT32_MAX)return EAGAIN;
+    size_t i=0;while(i<s->count && s->items[i].id)++i;
+    if(i==s->capacity) {
+        size_t cap=s->capacity ? s->capacity*2 : 8;
+        if(cap<s->capacity || cap>SIZE_MAX/sizeof *s->items)return EAGAIN;
+        void *grown=realloc(s->items,cap*sizeof *s->items);
+        if(!grown)return EAGAIN;
+        s->items=(struct luna_posix_timer *)grown;s->capacity=cap;
+    }
+    if(i==s->count)++s->count;
+    struct luna_posix_timer *t=s->items+i;memset(t,0,sizeof *t);
+    t->id=++s->sequence;t->owner=owner;t->clock=clock;t->armed_clock=clock;t->notify=notify;t->signo=signo;
+    t->value=value;t->callback=callback;t->clock_tid=tid;t->target_tid=tid;
+    *id=t->id;return 0;
+}
+static inline int luna_timer_delete(struct luna_posix_timers *s,uint32_t owner,uint32_t id)
+{
+    struct luna_posix_timer *t=luna_timer_find(s,owner,id);
+    if(!t)return EINVAL;
+    if(t->published && t->pending && (t->notify==0 || t->notify==4)) {
+        t->deleted=true;t->armed=false;
+    } else memset(t,0,sizeof *t);
+    return 0;
+}
+static inline int luna_timer_get(struct luna_posix_timers *s,uint32_t owner,uint32_t id,struct luna_timer_spec *spec,luna_timer_clock clock,void *context)
+{
+    struct luna_posix_timer *t=luna_timer_find(s,owner,id);
+    if(!t)return EINVAL;
+    uint64_t now=clock(context,t->armed_clock,t->clock_tid);
+    spec->interval=t->interval;
+    spec->value=t->armed && t->due>now ? t->due-now : 0;
+    return 0;
+}
+static inline int luna_timer_set(struct luna_posix_timers *s,uint32_t owner,uint32_t id,int flags,
+                   const struct luna_timer_spec *spec,struct luna_timer_spec *old,luna_timer_clock clock,void *context)
+{
+    struct luna_posix_timer *t=luna_timer_find(s,owner,id);
+    if(!t || (flags & ~1))return EINVAL;
+    if(old)(void)luna_timer_get(s,owner,id,old,clock,context);
+    /* Relative realtime timers are elapsed-time timers: wall-clock steps must
+     * not move them. An absolute rearm switches back to the original clock. */
+    t->armed_clock=t->clock==0 && !(flags&1) ? 1 : t->clock;
+    uint64_t now=clock(context,t->armed_clock,t->clock_tid);
+    const uint64_t limit=INT64_MAX; /* Linux ktime_t saturation */
+    t->interval=spec->interval>limit ? limit : spec->interval;t->armed=spec->value!=0;
+    t->due=(flags & 1) ? (spec->value>limit ? limit : spec->value) :
+        now>=limit || spec->value>limit-now ? limit : now+spec->value;
+    return 0;
+}
+static inline void luna_timer_poll(struct luna_posix_timers *s,luna_timer_clock clock,void *context)
+{
+    for(size_t i=0;i<s->count;++i) {
+        struct luna_posix_timer *t=s->items+i;
+        if(!t->id || !t->armed)continue;
+        uint64_t now=clock(context,t->armed_clock,t->clock_tid);
+        if(now<t->due)continue;
+        uint64_t extra=t->interval ? (now-t->due)/t->interval : 0;
+        uint64_t n=extra==UINT64_MAX ? UINT64_MAX : extra+1;
+        if(!t->interval)t->armed=false;
+        else if(n>((uint64_t)INT64_MAX-t->due)/t->interval)t->due=INT64_MAX;
+        else t->due+=n*t->interval;
+        if(t->notify!=1)t->pending=n>UINT64_MAX-t->pending ? UINT64_MAX : t->pending+n;
+    }
+}
+static inline uint64_t luna_timer_next(struct luna_posix_timers *s,luna_timer_clock clock,void *context)
+{
+    uint64_t next=UINT64_MAX;
+    for(size_t i=0;i<s->count;++i) {
+        const struct luna_posix_timer *t=s->items+i;
+        if(!t->id || !t->armed)continue;
+        uint64_t now=clock(context,t->armed_clock,t->clock_tid);
+        uint64_t left=t->due>now ? t->due-now : 0;
+        if(left<next)next=left;
+    }
+    return next;
+}
+static inline bool luna_timer_take(struct luna_posix_timer *t)
+{
+    if(!t || !t->pending)return false;
+    t->overrun=t->pending-1>(uint64_t)INT_MAX ? INT_MAX : (int)(t->pending-1);
+    t->pending=0;t->published=false;return true;
+}
+static inline void luna_timer_destroy(struct luna_posix_timers *s)
+{free(s->items);memset(s,0,sizeof *s);}
+
 /* ---- what the machine has ----------------------------------------------
  *
  * The guest sizes its caches and its texture pools from these, so a wrong
@@ -1615,6 +1817,108 @@ static inline void luna_vm_release_empty(const struct luna_guest_mapping *maps,
             begin = (maps[left].hi + page_size - 1) & ~(page_size - 1);
         }
     }
+}
+
+/* The page range mprotect()/munmap() act on: `address` must be page aligned,
+ * the length rounds up to whole pages and must not run past `limit`.
+ * Returns 0 or an errno; an empty range is [lo,lo). */
+static inline int luna_vm_page_range(uint64_t address, uint64_t length,
+    uint64_t limit, uint64_t *lo, uint64_t *hi)
+{
+    if (address & 4095u) return 22; /* EINVAL */
+    if (length > UINT64_MAX - 4095u) return 12; /* ENOMEM */
+    length = (length + 4095u) & ~(uint64_t)4095u;
+    if (length > limit || address > limit - length) return 12;
+    *lo = address;
+    *hi = address + length;
+    return 0;
+}
+
+/* A32 guest mapping table: the one record of what guest mmap() handed out,
+ * read by mprotect() (to change it) and by /proc/self/maps (to show it).
+ * Sorted, disjoint, [lo,hi) page aligned. */
+struct luna_vma_table {
+    struct luna_guest_mapping *v;
+    size_t n, cap;
+};
+
+/* Replace v[at, at+del) with add[0, count). */
+static inline int luna_vma_splice(struct luna_vma_table *t, size_t at,
+    size_t del, const struct luna_guest_mapping *add, size_t count)
+{
+    size_t need = t->n - del + count;
+    if (need > t->cap) {
+        size_t cap = t->cap ? t->cap * 2 : 64;
+        struct luna_guest_mapping *grown;
+        while (cap < need) cap *= 2;
+        grown = (struct luna_guest_mapping *)realloc(t->v, cap * sizeof *grown);
+        if (!grown) return -1;
+        t->v = grown;
+        t->cap = cap;
+    }
+    memmove(t->v + at + count, t->v + at + del, (t->n - at - del) * sizeof *t->v);
+    if (count) memcpy(t->v + at, add, count * sizeof *add);
+    t->n = need;
+    return 0;
+}
+
+/* Map [lo,hi) with `prot` (set) or unmap it (!set), cutting what it overlaps. */
+static inline int luna_vma_map(struct luna_vma_table *t, uint64_t lo,
+    uint64_t hi, bool set, uint32_t prot, bool file_backed)
+{
+    struct luna_guest_mapping piece[3];
+    size_t first = 0, last, k = 0;
+    if (hi <= lo) return 0;
+    while (first < t->n && t->v[first].hi <= lo) ++first;
+    last = first;
+    while (last < t->n && t->v[last].lo < hi) ++last;
+    if (first < last && t->v[first].lo < lo) {
+        piece[k] = t->v[first];
+        piece[k++].hi = lo;
+    }
+    if (set) {
+        piece[k].lo = lo; piece[k].hi = hi; piece[k].prot = prot;
+        piece[k].owned = true; piece[k++].file_backed = file_backed;
+    }
+    if (first < last && t->v[last - 1].hi > hi) {
+        piece[k] = t->v[last - 1];
+        piece[k++].lo = hi;
+    }
+    return luna_vma_splice(t, first, last - first, piece, k);
+}
+
+/* True when every byte of [lo,hi) is in the table. */
+static inline bool luna_vma_covered(const struct luna_vma_table *t,
+    uint64_t lo, uint64_t hi)
+{
+    size_t i = 0;
+    while (i < t->n && t->v[i].hi <= lo) ++i;
+    while (lo < hi) {
+        if (i == t->n || t->v[i].lo > lo) return false;
+        lo = t->v[i++].hi;
+    }
+    return true;
+}
+
+/* Change the protection of the tabled part of [lo,hi). */
+static inline int luna_vma_protect(struct luna_vma_table *t, uint64_t lo,
+    uint64_t hi, uint32_t prot)
+{
+    size_t i = t->n;
+    while (i-- > 0) {
+        struct luna_guest_mapping m = t->v[i], piece[3];
+        size_t k = 0;
+        uint64_t clo, chi;
+        if (m.hi <= lo || m.lo >= hi || m.prot == prot) continue;
+        clo = m.lo > lo ? m.lo : lo;
+        chi = m.hi < hi ? m.hi : hi;
+        if (m.lo < clo) { piece[k] = m; piece[k++].hi = clo; }
+        piece[k] = m; piece[k].lo = clo; piece[k].hi = chi;
+        piece[k++].prot = prot;
+        if (chi < m.hi) { piece[k] = m; piece[k++].lo = chi; }
+        if (luna_vma_splice(t, i, 1, piece, k)) return -1;
+    }
+    return 0;
 }
 
 /* Host-backed guest files share the same link representation across C and

@@ -493,6 +493,11 @@ static bool kf_generate(struct dvm *vm, dvm_ref self,
    if (ARG(0).l) (void)dvm_get_field(vm, ARG(0).l, "encoded", "[B", &enc);
    (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &alg);
    if (!enc.l) {
+      if (getenv("LUNARIA_DVM_TRACE")) {
+         struct dvm_class *spec = dvm_object_class(vm, ARG(0).l);
+         fprintf(stderr, "[crypto] KeyFactory.generate%s spec=%s\n",
+                 kind == 2 ? "Public" : "Private", spec ? spec->desc : "null");
+      }
       dvm__throw(vm, "java/security/spec/InvalidKeySpecException",
                  "no encoded key in the spec");
       return false;
@@ -677,31 +682,69 @@ static bool cipher_init(struct dvm *vm, dvm_ref self,
                         union dvm_value *out)
 {
    (void)out;
-   union dvm_value v = { .i = ARG(0).i };
-   (void)dvm_set_field(vm, self, "opmode", "I", v);
-   v.l = nargs >= 2 ? args[1].l : 0;
-   (void)dvm_set_field(vm, self, "key", "Ljava/lang/Object;", v);
-   /* init(mode, key, AlgorithmParameterSpec): an IvParameterSpec or a
-    * GCMParameterSpec, both of which carry the IV in `iv`. */
-   union dvm_value iv = { 0 };
-   if (nargs >= 3 && args[2].l)
-      (void)dvm_get_field(vm, args[2].l, "iv", "[B", &iv);
-   /* AEAD encryption without a GCMParameterSpec asks the provider for a fresh
-    * nonce.  Tink reads it back with getIV() and prefixes it to the payload. */
-   union dvm_value transform = { 0 };
+   union dvm_value empty = {0};
+   (void)dvm_set_field(vm, self, "opmode", "I", empty);
+   (void)dvm_set_field(vm, self, "key", "Ljava/lang/Object;", empty);
+   if (ARG(0).i < JCE_ENCRYPT || ARG(0).i > JCE_UNWRAP) {
+      dvm__throw(vm, "java/security/InvalidParameterException", "unsupported cipher mode");
+      return false;
+   }
+   if (nargs < 2 || !args[1].l) {
+      dvm__throw(vm, "java/security/InvalidKeyException", "no key");
+      return false;
+   }
+   const struct dvm_method *method = dvm__builtin_method();
+   const bool with_params = method && strstr(method->sig, "Ljava/security/spec/AlgorithmParameterSpec;");
+   dvm_ref params = with_params && nargs >= 3 ? args[2].l : 0;
+   dvm_ref random = !with_params && nargs >= 3 ? args[2].l : 0;
+   union dvm_value iv = {0}, transform = {0};
+   if (params) (void)dvm_get_field(vm, params, "iv", "[B", &iv);
    (void)dvm_get_field(vm, self, "transform", "Ljava/lang/String;", &transform);
-   const char *name = transform.l ? dvm_string_utf8(vm, transform.l) : NULL;
-   if (!iv.l && ARG(0).i == JCE_ENCRYPT && name && luna_strcasestr(name, "/GCM/")) {
-      uint8_t nonce[12];
-      if (RAND_bytes(nonce, (int)sizeof nonce) != 1) {
-         dvm__throw(vm, "java/security/ProviderException",
-                    "CSPRNG failed while generating a GCM nonce");
+   char alg[128], mode[128], pad[128];
+   cipher_parse(dvm_string_utf8(vm, transform.l), alg, sizeof alg,
+                mode, sizeof mode, pad, sizeof pad);
+   const bool rsa = !strcasecmp(alg, "RSA");
+   const bool gcm = !strcasecmp(mode, "GCM");
+   const bool encrypting = ARG(0).i == JCE_ENCRYPT || ARG(0).i == JCE_WRAP;
+   int expected = gcm ? 12 : (!strcasecmp(mode, "CBC") || !strcasecmp(mode, "CTR"))
+      ? (!strcasecmp(alg, "AES") ? 16 : 8) : 0;
+   if (!rsa) {
+      if (params && !iv.l) {
+         dvm__throw(vm, "java/security/InvalidAlgorithmParameterException", "unsupported cipher parameters");
          return false;
       }
-      iv.l = make_bytes(vm, nonce, (uint32_t)sizeof nonce);
+      if (iv.l && ((!expected) || (gcm ? !dvm_array_length(vm, iv.l)
+                                  : dvm_array_length(vm, iv.l) != (uint32_t)expected))) {
+         dvm__throw(vm, "java/security/InvalidAlgorithmParameterException", "invalid IV length");
+         return false;
+      }
+      if (!iv.l && expected) {
+         if (!encrypting) {
+            dvm__throw(vm, with_params ? "java/security/InvalidAlgorithmParameterException"
+                                      : "java/security/InvalidKeyException", "IV must be specified");
+            return false;
+         }
+         iv.l = dvm_new_array(vm, 'B', NULL, (uint32_t)expected);
+         if (!iv.l) return false;
+         if (random) {
+            struct dvm_method *next = dvm_find_method(vm, dvm_object_class(vm, random), "nextBytes", "([B)V");
+            union dvm_value ignored = {0};
+            if (!next || !dvm_call(vm, next, random, &iv, 1, &ignored)) return false;
+         } else if (RAND_bytes(dvm_array_data(vm, iv.l), expected) != 1) {
+            dvm__throw(vm, "java/security/ProviderException", "CSPRNG failed while generating an IV");
+            return false;
+         }
+      } else if (iv.l) {
+         uint32_t length = 0;
+         const uint8_t *bytes = arg_bytes(vm, iv.l, &length);
+         iv.l = make_bytes(vm, bytes, length);
+      }
    }
+   union dvm_value value = {.i = ARG(0).i};
+   (void)dvm_set_field(vm, self, "opmode", "I", value);
+   value.l = args[1].l;
+   (void)dvm_set_field(vm, self, "key", "Ljava/lang/Object;", value);
    (void)dvm_set_field(vm, self, "iv", "[B", iv);
-   union dvm_value empty = { .l = 0 };
    (void)dvm_set_field(vm, self, "aad", "[B", empty);
    RETV();
 }
@@ -960,6 +1003,10 @@ static bool cipher_doFinal(struct dvm *vm, dvm_ref self,
    union dvm_value tv = { 0 }, ov = { 0 }, kv = { 0 }, ivv = { 0 }, aadv = { 0 };
    (void)dvm_get_field(vm, self, "transform", "Ljava/lang/String;", &tv);
    (void)dvm_get_field(vm, self, "opmode", "I", &ov);
+   if (!ov.i) {
+      dvm__throw(vm, "java/lang/IllegalStateException", "cipher is not initialized");
+      return false;
+   }
    (void)dvm_get_field(vm, self, "key", "Ljava/lang/Object;", &kv);
    (void)dvm_get_field(vm, self, "iv", "[B", &ivv);
    (void)dvm_get_field(vm, self, "aad", "[B", &aadv);
@@ -1031,6 +1078,54 @@ static bool cipher_doFinal_into(struct dvm *vm, dvm_ref self,
    RETI((int32_t)src->length);
 }
 
+static bool cipher_getBlockSize(struct dvm *vm, dvm_ref self,
+                                const union dvm_value *args, int nargs,
+                                union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value transform = {0};
+   (void)dvm_get_field(vm, self, "transform", "Ljava/lang/String;", &transform);
+   char alg[128], mode[128], pad[128];
+   cipher_parse(dvm_string_utf8(vm, transform.l), alg, sizeof alg,
+                mode, sizeof mode, pad, sizeof pad);
+   /* Report the cipher's block, not EVP's streaming update granularity:
+    * AES CTR/GCM still have 16-byte blocks before and after init(). */
+   if (!strcasecmp(alg, "AES")) RETI(16);
+   if (!strcasecmp(alg, "DES") || !strcasecmp(alg, "DESede") ||
+       !strcasecmp(alg, "TripleDES")) RETI(8);
+   if (strcasecmp(alg, "RSA")) RETI(0); /* RC4 is a stream cipher. */
+
+   /* Conscrypt RSA reports the maximum input block for the current mode. */
+   union dvm_value key = {0}, kind = {0}, op = {0};
+   (void)dvm_get_field(vm, self, "key", "Ljava/lang/Object;", &key);
+   if (!key.l) {
+      dvm__throw(vm, "java/lang/IllegalStateException", "cipher is not initialized");
+      return false;
+   }
+   uint32_t length = 0;
+   const uint8_t *encoded = key_bytes(vm, key.l, &length);
+   (void)dvm_get_field(vm, key.l, "kind", "I", &kind);
+   const uint8_t *cursor = encoded;
+   EVP_PKEY *pkey = !encoded ? NULL : kind.i == 2
+      ? d2i_PUBKEY(NULL, &cursor, length)
+      : d2i_AutoPrivateKey(NULL, &cursor, length);
+   if (!pkey) return cipher_fail(vm, "cannot read the RSA key");
+   int size = EVP_PKEY_get_size(pkey);
+   EVP_PKEY_free(pkey);
+   (void)dvm_get_field(vm, self, "opmode", "I", &op);
+   if (op.i == JCE_ENCRYPT || op.i == JCE_WRAP) {
+      if (luna_strcasestr(pad, "OAEP")) {
+         int digest = 20;
+         if (luna_strcasestr(pad, "SHA-224")) digest = 28;
+         else if (luna_strcasestr(pad, "SHA-256")) digest = 32;
+         else if (luna_strcasestr(pad, "SHA-384")) digest = 48;
+         else if (luna_strcasestr(pad, "SHA-512")) digest = 64;
+         size -= 2 * digest + 2;
+      } else if (!strcasecmp(pad, "PKCS1Padding") || !*pad) size -= 11;
+   }
+   RETI(size);
+}
+
 static bool cipher_getIV(struct dvm *vm, dvm_ref self,
                          const union dvm_value *args, int nargs,
                          union dvm_value *out)
@@ -1038,86 +1133,151 @@ static bool cipher_getIV(struct dvm *vm, dvm_ref self,
    (void)args; (void)nargs;
    union dvm_value v = { 0 };
    (void)dvm_get_field(vm, self, "iv", "[B", &v);
-   RETL(v.l);
+   if (!v.l) RETL(0);
+   uint32_t length = 0;
+   const uint8_t *bytes = arg_bytes(vm, v.l, &length);
+   RETL(make_bytes(vm, bytes, length));
 }
 
 /* --- javax.crypto.Mac --------------------------------------------------- */
 
+/* Keep constant-size host digest state; data_destroy releases both contexts
+ * when the Java object is reclaimed or the VM is destroyed. */
+struct mac_state { EVP_MD_CTX *initial, *active; };
+static void mac_destroy(void *data)
+{
+   struct mac_state *state = data;
+   if (!state) return;
+   EVP_MD_CTX_free(state->initial);
+   EVP_MD_CTX_free(state->active);
+   free(state);
+}
+static const EVP_MD *mac_type(const char *algorithm)
+{
+   return algorithm && !strncasecmp(algorithm, "Hmac", 4) ?
+      EVP_get_digestbyname(algorithm + 4) : NULL;
+}
+static struct mac_state *mac_ready(struct dvm *vm, dvm_ref self)
+{
+   struct dvm_object *object = dvm__obj(vm, self);
+   struct mac_state *state = object ? object->data : NULL;
+   if (!state) dvm__throw(vm, "java/lang/IllegalStateException", "MAC not initialized");
+   return state;
+}
 static bool mac_getInstance(struct dvm *vm, dvm_ref self,
                             const union dvm_value *args, int nargs,
                             union dvm_value *out)
 {
    (void)self; (void)nargs;
    const char *alg = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
-   struct dvm_class *c = dvm__class_by_desc(vm, "Ljavax/crypto/Mac;");
-   dvm_ref m = c ? dvm_new_object(vm, c) : 0;
-   if (m) {
-      union dvm_value v = { .l = dvm_new_string(vm, alg ? alg : "HmacSHA256") };
-      (void)dvm_set_field(vm, m, "algorithm", "Ljava/lang/String;", v);
+   if (!alg) {
+      dvm__throw(vm, "java/lang/NullPointerException", "algorithm"); return false;
    }
+   if (!mac_type(alg)) {
+      dvm__throw(vm, "java/security/NoSuchAlgorithmException", "%s", alg); return false;
+   }
+   dvm_ref m = dvm_new_object(vm, dvm__class_by_desc(vm, "Ljavax/crypto/Mac;"));
+   if (m) (void)dvm_set_field(vm, m, "algorithm", "Ljava/lang/String;", ARG(0));
    RETL(m);
 }
-
 static bool mac_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                      int nargs, union dvm_value *out)
 {
    (void)nargs; (void)out;
-   union dvm_value v = { .l = ARG(0).l };
-   (void)dvm_set_field(vm, self, "key", "Ljava/lang/Object;", v);
+   uint32_t length = 0;
+   const uint8_t *bytes = key_bytes(vm, ARG(0).l, &length);
+   if (!ARG(0).l || !bytes || !length) {
+      dvm__throw(vm, "java/security/InvalidKeyException", "invalid MAC key"); return false;
+   }
+   union dvm_value algorithm = {0};
+   (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &algorithm);
+   const EVP_MD *md = mac_type(dvm_string_utf8(vm, algorithm.l));
+   struct mac_state *state = calloc(1, sizeof *state);
+   EVP_PKEY *key = EVP_PKEY_new_raw_private_key(EVP_PKEY_HMAC, NULL, bytes, length);
+   if (state) {
+      state->initial = EVP_MD_CTX_new(); state->active = EVP_MD_CTX_new();
+   }
+   int good = state && state->initial && state->active && key &&
+      EVP_DigestSignInit(state->initial, NULL, md, NULL, key) == 1 &&
+      EVP_MD_CTX_copy_ex(state->active, state->initial) == 1;
+   EVP_PKEY_free(key);
+   if (!good) {
+      mac_destroy(state);
+      dvm__throw(vm, "java/security/InvalidKeyException", "cannot initialize MAC"); return false;
+   }
+   struct dvm_object *object = dvm__obj(vm, self);
+   mac_destroy(object->data);
+   object->data = state; object->data_destroy = mac_destroy;
    RETV();
 }
-
+static bool mac_reset(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                      int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs; (void)out;
+   struct dvm_object *object = dvm__obj(vm, self);
+   struct mac_state *state = object ? object->data : NULL;
+   if (state && EVP_MD_CTX_copy_ex(state->active, state->initial) != 1) {
+      dvm__throw(vm, "java/security/ProviderException", "MAC reset failed"); return false;
+   }
+   RETV();
+}
+static bool mac_update(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                       int nargs, union dvm_value *out)
+{
+   (void)out;
+   struct mac_state *state = mac_ready(vm, self);
+   if (!state) return false;
+   /* Both array overloads ignore null after checking initialization. */
+   uint32_t length = 0;
+   const uint8_t *bytes = arg_bytes(vm, ARG(0).l, &length);
+   if (!ARG(0).l) RETV();
+   if (nargs == 3) {
+      int32_t offset = ARG(1).i, count = ARG(2).i;
+      if (!bytes || offset < 0 || count < 0 || (uint32_t)offset > length ||
+          (uint32_t)count > length - (uint32_t)offset) {
+         dvm__throw(vm, "java/lang/IllegalArgumentException", "invalid MAC input range"); return false;
+      }
+      bytes += offset; length = (uint32_t)count;
+   }
+   if (length && EVP_DigestSignUpdate(state->active, bytes, length) != 1) {
+      dvm__throw(vm, "java/security/ProviderException", "MAC update failed"); return false;
+   }
+   RETV();
+}
+static bool mac_update_byte(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                            int nargs, union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   struct mac_state *state = mac_ready(vm, self);
+   if (!state) return false;
+   uint8_t byte = (uint8_t)ARG(0).i;
+   if (EVP_DigestSignUpdate(state->active, &byte, 1) != 1) {
+      dvm__throw(vm, "java/security/ProviderException", "MAC update failed"); return false;
+   }
+   RETV();
+}
 static bool mac_doFinal(struct dvm *vm, dvm_ref self,
                         const union dvm_value *args, int nargs,
                         union dvm_value *out)
 {
-   (void)nargs;
-   union dvm_value av = { 0 }, kv = { 0 };
-   (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &av);
-   (void)dvm_get_field(vm, self, "key", "Ljava/lang/Object;", &kv);
-   const char *alg = av.l ? dvm_string_utf8(vm, av.l) : "HmacSHA256";
-
-   /* "HmacSHA256" names the digest after the prefix. */
-   const char *digest = alg;
-   if (!strncasecmp(alg, "Hmac", 4)) digest = alg + 4;
-   const EVP_MD *md = EVP_get_digestbyname(digest);
-   if (!md) {
-      dvm__throw(vm, "java/security/NoSuchAlgorithmException", "%s", alg);
-      return false;
+   struct mac_state *state = mac_ready(vm, self);
+   if (!state) return false;
+   if (nargs && !mac_update(vm, self, args, 1, out)) return false;
+   uint8_t bytes[EVP_MAX_MD_SIZE]; size_t length = sizeof bytes;
+   if (EVP_DigestSignFinal(state->active, bytes, &length) != 1) {
+      dvm__throw(vm, "java/security/ProviderException", "MAC finalization failed"); return false;
    }
-   uint32_t keylen = 0, inlen = 0;
-   const uint8_t *key = key_bytes(vm, kv.l, &keylen);
-   const uint8_t *in = arg_bytes(vm, ARG(0).l, &inlen);
-   uint8_t mac[EVP_MAX_MD_SIZE];
-   unsigned maclen = 0;
-   if (!HMAC(md, key ? key : (const uint8_t *)"", (int)keylen,
-             in ? in : (const uint8_t *)"", inlen, mac, &maclen)) {
-      dvm__throw(vm, "java/security/InvalidKeyException", "HMAC failed");
-      return false;
-   }
-   /* The first few, because a MAC that silently comes out empty is invisible
-    * until something built from it (an AppsFlyer CDN token, a signature) is
-    * quietly wrong. */
-   {
-      static int n = 0;
-      if (n++ < 6) {
-         char hex[25];
-         for (unsigned i = 0; i < 12 && i < maclen; ++i)
-            snprintf(hex + i * 2, 3, "%02x", mac[i]);
-         hex[(maclen < 12 ? maclen : 12) * 2] = '\0';
-         char txt[160];
-         size_t w = 0;
-         for (unsigned i = 0; i < inlen && w + 5 < sizeof txt; ++i) {
-            unsigned char ch = in[i];
-            if (ch >= 0x20 && ch < 0x7f) txt[w++] = (char)ch;
-            else { snprintf(txt + w, 5, "\\x%02x", ch); w += 4; }
-         }
-         txt[w] = '\0';
-         fprintf(stderr, "[crypto] Mac(%s): key=%u in=%u out=%u -> %s  in=\"%s\"\n",
-                 alg, keylen, inlen, maclen, hex, txt);
-      }
-   }
-   RETL(make_bytes(vm, mac, maclen));
+   if (!mac_reset(vm, self, NULL, 0, out)) return false;
+   RETL(make_bytes(vm, bytes, (uint32_t)length));
+}
+static bool mac_length(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                       int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value algorithm = {0};
+   (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &algorithm);
+   const EVP_MD *md = mac_type(dvm_string_utf8(vm, algorithm.l));
+   RETI(md ? EVP_MD_get_size(md) : 0);
 }
 
 /* --- java.security.Signature ------------------------------------------- */
@@ -2255,10 +2415,7 @@ static bool iv_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
 static bool iv_getIV(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                      int nargs, union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   union dvm_value v = { 0 };
-   (void)dvm_get_field(vm, self, "iv", "[B", &v);
-   RETL(v.l);
+   return cipher_getIV(vm, self, args, nargs, out);
 }
 
 static bool gcm_getTLen(struct dvm *vm, dvm_ref self,
@@ -2312,14 +2469,24 @@ static const struct rt_method rt_cipher[] = {
    M("updateAAD", "([B)V", cipher_updateAAD),
    M("updateAAD", "([BII)V", cipher_updateAAD),
    M("getIV", "()[B", cipher_getIV),
+   M("getBlockSize", "()I", cipher_getBlockSize),
    M("getProvider", "()Ljava/security/Provider;", cipher_getProvider),
    M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
    M_END,
 };
 
+static const struct rt_field rt_mac_fields[] = {
+   { "algorithm", "Ljava/lang/String;" }, F_END
+};
 static const struct rt_method rt_mac[] = {
    SM("getInstance", "(Ljava/lang/String;)Ljavax/crypto/Mac;", mac_getInstance),
    M("init", "(Ljava/security/Key;)V", mac_init),
+   M("update", "([B)V", mac_update),
+   M("update", "([BII)V", mac_update),
+   M("update", "(B)V", mac_update_byte),
+   M("reset", "()V", mac_reset),
+   M("getMacLength", "()I", mac_length),
+   M("doFinal", "()[B", mac_doFinal),
    M("doFinal", "([B)[B", mac_doFinal),
    M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
    M_END,

@@ -1736,6 +1736,22 @@ bool luna_overlay_shape_font(uint32_t handle,const uint16_t *text,size_t length,
 {return luna_overlay_shape_font_direction(handle,text,length,px,bold,0,run);}
 bool luna_overlay_shape_text(const uint16_t *text,size_t length,float px,bool bold,struct luna_text_run *run)
 {return luna_overlay_shape_font(0,text,length,px,bold,run);}
+/* Coverage bitmaps are shared: a screen of text is the same few hundred
+ * (glyph, size) pairs every frame, and rasterizing them is the expensive part.
+ * Direct-mapped; an entry still held by a caller is never replaced, the new
+ * glyph is handed out uncached instead. */
+#define GLYPH_CACHE_SLOTS 4096
+struct glyph_slot {
+ const void *font,*font_data;
+ uint32_t glyph;
+ uint32_t px_bits;
+ unsigned char *coverage;
+ int width,height,left,top;
+ unsigned refs;
+ bool used;
+};
+static struct glyph_slot g_glyph_cache[GLYPH_CACHE_SLOTS];
+
 bool luna_overlay_raster_glyph(const struct luna_text_glyph *glyph,float px,struct luna_text_bitmap *bitmap)
 {
  if(!glyph || !bitmap || !isfinite(px) || px<0 || px>32768) return false;
@@ -1743,18 +1759,41 @@ bool luna_overlay_raster_glyph(const struct luna_text_glyph *glyph,float px,stru
  const stbtt_fontinfo *info=glyph->font;
  bool good=info && info->data==glyph->font_data && glyph->glyph<(uint32_t)info->numGlyphs;
  if(good && px>0) {
+  uint32_t px_bits;memcpy(&px_bits,&px,sizeof px_bits);
+  uint32_t h=((uint32_t)(uintptr_t)glyph->font_data>>4)*2654435761u^glyph->glyph*40503u^px_bits*2246822519u;
+  struct glyph_slot *slot=&g_glyph_cache[(h^(h>>15))&(GLYPH_CACHE_SLOTS-1)];
+  if(slot->used && slot->font==glyph->font && slot->font_data==glyph->font_data &&
+     slot->glyph==glyph->glyph && slot->px_bits==px_bits) {
+   __atomic_fetch_add(&slot->refs,1,__ATOMIC_RELAXED);
+   bitmap->coverage=slot->coverage;bitmap->width=slot->width;bitmap->height=slot->height;
+   bitmap->left=slot->left;bitmap->top=slot->top;bitmap->cache=slot;
+   pthread_mutex_unlock(&g_present_lock);return true;
+  }
   float scale=stbtt_ScaleForMappingEmToPixels(info,px);int x0,y0,x1,y1;
   stbtt_GetGlyphBitmapBox(info,(int)glyph->glyph,scale,scale,&x0,&y0,&x1,&y1);
   if(x1-x0>8192 || y1-y0>8192 || x1<x0 || y1<y0) good=false;
   else if(x1>x0 && y1>y0) {
    bitmap->coverage=stbtt_GetGlyphBitmap(info,scale,scale,(int)glyph->glyph,&bitmap->width,&bitmap->height,&bitmap->left,&bitmap->top);
    good=bitmap->coverage!=NULL;
+   if(good && !__atomic_load_n(&slot->refs,__ATOMIC_ACQUIRE) && x1-x0<=256 && y1-y0<=256) {
+    if(slot->used) stbtt_FreeBitmap(slot->coverage,NULL);
+    *slot=(struct glyph_slot){glyph->font,glyph->font_data,glyph->glyph,px_bits,bitmap->coverage,
+     bitmap->width,bitmap->height,bitmap->left,bitmap->top,1,true};
+    bitmap->cache=slot;
+   }
   }
  }
  pthread_mutex_unlock(&g_present_lock);return good;
 }
 void luna_overlay_free_glyph(struct luna_text_bitmap *bitmap)
-{if(bitmap) {stbtt_FreeBitmap(bitmap->coverage,NULL);memset(bitmap,0,sizeof *bitmap);}}
+{
+ if(!bitmap) return;
+ if(bitmap->cache) {
+  struct glyph_slot *slot=bitmap->cache;
+  __atomic_fetch_sub(&slot->refs,1,__ATOMIC_RELEASE);
+ } else stbtt_FreeBitmap(bitmap->coverage,NULL);
+ memset(bitmap,0,sizeof *bitmap);
+}
 
 float luna_overlay_text_width(const char *text, float px, bool bold)
 {

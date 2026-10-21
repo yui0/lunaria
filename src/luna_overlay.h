@@ -214,6 +214,7 @@ struct luna_text_run {
 struct luna_text_bitmap {
  unsigned char *coverage;
  int width,height,left,top;
+ void *cache; /* owner entry while the coverage is shared; release with luna_overlay_free_glyph */
 };
 /* Immutable copied font data, cached until host shutdown. Zero is the system
  * face. Handles remain valid across platform-font reloads and glyph runs. */

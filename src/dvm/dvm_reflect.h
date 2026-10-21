@@ -2687,6 +2687,64 @@ static bool cl_getEnclosingClass(struct dvm *vm, dvm_ref self,
    RETL(desc ? class_object_for(vm, dvm__class_by_desc(vm, desc)) : 0);
 }
 
+static bool cl_getEnclosingExecutable(struct dvm *vm, dvm_ref self,
+                                       const union dvm_value *args, int nargs,
+                                       union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   struct dvm_object *object = dvm__obj(vm, self);
+   struct dvm_class *cls = object ? object->klass : NULL;
+   uint32_t index;
+   struct dex_method_id id;
+   if (!cls || !cls->dex || cls->is_array || cls->is_primitive ||
+       !dex_class_enclosing_method(cls->dex, cls->class_def_idx, &index) ||
+       !dex_method_id(cls->dex, index, &id)) RETL(0);
+   const char *name = dex_string(cls->dex, id.name_idx);
+   bool constructor = !strcmp(builtin_name(), "getEnclosingConstructor");
+   /* Class initializers have no public reflection object. Each API returns
+    * null when the enclosing executable has the other kind. */
+   if (!name || !strcmp(name, "<clinit>") ||
+       constructor != !strcmp(name, "<init>")) RETL(0);
+   const char *desc = dex_type(cls->dex, id.class_idx);
+   struct dvm_class *owner = desc ? dvm__class_by_desc(vm, desc) : NULL;
+   if (!owner || owner->synthesized) {
+      dvm__throw(vm, "java/lang/NoClassDefFoundError", "%s", desc ? desc : "?");
+      return false;
+   }
+   char *sig = dex_proto_signature_alloc(cls->dex, id.proto_idx);
+   if (!sig) {
+      dvm__throw(vm, "java/lang/OutOfMemoryError", "enclosing method signature");
+      return false;
+   }
+   struct dvm_method *method = NULL;
+   for (int i = 0; i < owner->nmethods; ++i) {
+      struct dvm_method *candidate = &owner->methods[i];
+      if (candidate->name && candidate->sig && !strcmp(candidate->name, name) &&
+          !strcmp(candidate->sig, sig)) { method = candidate; break; }
+   }
+   free(sig);
+   if (!method) {
+      dvm__throw(vm, "java/lang/NoSuchMethodError", "%s.%s", owner->name, name);
+      return false;
+   }
+   dvm_ref owner_ref = class_object_for(vm, owner);
+   if (constructor) RETL(reflect_constructor(vm, owner_ref, method));
+   struct dvm_class *mc = dvm__class_by_desc(vm, "Ljava/lang/reflect/Method;");
+   dvm_ref result = mc ? dvm_new_object(vm, mc) : 0;
+   if (!result) RETL(0);
+   dvm_pin(vm, result);
+   union dvm_value value = { .l = owner_ref };
+   (void)dvm_set_field(vm, result, "owner", "Ljava/lang/Class;", value);
+   value.l = dvm_new_string(vm, method->name);
+   (void)dvm_set_field(vm, result, "name", "Ljava/lang/String;", value);
+   value.l = dvm_new_string(vm, method->sig);
+   (void)dvm_set_field(vm, result, "sig", "Ljava/lang/String;", value);
+   value.i = (int32_t)method->access;
+   (void)dvm_set_field(vm, result, "access", "I", value);
+   dvm_unpin(vm, result);
+   RETL(result);
+}
+
 static bool cl_getDeclaredClasses(struct dvm *vm, dvm_ref self,
                                    const union dvm_value *args, int nargs,
                                    union dvm_value *out)
@@ -3895,6 +3953,8 @@ static const struct rt_method rt_class[] = {
    M("getDeclaredClasses", "()[Ljava/lang/Class;", cl_getDeclaredClasses),
    M("getDeclaringClass", "()Ljava/lang/Class;", cl_getDeclaringClass),
    M("getEnclosingClass", "()Ljava/lang/Class;", cl_getEnclosingClass),
+   M("getEnclosingMethod", "()Ljava/lang/reflect/Method;", cl_getEnclosingExecutable),
+   M("getEnclosingConstructor", "()Ljava/lang/reflect/Constructor;", cl_getEnclosingExecutable),
    M("getGenericSuperclass", "()Ljava/lang/reflect/Type;",
      cl_getGenericSuperclass),
    M("getGenericInterfaces", "()[Ljava/lang/reflect/Type;",

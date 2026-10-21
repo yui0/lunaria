@@ -1512,6 +1512,36 @@ static bool db_page_size(struct dvm *vm, dvm_ref self, const union dvm_value *ar
    RETJ(v);
 }
 
+/* setPageSize / setMaximumSize / getMaximumSize are PRAGMAs, as the framework
+ * writes them.  The size comes back rounded to a whole number of pages. */
+static bool db_set_page_size(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                             int nargs, union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   struct sq_db *d = db_of(vm, self);
+   char sql[64];
+   snprintf(sql, sizeof sql, "PRAGMA page_size = %lld", (long long)args[0].j);
+   if (!d || !sq_exec(vm, d, sql)) return false;
+   RETV();
+}
+
+static bool db_maximum_size(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                            int nargs, union dvm_value *out)
+{
+   struct sq_db *d = db_of(vm, self);
+   int64_t pages, page;
+   if (!d || !sq_query_int(vm, d, "PRAGMA page_size", &page)) return false;
+   if (nargs) {
+      char sql[64];
+      const int64_t want = (args[0].j + page - 1) / page;
+      snprintf(sql, sizeof sql, "PRAGMA max_page_count = %lld", (long long)want);
+      if (!sq_query_int(vm, d, sql, &pages)) return false;
+      RETJ(pages * page);
+   }
+   if (!sq_query_int(vm, d, "PRAGMA max_page_count", &pages)) return false;
+   RETJ(pages * page);
+}
+
 /* getAttachedDbs(): the databases this connection can name — "main" on the
  * file it was opened on.  Room's corruption handler deletes every file listed,
  * so the answer has to be the real one. */
@@ -1648,6 +1678,9 @@ const struct dvm_sqlite_method dvm_sqlite_database_methods[] = {
    { "setVersion", "(I)V", db_set_version, 0 },
    { "needUpgrade", "(I)Z", db_need_upgrade, 0 },
    { "getPageSize", "()J", db_page_size, 0 },
+   { "setPageSize", "(J)V", db_set_page_size, 0 },
+   { "getMaximumSize", "()J", db_maximum_size, 0 },
+   { "setMaximumSize", "(J)J", db_maximum_size, 0 },
    { "setMaxSqlCacheSize", "(I)V", db_noop, 0 },
    { "setLocale", "(Ljava/util/Locale;)V", db_noop, 0 },
    { "setLockingEnabled", "(Z)V", db_noop, 0 },

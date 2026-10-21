@@ -51,7 +51,10 @@ void lm_sink_push(struct lm_sink *s, const uint8_t *rgba, int w, int h,
  * all of it on the thread the guest is blocked on.  begin() hands back the
  * sink's own buffer to convert into, commit() publishes it. */
 uint8_t *lm_sink_begin(struct lm_sink *s, int w, int h);
-void lm_sink_commit(struct lm_sink *s, int w, int h, int64_t timestamp_ns);
+bool lm_sink_commit(struct lm_sink *s, int w, int h, int64_t timestamp_ns);
+void lm_sink_abandon(struct lm_sink *s);
+uint64_t lm_sink_commit_id(struct lm_sink *s);
+int64_t lm_sink_acquired_timestamp(struct lm_sink *s);
 
 /* Consumer side.  False when no frame has arrived since the last take; the
  * pointer stays valid until the next push. */
@@ -60,8 +63,7 @@ bool lm_sink_take(struct lm_sink *s, const uint8_t **rgba, int *w, int *h);
 /* Last frame still in the sink (even after take() cleared pending). */
 bool lm_sink_peek(const struct lm_sink *s, const uint8_t **rgba, int *w, int *h);
 
-/* Presentation time of the frame the last take() handed out, in nanoseconds —
- * SurfaceTexture.getTimestamp(). */
+/* Presentation time of the most recently committed frame, in nanoseconds. */
 int64_t lm_sink_timestamp(const struct lm_sink *s);
 
 /* --- the codec ----------------------------------------------------------- */
@@ -85,6 +87,9 @@ enum {
  * answers from this, so the list never advertises a codec that createByCodecName
  * would then fail to produce. */
 bool lm_codec_supported(const char *mime);
+/* AAC's ADTS frequency table (ascending) and PCM output channel limit. */
+enum { LM_AAC_MAX_CHANNELS = 8 };
+const int32_t *lm_aac_sample_rates(size_t *count);
 
 /* NULL when the mime type has no decoder here.  `mime` is kept by value. */
 struct lm_codec *lm_codec_new(const char *mime);
@@ -118,6 +123,12 @@ const uint8_t *lm_codec_output_buffer(struct lm_codec *c, int idx, size_t *len);
  * NULL — a codec configured without a surface just drops it). */
 void lm_codec_release_output(struct lm_codec *c, int idx, bool render,
                              struct lm_sink *sink);
+/* Explicit Surface timestamp, in nanoseconds. Media PTS is preserved. */
+void lm_codec_release_output_at(struct lm_codec *c, int idx,
+                                struct lm_sink *sink, int64_t timestamp_ns);
+/* Actual Surface commits, sampled on the producer thread. */
+void lm_codec_render_notifications(struct lm_codec *c, bool enabled);
+bool lm_codec_dequeue_rendered(struct lm_codec *c, int64_t *pts_us, int64_t *nano_time);
 
 /* LUNARIA_TRACE_MEDIA: whether to log the codec state machine.  Shared so the
  * Java side of MediaCodec can log on the same switch. */
@@ -140,6 +151,8 @@ const char *lm_codec_mime(const struct lm_codec *c);
  * this into an error for its listener rather than go on "playing" a movie that
  * will never produce a frame. */
 bool lm_codec_undecodable(const struct lm_codec *c);
+/* Fatal decoder status (Android status_t), zero while usable. */
+int lm_codec_error(struct lm_codec *c);
 
 /* --- MP4 demuxing -------------------------------------------------------- *
  *

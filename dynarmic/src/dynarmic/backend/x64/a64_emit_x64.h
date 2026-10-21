@@ -71,9 +71,10 @@ protected:
     void (*memory_exclusive_write_128)();
     void GenMemory128Accessors();
 
-    std::map<std::tuple<bool, size_t, int, int>, void (*)()> read_fallbacks;
-    std::map<std::tuple<bool, size_t, int, int>, void (*)()> write_fallbacks;
-    std::map<std::tuple<bool, size_t, int, int>, void (*)()> exclusive_write_fallbacks;
+    // Fixed keys: ordering, 8/16/32/64/128-bit width, and x64 register indices.
+    void (*read_fallbacks[2][5][16][16])() = {};
+    void (*write_fallbacks[2][5][16][16])() = {};
+    void (*exclusive_write_fallbacks[2][5][16][16])() = {};
     void GenFastmemFallbacks();
 
     const void* terminal_handler_pop_rsb_hint;

@@ -19,6 +19,11 @@ namespace {
 
 using namespace Xbyak::util;
 
+/* Widths and host register indices form a small, bounded key space. */
+static inline size_t FastmemFallbackSizeIndex(size_t bitsize) {
+    return bitsize == 8 ? 0 : bitsize == 16 ? 1 : bitsize == 32 ? 2 : bitsize == 64 ? 3 : 4;
+}
+
 constexpr size_t page_bits = 12;
 constexpr size_t page_size = 1 << page_bits;
 constexpr size_t page_mask = (1 << page_bits) - 1;

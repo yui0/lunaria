@@ -176,6 +176,9 @@ bool dex_field_signature(struct dex_file *d, uint32_t class_def_idx,
 /* Declaring/enclosing class recorded by EnclosingClass or EnclosingMethod. */
 const char *dex_class_enclosing_type(struct dex_file *d,
                                      uint32_t class_def_idx);
+/* EnclosingMethod's method_id, including constructors and class initializers. */
+bool dex_class_enclosing_method(struct dex_file *d, uint32_t class_def_idx,
+                                 uint32_t *method_idx);
 
 /* Member classes declare EnclosingClass; local/anonymous classes use EnclosingMethod. */
 bool dex_class_is_member(struct dex_file *d, uint32_t class_def_idx);

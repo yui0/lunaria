@@ -492,6 +492,7 @@ static int zip_extract(struct zip *z, const char *root, bool overwrite)
 struct manifest {
    char package[256], split[256], activity[512], application[512];
    char orientation[32], theme[32], min_sdk[32], target_sdk[32], config_changes[32];
+   char cleartext[8], network_security[32];
    char receivers[APK_META], services[APK_META];
    char providers[APK_META], permissions[APK_META], query_actions[APK_META], query_packages[APK_META];
 };
@@ -721,6 +722,9 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
                goto done;
             const struct attr *v = attribute(a, count, "enabled");
             if (v) app_enabled = attr_boolean(v);
+            v = attribute(a, count, "usesCleartextTraffic");
+            if (v) snprintf(m->cleartext, sizeof m->cleartext, "%d", attr_boolean(v));
+            if (attr_number(m->network_security, sizeof m->network_security, a, count, "networkSecurityConfig")) goto done;
             v = attribute(a, count, "directBootAware");
             if (v) app_boot = attr_boolean(v);
             if (copy_text(app_permission, sizeof app_permission, attr_text(a, count, "permission")) ||
@@ -2133,6 +2137,8 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       {"ANDROID_RECEIVERS", m->receivers}, {"ANDROID_SERVICES", m->services},
       {"ANDROID_CONTENT_PROVIDERS", m->providers}, {"ANDROID_REQUESTED_PERMISSIONS", m->permissions},
       {"ANDROID_MIN_SDK", m->min_sdk}, {"ANDROID_TARGET_SDK", m->target_sdk},
+      {"ANDROID_USES_CLEARTEXT_TRAFFIC", m->cleartext},
+      {"ANDROID_NETWORK_SECURITY_CONFIG", m->network_security},
       {"ANDROID_QUERY_ACTIONS", m->query_actions}, {"ANDROID_QUERY_PACKAGES", m->query_packages},
    };
    for (size_t i = 0; i < sizeof metadata / sizeof metadata[0]; i++) {

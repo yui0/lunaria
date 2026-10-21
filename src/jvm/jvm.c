@@ -17,6 +17,7 @@
 #include <stdatomic.h>
 #include "lunaria_os.h"
 #include "jvm.h"
+#include "java_type.h"
 #include "trace.h"
 #include "dvm/dvm_jni.h"
 #include "dvm/dvm.h"
@@ -593,7 +594,9 @@ jvm_bridge_ref_count(struct jvm *jvm, jobject object)
       return 0;
    jvm_meta_lock();
    struct jvm_object *o = jvm_get_object(jvm, object);
-   int refs = o->type == JVM_OBJECT_NONE ? 0 : o->refs - o->array_refs;
+   /* Array elements are owning Java references too. A native frame may drop
+    * its local while an array still retains the same object and VM payload. */
+   int refs = o->type == JVM_OBJECT_NONE ? 0 : o->refs;
    jvm_meta_unlock();
    return refs;
 }
@@ -815,6 +818,11 @@ jvm_make_class(struct jvm *jvm, const char *name)
    return jvm_add_object_if_not_there(jvm, &o);
 }
 
+jclass jvm_primitive_class(struct jvm *jvm, const char *descriptor)
+{
+   return luna_java_primitive_name(descriptor) ? jvm_make_class(jvm, descriptor) : NULL;
+}
+
 /* LUNARIA_TRACE_JNIEXC=1: each exception that becomes pending, with the
  * class and message.  The first thing to ask when native code takes its error
  * path with nothing visibly wrong. */
@@ -833,7 +841,7 @@ JNIEnv_FindClass(JNIEnv* p0, const char* p1)
    assert(p0 && p1);
    verbose("%s", p1);
    struct jvm *jvm = jnienv_get_jvm(p0);
-   if (p1[0] != '[' && !dvm_jni_class_exists(p1)) {
+   if (!dvm_jni_class_exists(p1)) {
       static int reported;
       if (reported++ < 64)
          fprintf(stderr, "[jvm] FindClass(%s): NoClassDefFoundError\n", p1);
@@ -1835,8 +1843,8 @@ jvm_wrap_method(struct jvm *jvm, jmethodID method_id)
  * silently returned zero — see src/dvm/dvm.h.  Exactly one of `ap` and `jargs`
  * carries the arguments. */
 static bool
-jvm_dvm_try(JNIEnv *env, jobject self, jmethodID method_id, bool is_static,
-            va_list *ap, const jvalue *jargs, jvalue *out)
+jvm_dvm_try_mode(JNIEnv *env, jobject self, jmethodID method_id, bool is_static,
+            va_list *ap, const jvalue *jargs, jvalue *out, bool nonvirtual)
 {
    if (dvm_jni_mode() == DVM_JNI_OFF || !method_id)
       return false;
@@ -1850,10 +1858,20 @@ jvm_dvm_try(JNIEnv *env, jobject self, jmethodID method_id, bool is_static,
    if (!ko)
       return false;
 
-   return dvm_jni_invoke(env, ko->klass.name.data, mo->method.name.data,
+   return (nonvirtual ? dvm_jni_invoke_nonvirtual : dvm_jni_invoke)(env, ko->klass.name.data, mo->method.name.data,
                          mo->method.signature.data, self, is_static,
                          ap, jargs, out);
 }
+
+static bool
+jvm_dvm_try(JNIEnv *env, jobject self, jmethodID method_id, bool is_static,
+            va_list *ap, const jvalue *jargs, jvalue *out)
+{ return jvm_dvm_try_mode(env, self, method_id, is_static, ap, jargs, out, false); }
+
+static bool
+jvm_dvm_try_nonvirtual(JNIEnv *env, jobject self, jmethodID method_id, bool is_static,
+            va_list *ap, const jvalue *jargs, jvalue *out)
+{ return jvm_dvm_try_mode(env, self, method_id, is_static, ap, jargs, out, true); }
 
 /* The host stubs in jni_stubs.c all take their arguments as a `va_list` —
  * that is the shape the JNI *V* entry points hand them.  The *A* entry points
@@ -2026,7 +2044,7 @@ JNIEnv_CallNonvirtualVoidMethodV(JNIEnv* p0, jobject p1, jclass p2, jmethodID p3
       jvalue rv;
       va_list copy;
       va_copy(copy, p4);
-      bool done = jvm_dvm_try(p0, p1, p3, false, &copy, NULL, &rv);
+      bool done = jvm_dvm_try_nonvirtual(p0, p1, p3, false, &copy, NULL, &rv);
       va_end(copy);
       if (done)
          return;
@@ -2051,7 +2069,7 @@ JNIEnv_CallNonvirtualVoidMethodA(JNIEnv* p0, jobject p1, jclass p2, jmethodID p3
    void *fp = jvm_wrap_method(jnienv_get_jvm(p0), p3);
    if (!fp || dvm_jni_mode() == DVM_JNI_PREFER) {
       jvalue rv;
-      if (jvm_dvm_try(p0, p1, p3, false, NULL, p4, &rv))
+      if (jvm_dvm_try_nonvirtual(p0, p1, p3, false, NULL, p4, &rv))
          return;
    }
    if (fp)
@@ -2112,7 +2130,7 @@ JNIEnv_CallNonvirtualVoidMethodA(JNIEnv* p0, jobject p1, jclass p2, jmethodID p3
          jvalue rv; \
          va_list copy; \
          va_copy(copy, p4); \
-         bool done = jvm_dvm_try(p0, p1, method, false, &copy, NULL, &rv); \
+         bool done = jvm_dvm_try_nonvirtual(p0, p1, method, false, &copy, NULL, &rv); \
          va_end(copy); \
          if (done) \
             return (T)rv.VF; \
@@ -2125,7 +2143,7 @@ JNIEnv_CallNonvirtualVoidMethodA(JNIEnv* p0, jobject p1, jclass p2, jmethodID p3
       void *fp = jvm_wrap_method(jnienv_get_jvm(p0), method); \
       if (!fp || dvm_jni_mode() == DVM_JNI_PREFER) { \
          jvalue rv; \
-         if (jvm_dvm_try(p0, p1, method, false, NULL, p4, &rv)) \
+         if (jvm_dvm_try_nonvirtual(p0, p1, method, false, NULL, p4, &rv)) \
             return (T)rv.VF; \
       } \
       return (fp ? JVM_CALL_NV_A(fp, T, p0, p1, p2, p4) : D); \

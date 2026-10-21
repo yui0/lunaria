@@ -1130,6 +1130,25 @@ const char *dex_class_enclosing_type(struct dex_file *d, uint32_t class_def_idx)
    return class_enclosing_type(d, class_def_idx, NULL);
 }
 
+bool dex_class_enclosing_method(struct dex_file *d, uint32_t class_def_idx,
+                                 uint32_t *method_idx)
+{
+   struct dex_class_def cd;
+   uint32_t annotation;
+   struct dex_value value;
+   if (!d || !dex_class_def(d, class_def_idx, &cd) || !cd.annotations_off ||
+       (uint64_t)cd.annotations_off + 16u > d->len ||
+       !dex_annotation_set_find(d, dex_u32_at(d, cd.annotations_off),
+                                 "Ldalvik/annotation/EnclosingMethod;", false,
+                                 &annotation) ||
+       !annotation || d->p[annotation - 1u] != 2u || /* system visibility */
+       !dex_annotation_element(d, annotation, "value", &value) ||
+       value.type != DEX_VALUE_METHOD || value.bits >= d->method_ids_size)
+      return false;
+   if (method_idx) *method_idx = (uint32_t)value.bits;
+   return true;
+}
+
 bool dex_class_is_member(struct dex_file *d, uint32_t class_def_idx)
 {
    bool member = false;

@@ -41,6 +41,10 @@
 #include <elf.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <utility>
+#ifdef __linux__
+#include <sys/inotify.h>
+#endif
 #include <locale.h>
 #include <fenv.h>
 #include <map>
@@ -1215,6 +1219,11 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"glGetnUniformuiv", SVC_GL32_GetnUniformuiv},
     {"glGetDebugMessageLog", SVC_GL32_GetDebugMessageLog},
 
+    {"timer_create",SVC_POSIX_TIMER_CREATE},
+    {"timer_settime",SVC_POSIX_TIMER_SETTIME},
+    {"timer_gettime",SVC_POSIX_TIMER_GETTIME},
+    {"timer_delete",SVC_POSIX_TIMER_DELETE},
+    {"timer_getoverrun",SVC_POSIX_TIMER_GETOVERRUN},
     {"clock_gettime",           SVC_CLOCK_GETTIME},
     {"gettimeofday",            SVC_GETTIMEOFDAY},
     {"time",                    SVC_TIME},
@@ -1503,6 +1512,7 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"sem_getvalue",            SVC_SEM_GETVALUE},
     {"sem_timedwait",           SVC_SEM_TIMEDWAIT},
     {"sleep",                   SVC_SLEEP},
+    {"capget",                  SVC_CAPGET},
     {"getuid",                  SVC_GETUID},
     {"geteuid",                 SVC_GETEUID},
     {"getegid",                 SVC_GETEGID},
@@ -1530,7 +1540,7 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"ALooper_wake",                SVC_ALOOPER_WAKE},
     {"ALooper_addFd",               SVC_ALOOPER_ADDFD},
     {"ALooper_removeFd",            SVC_ALOOPER_REMOVEFD},
-    // AAudio: stateful stubs; the data callback is pumped from idle points
+    // AAudio streams run data callbacks on their own guest threads.
     {"AAudio_createStreamBuilder",              SVC_AAUDIO_CREATE_BUILDER},
     {"AAudioStreamBuilder_setDirection",        SVC_AAUDIO_SET_DIRECTION},
     {"AAudioStreamBuilder_setSampleRate",       SVC_AAUDIO_SET_RATE},
@@ -1539,7 +1549,7 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"AAudioStreamBuilder_setSharingMode",      SVC_RET0},
     {"AAudioStreamBuilder_setPerformanceMode",  SVC_RET0},
     {"AAudioStreamBuilder_setBufferCapacityInFrames", SVC_RET0},
-    {"AAudioStreamBuilder_setFramesPerDataCallback",  SVC_RET0},
+    {"AAudioStreamBuilder_setFramesPerDataCallback",  SVC_AAUDIO_SET_CALLBACK_FRAMES},
     {"AAudioStreamBuilder_setDataCallback",     SVC_AAUDIO_SET_DATA_CB},
     {"AAudioStreamBuilder_setErrorCallback",    SVC_RET0},
     {"AAudioStreamBuilder_setDeviceId",         SVC_RET0},
@@ -2373,6 +2383,8 @@ static bool svc_prefers_guest_export(const char *name, uint32_t svc) {
 
 // Guest-side ARM stub for pthread_once: actually runs the init routine (an SVC handler cannot re-enter the JIT).
 static constexpr uint32_t PTHREAD_ONCE_STUB = 0x41008000u;
+static constexpr uint32_t POSIX_TIMER_STUB = PTHREAD_ONCE_STUB + 0x100u;
+static constexpr uint32_t AAUDIO_CALLBACK_STUB = PTHREAD_ONCE_STUB + 0x200u;
 static constexpr uint32_t MJIV_STUB         = 0x41009000u; /* mono_jit_init_version wrapper */
 static constexpr uint32_t MONO_CFG_PARSE_STUB = 0x41009100u; /* mono_config_parse: noop (done in prepare) */
 static constexpr uint32_t MONO_CFG_ASM_STUB   = 0x41009110u; /* mono_config_for_assembly: noop ret0 */
@@ -2410,6 +2422,9 @@ static constexpr uint32_t CUR_TID_VA      = FAST_MUTEX_PAGE; /* word: tid+1 */
 static uint32_t g_fastmutex_lock_va    = 0;
 static uint32_t g_fastmutex_unlock_va  = 0;
 static uint32_t g_fastmutex_trylock_va = 0;
+/* ARM32 in-guest libc leaf stubs, 0 until build_fast_libc_stubs32() runs. */
+static uint32_t g_fast32_getspecific_va, g_fast32_self_va, g_fast32_memset_va,
+                g_fast32_memcpy_va;
 
 /* Fast in-guest pthread_rwlock stubs for AArch64 guests.  The counter lives in
  * the guest's own pthread_rwlock_t; the uncontended path is an ldaxr/stlxr
@@ -2449,6 +2464,14 @@ static constexpr uint32_t TLS64_ERRNO_OFF  = 0xBFCu;
  * call a Unity title makes most often after its GL calls is a load off
  * TPIDR_EL0 rather than an exit from the JIT. */
 static constexpr uint32_t TLS64_SELF_OFF   = 0xBF0u;
+/* Non-zero while this thread has a JNI exception pending.  Native code asks
+ * ExceptionCheck()/ExceptionOccurred() after nearly every call it makes into
+ * Java (a measured 35% of all SVCs during an Adjust signature burst), and the
+ * answer is almost always "none".  The host republishes the word after every
+ * JNI SVC, so a guest stub can answer the common case with one load off
+ * TPIDR_EL0 and leave the JIT only when something is actually pending.  A
+ * stale 1 only costs the slow path; the host never leaves a stale 0. */
+static constexpr uint32_t TLS64_EXC_OFF    = 0xBECu;
 /* The words above are part of Lunaria's synthetic TLS ABI, not bionic's TCB.
  * A CLONE_SETTLS value is owned and laid out by guest libc and must remain
  * completely opaque to the emulator. */
@@ -2625,6 +2648,21 @@ static uint32_t lookup_direct_va_fast64(const char *name)
     return it != map.end() ? it->second() : 0;
 }
 
+static uint32_t lookup_direct_va_fast32(const char *name)
+{
+    extern bool g_guest_bionic_loaded;
+    if (!name) return 0;
+    if (g_guest_bionic_loaded && !strncmp(name, "pthread_", 8)) return 0;
+    static const std::unordered_map<std::string_view, uint32_t *> map = {
+        {"pthread_getspecific", &g_fast32_getspecific_va},
+        {"pthread_self", &g_fast32_self_va},
+        {"memset", &g_fast32_memset_va},
+        {"memcpy", &g_fast32_memcpy_va},
+    };
+    auto it = map.find(name);
+    return it != map.end() ? *it->second : 0;
+}
+
 static uint32_t lookup_symbol_svc(const char *name);
 
 /* Pure libc supplies only audited functions, including through dlsym.
@@ -2650,6 +2688,7 @@ static uint32_t lookup_symbol_direct_va(const char *name) {
         if (uint64_t t = luna_vk_symbol(name))
             return (uint32_t)(t - A64_GUEST_BASE);
     if (uint32_t va = lookup_direct_va_fast64(name)) return va;
+    if (uint32_t va = lookup_direct_va_fast32(name)) return va;
     if (strcmp(name, "__data_start") == 0 || strcmp(name, "data_start") == 0)
         return g_reloc_data_start ? g_reloc_data_start : LIBC_DATA;
     if (strncmp(name, "AMEDIAFORMAT_KEY_", 17) == 0) return NOOP_RET0;
@@ -4301,17 +4340,20 @@ static ArmExecCtx *g_ctx = nullptr;
 
 /* Host calls (arm_exec.h). Descriptors live in a fixed array and are
  * published by bumping the count, so the dispatcher reads them without a
- * lock while another thread registers. Trampolines are carved out of guest
- * heap chunks: they are never freed, and a chunk that has held code is never
- * handed back to be data. */
+ * lock while another thread registers. Code lives in a dedicated RX region
+ * below the ELF image window; ordinary guest heap pages remain non-executable.
+ * Host writes populate each unused slot before its descriptor is published. */
 struct HostCallDesc {
     HostCallFn fn;
     uintptr_t data;
     const char *name;
     unsigned flags;
 };
+static constexpr uint32_t HOSTCALL_BASE = 0x0F000000u;
 static constexpr uint32_t HOSTCALL_MAX = 16384u;
 static constexpr uint32_t HOSTCALL_TRAMP = 16u;   /* svc; ret; .word idx; pad */
+static_assert(HOSTCALL_BASE + HOSTCALL_MAX * HOSTCALL_TRAMP <= MMAP_BASE,
+              "host-call code must stay below the guest image/mmap window");
 static HostCallDesc g_host_calls[HOSTCALL_MAX];
 static std::atomic<uint32_t> g_host_call_count{0};
 
@@ -4320,7 +4362,6 @@ extern "C" uint64_t luna_host_call_tramp(const char *name, HostCallFn fn,
 {
     if (!g_ctx || !g_ctx->is_arm64 || !fn) return 0;
     static std::mutex mu;
-    static uint32_t chunk = 0, chunk_left = 0;
     std::lock_guard<std::mutex> lk(mu);
     const uint32_t idx = g_host_call_count.load(std::memory_order_relaxed);
     if (idx >= HOSTCALL_MAX) {
@@ -4332,16 +4373,10 @@ extern "C" uint64_t luna_host_call_tramp(const char *name, HostCallFn fn,
         }
         return 0;
     }
-    if (chunk_left < HOSTCALL_TRAMP) {
-        constexpr uint32_t CHUNK = 4096u;
-        ArmLockGuard g;
-        chunk = arm_malloc(*g_ctx, CHUNK);
-        if (!chunk) return 0;
-        chunk_left = CHUNK;
-    }
-    const uint32_t at = chunk;
-    chunk += HOSTCALL_TRAMP;
-    chunk_left -= HOSTCALL_TRAMP;
+    if (!idx)
+        a64_map_declare_backing(HOSTCALL_BASE,
+                               HOSTCALL_MAX * HOSTCALL_TRAMP, 5u /* R|X */);
+    const uint32_t at = HOSTCALL_BASE + idx * HOSTCALL_TRAMP;
     g_host_calls[idx] = { fn, data, name, flags };
     ArmExecCtx &ctx = *g_ctx;
     ctx.mem.write32(at + 0u, 0xD4000001u | ((SVC_HOSTCALL & 0xFFFFu) << 5));
@@ -5201,6 +5236,23 @@ static bool synth_guest_task_bytes(const char *path, char **out_buf,
 static uint32_t guest_process_of_tid(uint32_t linux_tid);
 static const char *synth_guest_proc_root(void);
 
+/* A small constant /proc file, written once to a temporary file and handed
+ * out by name.  `slot` is the caller's own static buffer. */
+static const char *synth_proc_constant(char *slot, size_t slot_size,
+                                       const char *tag, const char *body, size_t n)
+{
+    if (!slot[0]) {
+        char buf[64];
+        snprintf(buf, sizeof buf, "/tmp/lunaria-proc-%s-XXXXXX", tag);
+        int fd = luna_temp_mkstemp(buf, sizeof buf);
+        if (fd < 0) return nullptr;
+        if (luna_fd_write(fd, body, n) < 0) { }
+        luna_fd_close(fd);
+        snprintf(slot, slot_size, "%s", buf);
+    }
+    return slot;
+}
+
 // Synthetic /proc/self/maps.
 static const char *synthetic_proc_path(const char *path) {
     if (path) {
@@ -5317,6 +5369,58 @@ static const char *synthetic_proc_path(const char *path) {
             return synth_guest_stat();
         if (slash && proc_subject_live && !strcmp(slash, "/status"))
             return synth_guest_status();
+        /* What an untrusted app reads about itself: its SELinux domain (a
+         * NUL-terminated context, no newline), the domain it was forked from,
+         * and the environment the zygote handed down.  Security libraries read
+         * these to check that they run in an app process; answering ENOENT is a
+         * state no Android kernel produces. */
+        /* /proc/<self|live pid>/attr/<name>: the subject is two components up. */
+        auto proc_attr = [&](const char *name) {
+            if (strncmp(path, "/proc/", 6)) return false;
+            const char *subject = path + 6;
+            const char *sl = strchr(subject, '/');
+            if (!sl || strncmp(sl, "/attr/", 6) || strcmp(sl + 6, name)) return false;
+            if (sl - subject == 4 && !memcmp(subject, "self", 4)) return true;
+            char *end = nullptr;
+            unsigned long n = strtoul(subject, &end, 10);
+            return end == sl && n <= UINT32_MAX &&
+                   (n == guest_pid() || guest_process_of_tid((uint32_t)n) == guest_pid());
+        };
+        if (proc_attr("current")) {
+            static char f[64] = "";
+            static const char body[] = "u:r:untrusted_app:s0:c512,c768";
+            return synth_proc_constant(f, sizeof f, "attr-current", body, sizeof body);
+        }
+        if (proc_attr("prev")) {
+            static char f[64] = "";
+            static const char body[] = "u:r:zygote:s0";
+            return synth_proc_constant(f, sizeof f, "attr-prev", body, sizeof body);
+        }
+        if (slash && proc_subject_live && !strcmp(slash, "/environ")) {
+            static char f[64] = "";
+            static const char body[] =
+                "ANDROID_ASSETS=/system/app\0ANDROID_BOOTLOGO=1\0ANDROID_DATA=/data\0"
+                "ANDROID_ROOT=/system\0ANDROID_STORAGE=/storage\0"
+                "ASEC_MOUNTPOINT=/mnt/asec\0EXTERNAL_STORAGE=/sdcard\0"
+                "PATH=/product/bin:/apex/com.android.runtime/bin:/system/bin:/system/xbin:/vendor/bin\0"
+                "LOOP_MOUNTPOINT=/mnt/obb\0";
+            return synth_proc_constant(f, sizeof f, "environ", body, sizeof body - 1);
+        }
+        if (!strcmp(path, "/proc/sys/fs/inotify/max_user_watches")) {
+            static char f[64] = "";
+            static const char body[] = "8192\n";
+            return synth_proc_constant(f, sizeof f, "inotify-watches", body, sizeof body - 1);
+        }
+        if (!strcmp(path, "/proc/sys/fs/inotify/max_user_instances")) {
+            static char f[64] = "";
+            static const char body[] = "128\n";
+            return synth_proc_constant(f, sizeof f, "inotify-instances", body, sizeof body - 1);
+        }
+        if (!strcmp(path, "/proc/sys/fs/inotify/max_queued_events")) {
+            static char f[64] = "";
+            static const char body[] = "16384\n";
+            return synth_proc_constant(f, sizeof f, "inotify-events", body, sizeof body - 1);
+        }
         /* /proc/<pid>/mountinfo describes the process's mount namespace, not a
          * privileged host resource, so the blanket /proc block must not answer
          * ENOENT for the guest's own pid (impossible on Android). Expose a small,
@@ -5616,6 +5720,7 @@ struct ArmSignalWaitState {
     bool sleep_posix_error = false;
     uint32_t sleep_saved_errno = 0;
     bool sleep_abstime = false;
+    uint32_t waiting_posix_timer = 0;
     bool waiting_signal = false;
 };
 
@@ -5637,6 +5742,11 @@ struct ArmSignalFrameState {
 // Cooperative guest threads.
 struct ArmThread {
     uint32_t                     id = 0;       /* pthread_self value (2-based) */
+    /* A32 slices may be driven by Java callback hosts as well as the pump.
+     * EGL bindings are host-thread local; keep an owning guest on that host
+     * until it explicitly releases its context. */
+    pthread_t                    egl_host_thread{};
+    bool                         egl_host_bound = false;
     /* Linux process identity is not pthread identity. Ordinary pthreads inherit
      * these values; a fork/system child gets a new pid, so an exec'd helper
      * neither appears in its parent's /proc/<pid>/task nor sees getpid() equal
@@ -5745,6 +5855,7 @@ struct ArmThread {
      * question; with a pool the pump hands slices out and keeps going, and the
      * next pass must not dispatch a thread that is already on an engine. */
     bool                         running = false;
+    uint32_t                     run_site = 0;  /* which dispatch path set `running` last */
     /* Linux scheduling attributes are guest-visible process state even though
      * host execution remains cooperative.  Keep them per guest thread so
      * pthread_{get,set}schedparam round-trips instead of either lying about
@@ -5881,6 +5992,7 @@ struct ArmThread {
      * that thread's own register context at its next slice boundary. */
     uint64_t                     pending_signals = 0;
     uint8_t                      signal_depth = 0;
+    uint32_t                     waiting_posix_timer = 0;
     bool                         waiting_signal = false;
     uint64_t                     sigsuspend_old_mask = 0;
     std::array<ArmSignalFrameState, A64_SIGNAL_DEPTH_MAX> signal_frames{};
@@ -6344,6 +6456,7 @@ static uint64_t guest_maps_key(void)
         h *= 1099511628211ull;
     };
     mix(g_a64_maps_gen.load(std::memory_order_acquire));
+    mix(g_a32_vma_gen);
     mix(g_guest_proc_arm64 ? 1u : 0u);
     mix(guest_pid());
     mix(g_heap_size);
@@ -6360,6 +6473,18 @@ static uint64_t guest_maps_key(void)
         mix(t.id); mix(t.stack_base); mix(t.stack_size);
     }
     return h;
+}
+
+/* The permission field /proc/self/maps shows for a guest protection, for both
+ * ABIs.  Presentation policy lives here and only here: anything a tamper
+ * check needs shown differently from the raw PROT_* bits is changed in this
+ * one function. */
+static void guest_maps_perm(uint32_t prot, char perm[5])
+{
+    perm[0] = 'r'; perm[1] = '-'; perm[2] = '-'; perm[3] = 'p'; perm[4] = '\0';
+    if (prot & LUNA_PROT_WRITE) perm[1] = 'w';
+    if (prot & LUNA_PROT_EXEC)  perm[2] = 'x';
+    if (!(prot & (LUNA_PROT_READ | LUNA_PROT_WRITE | LUNA_PROT_EXEC))) perm[0] = '-';
 }
 
 static const char *synth_guest_maps(void) {
@@ -6444,8 +6569,24 @@ static const char *synth_guest_maps(void) {
         if (g_guest_proc_arm64)
             emit_a64(a64_guest_va(r.lo), a64_guest_va(r.hi), perm,
                      r.file_off, maj, min, ino, nm);
-        else
-            emit_a32(r.lo, r.hi, perm, r.file_off, maj, min, ino, nm);
+        else {
+            /* Pages the guest re-protected show their current permissions. */
+            uint32_t at = r.lo;
+            for (size_t i = 0; i < g_a32_image_prot.n && at < r.hi; ++i) {
+                const luna_guest_mapping &o = g_a32_image_prot.v[i];
+                if (o.hi <= at || o.lo >= r.hi) continue;
+                const uint32_t olo = (uint32_t)std::max<uint64_t>(o.lo, at);
+                const uint32_t ohi = (uint32_t)std::min<uint64_t>(o.hi, r.hi);
+                if (olo > at)
+                    emit_a32(at, olo, perm, r.file_off + (at - r.lo), maj, min, ino, nm);
+                char now[5];
+                guest_maps_perm(o.prot, now);
+                emit_a32(olo, ohi, now, r.file_off + (olo - r.lo), maj, min, ino, nm);
+                at = ohi;
+            }
+            if (at < r.hi)
+                emit_a32(at, r.hi, perm, r.file_off + (at - r.lo), maj, min, ino, nm);
+        }
     }
 
     /* Image-window heap + mmap bump arenas (backing offsets). */
@@ -6463,19 +6604,28 @@ static const char *synth_guest_maps(void) {
     } else {
         emit_a32(HEAP_BASE, HEAP_BASE + g_heap_size, "rw-p", 0, 0, 0, 0,
                  "[heap]");
+        /* What the guest mmap()ed, with the protection it holds now.  The
+         * kernel merges neighbours that look alike, anonymous ones included. */
+        for (size_t i = 0; i < g_a32_vmas.n;) {
+            const luna_guest_mapping &m = g_a32_vmas.v[i];
+            uint64_t hi = m.hi;
+            size_t j = i + 1;
+            while (!m.file_backed && j < g_a32_vmas.n && g_a32_vmas.v[j].lo == hi &&
+                   !g_a32_vmas.v[j].file_backed && g_a32_vmas.v[j].prot == m.prot)
+                hi = g_a32_vmas.v[j++].hi;
+            char perm[5];
+            guest_maps_perm(m.prot, perm);
+            emit_a32((uint32_t)m.lo, (uint32_t)hi, perm, 0, 0, 0, 0, "");
+            i = j;
+        }
     }
 
     /* High guest==host mappings (anonymous mmap outside the image window). */
     if (g_guest_proc_arm64) {
         std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
         for (const A64Mapping &m : g_a64_maps) {
-            char perm[5] = {'r', '-', '-', 'p', '\0'};
-            if (m.prot & LUNA_PROT_WRITE) perm[1] = 'w';
-            if (m.prot & LUNA_PROT_EXEC)  perm[2] = 'x';
-            if (!(m.prot & LUNA_PROT_READ) && !(m.prot & LUNA_PROT_WRITE) &&
-                !(m.prot & LUNA_PROT_EXEC)) {
-                perm[0] = '-';
-            }
+            char perm[5];
+            guest_maps_perm(m.prot, perm);
             /* An anonymous mapping on a device is either unnamed or carries a name the
              * process set with PR_SET_VMA_ANON_NAME, never the emulator's own
              * architecture: "[anon:a64]" says "something that is not the app made this
@@ -7430,18 +7580,33 @@ struct GuestDlError {
 /* ARM32 TPIDRURO and the bridge's mutex owner belong to the guest thread.
  * Keep one TLS block for both MRC and __kuser_get_tls. */
 static constexpr uint32_t TLS32_OWNER_OFF = 0xf00u;
+/* Pending-JNI-exception word of the thread's ARM32 TLS block; see
+ * TLS64_EXC_OFF for the protocol. */
+static constexpr uint32_t TLS32_EXC_OFF   = 0xf04u;
+/* pthread_self() answer of the thread, and its pthread_setspecific values for
+ * keys below TLS32_MAX_KEYS (a mirror of g_tls; the host map stays the owner).
+ * The in-guest stubs read both off TPIDRURO so the two hottest pthread calls
+ * of an IL2CPP title never leave the JIT. */
+static constexpr uint32_t TLS32_SELF_OFF  = 0xf08u;
+static constexpr uint32_t TLS32_KEYS_OFF  = 0x800u;
+static constexpr uint32_t TLS32_MAX_KEYS  = 128u;
 static std::atomic<uint32_t> g_tls32_by_tid[THREAD_TID_MAX];
 static thread_local uint32_t g_tpidr32_val;
 static uint32_t arm32_tls_for_tid(ArmExecCtx &ctx, uint32_t tid) {
     if (tid >= THREAD_TID_MAX) return 0;
-    ArmLockGuard locked;
+    /* Published once and never changed: no need for the execution lock after
+     * the first call, and this runs on every SVC. */
     uint32_t value = g_tls32_by_tid[tid].load(std::memory_order_acquire);
+    if (value) return value;
+    ArmLockGuard locked;
+    value = g_tls32_by_tid[tid].load(std::memory_order_acquire);
     if (!value) {
         value = arm_malloc(ctx, 4096);
         if (!value) return 0;
         memset(ctx.mem.ptr(value), 0, 4096);
         ctx.mem.write32(value, value); /* TLS_SLOT_SELF */
         ctx.mem.write32(value + TLS32_OWNER_OFF, (tid + 1u) & 0xffu);
+        ctx.mem.write32(value + TLS32_SELF_OFF, tid ? tid : 1u);
         g_tls32_by_tid[tid].store(value, std::memory_order_release);
     }
     return value;
@@ -7846,6 +8011,12 @@ static GuestVA a64_sig_restorer(ArmExecCtx &ctx) {
  * by call_guest_abi64. */
 static thread_local GuestVA g_cb_lr_override = 0;
 
+static struct luna_posix_timers g_posix_timers;
+static bool posix_timer_siginfo(ArmExecCtx &,GuestVA,int,uint32_t,bool);
+static void posix_timer_requeue(ArmExecCtx &,uint32_t,int);
+static void posix_timer_poll(ArmExecCtx &);
+static std::atomic<uint64_t> g_posix_timer_due_ns{UINT64_MAX};
+
 static void a64_fill_signal_frame(ArmExecCtx &ctx, int sig, uint32_t target_tid,
                                   GuestVA *si_out, GuestVA *uc_out,
                                   const uint64_t *live_regs = nullptr,
@@ -8068,10 +8239,21 @@ static uint32_t alloc_guest_tid() {
     return id;
 }
 
+/* The in-guest getspecific stub reads the thread's TLS page, and a retired
+ * tid's page is handed to the next thread that takes the number. */
+static void a32_tls_mirror_reset(uint32_t tid) {
+    if (!g_fast32_getspecific_va || !g_ctx || g_ctx->is_arm64 || tid >= THREAD_TID_MAX)
+        return;
+    if (const uint32_t page = g_tls32_by_tid[tid].load(std::memory_order_acquire))
+        for (uint32_t k = 0; k < TLS32_MAX_KEYS; ++k)
+            g_ctx->mem.write32(page + TLS32_KEYS_OFF + k * 4u, 0);
+}
+
 static void thread_retire(uint32_t id) {
     ArmThread *t = thread_slot_by_tid(id);
     if (!t || !t->finished || t->running)
         return;
+    a32_tls_mirror_reset(id);
     /* Anything counted outside the slot has to be given back before the slot
      * is cleared, or the count outlives the thread. */
     if (t->lock_owner_boost) a64_lock_boost_drop();
@@ -8116,17 +8298,12 @@ static std::array<bool, 256>    g_in_ready{};
 static std::array<uint64_t, 256> g_ready_pops{};
 static std::array<bool, 256>    g_in_wait_poll{};
 
-struct SleepHeapEntry {
-    uint64_t deadline_ns = 0;
-    uint8_t  tid = 0;
-    bool operator>(const SleepHeapEntry &o) const { return deadline_ns > o.deadline_ns; }
-};
-static std::vector<SleepHeapEntry> g_sleep_heap;
-static std::array<bool, 256>       g_in_sleep_heap{};
+typedef struct luna_deadline_entry SleepHeapEntry;
+static struct luna_deadline_heap g_sleep_heap = {};
 
 static inline bool thread_has_sync_wait(const ArmThread &t)
 {
-    return t.waiting_signal || t.waiting_cond || t.waiting_mutex ||
+    return t.waiting_posix_timer || t.waiting_signal || t.waiting_cond || t.waiting_mutex ||
            t.waiting_rwlock || t.waiting_join || t.waiting_fds ||
            t.waiting_sem || t.waiting_futex || t.waiting_egl_sync;
 }
@@ -8155,7 +8332,7 @@ static EGLint egl_sync_client_wait(uint32_t h, uint32_t flags,
 
 static void sleep_heap_remove(uint32_t tid)
 {
-    if (tid) g_in_sleep_heap[tid] = false;
+    luna_deadline_heap_remove(&g_sleep_heap, tid);
 }
 
 static void sleep_heap_push(uint32_t tid, uint64_t deadline_ns);
@@ -8409,6 +8586,7 @@ static void arm_signal_save_wait(ArmExecCtx &ctx, ArmThread &t, ArmSignalWaitSta
     }
     w.sleep_abstime = t.sleep_abstime;
     w.waiting_signal = t.waiting_signal;
+    w.waiting_posix_timer = t.waiting_posix_timer;
 }
 
 static void arm_signal_clear_wait(ArmThread &t) {
@@ -8447,6 +8625,7 @@ static void arm_signal_clear_wait(ArmThread &t) {
     t.sleep_posix_error = false;
     t.sleep_abstime = false;
     t.waiting_signal = false;
+    t.waiting_posix_timer = 0;
 }
 
 static void arm_signal_restore_wait(ArmThread &t, const ArmSignalWaitState &w) {
@@ -8485,6 +8664,7 @@ static void arm_signal_restore_wait(ArmThread &t, const ArmSignalWaitState &w) {
     t.sleep_posix_error = w.sleep_posix_error;
     t.sleep_abstime = w.sleep_abstime;
     t.waiting_signal = w.waiting_signal;
+    t.waiting_posix_timer = w.waiting_posix_timer;
 }
 
 /* Return one pending, unmasked signal.  The execution lock protects both the
@@ -8607,6 +8787,7 @@ static bool a64_deliver_pending_signal(ArmExecCtx &ctx, ArmThread &t) {
                           t.regs64.data(), t.sp64, t.pc64, t.pstate64,
                           frame.si, frame.uc);
     if (!si_va || !uc_va) return false;
+    (void)posix_timer_siginfo(ctx,si_va,sig,t.id,true);
 
     GuestVA handler = installed_handler;
     if (handler < 0x100000000ull && !a64_is_guest_va(handler))
@@ -8630,6 +8811,7 @@ static bool a64_deliver_pending_signal(ArmExecCtx &ctx, ArmThread &t) {
     t.regs[13] = (uint32_t)t.sp64;
     ++t.signal_depth;
     t.pending_signals &= ~(1ull << (unsigned)(sig - 1));
+    posix_timer_requeue(ctx,t.id,sig);
     /*  */
     {
         uint64_t blocked = resume_mask | sa.mask;
@@ -8785,6 +8967,7 @@ static bool a32_deliver_pending_signal(ArmExecCtx &ctx, ArmThread &t)
     arm_signal_clear_wait(t);
     memset(ctx.mem.ptr(base), 0, 1024);
     ctx.mem.write32(base, sig);
+    (void)posix_timer_siginfo(ctx,base,sig,t.id,false);
     ctx.mem.write32(frame.uc + 8, (uint32_t)alt.sp);
     ctx.mem.write32(frame.uc + 12, alt.flags);
     ctx.mem.write32(frame.uc + 16, (uint32_t)alt.size);
@@ -8812,6 +8995,7 @@ static bool a32_deliver_pending_signal(ArmExecCtx &ctx, ArmThread &t)
     t.cpsr = (t.cpsr & ~0x0600fc20u) | ((handler & 1) ? 0x20u : 0u);
     ++t.signal_depth;
     t.pending_signals &= ~(1ull << (sig - 1));
+    posix_timer_requeue(ctx,t.id,sig);
     uint64_t blocked = resume_mask | sa.mask;
     if (!(sa.flags & GUEST_SA_NODEFER)) blocked |= 1ull << (sig - 1);
     blocked &= ~((1ull << 8) | (1ull << 18));
@@ -9409,11 +9593,13 @@ static std::atomic<uint64_t> g_guest_ticks_by_tid[TICKS_TID_MAX];
  * which is invisible in the SVC accounting and is the difference between a
  * JIT that runs at 2-3x native and one that does not. */
 static std::atomic<uint64_t> g_a64_mem_cb{0};
+static void pc_histo_report(void);
 static void a64_dump_guest_backtrace(const char *what, uint32_t tid, uint64_t fp);
 /* Is an engine executing this guest thread right now?  See g_tid_on_engine. */
 static bool a64_thread_on_an_engine(uint32_t tid);
 extern "C" void arm_exec_ticks_report(void)
 {
+    pc_histo_report();   /* A32 has no per-slice report to carry it */
     std::pair<uint64_t, uint32_t> top[TICKS_TID_MAX];
     size_t n = 0;
     uint64_t total = 0;
@@ -9461,11 +9647,11 @@ extern "C" void arm_exec_ticks_report(void)
             suspect[t.id] = 9;
             fprintf(stderr, "[sched64] LOST THREAD tid=%u (%s): running=1 but "
                     "no engine has it (slices=%llu ticks=%llu pc=0x%llx "
-                    "lr=0x%llx) — a dispatch path returned without handing it "
+                    "lr=0x%llx run_site=%u) — a dispatch path returned without handing it "
                     "back\n", t.id, thread_name_of(t.id),
                     (unsigned long long)t.slices,
                     (unsigned long long)t.total_ticks,
-                    (unsigned long long)t.pc64, (unsigned long long)t.lr64);
+                    (unsigned long long)t.pc64, (unsigned long long)t.lr64, t.run_site);
             a64_dump_guest_backtrace("lost-thread", t.id, t.regs64[29]);
         }
     }
@@ -9669,13 +9855,37 @@ static void svc_hist_dump(void) {
     }
 }
 
+/* The ring stamps entries with the cycle counter where there is one: a clock
+ * read per SVC was a visible part of the exit cost, and the stamps are only
+ * ever subtracted from each other for a dump.  svc_ring_ns_per_stamp() turns
+ * the difference into nanoseconds from two reference points taken on the
+ * first record. */
+#if defined(__x86_64__)
+static inline uint64_t svc_ring_stamp(void) { return __builtin_ia32_rdtsc(); }
+#else
+static inline uint64_t svc_ring_stamp(void) { return host_mono_ns(); }
+#endif
+static uint64_t g_svc_stamp0, g_svc_ns0;
+static double svc_ring_ns_per_stamp(void) {
+    const uint64_t dstamp = svc_ring_stamp() - g_svc_stamp0;
+    const uint64_t dns = host_mono_ns() - g_svc_ns0;
+    return dstamp && dns ? (double)dns / (double)dstamp : 1.0;
+}
 static void svc_ring_record(uint32_t svc, uint32_t lr, uint32_t r0,
                             uint32_t raw = 0) {
-    if (!g_svc_total) (void)emu_uptime_s();   /* start the throughput clock */
+    if (!g_svc_total) {
+        (void)emu_uptime_s();   /* start the throughput clock */
+        g_svc_stamp0 = svc_ring_stamp();
+        g_svc_ns0 = host_mono_ns();
+    }
     ++g_svc_total;
+    /* A lost count under a race costs a diagnostic one tick; a locked add on a
+     * line every guest thread shares costs every SVC. */
     if (svc < SVC_TIME_MAX)
-        g_svc_calls_by_no[svc].fetch_add(1, std::memory_order_relaxed);
-    const uint64_t now = host_mono_ns();
+        g_svc_calls_by_no[svc].store(
+            g_svc_calls_by_no[svc].load(std::memory_order_relaxed) + 1,
+            std::memory_order_relaxed);
+    const uint64_t now = svc_ring_stamp();
     g_svc_ring[g_svc_ring_pos++ & 1023] = {svc, lr, r0, g_current_tid, raw, now};
     if (g_current_tid == 0)
         g_svc_ring_main[g_svc_ring_main_pos++ & 255] = {svc, lr, r0, 0, raw, now};
@@ -9717,7 +9927,8 @@ static void svc_ring_dump_tid(uint32_t tid) {
             e.svc == SVC_PTHREAD_MUTEX_DESTROY)
             continue;
         const double ago = e.ns && last >= e.ns
-                               ? (double)(last - e.ns) / 1e6 : 0.0;
+                               ? (double)(last - e.ns) * svc_ring_ns_per_stamp() / 1e6
+                               : 0.0;
         if (e.svc)
             fprintf(stderr, "  -%8.1f ms  svc=%u(%s) lr=0x%08x r0=0x%08x\n",
                     ago, e.svc, svc_symbol_name(e.svc), e.lr, e.r0);
@@ -10635,23 +10846,6 @@ static inline CbWaitSlot *cb_wait_slot(void)
 static bool cb_lock_wait_try_grant(ArmExecCtx &ctx);
 static void cb_lock_wait_progress(ArmExecCtx &ctx, int depth);
 static void cb_lock_wait_reset(void);
-
-/* True while the callback's wait still has a deadline ahead of it. The
- * callback watchdog exists for a wait that can never end: a mutex whose
- * owner is gone, a condition nobody will signal. A sleep, and a timed
- * condition or futex wait, are not that: they have a definite end, and the
- * guest is entitled to reach it. Abandoning one partway through leaves the
- * guest's own native state half-finished, which is worse than the wait
- * (nmssNativeGetCertValue() sleeps in ~60-second steps inside one callback,
- * so its total elapsed time passes the 120-second limit while doing exactly
- * what it should). */
-static bool cb_lock_wait_deadline_ahead(void)
-{
-    const CbLockWait &w = g_cb_lock_wait;
-    if (w.kind == CbLockWait::Idle) return false;
-    if (w.kind != CbLockWait::Sleep && !w.timed) return false;
-    return host_mono_ns() < w.deadline_ns;
-}
 
 /* The stack window this host thread holds for an outermost callback.
  * -1 = none.  Nested callbacks reuse the same window. */
@@ -12150,8 +12344,6 @@ static constexpr uint32_t ARM_AINPUTQUEUE     = 0xC0FEBE10u; /* opaque AInputQue
 static constexpr uint32_t ARM_AINPUTEVENT     = 0xC0FEBE11u; /* opaque AInputEvent* */
 
 // Guest-visible audio buffer handed to AAudio data callbacks (above CB stack)
-static constexpr uint32_t AAUDIO_BUF_BASE = 0x47800000u;
-static constexpr uint32_t AAUDIO_BUF_SIZE = 0x00010000u;  /* 64KB */
 static constexpr uint32_t AAUDIO_BURST_FRAMES = 480u;     /* 10ms @ 48kHz */
 
 // FMOD's mixer — and its async command processing, which resolves e.
@@ -12163,11 +12355,15 @@ struct AAudioStreamState {
     uint32_t channels  = 2;
     uint32_t format    = 2;        /* AAUDIO_FORMAT_PCM_FLOAT */
     uint32_t sample_rate = 48000;
+    uint32_t callback_frames = AAUDIO_BURST_FRAMES;
+    uint32_t worker_tid = 0;
+    uint32_t callback_args = 0;
+    uint64_t next_due_ns = 0;
+    bool callback_pending = false;
 };
 static AAudioStreamState g_aaudio_builder;
 static std::map<uint32_t, AAudioStreamState> g_aaudio_streams;
 static uint32_t g_aaudio_stream_count = 0;
-static bool g_aaudio_buf_mapped = false;
 
 // Typed arguments for guest calls.
 struct GuestArg {
@@ -12355,6 +12551,9 @@ static void guest_tls_destructors_run(ArmExecCtx &ctx, uint32_t tid)
             if (it == g_tls.end() || !it->second) continue;
             value = it->second;
             it->second = 0;                    /* cleared before the call */
+            if (!ctx.is_arm64 && g_fast32_getspecific_va)
+               if (const uint32_t page = arm32_tls_for_tid(ctx, tid))
+                  ctx.mem.write32(page + TLS32_KEYS_OFF + key * 4u, 0);
          }
          any = true;
          if (lunaria_env("LUNARIA_TRACE_TLS"))
@@ -12415,7 +12614,6 @@ static bool dvm_call_guest_native(const char *klass, const char *method,
                                   const jvalue *args, int nargs, jvalue *out);
 static bool dvm_native_activity_stage(int stage, jobject activity);
 
-static void drive_aaudio_callbacks(ArmExecCtx &ctx);
 static void drive_opensles_callbacks(ArmExecCtx &ctx);
 
 // OpenSL ES buffer queues.
@@ -12798,6 +12996,8 @@ static uint64_t ndk_choreo_next_due_for(uint32_t tid)
 
 /* Deliver queued NDK choreographer callbacks — called from the Looper poll
  * (and the other pump/idle sites) on the thread that registered them. */
+static bool pc_histo_on(void);
+static void pc_histo_add(uint64_t pc, uint64_t lr, uint32_t tid);
 static void schedule_threads(uint64_t slice);
 static void drive_ndk_choreographer(ArmExecCtx &ctx) {
     if (g_in_cb() || g_ndk_choreo_q.empty()) return;
@@ -14624,10 +14824,21 @@ static void gl_trace_fb0_draw(const char *what, GLenum mode, GLsizei count) {
     /* What the pixel held *before* this draw.  Without it, "the screen is
      * white after the composite" cannot be told apart from "the screen was
      * already white and the composite did not cover it". */
+    GLint saved_read = 0, depth_func = 0, scissor[4] = {}, cull_mode = 0;
+    pfn_glGetIntegerv(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &saved_read);
+    pfn_glGetIntegerv(0x0B74 /* DEPTH_FUNC */, &depth_func);
+    pfn_glGetIntegerv(0x0C10 /* SCISSOR_BOX */, scissor);
+    pfn_glGetIntegerv(0x0B45 /* CULL_FACE_MODE */, &cull_mode);
+    fprintf(stderr, "[gl] draw-state read_fb=%d depth_func=0x%x scissor=%d:%d,%d,%d,%d cull=%d:0x%x\n",
+            saved_read, depth_func, (int)pfn_glIsEnabled(0x0C11),
+            scissor[0], scissor[1], scissor[2], scissor[3],
+            (int)pfn_glIsEnabled(0x0B44), cull_mode);
+    pfn_glBindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, (GLuint)traced_fbo);
     unsigned char before[4] = {};
     if (pfn_glReadPixels && vp[2] > 0 && vp[3] > 0)
         pfn_glReadPixels(vp[0] + vp[2] / 2, vp[1] + vp[3] / 2, 1, 1,
                          0x1908, 0x1401, before);
+    pfn_glBindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, (GLuint)saved_read);
     fprintf(stderr, "[gl] FB0-%s#%d fb=%d mode=0x%x count=%d prog=%d depth=%d "
             "blend=%d/%x/%x mask=%d%d%d%d tex=[%d,%d,%d,%d,%d,%d,%d,%d] "
             "vp=%d,%d,%dx%d before=%u,%u,%u,%u tid=%u\n",
@@ -14643,9 +14854,17 @@ static void gl_trace_fb0_draw(const char *what, GLenum mode, GLsizei count) {
 static void gl_trace_fb0_draw_after(void) {
     if (!pfn_glReadPixels || !pfn_glGetIntegerv) return;
     GLint vp[4] = {};
-    if (!gl_trace_draw_window(nullptr)) return;
+    GLint draw_fbo = 0;
+    if (!gl_trace_draw_window(&draw_fbo)) return;
     static int n = 0;
     if (n++ >= gl_trace_draw_cap()) return;
+    /* ES3 has independent draw/read bindings. Inspect the target of the
+     * draw just issued, then restore the guest's read framebuffer. */
+    GLint read_fbo = 0;
+    pfn_glGetIntegerv(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &read_fbo);
+    pfn_glBindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, (GLuint)draw_fbo);
+    fprintf(stderr, "[gl] draw-result draw_fb=%d saved_read_fb=%d tid=%u\n",
+            draw_fbo, read_fbo, g_current_tid);
     pfn_glGetIntegerv(0x0BA2, vp);
     GLint x = vp[2] > 0 ? vp[0] + vp[2] / 2 : 0;
     GLint y = vp[3] > 0 ? vp[1] + vp[3] / 2 : 0;
@@ -14682,6 +14901,7 @@ static void gl_trace_fb0_draw_after(void) {
                         n, c[0], c[1], q[0], q[1], q[2], q[3]);
         }
     }
+    pfn_glBindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, (GLuint)read_fbo);
 }
 
 /* Dump interleaved VBO + key uniforms for early FB0 UI quads (count=6).
@@ -16427,6 +16647,9 @@ static int egl_host_make_current(uint32_t draw_h, uint32_t read_h,
                              EGL_NO_CONTEXT)
             : EGL_FALSE;
         if (!ok) return EGL_FALSE;
+        if (lunaria_env("LUNARIA_TRACE_EGL"))
+            fprintf(stderr, "[egl] release ctx=0x%x tid=%u lr=0x%08x\n",
+                    old_ctx_h, g_current_tid, lr);
         g_egl_tid_ctx.erase(g_current_tid);
         g_egl_tid_surf.erase(g_current_tid);
         gl_tid_unmark(g_current_tid);
@@ -16452,6 +16675,12 @@ static int egl_host_make_current(uint32_t draw_h, uint32_t read_h,
         }
         g_egl_tid_ctx[g_current_tid] = ctx_h;
         g_egl_tid_surf[g_current_tid] = (draw == EGL_NO_SURFACE) ? 0u : ARM_EGL_SURFACE;
+        if (ArmThread *thread = thread_slot_by_tid(g_current_tid)) {
+            if (!thread->is_arm64) {
+                thread->egl_host_thread = pthread_self();
+                thread->egl_host_bound = true;
+            }
+        }
         egl_note_bound(ctx_h, draw);
         /* The guest has taken the window surface.  The boot card draws
          * through its own unshared overlay context; it must not steal this
@@ -17191,6 +17420,11 @@ static void request_cooperative_yield() {
 }
 
 /* How long a timespec at `ts` asks for, in nanoseconds.  0 if unreadable. */
+/* pselect6(2) is select(2) with a struct timespec timeout: it sets the wait
+ * budget here and runs the one select implementation (SVC_NET_SELECT). */
+static constexpr long SELECT_BUDGET_FROM_ARGS = LONG_MIN;
+static thread_local long g_select_budget_ms = SELECT_BUDGET_FROM_ARGS;
+
 static uint64_t guest_timespec_ns(ArmExecCtx &ctx, GuestVA ts);
 /* Park the calling guest thread for `req_ns`, the way SVC_NANOSLEEP does.
  * bionic's nanosleep()/usleep() go through the raw `svc #0` stubs, not
@@ -19621,6 +19855,31 @@ static const char *map_guest_path_raw(const char *path, char *buf, size_t bufsz)
             return buf;
         }
     }
+    /* The directories above the installed package.  A packed library locates
+     * itself by walking /data/app/~~INSTALLER==/<pkg>-<ver>==/lib/<abi>/<so>
+     * upward and stat()ing every level; on a device each one exists, so each
+     * must resolve to a directory here too -- the parent of the staged
+     * code path stands for both. */
+    {
+        const char *code = lunaria_env("ANDROID_PACKAGE_CODE_PATH");
+        size_t n = strlen(path);
+        while (n > 1 && path[n - 1] == '/') --n;
+        const bool app_root = n == 9 && !strncmp(path, "/data/app", 9);
+        const bool installer = n > 14 && !strncmp(path, "/data/app/~~", 12) &&
+                               !memchr(path + 12, '/', n - 12) &&
+                               path[n - 1] == '=' && path[n - 2] == '=';
+        if ((app_root || installer) && code && *code) {
+            size_t len = strlen(code);
+            while (len > 1 && code[len - 1] == '/') --len;
+            while (len > 1 && code[len - 1] != '/') --len;
+            while (len > 1 && code[len - 1] == '/') --len;
+            if (len < bufsz) {
+                memcpy(buf, code, len);
+                buf[len] = '\0';
+                return buf;
+            }
+        }
+    }
     /* /data/app/~~INSTALLER==/<pkg>-<ver>==/<file>
      * Security modules (libnmsssa, A6241C93595) open the app's on-device APK
      * to verify its signing certificate — via the device-canonical path, not
@@ -19848,11 +20107,18 @@ static const char *map_guest_path_raw(const char *path, char *buf, size_t bufsz)
     };
     for (const char *a : data_alias) {
         if (!path_under(path, a, strlen(a))) continue;
+        const char *package = lunaria_env("ANDROID_PACKAGE_NAME");
+        const char *rest = path + strlen(a);
+        /* Only the running package is backed by its staged data tree.
+         * Other packages retain their names in the confined guest root. */
+        if (!package || !*package || *rest != '/') break;
+        ++rest;
+        size_t package_len = strlen(package);
+        if (strncmp(rest, package, package_len) != 0 ||
+            (rest[package_len] != '\0' && rest[package_len] != '/')) break;
+        rest += package_len;
         const char *base = guest_app_data_dir();
         if (!base) break;
-        /* Skip the package segment: an app only ever gets its own. */
-        const char *rest = path + strlen(a);
-        if (*rest == '/') { const char *sl = strchr(rest + 1, '/'); rest = sl ? sl : ""; }
         snprintf(buf, bufsz, "%s%s", base, rest);
         return buf;
     }
@@ -23178,18 +23444,16 @@ struct FdWaitEpollCtx {
     int epfd;
     int maxev;
     GuestVA evs;
-    bool a64;
 };
 static int fd_wait_epoll_ready(void *vp) {
     auto *c = static_cast<FdWaitEpollCtx *>(vp);
     luna_os_poll_event he[256];
     const int rc = luna_os_poll_wait(c->epfd, he, c->maxev, 0);
-    const uint32_t esz = c->a64 ? 16u : 12u;
+    const uint32_t esz = 16u;
     for (int i = 0; i < rc && c->evs; ++i) {
         const GuestVA at = c->evs + (GuestVA)i * esz;
         c->ctx->mem.write32(at, he[i].events);
-        if (c->a64) c->ctx->mem.write64(at + 8, he[i].data);
-        else c->ctx->mem.write32((uint32_t)at + 4, (uint32_t)he[i].data);
+        c->ctx->mem.write64(at + 8, he[i].data);
     }
     return rc;
 }
@@ -23356,10 +23620,10 @@ static GuestFdWait make_select_wait(ArmExecCtx &ctx, int nfds, GuestVA rp,
     return w;
 }
 static GuestFdWait make_epoll_wait(ArmExecCtx &ctx, int epfd, int maxev,
-                                   GuestVA evs, bool a64, int64_t deadline) {
+                                   GuestVA evs, int64_t deadline) {
     GuestFdWait w;
     w.ready = fd_wait_epoll_ready;
-    w.ctx = new FdWaitEpollCtx{&ctx, epfd, maxev, evs, a64};
+    w.ctx = new FdWaitEpollCtx{&ctx, epfd, maxev, evs};
     w.free_ctx = fd_wait_free_epoll;
     w.deadline_ms = deadline;
     return w;
@@ -24407,6 +24671,8 @@ static void sched_idle_wait(void)
             /* GL work belongs to the pump, so another host waiter must not
              * spin on a queued thread it cannot dispatch. */
             if (t->is_arm64 && gl_tid_marked(tid) && !g_a64_is_pump) continue;
+            if (t->egl_host_bound &&
+                !pthread_equal(t->egl_host_thread,pthread_self())) continue;
             return;
         }
     }
@@ -24513,10 +24779,13 @@ static void sleep_timer_thread(void)
         const bool fds_parked =
             g_fd_waits_polled.load(std::memory_order_acquire) != 0;
         const uint64_t fd_poll_ns = 500000ull;   /* 0.5 ms */
-        const uint64_t due = g_sleep_next_due_ns.load(std::memory_order_relaxed);
-        const auto deadline_changed = [due] {
+        const uint64_t sleep_due = g_sleep_next_due_ns.load(std::memory_order_relaxed);
+        const uint64_t timer_due = g_posix_timer_due_ns.load(std::memory_order_relaxed);
+        const uint64_t due = std::min(sleep_due,timer_due);
+        const auto deadline_changed = [sleep_due,timer_due] {
             return g_sleep_timer_stop.load(std::memory_order_relaxed) ||
-                   g_sleep_next_due_ns.load(std::memory_order_relaxed) != due;
+                   g_sleep_next_due_ns.load(std::memory_order_relaxed) != sleep_due ||
+                   g_posix_timer_due_ns.load(std::memory_order_relaxed) != timer_due;
         };
         if (due == UINT64_MAX) {
             /* Nothing parked.  Announcements change the predicate; the
@@ -24569,6 +24838,7 @@ static void sleep_timer_thread(void)
         {
             ArmLockGuard g;
             sleep_heap_wake_due();
+            if(g_ctx)posix_timer_poll(*g_ctx);
         }
         sched_pass_notify();
         a64par::sched_poke();
@@ -24618,27 +24888,20 @@ static void sleep_park_announce(uint64_t due_ns)
 
 static void sleep_heap_republish(void)
 {
-    uint64_t least = UINT64_MAX;
-    for (const auto &e : g_sleep_heap) {
-        if (!g_in_sleep_heap[e.tid]) continue;
+    SleepHeapEntry e;
+    while (luna_deadline_heap_peek(&g_sleep_heap, &e)) {
         ArmThread *t = thread_slot_by_tid(e.tid);
-        if (!t || t->finished) continue;
-        const uint64_t due = thread_deadline_ns(*t);
-        /* Lazy deletion needs the deadline as its generation.  A tid can end
-         * one wait and start another before the stale entry reaches the top. */
-        if (!due || due != e.deadline_ns) continue;
-        if (due < least) least = due;
+        if (t && !t->finished && thread_deadline_ns(*t) == e.deadline_ns) break;
+        luna_deadline_heap_remove(&g_sleep_heap, e.tid);
     }
-    g_sleep_next_due_ns.store(least, std::memory_order_relaxed);
+    g_sleep_next_due_ns.store(luna_deadline_heap_peek(&g_sleep_heap, &e)
+                             ? e.deadline_ns : UINT64_MAX, std::memory_order_relaxed);
 }
 
 static void sleep_heap_push(uint32_t tid, uint64_t deadline_ns)
 {
-    if (!tid || !deadline_ns) return;
-    g_in_sleep_heap[tid] = true;
-    g_sleep_heap.push_back({ deadline_ns, (uint8_t)tid });
-    std::push_heap(g_sleep_heap.begin(), g_sleep_heap.end(),
-                   std::greater<SleepHeapEntry>());
+    if (!tid || tid >= 256 || !deadline_ns) return;
+    luna_deadline_heap_set(&g_sleep_heap, tid, deadline_ns);
     sleep_park_announce(deadline_ns);
 }
 
@@ -24657,32 +24920,14 @@ static std::atomic<uint64_t> g_sleep_wakes{0};
 static void sleep_heap_wake_due(void)
 {
     const uint64_t now = host_mono_ns();
-    while (!g_sleep_heap.empty()) {
-        std::pop_heap(g_sleep_heap.begin(), g_sleep_heap.end(),
-                      std::greater<SleepHeapEntry>());
-        const SleepHeapEntry e = g_sleep_heap.back();
-        g_sleep_heap.pop_back();
-        if (!g_in_sleep_heap[e.tid]) continue;
+    SleepHeapEntry e;
+    while (luna_deadline_heap_peek(&g_sleep_heap, &e)) {
+        if (e.deadline_ns > now) break;
+        luna_deadline_heap_remove(&g_sleep_heap, e.tid);
         ArmThread *tp = thread_slot_by_tid(e.tid);
-        if (!tp || tp->finished) {
-            g_in_sleep_heap[e.tid] = false;
-            continue;
-        }
+        if (!tp || tp->finished) continue;
         const uint64_t due = thread_deadline_ns(*tp);
-        if (!due || due != e.deadline_ns) {
-            if (tp->waiting_sem && lunaria_env("LUNARIA_TRACE_SEM"))
-                fprintf(stderr, "[sem] heap-stale tid=%u due=%llu entry=%llu\n",
-                        e.tid, (unsigned long long)due,
-                        (unsigned long long)e.deadline_ns);
-            continue; /* stale generation */
-        }
-        if (due > now) {
-            g_sleep_heap.push_back(e);
-            std::push_heap(g_sleep_heap.begin(), g_sleep_heap.end(),
-                           std::greater<SleepHeapEntry>());
-            break;
-        }
-        g_in_sleep_heap[e.tid] = false;
+        if (!due || due != e.deadline_ns) continue;
 
         if (tp->waiting_cond && tp->cond_timed) {
             if (tp->waiting_futex && tp->futex_is_cond) {
@@ -24813,7 +25058,6 @@ void guest_sleep_ns(uint64_t req_ns)
         do {
             maybe_schedule_on_wait();
             if (g_ctx) {
-                drive_aaudio_callbacks(*g_ctx);
                 drive_opensles_callbacks(*g_ctx);
                 drive_ndk_choreographer(*g_ctx);
             }
@@ -24896,7 +25140,7 @@ extern "C" void arm_exec_prepare_mono_config(void);
  * stack that uses the file-descriptor calls instead got only byte totals, so
  * the same trace said less about the connection that matters most. */
 static void net_trace_data(const char *what, int fd, const uint8_t *p, ssize_t n) {
-    if (n <= 0 || !p || !guest_net::is_guest_socket(fd) || !guest_net::trace())
+    if (!guest_net::trace() || n <= 0 || !p || !guest_net::is_guest_socket(fd))
         return;
     size_t show = (size_t)n;
     if (show > 400) show = 400;
@@ -25095,6 +25339,8 @@ static inline bool gl_tid_marked(uint32_t tid) {
  * engine pool.  Pinning is a property of holding the binding, not a mark a
  * thread wears for the rest of its life. */
 static inline void gl_tid_unmark(uint32_t tid) {
+    if (ArmThread *thread = thread_slot_by_tid(tid))
+        thread->egl_host_bound = false;
     if (tid >= GL_TID_BITS) return;
     g_gl_tids[tid / 64].fetch_and(~(1ull << (tid % 64)), std::memory_order_relaxed);
 }
@@ -25342,7 +25588,7 @@ static bool svc_lockfree_compute(uint32_t no) {
          * engine) touches nothing shared. Under this title a third of all
          * execution-lock time was usleep handlers doing nothing but queueing for the
          * lock and giving it back. */
-        for (uint32_t n : {SVC_USLEEP, SVC_SLEEP, SVC_NANOSLEEP, SVC_CLOCK_NANOSLEEP,
+        for (uint32_t n : {SVC_POSIX_TIMER_WAIT, SVC_USLEEP, SVC_SLEEP, SVC_NANOSLEEP, SVC_CLOCK_NANOSLEEP,
                            SVC_SCHED_YIELD}) set(n);
 
         /* stdio over a guest FILE*. feof/fgets/fileno/fread only touch the shim and
@@ -25390,7 +25636,15 @@ enum : uint8_t {
 };
 struct SvcFpArgs { uint8_t pos, n, mode; };
 
+typedef bool (*SvcLeafFn)(ArmExecCtx *ctx, const uint64_t a[3], uint64_t *ret);
+static bool svc_leaf_strlen(ArmExecCtx *ctx, const uint64_t a[3], uint64_t *ret);
+static bool svc_leaf_strcmp(ArmExecCtx *ctx, const uint64_t a[3], uint64_t *ret);
+static bool svc_leaf_memcmp(ArmExecCtx *ctx, const uint64_t a[3], uint64_t *ret);
+static bool svc_leaf_memset(ArmExecCtx *ctx, const uint64_t a[3], uint64_t *ret);
+static bool svc_leaf_memmove(ArmExecCtx *ctx, const uint64_t a[3], uint64_t *ret);
+
 struct SvcInfo {
+    SvcLeafFn leaf;
     uint8_t flags;
     SvcFpArgs fp;                 /* n == 0: no float arguments           */
     const A64SoftFpAbi *softfp;   /* soft-float result width, or null     */
@@ -25406,6 +25660,18 @@ static void svc_info_build(void)
         if (svc_touches_gl_compute(no)) f |= SVCF_GL;
         if (a64_is_wait_svc(no))        f |= SVCF_WAIT;
         g_svc_info[no].flags = f;
+    }
+
+    /* Bounded SVC keys share this table and its existing initialization.
+     * No separate heap allocation or lazy-init guard on the leaf path. */
+    static const struct { uint32_t no; SvcLeafFn fn; } leaves[] = {
+        { SVC_STRLEN, svc_leaf_strlen }, { SVC_STRCMP, svc_leaf_strcmp },
+        { SVC_MEMCMP, svc_leaf_memcmp }, { SVC_MEMSET, svc_leaf_memset },
+        { SVC_MEMCPY, svc_leaf_memmove }, { SVC_MEMMOVE, svc_leaf_memmove },
+    };
+    for (size_t i = 0; i < sizeof leaves / sizeof leaves[0]; ++i) {
+        SvcInfo *info = &g_svc_info[leaves[i].no];
+        if (info->flags & SVCF_LOCKFREE) info->leaf = leaves[i].fn;
     }
 
     /* The hook chain at the top of Arm64Callbacks::CallSVC.  A hook added
@@ -25706,10 +25972,12 @@ static int guest_timerfd_call(ArmExecCtx &ctx, int op, bool wide,
  * syscall returns -errno; libc mprotect/syscall translate it to -1 + errno. */
 static int a64_guest_mprotect(ArmExecCtx *ctx, GuestVA address,
                              uint64_t length, uint32_t prot) {
-    if (address & 4095u) { errno = EINVAL; return -1; }
-    if (length > UINT64_MAX - 4095u) { errno = ENOMEM; return -1; }
-    length = (length + 4095u) & ~4095ull;
-    if (length > UINT64_MAX - address) { errno = ENOMEM; return -1; }
+    uint64_t first, end;
+    if (int e = luna_vm_page_range(address, length, UINT64_MAX, &first, &end)) {
+        errno = e;
+        return -1;
+    }
+    length = end - first;
     if (length && a64_map_set_prot(address, address + length, prot)) return -1;
     if (length && (prot & 4u /* PROT_EXEC */)) {
         GuestVA va = a64_mapping_va(address);
@@ -25721,6 +25989,159 @@ static int a64_guest_mprotect(ArmExecCtx *ctx, GuestVA address,
         fprintf(stderr, "[mprotect] 0x%llx+%llu prot=%u\n",
                 (unsigned long long)address, (unsigned long long)length, prot);
     return 0;
+}
+
+/* A32 guest mappings.  The image is one host reservation that stays RW, so
+ * a guest page's protection is not enforced by the host; it is the guest's
+ * view -- /proc/self/maps and mprotect() answer from the same g_a32_vmas /
+ * g_loaded_regions records. */
+
+/* End of the guest range that contains `at`, or `at` if none does. */
+static uint64_t a32_mapped_end(uint64_t at)
+{
+    uint64_t end = at;
+    auto in = [&](uint64_t lo, uint64_t hi) { if (at >= lo && at < hi && hi > end) end = hi; };
+    for (size_t i = 0; i < g_a32_vmas.n; ++i)
+        in(g_a32_vmas.v[i].lo, g_a32_vmas.v[i].hi);
+    for (const auto &r : g_loaded_regions)
+        if (r.process_pid == guest_pid()) in(r.lo, r.hi);
+    in(HEAP_BASE, (uint64_t)HEAP_BASE + g_heap_size);
+    in(STACK_BASE, (uint64_t)STACK_BASE + STACK_SIZE);
+    for (const auto &t : g_threads)
+        if (t.id && !t.finished && t.stack_base && t.stack_size)
+            in(t.stack_base, (uint64_t)t.stack_base + t.stack_size);
+    for (uint32_t tid = 1; tid < 4096; ++tid)
+        if (g_dvm_native_stacks[tid].base)
+            in(g_dvm_native_stacks[tid].base,
+               (uint64_t)g_dvm_native_stacks[tid].base + g_dvm_native_stacks[tid].size);
+    const uint32_t callbacks = g_cb_stack_mapped.load(std::memory_order_acquire);
+    for (int i = 0; i < g_cb_slots; ++i)
+        if (callbacks & (1u << i))
+            in(cb_stack_base(i), (uint64_t)cb_stack_base(i) + CB_STACK_SIZE);
+    return end;
+}
+
+/* mprotect(): 0 or an errno. */
+static int a32_guest_mprotect(ArmExecCtx &ctx, uint32_t address,
+                              uint32_t length, uint32_t prot)
+{
+    uint64_t lo, hi;
+    if (int e = luna_vm_page_range(address, length, 0x100000000ull, &lo, &hi)) return e;
+    if (hi == lo) return 0;
+    for (uint64_t at = lo; at < hi;) {
+        const uint64_t end = a32_mapped_end(at);
+        if (end == at) return ENOMEM;
+        at = end;
+    }
+    prot &= 7u;
+    if (luna_vma_protect(&g_a32_vmas, lo, hi, prot)) return ENOMEM;
+    ++g_a32_vma_gen;
+    for (const auto &r : g_loaded_regions)
+        if (r.hi > lo && r.lo < hi)
+            luna_vma_map(&g_a32_image_prot, std::max<uint64_t>(r.lo, lo),
+                         std::min<uint64_t>(r.hi, hi), true, prot, true);
+    /* Making a page executable is the point at which the translation of what
+     * used to be there stops being allowed to live. */
+    if (prot & 4u /* PROT_EXEC */) {
+        if (ctx.jit) ctx.jit->InvalidateCacheRange((uint32_t)lo, (size_t)(hi - lo));
+        if (ctx.jit_aux)
+            ctx.jit_aux->InvalidateCacheRange((uint32_t)lo, (size_t)(hi - lo));
+        cb_invalidate_all((uint32_t)lo, (size_t)(hi - lo));
+    }
+    if (lunaria_env("LUNARIA_TRACE_MMAP"))
+        fprintf(stderr, "[mprotect] 0x%08x+%llu prot=%u (a32)\n",
+                address, (unsigned long long)(hi - lo), prot);
+    return 0;
+}
+
+/* Record a mapping the guest just made at [addr, addr+length). */
+static void a32_guest_mmap_commit(ArmExecCtx &ctx, uint32_t addr, uint32_t length,
+                                  uint32_t prot, uint32_t flags, int32_t fd)
+{
+    length = (length + 4095u) & ~4095u;
+    /* MAP_FIXED | MAP_ANONYMOUS replaces what was there with zero pages. */
+    if ((flags & 0x10u) && (flags & 0x20u)) {
+        uint8_t *p = ctx.mem.ptr(addr);
+        if (p && ctx.mem.ptr(addr + length - 1u)) memset(p, 0, length);
+    }
+    a32_vma_map(addr, (uint64_t)addr + length, true, prot & 7u,
+                fd >= 0 && !(flags & 0x20u));
+}
+
+/* munmap(): 0 or an errno. */
+static int a32_guest_munmap(ArmExecCtx &ctx, uint32_t address, uint32_t length)
+{
+    uint64_t lo64, hi64;
+    if (!length) return EINVAL;
+    if (luna_vm_page_range(address, length, 0x100000000ull, &lo64, &hi64)) return EINVAL;
+    a32_vma_map(lo64, hi64, false, 0);
+    /* Bump arenas can reclaim a suffix of their most recent mapping. */
+    for (auto it = g_mmap_slabs.rbegin(); it != g_mmap_slabs.rend(); ++it) {
+        if (lo64 < it->lo || lo64 > it->hi || hi64 < it->hi)
+            continue;
+        uint64_t bump_end = ((uint64_t)it->hi + MMAP_ALIGN - 1u) &
+                            ~(uint64_t)(MMAP_ALIGN - 1u);
+        uint32_t *next = nullptr;
+        if (it->lo >= MMAP_BASE && it->lo < MMAP_END &&
+            (g_mmap_next == (uint32_t)bump_end ||
+             (bump_end >= MMAP_END && g_mmap_next == 0xffffffffu)))
+            next = &g_mmap_next;
+        else if (it->lo >= g_mmap2_base &&
+                 (g_mmap2_next == (uint32_t)bump_end ||
+                  (bump_end >= mmap2_end_excl() &&
+                   g_mmap2_next == 0xffffffffu)))
+            next = &g_mmap2_next;
+        if (!next)
+            continue;
+        const uint32_t old_hi = it->hi;
+        *next = address;
+        it->hi = address;
+        const uint64_t released = (uint64_t)old_hi - address;
+        g_mmap_prot_none_bytes = released < g_mmap_prot_none_bytes
+                                     ? g_mmap_prot_none_bytes - released : 0;
+        if (lunaria_env("LUNARIA_TRACE_MMAP"))
+            fprintf(stderr, "[munmap] reclaimed tail [%08x,%08x), next=%08x\n",
+                    address, old_hi, *next);
+        return 0;
+    }
+    /* Not the bump tail: hand the range to the free list instead of leaking it. */
+    const bool in_primary   = lo64 >= MMAP_BASE && hi64 <= MMAP_END;
+    const bool in_secondary = lo64 >= g_mmap2_base && hi64 <= mmap2_end_excl();
+    if (in_primary || in_secondary) {
+        const uint32_t lo = (uint32_t)lo64, hi = (uint32_t)hi64;
+        if (uint8_t *p = ctx.mem.ptr(lo))
+            if (ctx.mem.ptr(hi - 1u)) memset(p, 0, hi - lo);
+        mmap_free_insert(lo, hi);
+        for (auto it = g_mmap_slabs.begin(); it != g_mmap_slabs.end();)
+            it = (it->lo >= lo && it->hi <= hi) ? g_mmap_slabs.erase(it)
+                                                : std::next(it);
+        if (lunaria_env("LUNARIA_TRACE_MMAP"))
+            fprintf(stderr, "[munmap] freed [%08x,%08x) -> %zu free ranges\n",
+                    lo, hi, g_mmap_freelist.size());
+    } else if (lunaria_env("LUNARIA_TRACE_MMAP")) {
+        fprintf(stderr, "[munmap] accepted non-arena addr=%08x len=%u\n", address, length);
+    }
+    return 0;
+}
+
+/* madvise(MADV_DONTNEED) on A32.  The image is one anonymous host reservation,
+ * so the host drops pages to zero -- right for anonymous memory.  A private
+ * file mapping (a loaded library) instead reads back from its file on the next
+ * touch, which is how a packed library discards and re-faults its own code. */
+static void a32_dontneed_refill(uint32_t lo, uint32_t hi, ArmExecCtx &ctx)
+{
+    for (const auto &r : g_loaded_regions) {
+        if (r.process_pid != guest_pid() || r.hi <= lo || r.lo >= hi) continue;
+        const uint32_t from = std::max(r.lo, lo), to = std::min(r.hi, hi);
+        const int fd = luna_file_open(r.path.c_str(), O_RDONLY | LUNA_FILE_CLOEXEC, 0);
+        if (fd < 0) continue;
+        uint8_t *dst = ctx.mem.ptr(from);
+        const size_t want = to - from;
+        ptrdiff_t got = luna_file_pread(fd, dst, want, (int64_t)(r.file_off + (from - r.lo)));
+        if (got < 0) got = 0;
+        if ((size_t)got < want) memset(dst + got, 0, want - (size_t)got);
+        luna_fd_close(fd);
+    }
 }
 
 /* ARM_NR_cacheflush and libc's cacheflush(start, end, flags): the guest wrote
@@ -25757,6 +26178,570 @@ static void guest_cacheflush(ArmExecCtx &ctx, uint32_t r0, uint32_t r1)
 }
 
 
+static int guest_pthread_create(ArmExecCtx &ctx,GuestVA out,GuestVA attr,GuestVA function,
+    GuestVA argument,uint32_t lr,bool detached,uint32_t *created)
+{
+    const GuestVA r0=out,r2=function,r3=argument;
+        // pthread_create(thread_t*, attr*, fn_va, arg)
+        const bool create64 = ctx.is_arm64;
+        uint32_t new_stack_lo = 0;
+        /* Honour the attribute the caller built: a thread asked for with a
+         * large stack really needs it (deep recursion in a parser, a
+         * script VM), and PTHREAD_CREATE_DETACHED decides who reaps it. */
+        const GuestVA attr_va = attr;
+        uint32_t attr_flags = (attr_va ? ctx.mem.read32(attr_va) : 0u) | (detached ? 1u : 0u);
+        uint32_t new_stack_sz = thread_stack_size(create64);
+        GuestVA supplied_stack = 0;
+        if (attr_va) {
+            const uint32_t w = create64 ? 8u : 4u;
+            supplied_stack = create64 ? ctx.mem.read64(attr_va + w)
+                                      : ctx.mem.read32(attr_va + w);
+            uint64_t want = create64 ? ctx.mem.read64(attr_va + 2u * w)
+                                     : ctx.mem.read32(attr_va + 2u * w);
+            if (want < 16384u || want > UINT32_MAX - 4095u ||
+                (supplied_stack && supplied_stack > UINT64_MAX - want)) {
+                return EINVAL;
+            }
+            if (supplied_stack) {
+                new_stack_sz = (uint32_t)want;
+            } else
+            if (want >= 16384u) {
+                /* Round to a page and clamp: the stacks come out of a fixed
+                 * window, so one absurd request must not exhaust it. */
+                want = (want + 4095u) & ~4095ull;
+                new_stack_sz = (uint32_t)want;
+            }
+        }
+        {
+            auto &pool = g_thread_stack_free[new_stack_sz];
+            if (!supplied_stack && r2 && !pool.empty()) {
+                new_stack_lo = pool.back();
+                pool.pop_back();
+            }
+        }
+        if (!supplied_stack && r2 && !new_stack_lo &&
+            (uint64_t)g_thread_stack_next + new_stack_sz <= HEAP_BASE) {
+            new_stack_lo = g_thread_stack_next;
+            g_thread_stack_next += new_stack_sz;
+        }
+        if (r2 && (new_stack_lo || supplied_stack)) {
+            if (!supplied_stack)
+                thread_stack_map(ctx, new_stack_lo, new_stack_sz);
+            if (lunaria_env("LUNARIA_TRACE_STACKS"))
+                fprintf(stderr, "[stack] alloc lo=0x%x size=0x%x supplied=%d "
+                        "from tid=%u\n", new_stack_lo, new_stack_sz,
+                        (int)supplied_stack, g_current_tid);
+            ArmThread t;
+            // Shared with fork() (see alloc_guest_tid): one counter, so the two paths can never collide on an id.
+            uint32_t nid = alloc_guest_tid();
+            if (!nid) {
+                fprintf(stderr, "[arm_exec] pthread_create: no free tid "
+                        "(%zu slots) — EAGAIN\n",
+                        g_threads.size());
+                if (!supplied_stack)
+                    g_thread_stack_free[new_stack_sz].push_back(new_stack_lo);
+                return EAGAIN;
+            }
+            t.id = nid;
+            g_guest_dlerrors[nid].pending = false;
+            inherit_process_identity(t);
+            /* POSIX/Linux: a newly-created pthread inherits a copy of the creating
+             * thread's signal mask. A reused tid's slot must not be left at zero (or at
+             * its previous owner's value), or pthread_sigmask(), signal delivery and
+             * /proc/<tid>/status disagree as soon as the caller creates a worker after
+             * blocking a signal. */
+            signal_mask_store(t.id, signal_mask_load(g_current_tid));
+            uint32_t stack_top = new_stack_lo + new_stack_sz - 16;
+            t.stack_base = new_stack_lo;
+            t.stack_size = new_stack_sz;
+            t.stack_user_owned = supplied_stack != 0;
+            t.regs[0]  = r3;            /* arg */
+            t.regs[13] = stack_top;
+            t.is_arm64 = create64;
+            // Same sentinel page as A32 — address 4 caused InterpreterFallback dumps and confused clean thread returns with real.
+            t.regs[14] = SENTINEL_ADDR;
+            t.regs[15] = r2 & ~1u;
+            t.entry_pc = r2 & ~1u;
+            if (t.is_arm64) {
+                // CallSVC may be running on the main, scheduler, or callback.
+                GuestVA fn64 = function;
+                GuestVA arg64 = argument;
+                t.regs64.fill(0);
+                t.regs64[0] = arg64; /* x0 = start_routine arg */
+                t.start_arg = arg64;
+                t.stack_base = a64_guest_va((BackingOffset)new_stack_lo);
+                t.sp64 = a64_guest_va(stack_top);
+                t.lr64 = a64_guest_va(SENTINEL_ADDR);
+                t.pc64 = fn64 & ~1ull;
+                t.entry_pc = t.pc64;
+                t.regs64[30] = t.lr64;
+            }
+            if (supplied_stack) {
+                t.stack_base = supplied_stack;
+                const GuestVA top = (supplied_stack + new_stack_sz) & ~(GuestVA)15u;
+                t.regs[13] = (uint32_t)top;
+                if (create64) t.sp64 = top;
+            }
+            t.cpsr = (r2 & 1u) ? 0x30u : 0x10u;
+            t.created_ns = host_mono_ns();
+            svc_ring_reset_tid(t.id);
+            t.detached = (attr_flags & 1u) != 0;   /* PTHREAD_CREATE_DETACHED */
+            /* tids are handed out again after a join, so a descriptor wait
+             * left behind by the previous owner must not be inherited. */
+            if (guest_net::g_fd_waits.erase(t.id)) fd_deadline_republish();
+            g_disk_reads.erase(t.id);
+            /* Reuse a retired slot before growing, so a long-running process that
+             * creates and joins threads does not grow g_threads without bound (joined
+             * slots are emptied instead of erased). */
+            {
+                ArmThread *slot;
+                if (!g_free_thread_slots.empty()) {
+                    slot = g_free_thread_slots.back();
+                    g_free_thread_slots.pop_back();
+                    *slot = t;
+                } else {
+                    g_threads.push_back(t);
+                    slot = &g_threads.back();
+                }
+                /* g_threads is a deque, so existing entries keep their
+                 * addresses; only the new slot has to be indexed. */
+                g_thread_by_tid[slot->id] = slot;
+            }
+            thread_name_inherit(t.id, g_current_tid);
+            /* Create the errno slot now, from the creating thread's SVC, and not on
+             * first use: a first use can be the scheduler's wake path, which must not
+             * allocate (see errno_va_existing). */
+            (void)errno_va(ctx, t.id);
+            if(created)*created=t.id;
+            thread_mark_ready(t.id);
+            if (r0) {
+                if (t.is_arm64) {
+                    uint64_t tid64 = t.id;
+                    std::memcpy(ctx.mem.ptr(r0), &tid64, 8);
+                } else {
+                    ctx.mem.write32(r0, t.id);
+                }
+            }
+            /* lr names the code that decided to start this thread, which is
+             * the only way to find that decision when the thread body itself
+             * has no callers to read — an obfuscated module reaches its
+             * "report and die" routine exactly that way. */
+            fprintf(stderr, "[arm_exec] pthread_create tid=%u fn=0x%llx arg=0x%llx "
+                    "sp=0x%llx out=0x%08lx from=tid%u lr=0x%08x\n", t.id,
+                    (unsigned long long)t.entry_pc,
+                    (unsigned long long)(t.is_arm64 ? t.regs64[0] : r3),
+                    (unsigned long long)(t.is_arm64 ? t.sp64 : stack_top), r0,
+                    g_current_tid, lr);
+            /* LUNARIA_THREAD_ARG_DUMP=<hex fn VA>: the object handed to a
+             * thread whose body is that function, plus the registers the
+             * caller still holds.  A thread started only to report something
+             * carries what it found in exactly those two places, and neither
+             * is reachable any other way once the caller has returned. */
+            /* LUNARIA_THREAD_SPAWN_TRACE=<hex offset in the entry's image>:
+             * when a thread starts at that offset, say what the *creating*
+             * thread had just been doing.  A module that decides something
+             * and then starts a thread to act on it leaves the decision only
+             * in the creator's own history -- by the time the new thread
+             * reports, its caller is long gone.  Offsets, not addresses:
+             * an image the app wrote at runtime lands at a different base
+             * every run. */
+            if (const char *sp_want = lunaria_env("LUNARIA_THREAD_SPAWN_TRACE")) {
+                const uint64_t off_want = strtoull(sp_want, nullptr, 16);
+                const uint64_t base = a64_module_base_for(t.entry_pc);
+                if (off_want && base && t.entry_pc - base == off_want) {
+                    fprintf(stderr, "[spawn] tid=%u starts at +0x%llx; creator "
+                            "tid=%u history follows\n", t.id,
+                            (unsigned long long)off_want, g_current_tid);
+                    svc_ring_dump_tid(g_current_tid);
+                    if (g_svc_jit64)
+                        a64_dump_guest_backtrace("spawn creator", g_current_tid,
+                                                 g_svc_jit64->GetRegister(29));
+                    /* The deciding thread reads nothing through the emulator:
+                     * it acts on state its siblings in the same image
+                     * gathered earlier.  Those siblings *do* call in here, so
+                     * their histories are where an answer this emulator got
+                     * wrong would show.  Dump every live thread that runs in
+                     * the same image. */
+                    /* The thread argument is where a decision already made
+                     * is handed over: the evaluator in this image branches on
+                     * one int in it. */
+                    {
+                        const GuestVA arg =
+                            (GuestVA)(t.is_arm64 ? t.regs64[0] : r3);
+                        fprintf(stderr, "[spawn]  arg=0x%llx:",
+                                (unsigned long long)arg);
+                        for (uint32_t o = 0; o < 0x40 && ctx.mem.ptr(arg + o);
+                             o += 8)
+                            fprintf(stderr, " +%02x=%016llx", o,
+                                    (unsigned long long)ctx.mem.read64(arg + o));
+                        fprintf(stderr, "\n");
+                    }
+                    /* The creator is stopped inside the routine that made
+                     * the decision, so its callee-saved registers still hold
+                     * that routine's locals -- including the object whose one
+                     * int the verdict is read from. */
+                    if (g_svc_jit64) {
+                        for (int rr = 19; rr <= 28; ++rr) {
+                            const uint64_t v = g_svc_jit64->GetRegister((size_t)rr);
+                            fprintf(stderr, "[spawn]  x%d=0x%llx", rr,
+                                    (unsigned long long)v);
+                            if (v > 0x1000 && ctx.mem.ptr((GuestVA)v) &&
+                                ctx.mem.ptr((GuestVA)v + 0x1f)) {
+                                fprintf(stderr, " ->");
+                                for (uint32_t o = 0; o < 0x20; o += 4)
+                                    fprintf(stderr, " %08x",
+                                            ctx.mem.read32((GuestVA)v + o));
+                            }
+                            fprintf(stderr, "\n");
+                        }
+                    }
+                    fprintf(stderr, "[spawn] siblings in the same image:\n");
+                    for (const auto &st : g_threads) {
+                        if (st.finished || st.id == g_current_tid) continue;
+                        if (a64_module_base_for(st.entry_pc) != base) continue;
+                        fprintf(stderr, "[spawn]  tid=%u entry=+0x%llx\n",
+                                st.id,
+                                (unsigned long long)(st.entry_pc - base));
+                        svc_ring_dump_tid(st.id);
+                    }
+                }
+            }
+            if (const char *want = lunaria_env("LUNARIA_THREAD_ARG_DUMP")) {
+                const uint64_t fn_want = strtoull(want, nullptr, 16);
+                const uint64_t fn_got = t.is_arm64 ? t.entry_pc : t.entry_pc;
+                if (fn_want && (fn_got == fn_want ||
+                                (fn_got & 0xffffffffull) == fn_want)) {
+                    const GuestVA arg = (GuestVA)(t.is_arm64 ? t.regs64[0] : r3);
+                    fprintf(stderr, "[thread-arg] fn=0x%llx arg=0x%llx\n",
+                            (unsigned long long)fn_got, (unsigned long long)arg);
+                    for (uint32_t o = 0; o < 0x80 && ctx.mem.ptr(arg + o); o += 16)
+                        fprintf(stderr, "[thread-arg]   +0x%02x %016llx %016llx\n",
+                                o, (unsigned long long)ctx.mem.read64(arg + o),
+                                (unsigned long long)ctx.mem.read64(arg + o + 8));
+                    if (g_svc_jit64)
+                        for (int rr = 19; rr <= 28; ++rr)
+                            fprintf(stderr, "[thread-arg]   x%d=0x%llx\n", rr,
+                                    (unsigned long long)g_svc_jit64->GetRegister((size_t)rr));
+                    if (g_svc_jit64) {
+                        const GuestVA creator_sp = g_svc_jit64->GetSP();
+                        fprintf(stderr, "[thread-arg]   creator-sp=0x%llx\n",
+                                (unsigned long long)creator_sp);
+                        for (uint32_t o = 0; o < 0xc0; o += 16)
+                            fprintf(stderr, "[thread-arg]   sp+0x%02x %016llx %016llx\n",
+                                    o,
+                                    (unsigned long long)ctx.mem.read64(creator_sp + o),
+                                    (unsigned long long)ctx.mem.read64(creator_sp + o + 8));
+                        for (int rr : {22, 24}) {
+                            const GuestVA p = g_svc_jit64->GetRegister((size_t)rr);
+                            fprintf(stderr, "[thread-arg]   *x%d(%llx)=%08x\n", rr,
+                                    (unsigned long long)p,
+                                    p ? ctx.mem.read32(p) : 0u);
+                        }
+                        /* Walk the AArch64 frame chain while the creator is
+                         * stopped in pthread_create.  The creator's own local
+                         * decision bytes live below its x29; the SVC wrapper's
+                         * current SP only exposes libc temporaries.  Keep this
+                         * opt-in with THREAD_ARG_DUMP because dumping a whole
+                         * parent frame is intentionally verbose. */
+                        GuestVA fp = (GuestVA)g_svc_jit64->GetRegister(29);
+                        for (unsigned depth = 0; depth < 12 && fp; ++depth) {
+                            if (!ctx.mem.ptr(fp) || !ctx.mem.ptr(fp + 15)) break;
+                            const GuestVA next = (GuestVA)ctx.mem.read64(fp);
+                            const uint64_t saved_lr = ctx.mem.read64(fp + 8);
+                            fprintf(stderr,
+                                    "[thread-arg]   frame[%u] fp=0x%llx next=0x%llx lr=0x%llx\n",
+                                    depth, (unsigned long long)fp,
+                                    (unsigned long long)next,
+                                    (unsigned long long)saved_lr);
+                            const uint32_t lr32 = (uint32_t)saved_lr;
+                            if (lr32 >= 0x27000000u && lr32 < 0x28000000u &&
+                                fp >= 0x180 && ctx.mem.ptr(fp - 0x180)) {
+                                const GuestVA base = fp - 0x180;
+                                fprintf(stderr,
+                                        "[thread-arg]   module parent locals base=0x%llx\n",
+                                        (unsigned long long)base);
+                                for (uint32_t o = 0; o < 0x1a0; o += 16)
+                                    fprintf(stderr,
+                                            "[thread-arg]     fp-180+0x%03x %016llx %016llx\n",
+                                            o,
+                                            (unsigned long long)ctx.mem.read64(base + o),
+                                            (unsigned long long)ctx.mem.read64(base + o + 8));
+                            }
+                            if (next <= fp || next - fp > 0x100000u) break;
+                            fp = next;
+                        }
+                    }
+                    svc_ring_dump_tid(g_current_tid);
+                    fprintf(stderr, "[thread-arg]   preceding SVCs (newest first):\n");
+                    for (uint32_t bi = 0, shown = 0; bi < 1024u && shown < 80u; ++bi) {
+                        const SvcTraceEnt &e =
+                            g_svc_ring[(g_svc_ring_pos - 1u - bi) & 1023u];
+                        if (!e.svc && !e.lr) continue;
+                        fprintf(stderr,
+                                "[thread-arg]     svc=%-5u lr=0x%08x r0=0x%08x tid=%u\n",
+                                e.svc, e.lr, e.r0, e.tid);
+                        ++shown;
+                    }
+                }
+            }
+            if (lunaria_env("LUNARIA_TRACE_JOBS") && r3 >= 0x1000u) {
+                // dump the thread-arg object: Baselib job-worker layout has.
+                fprintf(stderr, "  [arg dump] +0x48=0x%08x +0x88=0x%08x +0xc8=0x%08x "
+                        "+0x108=0x%08x +0x148=0x%08x +0x14c=0x%08x +0x150=0x%08x\n",
+                        ctx.mem.read32(r3+0x48), ctx.mem.read32(r3+0x88),
+                        ctx.mem.read32(r3+0xc8), ctx.mem.read32(r3+0x108),
+                        ctx.mem.read32(r3+0x148), ctx.mem.read32(r3+0x14c),
+                        ctx.mem.read32(r3+0x150));
+            }
+
+            bool immediate = false;
+            if (g_mono_base) {
+                uint32_t fn = r2 & ~1u;
+
+                if ((fn >= g_mono_base && fn < g_mono_base + 0x800000u) ||
+                    (lr >= g_mono_base && lr < g_mono_base + 0x800000u))
+                    immediate = true;
+            }
+            if (immediate && !created)
+                if (!g_threads.empty())
+                    schedule_threads(env_ticks("LUNARIA_THREAD_TICKS", 200'000'000ULL));
+            return 0;
+        }
+        // No stack to give.
+        if (r2)
+            fprintf(stderr, "[arm_exec] pthread_create FAILED: no stack left "
+                    "(fn=0x%llx, %zu live threads)\n",
+                    (unsigned long long)(ctx.is_arm64 ? function : (GuestVA)r2),
+                    g_threads.size());
+        if (r0) {
+            if (ctx.is_arm64) ctx.mem.write64((GuestVA)r0, 0);
+            else              ctx.mem.write32(r0, 0);
+        }
+        return EAGAIN;
+}
+
+/* Guest POSIX timer ABI, signals and scheduler integration.
+ * All timer state is accessed under the ARM lock. */
+static uint64_t posix_timer_clock(void *context,int clock,uint32_t tid)
+{
+    (void)context;
+    if(clock==2)return g_guest_cpu_ns.load(std::memory_order_relaxed);
+    if(clock==3) {
+        const ArmThread *t=arm_thread_by_tid(tid);
+        uint64_t ns=t ? t->cpu_ns : 0;
+        if(tid==g_current_tid && g_slice_run_t0)ns+=host_mono_ns()-g_slice_run_t0;
+        return ns;
+    }
+    clockid_t host;struct timespec ts={};
+    if(!host_clock_from_android(clock,&host) || clock_gettime(host,&ts))return 0;
+    return (uint64_t)ts.tv_sec*1000000000u+(uint64_t)ts.tv_nsec;
+}
+static void posix_timer_deadline(void)
+{
+    uint64_t left=luna_timer_next(&g_posix_timers,posix_timer_clock,nullptr),now=host_mono_ns();
+    uint64_t due=left>UINT64_MAX-now ? UINT64_MAX : now+left;
+    sleep_timer_start();
+    std::lock_guard<std::mutex> lock(g_sleep_timer_mx);
+    if(g_posix_timer_due_ns.exchange(due,std::memory_order_relaxed)!=due)g_sleep_timer_cv.notify_one();
+}
+static void posix_timer_wake(ArmExecCtx &ctx,uint32_t tid,uint32_t timer)
+{
+    ArmThread *t=arm_thread_by_tid(tid);
+    if(t && t->waiting_posix_timer==timer) {
+        t->waiting_posix_timer=0;thread_mark_ready(tid);
+    }
+    (void)ctx;
+}
+static uint32_t posix_timer_signal_target(const struct luna_posix_timer *timer)
+{
+    if(timer->notify==4)return timer->target_tid;
+    uint64_t bit=UINT64_C(1)<<(timer->signo-1);
+    if(timer->owner==GUEST_TID_BASE && !(signal_mask_load(0)&bit))return 0;
+    for(const ArmThread &t:g_threads)
+        if(t.id && !t.finished && t.process_pid==timer->owner && !(signal_mask_load(t.id)&bit))return t.id;
+    if(timer->owner==GUEST_TID_BASE)return 0;
+    return timer->clock_tid;
+}
+static void posix_timer_raise(ArmExecCtx &ctx,uint32_t tid,int sig)
+{
+    if(tid<4096 && tid>=256 && g_dvm_native_stacks[tid].attached)
+        g_dvm_pending_signals[tid].fetch_or(UINT64_C(1)<<(sig-1),std::memory_order_release);
+    else guest_raise_signal(ctx,tid,sig);
+}
+static void posix_timer_poll(ArmExecCtx &ctx)
+{
+    luna_timer_poll(&g_posix_timers,posix_timer_clock,nullptr);
+    for(size_t i=0;i<g_posix_timers.count;++i) {
+        struct luna_posix_timer *t=g_posix_timers.items+i;
+        if(t->deleted && t->published && signal_handler_load(t->owner,t->signo)==1)memset(t,0,sizeof *t);
+        if(!t->id || t->deleted || !t->pending)continue;
+        if((t->notify==0 || t->notify==4) && signal_handler_load(t->owner,t->signo)==1) {
+            (void)luna_timer_take(t);continue;
+        }
+        if(t->notify==2)posix_timer_wake(ctx,t->target_tid,t->id);
+        else if(!t->published && (t->notify==0 || t->notify==4)) {
+            t->notified_tid=posix_timer_signal_target(t);
+            uint32_t target=t->notified_tid;int sig=t->signo;
+            t->published=true;posix_timer_raise(ctx,target,sig);
+        }
+    }
+    posix_timer_deadline();
+}
+static bool posix_timer_siginfo(ArmExecCtx &ctx,GuestVA info,int sig,uint32_t tid,bool wide)
+{
+    for(size_t i=0;i<g_posix_timers.count;++i) {
+        struct luna_posix_timer *t=g_posix_timers.items+i;
+        if(!t->id || !t->published || t->signo!=sig || t->notified_tid!=tid)continue;
+        if(!luna_timer_take(t))continue;
+        uint32_t offset=wide ? 16u : 12u;
+        ctx.mem.write32(info+8,(uint32_t)-2); /* SI_TIMER */
+        ctx.mem.write32(info+offset,t->id);
+        ctx.mem.write32(info+offset+4,(uint32_t)t->overrun);
+        if(wide)ctx.mem.write64(info+offset+8,t->value);
+        else ctx.mem.write32(info+offset+8,(uint32_t)t->value);
+        if(t->deleted)memset(t,0,sizeof *t);
+        return true;
+    }
+    return false;
+}
+static void posix_timer_requeue(ArmExecCtx &ctx,uint32_t tid,int sig)
+{
+    for(size_t i=0;i<g_posix_timers.count;++i) {
+        const struct luna_posix_timer *t=g_posix_timers.items+i;
+        if(!t->id || !t->pending || !t->published || t->signo!=sig || t->notified_tid!=tid)continue;
+        if(ArmThread *thread=arm_thread_by_tid(tid))thread->pending_signals|=UINT64_C(1)<<(sig-1);
+        else if(tid==0)g_main_pending_signals.fetch_or(UINT64_C(1)<<(sig-1),std::memory_order_release);
+        else if(tid<4096)g_dvm_pending_signals[tid].fetch_or(UINT64_C(1)<<(sig-1),std::memory_order_release);
+        break;
+    }
+    (void)ctx;
+}
+static bool posix_timer_spec_read(ArmExecCtx &ctx,GuestVA va,struct luna_timer_spec *spec)
+{
+    const uint32_t size=ctx.is_arm64 ? 16u : 8u;
+    if(!va || !ctx.mem.try_ptr(va,size*2)){errno=EFAULT;return false;}
+    int64_t is=0,in=0,vs=0,vn=0;
+    (void)guest_timespec_read(ctx,va,&is,&in);
+    (void)guest_timespec_read(ctx,va+size,&vs,&vn);
+    if(!guest_timespec_valid(is,in) || !guest_timespec_valid(vs,vn)){errno=EINVAL;return false;}
+    spec->interval=guest_duration_ns(is,in);spec->value=guest_duration_ns(vs,vn);return true;
+}
+static void posix_timer_spec_write(ArmExecCtx &ctx,GuestVA va,const struct luna_timer_spec *spec)
+{
+    uint64_t ns[2]={spec->interval,spec->value};
+    for(unsigned i=0;i<2;++i) {
+        if(ctx.is_arm64){ctx.mem.write64(va+i*16,ns[i]/1000000000u);ctx.mem.write64(va+i*16+8,ns[i]%1000000000u);}
+        else {ctx.mem.write32(va+i*8,(uint32_t)(ns[i]/1000000000u));ctx.mem.write32(va+i*8+4,(uint32_t)(ns[i]%1000000000u));}
+    }
+}
+static int posix_timer_create(ArmExecCtx &ctx,int clock,GuestVA event,GuestVA output,uint32_t lr)
+{
+    unsigned word=ctx.is_arm64 ? 8u : 4u;
+    if(!output || !ctx.mem.try_ptr(output,word))return EFAULT;
+    if(event && !ctx.mem.try_ptr(event,64))return EFAULT;
+    int notify=event ? (int)ctx.mem.read32(event+word+4) : 0;
+    int signo=event ? (int)ctx.mem.read32(event+word) : 14;
+    uint64_t value=event ? (ctx.is_arm64 ? ctx.mem.read64(event) : ctx.mem.read32(event)) : 0;
+    uint64_t function=event && notify==2 ? (ctx.is_arm64 ? ctx.mem.read64(event+word+8) : ctx.mem.read32(event+word+8)) : 0;
+    GuestVA attr=event && notify==2 ? (ctx.is_arm64 ? ctx.mem.read64(event+word+8+word) : ctx.mem.read32(event+word+8+word)) : 0;
+    if(attr && !ctx.mem.try_ptr(attr,ctx.is_arm64 ? 56u : 24u))return EFAULT;
+    uint32_t id=0,owner=guest_pid();
+    int error=luna_timer_create(&g_posix_timers,owner,clock,notify,signo,value,function,g_current_tid,&id);
+    if(error)return error;
+    if(notify==2) {
+        uint32_t worker=0;
+        error=guest_pthread_create(ctx,0,attr,ctx.is_arm64 ? a64_guest_va(POSIX_TIMER_STUB) : POSIX_TIMER_STUB,id,lr,true,&worker);
+        if(error){(void)luna_timer_delete(&g_posix_timers,owner,id);return error;}
+        luna_timer_find(&g_posix_timers,owner,id)->target_tid=worker;
+    } else if(notify==4) {
+        uint32_t supplied=ctx.mem.read32(event+word+8);
+        uint32_t tid=supplied>=GUEST_TID_BASE ? sched_of_linux_tid(supplied) : supplied==1 ? 0 : supplied;
+        const ArmThread *target=arm_thread_by_tid(tid);
+        bool live=target && target->process_pid==owner;
+        if(tid==0 && supplied==GUEST_TID_BASE && owner==GUEST_TID_BASE)live=true;
+        if(tid!=0 && tid<4096 && tid>=256 && g_dvm_native_stacks[tid].attached && owner==GUEST_TID_BASE)live=true;
+        if(!live) {
+            (void)luna_timer_delete(&g_posix_timers,owner,id);return EINVAL;
+        }
+        luna_timer_find(&g_posix_timers,owner,id)->target_tid=tid;
+    }
+    if(!event)luna_timer_find(&g_posix_timers,owner,id)->value=id;
+    if(ctx.is_arm64)ctx.mem.write64(output,id);else ctx.mem.write32(output,id);
+    return 0;
+}
+
+/* Leaf SVCs as a table of functions, shared by the A32 and A64 exits.
+ *
+ * The libc string/memory calls account for most exits of an IL2CPP title.  A
+ * general exit pays for the execution lock, the identity and exception
+ * bookkeeping, the diagnostic rings and a register-file round trip, and then
+ * enters dispatch_svc()'s one very large switch; none of that is owed by a
+ * function that only reads and writes the caller's memory.  Each handler here
+ * takes the first three argument registers at their architectural width (a
+ * zero-extended r0..r2 on A32, x0..x2 on A64) and answers the value for r0/x0,
+ * so one implementation serves both ABIs.  Returning false hands the call to
+ * the general path, which owns every diagnostic and every unusual case (a
+ * clamped or out-of-range copy, a very large block).
+ *
+ * svc_leaf_fn() is empty for any number whose handler needs the execution lock
+ * (svc_lockfree() is where the diagnostics that need it switch that off), so
+ * the general path stays authoritative whenever a trace is armed. */
+static bool svc_leaf_strlen(ArmExecCtx *ctx, const uint64_t a[3], uint64_t *ret)
+{
+    *ret = (uint32_t)guest_strlen_mapped(*ctx, (GuestVA)a[0]);
+    return true;
+}
+static bool svc_leaf_strcmp(ArmExecCtx *ctx, const uint64_t a[3], uint64_t *ret)
+{
+    *ret = (uint32_t)guest_strcmp_mapped(*ctx, (GuestVA)a[0], (GuestVA)a[1]);
+    return true;
+}
+static bool svc_leaf_memcmp(ArmExecCtx *ctx, const uint64_t a[3], uint64_t *ret)
+{
+    /* try_ptr, so an unmapped operand is not compared against the shared
+     * scratch page, which would answer "equal" for garbage. */
+    const GuestVA va = (GuestVA)a[0], vb = (GuestVA)a[1];
+    const size_t n = (size_t)a[2];
+    const uint8_t *p = va ? ctx->mem.try_ptr(va, n ? n : 1) : nullptr;
+    const uint8_t *q = vb ? ctx->mem.try_ptr(vb, n ? n : 1) : nullptr;
+    *ret = (!p || !q) ? (p == q ? 0u : 1u) : (uint32_t)memcmp(p, q, n);
+    return true;
+}
+static bool svc_leaf_memset(ArmExecCtx *ctx, const uint64_t a[3], uint64_t *ret)
+{
+    *ret = a[0];
+    const size_t n = (size_t)a[2];
+    if (!n) return true;
+    if (n > (256u << 20)) return false;
+    if (ctx->is_arm64) {
+        if (a[0]) a64_guest_memset(ctx->mem, a[0], (int)(a[1] & 0xFF), n);
+        return true;
+    }
+    if (guest_clamp_write_n((uint32_t)a[0], (uint32_t)n) != n) return false;
+    memset(ctx->mem.ptr((uint32_t)a[0]), (int)(a[1] & 0xFF), n);
+    return true;
+}
+static bool svc_leaf_memmove(ArmExecCtx *ctx, const uint64_t a[3], uint64_t *ret)
+{
+    *ret = a[0];
+    const size_t n = (size_t)a[2];
+    if (!n) return true;
+    if (n > (256u << 20)) return false;
+    if (ctx->is_arm64) {
+        if (a[0] && a[1]) a64_guest_memmove(ctx->mem, a[0], a[1], n);
+        return true;
+    }
+    if (a[1] + n > 0x100000000ull) return false;
+    if (guest_clamp_write_n((uint32_t)a[0], (uint32_t)n) != n) return false;
+    memmove(ctx->mem.ptr((uint32_t)a[0]), ctx->mem.ptr((uint32_t)a[1]), n);
+    return true;
+}
+
+static SvcLeafFn svc_leaf_fn(uint32_t svc_no)
+{
+    return svc_info(svc_no).leaf;
+}
+
 static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                          std::array<uint64_t, 16> &regs) {
     GlDebugDelivery debug_delivery{ctx, regs};
@@ -25786,6 +26771,36 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     /* Pin this guest thread to the pump's engine for good (see g_gl_tids). */
     if (ctx.is_arm64 && (svc_flags & SVCF_GL)) gl_tid_mark(g_current_tid, svc_no);
 
+    /* LUNARIA_SVC_TIME=1: wall time spent inside each SVC handler (host side,
+     * blocking included), top offenders every 10 s. */
+    struct SvcTimer {
+        uint32_t no; uint64_t t0; bool on;
+        SvcTimer(uint32_t n, bool enabled) : no(n), t0(enabled ? host_mono_ns() : 0), on(enabled) {}
+        ~SvcTimer() {
+            if (!on) return;
+            static std::atomic<uint64_t> ns[1024], calls[1024], last_report{0};
+            const uint64_t now = host_mono_ns();
+            if (no < 1024) {
+                ns[no].fetch_add(now - t0, std::memory_order_relaxed);
+                calls[no].fetch_add(1, std::memory_order_relaxed);
+            }
+            uint64_t prev = last_report.load(std::memory_order_relaxed);
+            if (now - prev < 10'000'000'000ull ||
+                !last_report.compare_exchange_strong(prev, now)) return;
+            fprintf(stderr, "[svctime] top by total time:\n");
+            bool used[1024] = {};
+            for (int pass = 0; pass < 10; ++pass) {
+                int best = -1; uint64_t bv = 0;
+                for (int i = 0; i < 1024; ++i)
+                    if (!used[i] && ns[i].load() > bv) { bv = ns[i].load(); best = i; }
+                if (best < 0) break;
+                used[best] = true;
+                fprintf(stderr, "[svctime]   svc=%d calls=%llu total=%.1fms avg=%.1fus\n", best,
+                        (unsigned long long)calls[best].load(), bv / 1e6,
+                        bv / 1e3 / (double)std::max<uint64_t>(1, calls[best].load()));
+            }
+        }
+    } svc_timer(svc_no, lunaria_env("LUNARIA_SVC_TIME") != nullptr);
     // LUNARIA_SVC_HISTO: count SVCs by number; dump the top offenders every N.
     static const bool svc_histo = lunaria_env("LUNARIA_SVC_HISTO") != nullptr;
     if (svc_histo) {
@@ -26893,6 +27908,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 ret64((uint64_t)-(int64_t)e);
             }
         };
+        if (nr == (ctx.is_arm64 ? 90u : 184u)) {
+            raw_via_libc(SVC_CAPGET);
+            break;
+        }
         if (!ctx.is_arm64 && nr == 65) { ret32((uint32_t)guest_session_call(SVC_GETPGRP, 0, 0)); break; }
         if (!ctx.is_arm64) {
             uint32_t mapped_nr = 0;
@@ -26928,6 +27947,15 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             case 295: mapped_nr = 209; break; /* getsockopt */
             case 293: mapped_nr = 210; break; /* shutdown */
             case 366: mapped_nr = 242; break; /* accept4 */
+            case 335: mapped_nr = 72;  break; /* pselect6 */
+            case 332: case 85: mapped_nr = 78; break;     /* readlinkat, readlink */
+            case 328: case 10: case 40: mapped_nr = 35; break;   /* unlinkat, unlink, rmdir */
+            case 323: case 39: mapped_nr = 34; break;     /* mkdirat, mkdir */
+            case 41:  mapped_nr = 23;  break; /* dup */
+            case 376: mapped_nr = 270; break; /* process_vm_readv */
+            case 360: case 316: mapped_nr = 26; break;    /* inotify_init1, inotify_init */
+            case 317: mapped_nr = 27;  break; /* inotify_add_watch */
+            case 318: mapped_nr = 28;  break; /* inotify_rm_watch */
             default: break;
             }
             if (mapped_nr) {
@@ -26945,13 +27973,98 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     g_svc_args64[1] = regs[0];
                     g_svc_args64[0] = (uint64_t)(int64_t)-100;   /* AT_FDCWD */
                 }
+                /* The path-only forms are the *at forms with AT_FDCWD. */
+                if (nr == 85 || nr == 10 || nr == 40 || nr == 39) {
+                    g_svc_args64[3] = regs[2];
+                    g_svc_args64[2] = nr == 40 ? 0x200u /* AT_REMOVEDIR */
+                                    : nr == 10 ? 0u : regs[1];
+                    if (nr == 85) g_svc_args64[2] = regs[1];
+                    g_svc_args64[1] = regs[0];
+                    g_svc_args64[0] = (uint64_t)(int64_t)-100;   /* AT_FDCWD */
+                }
+                if (nr == 316) g_svc_args64[0] = 0;   /* inotify_init() has no flags */
                 nr = mapped_nr;
                 canon = true;
             }
         }
         switch (nr) {
+        case 78: { /* AArch64 __NR_readlinkat(dfd, path, buf, size) */
+            const GuestVA bufva = g_svc_args64[2];
+            const size_t capacity = (size_t)(canon && !ctx.is_arm64 ? (uint32_t)g_svc_args64[3] : g_svc_args64[3]);
+            const char *path = ctx.mem.cstr(g_svc_args64[1]);
+            int64_t rv;
+            if (!path || (capacity && !ctx.mem.try_ptr(bufva, capacity))) rv = -EFAULT;
+            else if (!strncmp(path, "/proc/", 6) || !strcmp(path, "/proc")) rv = -ENOENT;
+            else if ((int)(int64_t)g_svc_args64[0] != LUNA_AT_FDCWD && path[0] != '/') rv = -ENOSYS;
+            else {
+                char mapped[PATH_MAX];
+                const char *host = map_guest_path(path, mapped, sizeof mapped);
+                ptrdiff_t n;
+                { ArmLockDropped unlocked; (void)unlocked;
+                  n = host ? luna_file_readlink(host, (char *)ctx.mem.ptr(bufva), capacity) : -1; }
+                rv = n < 0 ? guest_syscall_errno(host ? errno : EFAULT) : (int64_t)n;
+            }
+            ret64((uint64_t)rv);
+            break;
+        }
+        case 34: { /* AArch64 __NR_mkdirat(dfd, path, mode) */
+            const char *path = ctx.mem.cstr(g_svc_args64[1]);
+            int64_t rv;
+            if (!path) rv = -EFAULT;
+            else if ((int)(int64_t)g_svc_args64[0] != LUNA_AT_FDCWD && path[0] != '/') rv = -ENOSYS;
+            else {
+                char mapped[PATH_MAX];
+                const char *host = map_guest_path(path, mapped, sizeof mapped);
+                if (!host) rv = -EFAULT;
+                else if (!strncmp(host, "/proc/", 6) || !strcmp(host, "/proc")) rv = -EACCES;
+                else {
+                    const int rc = luna_file_mkdir(host, (unsigned)g_svc_args64[2]);
+                    rv = rc < 0 ? guest_syscall_errno(errno) : 0;
+                }
+            }
+            ret64((uint64_t)rv);
+            break;
+        }
+        case 23: { /* AArch64 __NR_dup(oldfd) */
+            const int fd = luna_fd_dup((int)(int64_t)g_svc_args64[0], 0, 0);
+            ret64(fd < 0 ? (uint64_t)guest_syscall_errno(errno) : (uint64_t)fd);
+            break;
+        }
+        case 270: /* AArch64 __NR_process_vm_readv */
+            raw_via_libc(SVC_PROCESS_VM_READV);
+            break;
+#ifdef __linux__
+        case 26: { /* AArch64 __NR_inotify_init1(flags) */
+            const int fd = ::inotify_init1((int)g_svc_args64[0] & (IN_NONBLOCK | IN_CLOEXEC));
+            ret64(fd < 0 ? (uint64_t)guest_syscall_errno(errno) : (uint64_t)fd);
+            break;
+        }
+        case 27: { /* AArch64 __NR_inotify_add_watch(fd, path, mask) */
+            const char *path = ctx.mem.cstr(g_svc_args64[1]);
+            int64_t rv;
+            if (!path) rv = -EFAULT;
+            else {
+                char mapped[PATH_MAX];
+                const char *host = map_guest_path(path, mapped, sizeof mapped);
+                if (!host) rv = -EFAULT;
+                else if (!strncmp(host, "/proc/", 6) || !strcmp(host, "/proc")) rv = -ENOENT;
+                else {
+                    const int wd = ::inotify_add_watch((int)(int64_t)g_svc_args64[0], host,
+                                                       (uint32_t)g_svc_args64[2]);
+                    rv = wd < 0 ? guest_syscall_errno(errno) : wd;
+                }
+            }
+            ret64((uint64_t)rv);
+            break;
+        }
+        case 28: { /* AArch64 __NR_inotify_rm_watch(fd, wd) */
+            const int rc = ::inotify_rm_watch((int)(int64_t)g_svc_args64[0], (int)g_svc_args64[1]);
+            ret64(rc < 0 ? (uint64_t)guest_syscall_errno(errno) : 0u);
+            break;
+        }
+#endif
         case 35: { /* AArch64 __NR_unlinkat */
-            if (!ctx.is_arm64) {
+            if (!canon) {
                 if (uint32_t eva = errno_va(ctx, g_current_tid))
                     ctx.mem.write32(eva, guest_errno_word(ENOSYS));
                 ret32(~0u);
@@ -28132,7 +29245,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             if (rc == 0 && want != 0 && parkable) {
                 ArmLockGuard wait_locked;
                 guest_net::GuestFdWait w =
-                    guest_net::make_epoll_wait(ctx, epfd, maxev, evs, true, deadline);
+                    guest_net::make_epoll_wait(ctx, epfd, maxev, evs, deadline);
                 w.what = "epoll_pwait";
                 w.mask_swapped = mask_swapped;
                 w.saved_mask = saved_mask;
@@ -28161,6 +29274,14 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 break;
             }
             ret64((uint64_t)rc);
+            break;
+        }
+        case 72: { /* AArch64 __NR_pselect6(nfds, rd, wr, ex, timeout_ts, {sigmask, size}) */
+            const GuestVA ts_va = ctx.is_arm64 ? g_svc_args64[4] : (GuestVA)regs[4];
+            g_select_budget_ms = ts_va
+                ? (long)(guest_timespec_ns(ctx, ts_va) / 1'000'000ull) : -1L;
+            dispatch_svc(ctx, SVC_NET_SELECT, regs);
+            g_select_budget_ms = SELECT_BUDGET_FROM_ARGS;
             break;
         }
         case 73: { /* AArch64 __NR_ppoll(fds, nfds, timeout_ts, sigmask, sigsetsize) */
@@ -28289,6 +29410,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 ret64(got ? got : (uint64_t)guest_syscall_errno(errno ? errno : ENOMEM));
                 break;
             }
+            if (!r1 || (r1 + 4095ull) > INT32_MAX || (off & 4095u)) {
+                ret32((uint32_t)-(!r1 || (off & 4095u) ? EINVAL : ENOMEM)); break;
+            }
             uint32_t addr;
             if (r0 && (r3 & 0x10u)) { /* MAP_FIXED */
                 if (guest_range_hits_loaded(r0, r1)) {
@@ -28296,17 +29420,17 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     if (fx++ < 8)
                         fprintf(stderr, "[mmap0] MAP_FIXED into library rejected %#lx+%#lx\n",
                                 r0, r1);
-                    ret32(~0u); break;
+                    ret32((uint32_t)-EINVAL); break;
                 }
                 addr = r0;
             } else {
                 uint32_t got = 0;
                 // prot in r2 for raw mmap syscall
                 if ((r3 & 0x20u) && r2 == 0 && !mmap_prot_none_budget_ok(r1)) {
-                    ret32(~0u); break;
+                    ret32((uint32_t)-ENOMEM); break;
                 }
                 addr = mmap_bump_exact(r1, &got);
-                if (addr == ~0u) { ret32(~0u); break; }
+                if (addr == ~0u) { ret32((uint32_t)-ENOMEM); break; }
                 r1 = got; /* matches guest-requested length (page-rounded) */
                 if ((r3 & 0x20u) && r2 == 0)
                     g_mmap_prot_none_bytes += got;
@@ -28318,6 +29442,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                                 (int32_t)fd_raw, (unsigned long long)off, errno);
                 }
             }
+            a32_guest_mmap_commit(ctx, addr, (uint32_t)r1, (uint32_t)r2, (uint32_t)r3, (int32_t)fd_raw);
             if (lunaria_env("LUNARIA_TRACE_MMAP"))
                 fprintf(stderr, "[mmap0] nr=%u r1=%lu prot=%lu flags=%#lx fd=%d off=%u -> %#x\n",
                         nr, r1, r2, r3, (int32_t)fd_raw, off, addr);
@@ -28330,6 +29455,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 uint64_t len = (g_svc_args64[1] + 4095ull) & ~4095ull;
                 if (len && !a64_is_guest_va(lo))
                     a64_map_remove(lo, lo + len, /*release=*/true);
+            } else if (int e = a32_guest_munmap(ctx, (uint32_t)r0, (uint32_t)r1)) {
+                ret32((uint32_t)-e); break;
             }
             ret32(0); break;
         case 125: /* __NR_mprotect (ARM32) */
@@ -28341,7 +29468,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     g_svc_args64[1], (uint32_t)g_svc_args64[2]);
                 ret64(rc ? (uint64_t)guest_syscall_errno(errno) : 0);
             } else {
-                ret32(0);
+                const int e = a32_guest_mprotect(ctx, (uint32_t)r0, (uint32_t)r1, (uint32_t)r2);
+                ret32((uint32_t)-e);
             }
             break;
         case 154: case 155: case 156: case 157: {
@@ -28387,10 +29515,15 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     fd = guest_open_path(path, flags, mode);
                 }
             }
-            if (ctx.is_arm64)
-                ret64(fd < 0 ? (uint64_t)guest_syscall_errno(errno) : (uint64_t)fd);
-            else
-                ret32((uint32_t)fd);
+            /* A raw svc answers -errno on both ABIs; the C library's -1 and
+             * errno is its own wrapper.  A failed open reported as -1 reads as
+             * EPERM, i.e. "the file exists and may not be opened". */
+            {
+                const int open_errno = errno;
+                const int64_t rv = fd < 0 ? guest_syscall_errno(open_errno) : (int64_t)fd;
+                if (ctx.is_arm64) ret64((uint64_t)rv);
+                else              ret32((uint32_t)rv);
+            }
             if (lunaria_env("LUNARIA_TRACE_OPEN"))
                 fprintf(stderr,
                         "[raw-openat] nr=%u dfd=%lld path=%s flags=%#x "
@@ -28757,7 +29890,6 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                         return;
                     }
                     schedule_threads(20'000'000ULL);
-                    drive_aaudio_callbacks(ctx);
                     drive_opensles_callbacks(ctx);
                     drive_ndk_choreographer(ctx);
                     if (ctx.mem.read32(fu_uaddr) != (uint32_t)r2) changed = true;
@@ -29175,9 +30307,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             if (mo.type == jvm_object::JVM_OBJECT_METHOD)
                 ctor_sig = mo.method.signature.data;
         }
-        jvalue ctor_args[8];
+        jvalue ctor_args[LUNARIA_JNI_MAX_ARGS];
         int ctor_nargs = jni_marshal_jvalues(ctx, regs, (int)svc_no - 28,
-                                             ctor_sig, ctor_args, 8);
+                                             ctor_sig, ctor_args, LUNARIA_JNI_MAX_ARGS);
         jobject no = jvm->native.NewObjectA(env, AS_CLASS(r1), ctor,
                                             ctor_nargs > 0 ? ctor_args : nullptr);
         /* dalvik.system.InMemoryDexClassLoader(ByteBuffer, ClassLoader):
@@ -29563,9 +30695,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
          * AndroidThunkJava_GetSharedPreferenceString with a null key and a null
          * default). */
         if (mid && r1) {
-            jvalue host_args[8];
+            jvalue host_args[LUNARIA_JNI_MAX_ARGS];
             int nargs = jni_marshal_jvalues(ctx, regs, (int)svc_no - 34, msig,
-                                            host_args, 8);
+                                            host_args, LUNARIA_JNI_MAX_ARGS);
             uint32_t res = (uint32_t)(uintptr_t)
                 jvm->native.CallObjectMethodA(env, AS_OBJ(r1), mid,
                                               nargs > 0 ? host_args : nullptr);
@@ -29657,8 +30789,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
          * methods the JVM has no implementation for. */
         uint32_t bret = 0;
         if (mid && r1) {
-            jvalue bargs[8];
-            int bn = jni_call_args(ctx, regs, (int)svc_no - 37, mid, bargs, 8);
+            jvalue bargs[LUNARIA_JNI_MAX_ARGS];
+            int bn = jni_call_args(ctx, regs, (int)svc_no - 37, mid, bargs, LUNARIA_JNI_MAX_ARGS);
             bret = jvm->native.CallBooleanMethodA(env, AS_OBJ(r1), mid,
                                                   bn > 0 ? bargs : nullptr) ? 1u : 0u;
         }
@@ -29707,8 +30839,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         int base = svc_no <= 42 ? 40 : svc_no <= 45 ? 43 : 46;
         auto mid = AS_MID(r2);
         if (!mid || !r1) { ret32(0); break; }
-        jvalue a[8];
-        int n = jni_call_args(ctx, regs, (int)svc_no - base, mid, a, 8);
+        jvalue a[LUNARIA_JNI_MAX_ARGS];
+        int n = jni_call_args(ctx, regs, (int)svc_no - base, mid, a, LUNARIA_JNI_MAX_ARGS);
         jvalue *ap = n > 0 ? a : nullptr;
         uint32_t v = base == 40
             ? (uint32_t)(int32_t)jvm->native.CallByteMethodA(env, AS_OBJ(r1), mid, ap)
@@ -29759,8 +30891,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         // Forward to the host JVM (dlsym'd libjvm-*.
         if (mid && r1) {
-            jvalue ia[8];
-            int in = jni_call_args(ctx, regs, (int)svc_no - 49, mid, ia, 8);
+            jvalue ia[LUNARIA_JNI_MAX_ARGS];
+            int in = jni_call_args(ctx, regs, (int)svc_no - 49, mid, ia, LUNARIA_JNI_MAX_ARGS);
             ret32((uint32_t)jvm->native.CallIntMethodA(env, AS_OBJ(r1), mid,
                                                        in > 0 ? ia : nullptr));
             break;
@@ -29772,8 +30904,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case 52: case 53: case 54:
         if (try_asset_jni(ctx, svc_no, regs)) break;
         if (r1 && r2) {
-            jvalue la[8];
-            int ln = jni_call_args(ctx, regs, (int)svc_no - 52, AS_MID(r2), la, 8);
+            jvalue la[LUNARIA_JNI_MAX_ARGS];
+            int ln = jni_call_args(ctx, regs, (int)svc_no - 52, AS_MID(r2), la, LUNARIA_JNI_MAX_ARGS);
             ret64((uint64_t)jvm->native.CallLongMethodA(env, AS_OBJ(r1), AS_MID(r2),
                                                         ln > 0 ? la : nullptr));
             break;
@@ -29783,8 +30915,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case 55: case 56: case 57: {
         g_svc_ret_fp = 4;
         if (r1 && r2) {
-            jvalue fa[8];
-            int fn2 = jni_call_args(ctx, regs, (int)svc_no - 55, AS_MID(r2), fa, 8);
+            jvalue fa[LUNARIA_JNI_MAX_ARGS];
+            int fn2 = jni_call_args(ctx, regs, (int)svc_no - 55, AS_MID(r2), fa, LUNARIA_JNI_MAX_ARGS);
             jfloat v = jvm->native.CallFloatMethodA(env, AS_OBJ(r1), AS_MID(r2),
                                                     fn2 > 0 ? fa : nullptr);
             uint32_t bits; memcpy(&bits, &v, 4);
@@ -29810,8 +30942,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case 58: case 59: case 60: {
         g_svc_ret_fp = 8;
         if (r1 && r2) {
-            jvalue da[8];
-            int dn = jni_call_args(ctx, regs, (int)svc_no - 58, AS_MID(r2), da, 8);
+            jvalue da[LUNARIA_JNI_MAX_ARGS];
+            int dn = jni_call_args(ctx, regs, (int)svc_no - 58, AS_MID(r2), da, LUNARIA_JNI_MAX_ARGS);
             jdouble v = jvm->native.CallDoubleMethodA(env, AS_OBJ(r1), AS_MID(r2),
                                                       dn > 0 ? da : nullptr);
             uint64_t bits; memcpy(&bits, &v, 8);
@@ -30209,9 +31341,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             if (mo.type == jvm_object::JVM_OBJECT_METHOD && mo.method.signature.data)
                 sig = mo.method.signature.data;
         }
-        jvalue host_args[8];
+        jvalue host_args[LUNARIA_JNI_MAX_ARGS];
         int variant = (int)svc_no - 61;
-        int nargs = jni_marshal_jvalues(ctx, regs, variant, sig, host_args, 8);
+        int nargs = jni_marshal_jvalues(ctx, regs, variant, sig, host_args, LUNARIA_JNI_MAX_ARGS);
         if (mname && !strcmp(mname, "OnApplicationPause") && nargs >= 1) {
             fprintf(stderr, "[arm_jni] OnApplicationPause(%u) — forcing false (emulator always focused)\n",
                     (unsigned)host_args[0].z);
@@ -30250,8 +31382,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             if (mo.type == jvm_object::JVM_OBJECT_METHOD && mo.method.signature.data)
                 sig = mo.method.signature.data;
         }
-        jvalue host_args[64];
-        const int nargs = jni_marshal_jvalues(ctx, regs, variant, sig, host_args, 64, 4);
+        jvalue host_args[LUNARIA_JNI_MAX_ARGS];
+        const int nargs = jni_marshal_jvalues(ctx, regs, variant, sig, host_args, LUNARIA_JNI_MAX_ARGS, 4);
         jvalue *a = nargs > 0 ? host_args : nullptr;
         switch (type) {
         case 0: RET_OBJ(jvm->native.CallNonvirtualObjectMethodA(env, obj, cls, mid, a)); break;
@@ -30506,9 +31638,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             break;
         }
         if (mname && (!strcmp(mname, "getFieldID") || !strcmp(mname, "getMethodID"))) {
-            jvalue host_args[4];
+            jvalue host_args[LUNARIA_JNI_MAX_ARGS];
             int nargs = jni_marshal_jvalues(ctx, regs, (int)svc_no - 114, msig,
-                                            host_args, 4);
+                                            host_args, LUNARIA_JNI_MAX_ARGS);
             jobject got = jvm->native.CallStaticObjectMethodA(
                 env, AS_CLASS(r1), mid, nargs > 0 ? host_args : nullptr);
             static uint64_t gm_log = 0;
@@ -30527,8 +31659,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             break;
         }
         {
-            jvalue sa[8];
-            int sn = jni_marshal_jvalues(ctx, regs, (int)svc_no - 114, msig, sa, 8);
+            jvalue sa[LUNARIA_JNI_MAX_ARGS];
+            int sn = jni_marshal_jvalues(ctx, regs, (int)svc_no - 114, msig, sa, LUNARIA_JNI_MAX_ARGS);
             RET_OBJ(jvm->native.CallStaticObjectMethodA(env, AS_CLASS(r1), mid,
                                                         sn > 0 ? sa : nullptr));
         }
@@ -30547,8 +31679,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (try_asset_jni(ctx, svc_no, regs)) break;
         uint32_t bret = 0;
         if (mid && r1) {
-            jvalue ba[8];
-            int bn = jni_call_args(ctx, regs, (int)svc_no - 117, mid, ba, 8);
+            jvalue ba[LUNARIA_JNI_MAX_ARGS];
+            int bn = jni_call_args(ctx, regs, (int)svc_no - 117, mid, ba, LUNARIA_JNI_MAX_ARGS);
             bret = jvm->native.CallStaticBooleanMethodA(env, AS_CLASS(r1), mid,
                                                         bn > 0 ? ba : nullptr) ? 1u : 0u;
         }
@@ -30571,8 +31703,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (base == 138) g_svc_ret_fp = 8;
         auto mid = AS_MID(r2);
         if (!mid || !r1) { if (wide) ret64(0); else ret32(0); break; }
-        jvalue a[8];
-        int n = jni_call_args(ctx, regs, (int)svc_no - base, mid, a, 8);
+        jvalue a[LUNARIA_JNI_MAX_ARGS];
+        int n = jni_call_args(ctx, regs, (int)svc_no - base, mid, a, LUNARIA_JNI_MAX_ARGS);
         jvalue *ap = n > 0 ? a : nullptr;
         jclass cls = AS_CLASS(r1);
         switch (base) {
@@ -30608,8 +31740,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             break;
         }
         {
-            jvalue va[8];
-            int vn = jni_call_args(ctx, regs, (int)svc_no - 141, AS_MID(r2), va, 8);
+            jvalue va[LUNARIA_JNI_MAX_ARGS];
+            int vn = jni_call_args(ctx, regs, (int)svc_no - 141, AS_MID(r2), va, LUNARIA_JNI_MAX_ARGS);
             jvm->native.CallStaticVoidMethodA(env, AS_CLASS(r1), AS_MID(r2),
                                               vn > 0 ? va : nullptr);
         }
@@ -31457,8 +32589,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_STRLEN: {
-        GuestVA sva = ctx.is_arm64 ? g_svc_args64[0] : (GuestVA)r0;
-        ret32((uint32_t)guest_strlen_mapped(ctx, sva));
+        const uint64_t a[3] = { argp(0), argp(1), argp(2) };
+        uint64_t v;
+        (void)svc_leaf_strlen(&ctx, a, &v);
+        ret32((GuestVA)v);
         break;
     }
     case SVC_STRCPY: {
@@ -31501,9 +32635,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_STRCMP: {
-        GuestVA a = ctx.is_arm64 ? g_svc_args64[0] : (GuestVA)r0;
-        GuestVA b = ctx.is_arm64 ? g_svc_args64[1] : (GuestVA)r1;
-        ret32((uint32_t)guest_strcmp_mapped(ctx, a, b));
+        const uint64_t a[3] = { argp(0), argp(1), argp(2) };
+        uint64_t v;
+        (void)svc_leaf_strcmp(&ctx, a, &v);
+        ret32((GuestVA)v);
         break;
     }
     case SVC_STRNCMP: {
@@ -31832,7 +32967,6 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     return;
                 }
                 schedule_threads(20'000'000ULL);
-                drive_aaudio_callbacks(ctx);
                 drive_opensles_callbacks(ctx);
                 drive_ndk_choreographer(ctx);
                 sched_idle_wait();
@@ -31873,349 +33007,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
 
-    // pthread_create: capture a full guest-thread context with its own stack.
     case SVC_PTHREAD_CREATE: {
-        // pthread_create(thread_t*, attr*, fn_va, arg)
-        const bool create64 = g_ctx && g_ctx->is_arm64;
-        uint32_t new_stack_lo = 0;
-        /* Honour the attribute the caller built: a thread asked for with a
-         * large stack really needs it (deep recursion in a parser, a
-         * script VM), and PTHREAD_CREATE_DETACHED decides who reaps it. */
-        const GuestVA attr_va = argp(1);
-        uint32_t attr_flags = attr_va ? ctx.mem.read32(attr_va) : 0u;
-        uint32_t new_stack_sz = thread_stack_size(create64);
-        GuestVA supplied_stack = 0;
-        if (attr_va) {
-            const uint32_t w = create64 ? 8u : 4u;
-            supplied_stack = create64 ? ctx.mem.read64(attr_va + w)
-                                      : ctx.mem.read32(attr_va + w);
-            uint64_t want = create64 ? ctx.mem.read64(attr_va + 2u * w)
-                                     : ctx.mem.read32(attr_va + 2u * w);
-            if (want < 16384u || want > UINT32_MAX - 4095u ||
-                (supplied_stack && supplied_stack > UINT64_MAX - want)) {
-                ret32(22u /* EINVAL */);
-                break;
-            }
-            if (supplied_stack) {
-                new_stack_sz = (uint32_t)want;
-            } else
-            if (want >= 16384u) {
-                /* Round to a page and clamp: the stacks come out of a fixed
-                 * window, so one absurd request must not exhaust it. */
-                want = (want + 4095u) & ~4095ull;
-                new_stack_sz = (uint32_t)want;
-            }
-        }
-        {
-            auto &pool = g_thread_stack_free[new_stack_sz];
-            if (!supplied_stack && r2 && !pool.empty()) {
-                new_stack_lo = pool.back();
-                pool.pop_back();
-            }
-        }
-        if (!supplied_stack && r2 && !new_stack_lo &&
-            (uint64_t)g_thread_stack_next + new_stack_sz <= HEAP_BASE) {
-            new_stack_lo = g_thread_stack_next;
-            g_thread_stack_next += new_stack_sz;
-        }
-        if (r2 && (new_stack_lo || supplied_stack)) {
-            if (!supplied_stack)
-                thread_stack_map(ctx, new_stack_lo, new_stack_sz);
-            if (lunaria_env("LUNARIA_TRACE_STACKS"))
-                fprintf(stderr, "[stack] alloc lo=0x%x size=0x%x supplied=%d "
-                        "from tid=%u\n", new_stack_lo, new_stack_sz,
-                        (int)supplied_stack, g_current_tid);
-            ArmThread t;
-            // Shared with fork() (see alloc_guest_tid): one counter, so the two paths can never collide on an id.
-            uint32_t nid = alloc_guest_tid();
-            if (!nid) {
-                fprintf(stderr, "[arm_exec] pthread_create: no free tid "
-                        "(%zu slots) — EAGAIN\n",
-                        g_threads.size());
-                if (!supplied_stack)
-                    g_thread_stack_free[new_stack_sz].push_back(new_stack_lo);
-                ret32(11u /* EAGAIN */);
-                break;
-            }
-            t.id = nid;
-            g_guest_dlerrors[nid].pending = false;
-            inherit_process_identity(t);
-            /* POSIX/Linux: a newly-created pthread inherits a copy of the creating
-             * thread's signal mask. A reused tid's slot must not be left at zero (or at
-             * its previous owner's value), or pthread_sigmask(), signal delivery and
-             * /proc/<tid>/status disagree as soon as the caller creates a worker after
-             * blocking a signal. */
-            signal_mask_store(t.id, signal_mask_load(g_current_tid));
-            uint32_t stack_top = new_stack_lo + new_stack_sz - 16;
-            t.stack_base = new_stack_lo;
-            t.stack_size = new_stack_sz;
-            t.stack_user_owned = supplied_stack != 0;
-            t.regs[0]  = r3;            /* arg */
-            t.regs[13] = stack_top;
-            t.is_arm64 = create64;
-            // Same sentinel page as A32 — address 4 caused InterpreterFallback dumps and confused clean thread returns with real.
-            t.regs[14] = SENTINEL_ADDR;
-            t.regs[15] = r2 & ~1u;
-            t.entry_pc = r2 & ~1u;
-            if (t.is_arm64) {
-                // CallSVC may be running on the main, scheduler, or callback.
-                GuestVA fn64 = g_svc_args64[2];
-                GuestVA arg64 = g_svc_args64[3];
-                t.regs64.fill(0);
-                t.regs64[0] = arg64; /* x0 = start_routine arg */
-                t.start_arg = arg64;
-                t.stack_base = a64_guest_va((BackingOffset)new_stack_lo);
-                t.sp64 = a64_guest_va(stack_top);
-                t.lr64 = a64_guest_va(SENTINEL_ADDR);
-                t.pc64 = fn64 & ~1ull;
-                t.entry_pc = t.pc64;
-                t.regs64[30] = t.lr64;
-            }
-            if (supplied_stack) {
-                t.stack_base = supplied_stack;
-                const GuestVA top = (supplied_stack + new_stack_sz) & ~(GuestVA)15u;
-                t.regs[13] = (uint32_t)top;
-                if (create64) t.sp64 = top;
-            }
-            t.cpsr = (r2 & 1u) ? 0x30u : 0x10u;
-            t.created_ns = host_mono_ns();
-            svc_ring_reset_tid(t.id);
-            t.detached = (attr_flags & 1u) != 0;   /* PTHREAD_CREATE_DETACHED */
-            /* tids are handed out again after a join, so a descriptor wait
-             * left behind by the previous owner must not be inherited. */
-            if (guest_net::g_fd_waits.erase(t.id)) fd_deadline_republish();
-            g_disk_reads.erase(t.id);
-            /* Reuse a retired slot before growing, so a long-running process that
-             * creates and joins threads does not grow g_threads without bound (joined
-             * slots are emptied instead of erased). */
-            {
-                ArmThread *slot;
-                if (!g_free_thread_slots.empty()) {
-                    slot = g_free_thread_slots.back();
-                    g_free_thread_slots.pop_back();
-                    *slot = t;
-                } else {
-                    g_threads.push_back(t);
-                    slot = &g_threads.back();
-                }
-                /* g_threads is a deque, so existing entries keep their
-                 * addresses; only the new slot has to be indexed. */
-                g_thread_by_tid[slot->id] = slot;
-            }
-            thread_name_inherit(t.id, g_current_tid);
-            /* Create the errno slot now, from the creating thread's SVC, and not on
-             * first use: a first use can be the scheduler's wake path, which must not
-             * allocate (see errno_va_existing). */
-            (void)errno_va(ctx, t.id);
-            thread_mark_ready(t.id);
-            if (r0) {
-                if (t.is_arm64) {
-                    uint64_t tid64 = t.id;
-                    std::memcpy(ctx.mem.ptr(r0), &tid64, 8);
-                } else {
-                    ctx.mem.write32(r0, t.id);
-                }
-            }
-            /* lr names the code that decided to start this thread, which is
-             * the only way to find that decision when the thread body itself
-             * has no callers to read — an obfuscated module reaches its
-             * "report and die" routine exactly that way. */
-            fprintf(stderr, "[arm_exec] pthread_create tid=%u fn=0x%llx arg=0x%llx "
-                    "sp=0x%llx out=0x%08lx from=tid%u lr=0x%08x\n", t.id,
-                    (unsigned long long)t.entry_pc,
-                    (unsigned long long)(t.is_arm64 ? t.regs64[0] : r3),
-                    (unsigned long long)(t.is_arm64 ? t.sp64 : stack_top), r0,
-                    g_current_tid, lr);
-            /* LUNARIA_THREAD_ARG_DUMP=<hex fn VA>: the object handed to a
-             * thread whose body is that function, plus the registers the
-             * caller still holds.  A thread started only to report something
-             * carries what it found in exactly those two places, and neither
-             * is reachable any other way once the caller has returned. */
-            /* LUNARIA_THREAD_SPAWN_TRACE=<hex offset in the entry's image>:
-             * when a thread starts at that offset, say what the *creating*
-             * thread had just been doing.  A module that decides something
-             * and then starts a thread to act on it leaves the decision only
-             * in the creator's own history -- by the time the new thread
-             * reports, its caller is long gone.  Offsets, not addresses:
-             * an image the app wrote at runtime lands at a different base
-             * every run. */
-            if (const char *sp_want = lunaria_env("LUNARIA_THREAD_SPAWN_TRACE")) {
-                const uint64_t off_want = strtoull(sp_want, nullptr, 16);
-                const uint64_t base = a64_module_base_for(t.entry_pc);
-                if (off_want && base && t.entry_pc - base == off_want) {
-                    fprintf(stderr, "[spawn] tid=%u starts at +0x%llx; creator "
-                            "tid=%u history follows\n", t.id,
-                            (unsigned long long)off_want, g_current_tid);
-                    svc_ring_dump_tid(g_current_tid);
-                    if (g_svc_jit64)
-                        a64_dump_guest_backtrace("spawn creator", g_current_tid,
-                                                 g_svc_jit64->GetRegister(29));
-                    /* The deciding thread reads nothing through the emulator:
-                     * it acts on state its siblings in the same image
-                     * gathered earlier.  Those siblings *do* call in here, so
-                     * their histories are where an answer this emulator got
-                     * wrong would show.  Dump every live thread that runs in
-                     * the same image. */
-                    /* The thread argument is where a decision already made
-                     * is handed over: the evaluator in this image branches on
-                     * one int in it. */
-                    {
-                        const GuestVA arg =
-                            (GuestVA)(t.is_arm64 ? t.regs64[0] : r3);
-                        fprintf(stderr, "[spawn]  arg=0x%llx:",
-                                (unsigned long long)arg);
-                        for (uint32_t o = 0; o < 0x40 && ctx.mem.ptr(arg + o);
-                             o += 8)
-                            fprintf(stderr, " +%02x=%016llx", o,
-                                    (unsigned long long)ctx.mem.read64(arg + o));
-                        fprintf(stderr, "\n");
-                    }
-                    /* The creator is stopped inside the routine that made
-                     * the decision, so its callee-saved registers still hold
-                     * that routine's locals -- including the object whose one
-                     * int the verdict is read from. */
-                    if (g_svc_jit64) {
-                        for (int rr = 19; rr <= 28; ++rr) {
-                            const uint64_t v = g_svc_jit64->GetRegister((size_t)rr);
-                            fprintf(stderr, "[spawn]  x%d=0x%llx", rr,
-                                    (unsigned long long)v);
-                            if (v > 0x1000 && ctx.mem.ptr((GuestVA)v) &&
-                                ctx.mem.ptr((GuestVA)v + 0x1f)) {
-                                fprintf(stderr, " ->");
-                                for (uint32_t o = 0; o < 0x20; o += 4)
-                                    fprintf(stderr, " %08x",
-                                            ctx.mem.read32((GuestVA)v + o));
-                            }
-                            fprintf(stderr, "\n");
-                        }
-                    }
-                    fprintf(stderr, "[spawn] siblings in the same image:\n");
-                    for (const auto &st : g_threads) {
-                        if (st.finished || st.id == g_current_tid) continue;
-                        if (a64_module_base_for(st.entry_pc) != base) continue;
-                        fprintf(stderr, "[spawn]  tid=%u entry=+0x%llx\n",
-                                st.id,
-                                (unsigned long long)(st.entry_pc - base));
-                        svc_ring_dump_tid(st.id);
-                    }
-                }
-            }
-            if (const char *want = lunaria_env("LUNARIA_THREAD_ARG_DUMP")) {
-                const uint64_t fn_want = strtoull(want, nullptr, 16);
-                const uint64_t fn_got = t.is_arm64 ? t.entry_pc : t.entry_pc;
-                if (fn_want && (fn_got == fn_want ||
-                                (fn_got & 0xffffffffull) == fn_want)) {
-                    const GuestVA arg = (GuestVA)(t.is_arm64 ? t.regs64[0] : r3);
-                    fprintf(stderr, "[thread-arg] fn=0x%llx arg=0x%llx\n",
-                            (unsigned long long)fn_got, (unsigned long long)arg);
-                    for (uint32_t o = 0; o < 0x80 && ctx.mem.ptr(arg + o); o += 16)
-                        fprintf(stderr, "[thread-arg]   +0x%02x %016llx %016llx\n",
-                                o, (unsigned long long)ctx.mem.read64(arg + o),
-                                (unsigned long long)ctx.mem.read64(arg + o + 8));
-                    if (g_svc_jit64)
-                        for (int rr = 19; rr <= 28; ++rr)
-                            fprintf(stderr, "[thread-arg]   x%d=0x%llx\n", rr,
-                                    (unsigned long long)g_svc_jit64->GetRegister((size_t)rr));
-                    if (g_svc_jit64) {
-                        const GuestVA creator_sp = g_svc_jit64->GetSP();
-                        fprintf(stderr, "[thread-arg]   creator-sp=0x%llx\n",
-                                (unsigned long long)creator_sp);
-                        for (uint32_t o = 0; o < 0xc0; o += 16)
-                            fprintf(stderr, "[thread-arg]   sp+0x%02x %016llx %016llx\n",
-                                    o,
-                                    (unsigned long long)ctx.mem.read64(creator_sp + o),
-                                    (unsigned long long)ctx.mem.read64(creator_sp + o + 8));
-                        for (int rr : {22, 24}) {
-                            const GuestVA p = g_svc_jit64->GetRegister((size_t)rr);
-                            fprintf(stderr, "[thread-arg]   *x%d(%llx)=%08x\n", rr,
-                                    (unsigned long long)p,
-                                    p ? ctx.mem.read32(p) : 0u);
-                        }
-                        /* Walk the AArch64 frame chain while the creator is
-                         * stopped in pthread_create.  The creator's own local
-                         * decision bytes live below its x29; the SVC wrapper's
-                         * current SP only exposes libc temporaries.  Keep this
-                         * opt-in with THREAD_ARG_DUMP because dumping a whole
-                         * parent frame is intentionally verbose. */
-                        GuestVA fp = (GuestVA)g_svc_jit64->GetRegister(29);
-                        for (unsigned depth = 0; depth < 12 && fp; ++depth) {
-                            if (!ctx.mem.ptr(fp) || !ctx.mem.ptr(fp + 15)) break;
-                            const GuestVA next = (GuestVA)ctx.mem.read64(fp);
-                            const uint64_t saved_lr = ctx.mem.read64(fp + 8);
-                            fprintf(stderr,
-                                    "[thread-arg]   frame[%u] fp=0x%llx next=0x%llx lr=0x%llx\n",
-                                    depth, (unsigned long long)fp,
-                                    (unsigned long long)next,
-                                    (unsigned long long)saved_lr);
-                            const uint32_t lr32 = (uint32_t)saved_lr;
-                            if (lr32 >= 0x27000000u && lr32 < 0x28000000u &&
-                                fp >= 0x180 && ctx.mem.ptr(fp - 0x180)) {
-                                const GuestVA base = fp - 0x180;
-                                fprintf(stderr,
-                                        "[thread-arg]   module parent locals base=0x%llx\n",
-                                        (unsigned long long)base);
-                                for (uint32_t o = 0; o < 0x1a0; o += 16)
-                                    fprintf(stderr,
-                                            "[thread-arg]     fp-180+0x%03x %016llx %016llx\n",
-                                            o,
-                                            (unsigned long long)ctx.mem.read64(base + o),
-                                            (unsigned long long)ctx.mem.read64(base + o + 8));
-                            }
-                            if (next <= fp || next - fp > 0x100000u) break;
-                            fp = next;
-                        }
-                    }
-                    svc_ring_dump_tid(g_current_tid);
-                    fprintf(stderr, "[thread-arg]   preceding SVCs (newest first):\n");
-                    for (uint32_t bi = 0, shown = 0; bi < 1024u && shown < 80u; ++bi) {
-                        const SvcTraceEnt &e =
-                            g_svc_ring[(g_svc_ring_pos - 1u - bi) & 1023u];
-                        if (!e.svc && !e.lr) continue;
-                        fprintf(stderr,
-                                "[thread-arg]     svc=%-5u lr=0x%08x r0=0x%08x tid=%u\n",
-                                e.svc, e.lr, e.r0, e.tid);
-                        ++shown;
-                    }
-                }
-            }
-            if (lunaria_env("LUNARIA_TRACE_JOBS") && r3 >= 0x1000u) {
-                // dump the thread-arg object: Baselib job-worker layout has.
-                fprintf(stderr, "  [arg dump] +0x48=0x%08x +0x88=0x%08x +0xc8=0x%08x "
-                        "+0x108=0x%08x +0x148=0x%08x +0x14c=0x%08x +0x150=0x%08x\n",
-                        ctx.mem.read32(r3+0x48), ctx.mem.read32(r3+0x88),
-                        ctx.mem.read32(r3+0xc8), ctx.mem.read32(r3+0x108),
-                        ctx.mem.read32(r3+0x148), ctx.mem.read32(r3+0x14c),
-                        ctx.mem.read32(r3+0x150));
-            }
-            
-            bool immediate = false;
-            if (g_mono_base) {
-                uint32_t fn = r2 & ~1u;
-                
-                if ((fn >= g_mono_base && fn < g_mono_base + 0x800000u) ||
-                    (lr >= g_mono_base && lr < g_mono_base + 0x800000u))
-                    immediate = true;
-            }
-            if (immediate)
-                if (!g_threads.empty())
-                    schedule_threads(env_ticks("LUNARIA_THREAD_TICKS", 200'000'000ULL));
-            ret32(0);
-            break;
-        }
-        // No stack to give.
-        if (r2)
-            fprintf(stderr, "[arm_exec] pthread_create FAILED: no stack left "
-                    "(fn=0x%llx, %zu live threads)\n",
-                    (unsigned long long)(ctx.is_arm64 ? g_svc_args64[2] : (GuestVA)r2),
-                    g_threads.size());
-        if (r0) {
-            if (ctx.is_arm64) ctx.mem.write64((GuestVA)r0, 0);
-            else              ctx.mem.write32(r0, 0);
-        }
-        ret32(11u); /* EAGAIN */
+        ret32((uint32_t)guest_net::host_errno_to_guest_linux(guest_pthread_create(ctx,argp(0),argp(1),argp(2),argp(3),lr,false,nullptr)));
         break;
     }
-
 
     case SVC_ANW_FROM_SURFACE: {
         // ANativeWindow_fromSurface(env, surface) -> ANativeWindow*.
@@ -33000,7 +33795,6 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 ret32((uint32_t)-3);
                 break;
             }
-            drive_aaudio_callbacks(ctx);
             drive_opensles_callbacks(ctx);
             drive_ndk_choreographer(ctx);
             if (try_fds()) { woken = true; break; }
@@ -33281,9 +34075,16 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_AAUDIO_SET_RATE:
         if ((int32_t)r1 > 0) g_aaudio_builder.sample_rate = r1;
         ret32(0u); break;
+    case SVC_AAUDIO_SET_CALLBACK_FRAMES:
+        g_aaudio_builder.callback_frames = r1 ? (uint32_t)r1 : AAUDIO_BURST_FRAMES;
+        ret32(0u); break;
     case SVC_AAUDIO_OPEN_STREAM: {
         // AAudioStreamBuilder_openStream(builder, AAudioStream **stream)
         if (!r1) { ret32((uint32_t)-1); break; }
+        if ((int32_t)g_aaudio_builder.callback_frames <= 0 ||
+            (uint64_t)g_aaudio_builder.callback_frames * g_aaudio_builder.channels * 4u > UINT32_MAX - 32u) {
+            ret32((uint32_t)-898); break;
+        }
         uint32_t handle = ARM_AAUDIO_STREAM + 16u * g_aaudio_stream_count++;
         g_aaudio_streams[handle] = g_aaudio_builder;
         fprintf(stderr, "[arm_exec] AAudio openStream -> 0x%08x dir=%s cb=0x%llx "
@@ -33297,10 +34098,67 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_AAUDIO_START: {
         auto it = g_aaudio_streams.find(r0);
-        if (it != g_aaudio_streams.end()) it->second.started = true;
+        if (it == g_aaudio_streams.end()) { ret32((uint32_t)-892); break; }
+        AAudioStreamState *stream = &it->second;
+        stream->started = true;
+        if (stream->data_cb && !stream->worker_tid) {
+            if (!stream->callback_args)
+                stream->callback_args = arm_calloc(ctx, (uint64_t)stream->callback_frames *
+                    stream->channels * (stream->format == 1u ? 2u : 4u) + 32u);
+            if (!stream->callback_args) {
+                stream->started = false;
+                ret32((uint32_t)-887); break;
+            }
+            stream->next_due_ns = host_mono_ns();
+            int error = guest_pthread_create(ctx, 0, 0,
+                ctx.is_arm64 ? a64_guest_va(AAUDIO_CALLBACK_STUB) : AAUDIO_CALLBACK_STUB,
+                r0, lr, true, &stream->worker_tid);
+            if (error) { stream->started = false; ret32((uint32_t)-896); break; }
+            thread_name_set(stream->worker_tid, "AAudioCallback");
+        }
         fprintf(stderr, "[arm_exec] AAudioStream_requestStart 0x%08lx %s tid=%u\n",
                 r0, it != g_aaudio_streams.end() ? "ok" : "unknown", g_current_tid);
         ret32(0u); break;
+    }
+    case SVC_AAUDIO_CALLBACK_WAIT: {
+        /* The wrapper belongs to an ordinary guest pthread. Blocking inside
+         * the callback parks that thread, leaving the UI pump and other audio
+         * streams runnable. No host callback or borrowed thread identity. */
+        auto it = g_aaudio_streams.find((uint32_t)r0);
+        ArmThread *thread = arm_thread_by_tid(g_current_tid);
+        if (it == g_aaudio_streams.end() || !thread ||
+            it->second.worker_tid != g_current_tid) { ret_pair(0, 0); break; }
+        AAudioStreamState *stream = &it->second;
+        if (stream->callback_pending) {
+            stream->callback_pending = false;
+            if ((int32_t)r1 == 1) stream->started = false;
+        }
+        if (!stream->started) {
+            stream->worker_tid = 0;
+            ret_pair(0, 0); break;
+        }
+        uint64_t now = host_mono_ns();
+        if (now < stream->next_due_ns) {
+            thread->sleep_until_ns = stream->next_due_ns;
+            sleep_heap_push(g_current_tid, stream->next_due_ns);
+            g_svc_retry = true;
+            g_yield_requested = true;
+            break;
+        }
+        const uint32_t base = stream->callback_args;
+        const uint32_t word = ctx.is_arm64 ? 8u : 4u;
+        const uint64_t values[4] = {(uint32_t)r0, stream->user_data,
+            ctx.is_arm64 ? a64_guest_va(base + 32u) : base + 32u, stream->callback_frames};
+        for (unsigned i = 0; i < 4; ++i) {
+            if (ctx.is_arm64) ctx.mem.write64(base + i * word, values[i]);
+            else ctx.mem.write32(base + i * word, (uint32_t)values[i]);
+        }
+        memset(ctx.mem.ptr(base + 32u), 0, (size_t)stream->callback_frames *
+            stream->channels * (stream->format == 1u ? 2u : 4u));
+        stream->callback_pending = true;
+        stream->next_due_ns = now + (uint64_t)stream->callback_frames * 1000000000u / stream->sample_rate;
+        ret_pair(stream->data_cb, ctx.is_arm64 ? a64_guest_va(base) : base);
+        break;
     }
     case SVC_AAUDIO_STOP: {
         auto it = g_aaudio_streams.find(r0);
@@ -34640,7 +35498,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         // LUNARIA_TRACE_GLSHADER=1 traces the whole create/attach/link chain.
         uint32_t sh = pfn_glCreateShader ? (uint32_t)pfn_glCreateShader((GLenum)r0) : 0u;
         if (lunaria_env("LUNARIA_TRACE_GLSHADER"))
-            fprintf(stderr, "[glsh] CreateShader(type=0x%lx) -> %u\n", r0, sh);
+            fprintf(stderr, "[glsh] CreateShader(type=0x%lx) -> %u tid=%u guest=0x%x bound=0x%x context=%p\n",
+                    r0, sh, g_current_tid, egl_ctx_for_tid(g_current_tid),
+                    g_egl_bound_handle, (void *)eglGetCurrentContext());
         ret32(sh);
         break;
     }
@@ -36195,7 +37055,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             struct sockaddr_storage ss{};
             socklen_t alen = 0;
             if (svc_no == SVC_NET_SENDTO) {
-                GuestVA da = argp(4);
+                GuestVA da = argp_n(4);
                 alen = (socklen_t)arg32(5);
                 if (da && alen && alen <= sizeof ss)
                     std::memcpy(&ss, ctx.mem.ptr(da), alen);
@@ -36357,8 +37217,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 break;
             }
             if (svc_no == SVC_NET_RECVFROM) {
-                if (GuestVA sa = argp(4)) {
-                    if (GuestVA slp = argp(5)) {
+                if (GuestVA sa = argp_n(4)) {
+                    if (GuestVA slp = argp_n(5)) {
                         socklen_t cap = ctx.mem.read32(slp);
                         socklen_t k = alen < cap ? alen : cap;
                         fixup_host_sockaddr_for_guest(&ss, alen);
@@ -36371,20 +37231,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             if (n > 0) net_trace_80(fd, true, ctx.mem.ptr(buf), n);
             net_count(fd, true, n);
             if (n > 0 && is_guest_socket(fd)) fd_wake_all_ready(ctx);
-            if (trace()) {
-                fprintf(stderr, "[net] recv fd=%d %zd/%zu\n", fd, n, len);
-                if (n > 0) {
-                    const uint8_t *p = ctx.mem.ptr(buf);
-                    size_t show = (size_t)n;
-                    if (show > 400) show = 400;
-                    fprintf(stderr, "[net] recv data: ");
-                    for (size_t i = 0; i < show; ++i) {
-                        unsigned char c = p[i];
-                        fputc((c >= 32 && c < 127) ? c : '.', stderr);
-                    }
-                    fputc('\n', stderr);
-                }
-            }
+            net_trace_data("recv", fd, ctx.mem.ptr(buf), n);
             ok(n);
             break;
         }
@@ -36614,7 +37461,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 else ok(0);
                 break;
             }
-            GuestVA lp = argp(4);
+            GuestVA lp = argp_n(4);
             socklen_t l = lp ? (socklen_t)ctx.mem.read32(lp) : 0;
             if (l > 256) l = 256;
             uint8_t tmp[256] = {};
@@ -36646,8 +37493,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             // select(nfds, readfds, writefds, exceptfds, timeout).
             int nfds = (int)r0;
             if (nfds < 0 || nfds > FD_SETSIZE) nfds = FD_SETSIZE;
-            GuestVA rp = argp(1), wp = argp(2), ep = argp(3), tp = argp(4);
-            const long budget = timeval_ms(ctx, tp);
+            GuestVA rp = argp(1), wp = argp(2), ep = argp(3), tp = argp_n(4);
+            /* pselect6 arrives here with its timeout already in milliseconds:
+             * its struct timespec is not the struct timeval this reads. */
+            const long budget = g_select_budget_ms != SELECT_BUDGET_FROM_ARGS
+                ? std::exchange(g_select_budget_ms, SELECT_BUDGET_FROM_ARGS)
+                : timeval_ms(ctx, tp);
             const bool parkable = can_park_current();
             const int64_t deadline = wait_deadline_ms(budget, parkable);
             /* The guest's fd_sets are both the input and the output, so a
@@ -36905,13 +37756,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             break;
         }
         case SVC_NET_EPOLL_CTL: {
-            // Guest epoll_event is 12 bytes on A32 and 16 on A64.
+            // Android ARM EABI and AArch64 both align the 64-bit data at offset 8.
             GuestVA ev = argp(3);
             luna_os_poll_event he{};
             if (ev) {
                 he.events = ctx.mem.read32(ev);
-                he.data = ctx.is_arm64 ? ctx.mem.read64(ev + 8)
-                                       : ctx.mem.read32((uint32_t)ev + 4);
+                he.data = ctx.mem.read64(ev + 8);
             }
             if (luna_os_poll_ctl((int)r0, (int)r1, (int)r2,
                                  ev ? &he : nullptr) != 0)
@@ -36931,7 +37781,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
              * NULL one means "wait with the mask I already have" -- the only
              * case in which it is the same call as epoll_wait. */
             const bool pwait = svc_no != SVC_NET_EPOLL_WAIT;
-            const GuestVA pmask = pwait ? argp(4) : 0;
+            const GuestVA pmask = pwait ? argp_n(4) : 0;
             uint64_t saved_mask = 0;
             bool mask_swapped = false;
             if (pmask) {
@@ -36954,23 +37804,21 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             const bool waits = want != 0;
             ArmExecCtx *cp = &ctx;
             const int epfd = (int)r0;
-            const bool a64 = ctx.is_arm64;
-            auto epoll_once = [cp, epfd, maxev, evs, a64]() -> int {
+            auto epoll_once = [cp, epfd, maxev, evs]() -> int {
                 luna_os_poll_event he[256];
                 int rc = luna_os_poll_wait(epfd, he, maxev, 0);
-                const uint32_t esz = a64 ? 16u : 12u;
+                const uint32_t esz = 16u;
                 for (int i = 0; i < rc && evs; ++i) {
                     GuestVA at = evs + (GuestVA)i * esz;
                     cp->mem.write32((GuestVA)(at), he[i].events);
-                    if (a64) cp->mem.write64(at + 8, he[i].data);
-                    else cp->mem.write32((uint32_t)at + 4, (uint32_t)he[i].data);
+                    cp->mem.write64(at + 8, he[i].data);
                 }
                 return rc;
             };
             int rc = epoll_once();
             if (rc < 0) { fail(errno); break; }
             if (rc == 0 && waits && parkable) {
-                GuestFdWait w = make_epoll_wait(ctx, epfd, maxev, evs, a64, deadline);
+                GuestFdWait w = make_epoll_wait(ctx, epfd, maxev, evs, deadline);
                 w.what = pwait ? "epoll_pwait" : "epoll_wait";
                 w.mask_swapped = mask_swapped;
                 w.saved_mask = saved_mask;
@@ -37076,6 +37924,28 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 (void)unlocked;
                 rc = ::luna_socket_dns(node, serv, use_hints ? &hints : nullptr,
                                    &res);
+            }
+            /* Candidate order.  The guest's connect loop takes the list as given and
+             * only moves on after a failure it can see; an IPv6 path that connects
+             * and then does not work (a broken tunnel or router) is not such a
+             * failure.  IPv4 candidates go first, IPv6 stays behind them as the
+             * fallback.  LUNARIA_NET_PREFER=v6 keeps the resolver's order. */
+            if (rc == 0 && res) {
+                static const bool keep_order = [] {
+                    const char *e = lunaria_env("LUNARIA_NET_PREFER");
+                    return e && (!strcmp(e, "v6") || !strcmp(e, "6"));
+                }();
+                if (!keep_order) {
+                    struct addrinfo *v4 = nullptr, **t4 = &v4, *rest = nullptr, **tr = &rest;
+                    for (struct addrinfo *a = res, *n; a; a = n) {
+                        n = a->ai_next;
+                        a->ai_next = nullptr;
+                        if (a->ai_family == AF_INET) { *t4 = a; t4 = &a->ai_next; }
+                        else { *tr = a; tr = &a->ai_next; }
+                    }
+                    *t4 = rest;
+                    res = v4 ? v4 : rest;
+                }
             }
             if (trace() || rc != 0)
                 fprintf(stderr, "[net] getaddrinfo(%s,%s) -> %d%s\n",
@@ -38077,15 +38947,15 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         else if (path && (!strncmp(path, "/proc/", 6) || !strcmp(path, "/proc"))) {
             ret32(~0u); break;
         }
-        /* Bounded like the open trace above it: a guest that stats the same missing
+        /* Sample after the first 4000 calls: a guest that stats the same missing
          * .ini in a loop can write gigabytes of log in minutes and make the
          * formatting the run's bottleneck, a diagnostic that changes the thing it
          * measures. */
-        static int stat_trace_n = 0;
-        const bool trace_stat =
-            lunaria_env("LUNARIA_TRACE_OPEN") && stat_trace_n < 4000;
+        static uint64_t stat_trace_n = 0;
+        const bool trace_stat_enabled = lunaria_env("LUNARIA_TRACE_OPEN") != nullptr;
+        const bool trace_stat = trace_stat_enabled &&
+            (++stat_trace_n <= 4000 || (stat_trace_n % 65536u) == 0);
         if (trace_stat) {
-            ++stat_trace_n;
             fprintf(stderr, "[stat] %s\n", path ? path : "(null)");
         }
         /* APK fallback still uses the path after the host call returns. Keep
@@ -38332,28 +39202,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 ret32(~0u);
                 break;
             }
-        } else {
-            /* The same argument as above for A32: making a page executable is the point
-             * at which the instruction cache (here, the JIT's translation of that range)
-             * stops being allowed to hold what used to be there. An A32 guest that
-             * mprotects RW, rewrites its own code and mprotects RX back must not keep
-             * executing the old translation.
-             * The A32 image is one host reservation that is mapped RW for the whole run,
-             * so there is no host VMA to change: a guest page's protection is
-             * bookkeeping the emulator does not enforce, and reporting failure for a
-             * permission the guest is allowed to ask for would be worse than granting
-             * it. The cache invalidation is the part with observable behaviour. */
-            const uint32_t lo = (uint32_t)r0 & ~4095u;
-            const uint32_t len32 = ((uint32_t)r1 + 4095u) & ~4095u;
-            if (len32 && (r2 & 4u /* PROT_EXEC */)) {
-                if (ctx.jit) ctx.jit->InvalidateCacheRange(lo, (size_t)len32);
-                if (ctx.jit_aux)
-                    ctx.jit_aux->InvalidateCacheRange(lo, (size_t)len32);
-                cb_invalidate_all(lo, (size_t)len32);
-            }
-            if (lunaria_env("LUNARIA_TRACE_MMAP"))
-                fprintf(stderr, "[mprotect] 0x%08x+%u prot=%lu (a32)\n",
-                        lo, len32, r2);
+        } else if (int e = a32_guest_mprotect(ctx, (uint32_t)r0, (uint32_t)r1, (uint32_t)r2)) {
+            arm_set_errno(ctx, e);
+            ret32(~0u);
+            break;
         }
         ret32(0); break;
     }
@@ -38581,6 +39433,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 break;
             }
         }
+        a32_guest_mmap_commit(ctx, addr, (uint32_t)r1, (uint32_t)r2, (uint32_t)r3, (int32_t)fd);
         if (lunaria_env("LUNARIA_TRACE_MMAP"))
             fprintf(stderr, "[mmap] -> %#x\n", addr);
         ret32(addr);
@@ -38602,64 +39455,70 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             // Image-window address: the guest is unmapping something we own (library padding, service heap).
             ret32(0); break;
         }
-        // Bump arenas can reclaim a suffix of their most recent mapping.
-        uint64_t end = (uint64_t)r0 + (uint64_t)r1;
-        bool reclaimed = false;
-        for (auto it = g_mmap_slabs.rbegin(); it != g_mmap_slabs.rend(); ++it) {
-            if (r0 < it->lo || r0 > it->hi || end < it->hi)
-                continue;
-            uint64_t bump_end = ((uint64_t)it->hi + MMAP_ALIGN - 1u) &
-                                ~(uint64_t)(MMAP_ALIGN - 1u);
-            uint32_t *next = nullptr;
-            if (it->lo >= MMAP_BASE && it->lo < MMAP_END &&
-                (g_mmap_next == (uint32_t)bump_end ||
-                 (bump_end >= MMAP_END && g_mmap_next == 0xffffffffu)))
-                next = &g_mmap_next;
-            else if (it->lo >= g_mmap2_base &&
-                     (g_mmap2_next == (uint32_t)bump_end ||
-                      (bump_end >= mmap2_end_excl() &&
-                       g_mmap2_next == 0xffffffffu)))
-                next = &g_mmap2_next;
-            if (!next)
-                continue;
-
-            uint32_t old_hi = it->hi;
-            *next = r0;
-            it->hi = r0;
-            uint64_t released = (uint64_t)old_hi - r0;
-            g_mmap_prot_none_bytes =
-                released < g_mmap_prot_none_bytes
-                    ? g_mmap_prot_none_bytes - released : 0;
-            reclaimed = true;
-            if (lunaria_env("LUNARIA_TRACE_MMAP"))
-                fprintf(stderr, "[munmap] reclaimed tail [%08lx,%08x), next=%08x\n",
-                        r0, old_hi, *next);
+        if (int e = a32_guest_munmap(ctx, (uint32_t)r0, (uint32_t)r1)) {
+            arm_set_errno(ctx, e);
+            ret32(~0u);
             break;
-        }
-        if (!reclaimed) {
-            // Not the bump tail: hand the range to the free list instead of leaking it.
-            uint64_t lo64 = r0 & ~4095ull;
-            uint64_t hi64 = ((uint64_t)r0 + r1 + 4095ull) & ~4095ull;
-            bool in_primary   = lo64 >= MMAP_BASE && hi64 <= MMAP_END;
-            bool in_secondary = lo64 >= g_mmap2_base && hi64 <= mmap2_end_excl();
-            if ((in_primary || in_secondary) && hi64 > lo64 && hi64 <= 0x100000000ull) {
-                uint32_t lo = (uint32_t)lo64, hi = (uint32_t)hi64;
-                if (uint8_t *p = ctx.mem.ptr(lo))
-                    if (ctx.mem.ptr(hi - 1u)) memset(p, 0, hi - lo);
-                mmap_free_insert(lo, hi);
-                for (auto it = g_mmap_slabs.begin(); it != g_mmap_slabs.end();)
-                    it = (it->lo >= lo && it->hi <= hi) ? g_mmap_slabs.erase(it)
-                                                        : std::next(it);
-                if (lunaria_env("LUNARIA_TRACE_MMAP"))
-                    fprintf(stderr, "[munmap] freed [%08x,%08x) -> %zu free ranges\n",
-                            lo, hi, g_mmap_freelist.size());
-            } else if (lunaria_env("LUNARIA_TRACE_MMAP")) {
-                fprintf(stderr, "[munmap] accepted non-arena addr=%08lx len=%lu\n", r0, r1);
-            }
         }
         ret32(0); break;
     }
     // ---- time / environment / misc ----
+
+    case SVC_POSIX_TIMER_CREATE: {
+        int error=posix_timer_create(ctx,(int)r0,argp(1),argp(2),lr);
+        if(error)arm_set_errno(ctx,error);
+        ret64(error ? (uint64_t)-1 : 0);break;
+    }
+    case SVC_POSIX_TIMER_DELETE:
+    case SVC_POSIX_TIMER_GETTIME:
+    case SVC_POSIX_TIMER_SETTIME:
+    case SVC_POSIX_TIMER_GETOVERRUN: {
+        uint32_t id=(uint32_t)r0,owner=guest_pid();
+        struct luna_posix_timer *timer=luna_timer_find(&g_posix_timers,owner,id);
+        if(!timer){arm_set_errno(ctx,EINVAL);ret64((uint64_t)-1);break;}
+        if(svc_no==SVC_POSIX_TIMER_DELETE) {
+            uint32_t target=timer->target_tid;
+            int error=luna_timer_delete(&g_posix_timers,owner,id);
+            posix_timer_wake(ctx,target,id);posix_timer_poll(ctx);
+            ret64(error ? (uint64_t)-1 : 0);break;
+        }
+        posix_timer_poll(ctx);
+        timer=luna_timer_find(&g_posix_timers,owner,id);
+        if(svc_no==SVC_POSIX_TIMER_GETOVERRUN){ret32((uint32_t)timer->overrun);break;}
+        struct luna_timer_spec value={0,0},old={0,0};
+        unsigned size=ctx.is_arm64 ? 32u : 16u;
+        int error=0;
+        if(svc_no==SVC_POSIX_TIMER_GETTIME) {
+            if(!argp(1) || !ctx.mem.try_ptr(argp(1),size))error=EFAULT;
+            else {
+                error=luna_timer_get(&g_posix_timers,owner,id,&value,posix_timer_clock,nullptr);
+                if(!error)posix_timer_spec_write(ctx,argp(1),&value);
+            }
+        } else {
+            if(argp(3) && !ctx.mem.try_ptr(argp(3),size))error=EFAULT;
+            else if(!posix_timer_spec_read(ctx,argp(2),&value))error=errno;
+            else {
+                error=luna_timer_set(&g_posix_timers,owner,id,(int)r1,&value,&old,posix_timer_clock,nullptr);
+                if(!error && argp(3))posix_timer_spec_write(ctx,argp(3),&old);
+                if(!error)posix_timer_poll(ctx);
+            }
+        }
+        if(error)arm_set_errno(ctx,error);
+        ret64(error ? (uint64_t)-1 : 0);break;
+    }
+    case SVC_POSIX_TIMER_WAIT: {
+        struct luna_posix_timer *timer=luna_timer_find(&g_posix_timers,guest_pid(),(uint32_t)r0);
+        ArmThread *thread=arm_thread_by_tid(g_current_tid);
+        if(!timer || !thread || timer->notify!=2 || timer->target_tid!=g_current_tid) {ret64(0);break;}
+        if(luna_timer_take(timer)) {
+            thread->waiting_posix_timer=0;
+            ret_pair(timer->callback,timer->value);
+        } else {
+            thread->waiting_posix_timer=timer->id;
+            g_svc_retry=true;g_yield_requested=true;
+        }
+        break;
+    }
 
     case SVC_CLOCK_GETTIME: {
         // clock_gettime(clk, struct timespec*) — ARM32: {u32 sec; u32 nsec}
@@ -38872,6 +39731,48 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         int32_t result = guest_session_call(svc_no, (int32_t)arg32(0), (int32_t)arg32(1));
         if (result < 0) { arm_set_errno(ctx, -result); ret32(~0u); }
         else ret32((uint32_t)result);
+        break;
+    }
+    case SVC_CAPGET: {
+        /* Linux capability ABI: fixed u32 fields on both architectures.
+         * App threads have empty effective/permitted/inheritable sets, as
+         * reflected by the credential-changing handlers below. Never expose
+         * the host process's capabilities. */
+        const GuestVA header = argp(0), data = argp(1);
+        int error = 0;
+        unsigned words = 0;
+        if (!ctx.mem.try_ptr(header, 4)) error = EFAULT;
+        else {
+            const uint32_t version = ctx.mem.read32(header);
+            if (version == 0x19980330u) words = 1;
+            else if (version == 0x20071026u || version == 0x20080522u) words = 2;
+            else {
+                ctx.mem.write32(header, 0x20080522u);
+                if (data) error = EINVAL;
+            }
+            /* A NULL data pointer probes the ABI, without reading pid. */
+            if (!error && data && words) {
+                if (!ctx.mem.try_ptr(header, 8)) error = EFAULT;
+                else {
+                    const int32_t pid = (int32_t)ctx.mem.read32(header + 4);
+                    bool exists = pid == 0 || (uint32_t)pid == guest_pid() ||
+                                  (uint32_t)pid == guest_tid_of(g_current_tid);
+                    for (size_t i = 0; i < g_threads.size(); ++i)
+                        if (g_threads[i].id && !g_threads[i].finished &&
+                            guest_tid_of(g_threads[i].id) == (uint32_t)pid) exists = true;
+                    void *out = NULL;
+                    if (pid < 0) error = EINVAL;
+                    else if (!exists) error = ESRCH;
+                    else {
+                        out = ctx.mem.try_ptr(data, words * 12u);
+                        if (out) memset(out, 0, words * 12u);
+                        else error = EFAULT;
+                    }
+                }
+            }
+        }
+        if (error) { arm_set_errno(ctx, error); ret32(~0u); }
+        else ret32(0);
         break;
     }
     case SVC_GETPID:  ret32(guest_pid()); break;
@@ -39157,6 +40058,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             arm_set_errno(ctx, errno);
             ret32(~0u);
         } else {
+            if (advice == 4 /* MADV_DONTNEED */ && !ctx.is_arm64) {
+                const uint32_t lo = (uint32_t)a & ~4095u;
+                const uint64_t hi = ((uint64_t)a + len + 4095u) & ~4095ull;
+                a32_dontneed_refill(lo, (uint32_t)std::min<uint64_t>(hi, 0xfffff000u), ctx);
+                if (lunaria_env("LUNARIA_TRACE_MMAP"))
+                    fprintf(stderr, "[madvise] DONTNEED 0x%08x+%zu\n", lo, len);
+            }
             ret32(0);
         }
         break;
@@ -41522,7 +42430,6 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         while (rc == EGL_TIMEOUT_EXPIRED &&
                (!until || host_mono_ns() < until)) {
             schedule_threads(20'000'000ULL);
-            drive_aaudio_callbacks(ctx);
             drive_opensles_callbacks(ctx);
             drive_ndk_choreographer(ctx);
             sched_idle_wait();
@@ -43090,6 +43997,33 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_SYSCALL: {
         // Generic syscall() shim.
         uint32_t nr = r0;
+        /* syscall(number, ...) shifts the kernel arguments by one ABI slot.
+         * Share file I/O with raw svc#0, including pending reads and virtual
+         * descriptors, then translate the kernel's -errno to libc -1/errno. */
+        if ((ctx.is_arm64 && (nr==63u || nr==64u || nr==57u || nr==90u)) ||
+            (!ctx.is_arm64 && (nr==3u || nr==4u || nr==6u || nr==184u ||
+                               nr==90u || nr==91u || nr==125u || nr==192u))) {
+            const auto saved_args=g_svc_args64;
+            auto kernel_regs=regs;
+            GuestVA arguments[6];
+            for(unsigned i=0;i<6;++i) arguments[i]=argp_n(i+1);
+            for(unsigned i=0;i<6;++i) {
+                kernel_regs[i]=arguments[i];
+                g_svc_args64[i]=arguments[i];
+            }
+            kernel_regs[7]=nr;
+            dispatch_svc(ctx,0,kernel_regs);
+            g_svc_args64=saved_args;
+            int64_t result=ctx.is_arm64 ? (int64_t)kernel_regs[0]
+                                       : (int64_t)(int32_t)kernel_regs[0];
+            if(!g_svc_retry && result<0 && result>=-4095) {
+                if(uint32_t eva=errno_va(ctx,g_current_tid)) ctx.mem.write32(eva,(uint32_t)-result);
+                result=-1;
+            }
+            if(ctx.is_arm64) ret64((uint64_t)result);
+            else ret32((uint32_t)result);
+            break;
+        }
         const int timer_op = guest_timerfd_op(ctx.is_arm64, nr);
         if (timer_op >= 0) {
             int result = guest_timerfd_call(ctx, timer_op,
@@ -43333,7 +44267,6 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                         return;
                     }
                     schedule_threads(20'000'000ULL);
-                    drive_aaudio_callbacks(ctx);
                     drive_opensles_callbacks(ctx);
                     drive_ndk_choreographer(ctx);
                     if (ctx.mem.read32(fu_uaddr) != (uint32_t)r3) changed = true;
@@ -43617,6 +44550,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         g_tls_dtor.erase(key);
         for (auto it = g_tls.begin(); it != g_tls.end();)
             it = (it->first.second == key) ? g_tls.erase(it) : std::next(it);
+        if (!ctx.is_arm64 && g_fast32_getspecific_va)
+            for (uint32_t t = 0; t < THREAD_TID_MAX; ++t)
+                if (const uint32_t page = g_tls32_by_tid[t].load(std::memory_order_acquire))
+                    ctx.mem.write32(page + TLS32_KEYS_OFF + key * 4u, 0);
         if (ctx.is_arm64 && g_fast64_getspecific_va) {
             std::lock_guard<std::recursive_mutex> tls_lk(g_a64_tls_mx);
             for (const auto &kv : ctx.tpidr_by_tid)
@@ -43637,6 +44574,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         g_tls[{tid, key}] = val;
         // Also keep tid=0 alias for anything stored before this normalisation.
         if (tid == 1u) g_tls[{0u, key}] = val;
+        if (!ctx.is_arm64 && g_fast32_getspecific_va)
+            if (const uint32_t page = arm32_tls_for_tid(ctx, g_current_tid))
+                ctx.mem.write32(page + TLS32_KEYS_OFF + key * 4u, (uint32_t)val);
         /* Mirror into the guest-visible table the in-guest getspecific stub
          * reads, so the hot lookup never has to leave the JIT. */
         if (ctx.is_arm64 && g_fast64_getspecific_va)
@@ -44022,16 +44962,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     
 
     case SVC_MEMCMP: {
-        /* Use architectural args (argp), not the soft-float-substituted regs[], and
-         * try_ptr so an unmapped operand is not compared against the shared scratch
-         * page, which would answer "equal" for garbage and let a magic-tag check
-         * succeed or fail at random. */
-        GuestVA va = argp(0), vb = argp(1);
-        size_t n = (size_t)argp(2);
-        const uint8_t *a = va ? ctx.mem.try_ptr(va, n ? n : 1) : nullptr;
-        const uint8_t *b = vb ? ctx.mem.try_ptr(vb, n ? n : 1) : nullptr;
-        if (!a || !b) { ret32(a == b ? 0u : 1u); break; }
-        ret32((uint32_t)memcmp(a, b, n));
+        const uint64_t a[3] = { argp(0), argp(1), argp(2) };
+        uint64_t v;
+        (void)svc_leaf_memcmp(&ctx, a, &v);
+        ret32((GuestVA)v);
         break;
     }
     case SVC_MEMCHR: {
@@ -44336,6 +45270,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         path = map_guest_path(path, ac_mapped, sizeof ac_mapped);
         if (const char *subst = synthetic_proc_path(path)) path = subst;
         else if (path && (!strncmp(path, "/proc/", 6) || !strcmp(path, "/proc"))) {
+            arm_set_errno(ctx, ENOENT);
             ret32(~0u); break;
         }
         if (path && strncmp(path, "file://", 7) == 0) {
@@ -44354,9 +45289,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             fprintf(stderr, "[access_dll] %s mode=%d -> %d lr=0x%08x\n", path, (int)r1,
                     luna_file_access(path,(int)r1), lr);
         if (path && luna_file_access(path, (int)r1) == 0) { ret32(0); break; }
+        int access_error = path ? errno : EFAULT;
         char cache[PATH_MAX];
-        if (path && apk_extract_to_cache(path, cache, sizeof cache) &&
-            luna_file_access(cache, (int)r1) == 0) { ret32(0); break; }
+        if (path && apk_extract_to_cache(path, cache, sizeof cache)) {
+            if (luna_file_access(cache, (int)r1) == 0) { ret32(0); break; }
+            access_error = errno;
+        }
+        arm_set_errno(ctx, access_error);
         ret32(~0u);
         break;
     }
@@ -45728,7 +46667,6 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             if (futex_token_consume(cond)) { woken = true; break; }
             if (!g_scheduling)
                 schedule_threads(env_ticks("LUNARIA_THREAD_TICKS", 200'000'000ULL));
-            drive_aaudio_callbacks(ctx);
             drive_opensles_callbacks(ctx);
             drive_ndk_choreographer(ctx);
             if (cond_state_load(ctx.mem, cond) != seq) { woken = true; break; }
@@ -46125,7 +47063,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         char ul_mapped[PATH_MAX];
         path = map_guest_path(path, ul_mapped, sizeof ul_mapped);
         if (path) arm_exec_note_destructive("unlink", path, nullptr);
-        ret32(path ? (uint32_t)luna_file_unlink(path) : ~0u);
+        if (!path) { errno = EFAULT; RET_SSIZE_ERRNO(-1); break; }
+        const int result = luna_file_unlink(path);
+        RET_SSIZE_ERRNO(result);
         break;
     }
     case SVC_UNLINKAT: {
@@ -46147,6 +47087,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         b = map_guest_path(b, rn_mb, sizeof rn_mb);
         if (a) arm_exec_note_destructive("rename", a, b);
         int rc = (a && b) ? luna_file_rename(a, b) : -1;
+        const int error = a && b ? errno : EFAULT;
         if (rc != 0) {
             fprintf(stderr, "[rename] FAILED %s -> %s errno=%d (%s) lr=0x%08x tid=%u\n",
                     a ? a : "?", b ? b : "?", a && b ? errno : 0,
@@ -46169,7 +47110,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 }
             }
         }
-        ret32((uint32_t)rc);
+        errno = error;
+        RET_SSIZE_ERRNO(rc);
         break;
     }
     case SVC_FTRUNCATE: {
@@ -46179,8 +47121,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         const off_t length = ctx.is_arm64 ? (off_t)(int64_t)g_svc_args64[1]
                                          : (off_t)(int32_t)r1;
         int result;
-        { ArmLockDropped unlocked; result = ftruncate((int)r0, length); }
-        ret32((uint32_t)result);
+        int error;
+        { ArmLockDropped unlocked; result = ftruncate((int)r0, length); error = errno; }
+        errno = error;
+        RET_SSIZE_ERRNO(result);
         break;
     }
     case SVC_READLINK: {
@@ -46322,12 +47266,16 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         const GuestVA tm_va = argp(0);
         struct tm tmv;
         read_guest_tm(ctx, tm_va, tmv);
-        tmv.tm_isdst = -1;
         arm_exec_timezone_lock();
         int64_t t = -1, offset = 0;
         int converted = luna_os_time_make(&tmv, &t, &offset);
         arm_exec_timezone_unlock();
         if (converted < 0) { arm_set_errno(ctx, errno); ret64(~0ull); break; }
+        if (!ctx.is_arm64 && (t < INT32_MIN || t > INT32_MAX)) {
+            arm_set_errno(ctx, EOVERFLOW);
+            ret32(~0u);
+            break;
+        }
         // mktime normalizes the struct in place (tm_wday/tm_yday/tm_isdst and, on bionic/glibc, tm_gmtoff/tm_zone).
         if (tm_va) write_guest_tm(ctx, tm_va, tmv, offset);
         if (ctx.is_arm64) ret64((uint64_t)(int64_t)t);
@@ -50295,11 +51243,25 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             ret64(got);
             break;
         }
-        if (r2 <= r1) { ret32(r0); break; }
-        uint32_t p = arm_malloc(ctx, r2);
-        if (!p) { ret32(~0u); break; }
-        if (r0 && r1) memcpy(ctx.mem.ptr(p), ctx.mem.ptr(r0), r1);
-        ret32(p);
+        const uint32_t old_len = ((uint32_t)r1 + 4095u) & ~4095u;
+        const uint32_t new_len = ((uint32_t)r2 + 4095u) & ~4095u;
+        if ((r0 & 4095u) || !new_len) { arm_set_errno(ctx, EINVAL); ret32(~0u); break; }
+        if (new_len <= old_len) {
+            if (new_len < old_len)
+                a32_guest_munmap(ctx, (uint32_t)r0 + new_len, old_len - new_len);
+            ret32(r0);
+            break;
+        }
+        /* Growing needs MREMAP_MAYMOVE: the neighbour is not ours to take. */
+        uint32_t got = 0, prot = LUNA_PROT_READ | LUNA_PROT_WRITE;
+        for (size_t i = 0; i < g_a32_vmas.n; ++i)
+            if (r0 >= g_a32_vmas.v[i].lo && r0 < g_a32_vmas.v[i].hi) prot = g_a32_vmas.v[i].prot;
+        const uint32_t to = (r3 & 1u) ? mmap_bump_exact(new_len, &got, false) : ~0u;
+        if (to == ~0u) { arm_set_errno(ctx, ENOMEM); ret32(~0u); break; }
+        memcpy(ctx.mem.ptr(to), ctx.mem.ptr(r0), old_len);
+        a32_guest_mmap_commit(ctx, to, new_len, prot, 0x20u, -1);
+        a32_guest_munmap(ctx, (uint32_t)r0, old_len);
+        ret32(to);
         break;
     }
     case SVC_STRERROR: {
@@ -50766,6 +51728,21 @@ static void install_stub_coprocessors(Dynarmic::A32::UserConfig &cfg) {
 }
 
 // dynarmic callbacks.
+/* Guest loads and stores of an A32 JIT go straight to the host mapping, and so
+ * do its exclusive pairs: the reservation is still recorded in ctx.excl_mon
+ * under the monitor's spin lock and the store is a real compare-exchange, but
+ * the trip out of the JIT that every LDREX and STREX otherwise costs is gone
+ * (an IL2CPP title's atomics are the bulk of its inner loops).
+ * LUNARIA_A32_FASTMEM_EXCLUSIVE=0 puts the exclusives back on callbacks. */
+static void a32_apply_fastmem(Dynarmic::A32::UserConfig &cfg, ArmExecCtx &ctx)
+{
+    cfg.fastmem_pointer = (uintptr_t)ctx.mem.host;
+    cfg.recompile_on_fastmem_failure = true;
+    const char *xe = lunaria_env("LUNARIA_A32_FASTMEM_EXCLUSIVE");
+    cfg.fastmem_exclusive_access = !(xe && (xe[0] == '0' || xe[0] == 'n'));
+    cfg.recompile_on_exclusive_fastmem_failure = true;
+}
+
 class ArmCallbacks : public Dynarmic::A32::UserCallbacks {
 public:
     ArmExecCtx          *ctx;
@@ -50775,6 +51752,7 @@ public:
     uint64_t             slice_deadline_ns = 0;
     uint32_t             last_svc = UINT32_MAX;
     bool                 periodic_yield = false; /* force Run() return every 256M ticks */
+    bool                 svc_yield = false; /* a scheduling halt, not a guest return or fault */
 
     std::optional<uint32_t> MemoryReadCode(uint32_t va) override {
         ArmLockGuard locked;
@@ -50880,6 +51858,20 @@ public:
                 fprintf(stderr, "[arm_exec]   r5=0x%08x r6=0x%08x r7=0x%08x "
                         "r8=0x%08x r9=0x%08x r10=0x%08x r11=0x%08x\n",
                         r[5], r[6], r[7], r[8], r[9], r[10], r[11]);
+                /* How far the zeros reach: a hole in a loaded image is a load
+                 * problem, a page-sized one is something that cleared it. */
+                {
+                    uint32_t lo = va & ~4095u, hi = lo + 4096u;
+                    auto page_zero = [&](uint32_t a) {
+                        const uint8_t *q = ctx->mem.ptr(a);
+                        if (!q) return false;
+                        for (uint32_t k = 0; k < 4096u; ++k) if (q[k]) return false;
+                        return true;
+                    };
+                    while (lo >= 4096u && page_zero(lo - 4096u)) lo -= 4096u;
+                    while (hi && ctx->mem.ptr(hi) && page_zero(hi)) hi += 4096u;
+                    fprintf(stderr, "[arm_exec]   zero run [0x%08x,0x%08x)\n", lo, hi);
+                }
                 // Dump guest-stack return-address candidates for diagnostics.
                 for (int i = 0; i < 64; ++i) {
                     uint32_t w; std::memcpy(&w, ctx->mem.ptr(r[13] + i*4), 4);
@@ -51039,8 +52031,26 @@ public:
         {return write_exclusive<uint64_t>(va,d,e);}
 
     void CallSVC(uint32_t svc_no) override {
-        /* Everything outside guest code is serialised: see src/arm.h. */
-        ArmLockGuard aelock;
+        if (SvcLeafFn leaf = svc_leaf_fn(svc_no);
+            leaf && !(g_current_tid == 0 &&
+                      g_main_pending_signals.load(std::memory_order_relaxed))) {
+            auto &r = jit->Regs();
+            const uint64_t a[3] = { r[0], r[1], r[2] };
+            uint64_t ret;
+            if (leaf(ctx, a, &ret)) {
+                r[0] = (uint32_t)ret;
+                ++g_svc_total;
+                g_svc_calls_by_no[svc_no].store(
+                    g_svc_calls_by_no[svc_no].load(std::memory_order_relaxed) + 1,
+                    std::memory_order_relaxed);
+                return;
+            }
+        }
+        /* Everything outside guest code is serialised: see src/arm.h — except
+         * the handlers that touch no emulator state (the libc mem/str/math
+         * families), as on the A64 side.  The lock is the largest single part
+         * of what one of those exits costs. */
+        ArmLockGuardIf aelock(svc_no == 0 || !svc_lockfree(svc_no));
         /* JNI hands the execution lock to the bytecode VM and reacquires
          * it in DvmGilGuardIf's destructor. Restore the A32 stub identity
          * after that hand-off, not merely after dispatch_svc returns. */
@@ -51056,7 +52066,20 @@ public:
                     g_tpidr32_val = arm32_tls_for_tid(*ctx, g_current_tid);
             }
         } restore_identity{ctx};
-        arm_lock_tag(ARM_LOCK_TAG_SVC(svc_no));
+        /* Republish this thread's pending-exception word once the JNI call and
+         * its locks are done; see TLS32_EXC_OFF. */
+        struct PublishPending {
+            ArmExecCtx *ctx; uint32_t svc;
+            ~PublishPending() {
+                if (!(svc > 0 && svc < JNI_VTABLE_COUNT) || !ctx->jvm ||
+                    g_current_tid >= THREAD_TID_MAX) return;
+                const uint32_t tls = g_tls32_by_tid[g_current_tid].load(std::memory_order_acquire);
+                if (!tls) return;
+                const bool pending = ctx->jvm->native.ExceptionCheck(&ctx->jvm->env) != 0;
+                ctx->mem.write32(tls + TLS32_EXC_OFF, pending ? 1u : 0u);
+            }
+        } publish_pending{ctx, svc_no};
+        if (aelock.on) arm_lock_tag(ARM_LOCK_TAG_SVC(svc_no));
         DvmGilGuardIf gil(svc_touches_jvm(svc_no));
         struct ActiveJit {
             Dynarmic::A32::Jit *previous;
@@ -51096,7 +52119,13 @@ public:
         else for (size_t i = 0; i < 16; ++i) regs[i] = (uint32_t)arr[i];
         /* A restarted SVC needs the original arguments, not a scalar result. */
         if (g_svc_retry) regs = entry_regs;
-        if (g_current_tid == 0 && jit == ctx->jit.get()) {
+        /* The main thread's register snapshot is only read when a signal is
+         * delivered to it, so take it when one is (or may be) pending rather
+         * than copying the register and VFP files on every exit. */
+        if (g_current_tid == 0 && jit == ctx->jit.get() &&
+            (g_svc_retry || g_main_waiting_signal ||
+             g_main_pending_signals.load(std::memory_order_relaxed) ||
+             g_main_signal32.pending_signals)) {
             g_main_signal32.regs = regs;
             g_main_signal32.ext = jit->ExtRegs();
             g_main_signal32.cpsr = jit->Cpsr();
@@ -51125,6 +52154,7 @@ public:
         if (g_svc_retry) {
             g_svc_retry = false;
             g_yield_requested = false;
+            svc_yield = true;
             const bool thumb = (jit->Cpsr() & (1u << 5)) != 0;
             regs[15] -= thumb ? 2u : 4u;
             if (jit) jit->HaltExecution();
@@ -51133,6 +52163,7 @@ public:
         // thread blocked (e.g. sem_wait): yield this thread's slice
         if (g_yield_requested) {
             g_yield_requested = false;
+            svc_yield = true;
             static uint64_t yield_n = 0;
             if (yield_n++ < 8)
                 fprintf(stderr, "[halt] g_yield_requested svc=%u tid=%u lr=0x%08lx #%llu\n",
@@ -51148,6 +52179,16 @@ public:
         if (auto p = ctx->mem.ptr(pc)) std::memcpy(&instr, p, 4);
         fprintf(stderr,"[arm_exec] InterpreterFallback pc=0x%08x n=%zu instr=0x%08x\n",
                 pc, n, instr);
+        if (jit) {
+            static unsigned details = 0;
+            if (details++ < 8) {
+                const auto &r = jit->Regs();
+                fprintf(stderr, "[arm_exec] fallback tid=%u cpsr=%08x lr=%08x sp=%08x\n",
+                        g_current_tid, jit->Cpsr(), r[14], r[13]);
+                for (unsigned i = 0; i < 13; ++i)
+                    fprintf(stderr, " r%u=%08x%s", i, r[i], i == 12 ? "\n" : "");
+            }
+        }
         if(jit) jit->HaltExecution();
     }
     void ExceptionRaised(uint32_t pc, Dynarmic::A32::Exception ex) override {
@@ -51651,7 +52692,7 @@ static void schedule_threads(uint64_t slice) {
      * forgot to enqueue, are registered here once per pass. */
     for (auto &t : g_threads) {
         if (!t.id || t.finished || t.running) continue;
-        if (g_in_ready[t.id] || g_in_wait_poll[t.id] || g_in_sleep_heap[t.id]) continue;
+        if (g_in_ready[t.id] || g_in_wait_poll[t.id] || luna_deadline_heap_contains(&g_sleep_heap, t.id)) continue;
         thread_sched_update(t);
     }
     /* A thread parked on a condition must not own the mutex it passed to
@@ -51690,7 +52731,7 @@ static void schedule_threads(uint64_t slice) {
             if (t.is_arm64) (void)a64_deliver_pending_signal(ctx, t);
             else (void)a32_deliver_pending_signal(ctx, t);
         }
-        if (t.waiting_signal) return false;
+        if (t.waiting_signal || t.waiting_posix_timer) return false;
         if (t.waiting_cond) {
             const uint64_t now_ns = host_mono_ns();
             if (t.cond_timed && now_ns >= t.cond_until_ns) {
@@ -51849,6 +52890,11 @@ static void schedule_threads(uint64_t slice) {
     };
 
     auto sched_run_thread = [&](ArmThread &t) {
+        if (t.egl_host_bound &&
+            !pthread_equal(t.egl_host_thread,pthread_self())) {
+            thread_mark_ready(t.id);
+            return;
+        }
         if (t.entry_pc >= 0x02703800u && t.entry_pc < 0x02704000u) {
             uint32_t arg = t.regs[0];
             if (arg && ctx.mem.ptr(arg + 0x10u) && !ctx.mem.read32(arg + 0x10u)) {
@@ -51887,10 +52933,7 @@ static void schedule_threads(uint64_t slice) {
             cfg.processor_id = EXCL_ID_AUX;
             cfg.global_monitor = &ctx.excl_mon;
             a64_apply_optimizations(cfg);   /* the same LDXR/STXR choice, A32 side */
-            if (!g_wrange_hi) {
-                cfg.fastmem_pointer = (uintptr_t)ctx.mem.host;
-                cfg.recompile_on_fastmem_failure = true;
-            }
+            if (!g_wrange_hi) a32_apply_fastmem(cfg, ctx);
             install_stub_coprocessors(cfg);
             ctx.jit_aux = std::make_unique<Dynarmic::A32::Jit>(cfg);
             ctx.cb_aux->jit = ctx.jit_aux.get();
@@ -51912,6 +52955,7 @@ static void schedule_threads(uint64_t slice) {
         /* While the JIT owns the registers, the saved SP in t is stale.
          * Signal senders may queue signals but must not build a frame from
          * that stale SP or write into the live thread's stack. */
+        t.run_site = 1; /* which path set `running`: see the LOST THREAD report */
         t.running = true;
         set_cur_tid(ctx, t.id);
         {
@@ -51957,6 +53001,10 @@ static void schedule_threads(uint64_t slice) {
         g_sched_ticks_total += cb.ticks;
         tw.total_ns    += slice_elapsed_ns;
         ++tw.slices;
+        /* A slice that ran out its quantum stopped at an arbitrary instruction:
+         * a uniform time sample of guest execution (see pc_histo_add()). */
+        if (pc_histo_on() && thr == Dynarmic::HaltReason{})
+            pc_histo_add(tw.regs[15] & ~1u, tw.regs[14], tw.id);
 
         uint32_t pc15 = tw.regs[15] & ~1u;
         if (pc_in_sentinel(pc15)) {
@@ -52328,10 +53376,7 @@ static void call_guest_abi32(ArmExecCtx &ctx, uint32_t fn_va, const GuestArg *ar
         cfg.processor_id = excl_pe_id();
         cfg.global_monitor = &ctx.excl_mon;
         a64_apply_optimizations(cfg);   /* the same LDXR/STXR choice, A32 side */
-        if (!g_wrange_hi) {
-            cfg.fastmem_pointer = (uintptr_t)ctx.mem.host;
-            cfg.recompile_on_fastmem_failure = true;
-        }
+        if (!g_wrange_hi) a32_apply_fastmem(cfg, ctx);
         install_stub_coprocessors(cfg);
         g_cb32.jit[depth] = std::make_unique<Dynarmic::A32::Jit>(cfg);
         g_cb32.cb[depth]->jit = g_cb32.jit[depth].get();
@@ -52379,9 +53424,6 @@ static void call_guest_abi32(ArmExecCtx &ctx, uint32_t fn_va, const GuestArg *ar
     regs[15] = fn_va & ~1u;
     jit.SetCpsr(is_thumb ? 0x00000030u : 0x00000010u);
     // Resume across cycle-budget exhaustion and CacheInvalidation (mono backpatch / cacheflush mid-callback).
-    const double cb32_t0 = emu_uptime_s();
-    const double cb32_seconds = getenv("LUNARIA_CB_SECONDS")
-        ? atof(getenv("LUNARIA_CB_SECONDS")) : 120.0;
     for (;;) {
         if (g_process_stopping.load(std::memory_order_relaxed)) break;
         bool lock_abandon = false;
@@ -52393,13 +53435,9 @@ static void call_guest_abi32(ArmExecCtx &ctx, uint32_t fn_va, const GuestArg *ar
                 break;
             }
             if (cb_lock_wait_try_grant(ctx)) break;
-            if (g_cb_lock_wait.kind != CbLockWait::Cond &&
-                !cb_lock_wait_deadline_ahead() &&
-                cb32_seconds > 0 && emu_uptime_s() - cb32_t0 >= cb32_seconds) {
-                cb_lock_wait_reset();
-                lock_abandon = true;
-                break;
-            }
+            /* Waiting is part of the native call. Only the requested wait's
+             * own deadline or process shutdown may end it. Elapsed callback
+             * time cannot synthesize a return from an unfinished function. */
             cb_lock_wait_progress(ctx, depth);
         }
         if (waiting) __atomic_sub_fetch(&g_callback_waiters, 1u, __ATOMIC_RELEASE);
@@ -52416,6 +53454,7 @@ static void call_guest_abi32(ArmExecCtx &ctx, uint32_t fn_va, const GuestArg *ar
                       HR::UserDefined3 | HR::UserDefined4 | HR::Step);
         g_current_tid = prev_tid;
         g_tpidr32_val = callback_tls;
+        cb.svc_yield = false;
         Dynarmic::HaltReason chr;
         guest_pause_point();
         if (g_cb64_keep_ael) chr = jit.Run();
@@ -52434,7 +53473,9 @@ static void call_guest_abi32(ArmExecCtx &ctx, uint32_t fn_va, const GuestArg *ar
             continue;
         /* A slice ending is a scheduling boundary, never a native return.
          * Abandoning a callback here loses its stack and any locks it owns. */
-        if (cb.ticks >= cb.ticks_limit) {
+        if (cb.ticks >= cb.ticks_limit || cb.svc_yield) {
+            if (pc_histo_on() && !cb.svc_yield)
+                pc_histo_add(jit.Regs()[15], jit.Regs()[14], g_current_tid);
             chr &= ~HR::UserDefined1;
             if (chr == HR{}) {
                 if (!g_cb64_keep_ael) {
@@ -52524,6 +53565,7 @@ static ArmThread *audio_cb_thread(ArmExecCtx &ctx) {
     ArmThread t;
     t.id = AUDIO_CB_TID;
     t.is_arm64 = ctx.is_arm64;
+    t.run_site = 2; /* which path set `running`: see the LOST THREAD report */
     t.running = true;   /* never dispatched; see above */
     g_threads.push_back(t);
     ArmThread *slot = &g_threads.back();
@@ -52667,42 +53709,6 @@ extern "C" void arm_exec_dvm_thread_detach(void)
  * protected by ArmLock and stays set across those releases. */
 static bool g_audio_pump_active;
 
-// Pump every started AAudio stream's data callback once with a silent burst.
-static void drive_aaudio_callbacks(ArmExecCtx &ctx) {
-    if (g_in_cb()) return;
-    ArmLockGuard locked;
-    if (g_audio_pump_active || g_aaudio_streams.empty()) return;
-    g_audio_pump_active = true;
-    if (!g_aaudio_buf_mapped) {
-        ctx.mem.map(AAUDIO_BUF_BASE, AAUDIO_BUF_SIZE);
-        g_aaudio_buf_mapped = true;
-    }
-    for (auto &kv : g_aaudio_streams) {
-        AAudioStreamState &st = kv.second;
-        if (!st.started || !st.data_cb) continue;
-        uint32_t bytes_per_sample = (st.format == 1u) ? 2u : 4u; /* I16 : FLOAT */
-        uint32_t bytes = AAUDIO_BURST_FRAMES * st.channels * bytes_per_sample;
-        if (bytes > AAUDIO_BUF_SIZE) bytes = AAUDIO_BUF_SIZE;
-        memset(ctx.mem.ptr(AAUDIO_BUF_BASE), 0, bytes);   /* silence in/out */
-        int32_t rc;
-        {
-            AudioCbIdentity as_audio_thread(ctx);
-            if (ctx.is_arm64)
-                rc = call_guest_cb64(ctx, st.data_cb, kv.first, st.user_data,
-                                     a64_guest_va(AAUDIO_BUF_BASE), AAUDIO_BURST_FRAMES, nullptr, 0);
-            else
-                rc = call_guest_cb(ctx, (uint32_t)st.data_cb, kv.first, (uint32_t)st.user_data,
-                                   AAUDIO_BUF_BASE, AAUDIO_BURST_FRAMES);
-        }
-        static uint64_t pump_n = 0;
-        if (pump_n < 8 || (pump_n % 2000) == 0)
-            fprintf(stderr, "[aaudio] pump #%llu stream=0x%08x cb=0x%llx rc=%d\n",
-                    (unsigned long long)pump_n, kv.first, (unsigned long long)st.data_cb, rc);
-        ++pump_n;
-    }
-    g_audio_pump_active = false;
-}
-
 /* Android's AudioTrack consumer copies queued PCM, then posts one callback
  * per completely consumed buffer. Mix sources onto one output timeline: two
  * players must overlap, rather than competing to fill or overwrite a ring. */
@@ -52803,6 +53809,49 @@ static void drive_opensles_callbacks(ArmExecCtx &ctx) {
  * then skipped createScene ("WriteLock is still acquired") and called through
  * the null scene.  Every inline read masks the bit; every inline write keeps
  * it, including the word left behind when the last hold is released. */
+/* ARM32 libc leaf calls answered in guest code (the A64 side has had these for
+ * a long time).  Each takes the common case inline and leaves through its SVC
+ * for anything it does not own: null pointers, large blocks, bad keys.  Only
+ * calls the guest finishes faster than one exit are here: a byte-wise strlen or
+ * strcmp loop costs about what the SVC does, so those stay host calls.  Built
+ * from the assembled operations encoded below. */
+/* Generated from the assembly of the operations named below; see build_fast_libc_stubs32(). */
+static const uint32_t a32_fast_code[] = {
+    0xE3100102u, 0x0A000006u, 0xE3C02102u, 0xE3520080u,
+    0x2A000003u, 0xEE1D1F70u, 0xE2811B02u, 0xE7910102u,
+    0xE12FFF1Eu, 0xEF0001BDu, 0xE12FFF1Eu, 0xEE1D1F70u,
+    0xE5910F08u, 0xE3500000u, 0x112FFF1Eu, 0xEF0001B9u,
+    0xE12FFF1Eu, 0xE3520020u, 0x8A000008u, 0xE3500000u,
+    0x0A000006u, 0xE1A03000u, 0xE3520000u, 0x012FFF1Eu,
+    0xE4C31001u, 0xE2522001u, 0x1AFFFFFCu, 0xE12FFF1Eu,
+    0xEF0000F3u, 0xE12FFF1Eu, 0xE3520020u, 0x8A00000Bu,
+    0xE3500000u, 0x0A000009u, 0xE3510000u, 0x0A000007u,
+    0xE1A03000u, 0xE3520000u, 0x012FFF1Eu, 0xE4D1C001u,
+    0xE4C3C001u, 0xE2522001u, 0x1AFFFFFBu, 0xE12FFF1Eu,
+    0xEF0000F1u, 0xE12FFF1Eu,
+};
+static constexpr uint32_t A32_FAST_GETSPECIFIC = 0x0u;
+static constexpr uint32_t A32_FAST_SELF = 0x2Cu;
+static constexpr uint32_t A32_FAST_MEMSET = 0x44u;
+static constexpr uint32_t A32_FAST_MEMCPY = 0x78u;
+static constexpr uint32_t FAST_LIBC32_OFF = 0x400u;
+static void build_fast_libc_stubs32(ArmExecCtx &ctx) {
+    static_assert(SVC_PTHREAD_GETSPECIFIC == 445 && SVC_PTHREAD_SELF == 441 &&
+                  SVC_MEMSET == 243 && SVC_MEMCPY == 241,
+                  "a32_fast_code encodes these SVC numbers");
+    static_assert(FAST_LIBC32_OFF + sizeof a32_fast_code <= 0x1000u,
+                  "stubs must fit the fast stub page");
+    if (lunaria_env("LUNARIA_A32_FASTSTUBS") &&
+        lunaria_env("LUNARIA_A32_FASTSTUBS")[0] == '0') return;
+    const uint32_t base = FAST_MUTEX_PAGE + FAST_LIBC32_OFF;
+    for (size_t i = 0; i < sizeof a32_fast_code / sizeof a32_fast_code[0]; ++i)
+        ctx.mem.write32(base + (uint32_t)(i * 4), a32_fast_code[i]);
+    g_fast32_getspecific_va = base + A32_FAST_GETSPECIFIC;
+    g_fast32_self_va   = base + A32_FAST_SELF;
+    g_fast32_memset_va = base + A32_FAST_MEMSET;
+    g_fast32_memcpy_va = base + A32_FAST_MEMCPY;
+}
+
 static void build_fast_mutex_stubs(ArmExecCtx &ctx) {
     if (g_fastmutex_lock_va) return;
     auto movw = [](uint32_t rd, uint32_t imm){
@@ -52879,6 +53928,7 @@ static void build_fast_mutex_stubs(ArmExecCtx &ctx) {
         0xF57FF01Fu, 0xEF000000u | SVC_PTHREAD_MUTEX_TRYLOCK, 0xE12FFF1Eu,
     };
     for (uint32_t w : trylock_code) { ctx.mem.write32(p, w); p += 4; }
+    build_fast_libc_stubs32(ctx);
     fprintf(stderr, "[arm_exec] fast mutex stubs: lock=%#x unlock=%#x trylock=%#x\n",
             g_fastmutex_lock_va, g_fastmutex_unlock_va, g_fastmutex_trylock_va);
 }
@@ -53032,6 +54082,36 @@ static void build_jni_tables(ArmExecCtx &ctx) {
     for (uint32_t i = 0; i < JNI_VTABLE_COUNT; ++i)
         ctx.mem.write32(JNI_TBL_BASE + i*4, tramp(jni_vtable_svc(i)));
 
+    /* ExceptionOccurred / ExceptionCheck answered in guest code while nothing
+     * is pending: the ARM32 form of the stubs build_jni_tables64() installs.
+     * They sit at the top of the trampoline window, past the SVC pool. */
+    {
+        static_assert(TLS32_EXC_OFF == 0xf04u,
+                      "the ldr immediate below encodes TLS32_EXC_OFF");
+        static constexpr uint32_t JNI_SLOT_EXCEPTION_OCCURRED = 15u;
+        static constexpr uint32_t JNI_SLOT_EXCEPTION_CHECK    = 228u;
+        const uint32_t stub_base = JNI_TBL_BASE - 0x100u;
+        if (TRAMP_BASE + SVC_TRAMP_TOTAL * TRAMP_STRIDE > stub_base)
+            fprintf(stderr, "[jni] SVC trampoline pool overlaps the JNI stubs\n");
+        const uint32_t slots[2] = { JNI_SLOT_EXCEPTION_OCCURRED, JNI_SLOT_EXCEPTION_CHECK };
+        for (unsigned k = 0; k < 2; ++k) {
+            const uint32_t at = stub_base + k * 0x20u;
+            const uint32_t code[] = {
+                0xEE1D1F70u,                                  /* mrc p15,0,r1,c13,c0,3 */
+                0xE5911F04u,                                  /* ldr r1,[r1,#0xf04]    */
+                0xE3510000u,                                  /* cmp r1,#0             */
+                0x1A000001u,                                  /* bne slow              */
+                0xE3A00000u,                                  /* mov r0,#0             */
+                0xE12FFF1Eu,                                  /* bx lr                 */
+                0xEF000000u | jni_vtable_svc(slots[k]),       /* slow: svc #N          */
+                0xE12FFF1Eu,                                  /* bx lr                 */
+            };
+            for (size_t i = 0; i < sizeof code / sizeof code[0]; ++i)
+                ctx.mem.write32(at + (uint32_t)(i * 4), code[i]);
+            ctx.mem.write32(JNI_TBL_BASE + slots[k] * 4u, at);
+        }
+    }
+
     // JNIInvokeInterface table (8 slots)
     ctx.mem.map(JVM_TBL_BASE, JVM_SLOT_COUNT * 4);
     /* svc #0 is the raw-syscall entry, so the "no-op" default must be the
@@ -53077,6 +54157,20 @@ static void build_jni_tables(ArmExecCtx &ctx) {
     ctx.mem.map(PTHREAD_ONCE_STUB, sizeof(once_stub));
     for (size_t i = 0; i < sizeof(once_stub)/4; ++i)
         ctx.mem.write32(PTHREAD_ONCE_STUB + (uint32_t)(i*4), once_stub[i]);
+    /* Preserve r4/lr, keep timer in r4, wait for fn/value, call fn(value). */
+    const uint32_t timer_stub[]={0xe92d4010u,0xe1a04000u,0xe1a00004u,
+        0xef000000u | SVC_POSIX_TIMER_WAIT,0xe3500000u,0x08bd8010u,
+        0xe1a0c000u,0xe1a00001u,0xe12fff3cu,0xeafffff7u};
+    ctx.mem.map(POSIX_TIMER_STUB,sizeof timer_stub);
+    for(size_t i=0;i<sizeof timer_stub/4;++i)ctx.mem.write32(POSIX_TIMER_STUB+(uint32_t)(i*4),timer_stub[i]);
+
+    /* Preserve the stream handle across callback calls. WAIT returns fn and
+     * a four-word argument block; the callback result feeds the next WAIT. */
+    const uint32_t audio_stub[]={0xe92d4010u,0xe1a04000u,0xe3a01000u,0xe1a00004u,
+        0xef000000u | SVC_AAUDIO_CALLBACK_WAIT,0xe3500000u,0x08bd8010u,
+        0xe1a0c000u,0xe891000fu,0xe12fff3cu,0xe1a01000u,0xeafffff6u};
+    ctx.mem.map(AAUDIO_CALLBACK_STUB,sizeof audio_stub);
+    for(size_t i=0;i<sizeof audio_stub/4;++i)ctx.mem.write32(AAUDIO_CALLBACK_STUB+(uint32_t)(i*4),audio_stub[i]);
 
     // ARM Linux kuser helpers page (Documentation/arm/kernel_user_helpers.
     ctx.mem.map(0xffff0f00u, 0x100u);
@@ -53709,6 +54803,9 @@ static bool load_elf(ArmExecCtx &ctx, const char *path,
             fprintf(stderr, "[arm32] cannot locate symbol %s referenced by %s\n", name, path);
             guest_dl_error("cannot locate symbol", name);
             ln64_remove(lnmod);
+            for (const auto &region : g_loaded_regions)
+                if (region.path == path) luna_vma_map(&g_a32_image_prot, region.lo, region.hi, false, 0, false);
+            ++g_a32_vma_gen;
             g_loaded_regions.erase(std::remove_if(g_loaded_regions.begin(), g_loaded_regions.end(),
                 [path](const LoadedRegion &region) { return region.path == path; }), g_loaded_regions.end());
             g_module_phdrs.erase(std::remove_if(g_module_phdrs.begin(), g_module_phdrs.end(),
@@ -54163,10 +55260,8 @@ static int run_arm(ArmExecCtx &ctx, uint32_t entry_va,
         }
         if (!lunaria_env("LUNARIA_WATCH") && !lunaria_env("LUNARIA_WATCH_EXC_TYPE") &&
             !lunaria_env("LUNARIA_STEP_ON_VAL") && !lunaria_env("LUNARIA_STEP_RANGE") &&
-            !lunaria_env("LUNARIA_WWATCH") && !g_wrange_hi) {
-            cfg.fastmem_pointer = (uintptr_t)ctx.mem.host;
-            cfg.recompile_on_fastmem_failure = true;
-        }
+            !lunaria_env("LUNARIA_WWATCH") && !g_wrange_hi)
+            a32_apply_fastmem(cfg, ctx);
         install_stub_coprocessors(cfg);
         ctx.jit = std::make_unique<Dynarmic::A32::Jit>(cfg);
         ctx.cb->jit = ctx.jit.get();
@@ -54948,7 +56043,6 @@ extern "C" void arm_exec_run_pending_threads(void) {
     /* Audio device events continue even when all pthreads are parked. */
     ArmLockGuard locked;
     drive_opensles_callbacks(*g_ctx);
-    drive_aaudio_callbacks(*g_ctx);
 }
 
 // UnitySampleGame (and some Unity 4.
@@ -56263,6 +57357,8 @@ public:
         // UE hook resume stubs (displaced prologue + branch back).
         if (c >= UE_STUB_BASE && c < UE_STUB_BASE + 0x1000u)
             return ctx->mem.read32(c);
+        if (c >= AAUDIO_CALLBACK_STUB && c < AAUDIO_CALLBACK_STUB + 56) return ctx->mem.read32(c);
+        if (c >= POSIX_TIMER_STUB && c < POSIX_TIMER_STUB + 44) return ctx->mem.read32(c);
         if (c >= PTHREAD_ONCE_STUB && c < PTHREAD_ONCE_STUB + 64)
             return ctx->mem.read32(c);
         // In-guest pthread_rwlock stubs.
@@ -56997,12 +58093,15 @@ public:
                         (unsigned long long)jit64->GetSP(),
                         (unsigned long long)g_tpidr_el0_val, g_current_tid,
                         handler > 1u ? "guest handler" : "no handler");
-                if (n <= 4) {
-                    if (g_a64_regdump) g_a64_regdump("SIGSEGV");
-                    if (g_a64_fault_bt) g_a64_fault_bt();
-                }
             }
         }
+        /* Run() has returned, so its callback scope may already be gone.
+         * Select this stopped engine while reading its settled registers. */
+        Arm64Callbacks *previous_running = running;
+        running = this;
+        if (g_a64_regdump) g_a64_regdump("SIGSEGV");
+        if (g_a64_fault_bt) g_a64_fault_bt();
+        running = previous_running;
         if (handler > 1u &&
             enter_guest_signal(handler, GUEST_SIGSEGV, f.code,
                                f.addr))
@@ -57016,8 +58115,6 @@ public:
                 GUEST_SIGSEGV, f.code,
                 f.code == GUEST_SEGV_MAPERR ? "SEGV_MAPERR" : "SEGV_ACCERR",
                 (unsigned long long)f.addr, g_current_tid);
-        if (g_a64_regdump) g_a64_regdump("SIGSEGV");
-        if (g_a64_fault_bt) g_a64_fault_bt();
         jit64->SetRegister(30, a64_guest_va(SENTINEL_ADDR));
         jit64->SetPC(a64_guest_va(SENTINEL_ADDR));
         return false;
@@ -57068,6 +58165,10 @@ public:
             ctx->mem.write32(si + 8u, (uint32_t)si_code);
             ctx->mem.write64(si + 16u, fault_addr);
             ctx->mem.write64(uc + A64_UC_MCONTEXT, fault_addr);
+            if(si_code<=0) {
+                (void)posix_timer_siginfo(*ctx,si,sig,g_current_tid,true);
+                posix_timer_requeue(*ctx,g_current_tid,sig);
+            }
             ArmSignalFrameState &frame = t ? t->signal_frames[*depth]
                                            : g_main_signal_frames[*depth];
             frame.si = si;
@@ -57177,6 +58278,20 @@ public:
     // ---- SVC dispatch (adapter to ARM32 dispatch_svc) ----
     void CallSVC(uint32_t svc_no) override {
         if (!jit64) return;
+        if (SvcLeafFn leaf = svc_leaf_fn(svc_no)) {
+            const uint64_t a[3] = { jit64->GetRegister(0), jit64->GetRegister(1),
+                                    jit64->GetRegister(2) };
+            uint64_t ret;
+            if (leaf(ctx, a, &ret)) {
+                jit64->SetRegister(0, ret);
+                ++g_a64_slice_svcs;
+                ++g_svc_total;
+                g_svc_calls_by_no[svc_no].store(
+                    g_svc_calls_by_no[svc_no].load(std::memory_order_relaxed) + 1,
+                    std::memory_order_relaxed);
+                return;
+            }
+        }
         SvcCallerStackGuard caller_stack(jit64->GetSP(), true);
         /* How much of a slice is the emulator rather than the guest.  An SVC
          * runs inside Run(), so without this split "the JIT is slow" and "the
@@ -57208,6 +58323,18 @@ public:
                       : !raw_syscall_lockfree(jit64->GetRegister(8));
         ArmLockGuardIf aelock(need_lock);
         if (aelock.on) arm_lock_tag(ARM_LOCK_TAG_SVC(svc_no));
+        /* Runs after the JNI call and its locks are done: republish whether this
+         * thread has an exception pending, for the in-guest ExceptionCheck. */
+        struct PublishPending {
+            ArmExecCtx *ctx; uint32_t svc;
+            ~PublishPending() {
+                if (!(svc > 0 && svc < JNI_VTABLE_COUNT) || !ctx->jvm) return;
+                const uint32_t tls = a64_canon_va(g_tpidr_el0_val);
+                if (tls < TLS_WINDOW_BASE || tls >= TLS_WINDOW_END) return;
+                const bool pending = ctx->jvm->native.ExceptionCheck(&ctx->jvm->env) != 0;
+                ctx->mem.write32(tls + TLS64_EXC_OFF, pending ? 1u : 0u);
+            }
+        } publish_pending{ctx, svc_no};
         DvmGilGuardIf gil(svc_touches_jvm(svc_no));
         if (lk0) g_svc_lock_ns += host_mono_ns() - lk0;
         last_svc = svc_no;
@@ -60358,6 +61485,7 @@ static ArmThread *a64_claim(bool sleepers_only, unsigned engine_idx) {
         g_in_ready[tid] = false;
         ++g_ready_pops[tid];
         if (!tp->engine_aff) a64_assign_affinity(*tp);
+        tp->run_site = 3; /* which path set `running`: see the LOST THREAD report */
         tp->running = true;
         return tp;
     }
@@ -60377,6 +61505,7 @@ static ArmThread *a64_claim(bool sleepers_only, unsigned engine_idx) {
             a64_lock_boost_drop();
             t.sleep_until_ns = 0;
             g_in_ready[t.id] = false;
+            t.run_site = 4; /* which path set `running`: see the LOST THREAD report */
             t.running = true;
             return &t;
         }
@@ -60396,6 +61525,7 @@ static ArmThread *a64_claim(bool sleepers_only, unsigned engine_idx) {
         if (!t.engine_aff) a64_assign_affinity(t);
         g_in_ready[tid] = false;
         t.sleep_until_ns = 0;
+        t.run_site = 5; /* which path set `running`: see the LOST THREAD report */
         t.running = true;
         return tp;
     }
@@ -60406,6 +61536,7 @@ static ArmThread *a64_claim(bool sleepers_only, unsigned engine_idx) {
         if (!t.engine_aff) a64_assign_affinity(t);
         g_in_ready[t.id] = false;
         t.sleep_until_ns = 0;   /* the deadline passed; see above */
+        t.run_site = 6; /* which path set `running`: see the LOST THREAD report */
         t.running = true;
         return &t;
     }
@@ -60676,6 +61807,7 @@ extern "C" void arm_exec_shutdown_engines(void) {
      * synchronization objects are destroyed. */
     sleep_timer_shutdown();
     a64par::shutdown_workers();
+    luna_timer_destroy(&g_posix_timers);
 }
 extern "C" void arm_exec_begin_shutdown(void) {
     g_process_stopping.store(true, std::memory_order_relaxed);
@@ -60711,6 +61843,7 @@ static void a64_dispatch(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, uint32_t
              * engine's claim (the lock-owner boost admits GL owners), and a second
              * engine resuming it would run the same stack twice. sched64_run_thread
              * clears the flag in its epilogue. */
+            t.run_site = 7; /* which path set `running`: see the LOST THREAD report */
             t.running = true;
             sched64_run_thread(ctx, t, slice, prev_tid);
         } else {
@@ -60735,6 +61868,7 @@ static void a64_dispatch(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, uint32_t
          * running flag keep its claim exclusive with the worker queue. */
         if (__atomic_load_n(&g_callback_waiters, __ATOMIC_ACQUIRE)) {
             g_disp_inline.fetch_add(1, std::memory_order_relaxed);
+            t.run_site = 8; /* which path set `running`: see the LOST THREAD report */
             t.running = true;
             sched64_run_thread(ctx, t, slice, prev_tid);
             return;
@@ -60762,6 +61896,7 @@ static void a64_dispatch(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, uint32_t
                 for (auto &wp : g_workers)
                     if (!wp->busy) { free_w = wp.get(); break; }
             if (free_w) {
+                t.run_site = 9; /* which path set `running`: see the LOST THREAD report */
                 t.running = true;
                 free_w->job = Job{&ctx, &t, slice, prev_tid};
                 free_w->busy = true;
@@ -60777,6 +61912,7 @@ static void a64_dispatch(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, uint32_t
     }
     if (g_a64_is_worker) return;   /* the pass is being driven from an engine */
     g_disp_inline.fetch_add(1, std::memory_order_relaxed);
+    t.run_site = 10; /* which path set `running`: see the LOST THREAD report */
     t.running = true;   /* see the GL branch above */
     sched64_run_thread(ctx, t, slice, prev_tid);
 }
@@ -61345,16 +62481,8 @@ static void call_guest_abi64(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *arg
      * anti-cheat init, nmssNativeInit, is exactly this shape: it spawns four
      * threads and then waits for them). */
     const uint64_t cb_slice = env_ticks("LUNARIA_CB_SLICE_TICKS", 20'000'000ull);
-    /* The backstop is wall clock, not instructions. A tick budget cannot tell a
-     * hang from work: the anti-cheat's integrity check is a byte-at-a-time CRC32
-     * over tens of megabytes, which is seven instructions per byte and would run
-     * straight through a 200M-tick cap, cutting the callback off mid-checksum
-     * every launch so that nmssNativeInit never finished. Time says what was
-     * actually meant: stop something that is not going to end. */
-    const double cb_seconds = getenv("LUNARIA_CB_SECONDS")
-        ? atof(getenv("LUNARIA_CB_SECONDS")) : 120.0;
-    const uint64_t cb_budget = env_ticks("LUNARIA_CB_TICKS", 0ull);
-    const double cb_t0 = emu_uptime_s();
+    /* Execute until the native function returns or the process stops.
+     * Scheduler quanta limit individual slices, never the call's lifetime. */
     cb.ticks_remaining = cb_slice;
     cb.ticks_total = 0;
     j.ClearExclusiveState();
@@ -61434,20 +62562,6 @@ static void call_guest_abi64(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *arg
                             : -1.0, depth);
                 wait_trace_at = host_mono_ns() + 5000000000ull;
             }
-            const double cb_elapsed = emu_uptime_s() - cb_t0;
-            if (g_cb_lock_wait.kind != CbLockWait::Cond &&
-                !cb_lock_wait_deadline_ahead() &&
-                cb_seconds > 0 && cb_elapsed >= cb_seconds) {
-                static int lw = 0;
-                if (lw++ < 8)
-                    fprintf(stderr, "[cb64] lock wait timed out mva=0x%llx kind=%u "
-                            "after %.1fs — abandoning callback\n",
-                            (unsigned long long)g_cb_lock_wait.mva,
-                            (unsigned)g_cb_lock_wait.kind, cb_elapsed);
-                cb_lock_wait_reset();
-                lock_abandon = true;
-                break;
-            }
             cb_lock_wait_progress(ctx, depth);
         }
         if (waiting) __atomic_sub_fetch(&g_callback_waiters, 1u, __ATOMIC_RELEASE);
@@ -61484,20 +62598,8 @@ static void call_guest_abi64(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *arg
         if (pc_in_sentinel((uint32_t)pc)) break;
         if (g_cb_lock_wait.kind != CbLockWait::Idle)
             continue; /* parked on a lock — grant above, then Run again */
-        const double cb_elapsed = emu_uptime_s() - cb_t0;
         const bool holds_heap = g_lh.ctl && g_lh.ctl->state &&
             (g_lh.ctl->owner == 0 || g_lh.ctl->owner == callback_tpidr_el0);
-        if (!holds_heap &&
-            ((cb_budget && cb.ticks_total >= cb_budget) ||
-             (cb_seconds > 0 && cb_elapsed >= cb_seconds))) {
-            static int hr_warned = 0;
-            if (hr_warned++ < 8)
-                fprintf(stderr, "[cb64] giving up on fn=0x%llx pc=0x%llx ticks=%llu "
-                        "after %.1fs depth=%d (LUNARIA_CB_SECONDS/LUNARIA_CB_TICKS)\n",
-                        (unsigned long long)fn_va, (unsigned long long)pc,
-                        (unsigned long long)cb.ticks_total, cb_elapsed, depth);
-            break;
-        }
         if (cb.ticks_remaining == 0) {
             if (pc_histo_on()) pc_histo_add(pc, j.GetRegister(30), callback_tid);
             /* Slice spent and the callback has not returned: it is waiting for somebody.
@@ -62387,6 +63489,34 @@ static void build_jni_tables64(ArmExecCtx &ctx) {
         std::memcpy(ctx.mem.ptr(JNI_TBL64_BASE + i * 8u), &tramp_va, 8);
     }
 
+    /* ExceptionOccurred / ExceptionCheck answered in guest code while nothing
+     * is pending; see TLS64_EXC_OFF.  Each is: load the flag, branch to the
+     * ordinary SVC when set, otherwise return 0 (null / JNI_FALSE). */
+    {
+        static_assert(TLS64_EXC_OFF == 0xBECu,
+                      "the ldr immediate below encodes TLS64_EXC_OFF / 4 = 0x2FB");
+        static constexpr uint32_t JNI_SLOT_EXCEPTION_OCCURRED = 15u;
+        static constexpr uint32_t JNI_SLOT_EXCEPTION_CHECK    = 228u;
+        static constexpr uint32_t STUB_BASE = FAST_SYNC64_PAGE + 0x1C00u;
+        const uint32_t slots[2] = { JNI_SLOT_EXCEPTION_OCCURRED, JNI_SLOT_EXCEPTION_CHECK };
+        for (unsigned k = 0; k < 2; ++k) {
+            const uint32_t at = STUB_BASE + k * 0x20u;
+            const uint32_t code[] = {
+                0xD53BD041u,                                      /* mrs x1,tpidr_el0   */
+                0xB94BEC21u,                                      /* ldr w1,[x1,#0xBEC] */
+                0x35000061u,                                      /* cbnz w1,slow       */
+                0x2A1F03E0u,                                      /* mov w0,wzr         */
+                0xD65F03C0u,                                      /* ret                */
+                TRAMP64_SVC(jni_vtable_svc(slots[k])),            /* slow: svc #N       */
+                0xD65F03C0u,                                      /* ret                */
+            };
+            for (size_t i = 0; i < sizeof code / sizeof code[0]; ++i)
+                ctx.mem.write32(at + (uint32_t)(i * 4), code[i]);
+            const GuestVA va = a64_guest_va(at);
+            std::memcpy(ctx.mem.ptr(JNI_TBL64_BASE + slots[k] * 8u), &va, 8);
+        }
+    }
+
     // JNIInvokeInterface vtable: 8 slots × 8 bytes
     ctx.mem.map(JVM_TBL64_BASE, 64u);
     {
@@ -62477,6 +63607,18 @@ static void build_jni_tables64(ArmExecCtx &ctx) {
     ctx.mem.map(PTHREAD_ONCE_STUB, sizeof(once64));
     for (size_t i = 0; i < sizeof(once64) / 4; ++i)
         ctx.mem.write32(PTHREAD_ONCE_STUB + (uint32_t)(i * 4), once64[i]);
+    /* Preserve x19/lr, keep timer in x19, wait for fn/value, call fn(value). */
+    const uint32_t timer_stub[]={0xa9bf7bf3u,0xaa0003f3u,0xaa1303e0u,
+        0xd4000001u | (SVC_POSIX_TIMER_WAIT<<5),0xb40000a0u,0xaa0003f0u,
+        0xaa0103e0u,0xd63f0200u,0x17fffffau,0xa8c17bf3u,0xd65f03c0u};
+    ctx.mem.map(POSIX_TIMER_STUB,sizeof timer_stub);
+    for(size_t i=0;i<sizeof timer_stub/4;++i)ctx.mem.write32(POSIX_TIMER_STUB+(uint32_t)(i*4),timer_stub[i]);
+    const uint32_t audio_stub[]={0xa9bf7bf3u,0xaa0003f3u,0xd2800001u,0xaa1303e0u,
+        0xd4000001u | (SVC_AAUDIO_CALLBACK_WAIT<<5),0xb40000e0u,0xaa0003f0u,
+        0xa9410c22u,0xa9400420u,0xd63f0200u,0xaa0003e1u,0x17fffff8u,
+        0xa8c17bf3u,0xd65f03c0u};
+    ctx.mem.map(AAUDIO_CALLBACK_STUB,sizeof audio_stub);
+    for(size_t i=0;i<sizeof audio_stub/4;++i)ctx.mem.write32(AAUDIO_CALLBACK_STUB+(uint32_t)(i*4),audio_stub[i]);
 }
 
 /* Android packed relocations ("APS2", DT_ANDROID_RELA / SHT_ANDROID_RELA).
@@ -62902,6 +64044,9 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
             fprintf(stderr, "[arm64] cannot locate symbol %s referenced by %s\n", name, path);
             guest_dl_error("cannot locate symbol", name);
             ln64_remove(lnmod);
+            for (const auto &region : g_loaded_regions)
+                if (region.path == path) luna_vma_map(&g_a32_image_prot, region.lo, region.hi, false, 0, false);
+            ++g_a32_vma_gen;
             g_loaded_regions.erase(std::remove_if(g_loaded_regions.begin(), g_loaded_regions.end(),
                 [path](const LoadedRegion &region) { return region.path == path; }), g_loaded_regions.end());
             g_module_phdrs.erase(std::remove_if(g_module_phdrs.begin(), g_module_phdrs.end(),
@@ -63598,9 +64743,13 @@ static bool dvm_call_guest_native(const char *klass, const char *method,
     if (!fn) return false;
 
     static std::set<std::string> declined;
+    static pthread_mutex_t declined_mutex = PTHREAD_MUTEX_INITIALIZER;
     auto decline = [&](const char *why) {
         std::string key = std::string(klass) + "." + method + sig;
-        if (declined.insert(key).second)
+        pthread_mutex_lock(&declined_mutex);
+        const bool first = declined.insert(key).second;
+        pthread_mutex_unlock(&declined_mutex);
+        if (first)
             fprintf(stderr, "[dvm] native %s.%s%s not called: %s\n",
                     klass, method, sig, why);
         return false;
@@ -63662,9 +64811,14 @@ static bool dvm_call_guest_native(const char *klass, const char *method,
      * calls one native hundreds of thousands of times, and a line each cost
      * more than the emulation did. */
     {
+        /* The Java caller releases GIL before entering this bridge. */
         static std::set<std::string> seen;
+        static pthread_mutex_t seen_mutex = PTHREAD_MUTEX_INITIALIZER;
         std::string key = std::string(klass) + "." + method + sig;
-        if (seen.insert(key).second)
+        pthread_mutex_lock(&seen_mutex);
+        const bool first = seen.insert(key).second;
+        pthread_mutex_unlock(&seen_mutex);
+        if (first)
             fprintf(stderr, "[dvm] native %s.%s%s -> 0x%llx (%d args)\n",
                     klass, method, sig, (unsigned long long)fn, ng - 2);
     }
@@ -63995,8 +65149,7 @@ extern "C" int arm64_exec_context_init(struct jvm *jvm) {
     g_wait_poll.clear();
     g_in_ready.fill(false);
     g_in_wait_poll.fill(false);
-    g_sleep_heap.clear();
-    g_in_sleep_heap.fill(false);
+    luna_deadline_heap_clear(&g_sleep_heap);
     g_sleep_next_due_ns.store(UINT64_MAX, std::memory_order_relaxed);
     memset(g_guest_ptrace_traceme_pids, 0,
            sizeof g_guest_ptrace_traceme_pids);
@@ -64679,7 +65832,6 @@ extern "C" void arm64_exec_run_pending_threads(void) {
     schedule_threads(env_ticks("LUNARIA_HTTP_DRAIN_TICKS", 5'000'000ULL));
     // Device callbacks belong on the host frame, not on a guest spin path.
     drive_opensles_callbacks(*g_ctx);
-    drive_aaudio_callbacks(*g_ctx);
 }
 
 // Walk a guest AArch64 frame-pointer chain for a stall dump.
@@ -64804,6 +65956,20 @@ extern "C" void arm64_exec_svc_ring_dump(void) {
         a64_dump_guest_backtrace("main-jit64", 0,
                                  g_ctx->jit64->GetRegister(29));
     }
+    if (g_ctx && !g_ctx->is_arm64 && g_ctx->jit) {
+        const auto &r = g_ctx->jit->Regs();
+        fprintf(stderr, "[arm32] main-jit cpsr=%08x\n", g_ctx->jit->Cpsr());
+        for (unsigned i = 0; i < 16; ++i)
+            fprintf(stderr, " r%u=%08x%s", i, r[i], i % 4 == 3 ? "\n" : "");
+        fprintf(stderr, "[arm32] main stack words:");
+        for (unsigned i = 0; i < 64; ++i) {
+            const uint64_t at = (uint64_t)r[13] + i * 4u;
+            if (at > UINT32_MAX || !g_ctx->mem.ptr((uint32_t)at) ||
+                !g_ctx->mem.ptr((uint32_t)at + 3u)) break;
+            fprintf(stderr, " %08x", g_ctx->mem.read32((uint32_t)at));
+        }
+        fprintf(stderr, "\n");
+    }
     /* Threads that are marked running but are on no engine, and how many engines
      * there are to be on. More "running" threads than engines is impossible in a
      * healthy run and is the whole of a certain kind of stall: the extra ones
@@ -64826,10 +65992,10 @@ extern "C" void arm64_exec_svc_ring_dump(void) {
             ++lost;
             fprintf(stderr, "[sched64] LOST THREAD tid=%u (%s): running=1 but "
                     "no engine has it (slices=%llu ticks=%llu pc=0x%llx "
-                    "lr=0x%llx)\n", t.id, thread_name_of(t.id),
+                    "lr=0x%llx run_site=%u)\n", t.id, thread_name_of(t.id),
                     (unsigned long long)t.slices,
                     (unsigned long long)t.total_ticks,
-                    (unsigned long long)t.pc64, (unsigned long long)t.lr64);
+                    (unsigned long long)t.pc64, (unsigned long long)t.lr64, t.run_site);
             a64_dump_guest_backtrace("lost-thread", t.id, t.regs64[29]);
         }
         fprintf(stderr, "[sched64] %u engine(s); %u thread(s) marked running "
@@ -64896,7 +66062,7 @@ extern "C" void arm64_exec_svc_ring_dump(void) {
                     "ticks=%llu\n",
                     (int)t.running, (int)g_in_ready[t.id], in_rq,
                     (int)g_in_wait_poll[t.id], in_wq,
-                    (int)g_in_sleep_heap[t.id], (int)gl_tid_marked(t.id),
+                    (int)luna_deadline_heap_contains(&g_sleep_heap, t.id), (int)gl_tid_marked(t.id),
                     (unsigned)t.engine_aff,
                     (unsigned long long)t.slices,
                     (unsigned long long)t.total_ticks);

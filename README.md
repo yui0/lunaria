@@ -1,13 +1,15 @@
 # Lunaria
 
-### Android games on your desktop. No Android system image required.
+### Android apps and games, on your desktop.
+
+No Android system image required. ARM32 and ARM64, from the original package.
 
 [![License: MPL 2.0](https://img.shields.io/badge/license-MPL--2.0-5b5bd6.svg)](LICENSE)
 [![Guests](https://img.shields.io/badge/guest-ARM32%20%7C%20ARM64-20232a.svg)](#how-it-works)
 [![Engines](https://img.shields.io/badge/engines-Unity%20%7C%20Unreal%20%7C%20native-20232a.svg)](#compatibility)
 [![Sponsor](https://img.shields.io/badge/sponsor-%E2%99%A5-ea4aaa.svg)](https://github.com/sponsors/yui0)
 
-[日本語](README.ja.md)
+[Install](#install) · [Gallery](#gallery) · [Compatibility](#compatibility) · [Build from source](#quick-start) · [日本語](README.ja.md)
 
 **Lunaria brings Android applications and games to the desktop without running a full Android OS.**
 Instead of booting a virtual device, it loads the app's own package, executes its ARM32 or ARM64 code with
@@ -20,7 +22,8 @@ Chrome/Chromium browser or the included [luna-browser](luna-browser/) through th
 
 **Already demonstrated:** Genshin Impact, Ni no Kuni: Cross Worlds, Alchemia Story,
 Kikyu! Aeronaut (a 2013 ARM32 APK), Black Clover: Asta Fight, and other Unity and Unreal Engine titles.
-See [Compatibility](#compatibility) for exactly how far each game has been tested.
+Java-based apps are also progressing: TVer displays its welcome screen, and APKPure renders its store and download manager.
+See [Compatibility](#compatibility) for the tested stages and remaining limits.
 
 Lunaria follows the app's normal Android startup sequence: its `Application` and content providers initialize
 before the launcher `Activity`. Engines using `NativeActivity`, including Unreal Engine titles,
@@ -29,7 +32,7 @@ follow the corresponding Android lifecycle. There's no game-specific loader to w
 > [!IMPORTANT]
 > **Experimental software.** Lunaria is an actively developed compatibility layer, not a complete
 > Android emulator. Some titles reach gameplay; others stop at menus or fail to render.
-> The screenshots below are from actual Lunaria guest frames, not footage from a separate emulator.
+> The screenshots below show actual Lunaria output, including native game frames and Android UI rendered by the host.
 
 <p align="center">
   <img src="shots/genshin-mondstadt-night.png" width="100%" alt="Genshin Impact: Lumine gliding through Mondstadt at night, windmills lit below, full touch HUD">
@@ -47,18 +50,25 @@ follow the corresponding Android lifecycle. There's no game-specific loader to w
 Genshin Impact 7.1.0 (Unity IL2CPP, arm64-v8a) · Ni no Kuni: Cross Worlds (Unreal Engine 4, arm64-v8a)</sub></p>
 
 <p align="center">
-  <img src="shots/alchemia-story-title.png" width="48%" alt="Alchemia Story title screen, the cast gathered around the logo, Touch to start">
+  <img src="shots/black-clover-gameplay.png" width="48%" alt="Black Clover: Asta Fight gameplay, Asta fighting a monster with the full touch HUD">
   &nbsp;
-  <img src="shots/cross-worlds-lighthouse.png" width="48%" alt="Ni no Kuni: Cross Worlds in the field at sunset beside a lighthouse, full touch HUD">
+  <img src="shots/alchemia-story-title.png" width="48%" alt="Alchemia Story title screen, the cast gathered around the logo">
 </p>
 
-<p align="center"><sub>Alchemia Story 1.0.154 (Unity IL2CPP, arm64-v8a) · Cross Worlds in the field at sunset</sub></p>
+<p align="center"><sub>From 2D action to 3D RPGs: Black Clover: Asta Fight · Alchemia Story</sub></p>
 
-<p align="center">
-  <img src="shots/launcher.png" width="72%" alt="Lunaria launcher: drop an APK, XAPK, APKS or AAB, pick data folder and device profile">
-</p>
+## What's working now
 
-<p align="center"><sub>Drop a package into the launcher or choose a file. Save the data location, cache settings, and device profile in <code>lunaria.conf</code>.</sub></p>
+As of **October 20, 2026**, the tested paths include open-world gameplay in Genshin Impact, field gameplay in Cross Worlds, and 2D gameplay in Black Clover. The Android UI implementation also runs Java application screens from their original dex bytecode and resources.
+
+| Try | What to expect |
+|---|---|
+| **Play a supported game** | Load a local package, select a keyboard mapping, and use mouse or touch input. Results depend on the title and build. |
+| **Browse and launch packages** | Use the graphical launcher to open a local APK/XAPK/APKS/AAB or search APKPure. |
+| **Keep accounts separate** | Share installed game resources while keeping each profile's login and app data separate. |
+| **Explore Android app support** | TVer welcome UI and APKPure store/download screens render; TVer playback and APKPure installation completion remain unverified. |
+
+[Install a release](#install) or [build from source](#quick-start). Check the [compatibility table](#compatibility) before choosing a title.
 
 ## Install
 
@@ -109,7 +119,7 @@ To build from source instead, see [Quick start](#quick-start).
 | **ARM32 and ARM64 support** | Run ARMv7 and AArch64 instructions through dynarmic's JIT compiler. |
 | **Host-side graphics** | Forward EGL and OpenGL ES 3 to the host GPU; expose Vulkan when the host bridge is available. |
 | **Android services, without the full OS** | Provide JNI, AssetManager, OBB, pthread, OpenSL ES, and compatibility implementations of Android APIs. |
-| **Java from the original APK** | Execute methods from `classes*.dex` with the built-in Dalvik interpreter when no host-side stub is available. |
+| **Java and Android UI** | Execute `classes*.dex` with the built-in Dalvik interpreter; render Android views, text, layouts, and app resources through host implementations. |
 | **Video and audio** | Decode supported H.264 streams with OpenH264 and AAC with libavcodec when available. |
 | **WebView integration** | Render web content through Chrome/Chromium or the included luna-browser. |
 | **Configurable device identity** | Choose a device profile in `lunaria.conf`; the default emulates the identity of a Pixel 6. |
@@ -120,7 +130,21 @@ To build from source instead, see [Quick start](#quick-start).
 
 ## Gallery
 
-These images were captured directly from Lunaria's guest framebuffer, either in its GLFW window or through headless EGL. They are not screenshots of an Android emulator.
+These captures show Lunaria's game rendering and Android application UI. Captions distinguish gameplay from welcome and loading screens.
+
+### Beyond native game rendering
+
+Lunaria executes application dex bytecode and implements Android views, layouts, text, resources, and lifecycle callbacks on the host. This path is still under development; displaying an app's UI does not establish that all of its services work.
+
+<p align="center">
+  <img src="shots/trickcal-server-loading.jpg" width="66%" alt="Trickcal Chibi+Go 1.6.1 displaying its illustrated town and server configuration loading progress">
+  &nbsp;
+  <img src="shots/tver-welcome.png" width="20%" alt="TVer portrait welcome screen with program artwork and the consent button">
+</p>
+
+<p align="center"><sub>Trickcal: server configuration loading, gameplay not yet verified · TVer: welcome screen, video playback not yet verified</sub></p>
+
+APKPure has also displayed its store, recommendations, app details, and download manager. Download progress has been observed; a completed download, installation, and subsequent app launch have not yet been verified. See [Compatibility](#compatibility) for the current limits.
 
 ### Genshin Impact 7.1.0
 
@@ -172,16 +196,14 @@ Genshin Impact 7.1.0 runs through Unity IL2CPP on `arm64-v8a`. These captures us
 </p>
 
 <p align="center">
-  <img src="shots/genshin-server.png" width="48%" alt="Genshin Impact server select, Asia checked">
-  &nbsp;
-  <img src="shots/genshin-library.png" width="48%" alt="Genshin Impact: Jean in profile beside the library clock">
+  <img src="shots/genshin-library.png" width="72%" alt="Genshin Impact: Jean in profile beside the library clock">
 </p>
 
 <p align="center">
   <img src="shots/genshin-language.png" width="72%" alt="Genshin Impact language settings in Japanese">
 </p>
 
-<p align="center"><sub>Shader compile · TAP TO BEGIN · download · login · server · library · language</sub></p>
+<p align="center"><sub>Shader compile · TAP TO BEGIN · download · login · library · language</sub></p>
 
 Other frames are kept beside these:
 [`genshin-mondstadt.png`](shots/genshin-mondstadt.png),
@@ -191,7 +213,6 @@ Other frames are kept beside these:
 [`genshin-loading.png`](shots/genshin-loading.png),
 [`genshin-begin.png`](shots/genshin-begin.png),
 [`genshin-elements.png`](shots/genshin-elements.png),
-[`genshin-splash.png`](shots/genshin-splash.png),
 [`genshin-mail.png`](shots/genshin-mail.png),
 [`genshin-chat.png`](shots/genshin-chat.png),
 [`genshin-field.png`](shots/genshin-field.png),
@@ -299,7 +320,7 @@ Even this 2013 `armeabi` APK runs through Lunaria’s ARM32 path. Its original `
 <p align="center">
   <img src="shots/unity-sample.png" width="48%" alt="Unity sample game, 3D gameplay">
   &nbsp;
-  <img src="shots/black-clover.png" width="48%" alt="Black Clover: Asta Fight, side-scrolling stage with touch controls">
+  <img src="shots/black-clover-gameplay.png" width="48%" alt="Black Clover: Asta Fight, side-scrolling stage with touch controls">
 </p>
 
 <p align="center"><sub>UnitySampleGame · Start opens the 3D scene, 1280×720 &nbsp;·&nbsp; Black Clover: Asta Fight · gameplay, 1024×576</sub></p>
@@ -320,21 +341,24 @@ Even this 2013 `armeabi` APK runs through Lunaria’s ARM32 path. Its original `
 
 Launch Lunaria without arguments to open its graphical launcher. Drop an `.apk`, `.xapk`, `.apks`, or `.aab` onto the window, choose the data directory and device profile, and save your preferences in `lunaria.conf`. Large games may need time to load libraries, translate ARM instructions, and compile dex bytecode; a startup screen displays progress until the first guest frame appears.
 
+Enter an application name under **Find an app on APKPure** and press Enter or Search.
+Select a result after checking its name and Android package ID to download and open the latest XAPK.
+Downloads go into `downloads` under the package cache folder, or `cache/packages/downloads` under
+the data folder when no cache folder is set. With neither set, they go into `Downloads/Lunaria`
+under your home directory. Cancel stops a request; failed or cancelled transfers remove their partial files.
+If APKPure denies access, the launcher displays the HTTP error.
+
 Once a game is running, **right-click to open the host menu**. From there you can take screenshots (also **F12**), paste text, send Back, adjust audio, choose keyboard mappings and WebView settings, record or replay input, switch profiles, restart, toggle fullscreen, or quit.
 
 <p align="center">
-  <img src="shots/launcher.png" width="56%" alt="Lunaria launcher card on a blue sky, Open an application drop zone">
-  &nbsp;
-  <img src="shots/boot.png" width="40%" alt="Lunaria boot card: moon wordmark, ARM translation and dex compile progress">
+  <img src="shots/launcher.png" width="72%" alt="Lunaria graphical launcher with package selection, data directory, and device profile settings">
 </p>
 
 <p align="center">
-  <img src="shots/host-menu-kikyu.png" width="56%" alt="Host menu over Kikyu! Aeronaut: Input, Keyboard Controls, genshin.conf and crossworlds.conf">
-  &nbsp;
-  <img src="shots/host-menu.png" width="40%" alt="Host menu WebView engine submenu, luna-browser selected">
+  <img src="shots/host-menu-kikyu.png" width="72%" alt="Lunaria host menu over Kikyu! Aeronaut, with keyboard control layouts available">
 </p>
 
-<p align="center"><sub>Launcher · boot card · host menu on a 2013 APK · WebView engine picker</sub></p>
+<p align="center"><sub>Choose a package in the launcher · change controls from the in-game host menu</sub></p>
 
 ## Quick start
 
@@ -357,7 +381,7 @@ sudo apt install \
 
 **macOS (Apple Silicon)**
 
-Run `make` from this directory to download the pinned ANGLE, MoltenVK, and OpenH264 dependencies and build Lunaria. To open an XAPK, use `./lunaria-apk.sh /path/to/game.xapk`. See [Project status](#project-status) for current macOS display limitations.
+Run `make` from this directory to download the pinned ANGLE, MoltenVK, and OpenH264 dependencies and build Lunaria. To open an XAPK, use `./lunaria /path/to/game.xapk`. See [Project status](#project-status) for current macOS display limitations.
 
 **Windows (x86_64)**
 
@@ -398,6 +422,20 @@ Run `make syslib` to populate `syslib-arm64/` with AArch64 `libm`, bionic `libc`
 `make guestlib` builds `liblunaria_guest.so` from `src/lib/guest.c`. It currently handles zero-duration `nanosleep` calls without returning to the host.
 
 Lunaria embeds Unicode classification, normalization, and IDN tables. Legacy character encodings use Windows code pages or `iconv` on Linux/macOS; Windows date handling uses OS timezone rules and a compact CLDR mapping. **ICU is not required** for building or running Lunaria.
+
+### Android framework resources
+
+Android view themes and resource inheritance use the Android SDK Platform 31 resources. From this directory, install them with:
+
+```bash
+curl -fL https://dl.google.com/android/repository/platform-31_r01.zip -o /tmp/platform-31_r01.zip
+python3 scripts/install-framework.py /tmp/platform-31_r01.zip
+```
+
+The installer verifies Google's SHA-1 and copies the resources and notices from
+`android.jar` unchanged into `runtime/framework-res/`. Application APKs are not
+modified. Set `LUNARIA_FRAMEWORK_RES` to use another directory containing
+`resources.arsc` and `res/`. The default directory is relative to the executable.
 
 ### 3. Launch a package
 
@@ -452,7 +490,7 @@ LUNARIA_ARCH=arm64-v8a  ./lunaria game.apk
 
 ## Compatibility
 
-These results describe **what was actually observed**, not a promise that every feature of a title works. Support varies by version, platform, graphics driver, and game engine. For detailed logs and launch instructions, see `PROGRESS.md`.
+These results describe **what was actually observed**, not a promise that every feature of a title works. Support varies by version, platform, graphics driver, and game engine. For detailed logs and launch instructions, see [PROGRESS.md](PROGRESS.md).
 
 | Title | Engine / ABI | Current result |
 |---|---|---|
@@ -468,6 +506,10 @@ These results describe **what was actually observed**, not a promise that every 
 | **TIME LOCKER** | Unity · ARMv7 | Reaches the portrait tutorial gameplay scene |
 | **Black Clover: Asta Fight** | Unity IL2CPP · AArch64 XAPK | Base + split load; title menu, stage selection and gameplay render headlessly |
 | **Blade & Soul Revolution** | Unreal Engine 4 · AArch64 | Boots through dex / SDK setup into the game's own dialog; without a route to the patch server the client asks to reconnect |
+| **Trickcal Chibi+Go 1.6.1** | Unity 6000.3.13f1 IL2CPP · ARMv7 XAPK | Terms Activity and server-configuration loading screen observed. Startup remains under investigation; gameplay has not been verified. |
+| **TVer** | Java / dex Android UI | Welcome screen with program artwork and consent button renders. End-to-end video playback has not been verified. |
+| **APKPure 3.20.8002** | Java / dex Android UI | Store, recommendations, app details, and download manager render; HTTP download progress observed. Completed downloads, installation, and launching the installed app have not been verified. |
+| **Another Eden** | Native · ARMv7 XAPK | Existing-account load screen observed. Loading the game aborts; gameplay has not been reached. |
 | **Daggerfall Unity** | Unity Mono · ARMv7 | Mono starts, but rendering is not yet working. |
 
 <details>
@@ -785,15 +827,3 @@ Distribution builds use `-O3`, `-DNDEBUG`, and LTO. Dynarmic is rebuilt separate
 Licensed under the [Mozilla Public License 2.0](LICENSE).
 
 Project Lunaria © 2026 Yuichiro Nakada.
-
-Android framework theme inheritance uses the actual SDK Platform 31 resources:
-
-```sh
-curl -fL https://dl.google.com/android/repository/platform-31_r01.zip -o /tmp/platform-31_r01.zip
-python3 scripts/install-framework.py /tmp/platform-31_r01.zip
-```
-
-The installer verifies Google's SHA-1 and copies the resources and notices from
-`android.jar` unchanged into `runtime/framework-res/`. Application APKs are not
-modified. Set `LUNARIA_FRAMEWORK_RES` to use another directory containing
-`resources.arsc` and `res/`. The default directory is relative to the executable.

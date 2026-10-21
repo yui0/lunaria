@@ -217,7 +217,6 @@ install_linux() {
   Run:
     lunaria /path/to/app.apk
     lunaria                  # graphical launcher
-    lunaria-server 1         # headless launcher over qfkey (needs qberry RDP)
 
 EOF
 }

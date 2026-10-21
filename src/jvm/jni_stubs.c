@@ -12,6 +12,7 @@
 #include "lunaria_os.h"
 
 #include <libgen.h>
+#include <pthread.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -26,6 +27,7 @@
 #include "jvm/jni.h"
 #include "jvm.h"
 #include "java_type.h"
+#include "log_policy.h"
 #include "arm_exec.h"
 #include "dvm/dvm_jni.h"
 
@@ -604,6 +606,7 @@ android_log_write(JNIEnv *env, char level, va_list args)
     * answers NULL for a non-string handle rather than misreading it. */
    const char *msg = (*env)->GetStringUTFChars(env, va_arg(args, jstring), NULL);
    fprintf(stderr, "[java %c/%s] %s\n", level, tag ? tag : "?", msg ? msg : "");
+   lunaria_logbuf_write(level, tag, msg);
    return (jint)((tag ? strlen(tag) : 0) + (msg ? strlen(msg) : 0) + 2);
 }
 
@@ -631,12 +634,17 @@ android_util_Log_println(JNIEnv *env, jobject object, va_list args)
    return android_log_write(env, lv[(prio >= 2 && prio <= 7) ? prio : 0], args);
 }
 
-/* isLoggable(tag, level): the emulator prints every level, so say so. */
+/* isLoggable is an application-side guard, with Android's INFO default. */
 jboolean
 android_util_Log_isLoggable(JNIEnv *env, jobject object, va_list args)
 {
-   (void)env; (void)object; (void)args;
-   return JNI_TRUE;
+   (void)object;
+   jstring string=va_arg(args,jstring);
+   int priority=va_arg(args,jint);
+   const char *tag=string ? (*env)->GetStringUTFChars(env,string,NULL) : NULL;
+   bool result=lunaria_log_is_loggable(tag,priority,lunaria_android_property);
+   if(tag) (*env)->ReleaseStringUTFChars(env,string,tag);
+   return result ? JNI_TRUE : JNI_FALSE;
 }
 
 jstring
@@ -1038,10 +1046,25 @@ const char *lunaria_android_apk_path(void)
    return path;
 }
 
+/* The directory an installed package's libraries are copied to is named for the
+ * ABI of the package's own process: lib/arm64 for a 64-bit app, lib/arm for a
+ * 32-bit one, whatever the APK calls its folder (arm64-v8a, armeabi-v7a).  An
+ * app that checks its own libraries reads them from this path and compares what
+ * it finds with the process it runs in. */
+static const char *native_lib_abi_dir(void)
+{
+   const char *staged = getenv("ANDROID_NATIVE_LIB_DIR");
+   const char *abi = staged ? strrchr(staged, '/') : NULL;
+   abi = abi ? abi + 1 : staged;
+   if (abi && (!strcmp(abi, "armeabi-v7a") || !strcmp(abi, "armeabi"))) return "arm";
+   return "arm64";
+}
+
 const char *lunaria_android_native_lib_path(void)
 {
    static char path[PATH_MAX];
-   if (!path[0]) snprintf(path, sizeof path, "%s/lib/arm64", lunaria_android_apk_dir());
+   if (!path[0])
+      snprintf(path, sizeof path, "%s/lib/%s", lunaria_android_apk_dir(), native_lib_abi_dir());
    return path;
 }
 
@@ -2003,13 +2026,8 @@ android_content_pm_PackageManager_getPackageInfo(JNIEnv *env, jobject object, va
    return dvm_jni_package_info(env, name, flags);
 }
 
-/* PackageManager.getApplicationInfo(name, flags).  Native SDKs commonly ask
- * Context for the PackageManager and then query their own package again.  A
- * missing binding returned NULL even for the installed application, unlike
- * Android where it returns a fully populated ApplicationInfo (or throws
- * NameNotFoundException for an unknown package).  The host JNI boundary has
- * no pending-exception bridge here, so NULL is the faithful failure value for
- * an unknown name; the running package returns the same object as Context. */
+/* Native and bytecode callers share package visibility, metadata, and the
+ * pending NameNotFoundException for a package absent from the device. */
 jobject
 android_content_pm_PackageManager_getApplicationInfo(JNIEnv *env,
                                                        jobject object,
@@ -2018,17 +2036,8 @@ android_content_pm_PackageManager_getApplicationInfo(JNIEnv *env,
    assert(env && object);
    if (!JVM_VA_HAS_ARGS(args)) return NULL;
    jstring name = va_arg(args, jstring);
-   (void)va_arg(args, jint);
-   if (!name) return NULL;
-   const char *want = (*env)->GetStringUTFChars(env, name, NULL);
-   const char *installed = getenv("ANDROID_PACKAGE_NAME");
-   const int match = want && installed && !strcmp(want, installed);
-   if (getenv("LUNARIA_TRACE_HTTP"))
-      fprintf(stderr, "[apk-meta] PackageManager.getApplicationInfo(\"%s\") "
-                      "installed=\"%s\" match=%d\n",
-              want ? want : "<null>", installed ? installed : "<null>", match);
-   if (want) (*env)->ReleaseStringUTFChars(env, name, want);
-   return match ? lunaria_application_info(env) : NULL;
+   jint flags = va_arg(args, jint);
+   return dvm_jni_application_info(env, name, flags);
 }
 
 /* PackageInfo.versionCode — read as an int field. */

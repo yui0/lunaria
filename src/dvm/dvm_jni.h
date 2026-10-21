@@ -39,6 +39,9 @@ enum dvm_jni_mode dvm_jni_mode(void);
 bool dvm_jni_invoke(JNIEnv *env, const char *class_name, const char *method,
                     const char *sig, jobject self, bool is_static,
                     va_list *ap, const jvalue *jargs, jvalue *out);
+bool dvm_jni_invoke_nonvirtual(JNIEnv *env, const char *class_name, const char *method,
+                    const char *sig, jobject self, bool is_static,
+                    va_list *ap, const jvalue *jargs, jvalue *out);
 
 /* Called by arm_exec once the guest's libraries are loaded, so bytecode can
  * reach methods the guest declared `native`. */
@@ -65,6 +68,7 @@ bool dvm_jni_class_in_dex(const char *class_name);
  * PackageInfo, as a host handle.  NULL with NameNotFoundException pending when
  * the package is not installed. */
 jobject dvm_jni_package_info(JNIEnv *env, jstring name, jint flags);
+jobject dvm_jni_application_info(JNIEnv *env, jstring name, jint flags);
 
 /* True when the device we present has the class: the APK's dex or the
  * platform (see dvm_class_exists()).  What FindClass answers from. */
@@ -121,6 +125,7 @@ struct dvm;
 struct luna_touch_event;
 bool dvm_ui_dispatch_touch(struct dvm *vm, const struct luna_touch_event *sample);
 void dvm_jni_show_activity(JNIEnv *env, jobject activity);
+void dvm_jni_main_transaction(JNIEnv *env, bool begin);
 void dvm_jni_activity_dispatch(JNIEnv *env, jobject activity, const char *step,
                                int post);
 bool dvm_jni_activity_finishing(JNIEnv *env, jobject activity);

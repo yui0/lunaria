@@ -27,6 +27,7 @@ struct rt_bitmap {
    int config_index;
    dvm_ref color_space;
    bool recycled, is_mutable, has_alpha;
+   bool unpremultiplied;    /* setPremultiplied(false) */
    unsigned gen, png_gen;   /* png[] is current when png_gen == gen */
    char png[DVM_PATH_MAX];
    char overlay_key[64];
@@ -415,7 +416,7 @@ static bool drawable_create_from_resource_stream(struct dvm *vm, dvm_ref self,
    size_t len = 0;
    uint8_t *data = stream_slurp(vm, ARG(2).l, &len);
    if (!data) {
-      if (getenv("LUNARIA_TRACE_DRAWABLE"))
+      if (dvm__env("LUNARIA_TRACE_DRAWABLE"))
          fprintf(stderr, "[drawable] stream read failed (exception=%d)\n",
                  dvm_exception(vm) != 0);
       if (dvm_exception(vm)) return false;
@@ -424,7 +425,7 @@ static bool drawable_create_from_resource_stream(struct dvm *vm, dvm_ref self,
    dvm_ref bitmap = bitmap_decode(vm, data, len, 0, 0);
    free(data);
    if (dvm_exception(vm)) return false;
-   if (getenv("LUNARIA_TRACE_DRAWABLE")) {
+   if (dvm__env("LUNARIA_TRACE_DRAWABLE")) {
       const char *name = nargs > 3 && ARG(3).l ?
          dvm_string_utf8(vm, ARG(3).l) : NULL;
       fprintf(stderr, "[drawable] stream %s: %zu bytes, bitmap=%u\n",
@@ -823,6 +824,73 @@ static bool bm_setHasAlpha(struct dvm *vm, dvm_ref self,
    struct rt_bitmap *bm = bitmap_of(vm, self);
    if (bm) bm->has_alpha = ARG(0).i != 0;
    RETV();
+}
+
+/* Bitmap.reconfigure(): the same pixel storage under new dimensions and
+ * config, which is how a bitmap pool reuses one allocation for a smaller
+ * image.  Only a mutable bitmap may be reshaped.  The raster here is always
+ * 32-bit, so a request for more pixels than are held grows it, where a device
+ * would refuse; whatever lies beyond the old contents is cleared. */
+static bool bm_reconfigure(struct dvm *vm, dvm_ref self,
+                           const union dvm_value *args, int nargs,
+                           union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   struct rt_bitmap *bm = bitmap_of(vm, self);
+   if (!bitmap_live(vm, bm)) return false;
+   const int32_t width = ARG(0).i, height = ARG(1).i;
+   if (width <= 0 || height <= 0) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException", "width and height must be > 0");
+      return false;
+   }
+   if (!ARG(2).l) { dvm__throw(vm, "java/lang/NullPointerException", "config"); return false; }
+   if (!bm->is_mutable) {
+      dvm__throw(vm, "java/lang/IllegalStateException", "Immutable bitmap passed to reconfigure");
+      return false;
+   }
+   union dvm_value ordinal = { 0 };
+   (void)dvm_get_field(vm, ARG(2).l, "ordinal", "I", &ordinal);
+   if (ordinal.i < 0 || ordinal.i > 4) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException", "Unknown Bitmap config");
+      return false;
+   }
+   const size_t have = (size_t)bm->w * bm->h, want = (size_t)width * height;
+   if (want > have) {
+      uint32_t *grown = realloc(bm->px, want * sizeof *grown);
+      if (!grown) { dvm__throw(vm, "java/lang/OutOfMemoryError", "Bitmap.reconfigure"); return false; }
+      memset(grown + have, 0, (want - have) * sizeof *grown);
+      bm->px = grown;
+   }
+   bm->w = width;
+   bm->h = height;
+   bm->config_index = ordinal.i == 2 ? 3 : ordinal.i;   /* ARGB_4444 is upgraded by Android. */
+   if (ordinal.i == 1) bm->has_alpha = false;
+   ++bm->gen;
+   RETV();
+}
+
+/* The raster holds straight (un-premultiplied) alpha whatever this says, so
+ * the flag is state the app can read back rather than a change to the pixels;
+ * Glide sets it on a pooled bitmap before decoding into it. */
+static bool bm_setPremultiplied(struct dvm *vm, dvm_ref self,
+                                const union dvm_value *args, int nargs,
+                                union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   struct rt_bitmap *bm = bitmap_of(vm, self);
+   if (!bitmap_live(vm, bm)) return false;
+   bm->unpremultiplied = ARG(0).i == 0;
+   RETV();
+}
+
+static bool bm_isPremultiplied(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   struct rt_bitmap *bm = bitmap_of(vm, self);
+   if (!bitmap_live(vm, bm)) return false;
+   RETI(bm->has_alpha && !bm->unpremultiplied);
 }
 
 /* Public configuration metadata is independent of the host raster storage. */
@@ -1326,6 +1394,11 @@ static bool canvas_transform(struct dvm *vm, dvm_ref self,
    else {
       float radians=ARG(0).f*(float)(M_PI/180.0);
       op[0]=op[4]=cosf(radians); op[3]=sinf(radians); op[1]=-op[3];
+      if(nargs==3) {
+         float px=ARG(1).f,py=ARG(2).f;
+         op[2]=px-op[0]*px-op[1]*py;
+         op[5]=py-op[3]*px-op[4]*py;
+      }
    }
    canvas_read_matrix(vm,self,current);
    mat_mul(current,current,op);
@@ -1358,8 +1431,6 @@ static bool canvas_clip_contains(struct canvas_state *s, float x, float y)
    bool result=true;
    for (size_t i=0; s && i<s->clips; ++i) {
       const struct canvas_clip *c=&s->clip[i];
-      float lx=0,ly=0;
-      if (!c->singular) mat_map(c->inverse,x,y,&lx,&ly);
       bool inside;
       if(c->simple) {
          inside=x>=c->bounds[0] && y>=c->bounds[1] && x<c->bounds[2] && y<c->bounds[3];
@@ -1367,8 +1438,12 @@ static bool canvas_clip_contains(struct canvas_state *s, float x, float y)
          int px=(int)floorf(x)-c->mask_x,py=(int)floorf(y)-c->mask_y;
          inside=px>=0 && py>=0 && px<c->mask_width && py<c->mask_height &&
             c->mask[4*((size_t)py*c->mask_width+px)+3]!=0;
-      } else inside=!c->singular && isfinite(lx) && isfinite(ly) &&
-         lx>=c->rect[0] && lx<c->rect[2] && ly>=c->rect[1] && ly<c->rect[3];
+      } else {
+         float lx=0,ly=0;
+         if (!c->singular) mat_map(c->inverse,x,y,&lx,&ly);
+         inside=!c->singular && isfinite(lx) && isfinite(ly) &&
+            lx>=c->rect[0] && lx<c->rect[2] && ly>=c->rect[1] && ly<c->rect[3];
+      }
       switch(c->operation) {
          case 0: result=result && !inside;break;
          case 1: result=result && inside;break;
@@ -2255,21 +2330,6 @@ static inline uint32_t canvas_over_pixel(uint32_t s, uint32_t old, bool dst_alph
    return r;
 }
 
-/* One tap of a bilinear sample, weighted by coverage and straight alpha. */
-static inline void canvas_tap(const struct rt_bitmap *src, int x, int y, unsigned w,
-                              unsigned *a, unsigned *c0, unsigned *c1, unsigned *c2)
-{
-   if (!w) return;
-   uint32_t p = src->px[(size_t)y * src->w + x];
-   /* Opaque samples use coverage units; their fast normalization divides by
-    * 65536. Alpha-bearing samples use coverage * alpha and divide by a. */
-   unsigned pa = src->has_alpha ? p >> 24 : 1, wa = w * pa;
-   *a += wa;
-   *c0 += wa * ((p >> 16) & 255);
-   *c1 += wa * ((p >> 8) & 255);
-   *c2 += wa * (p & 255);
-}
-
 static void canvas_blit_scaled(const struct rt_bitmap *src, struct rt_bitmap *dst,
                                const int subset[4], const float inverse[9],
                                const float clip[4], int x0, int y0, int x1, int y1,
@@ -2285,6 +2345,27 @@ static void canvas_blit_scaled(const struct rt_bitmap *src, struct rt_bitmap *ds
    if (x0 >= x1 || y0 >= y1) return;
    const int64_t one = 65536;
    const int64_t du = (int64_t)llroundf(inverse[0] * 65536.f);
+   /* The source column and its bilinear weight depend on x alone, so they are
+    * worked out once per call rather than once per row. */
+   struct blit_col { int ix0, ix1; unsigned wx; bool inside, exact; };
+   const int cols = x1 - x0;
+   struct blit_col stack_cols[1024], *col = cols <= 1024 ? stack_cols : malloc((size_t)cols * sizeof *col);
+   if (!col) return;
+   {
+      int64_t u = (int64_t)llroundf((inverse[0] * (x0 + .5f) + inverse[2] - (filter ? .5f : 0.f)) * 65536.f);
+      for (int i = 0; i < cols; ++i, u += du) {
+         int64_t centre = filter ? u + 32768 : u;
+         struct blit_col *c = &col[i];
+         c->inside = centre >= (int64_t)subset[0] * one && centre < (int64_t)subset[2] * one;
+         if (!c->inside) continue;
+         int ix0 = (int)(u >> 16), ix1 = ix0 + 1;
+         c->exact = !filter || !(u & 0xffff);
+         c->wx = (unsigned)((u & 0xffff) >> 8);
+         c->ix0 = ix0 < subset[0] ? subset[0] : ix0 >= subset[2] ? subset[2] - 1 : ix0;
+         c->ix1 = ix1 < subset[0] ? subset[0] : ix1 >= subset[2] ? subset[2] - 1 : ix1;
+      }
+   }
+   const bool src_alpha = src->has_alpha, dst_alpha = dst->has_alpha;
    for (int y = y0; y < y1; ++y) {
       float fy = inverse[4] * (y + .5f) + inverse[5];
       if (!(fy >= subset[1] && fy < subset[3])) continue;
@@ -2294,33 +2375,40 @@ static void canvas_blit_scaled(const struct rt_bitmap *src, struct rt_bitmap *ds
       if (!filter) wy = 0;
       iy0 = iy0 < subset[1] ? subset[1] : iy0 >= subset[3] ? subset[3] - 1 : iy0;
       iy1 = iy1 < subset[1] ? subset[1] : iy1 >= subset[3] ? subset[3] - 1 : iy1;
-      int64_t u = (int64_t)llroundf((inverse[0] * (x0 + .5f) + inverse[2] - (filter ? .5f : 0.f)) * 65536.f);
+      const uint32_t *r0 = &src->px[(size_t)iy0 * src->w], *r1 = &src->px[(size_t)iy1 * src->w];
       uint32_t *row = &dst->px[(size_t)y * dst->w];
-      for (int x = x0; x < x1; ++x, u += du) {
-         /* u is the sample position, less half a texel when filtering. */
-         int64_t centre = filter ? u + 32768 : u;
-         if (centre < (int64_t)subset[0] * one || centre >= (int64_t)subset[2] * one) continue;
-         int ix0 = (int)(u >> 16);
+      for (int x = x0; x < x1; ++x) {
+         const struct blit_col *c = &col[x - x0];
+         if (!c->inside) continue;
          uint32_t s;
-         if (!filter || (!(u & 0xffff) && !wy)) {
-            int px = ix0 < subset[0] ? subset[0] : ix0 >= subset[2] ? subset[2] - 1 : ix0;
-            uint32_t p = src->px[(size_t)iy0 * src->w + px];
-            s = src->has_alpha ? p : (p | 0xff000000u);
+         if (c->exact && !wy) {
+            uint32_t p = r0[c->ix0];
+            s = src_alpha ? p : (p | 0xff000000u);
          } else {
-            int ix1 = ix0 + 1;
-            unsigned wx = (unsigned)((u & 0xffff) >> 8);
-            ix0 = ix0 < subset[0] ? subset[0] : ix0 >= subset[2] ? subset[2] - 1 : ix0;
-            ix1 = ix1 < subset[0] ? subset[0] : ix1 >= subset[2] ? subset[2] - 1 : ix1;
-            unsigned a = 0, c0 = 0, c1 = 0, c2 = 0;
-            canvas_tap(src, ix0, iy0, (256 - wx) * (256 - wy), &a, &c0, &c1, &c2);
-            canvas_tap(src, ix1, iy0, wx * (256 - wy), &a, &c0, &c1, &c2);
-            canvas_tap(src, ix0, iy1, (256 - wx) * wy, &a, &c0, &c1, &c2);
-            canvas_tap(src, ix1, iy1, wx * wy, &a, &c0, &c1, &c2);
-            if (!a) continue;
-            if (!src->has_alpha) {
+            const unsigned wx = c->wx;
+            const unsigned w00 = (256 - wx) * (256 - wy), w10 = wx * (256 - wy),
+                           w01 = (256 - wx) * wy, w11 = wx * wy;
+            const uint32_t p00 = r0[c->ix0], p10 = r0[c->ix1], p01 = r1[c->ix0], p11 = r1[c->ix1];
+            if (!src_alpha) {
                /* Opaque texels: the weights sum to 65536, so no division. */
+               unsigned c0 = w00 * ((p00 >> 16) & 255) + w10 * ((p10 >> 16) & 255) +
+                             w01 * ((p01 >> 16) & 255) + w11 * ((p11 >> 16) & 255);
+               unsigned c1 = w00 * ((p00 >> 8) & 255) + w10 * ((p10 >> 8) & 255) +
+                             w01 * ((p01 >> 8) & 255) + w11 * ((p11 >> 8) & 255);
+               unsigned c2 = w00 * (p00 & 255) + w10 * (p10 & 255) +
+                             w01 * (p01 & 255) + w11 * (p11 & 255);
                s = 0xff000000u | ((c0 + 32768) >> 16) << 16 | ((c1 + 32768) >> 16) << 8 | ((c2 + 32768) >> 16);
             } else {
+               unsigned a00 = w00 * (p00 >> 24), a10 = w10 * (p10 >> 24),
+                        a01 = w01 * (p01 >> 24), a11 = w11 * (p11 >> 24);
+               unsigned a = a00 + a10 + a01 + a11;
+               if (!a) continue;
+               unsigned c0 = a00 * ((p00 >> 16) & 255) + a10 * ((p10 >> 16) & 255) +
+                             a01 * ((p01 >> 16) & 255) + a11 * ((p11 >> 16) & 255);
+               unsigned c1 = a00 * ((p00 >> 8) & 255) + a10 * ((p10 >> 8) & 255) +
+                             a01 * ((p01 >> 8) & 255) + a11 * ((p11 >> 8) & 255);
+               unsigned c2 = a00 * (p00 & 255) + a10 * (p10 & 255) +
+                             a01 * (p01 & 255) + a11 * (p11 & 255);
                unsigned alpha = (a + 32768) >> 16;      /* weights sum to 65536 */
                s = (alpha > 255 ? 255u : alpha) << 24 | ((c0 + a / 2) / a) << 16 |
                    ((c1 + a / 2) / a) << 8 | ((c2 + a / 2) / a);
@@ -2330,9 +2418,10 @@ static void canvas_blit_scaled(const struct rt_bitmap *src, struct rt_bitmap *ds
             unsigned sa = ((s >> 24) * paint_alpha + 127) / 255;
             s = (s & 0x00ffffffu) | sa << 24;
          }
-         row[x] = canvas_over_pixel(s, row[x], dst->has_alpha);
+         row[x] = canvas_over_pixel(s, row[x], dst_alpha);
       }
    }
+   if (col != stack_cols) free(col);
 }
 
 static bool canvas_draw_bitmap(struct dvm *vm, dvm_ref self,
@@ -2551,6 +2640,38 @@ static bool canvas_text_run(struct dvm *vm,dvm_ref canvas,dvm_ref paint,
             box[3]=(int)fminf(box[3],fmaxf(0,ceilf(bounds[3])));
          }
       }
+      /* Unrotated text at its raster size, the common case: the sample point
+       * is a pure translation of the pixel, so the bilinear fractions are
+       * constant across a row and no matrix or clip query is needed. */
+      canvas_prepare_clip(state);
+      if((flags.i&1) && state->clip_simple && matrix[1]==0 && matrix[3]==0 && matrix[6]==0 && matrix[7]==0 &&
+         matrix[8]==1 && matrix[0]==1 && matrix[4]==1) {
+         const float *cb=state->clip_bounds;
+         for(int py=box[1];py<box[3];++py) {
+            if(!(py+.5f>=cb[1] && py+.5f<cb[3])) continue;
+            const float v=py+.5f-matrix[5];
+            if(!(v>=0 && v<mask.height)) continue;
+            const float sy=v-.5f;const int iy=(int)floorf(sy);const float fy=sy-iy;
+            for(int px=box[0];px<box[2];++px) {
+               if(!(px+.5f>=cb[0] && px+.5f<cb[2])) continue;
+               const float u=px+.5f-matrix[2];
+               if(!(u>=0 && u<mask.width)) continue;
+               const float sx=u-.5f;const int ix=(int)floorf(sx);const float fx=sx-ix;
+               float value=0;
+               for(int j=0;j<2;++j) for(int i=0;i<2;++i) {
+                  int tx=ix+i,ty=iy+j;
+                  if(tx>=0 && ty>=0 && tx<mask.width && ty<mask.height)
+                     value+=mask.coverage[(size_t)ty*mask.width+tx]*(i ? fx : 1-fx)*(j ? fy : 1-fy);
+               }
+               unsigned coverage=(unsigned)lroundf(value);
+               if(!coverage && dst->has_alpha) continue;
+               size_t index=(size_t)py*dst->w+px;
+               dst->px[index]=canvas_blend(color.u,dst->px[index],mode,coverage,!dst->has_alpha);
+            }
+         }
+         luna_overlay_free_glyph(&mask);
+         continue;
+      }
       for(int py=box[1];py<box[3];++py) for(int px=box[0];px<box[2];++px) {
          if(!canvas_clip_contains(state,px+.5f,py+.5f)) continue;
          float u,v;mat_map(inverse,px+.5f,py+.5f,&u,&v);
@@ -2743,6 +2864,7 @@ static const struct rt_method rt_canvas[] = {
    M("translate", "(FF)V", canvas_transform),
    M("scale", "(FF)V", canvas_transform),
    M("rotate", "(F)V", canvas_transform),
+   M("rotate", "(FFF)V", canvas_transform),
    M("skew", "(FF)V", canvas_transform),
    M("concat", "(Landroid/graphics/Matrix;)V", canvas_transform),
    M("clipRect", "(FFFF)Z", canvas_clip_rect),
@@ -2927,6 +3049,7 @@ static const struct rt_method rt_recording_canvas[] = {
    M("translate", "(FF)V", recording_canvas_call),
    M("scale", "(FF)V", recording_canvas_call),
    M("rotate", "(F)V", recording_canvas_call),
+   M("rotate", "(FFF)V", recording_canvas_call),
    M("skew", "(FF)V", recording_canvas_call),
    M("concat", "(Landroid/graphics/Matrix;)V", recording_canvas_call),
    M("clipRect", "(FFFF)Z", recording_canvas_call),
@@ -2958,13 +3081,17 @@ static const struct rt_method rt_recording_canvas[] = {
    M("drawBitmap", "(Landroid/graphics/Bitmap;Landroid/graphics/Rect;Landroid/graphics/RectF;Landroid/graphics/Paint;)V", recording_canvas_call),
    M_END
 };
+static bool x_clip_to_outline(struct dvm *vm,dvm_ref canvas,dvm_ref outline);
+static bool x_view_clip_to_outline(struct dvm *vm,dvm_ref view,dvm_ref canvas);
 static const struct rt_field rt_render_node_fields[]={
    {"recording","Landroid/graphics/RecordingCanvas;"},
    {"displayList","Landroid/graphics/RecordingCanvas;"},
    {"left","I"},{"top","I"},{"right","I"},{"bottom","I"},
    {"translationX","F"},{"translationY","F"},{"scaleX","F"},{"scaleY","F"},
    {"rotationZ","F"},{"pivotX","F"},{"pivotY","F"},{"pivotExplicit","Z"},
-   {"clipToBounds","Z"},F_END
+   {"clipToBounds","Z"},
+   {"outline","Landroid/graphics/Outline;"},{"clipToOutline","Z"},
+   {"hasOverlappingRendering","Z"},{"usesCompositingLayer","Z"},F_END
 };
 static bool render_node_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
@@ -3088,6 +3215,10 @@ static bool canvas_draw_render_node(struct dvm *vm,dvm_ref self,const union dvm_
       union dvm_value rect[]={{.i=0},{.i=0},{.i=(int32_t)((uint32_t)rt_get_int(vm,node,"right")-(uint32_t)rt_get_int(vm,node,"left"))},
          {.i=(int32_t)((uint32_t)rt_get_int(vm,node,"bottom")-(uint32_t)rt_get_int(vm,node,"top"))}};
       good=am_vcall(vm,self,"clipRect","(IIII)Z",rect,4,&ignored);
+   }
+   if(good && rt_get_int(vm,node,"clipToOutline")) {
+      union dvm_value outline={0};dvm_get_field(vm,node,"outline","Landroid/graphics/Outline;",&outline);
+      if(outline.l) good=x_clip_to_outline(vm,self,outline.l);
    }
    float replay_base[9];canvas_read_matrix(vm,self,replay_base);
    for(size_t i=0;good && i<recording->command_count;++i) {
@@ -3232,6 +3363,7 @@ static bool vg_draw_child(struct dvm *vm,dvm_ref self,const union dvm_value *arg
       good=am_vcall(vm,canvas,"clipRect","(IIII)Z",clip,4,&ignored);
       visible=ignored.i!=0;
    }
+   if (good) good=x_view_clip_to_outline(vm,child,canvas);
    bool trace=g_ui_draw_trace_budget!=0;
    uint32_t before=0;struct rt_bitmap *trace_bitmap=NULL;
    if(trace) {
@@ -3672,6 +3804,32 @@ static bool image_on_draw(struct dvm *vm,dvm_ref self,const union dvm_value *arg
    return good && restored;
 }
 
+static bool progress_bar_on_draw(struct dvm *vm,dvm_ref self,
+   const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   if(!ARG(0).l) {dvm__throw(vm,"java/lang/NullPointerException","canvas");return false;}
+   if(!progress_bar_resize(vm,self)) return false;
+   dvm_ref drawable=ui_obj(vm,self,rt_get_int(vm,self,"indeterminate") ?
+      "indeterminateDrawable" : "progressDrawable","Landroid/graphics/drawable/Drawable;");
+   if(!drawable) RETV();
+   union dvm_value saved={0},ignored={0},direction={0},width={0};
+   if(!am_vcall(vm,ARG(0).l,"save","()I",NULL,0,&saved)) return false;
+   bool good=am_vcall(vm,self,"getLayoutDirection","()I",NULL,0,&direction);
+   bool mirror=direction.i==1 && rt_get_int(vm,self,"mirrorForRtl");
+   if(good && mirror) good=view_get_width(vm,self,NULL,0,&width);
+   union dvm_value shift[]={{.f=mirror ? (float)progress_bar_int((int64_t)width.i-ui_int(vm,self,"paddingRight")) : (float)ui_int(vm,self,"paddingLeft")},
+      {.f=(float)ui_int(vm,self,"paddingTop")}},scale[]={{.f=-1},{.f=1}};
+   if(good) good=am_vcall(vm,ARG(0).l,"translate","(FF)V",shift,2,&ignored);
+   if(good && mirror) good=am_vcall(vm,ARG(0).l,"scale","(FF)V",scale,2,&ignored);
+   if(good) good=am_vcall(vm,drawable,"draw","(Landroid/graphics/Canvas;)V",args,1,out);
+   dvm_ref raised=vm->exception;
+   if(raised) {dvm_pin(vm,raised);dvm_clear_exception(vm);}
+   bool restored=am_vcall(vm,ARG(0).l,"restoreToCount","(I)V",&saved,1,&ignored);
+   if(raised) {vm->exception=raised;dvm_unpin(vm,raised);}
+   return good && restored;
+}
+
 /* Host widgets retain their existing rendering. A guest draw override owns
  * its subtree: call the real View pipeline and publish its resulting pixels. */
 static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
@@ -3683,6 +3841,8 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
       struct dvm_method *m=cls ? dvm_find_method(vm,cls,hooks[i],"(Landroid/graphics/Canvas;)V") : NULL;
       if (m && m->has_code) custom=true;
    }
+   /* ProgressBar renders its Drawable through the same View/Canvas pipeline. */
+   if(ui_is_a(vm,view,"android/widget/ProgressBar")) custom=true;
    if (ui_is_a(vm,view,"android/view/SurfaceView")) {
       dvm_ref holder=ui_obj(vm,view,"holder","Landroid/view/SurfaceHolder;");
       dvm_ref surface=ui_obj(vm,holder,"surface","Landroid/view/Surface;");
@@ -4023,6 +4183,12 @@ static const struct rt_method rt_bitmap[] = {
    M("getDensity", "()I", bm_flag),
    M("setDensity", "(I)V", bm_setDensity),
    M("setHasAlpha", "(Z)V", bm_setHasAlpha),
+   M("setPremultiplied", "(Z)V", bm_setPremultiplied),
+   M("isPremultiplied", "()Z", bm_isPremultiplied),
+   M("reconfigure", "(IILandroid/graphics/Bitmap$Config;)V", bm_reconfigure),
+   /* A hint that the bitmap is about to be drawn, so a device can upload it
+    * ahead of time; the raster here is already where drawing reads it. */
+   M("prepareToDraw", "()V", empty_void),
    M("getConfig", "()Landroid/graphics/Bitmap$Config;", bm_getConfig),
    M("getColorSpace", "()Landroid/graphics/ColorSpace;", bm_getColorSpace),
    M("copy", "(Landroid/graphics/Bitmap$Config;Z)Landroid/graphics/Bitmap;", bm_copy),
@@ -4993,3 +5159,169 @@ static const struct rt_field rt_gd_orientation_sfields[] = {
    F_END
 };
 
+
+/* Copyright © 2026 Yuichiro Nakada / Project Lunaria
+ * SPDX-License-Identifier: MPL-2.0 */
+/* RotateDrawable uses the child's bounds and keeps its own interpolation
+ * angle. Changing an endpoint invalidates but does not advance the level. */
+static float rotate_float(struct dvm *vm,dvm_ref self,const char *field)
+{
+   union dvm_value v={0};
+   (void)dvm_get_field(vm,self,field,"F",&v);
+   return v.f;
+}
+static void rotate_set_float(struct dvm *vm,dvm_ref self,const char *field,float value)
+{ (void)dvm_set_field(vm,self,field,"F",(union dvm_value){.f=value}); }
+static bool rotate_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   if(!drawable_init(vm,self,args,nargs,out)) return false;
+   rotate_set_float(vm,self,"pivotX",0.5f);
+   rotate_set_float(vm,self,"pivotY",0.5f);
+   rotate_set_float(vm,self,"fromDegrees",0.0f);
+   rotate_set_float(vm,self,"toDegrees",360.0f);
+   rotate_set_float(vm,self,"currentDegrees",0.0f);
+   (void)dvm_set_field(vm,self,"pivotXRelative","Z",(union dvm_value){.i=1});
+   (void)dvm_set_field(vm,self,"pivotYRelative","Z",(union dvm_value){.i=1});
+   RETV();
+}
+static bool rotate_property(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   const char *name=builtin_name();
+   const char *field=strstr(name,"FromDegrees") ? "fromDegrees" :
+      strstr(name,"ToDegrees") ? "toDegrees" : strstr(name,"PivotX") ? "pivotX" : "pivotY";
+   const bool relative=strstr(name,"Relative")!=NULL;
+   if(relative) field=strstr(name,"PivotX") ? "pivotXRelative" : "pivotYRelative";
+   union dvm_value v={0};
+   (void)dvm_get_field(vm,self,field,relative ? "Z" : "F",&v);
+   if(!nargs) {if(relative) RETI(v.i);RETF(v.f);}
+   bool changed=relative ? v.i!=(ARG(0).i!=0) : v.f!=ARG(0).f;
+   if(changed) {
+      v=ARG(0);if(relative)v.i=v.i!=0;
+      (void)dvm_set_field(vm,self,field,relative ? "Z" : "F",v);
+      if(!am_vcall(vm,self,"invalidateSelf","()V",NULL,0,out)) return false;
+   }
+   RETV();
+}
+static bool rotate_level(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   union dvm_value ignored={0};
+   if(!dc_level(vm,self,args,nargs,&ignored)) return false;
+   float from=rotate_float(vm,self,"fromDegrees"),to=rotate_float(vm,self,"toDegrees");
+   rotate_set_float(vm,self,"currentDegrees",from+(to-from)*(ARG(0).i/10000.0f));
+   if(!am_vcall(vm,self,"invalidateSelf","()V",NULL,0,&ignored)) return false;
+   RETI(1);
+}
+static bool rotate_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   dvm_ref child=dc_current(vm,self);
+   union dvm_value bounds={0},saved={0},ignored={0};
+   if(!am_vcall(vm,child,"getBounds","()Landroid/graphics/Rect;",NULL,0,&bounds)) return false;
+   int32_t left=rt_get_int(vm,bounds.l,"left"),top=rt_get_int(vm,bounds.l,"top");
+   float width=(float)rt_get_int(vm,bounds.l,"right")-(float)left;
+   float height=(float)rt_get_int(vm,bounds.l,"bottom")-(float)top;
+   union dvm_value relative_x={0},relative_y={0};
+   (void)dvm_get_field(vm,self,"pivotXRelative","Z",&relative_x);
+   (void)dvm_get_field(vm,self,"pivotYRelative","Z",&relative_y);
+   float px=rotate_float(vm,self,"pivotX"),py=rotate_float(vm,self,"pivotY");
+   union dvm_value rotation[3]={{.f=rotate_float(vm,self,"currentDegrees")},
+      {.f=left+(relative_x.i ? px*width : px)}, {.f=top+(relative_y.i ? py*height : py)}};
+   if(!am_vcall(vm,ARG(0).l,"save","()I",NULL,0,&saved) ||
+      !am_vcall(vm,ARG(0).l,"rotate","(FFF)V",rotation,3,&ignored) ||
+      !am_vcall(vm,child,"draw","(Landroid/graphics/Canvas;)V",args,nargs,&ignored)) return false;
+   return am_vcall(vm,ARG(0).l,"restoreToCount","(I)V",&saved,1,out);
+}
+static const struct rt_field rt_rotate_fields[]={
+   {"fromDegrees","F"},{"toDegrees","F"},{"currentDegrees","F"},
+   {"pivotX","F"},{"pivotY","F"},{"pivotXRelative","Z"},{"pivotYRelative","Z"},F_END
+};
+static const struct rt_method rt_rotate_drawable[]={
+   M("<init>","()V",rotate_init),M("draw","(Landroid/graphics/Canvas;)V",rotate_draw),
+   M("onLevelChange","(I)Z",rotate_level),
+   M("getFromDegrees","()F",rotate_property),M("setFromDegrees","(F)V",rotate_property),
+   M("getToDegrees","()F",rotate_property),M("setToDegrees","(F)V",rotate_property),
+   M("getPivotX","()F",rotate_property),M("setPivotX","(F)V",rotate_property),
+   M("getPivotY","()F",rotate_property),M("setPivotY","(F)V",rotate_property),
+   M("isPivotXRelative","()Z",rotate_property),M("setPivotXRelative","(Z)V",rotate_property),
+   M("isPivotYRelative","()Z",rotate_property),M("setPivotYRelative","(Z)V",rotate_property),M_END
+};
+
+/* AnimatedRotateDrawable advances only through its scheduled Runnable; draw
+ * observes the current frame. Timing and visibility follow Android's wrapper. */
+static bool animated_rotate_next(struct dvm *vm,dvm_ref self,bool schedule)
+{
+   union dvm_value action={0},ignored={0};
+   (void)dvm_get_field(vm,self,"nextFrame","Ljava/lang/Runnable;",&action);
+   if(!action.l) return true;
+   if(!am_vcall(vm,self,"unscheduleSelf","(Ljava/lang/Runnable;)V",&action,1,&ignored)) return false;
+   if(!schedule) return true;
+   union dvm_value a[]={action,{.j=(int64_t)(luna_os_uptime_ns()/1000000ULL)+rt_get_int(vm,self,"frameDuration")}};
+   return am_vcall(vm,self,"scheduleSelf","(Ljava/lang/Runnable;J)V",a,2,&ignored);
+}
+static bool animated_rotate_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   if(!rotate_init(vm,self,args,nargs,out)) return false;
+   rotate_set_float(vm,self,"pivotX",0);rotate_set_float(vm,self,"pivotY",0);
+   (void)dvm_set_field(vm,self,"pivotXRelative","Z",(union dvm_value){0});
+   (void)dvm_set_field(vm,self,"pivotYRelative","Z",(union dvm_value){0});
+   rt_set_int(vm,self,"framesCount",12);rt_set_int(vm,self,"frameDuration",150);
+   rt_set_int(vm,self,"running",0);
+   dvm_ref action=dvm_new_object(vm,dvm_find_class(vm,"lunaria/AnimatedRotateFrame"));
+   if(!action) return false;
+   (void)dvm_set_field(vm,action,"owner","Landroid/graphics/drawable/AnimatedRotateDrawable;",(union dvm_value){.l=self});
+   (void)dvm_set_field(vm,self,"nextFrame","Ljava/lang/Runnable;",(union dvm_value){.l=action});
+   RETV();
+}
+static bool animated_rotate_control(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   const char *name=builtin_name();
+   if(!strcmp(name,"isRunning")) RETI(rt_get_int(vm,self,"running"));
+   if(!strcmp(name,"setFramesCount") || !strcmp(name,"setFramesDuration")) {
+      rt_set_int(vm,self,!strcmp(name,"setFramesCount") ? "framesCount" : "frameDuration",ARG(0).i);RETV();
+   }
+   bool start=!strcmp(name,"start");
+   if(start && rt_get_int(vm,self,"running")) RETV();
+   rt_set_int(vm,self,"running",start);
+   if(!animated_rotate_next(vm,self,start)) return false;
+   RETV();
+}
+static bool animated_rotate_visible(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   if(!dc_visible(vm,self,args,nargs,out)) return false;
+   bool changed=out->i!=0;
+   if(!ARG(0).i) return animated_rotate_next(vm,self,false);
+   if(changed || ARG(1).i) {
+      rotate_set_float(vm,self,"currentDegrees",0);
+      if(!animated_rotate_next(vm,self,true)) return false;
+   }
+   out->i=changed;return true;
+}
+static bool animated_rotate_frame(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   union dvm_value owner={0},ignored={0};
+   (void)dvm_get_field(vm,self,"owner","Landroid/graphics/drawable/AnimatedRotateDrawable;",&owner);
+   if(!owner.l) RETV();
+   float increment=360.0f/(float)rt_get_int(vm,owner.l,"framesCount");
+   float degrees=rotate_float(vm,owner.l,"currentDegrees")+increment;
+   if(degrees>360.0f-increment) degrees=0;
+   rotate_set_float(vm,owner.l,"currentDegrees",degrees);
+   if(!am_vcall(vm,owner.l,"invalidateSelf","()V",NULL,0,&ignored) ||
+      !animated_rotate_next(vm,owner.l,true)) return false;
+   RETV();
+}
+static const struct rt_field rt_animated_rotate_fields[]={
+   {"fromDegrees","F"},{"toDegrees","F"},{"currentDegrees","F"},
+   {"pivotX","F"},{"pivotY","F"},{"pivotXRelative","Z"},{"pivotYRelative","Z"},
+   {"framesCount","I"},{"frameDuration","I"},{"running","I"},{"nextFrame","Ljava/lang/Runnable;"},F_END};
+static const struct rt_field rt_animated_rotate_frame_fields[]={
+   {"owner","Landroid/graphics/drawable/AnimatedRotateDrawable;"},F_END};
+static const struct rt_method rt_animated_rotate_frame[]={M("run","()V",animated_rotate_frame),M_END};
+static const char *const rt_animated_rotate_interfaces[]={"Landroid/graphics/drawable/Animatable;",NULL};
+static const struct rt_method rt_animatable[]={
+   {"start","()V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
+   {"stop","()V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
+   {"isRunning","()Z",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},M_END};
+static const struct rt_method rt_animated_rotate[]={
+   M("<init>","()V",animated_rotate_init),M("draw","(Landroid/graphics/Canvas;)V",rotate_draw),
+   M("start","()V",animated_rotate_control),M("stop","()V",animated_rotate_control),
+   M("isRunning","()Z",animated_rotate_control),M("setVisible","(ZZ)Z",animated_rotate_visible),
+   M("setFramesCount","(I)V",animated_rotate_control),M("setFramesDuration","(I)V",animated_rotate_control),M_END};

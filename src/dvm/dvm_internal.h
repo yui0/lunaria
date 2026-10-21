@@ -53,6 +53,9 @@ struct dvm_method {
    int arg_slots;      /* parameter registers, excluding `this` */
    int arg_count;      /* declared parameters */
    char ret_kind;
+   /* virtual_target()'s two-entry inline cache: receiver class -> override. */
+   struct dvm_class *vt_cls[2];
+   struct dvm_method *vt_m[2];
 };
 
 /* One resolved lookup, cached on the class it was asked of.  `hash` is zero
@@ -210,6 +213,10 @@ struct dvm {
    struct bytecode_thread *host_threads; /* joinable Java threads, under GIL */
    struct dvm_hooks hooks;
    dvm_ref pending_intents; /* live IntentSender tokens, under GIL */
+   uint64_t executor_sequence; /* FIFO order of equal-deadline tasks, under GIL */
+   struct dvm_alarm *alarms; /* process-local AlarmManager service, under GIL */
+   struct rt_codec *active_codecs; /* asynchronous MediaCodec, under GIL */
+   struct rt_surface_texture *surface_textures; /* frame listeners, under GIL */
    dvm_ref content_providers; /* attached local providers, under GIL */
    struct dvm_network_callback *network_callbacks;
    size_t nnetwork_callbacks;
@@ -286,6 +293,7 @@ struct dvm {
    bool keystore_hydrated;
    dvm_ref accepted_issuers; /* host CA snapshot belongs to this VM */
    dvm_ref main_thread;
+   unsigned main_transaction_depth; /* lifecycle work holds the main Looper until completion */
    uint64_t main_host_thread;
    dvm_ref main_thread_group, system_thread_group;
    struct dvm_attached_thread native_threads[256];
@@ -389,6 +397,9 @@ void dvm__main_queue_idle(struct dvm *vm, bool dispatched);
 bool dvm__class_assignable(struct dvm *vm, struct dvm_class *from,
                            struct dvm_class *to);
 struct dvm_object *dvm__obj(struct dvm *vm, dvm_ref ref);
+/* A non-escaping builtin may discard its newly imported JNI copies. */
+bool dvm__builtin_borrows_jni_payloads(const struct dvm_method *method);
+void dvm__discard_temporary(struct dvm *vm,dvm_ref ref);
 void dvm__throw(struct dvm *vm, const char *class_name, const char *fmt, ...);
 void dvm__warn_placeholder(struct dvm *vm);
 /* The builtin whose body is running, for the handful of handlers bound to
@@ -527,6 +538,12 @@ static inline void dvm__note_io_progress(struct dvm *vm, size_t bytes) {
  * Runs from the pending-queue drain because that is this VM's main looper —
  * the thread every other posted callback already runs on. */
 void dvm__ui_tick(struct dvm *vm);
+/* getenv() for a literal name whose value never changes while the process
+ * runs; see dvm.c. */
+const char *dvm__env(const char *name);
+/* Looper.setMessageLogging(): the dispatchers print around each message. */
+void dvm_runtime_looper_log(struct dvm *vm, dvm_ref looper, bool begin, dvm_ref runnable);
+int dvm_runtime_orphan_extras(const char **first);
 void dvm__network_tick(struct dvm *vm);
 
 /* Runs threads queued by Thread.start(); called when the VM returns to JNI. */
@@ -581,6 +598,9 @@ bool dvm_runtime_context_broadcast(struct dvm *vm, const char *method,
 /* dvm_runtime.c: installs the built-in classes into a fresh VM. */
 void dvm_runtime_install(struct dvm *vm);
 void dvm_nsd_poll(struct dvm *vm);
+void dvm_alarm_poll(struct dvm *vm);
+void dvm_alarm_poll_at(struct dvm *vm, int64_t wall_ms, int64_t elapsed_ms);
+void dvm_alarm_finish(struct dvm *vm);
 void dvm_nsd_finish(struct dvm *vm);
 /* Called by dvm.c when a class has no dex definition, before falling back to
  * the host stubs.  Returns NULL when the runtime has no built-in for it. */

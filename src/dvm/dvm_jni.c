@@ -239,6 +239,51 @@ struct bridge_frame {
 };
 static _Thread_local struct bridge_frame *g_bridge_frame;
 
+/* Fresh copies imported for a borrowing builtin belong to that invocation.
+ * Existing wrappers can be referenced by Java fields, arrays or other frames
+ * and must never be disconnected by this scope. */
+struct borrowed_import { jobject host; dvm_ref ref; };
+struct borrowed_imports {
+   struct borrowed_imports *previous;
+   struct borrowed_import *items;
+   size_t count,capacity;
+   struct borrowed_import local[8];
+};
+static _Thread_local struct borrowed_imports *g_borrowed_imports;
+
+static void borrowed_import_record(jobject host,dvm_ref ref)
+{
+   struct borrowed_imports *scope=g_borrowed_imports;
+   if(!scope || !host || !ref)return;
+   if(scope->count==scope->capacity) {
+      size_t capacity=scope->capacity*2;
+      struct borrowed_import *items=malloc(capacity*sizeof *items);
+      if(!items)return; /* Preserve ownership if bookkeeping runs out of memory. */
+      memcpy(items,scope->items,scope->count*sizeof *items);
+      if(scope->items!=scope->local)free(scope->items);
+      scope->items=items;scope->capacity=capacity;
+   }
+   scope->items[scope->count++]=(struct borrowed_import){host,ref};
+}
+
+static void borrowed_import_end(struct dvm *vm,JNIEnv *env,
+                                 struct borrowed_imports *scope,bool release)
+{
+   g_borrowed_imports=scope->previous;
+   for(size_t i=scope->count;release && i>0;--i) {
+      const struct borrowed_import *item=&scope->items[i-1];
+      struct dvm_object *object=dvm__obj(vm,item->ref);
+      if(!object || object->pins!=1 ||
+         object->host_handle!=(uint32_t)(uintptr_t)item->host)continue;
+      object->host_handle=0;
+      forget_wrapper((uint32_t)(uintptr_t)item->host,item->ref);
+      (*env)->DeleteGlobalRef(env,item->host);
+      dvm_unpin(vm,item->ref);
+      dvm__discard_temporary(vm,item->ref);
+   }
+   if(scope->items!=scope->local)free(scope->items);
+}
+
 static void bridge_record(jobject handle, dvm_ref source, bool direct)
 {
    struct bridge_frame *f = g_bridge_frame;
@@ -273,7 +318,7 @@ static bool bridge_release_one(struct dvm *vm, JNIEnv *env, struct jvm *jvm,
    const int refs = jvm_bridge_ref_count(jvm, local->handle);
    if (refs > 1) {
       (*env)->DeleteLocalRef(env, local->handle);
-      return false;  /* a global reference still owns this handle */
+      return false;  /* another local, global or array reference owns it */
    }
    struct dvm_object *o = local->source ? dvm__obj(vm, local->source) : NULL;
    if (o && o->host_handle == (uint32_t)(uintptr_t)local->handle) {
@@ -346,7 +391,24 @@ static dvm_ref wrapper_for(struct dvm *vm, JNIEnv *env,
    if (!r) return 0;
    dvm_pin(vm, r);
    remember_wrapper(host, r);
+   borrowed_import_record(owned,r);
    return r;
+}
+
+/* A payload copied into the interpreter remains the same Java object. The
+ * interpreter owns the payload until VM teardown, just as it owns ordinary
+ * external wrappers; its reference must outlive the incoming JNI local. */
+static dvm_ref bind_payload(struct dvm *vm, JNIEnv *env, dvm_ref ref, jobject host)
+{
+   struct dvm_object *object = ref ? dvm__obj(vm, ref) : NULL;
+   if (!object) return 0;
+   jobject owned = (*env)->NewGlobalRef(env, host);
+   if (!owned) return 0;
+   object->host_handle = (uint32_t)(uintptr_t)owned;
+   dvm_pin(vm, ref);
+   remember_wrapper(object->host_handle, ref);
+   borrowed_import_record(owned,ref);
+   return ref;
 }
 
 /* Element descriptor and width of a host array class name ("[B" → 'B', 1). */
@@ -446,7 +508,7 @@ static dvm_ref host_array_to_dvm(struct dvm *vm, JNIEnv *env, jobject o)
    dvm_ref r = dvm_new_array(vm, kind, elem, (uint32_t)n);
    void *dst = r ? dvm_array_data(vm, r) : NULL;
    if (dst && n > 0) ARRAY_REGION(env, Get, kind, o, n, dst);
-   return r;
+   return bind_payload(vm, env, r, o);
 }
 
 /* The other direction of the copy above, run after the callee returns.
@@ -551,6 +613,16 @@ static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
     * A cleared weak reference crosses the Java boundary as null. */
    o = jvm_resolve_reference(jnienv_get_jvm(env), o);
    if (!o) return 0;
+   dvm_ref known = find_wrapper((uint32_t)(uintptr_t)o);
+   if (known) {
+      struct dvm_object *object = dvm__obj(vm, known);
+      /* Native code may have modified a primitive array since the previous
+       * crossing. Refresh its existing payload rather than replacing it. */
+      if (object && object->kind == DVM_OBJ_ARRAY && object->elem_kind != 'L' &&
+          object->length && object->data)
+         ARRAY_REGION(env, Get, object->elem_kind, o, (jsize)object->length, object->data);
+      return known;
+   }
    dvm_ref arr = host_array_to_dvm(vm, env, o);
    if (arr) return arr;
    /* A JNI member id carries the same metadata as its reflected object.
@@ -603,16 +675,10 @@ static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
       struct jvm *jvm = jnienv_get_jvm(env);
       const char *described = jvm_described_class_name(jvm, o);
       if (described && *described) {
-         /* Only a class the VM defines becomes a VM Class object.  A class
-          * that exists solely in the host stub layer has no methods or fields
-          * here, so a Class object for it would answer an empty
-          * getConstructors()/getDeclaredMethods() — reflection over it would
-          * fail rather than reach the stub that can service it.  Such a
-          * handle stays a wrapper, which is what carries it back out to the
-          * layer that owns it.  (Its getName() is wrong here; fixing that
-          * means giving external classes real reflective members, not
-          * renaming the wrapper — see PROGRESS.md.) */
-         struct dvm_class *c = dvm_find_class(vm, described);
+         /* A Class names the represented type even when its implementation
+          * is host-backed. An opaque java.lang.Class wrapper loses that
+          * identity and makes reflection inspect Class itself. */
+         struct dvm_class *c = dvm_find_class_or_external(vm, described);
          if (c) {
             dvm_ref r = dvm_class_object(vm, c);
             if (r) dvm_pin(vm, r);
@@ -630,7 +696,7 @@ static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
       if (strc && (*env)->IsInstanceOf(env, o, strc)) {
          size_t bytes;
          const char *utf = jvm_string_wtf8(jnienv_get_jvm(env), (jstring)o, &bytes);
-         return dvm_new_string_n(vm, utf, bytes);
+         return bind_payload(vm, env, dvm_new_string_n(vm, utf, bytes), o);
       }
    }
    /* Wrap it as what it actually is.  Naming every incoming object
@@ -741,8 +807,14 @@ static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
    uint32_t host = dvm_external_handle(vm, r);
    if (host) {
       if (jvm_bridge_ref_count(jnienv_get_jvm(env), (jobject)(uintptr_t)host) > 0 &&
-          wrapper_current(env, host, r))
+          wrapper_current(env, host, r)) {
+         struct dvm_object *object = dvm__obj(vm, r);
+         if (object && object->kind == DVM_OBJ_ARRAY && object->elem_kind != 'L' &&
+             object->length && object->data)
+            ARRAY_REGION(env, Set, object->elem_kind, (jobject)(uintptr_t)host,
+                         (jsize)object->length, object->data);
          return (*env)->NewLocalRef(env, (jobject)(uintptr_t)host);
+      }
       struct dvm_object *stale = dvm__obj(vm, r);
       if (stale) stale->host_handle = 0;
       forget_wrapper(host, r);
@@ -755,7 +827,8 @@ static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
    if (s) {
       size_t bytes = dvm_string_utf8_length(vm, r);
       jobject h = (jobject)jvm_new_string_wtf8(jnienv_get_jvm(env), s, bytes);
-      bridge_record(h, 0, false);
+      if (!bind_payload(vm, env, r, h)) return NULL;
+      bridge_record(h, r, false);
       return h;
    }
 
@@ -804,19 +877,21 @@ static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
     * IsInstanceOf/IsAssignableFrom, Class.getName, reflection), and those
     * cannot work on an opaque that has no class behind it.
     *
-    * klass->name is already the internal form FindClass wants, including for
-    * array classes ("[I", "[Ljava/lang/String;").  A Class object with no
-    * klass — a primitive class the VM models differently — is left to the
-    * generic path rather than guessed at. */
+    * Arrays use FindClass's internal form. Primitive Class objects instead
+    * cross through an internal factory: "I" is a descriptor, not a class
+    * name which JNI FindClass is allowed to load. */
    if (c && c->name && !strcmp(c->name, "java/lang/Class")) {
       struct dvm_object *co = dvm__obj(vm, r);
       if (co && co->kind == DVM_OBJ_CLASS && co->klass && co->klass->name) {
-         jclass jc = (*env)->FindClass(env, co->klass->name);
+         jclass jc = co->klass->is_primitive
+            ? jvm_primitive_class(jnienv_get_jvm(env), co->klass->desc)
+            : (*env)->FindClass(env, co->klass->name);
          if (jc) {
             co->host_handle = (uint32_t)(uintptr_t)jc;
             remember_wrapper(co->host_handle, r);
             return (jobject)jc;
          }
+         return NULL;
       }
    }
 
@@ -1066,10 +1141,14 @@ static bool pm_query_package(struct dvm *vm, const union dvm_value *args,
    const char *want = NULL;
    if (nargs >= 1 && args[0].l) want = dvm_string_utf8(vm, args[0].l);
    if (!want || !*want) want = getenv("ANDROID_PACKAGE_NAME");
-   if (!want || !lunaria_android_package_find(want, record)) return false;
+   const bool found = want && lunaria_android_package_find(want, record);
    /* A package the caller cannot see is, to that caller, not installed --
       the same NameNotFoundException a device raises. */
-   return lunaria_android_package_visible(record) != 0;
+   const bool visible = found && lunaria_android_package_visible(record) != 0;
+   if (getenv("LUNARIA_TRACE_PM"))
+      fprintf(stderr, "[pm] query %s found=%d visible=%d\n",
+              want ? want : "<null>", found, visible);
+   return visible;
 }
 
 static void dvm_fill_registered_application_info(
@@ -1413,9 +1492,9 @@ static bool hook_call_external_inner(void *user, struct dvm *vm, const char *cla
     * still yields zero, as it always did). */
    if (!jvm_method_has_stub(env, mid)) return false;
 
-   jvalue jargs[64];
+   jvalue jargs[LUNARIA_JNI_MAX_ARGS];
    memset(jargs, 0, sizeof jargs);
-   for (int i = 0; i < nargs && i < 64; ++i) {
+   for (int i = 0; i < nargs && i < LUNARIA_JNI_MAX_ARGS; ++i) {
       char one[256];
       if (!dvm__sig_param(sig, i, one, sizeof one)) break;
       jargs[i] = dvm_to_jvalue(vm, env, dvm__kind_of(one), args[i]);
@@ -1542,9 +1621,9 @@ static bool hook_call_native(void *user, struct dvm *vm, const char *class_name,
    struct bridge_frame frame = { .prev = g_bridge_frame };
    g_bridge_frame = &frame;
 
-   jvalue jargs[64];
+   jvalue jargs[LUNARIA_JNI_MAX_ARGS];
    memset(jargs, 0, sizeof jargs);
-   for (int i = 0; i < nargs && i < 64; ++i) {
+   for (int i = 0; i < nargs && i < LUNARIA_JNI_MAX_ARGS; ++i) {
       char one[256];
       if (!dvm__sig_param(sig, i, one, sizeof one)) break;
       jargs[i] = dvm_to_jvalue(vm, env, dvm__kind_of(one), args[i]);
@@ -1577,7 +1656,7 @@ static bool hook_call_native(void *user, struct dvm *vm, const char *class_name,
    /* The native may have written into a direct buffer's guest region; the
     * bytes have to be back in the VM's array before bytecode reads them
     * again (UnityWebRequest's upload loop reads array() on the next line). */
-   for (int i = 0; i < nargs && i < 64; ++i)
+   for (int i = 0; i < nargs && i < LUNARIA_JNI_MAX_ARGS; ++i)
       if (args[i].l && dvm_buffer_is_direct(vm, args[i].l))
          dvm_direct_buffer_from_host(vm, args[i].l);
 
@@ -1791,14 +1870,60 @@ static struct dvm_method *find(struct dvm *vm, const char *class_name,
    return dvm_lookup(vm, class_name, method, NULL);
 }
 
-bool dvm_jni_invoke_locked(JNIEnv *env, const char *class_name, const char *method,
+/* Report ownership growth without logging String contents. GIL protects both
+ * the wrapper table and these diagnostic counters. Count after borrowed
+ * imports are released, so temporary conversions do not look like retention. */
+static void trace_jni_lifetime(const char *class_name,const char *method,
+                               const char *sig,size_t before,bool handled)
+{
+   static int enabled=-1;
+   static size_t reported_bucket;
+   if(enabled<0)enabled=getenv("LUNARIA_TRACE_JNI_LIFETIME")!=NULL;
+   if(!enabled || g_nwrappers<=before)return;
+   size_t bucket=g_nwrappers/1024;
+   if(bucket<=reported_bucket)return;
+   reported_bucket=bucket;
+   fprintf(stderr,"[jni-lifetime] live=%zu added=%zu handled=%d %s.%s%s\n",
+           g_nwrappers,g_nwrappers-before,handled,class_name,method,sig ? sig : "");
+}
+
+static bool dvm_jni_invoke_locked(JNIEnv *env, const char *class_name, const char *method,
                     const char *sig, jobject self, bool is_static,
-                    va_list *ap, const jvalue *jargs, jvalue *out)
+                    va_list *ap, const jvalue *jargs, jvalue *out, bool nonvirtual)
 {
    struct dvm *vm = vm_get();
    if (!vm || !class_name || !method) return false;
 
+   JNIEnv *saved = g_env;
+   g_env = env;
+   if (env) g_env_any = env;
+   const size_t wrappers_before=g_nwrappers;
    struct dvm_method *m = find(vm, class_name, method, sig);
+   struct borrowed_imports imports={.previous=g_borrowed_imports};
+   const bool borrowing=dvm__builtin_borrows_jni_payloads(m);
+   if(borrowing) {
+      imports.items=imports.local;
+      imports.capacity=sizeof imports.local/sizeof imports.local[0];
+      g_borrowed_imports=&imports;
+   } else {
+      /* A nested call with unknown retention must not enter an outer scope. */
+      g_borrowed_imports=NULL;
+   }
+   dvm_ref dself = 0;
+   if (!is_static && self)
+      dself = from_jobject(vm, env, self);
+   else if (!is_static)
+      dself = dvm_new_object(vm, dvm_find_class(vm, class_name));
+
+   /* GetMethodID identifies a declaration. Call<Type>Method dispatches on
+    * the actual receiver, including interface calls; only constructors and
+    * CallNonvirtual<Type>Method execute the named implementation directly. */
+   if (!is_static && dself && !nonvirtual && strcmp(method, "<init>")) {
+      struct dvm_class *actual = dvm_object_class(vm, dself);
+      struct dvm_method *override = actual
+         ? dvm_find_method(vm, actual, method, sig) : NULL;
+      if (override) m = override;
+   }
    /* A `native` method the dex declares is still the dex's method: a JNI call
     * to it initialises its class first (JNI spec, Call<Type>Method* and
     * GetStaticMethodID) and then runs whatever RegisterNatives or the
@@ -1813,20 +1938,20 @@ bool dvm_jni_invoke_locked(JNIEnv *env, const char *class_name, const char *meth
       if (getenv("LUNARIA_DVM_TRACE"))
          fprintf(stderr, "[dvm] miss %s.%s%s\n", class_name, method,
                  sig ? sig : "");
+      g_env = saved;
+      if(borrowing)borrowed_import_end(vm,env,&imports,false);
+      else g_borrowed_imports=imports.previous;
+      trace_jni_lifetime(class_name,method,sig,wrappers_before,false);
       return false;
    }
 
    const char *msig = m->sig ? m->sig : sig;
    int nargs = dvm_sig_arg_count(msig);
    if (nargs < 0) nargs = 0;
-   if (nargs > 64) nargs = 64;
+   if (nargs > LUNARIA_JNI_MAX_ARGS) nargs = LUNARIA_JNI_MAX_ARGS;
 
-   JNIEnv *saved = g_env;
-   g_env = env;
-   if (env) g_env_any = env;
-
-   union dvm_value args[64];
-   jobject host_arrays[64];
+   union dvm_value args[LUNARIA_JNI_MAX_ARGS];
+   jobject host_arrays[LUNARIA_JNI_MAX_ARGS];
    memset(args, 0, sizeof args);
    memset(host_arrays, 0, sizeof host_arrays);
    for (int i = 0; i < nargs; ++i) {
@@ -1883,15 +2008,6 @@ bool dvm_jni_invoke_locked(JNIEnv *env, const char *class_name, const char *meth
       fprintf(stderr, "\n");
    }
 
-   dvm_ref dself = 0;
-   if (!is_static && self) {
-      /* Receivers need the same conversion as arguments: strings and arrays
-       * have VM payloads, while ordinary objects keep their host identity. */
-      dself = from_jobject(vm, env, self);
-   } else if (!is_static) {
-      dself = dvm_new_object(vm, dvm_find_class(vm, class_name));
-   }
-
    union dvm_value ret;
    ++g_calls;
    bool ok = dvm_call(vm, m, dself, args, nargs, &ret);
@@ -1914,6 +2030,9 @@ bool dvm_jni_invoke_locked(JNIEnv *env, const char *class_name, const char *meth
    }
 
    if (out) *out = dvm_to_jvalue(vm, env, dvm_sig_return_kind(msig), ret);
+   if(borrowing)borrowed_import_end(vm,env,&imports,dvm__builtin_borrows_jni_payloads(m));
+   else g_borrowed_imports=imports.previous;
+   trace_jni_lifetime(class_name,method,msig,wrappers_before,true);
    g_env = saved;
    return true;
 }
@@ -1925,6 +2044,16 @@ void dvm_jni_show_activity(JNIEnv *env, jobject activity)
    unsigned cookie = dvm_gil_enter_from_guest(vm);
    dvm_ref ref = from_jobject(vm, env, activity);
    if (ref) dvm__activity_visible(vm, ref);
+   dvm_gil_leave_to_guest(vm, cookie);
+}
+
+void dvm_jni_main_transaction(JNIEnv *env, bool begin)
+{
+   struct dvm *vm = dvm_jni_vm();
+   if (!vm || !env) return;
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   if (begin) ++vm->main_transaction_depth;
+   else if (vm->main_transaction_depth) --vm->main_transaction_depth;
    dvm_gil_leave_to_guest(vm, cookie);
 }
 
@@ -1961,7 +2090,18 @@ bool dvm_jni_invoke(JNIEnv *env, const char *class_name, const char *method,
 {
    struct dvm *vm = vm_get();
    unsigned cookie = dvm_gil_enter_from_guest(vm);
-   bool r = dvm_jni_invoke_locked(env, class_name, method, sig, self, is_static, ap, jargs, out);
+   bool r = dvm_jni_invoke_locked(env, class_name, method, sig, self, is_static, ap, jargs, out, false);
+   dvm_gil_leave_to_guest(vm, cookie);
+   return r;
+}
+
+bool dvm_jni_invoke_nonvirtual(JNIEnv *env, const char *class_name, const char *method,
+                    const char *sig, jobject self, bool is_static,
+                    va_list *ap, const jvalue *jargs, jvalue *out)
+{
+   struct dvm *vm = vm_get();
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   bool r = dvm_jni_invoke_locked(env, class_name, method, sig, self, is_static, ap, jargs, out, true);
    dvm_gil_leave_to_guest(vm, cookie);
    return r;
 }
@@ -2181,7 +2321,8 @@ bool dvm_jni_class_in_dex(const char *class_name)
  * Get<Type>Field calls bytecode would use as plain field reads.  Returns NULL
  * with NameNotFoundException pending when the package is not one this device
  * has, as the platform does. */
-jobject dvm_jni_package_info(JNIEnv *env, jstring name, jint flags)
+static jobject dvm_jni_package_query(JNIEnv *env, jstring name, jint flags,
+                                      const char *method, const char *signature)
 {
    struct dvm *vm = vm_get();
    if (!vm || !env) return NULL;
@@ -2195,8 +2336,8 @@ jobject dvm_jni_package_info(JNIEnv *env, jstring name, jint flags)
    /* No bridge frame: the handle returned is the caller's local reference, and
     * a frame would release it on the way out. */
    const bool handled = hook_call_external_inner(
-      NULL, vm, "android/content/pm/PackageManager", "getPackageInfo",
-      "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;", 0, args, 2, &out);
+      NULL, vm, "android/content/pm/PackageManager", method,
+      signature, 0, args, 2, &out);
    if (handled && !vm->exception && out.l)
       result = to_jobject(vm, env, out.l);
    if (vm->exception) {
@@ -2211,6 +2352,18 @@ jobject dvm_jni_package_info(JNIEnv *env, jstring name, jint flags)
    g_env = saved;
    dvm_gil_leave_to_guest(vm, cookie);
    return result;
+}
+
+jobject dvm_jni_package_info(JNIEnv *env, jstring name, jint flags)
+{
+   return dvm_jni_package_query(env, name, flags, "getPackageInfo",
+      "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;");
+}
+
+jobject dvm_jni_application_info(JNIEnv *env, jstring name, jint flags)
+{
+   return dvm_jni_package_query(env, name, flags, "getApplicationInfo",
+      "(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;");
 }
 
 bool dvm_jni_class_exists(const char *class_name)
