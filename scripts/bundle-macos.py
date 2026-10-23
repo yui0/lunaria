@@ -10,7 +10,12 @@ stage=Path(sys.argv[1]).resolve()
 here=Path(__file__).resolve().parents[1]
 libdir=stage/'lib';libdir.mkdir(exist_ok=True)
 search=[stage/'runtime',libdir,here/'runtime',here/'.deps/lib',Path(os.environ.get('MAC_OPENSSL','/opt/homebrew/opt/openssl@3'))/'lib']
+browser=stage/'luna-browser'/'luna-browser'
 queue=[(stage/'lunaria',here/'lunaria')]
+# luna-browser is the WebView engine used when no Chrome is installed.  It is
+# an executable one directory below the bundle root, so ../lib and ../runtime
+# are where its bundled libraries are.
+if browser.is_file():queue.append((browser,here/'luna-browser'/'luna-browser'))
 queue.extend((p,here/'runtime'/p.name) for p in (stage/'runtime').iterdir() if p.is_file())
 # ANGLE loads its Vulkan driver through a manifest, so otool's dependency
 # closure cannot discover it. Ship the driver and its own dependency closure.
@@ -32,7 +37,7 @@ def install_id(path):
     return lines[1].strip() if len(lines)>1 else None
 def dependencies(path):
     result=subprocess.run(['otool','-L',str(path)],check=True,text=True,stdout=subprocess.PIPE)
-    own=install_id(path) if Path(path)!=stage/'lunaria' else None
+    own=install_id(path) if Path(path) not in (stage/'lunaria',browser) else None
     # Universal dylibs print a heading for each architecture. Only load-command
     # lines carry a compatibility version; headings are not dependencies.
     return [name for name in (line.strip().split(' (compatibility version',1)[0]
@@ -63,7 +68,11 @@ while queue:
         target.chmod(target.stat().st_mode|0o200)
         subprocess.run(['install_name_tool','-change',name,'@rpath/'+target.name,str(dest)],check=True)
         queue.append((target,original))
-    if dest!=stage/'lunaria':
+    if dest==browser and needs_rpath:
+        for relative in ('@loader_path/../lib','@loader_path/../runtime'):
+            result=subprocess.run(['install_name_tool','-add_rpath',relative,str(dest)],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            if result.returncode and b'duplicate' not in result.stderr.lower():sys.exit(result.stderr.decode())
+    if dest not in (stage/'lunaria',browser):
         subprocess.run(['install_name_tool','-id','@rpath/'+dest.name,str(dest)],check=True)
         # A dylib may need another bundled dylib before main() is entered.
         # System-only dylibs need no search paths; prebuilt universal drivers

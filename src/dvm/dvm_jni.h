@@ -125,6 +125,9 @@ struct dvm;
 struct luna_touch_event;
 bool dvm_ui_dispatch_touch(struct dvm *vm, const struct luna_touch_event *sample);
 void dvm_jni_show_activity(JNIEnv *env, jobject activity);
+struct lm_sink;
+jobject dvm_jni_surface_from_sink(JNIEnv *env, struct lm_sink *sink);
+struct lm_sink *dvm_jni_surface_acquire_sink(JNIEnv *env, jobject surface);
 void dvm_jni_main_transaction(JNIEnv *env, bool begin);
 void dvm_jni_activity_dispatch(JNIEnv *env, jobject activity, const char *step,
                                int post);

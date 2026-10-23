@@ -237,16 +237,50 @@ bool luna_overlay_image_argb(const char *key,int width,int height,const uint32_t
 void luna_overlay_image_forget(const char *key)
 {if(key && *key) (void)overlay_queue_image(key,0,0,NULL);}
 
+/* luna_reset_document() frees every texture, host-uploaded ones included, and
+ * a guest bitmap is only queued again when its pixels change.  Without a copy
+ * here, the first republish after the upload (a dialog's second pass, the
+ * input method, a toast) left a RecyclerView raster with no picture. */
+struct overlay_image_store {char key[96];int width,height;unsigned char *rgba;struct overlay_image_store *next;};
+static struct overlay_image_store *g_image_store;
+
+static void overlay_store_image(const char *key,int width,int height,const unsigned char *rgba)
+{
+ struct overlay_image_store **link=&g_image_store;
+ while(*link && strcmp((*link)->key,key)) link=&(*link)->next;
+ struct overlay_image_store *entry=*link;
+ if(!rgba) {
+  if(entry) {*link=entry->next;free(entry->rgba);free(entry);}
+  return;
+ }
+ const size_t bytes=(size_t)width*height*4;
+ if(!entry) {
+  entry=calloc(1,sizeof *entry);if(!entry) return;
+  snprintf(entry->key,sizeof entry->key,"%s",key);entry->next=g_image_store;g_image_store=entry;
+ }
+ unsigned char *copy=malloc(bytes);
+ if(!copy) return;
+ memcpy(copy,rgba,bytes);free(entry->rgba);entry->rgba=copy;entry->width=width;entry->height=height;
+}
+
 static void overlay_upload_images(void)
 {
  /* Called with doc_lock and the GL context current. Coalesced entries never
   * keep a borrowed VM pointer across either a draw or object destruction. */
  while(g_image_updates) {
   struct overlay_image_update *entry=g_image_updates;g_image_updates=entry->next;
+  overlay_store_image(entry->key,entry->width,entry->height,entry->rgba);
   if(entry->rgba) (void)luna_update_texture_rgba(entry->key,entry->width,entry->height,entry->rgba);
   else luna_invalidate_texture(entry->key);
   free(entry->rgba);free(entry);
  }
+}
+
+/* After a document reset: put every stored picture back. */
+static void overlay_restore_images(void)
+{
+ for(struct overlay_image_store *e=g_image_store;e;e=e->next)
+  (void)luna_update_texture_rgba(e->key,e->width,e->height,e->rgba);
 }
 
 void luna_overlay_image_changed(const char *path)
@@ -276,6 +310,7 @@ static luna_overlay_scroll_fn g_scroll_fn;
 static luna_overlay_web_pointer_fn g_web_pointer_fn;
 static luna_overlay_web_char_fn g_web_char_fn;
 static luna_overlay_web_key_fn g_web_key_fn;
+static luna_overlay_web_text_fn g_web_text_fn;
 static char g_web_pointer_capture[32];
 static char g_web_focus[32];
 static luna_overlay_frame_fn g_frame_fn;
@@ -858,10 +893,12 @@ void luna_overlay_set_web_pointer_handler(luna_overlay_web_pointer_fn fn)
 }
 
 void luna_overlay_set_web_text_handlers(luna_overlay_web_char_fn char_fn,
-                                        luna_overlay_web_key_fn key_fn)
+                                        luna_overlay_web_key_fn key_fn,
+                                        luna_overlay_web_text_fn text_fn)
 {
    g_web_char_fn = char_fn;
    g_web_key_fn = key_fn;
+   g_web_text_fn = text_fn;
 }
 
 bool luna_overlay_web_char(uint32_t codepoint)
@@ -876,7 +913,19 @@ bool luna_overlay_web_char(uint32_t codepoint)
    return true;
 }
 
-bool luna_overlay_web_key(int key, int action)
+bool luna_overlay_web_text(const char *utf8)
+{
+   if (luna_guest_paused()) return true;
+   char id[sizeof g_web_focus];
+   pthread_mutex_lock(&g_ptr_lock);
+   memcpy(id, g_web_focus, sizeof id);
+   pthread_mutex_unlock(&g_ptr_lock);
+   if (!id[0] || !g_web_text_fn || !utf8) return false;
+   g_web_text_fn(id, utf8);
+   return true;
+}
+
+bool luna_overlay_web_key(int key, int action, int mods)
 {
    if (luna_guest_paused()) return true;
    char id[sizeof g_web_focus];
@@ -884,7 +933,19 @@ bool luna_overlay_web_key(int key, int action)
    memcpy(id, g_web_focus, sizeof id);
    pthread_mutex_unlock(&g_ptr_lock);
    if (!id[0] || !g_web_key_fn) return false;
-   g_web_key_fn(id, key, action);
+   /* GLFW modifiers: control on Linux/Windows, command on macOS. Read the
+    * host clipboard on its window thread and commit it in one text event. */
+#ifdef __APPLE__
+   const int shortcut = mods & 8;
+#else
+   const int shortcut = mods & 2;
+#endif
+   if (shortcut && key == 86 && g_web_text_fn) {
+      if (action) {
+         char *text = arm_exec_clipboard_get();
+         if (text) { g_web_text_fn(id, text); free(text); }
+      }
+   } else g_web_key_fn(id, key, action, mods);
    return true;
 }
 
@@ -1289,6 +1350,7 @@ bound:
             luna_set_clear_before_paint(i, 1);
             g_surface_holes = true;
          }
+         overlay_restore_images();
          overlay_wire_clicks();
          /* One layout pass so a dump of element boxes is meaningful. */
          luna_update(overlay_now(), 0.0);
@@ -1635,7 +1697,10 @@ static bool text_shape_locked(const uint16_t *text,size_t length,size_t start,si
  memset(out,0,sizeof *out);
  if(length>INT_MAX || start>length || item_count>length-start || !isfinite(px) || px<0 || px>32768 || (!text && length)) return false;
  if(!item_count || px==0) return true;
- if(!text_hb_load()) return false;
+ /* No HarfBuzz on this host (macOS ships none): lay out one glyph per code
+  * point with stb's advances.  No ligatures/kerning/RTL reordering, but the
+  * guest's own dialogs (terms of service, ...) still measure and draw. */
+ bool use_hb=text_hb_load();
  int previous_bold=g_font_bold_hint;g_font_bold_hint=bold ? 1 : 0;
  bool good=true;size_t begin=start,limit=start+item_count,capacity=0;
  while(begin<limit && good) {
@@ -1647,6 +1712,24 @@ static bool text_shape_locked(const uint16_t *text,size_t length,size_t start,si
   out->ascent=fminf(out->ascent,-ascent*metric_scale);
   out->descent=fmaxf(out->descent,-descent*metric_scale);
   while(end<limit) {size_t next=end;cp=text_codepoint(text,limit,&next);if((custom && stbtt_FindGlyphIndex(custom,(int)cp) ? custom : font_for_codepoint((int)cp))!=info) break;end=next;}
+  if(!use_hb) {
+   size_t at=begin;
+   while(at<end) {
+    size_t from=at;uint32_t c=text_codepoint(text,end,&at);
+    int index=stbtt_FindGlyphIndex(info,(int)c),adv=0,lsb=0;
+    stbtt_GetGlyphHMetrics(info,index,&adv,&lsb);
+    if(out->count==capacity) {
+     capacity=capacity ? capacity*2 : 16;struct luna_text_glyph *grown=realloc(out->glyphs,capacity*sizeof *grown);
+     if(!grown) {good=false;break;}
+     out->glyphs=grown;
+    }
+    struct luna_text_glyph *g=&out->glyphs[out->count++];
+    *g=(struct luna_text_glyph){.font=info,.font_data=info->data,.glyph=(uint32_t)index,.cluster=(uint32_t)(from-start),
+       .x=out->width,.y=0,.advance=adv*metric_scale};
+    out->width+=g->advance;out->missing=out->missing || !g->glyph;
+   }
+   begin=end;continue;
+  }
   void *font=text_hb_font(info),*buffer=text_hb.buffer_create();
   if(!font || !buffer) {if(buffer) text_hb.buffer_destroy(buffer);good=false;break;}
   int scale=(int)floorf(px*64+.5f);text_hb.font_set_scale(font,scale,scale);
@@ -1707,7 +1790,7 @@ uint32_t luna_overlay_font_load(const void *data,size_t size,int index)
    uint32_t handle=f->handle;pthread_mutex_unlock(&g_present_lock);return handle;
   }
  struct text_custom_face *f=calloc(1,sizeof *f);
- if(!f || !text_hb_load() || text_custom_count==UINT32_MAX) {free(f);pthread_mutex_unlock(&g_present_lock);return 0;}
+ if(!f || text_custom_count==UINT32_MAX) {free(f);pthread_mutex_unlock(&g_present_lock);return 0;}
  f->bytes=malloc(size);
  if(!f->bytes) {free(f);pthread_mutex_unlock(&g_present_lock);return 0;}
  memcpy(f->bytes,data,size);
@@ -1873,6 +1956,9 @@ static double g_menu_x, g_menu_y;
 static int    g_menu_w, g_menu_h;
 static int    g_menu_sub;
 static bool g_settings_open;
+static bool g_profile_rename, g_profile_select_all;
+static char g_profile_name[256], g_profile_error[128];
+static size_t g_profile_cursor;
 /* Pending API preference; driver state changes only on the next launch. */
 static int g_graphics_choice = -1;
 static int g_gl_identity_choice = -1;
@@ -2123,7 +2209,9 @@ static int menu_main_rows(struct menu_buf *b, int parent_y[SUB_COUNT])
    y += menu_sep(b);
    if (getenv("ANDROID_PACKAGE_NAME")) {
       parent_y[SUB_PROFILE] = y;
-      y += menu_item(b, "sub-profile", "Profile", false, luna_apk_profile_current());
+      char label[256];
+      luna_apk_profile_label(luna_apk_profile_current(), label, sizeof label);
+      y += menu_item(b, "sub-profile", "Profile", false, label);
       y += menu_item(b, "restart", "Restart", false, NULL);
       y += menu_item(b, "launcher", "Back to launcher", false, NULL);
    }
@@ -2261,10 +2349,12 @@ static int menu_sub_rows(struct menu_buf *b)
       const char *cur = luna_apk_profile_current();
       y += menu_header(b, "PROFILE");
       y += menu_item(b, "profile-new", "New Profile", false, NULL);
+      y += menu_item(b, "profile-rename", "Rename Profile…", false, NULL);
       y += menu_sep(b);
       for (int i = 0; i < n; ++i) {
          snprintf(id, sizeof id, "profile-%d", i);
-         y += menu_item(b, id, names[i], !strcmp(names[i], cur), NULL);
+         char label[256]; luna_apk_profile_label(names[i], label, sizeof label);
+         y += menu_item(b, id, label, !strcmp(names[i], cur), NULL);
       }
       y += menu_item(b, NULL, "Switching restarts the app", false, NULL);
    }
@@ -2284,6 +2374,27 @@ static void menu_publish_locked(void)
          free(b.p);
       } else luna_overlay_set_menu(NULL, NULL, false);
       return;
+   }
+   if (g_profile_rename) {
+      struct menu_buf doc = {0};
+      int width = g_menu_w < 488 ? g_menu_w - 16 : 472;
+      menu_put(&doc, "<div id=\"luna-menu-backdrop\"></div>");
+      menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;width:%dpx;\">",
+                (g_menu_w-width)/2, menu_clampi((g_menu_h-210)/2, 8, g_menu_h), width);
+      menu_header(&doc, "RENAME PROFILE");
+      menu_item(&doc, NULL, "Display name (account data stays in place)", false, NULL);
+      menu_put(&doc, "<div id=\"luna-menu-profile-name\" style=\"margin:8px;padding:8px;border:1px solid #6fa8ff;white-space:pre;overflow:hidden;color:#fff;\">");
+      if (g_profile_select_all) menu_put(&doc, "<span style=\"background:#315d91;\">");
+      char left[256]; memcpy(left, g_profile_name, g_profile_cursor); left[g_profile_cursor] = 0;
+      menu_put_text(&doc, left); menu_put(&doc, "<span style=\"color:#8bbcff;\">|</span>");
+      menu_put_text(&doc, g_profile_name + g_profile_cursor);
+      if (g_profile_select_all) menu_put(&doc, "</span>");
+      menu_put(&doc, "</div>");
+      if (g_profile_error[0]) menu_item(&doc, NULL, g_profile_error, false, NULL);
+      menu_item(&doc, "profile-name-save", "Save", false, NULL);
+      menu_item(&doc, "profile-name-cancel", "Cancel", false, NULL);
+      menu_put(&doc, "</div>");
+      luna_overlay_set_menu(doc.p, g_menu_style, true); free(doc.p); return;
    }
    if (g_settings_open) {
       struct menu_buf doc = {0};
@@ -2373,6 +2484,11 @@ static int menu_paste_clipboard(void)
    char *text = arm_exec_clipboard_get();
    if (!text) return -1;
    const bool ime = luna_ime_active();
+   if (!ime && luna_overlay_web_text(text)) {
+      const int typed = text[0] != 0;
+      free(text);
+      return typed;
+   }
    int typed = 0;
    for (const unsigned char *p = (const unsigned char *)text; *p; ) {
       uint32_t cp = *p;
@@ -2632,7 +2748,22 @@ static void menu_clicked(const char *id)
    if (*id == '-') ++id;
    pthread_mutex_lock(&g_menu_lock);
    bool keep_open = false;
-   if (!strcmp(id, "pause")) {
+   if (!strcmp(id, "profile-rename")) {
+      luna_apk_profile_label(luna_apk_profile_current(), g_profile_name, sizeof g_profile_name);
+      g_profile_cursor = strlen(g_profile_name); g_profile_select_all = true;
+      g_profile_error[0] = 0; g_profile_rename = true; keep_open = true;
+   } else if (!strcmp(id, "profile-name-save")) {
+      if (!luna_apk_profile_set_label(luna_apk_profile_current(), g_profile_name)) {
+         g_profile_rename = false; menu_notice_locked("Profile renamed");
+      } else {
+         snprintf(g_profile_error, sizeof g_profile_error, "Cannot save. Check name and storage access.");
+         keep_open = true;
+      }
+   } else if (!strcmp(id, "profile-name-cancel")) {
+      g_profile_rename = false;
+   } else if (!strcmp(id, "profile-name")) {
+      keep_open = true;
+   } else if (!strcmp(id, "pause")) {
       const bool paused = !luna_guest_paused();
       luna_guest_set_paused(paused);
       menu_notice_locked(paused ? "Paused" : "Resumed");
@@ -2864,7 +2995,7 @@ static void menu_clicked(const char *id)
       arm_exec_request_quit();
    } else keep_open = true;
    g_menu_open = keep_open;
-   if (!g_menu_open) g_menu_sub = SUB_NONE;
+   if (!g_menu_open) { g_menu_sub = SUB_NONE; g_profile_rename = false; }
    menu_publish_locked();
    pthread_mutex_unlock(&g_menu_lock);
 }
@@ -2874,6 +3005,7 @@ void luna_menu_open(double x, double y, int w, int h)
    luna_overlay_set_menu_handler(menu_clicked);
    pthread_mutex_lock(&g_menu_lock);
    g_menu_open = true;
+   g_profile_rename = false;
    g_settings_open = false;
    g_menu_sub = SUB_NONE;
    g_menu_x = x;
@@ -2888,6 +3020,7 @@ void luna_menu_close(void)
 {
    pthread_mutex_lock(&g_menu_lock);
    g_menu_open = false;
+   g_profile_rename = false;
    g_settings_open = false;
    g_menu_sub = SUB_NONE;
    menu_publish_locked();
@@ -2902,4 +3035,70 @@ void luna_menu_tick(void)
       menu_publish_locked();
    }
    pthread_mutex_unlock(&g_menu_lock);
+}
+
+/* Host menu editing is serialized with menu publication. It never enters the
+ * Android IME or the WebView, and clipboard access stays on the window thread. */
+static void profile_name_insert(const char *text)
+{
+   size_t n = strlen(text), len = strlen(g_profile_name);
+   if (n + (g_profile_select_all ? 0 : len) >= sizeof g_profile_name) {
+      snprintf(g_profile_error, sizeof g_profile_error, "Name is limited to 255 UTF-8 bytes."); return;
+   }
+   if (g_profile_select_all) { len = 0; g_profile_name[0] = 0; g_profile_cursor = 0; }
+   memmove(g_profile_name + g_profile_cursor + n, g_profile_name + g_profile_cursor, len - g_profile_cursor + 1);
+   memcpy(g_profile_name + g_profile_cursor, text, n);
+   g_profile_cursor += n; g_profile_select_all = false; g_profile_error[0] = 0;
+}
+bool luna_overlay_host_char(uint32_t cp)
+{
+   pthread_mutex_lock(&g_menu_lock);
+   bool active = g_menu_open && g_profile_rename;
+   if (active && cp >= 32 && cp != 127 && cp <= 0x10ffff && !(cp >= 0xd800 && cp <= 0xdfff)) {
+      char text[5] = {0};
+      if (cp < 0x80) text[0] = cp;
+      else if (cp < 0x800) { text[0] = 0xc0 | (cp >> 6); text[1] = 0x80 | (cp & 63); }
+      else if (cp < 0x10000) { text[0] = 0xe0 | (cp >> 12); text[1] = 0x80 | ((cp >> 6) & 63); text[2] = 0x80 | (cp & 63); }
+      else { text[0] = 0xf0 | (cp >> 18); text[1] = 0x80 | ((cp >> 12) & 63); text[2] = 0x80 | ((cp >> 6) & 63); text[3] = 0x80 | (cp & 63); }
+      profile_name_insert(text); menu_publish_locked();
+   }
+   pthread_mutex_unlock(&g_menu_lock); return active;
+}
+bool luna_overlay_host_key(int key, int action, int mods)
+{
+   pthread_mutex_lock(&g_menu_lock);
+   bool active = g_menu_open && g_profile_rename;
+   const char *command = NULL;
+   if (active && action) {
+#ifdef __APPLE__
+      bool shortcut = (mods & LUNA_MOD_SUPER) != 0;
+#else
+      bool shortcut = (mods & LUNA_MOD_CONTROL) != 0;
+#endif
+      size_t len = strlen(g_profile_name), before = g_profile_cursor, after = g_profile_cursor;
+      if (before) { --before; while (before && ((unsigned char)g_profile_name[before] & 0xc0) == 0x80) --before; }
+      if (after < len) { ++after; while (after < len && ((unsigned char)g_profile_name[after] & 0xc0) == 0x80) ++after; }
+      if (key == LUNA_KEY_ENTER) command = "luna-menu-profile-name-save"; /* Enter */
+      else if (key == LUNA_KEY_ESCAPE) command = "luna-menu-profile-name-cancel";
+      else if (shortcut && key == LUNA_KEY_A) g_profile_select_all = true;
+      else if (shortcut && (key == LUNA_KEY_C || key == LUNA_KEY_X) && g_profile_select_all) {
+         arm_exec_clipboard_set(g_profile_name);
+         if (key == LUNA_KEY_X) { g_profile_name[0] = 0; g_profile_cursor = 0; g_profile_select_all = false; }
+      } else if (shortcut && key == LUNA_KEY_V) {
+         char *text = arm_exec_clipboard_get();
+         if (text) { profile_name_insert(text); free(text); }
+      } else if (key == LUNA_KEY_BACKSPACE || key == LUNA_KEY_DELETE) { /* Backspace / Delete */
+         if (g_profile_select_all) { g_profile_name[0] = 0; g_profile_cursor = 0; }
+         else if (key == LUNA_KEY_BACKSPACE) { memmove(g_profile_name+before, g_profile_name+g_profile_cursor, len-g_profile_cursor+1); g_profile_cursor = before; }
+         else memmove(g_profile_name+g_profile_cursor, g_profile_name+after, len-after+1);
+         g_profile_select_all = false;
+      } else if (key == LUNA_KEY_LEFT || key == LUNA_KEY_RIGHT || key == LUNA_KEY_HOME || key == LUNA_KEY_END) {
+         g_profile_cursor = key == LUNA_KEY_HOME ? 0 : key == LUNA_KEY_END ? len : key == LUNA_KEY_LEFT ? before : after;
+         g_profile_select_all = false;
+      }
+      if (!command) menu_publish_locked();
+   }
+   pthread_mutex_unlock(&g_menu_lock);
+   if (command) menu_clicked(command);
+   return active;
 }

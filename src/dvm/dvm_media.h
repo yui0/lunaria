@@ -25,6 +25,50 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* ImageReader buffer ownership and acquisition queue. */
+struct liq_queue;
+struct liq_image;
+enum {
+    LIQ_OK = 0,
+    LIQ_INVALID_OBJECT = -10003,
+    LIQ_INVALID_PARAMETER = -10004,
+    LIQ_WOULD_BLOCK = -10008,
+    LIQ_NO_BUFFER = -30001,
+    LIQ_MAX_ACQUIRED = -30002,
+    LIQ_NO_MEMORY = -10000
+};
+/* capacity counts both queued and acquired buffers. The producer retains its
+ * buffer on WOULD_BLOCK; it must retry or cancel, never report a render. */
+struct liq_queue *liq_new(unsigned max_images, unsigned capacity);
+void liq_ref(struct liq_queue *queue);
+void liq_unref(struct liq_queue *queue);
+/* Closing disconnects the producer and discards unacquired buffers. Acquired
+ * images retain their storage until released, including after queue unref. */
+void liq_close(struct liq_queue *queue);
+/* Takes malloc-owned RGBA pixels only on success, then sets *pixels to NULL. */
+int liq_submit(struct liq_queue *queue, uint8_t **pixels, size_t bytes,
+               unsigned width, unsigned height, int64_t timestamp_ns);
+int liq_acquire(struct liq_queue *queue, bool latest, struct liq_image **image);
+void liq_release(struct liq_image *image);
+const uint8_t *liq_pixels(const struct liq_image *image);
+unsigned liq_width(const struct liq_image *image);
+unsigned liq_height(const struct liq_image *image);
+int64_t liq_timestamp(const struct liq_image *image);
+/* Monotonic arrival sequence for dispatching ImageReader listeners outside
+ * the decoder thread. It changes only when a buffer actually enters queue. */
+uint64_t liq_sequence(struct liq_queue *queue);
+/* Producer-thread wakeup only: signal an event/fd here, dispatch guest code on
+ * its listener thread. Called under the queue mutex; do not reenter the queue.
+ * Replacing/unsetting the hook waits for any previous invocation to finish.
+ * Registration immediately signals the current sequence/closed state so a
+ * frame arriving before listener installation cannot lose its wakeup.
+ * The context must remain valid until the hook is unset or the queue freed. */
+typedef void (*liq_notify_fn)(void *context, uint64_t sequence, bool closed);
+void liq_set_notify(struct liq_queue *queue, liq_notify_fn notify, void *context);
+/* Waits without consuming a slot. A finite timeout lets a codec observe
+ * cancellation without disconnecting a Surface that may be reused. */
+int liq_wait_space(struct liq_queue *queue, unsigned timeout_ms);
+
 /* --- the frame sink behind android.view.Surface -------------------------- *
  *
  * A MediaCodec renders into a Surface; a SurfaceTexture takes the frames back
@@ -34,6 +78,10 @@
 struct lm_sink;
 
 struct lm_sink *lm_sink_new(void);
+struct lm_sink *lm_sink_new_reader(unsigned max_images, unsigned capacity);
+/* Borrowed while the sink is retained. Unlike SurfaceTexture this consumer
+ * retains individually acquired frames and applies producer back-pressure. */
+struct liq_queue *lm_sink_image_queue(struct lm_sink *s);
 /* Retain while an asynchronous producer owns a destination. free releases one
  * reference; a detached window need not keep historical buffers alive. */
 void lm_sink_ref(struct lm_sink *s);
@@ -142,6 +190,7 @@ void dvm_media_pump_active(struct dvm *vm);
 /* Audio decoders answer these instead of a picture size. */
 void lm_codec_audio_format(const struct lm_codec *c, int *rate, int *channels);
 bool lm_codec_is_video(const struct lm_codec *c);
+bool lm_codec_image_reader_supported(const struct lm_codec *c);
 /* "video/avc", "video/x-vnd.on2.vp9", … or NULL when this is not a video codec. */
 const char *lm_codec_mime(const struct lm_codec *c);
 

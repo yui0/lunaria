@@ -1281,9 +1281,88 @@ static bool profile_valid(const char *s)
          return false;
    return true;
 }
+/* Labels live outside guest data; immutable IDs continue to select accounts. */
+static int profile_label_path(const char *root, const char *package, const char *id,
+                              char *out, size_t cap)
+{
+   char rel[768];
+   if (!root || !package || !profile_valid(id) || !package_valid(package)) return -1;
+   snprintf(rel, sizeof rel, "profiles/%s/.labels/%s", package, id);
+   return path_join(out, cap, root, rel);
+}
+static bool profile_label_valid(const char *text)
+{
+   size_t n = strlen(text);
+   if (!n || n > 255) return false;
+   bool visible = false;
+   for (size_t i = 0; i < n;) {
+      unsigned c = (unsigned char)text[i++], cp = c, more = 0, min = 0;
+      if (c >= 0xc2 && c <= 0xdf) { cp = c & 31; more = 1; min = 0x80; }
+      else if (c >= 0xe0 && c <= 0xef) { cp = c & 15; more = 2; min = 0x800; }
+      else if (c >= 0xf0 && c <= 0xf4) { cp = c & 7; more = 3; min = 0x10000; }
+      else if (c >= 0x80) return false;
+      if (i + more > n) return false;
+      for (unsigned k = 0; k < more; ++k) {
+         unsigned b = (unsigned char)text[i++];
+         if ((b & 0xc0) != 0x80) return false;
+         cp = (cp << 6) | (b & 63);
+      }
+      if (cp < min || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff) ||
+          cp < 32 || (cp >= 127 && cp <= 159)) return false;
+      if (cp != ' ' && cp != 0x3000) visible = true;
+   }
+   return visible;
+}
+static int profile_label_read(const char *root, const char *package, const char *id,
+                              char *out, size_t cap)
+{
+   char path[APK_PATH], text[257];
+   if (!profile_label_path(root, package, id, path, sizeof path)) {
+      FILE *f = fopen(path, "rb");
+      if (f) {
+         size_t n = fread(text, 1, sizeof text - 1, f);
+         bool ok = !ferror(f); fclose(f); text[n] = 0;
+         if (ok && n == strlen(text) && profile_label_valid(text)) return copy_text(out, cap, text);
+      }
+   }
+   return copy_text(out, cap, id);
+}
+static int profile_label_write(const char *root, const char *package, const char *id,
+                               const char *label)
+{
+   char path[APK_PATH], temp[APK_PATH], dir[APK_PATH], rel[768];
+   if (!profile_label_valid(label) || profile_label_path(root, package, id, path, sizeof path))
+      return apk_error("profile name must contain 1–255 bytes of UTF-8 text without control characters");
+   if (strcmp(id, "default")) {
+      snprintf(rel, sizeof rel, "profiles/%s/%s", package, id);
+      if (path_join(dir, sizeof dir, root, rel) || !directory(dir))
+         return apk_error("profile does not exist: %s", id);
+   }
+   copy_text(dir, sizeof dir, path); *strrchr(dir, '/') = 0;
+   if (mkdirs(dir) || snprintf(temp, sizeof temp, "%s/.rename-XXXXXX", dir) >= (int)sizeof temp) return -1;
+   int fd = luna_file_mkstemp(temp);
+   if (fd < 0) return -1;
+   size_t n = strlen(label), off = 0;
+   while (off < n) {
+      ptrdiff_t written = luna_fd_write(fd, label + off, n - off);
+      if (written < 0 && errno == EINTR) continue;
+      if (written <= 0) break;
+      off += (size_t)written;
+   }
+   int closed = luna_fd_close(fd);
+   if (off == n && !closed && !luna_file_rename(temp, path)) return 0;
+   luna_file_unlink(temp);
+   return apk_error("cannot save profile name");
+}
+static void profile_label_print(const char *root, const char *package, const char *id)
+{
+   char label[256]; profile_label_read(root, package, id, label, sizeof label);
+   if (strcmp(id, label)) printf("%s\t%s\n", id, label);
+   else puts(id);
+}
 static int profiles_list(const char *root, const char *package)
 {
-   puts("default");
+   profile_label_print(root, package, "default");
    char dir[APK_PATH], relative[512];
    snprintf(relative, sizeof relative, "profiles/%s", package);
    if (path_join(dir, sizeof dir, root, relative))
@@ -1295,7 +1374,7 @@ static int profiles_list(const char *root, const char *package)
    while ((e = luna_directory_read(d))) {
       char path[APK_PATH];
       if (profile_valid(e->d_name) && !path_join(path, sizeof path, dir, e->d_name) && directory(path))
-         puts(e->d_name);
+         profile_label_print(root, package, e->d_name);
    }
    return luna_directory_close(d);
 }
@@ -1332,7 +1411,15 @@ static int profiles_choose(const char *root, const char *package, char *choice, 
       result = copy_text(choice, capacity, names[0]);
       goto done;
    }
-   result = luna_launcher_choose(package, (const char *const *)names, count, choice, capacity);
+   char (*labels)[256] = calloc(count, sizeof *labels);
+   const char **display = calloc(count, sizeof *display);
+   if (!labels || !display) { free(labels); free(display); goto done; }
+   for (size_t i = 0; i < count; ++i) {
+      profile_label_read(root, package, names[i], labels[i], sizeof labels[i]);
+      display[i] = labels[i];
+   }
+   result = luna_launcher_choose(package, (const char *const *)names, display, count, choice, capacity);
+   free(display); free(labels);
    if (result) apk_error("profile selection requires the launch window; use --profile NAME for a headless run");
 done:
    for (size_t i=0; i<count; ++i) free(names[i]);
@@ -1625,6 +1712,7 @@ static void apk_help(void)
 {
    puts("Usage: lunaria [--config FILE] [--data-root DIR] [--profile NAME] APP.apk|APP.aab|APP.xapk|APP.apks\n"
         "       lunaria [--list-profiles | --choose-profile | --prepare-profile | --install-only] APP.apk\n"
+        "       lunaria --profile ID --rename-profile NAME APP.apk\n"
         "       lunaria MODULE.so\n\n"
         "APK archives are installed once in cache/packages; application data persists in data/.\n"
         "Environment settings override lunaria.conf; command-line options override both.");
@@ -1864,6 +1952,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
    }
    restart_remember(*argc, *argv);
    bool list = false, prepare = false, install = false, choose = false, profile_requested = false;
+   const char *rename_label = NULL;
    bool launch_ui_ready = false;
    int at = 1;
    for (; at < *argc; at++) {
@@ -1893,6 +1982,14 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       if (!strcmp(arg, "--choose-profile")) {
          choose = true;
          profile_requested = false;
+         continue;
+      }
+      if (!strcmp(arg, "--rename-profile") || !strncmp(arg, "--rename-profile=", 17)) {
+         if (arg[16] == '=') rename_label = arg + 17;
+         else {
+            if (++at >= *argc) return apk_error("--rename-profile requires a name");
+            rename_label = (*argv)[at];
+         }
          continue;
       }
       const char *key = NULL, *value = NULL;
@@ -2057,6 +2154,10 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       goto done;
    if (directory(olddata) && !exists(newdata) && luna_file_rename(olddata, newdata))
       goto done;
+   if (rename_label) {
+      result = profile_label_write(root, m->package, env_value("LUNARIA_PROFILE", "default"), rename_label) ? -1 : 1;
+      goto done;
+   }
    if (list) {
       result = profiles_list(root, m->package) ? -1 : 1;
       goto done;
@@ -2262,6 +2363,15 @@ int luna_apk_profile_list(char (*names)[65], int max)
    }
    luna_directory_close(d);
    return n;
+}
+
+int luna_apk_profile_label(const char *id, char *out, size_t cap)
+{
+   return profile_label_read(getenv("LUNARIA_DATA_ROOT"), getenv("ANDROID_PACKAGE_NAME"), id, out, cap);
+}
+int luna_apk_profile_set_label(const char *id, const char *label)
+{
+   return profile_label_write(getenv("LUNARIA_DATA_ROOT"), getenv("ANDROID_PACKAGE_NAME"), id, label);
 }
 
 /* The next unused "profile-N". */

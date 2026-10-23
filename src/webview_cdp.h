@@ -60,7 +60,7 @@ int lunaria_cdp_page_touch(struct lunaria_cdp_page *page,
 int lunaria_cdp_page_insert_text(struct lunaria_cdp_page *page,
                                  const char *text, unsigned *request_id);
 int lunaria_cdp_page_key(struct lunaria_cdp_page *page,
-                         const char *key, int virtual_code, int pressed);
+                         const char *key, int virtual_code, int pressed, unsigned modifiers);
 int lunaria_cdp_page_eval(struct lunaria_cdp_page *page,
                           const char *expression, unsigned *request_id);
 int lunaria_cdp_page_viewport(struct lunaria_cdp_page *page,

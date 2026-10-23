@@ -481,6 +481,76 @@ static const char *kf_key_class(const char *alg, int32_t kind)
    return "Ljava/security/Key;";
 }
 
+/* Numeric RSA specifications are immutable BigInteger references, not an
+ * encoded byte array. Keep the inputs until the provider imports the key. */
+static bool rsa_public_spec_init(struct dvm *vm, dvm_ref self,
+                                 const union dvm_value *args, int nargs,
+                                 union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   (void)dvm_set_field(vm,self,"modulus","Ljava/math/BigInteger;",ARG(0));
+   (void)dvm_set_field(vm,self,"publicExponent","Ljava/math/BigInteger;",ARG(1));
+   RETV();
+}
+
+static bool rsa_public_spec_modulus(struct dvm *vm, dvm_ref self,
+                                    const union dvm_value *args, int nargs,
+                                    union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   return dvm_get_field(vm,self,"modulus","Ljava/math/BigInteger;",out);
+}
+
+static bool rsa_public_spec_exponent(struct dvm *vm, dvm_ref self,
+                                     const union dvm_value *args, int nargs,
+                                     union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   return dvm_get_field(vm,self,"publicExponent","Ljava/math/BigInteger;",out);
+}
+
+static bool kf_rsa_public_spec(struct dvm *vm, dvm_ref spec,
+                               union dvm_value *out)
+{
+   union dvm_value modulus={0}, exponent={0};
+   (void)dvm_get_field(vm,spec,"modulus","Ljava/math/BigInteger;",&modulus);
+   (void)dvm_get_field(vm,spec,"publicExponent","Ljava/math/BigInteger;",&exponent);
+   if(!modulus.l || !exponent.l) {
+      dvm__throw(vm,"java/security/spec/InvalidKeySpecException","null RSA component");
+      return false;
+   }
+   BIGNUM *n=bigint_bn(vm,modulus.l);
+   BIGNUM *e=n ? bigint_bn(vm,exponent.l) : NULL;
+   if(!n || !e) {BN_free(n);BN_free(e);return false;}
+   OSSL_PARAM_BLD *builder=OSSL_PARAM_BLD_new();
+   OSSL_PARAM *params=NULL;
+   EVP_PKEY_CTX *ctx=NULL;
+   EVP_PKEY *key=NULL;
+   bool good=!BN_is_negative(n) && !BN_is_zero(n) &&
+      !BN_is_negative(e) && !BN_is_zero(e) && builder &&
+      OSSL_PARAM_BLD_push_BN(builder,OSSL_PKEY_PARAM_RSA_N,n) &&
+      OSSL_PARAM_BLD_push_BN(builder,OSSL_PKEY_PARAM_RSA_E,e);
+   if(good) {
+      params=OSSL_PARAM_BLD_to_param(builder);
+      ctx=EVP_PKEY_CTX_new_from_name(NULL,"RSA",NULL);
+      good=params && ctx && EVP_PKEY_fromdata_init(ctx)>0 &&
+         EVP_PKEY_fromdata(ctx,&key,EVP_PKEY_PUBLIC_KEY,params)>0;
+   }
+   unsigned char *der=NULL;
+   int length=good ? i2d_PUBKEY(key,&der) : 0;
+   EVP_PKEY_free(key);EVP_PKEY_CTX_free(ctx);
+   OSSL_PARAM_free(params);OSSL_PARAM_BLD_free(builder);
+   BN_free(n);BN_free(e);
+   if(length<=0) {
+      OPENSSL_free(der);
+      dvm__throw(vm,"java/security/spec/InvalidKeySpecException","invalid RSA public key");
+      return false;
+   }
+   dvm_ref encoded=make_bytes(vm,der,(uint32_t)length);
+   OPENSSL_free(der);
+   RETL(key_make(vm,kf_key_class("RSA",2),encoded,"RSA",2));
+}
+
 /* generatePrivate / generatePublic: the spec's bytes become the key's encoded
  * form; OpenSSL parses them when the cipher is used, which is where a
  * malformed key should surface. */
@@ -492,6 +562,12 @@ static bool kf_generate(struct dvm *vm, dvm_ref self,
    union dvm_value enc = { 0 }, alg = { 0 };
    if (ARG(0).l) (void)dvm_get_field(vm, ARG(0).l, "encoded", "[B", &enc);
    (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &alg);
+   const char *alg_name = alg.l ? dvm_string_utf8(vm, alg.l) : "RSA";
+   struct dvm_class *spec_class=dvm_object_class(vm,ARG(0).l);
+   if(kind==2 && alg_name && !strcasecmp(alg_name,"RSA") && spec_class &&
+      dvm__class_assignable(vm,spec_class,
+         dvm__class_by_desc(vm,"Ljava/security/spec/RSAPublicKeySpec;")))
+      return kf_rsa_public_spec(vm,ARG(0).l,out);
    if (!enc.l) {
       if (getenv("LUNARIA_DVM_TRACE")) {
          struct dvm_class *spec = dvm_object_class(vm, ARG(0).l);
@@ -502,7 +578,6 @@ static bool kf_generate(struct dvm *vm, dvm_ref self,
                  "no encoded key in the spec");
       return false;
    }
-   const char *alg_name = alg.l ? dvm_string_utf8(vm, alg.l) : "RSA";
    RETL(key_make(vm, kf_key_class(alg_name, kind), enc.l, alg_name, kind));
 }
 
@@ -677,12 +752,29 @@ static bool cipher_getInstance_named(struct dvm *vm, dvm_ref self,
    return cipher_getInstance(vm, self, args, 1, out);
 }
 
+/* Native state follows the Java object's lifetime. */
+static void cipher_state_destroy(void *data)
+{
+   EVP_CIPHER_CTX_free(data);
+}
+static void cipher_state_clear(struct dvm *vm, dvm_ref self)
+{
+   struct dvm_object *object = dvm__obj(vm, self);
+   if (object && object->data) {
+      cipher_state_destroy(object->data);
+      object->data = NULL;
+      object->data_destroy = NULL;
+   }
+}
+
 static bool cipher_init(struct dvm *vm, dvm_ref self,
                         const union dvm_value *args, int nargs,
                         union dvm_value *out)
 {
    (void)out;
    union dvm_value empty = {0};
+   cipher_state_clear(vm, self);
+   (void)dvm_set_field(vm, self, "pending", "[B", empty);
    (void)dvm_set_field(vm, self, "opmode", "I", empty);
    (void)dvm_set_field(vm, self, "key", "Ljava/lang/Object;", empty);
    if (ARG(0).i < JCE_ENCRYPT || ARG(0).i > JCE_UNWRAP) {
@@ -996,6 +1088,142 @@ static bool cipher_sym(struct dvm *vm, int opmode, const char *alg,
    RETL(r);
 }
 
+/* Clone before processing so an undersized output does not consume input or
+ * advance cipher state. GCM retains ciphertext until authentication at final;
+ * RSA similarly has no partial output. */
+static bool cipher_update_bytes(struct dvm *vm, dvm_ref self,
+                                const uint8_t *input, uint32_t length,
+                                uint8_t **output, int *written,
+                                EVP_CIPHER_CTX **next, bool *buffered)
+{
+   union dvm_value op={0}, transform={0}, keyref={0}, ivref={0};
+   (void)dvm_get_field(vm,self,"opmode","I",&op);
+   if (op.i != JCE_ENCRYPT && op.i != JCE_DECRYPT) {
+      dvm__throw(vm,"java/lang/IllegalStateException","cipher is not initialized for encryption/decryption");
+      return false;
+   }
+   (void)dvm_get_field(vm,self,"transform","Ljava/lang/String;",&transform);
+   char alg[128],mode[128],pad[128];
+   cipher_parse(dvm_string_utf8(vm,transform.l),alg,sizeof alg,mode,sizeof mode,pad,sizeof pad);
+   *buffered = !strcasecmp(alg,"RSA") || !strcasecmp(mode,"GCM");
+   *written=0; *output=NULL; *next=NULL;
+   if (*buffered) return true;
+   EVP_CIPHER_CTX *ctx=EVP_CIPHER_CTX_new();
+   struct dvm_object *object=dvm__obj(vm,self);
+   int ok=ctx != NULL;
+   if (ok && object->data) ok=EVP_CIPHER_CTX_copy(ctx,object->data)>0;
+   else if (ok) {
+      uint32_t keylen=0,ivlen=0;
+      (void)dvm_get_field(vm,self,"key","Ljava/lang/Object;",&keyref);
+      (void)dvm_get_field(vm,self,"iv","[B",&ivref);
+      const uint8_t *key=key_bytes(vm,keyref.l,&keylen);
+      const uint8_t *iv=ivref.l?arg_bytes(vm,ivref.l,&ivlen):NULL;
+      const EVP_CIPHER *type=cipher_pick(alg,mode,keylen);
+      ok=key && type && EVP_CipherInit_ex(ctx,type,NULL,key,iv,op.i==JCE_ENCRYPT)>0;
+      if(ok) ok=EVP_CIPHER_CTX_set_padding(ctx,strcasecmp(pad,"NoPadding")!=0)>0;
+   }
+   if(ok) *output=malloc((size_t)length+EVP_MAX_BLOCK_LENGTH);
+   if(ok && !*output) ok=0;
+   if(ok && length) ok=EVP_CipherUpdate(ctx,*output,written,input,(int)length)>0;
+   if(!ok) {
+      free(*output); *output=NULL; EVP_CIPHER_CTX_free(ctx);
+      return cipher_fail(vm,"cipher update failed");
+   }
+   *next=ctx;
+   return true;
+}
+static bool cipher_commit_update(struct dvm *vm,dvm_ref self,
+                                 EVP_CIPHER_CTX *next,bool buffered,
+                                 const uint8_t *input,uint32_t length)
+{
+   if(buffered) {
+      union dvm_value old={0}; uint32_t size=0;
+      (void)dvm_get_field(vm,self,"pending","[B",&old);
+      const uint8_t *bytes=old.l?arg_bytes(vm,old.l,&size):NULL;
+      if(length>INT32_MAX-size) {
+         dvm__throw(vm,"java/lang/OutOfMemoryError","cipher input too large"); return false;
+      }
+      dvm_ref joined=dvm_new_array(vm,'B',NULL,size+length);
+      if(!joined) return false;
+      uint8_t *dest=dvm_array_data(vm,joined);
+      if(size) memcpy(dest,bytes,size);
+      if(length) memcpy(dest+size,input,length);
+      union dvm_value value={.l=joined};
+      return dvm_set_field(vm,self,"pending","[B",value);
+   }
+   cipher_state_clear(vm,self);
+   struct dvm_object *object=dvm__obj(vm,self);
+   object->data=next; object->data_destroy=cipher_state_destroy;
+   return true;
+}
+static bool cipher_update_buffers(struct dvm *vm,dvm_ref self,
+                                  const union dvm_value *args,int nargs,
+                                  union dvm_value *out)
+{
+   (void)nargs;
+   if(!ARG(0).l || !ARG(1).l) {
+      dvm__throw(vm,"java/lang/NullPointerException","cipher buffer"); return false;
+   }
+   if(ARG(0).l==ARG(1).l) {
+      dvm__throw(vm,"java/lang/IllegalArgumentException","input and output are the same buffer"); return false;
+   }
+   union dvm_value readonly={0};
+   (void)dvm_get_field(vm,ARG(1).l,"readOnly","Z",&readonly);
+   if(readonly.i) {
+      dvm__throw(vm,"java/nio/ReadOnlyBufferException","cipher output"); return false;
+   }
+   struct dvm_object *src=stream_buf(vm,ARG(0).l),*dst=stream_buf(vm,ARG(1).l);
+   int32_t ip=0,il=0,op=0,ol=0;
+   (void)stream_field(vm,ARG(0).l,"pos",&ip);
+   (void)stream_field(vm,ARG(0).l,"count",&il);
+   (void)stream_field(vm,ARG(1).l,"pos",&op);
+   (void)stream_field(vm,ARG(1).l,"count",&ol);
+   if(!src || !dst || ip<0 || il<ip || (uint32_t)il>src->length ||
+      op<0 || ol<op || (uint32_t)ol>dst->length) {
+      dvm__throw(vm,"java/lang/IllegalArgumentException","invalid cipher buffer window"); return false;
+   }
+   const uint8_t *input=src->data?(uint8_t *)src->data+ip:(const uint8_t *)"";
+   uint8_t *bytes=NULL; int written=0; EVP_CIPHER_CTX *next=NULL; bool buffered=false;
+   if(!cipher_update_bytes(vm,self,input,(uint32_t)(il-ip),&bytes,&written,&next,&buffered)) return false;
+   if(written>ol-op) {
+      free(bytes); EVP_CIPHER_CTX_free(next);
+      dvm__throw(vm,"javax/crypto/ShortBufferException","output buffer too small"); return false;
+   }
+   if(!cipher_commit_update(vm,self,next,buffered,input,(uint32_t)(il-ip))) {
+      free(bytes); EVP_CIPHER_CTX_free(next); return false;
+   }
+   if(written) memcpy((uint8_t *)dst->data+op,bytes,(size_t)written);
+   free(bytes);
+   stream_set_field(vm,ARG(0).l,"pos",il);
+   stream_set_field(vm,ARG(1).l,"pos",op+written);
+   RETI(written);
+}
+
+static bool cipher_update_array(struct dvm *vm,dvm_ref self,
+                                const union dvm_value *args,int nargs,
+                                union dvm_value *out)
+{
+   if(!ARG(0).l) {
+      dvm__throw(vm,"java/lang/IllegalArgumentException","null cipher input"); return false;
+   }
+   uint32_t size=0; const uint8_t *input=arg_bytes(vm,ARG(0).l,&size);
+   int32_t offset=nargs>=3?ARG(1).i:0;
+   int32_t length=nargs>=3?ARG(2).i:(int32_t)size;
+   if(offset<0 || length<0 || (uint32_t)offset>size || (uint32_t)length>size-(uint32_t)offset) {
+      dvm__throw(vm,"java/lang/IllegalArgumentException","invalid cipher input range"); return false;
+   }
+   if(input) input+=offset;
+   uint8_t *bytes=NULL; int written=0; EVP_CIPHER_CTX *next=NULL; bool buffered=false;
+   if(!cipher_update_bytes(vm,self,input,(uint32_t)length,&bytes,&written,&next,&buffered)) return false;
+   dvm_ref result=written?make_bytes(vm,bytes,(uint32_t)written):0;
+   free(bytes);
+   if(written && !result) { EVP_CIPHER_CTX_free(next); return false; }
+   if(!cipher_commit_update(vm,self,next,buffered,input,(uint32_t)length)) {
+      EVP_CIPHER_CTX_free(next); return false;
+   }
+   RETL(result);
+}
+
 static bool cipher_doFinal(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out)
@@ -1021,12 +1249,14 @@ static bool cipher_doFinal(struct dvm *vm, dvm_ref self,
    const uint8_t *key = key_bytes(vm, kv.l, &keylen);
    const uint8_t *iv = ivv.l ? arg_bytes(vm, ivv.l, &ivlen) : NULL;
    const uint8_t *aad = aadv.l ? arg_bytes(vm, aadv.l, &aadlen) : NULL;
-   const uint8_t *in = arg_bytes(vm, ARG(0).l, &inlen);
+   const uint8_t *in = nargs ? arg_bytes(vm, ARG(0).l, &inlen) : NULL;
    if (nargs >= 3) {
       uint32_t off = (uint32_t)args[1].i, len = (uint32_t)args[2].i;
-      if (off > inlen) off = inlen;
-      if (len > inlen - off) len = inlen - off;
-      in += off;
+      if (off > inlen || len > inlen - off) {
+         dvm__throw(vm,"java/lang/IllegalArgumentException","invalid cipher input range");
+         return false;
+      }
+      if (in) in += off;
       inlen = len;
    }
    if (!key) {
@@ -1041,12 +1271,44 @@ static bool cipher_doFinal(struct dvm *vm, dvm_ref self,
       fprintf(stderr, "[jce] %s alg=%s mode=%s pad=%s key=%u(kind %d) iv=%u "
               "in=%u\n", ov.i == 1 ? "encrypt" : ov.i == 2 ? "decrypt" : "?",
               alg, mode, pad, keylen, kind.i, ivlen, inlen);
+   struct dvm_object *object=dvm__obj(vm,self);
+   if(object && object->data) {
+      uint8_t *bytes=NULL; int written=0,tail=0;
+      EVP_CIPHER_CTX *next=NULL; bool buffered=false;
+      if(!cipher_update_bytes(vm,self,in,inlen,&bytes,&written,&next,&buffered)) return false;
+      int final_ok=EVP_CipherFinal_ex(next,bytes+written,&tail)>0;
+      EVP_CIPHER_CTX_free(next);
+      if(!final_ok) { free(bytes); return cipher_fail(vm,"cipher final failed"); }
+      dvm_ref result=make_bytes(vm,bytes,(uint32_t)(written+tail));
+      free(bytes);
+      if(!result) return false;
+      cipher_state_clear(vm,self);
+      union dvm_value empty={0};
+      (void)dvm_set_field(vm,self,"aad","[B",empty);
+      RETL(result);
+   }
+   union dvm_value pending={0}; uint32_t pending_len=0;
+   (void)dvm_get_field(vm,self,"pending","[B",&pending);
+   const uint8_t *prefix=pending.l?arg_bytes(vm,pending.l,&pending_len):NULL;
+   uint8_t *joined=NULL;
+   if(pending_len) {
+      if(inlen>INT32_MAX-pending_len) {
+         dvm__throw(vm,"java/lang/OutOfMemoryError","cipher input too large"); return false;
+      }
+      joined=malloc((size_t)pending_len+inlen);
+      if(!joined) { dvm__throw(vm,"java/lang/OutOfMemoryError","cipher input"); return false; }
+      memcpy(joined,prefix,pending_len);
+      if(inlen) memcpy(joined+pending_len,in,inlen);
+      in=joined; inlen+=pending_len;
+   }
    bool ok = !strcasecmp(alg, "RSA")
       ? cipher_rsa(vm, ov.i, pad, key, keylen, kind.i, in, inlen, out)
       : cipher_sym(vm, ov.i, alg, mode, pad, key, keylen, iv, ivlen, aad,
                    aadlen, in, inlen, out);
+   free(joined);
    if (ok) {
       union dvm_value empty = { .l = 0 };
+      (void)dvm_set_field(vm, self, "pending", "[B", empty);
       (void)dvm_set_field(vm, self, "aad", "[B", empty);
    }
    return ok;
@@ -1060,19 +1322,38 @@ static bool cipher_doFinal_into(struct dvm *vm, dvm_ref self,
       dvm__throw(vm, "java/lang/IllegalArgumentException", "doFinal args");
       return false;
    }
+   struct dvm_object *object=dvm__obj(vm,self);
+   EVP_CIPHER_CTX *saved=NULL;
+   if(object && object->data) {
+      saved=EVP_CIPHER_CTX_new();
+      if(!saved || EVP_CIPHER_CTX_copy(saved,object->data)<=0) {
+         EVP_CIPHER_CTX_free(saved); return cipher_fail(vm,"cannot preserve cipher state");
+      }
+   }
+   union dvm_value aad={0},pending={0};
+   (void)dvm_get_field(vm,self,"aad","[B",&aad);
+   (void)dvm_get_field(vm,self,"pending","[B",&pending);
    union dvm_value bytes = { 0 };
-   if (!cipher_doFinal(vm, self, args, 3, &bytes)) return false;
+   if (!cipher_doFinal(vm, self, args, 3, &bytes)) {
+      EVP_CIPHER_CTX_free(saved); return false;
+   }
    struct dvm_object *src = bytes.l ? dvm__obj(vm, bytes.l) : NULL;
    struct dvm_object *dst = args[3].l ? dvm__obj(vm, args[3].l) : NULL;
    int32_t offset = args[4].i;
    if (!src || src->kind != DVM_OBJ_ARRAY || !dst ||
-       dst->kind != DVM_OBJ_ARRAY || !dst->data || offset < 0 ||
+       dst->kind != DVM_OBJ_ARRAY || offset < 0 ||
        (uint32_t)offset > dst->length ||
        src->length > dst->length - (uint32_t)offset) {
-      dvm__throw(vm, "javax/crypto/ShortBufferException",
-                 "output buffer too small");
+      cipher_state_clear(vm,self);
+      object=dvm__obj(vm,self);
+      object->data=saved;
+      object->data_destroy=saved?cipher_state_destroy:NULL;
+      (void)dvm_set_field(vm,self,"aad","[B",aad);
+      (void)dvm_set_field(vm,self,"pending","[B",pending);
+      dvm__throw(vm, "javax/crypto/ShortBufferException", "output buffer too small");
       return false;
    }
+   EVP_CIPHER_CTX_free(saved);
    if (src->length)
       memcpy((uint8_t *)dst->data + offset, src->data, src->length);
    RETI((int32_t)src->length);
@@ -2329,7 +2610,7 @@ static const struct rt_field rt_cipher_fields[] = {
    { "provider", "Ljava/security/Provider;" },
    { "transform", "Ljava/lang/String;" }, { "opmode", "I" },
    { "key", "Ljava/lang/Object;" }, { "iv", "[B" },
-   { "aad", "[B" },
+   { "aad", "[B" }, { "pending", "[B" },
    { "algorithm", "Ljava/lang/String;" }, F_END
 };
 
@@ -2372,6 +2653,21 @@ static const struct rt_method rt_key_spec[] = {
    M("<init>", "([B)V", spec_init),
    M("getEncoded", "()[B", key_getEncoded),
    M_END,
+};
+
+static const char *const rt_iface_key_spec[] = {"Ljava/security/spec/KeySpec;",NULL};
+static const struct rt_field rt_encoded_key_spec_fields[] = {
+   {"encoded","[B"},F_END
+};
+static const struct rt_field rt_rsa_public_spec_fields[] = {
+   {"modulus","Ljava/math/BigInteger;"},
+   {"publicExponent","Ljava/math/BigInteger;"},F_END
+};
+static const struct rt_method rt_rsa_public_spec[] = {
+   M("<init>","(Ljava/math/BigInteger;Ljava/math/BigInteger;)V",rsa_public_spec_init),
+   M("getModulus","()Ljava/math/BigInteger;",rsa_public_spec_modulus),
+   M("getPublicExponent","()Ljava/math/BigInteger;",rsa_public_spec_exponent),
+   M_END
 };
 
 /* IvParameterSpec / GCMParameterSpec both surface the IV through `iv`. */
@@ -2464,6 +2760,10 @@ static const struct rt_method rt_cipher[] = {
      cipher_init),
    M("init", "(ILjava/security/Key;Ljava/security/SecureRandom;)V", cipher_init),
    M("doFinal", "([B)[B", cipher_doFinal),
+   M("doFinal", "()[B", cipher_doFinal),
+   M("update", "(Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;)I", cipher_update_buffers),
+   M("update", "([B)[B", cipher_update_array),
+   M("update", "([BII)[B", cipher_update_array),
    M("doFinal", "([BII)[B", cipher_doFinal),
    M("doFinal", "([BII[BI)I", cipher_doFinal_into),
    M("updateAAD", "([B)V", cipher_updateAAD),

@@ -63,7 +63,7 @@ void luna_boot_finish(const char *why);
 int luna_launcher_begin(const char *path);
 void luna_launcher_progress(const char *stage, const char *file, uint64_t bytes, uint64_t total);
 int luna_launcher_cancelled(void);
-int luna_launcher_choose(const char *package, const char *const *profiles,
+int luna_launcher_choose(const char *package, const char *const *profiles, const char *const *labels,
                          size_t count, char *choice, size_t capacity);
 /* One setting the launcher screen offers next to the application: a key of
  * lunaria.conf, what to call it, and its value (filled in by the caller,
@@ -74,6 +74,7 @@ typedef struct luna_launcher_setting {
    int folder;
    int compact;      /* shares a row with the neighbouring compact settings */
    const char *const *choices; /* NULL-terminated values, or NULL for text */
+   const char *const *choice_labels; /* optional display names for choices */
    char value[1024];
 } luna_launcher_setting;
 
@@ -94,6 +95,8 @@ void *luna_launcher_take_window(void);
  * starting over under another (returns only when it could not). */
 const char *luna_apk_profile_current(void);
 int luna_apk_profile_list(char (*names)[65], int max);
+int luna_apk_profile_label(const char *id, char *out, size_t cap);
+int luna_apk_profile_set_label(const char *id, const char *label);
 int luna_apk_profile_new_name(char *out, size_t cap);
 int luna_apk_restart(const char *profile);
 /* Starts over with no APK, showing the launcher screen. */

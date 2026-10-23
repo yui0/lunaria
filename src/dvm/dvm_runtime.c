@@ -65,6 +65,7 @@ extern bool luna_vk_available(void) DVM_OPTIONAL_SYMBOL;
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/pem.h>
+#include <openssl/param_build.h>
 #include <openssl/pkcs7.h>
 #include <openssl/rand.h>
 #include <openssl/rsa.h>
@@ -17325,6 +17326,10 @@ static bool latch_init(struct dvm *vm, dvm_ref self,
                        union dvm_value *out)
 {
    (void)nargs; (void)out;
+   if (ARG(0).i < 0) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException", "count < 0");
+      return false;
+   }
    union dvm_value value = { .i = ARG(0).i };
    (void)dvm_set_field(vm, self, "count", "I", value);
    RETV();
@@ -17341,6 +17346,16 @@ static bool latch_count_down(struct dvm *vm, dvm_ref self,
    (void)dvm_set_field(vm, self, "count", "I", value);
    dvm_gil_notify_for(self);
    RETV();
+}
+
+static bool latch_get_count(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value value = { 0 };
+   (void)dvm_get_field(vm, self, "count", "I", &value);
+   RETJ(value.i);
 }
 
 static bool latch_count_is_zero(struct dvm *vm, dvm_ref self)
@@ -17461,7 +17476,7 @@ static const struct rt_method rt_latch[] = {
    M("countDown", "()V", latch_count_down),
    M("await", "()V", latch_await),
    M("await", "(JLjava/util/concurrent/TimeUnit;)Z", latch_await),
-   M("getCount", "()J", ret_zero),
+   M("getCount", "()J", latch_get_count),
    M_END,
 };
 
@@ -21355,7 +21370,7 @@ static const struct rt_field rt_bytes_stream_fields[] = {
    /* allocateDirect(): the buffer promises an address JNI can take.  The
     * flag is what tells the JNI bridge to back this one with guest memory
     * (see arm_exec_new_guest_direct_buffer). */
-   { "direct", "Z" },
+   { "direct", "Z" }, { "nativeBacked", "Z" },
    /* java.nio buffers start BIG_ENDIAN; order(ByteOrder) changes this flag. */
    { "little", "Z" }, { "readOnly", "Z" }, F_END
 };
@@ -29133,6 +29148,7 @@ static bool cs_compareTo(struct dvm *vm, dvm_ref self, const union dvm_value *ar
    RETI(strcasecmp(x ? x : "", y ? y : ""));
 }
 
+static bool cs_decode(struct dvm *, dvm_ref, const union dvm_value *, int, union dvm_value *);
 static const struct rt_field rt_charset_fields[] = {
    { "name", "Ljava/lang/String;" }, F_END
 };
@@ -29142,6 +29158,7 @@ static const struct rt_method rt_charset[] = {
    SM("isSupported", "(Ljava/lang/String;)Z", cs_forName),
    SM("defaultCharset", "()Ljava/nio/charset/Charset;", cs_defaultCharset),
    M("name", "()Ljava/lang/String;", cs_name),
+   M("decode", "(Ljava/nio/ByteBuffer;)Ljava/nio/CharBuffer;", cs_decode),
    M("displayName", "()Ljava/lang/String;", cs_name),
    M("toString", "()Ljava/lang/String;", cs_name),
    M("equals", "(Ljava/lang/Object;)Z", cs_equals),
@@ -29904,7 +29921,9 @@ static bool bb_hasArray(struct dvm *vm, dvm_ref self,
 {
    (void)args; (void)nargs;
    struct dvm_object *b = stream_buf(vm, self);
-   RETI(b && !bb_read_only(vm, self) ? 1 : 0);
+   union dvm_value native={0};
+   (void)dvm_get_field(vm,self,"nativeBacked","Z",&native);
+   RETI(b && !native.i && !bb_read_only(vm, self) ? 1 : 0);
 }
 
 static bool bb_little_endian(struct dvm *vm, dvm_ref self)
@@ -30183,6 +30202,10 @@ static bool bb_array(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                      int nargs, union dvm_value *out)
 {
    (void)args; (void)nargs;
+   union dvm_value native={0};
+   (void)dvm_get_field(vm,self,"nativeBacked","Z",&native);
+   if(native.i) {dvm__throw(vm,"java/lang/UnsupportedOperationException","native memory has no Java array");return false;}
+   if(!bb_writable(vm,self))return false;
    union dvm_value v = { 0 };
    (void)dvm_get_field(vm, self, "buf", "[B", &v);
    RETL(v.l);
@@ -30192,7 +30215,8 @@ static bool bb_arrayOffset(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out)
 {
-   (void)args; (void)nargs;
+   union dvm_value array={0};
+   if(!bb_array(vm,self,args,nargs,&array))return false;
    RETI(0);
 }
 
@@ -30539,7 +30563,17 @@ static bool buffer_has_remaining(struct dvm *vm, dvm_ref self,
    RETI(p.i < l.i);
 }
 
+static bool buffer_capacity(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   struct dvm_class *c=dvm_object_class(vm,self);
+   struct dvm_method *m=c ? dvm_find_method(vm,c,"capacity","()I") : NULL;
+   if(m && m->builtin!=buffer_capacity)return dvm_call(vm,m,self,args,nargs,out);
+   dvm__throw(vm,"java/lang/AbstractMethodError","buffer capacity");return false;
+}
 static const struct rt_method rt_nio_buffer[] = {
+   M("capacity","()I",buffer_capacity),
+   M("position","()I",bb_position),M("limit","()I",bb_limit),
+   M("remaining","()I",bb_remaining),
    M("hasRemaining", "()Z", buffer_has_remaining), M_END,
 };
 
@@ -30742,6 +30776,194 @@ static const struct rt_method rt_shortbuffer[]={
  M("mark","()Ljava/nio/ShortBuffer;",sb_mark),M("reset","()Ljava/nio/ShortBuffer;",sb_reset),M("rewind","()Ljava/nio/ShortBuffer;",sb_rewind),M("clear","()Ljava/nio/ShortBuffer;",sb_clear),M("flip","()Ljava/nio/ShortBuffer;",sb_flip),
  M("slice","()Ljava/nio/ShortBuffer;",sb_slice),M("duplicate","()Ljava/nio/ShortBuffer;",sb_duplicate),M("asReadOnlyBuffer","()Ljava/nio/ShortBuffer;",sb_readonly),M("compact","()Ljava/nio/ShortBuffer;",sb_compact),
  M("isDirect","()Z",bb_isDirect),M("isReadOnly","()Z",bb_isReadOnly),M("hasArray","()Z",sb_hasArray),M("array","()[S",sb_array),M("arrayOffset","()I",sb_arrayOffset),M("order","()Ljava/nio/ByteOrder;",sb_order),M_END
+};
+
+/* CharBuffer stores UTF-16 units. Position/limit/capacity count chars, and
+ * slices/duplicates share the array while retaining independent state. */
+static dvm_ref cb_array_ref(struct dvm *vm,dvm_ref self)
+{union dvm_value a={0};(void)dvm_get_field(vm,self,"chars","[C",&a);return a.l;}
+static uint16_t *cb_data(struct dvm *vm,dvm_ref self)
+{uint16_t *p=dvm_array_data(vm,cb_array_ref(vm,self));return p ? p+sb_field(vm,self,"offset") : NULL;}
+static dvm_ref cb_new(struct dvm *vm,dvm_ref array,int32_t offset,int32_t capacity,bool readonly)
+{
+   dvm_ref o=dvm_new_object(vm,dvm_find_class(vm,"java/nio/CharBuffer"));
+   if(!o){dvm__throw(vm,"java/lang/OutOfMemoryError","CharBuffer");return 0;}
+   (void)dvm_set_field(vm,o,"chars","[C",(union dvm_value){.l=array});
+   (void)dvm_set_field(vm,o,"readOnly","Z",(union dvm_value){.i=readonly});
+   (void)dvm_set_field(vm,o,"little","Z",(union dvm_value){.i=sb_native_little()});
+   stream_set_field(vm,o,"offset",offset);stream_set_field(vm,o,"capacity",capacity);
+   stream_set_field(vm,o,"count",capacity);stream_set_field(vm,o,"pos",0);stream_set_field(vm,o,"mark",-1);
+   return o;
+}
+static bool cb_allocate(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)nargs;
+   if(ARG(0).i<0)return sb_fail(vm,"java/lang/IllegalArgumentException");
+   dvm_ref a=dvm_new_array(vm,'C',"C",(uint32_t)ARG(0).i);
+   if(!a)return sb_fail(vm,"java/lang/OutOfMemoryError");
+   RETL(cb_new(vm,a,0,ARG(0).i,false));
+}
+static bool cb_wrap(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;
+   struct dvm_object *a=dvm__obj(vm,ARG(0).l);
+   if(!a)return sb_fail(vm,"java/lang/NullPointerException");
+   int32_t pos=nargs==3 ? ARG(1).i : 0,len=nargs==3 ? ARG(2).i : (int32_t)a->length;
+   if(pos<0 || len<0 || (uint32_t)pos>a->length || (uint32_t)len>a->length-(uint32_t)pos)return sb_fail(vm,"java/lang/IndexOutOfBoundsException");
+   dvm_ref o=cb_new(vm,ARG(0).l,0,(int32_t)a->length,false);
+   if(!o)return false;
+   stream_set_field(vm,o,"pos",pos);stream_set_field(vm,o,"count",pos+len);RETL(o);
+}
+static bool cb_get(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   int32_t index=nargs ? ARG(0).i : sb_field(vm,self,"pos");
+   if(index<0 || index>=sb_field(vm,self,"count"))return sb_fail(vm,nargs ? "java/lang/IndexOutOfBoundsException" : "java/nio/BufferUnderflowException");
+   uint16_t value=cb_data(vm,self)[index];
+   if(!nargs)stream_set_field(vm,self,"pos",index+1);
+   RETI(value);
+}
+static bool cb_put(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   if(!bb_writable(vm,self))return false;
+   int32_t index=nargs==2 ? ARG(0).i : sb_field(vm,self,"pos");
+   if(index<0 || index>=sb_field(vm,self,"count"))return sb_fail(vm,nargs==2 ? "java/lang/IndexOutOfBoundsException" : "java/nio/BufferOverflowException");
+   cb_data(vm,self)[index]=(uint16_t)ARG(nargs==2 ? 1 : 0).i;
+   if(nargs!=2)stream_set_field(vm,self,"pos",index+1);
+   RETL(self);
+}
+static bool cb_bulk(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out,bool put)
+{
+   if(put && !bb_writable(vm,self))return false;
+   struct dvm_object *a=dvm__obj(vm,ARG(0).l);
+   if(!a)return sb_fail(vm,"java/lang/NullPointerException");
+   int32_t off=nargs==3 ? ARG(1).i : 0,len=nargs==3 ? ARG(2).i : (int32_t)a->length,pos=sb_field(vm,self,"pos");
+   if(off<0 || len<0 || (uint32_t)off>a->length || (uint32_t)len>a->length-(uint32_t)off)return sb_fail(vm,"java/lang/IndexOutOfBoundsException");
+   if(len>sb_field(vm,self,"count")-pos)return sb_fail(vm,put ? "java/nio/BufferOverflowException" : "java/nio/BufferUnderflowException");
+   if(len) {
+      uint16_t *array=a->data,*buffer=cb_data(vm,self)+pos;
+      if(put)memmove(buffer,array+off,(size_t)len*sizeof *array);
+      else memmove(array+off,buffer,(size_t)len*sizeof *array);
+   }
+   stream_set_field(vm,self,"pos",pos+len);RETL(self);
+}
+static bool cb_get_array(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{return cb_bulk(vm,self,args,nargs,out,false);}
+static bool cb_put_array(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{return cb_bulk(vm,self,args,nargs,out,true);}
+static bool cb_view(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   bool slice=!strcmp(builtin_name(),"slice"),ro=!strcmp(builtin_name(),"asReadOnlyBuffer") || bb_read_only(vm,self);
+   int32_t pos=sb_field(vm,self,"pos"),lim=sb_field(vm,self,"count");
+   dvm_ref o=cb_new(vm,cb_array_ref(vm,self),sb_field(vm,self,"offset")+(slice ? pos : 0),slice ? lim-pos : sb_field(vm,self,"capacity"),ro);
+   if(!o)return false;
+   if(!slice){stream_set_field(vm,o,"pos",pos);stream_set_field(vm,o,"count",lim);stream_set_field(vm,o,"mark",sb_field(vm,self,"mark"));}
+   RETL(o);
+}
+static bool cb_array(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{(void)args;(void)nargs;if(!bb_writable(vm,self))return false;RETL(cb_array_ref(vm,self));}
+static bool cb_has_array(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{(void)args;(void)nargs;RETI(cb_array_ref(vm,self) && !bb_read_only(vm,self));}
+static bool cb_array_offset(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{if(!bb_writable(vm,self))return false;(void)args;(void)nargs;RETI(sb_field(vm,self,"offset"));}
+static bool cb_to_string(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   int32_t pos=sb_field(vm,self,"pos"),n=sb_field(vm,self,"count")-pos;
+   if((size_t)n>(SIZE_MAX-1)/3)return sb_fail(vm,"java/lang/OutOfMemoryError");
+   char *text=malloc((size_t)n*3+1);
+   if(!text)return sb_fail(vm,"java/lang/OutOfMemoryError");
+   size_t bytes=jcs_utf16_to_wtf8(n ? cb_data(vm,self)+pos : NULL,(size_t)n,text);
+   dvm_ref result=dvm_new_string_n(vm,text,bytes);free(text);RETL(result);
+}
+static bool cb_length(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{return bb_remaining(vm,self,args,nargs,out);}
+static bool cb_char_at(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;int32_t pos=sb_field(vm,self,"pos"),index=ARG(0).i;
+   if(index<0 || index>=sb_field(vm,self,"count")-pos)return sb_fail(vm,"java/lang/IndexOutOfBoundsException");
+   RETI(cb_data(vm,self)[pos+index]);
+}
+static bool cb_subsequence(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;int32_t pos=sb_field(vm,self,"pos"),n=sb_field(vm,self,"count")-pos,start=ARG(0).i,end=ARG(1).i;
+   if(start<0 || end<start || end>n)return sb_fail(vm,"java/lang/IndexOutOfBoundsException");
+   dvm_ref o=cb_new(vm,cb_array_ref(vm,self),sb_field(vm,self,"offset"),sb_field(vm,self,"capacity"),bb_read_only(vm,self));
+   if(!o)return false;
+   stream_set_field(vm,o,"pos",pos+start);stream_set_field(vm,o,"count",pos+end);RETL(o);
+}
+static bool cb_compact(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;if(!bb_writable(vm,self))return false;
+   int32_t pos=sb_field(vm,self,"pos"),n=sb_field(vm,self,"count")-pos;
+   if(n)memmove(cb_data(vm,self),cb_data(vm,self)+pos,(size_t)n*2);
+   stream_set_field(vm,self,"pos",n);stream_set_field(vm,self,"count",sb_field(vm,self,"capacity"));stream_set_field(vm,self,"mark",-1);RETL(self);
+}
+static bool cb_compare(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;bool equals=!strcmp(builtin_name(),"equals");
+   struct dvm_class *other=dvm_object_class(vm,ARG(0).l),*base=dvm_find_class(vm,"java/nio/CharBuffer");
+   if(!other || !dvm__class_assignable(vm,other,base)) {
+      if(equals)RETI(0);
+      return sb_fail(vm,ARG(0).l ? "java/lang/ClassCastException" : "java/lang/NullPointerException");
+   }
+   int32_t pa=sb_field(vm,self,"pos"),pb=sb_field(vm,ARG(0).l,"pos");
+   int32_t na=sb_field(vm,self,"count")-pa,nb=sb_field(vm,ARG(0).l,"count")-pb;
+   int32_t result=0,n=na<nb ? na : nb;
+   for(int32_t i=0;i<n;++i) {
+      result=(int32_t)cb_data(vm,self)[pa+i]-(int32_t)cb_data(vm,ARG(0).l)[pb+i];
+      if(result)break;
+   }
+   if(!result)result=na-nb;
+   RETI(equals ? result==0 : result);
+}
+static bool cb_hash(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;uint32_t hash=1;int32_t pos=sb_field(vm,self,"pos");
+   for(int32_t i=sb_field(vm,self,"count");i>pos;)hash=hash*31u+cb_data(vm,self)[--i];
+   RETI((int32_t)hash);
+}
+static bool cs_decode(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;dvm_ref input=ARG(0).l;
+   if(!input)return sb_fail(vm,"java/lang/NullPointerException");
+   struct dvm_object *bytes=stream_buf(vm,input);
+   int32_t pos=sb_field(vm,input,"pos"),limit=sb_field(vm,input,"count");
+   if(!bytes || pos<0 || limit<pos || (uint32_t)limit>bytes->length)return sb_fail(vm,"java/lang/IllegalArgumentException");
+   union dvm_value name={0};(void)dvm_get_field(vm,self,"name","Ljava/lang/String;",&name);
+   const char *charset=name.l ? dvm_string_utf8(vm,name.l) : "UTF-8";
+   struct jcs cs;if(!jcs_lookup(charset,&cs))return sb_fail(vm,"java/nio/charset/UnsupportedCharsetException");
+   size_t length=0;
+   char *text=jcs_decode(&cs,bytes->data ? (const uint8_t *)bytes->data+pos : NULL,(size_t)(limit-pos),&length);
+   if(!text)return sb_fail(vm,"java/lang/OutOfMemoryError");
+   size_t units=jcs_wtf8_to_utf16(text,length,NULL);
+   if(units>INT32_MAX){free(text);return sb_fail(vm,"java/lang/OutOfMemoryError");}
+   dvm_ref chars=dvm_new_array(vm,'C',"C",(uint32_t)units);
+   if(!chars){free(text);return sb_fail(vm,"java/lang/OutOfMemoryError");}
+   if(units)jcs_wtf8_to_utf16(text,length,dvm_array_data(vm,chars));
+   free(text);dvm_ref result=cb_new(vm,chars,0,(int32_t)units,false);
+   if(!result)return false;
+   stream_set_field(vm,input,"pos",limit);RETL(result);
+}
+static const struct rt_field rt_charbuffer_fields[]={
+   {"chars","[C"},{"offset","I"},{"capacity","I"},{"pos","I"},{"count","I"},{"mark","I"},
+   {"readOnly","Z"},{"direct","Z"},{"little","Z"},F_END
+};
+static const char *const rt_charbuffer_interfaces[]={
+   "Ljava/lang/CharSequence;","Ljava/lang/Comparable;","Ljava/lang/Appendable;","Ljava/lang/Readable;",NULL
+};
+static const struct rt_method rt_charbuffer[]={
+   SM("allocate","(I)Ljava/nio/CharBuffer;",cb_allocate),SM("wrap","([C)Ljava/nio/CharBuffer;",cb_wrap),SM("wrap","([CII)Ljava/nio/CharBuffer;",cb_wrap),
+   M("get","()C",cb_get),M("get","(I)C",cb_get),M("get","([C)Ljava/nio/CharBuffer;",cb_get_array),M("get","([CII)Ljava/nio/CharBuffer;",cb_get_array),
+   M("put","(C)Ljava/nio/CharBuffer;",cb_put),M("put","(IC)Ljava/nio/CharBuffer;",cb_put),M("put","([C)Ljava/nio/CharBuffer;",cb_put_array),M("put","([CII)Ljava/nio/CharBuffer;",cb_put_array),
+   M("capacity","()I",sb_capacity),M("remaining","()I",bb_remaining),M("position","()I",sb_position),M("position","(I)Ljava/nio/Buffer;",sb_position),M("position","(I)Ljava/nio/CharBuffer;",sb_position),
+   M("limit","()I",sb_limit),M("limit","(I)Ljava/nio/Buffer;",sb_limit),M("limit","(I)Ljava/nio/CharBuffer;",sb_limit),
+   M("clear","()Ljava/nio/Buffer;",sb_clear),M("clear","()Ljava/nio/CharBuffer;",sb_clear),M("flip","()Ljava/nio/Buffer;",sb_flip),M("flip","()Ljava/nio/CharBuffer;",sb_flip),
+   M("rewind","()Ljava/nio/Buffer;",sb_rewind),M("rewind","()Ljava/nio/CharBuffer;",sb_rewind),M("mark","()Ljava/nio/Buffer;",sb_mark),M("mark","()Ljava/nio/CharBuffer;",sb_mark),M("reset","()Ljava/nio/Buffer;",sb_reset),M("reset","()Ljava/nio/CharBuffer;",sb_reset),
+   M("slice","()Ljava/nio/CharBuffer;",cb_view),M("duplicate","()Ljava/nio/CharBuffer;",cb_view),M("asReadOnlyBuffer","()Ljava/nio/CharBuffer;",cb_view),M("compact","()Ljava/nio/CharBuffer;",cb_compact),
+   M("array","()[C",cb_array),M("arrayOffset","()I",cb_array_offset),M("hasArray","()Z",cb_has_array),M("isReadOnly","()Z",bb_isReadOnly),M("isDirect","()Z",bb_isDirect),M("order","()Ljava/nio/ByteOrder;",sb_order),
+   M("length","()I",cb_length),M("charAt","(I)C",cb_char_at),M("subSequence","(II)Ljava/lang/CharSequence;",cb_subsequence),M("toString","()Ljava/lang/String;",cb_to_string),
+   M("compareTo","(Ljava/nio/CharBuffer;)I",cb_compare),M("compareTo","(Ljava/lang/Object;)I",cb_compare),M("equals","(Ljava/lang/Object;)Z",cb_compare),M("hashCode","()I",cb_hash),M_END
 };
 
 static const struct rt_method rt_bytebuffer[] = {
@@ -31489,6 +31711,30 @@ static struct lm_sink *surface_sink(struct dvm *vm, dvm_ref surface)
 }
 
 static bool surface_refresh_bitmap(struct dvm *, dvm_ref);
+
+dvm_ref dvm_surface_from_sink(struct dvm *vm, struct lm_sink *sink)
+{
+   if (!vm || !sink) return 0;
+   struct dvm_class *cls=dvm_find_class(vm,"android/view/Surface");
+   dvm_ref surface=cls ? dvm_new_object(vm,cls) : 0;
+   if (!surface) return 0;
+   if (!dvm_set_field(vm,surface,"window","Z",(union dvm_value){.i=1}) ||
+       !dvm_set_field(vm,surface,"windowSink","J",
+          (union dvm_value){.j=(int64_t)(uintptr_t)sink})) return 0;
+   struct dvm_object *object=dvm__obj(vm,surface);
+   lm_sink_ref(sink);
+   object->data=sink;
+   object->data_destroy=window_sink_destroy;
+   return surface;
+}
+
+struct lm_sink *dvm_surface_acquire_sink(struct dvm *vm, dvm_ref surface)
+{
+   if (!vm || !surface) return NULL;
+   struct lm_sink *sink=surface_sink(vm,surface);
+   lm_sink_ref(sink);
+   return sink;
+}
 
 struct rt_surface_texture {
    struct dvm *vm;
@@ -45656,7 +45902,8 @@ static pthread_mutex_t g_webview_pointer_lock = PTHREAD_MUTEX_INITIALIZER;
 struct webview_text_event {
    dvm_ref view;
    uint32_t codepoint;
-   int key, action;
+   int key, action, mods;
+   char *text;
 };
 static struct webview_text_event g_webview_text[64];
 static int g_webview_ntext;
@@ -45682,7 +45929,23 @@ static void webview_char_from_overlay(const char *id, uint32_t codepoint)
    pthread_mutex_unlock(&g_webview_text_lock);
 }
 
-static void webview_key_from_overlay(const char *id, int key, int action)
+static void webview_text_from_overlay(const char *id, const char *utf8)
+{
+   dvm_ref ref = webview_id_ref(id);
+   if (!ref || !utf8 || !*utf8) return;
+   char *copy = strdup(utf8);
+   if (!copy) return;
+   pthread_mutex_lock(&g_webview_text_lock);
+   if (g_webview_ntext < (int)(sizeof g_webview_text / sizeof g_webview_text[0])) {
+      g_webview_text[g_webview_ntext++] =
+         (struct webview_text_event){ .view = ref, .text = copy };
+      copy = NULL;
+   }
+   pthread_mutex_unlock(&g_webview_text_lock);
+   free(copy);
+}
+
+static void webview_key_from_overlay(const char *id, int key, int action, int mods)
 {
    dvm_ref ref = webview_id_ref(id);
    if (!ref) return;
@@ -45691,7 +45954,7 @@ static void webview_key_from_overlay(const char *id, int key, int action)
                               sizeof g_webview_text[0]))
       g_webview_text[g_webview_ntext++] =
          (struct webview_text_event){ .view = ref, .key = key,
-                                      .action = action };
+                                      .action = action, .mods = mods };
    pthread_mutex_unlock(&g_webview_text_lock);
 }
 
@@ -45766,24 +46029,31 @@ int dvm_webview_count(void)
 static const char *webview_luna_browser(void)
 {
    static char path[DVM_PATH_MAX];
-#if defined(__linux__)
    char exe[DVM_PATH_MAX];
-   ssize_t n = luna_file_readlink("/proc/self/exe", exe, sizeof exe - 1);
-   if (n > 0) {
-      exe[n] = '\0';
-      char *slash = strrchr(exe, '/');
-      if (slash) {
-         *slash = '\0';
-         static const char *rel[] = { "luna-browser/luna-browser", "luna-browser", NULL };
-         for (int i = 0; rel[i]; ++i) {
-            snprintf(path, sizeof path, "%s/%s", exe, rel[i]);
-            struct stat st;
-            if (luna_file_stat_follow(path, &st) == 0 && S_ISREG(st.st_mode) && luna_file_access(path, X_OK) == 0)
-               return path;
-         }
-      }
-   }
+   if (luna_os_executable_path(exe, sizeof exe) != 0) return NULL;
+   char *slash = strrchr(exe, '/');
+#if defined(_WIN32)
+   char *bslash = strrchr(exe, '\\');
+   if (bslash && (!slash || bslash > slash)) slash = bslash;
 #endif
+   if (!slash) return NULL;
+   *slash = '\0';
+   /* Next to the emulator, or in an app bundle's Resources directory. */
+   static const char *rel[] = {
+      "luna-browser/luna-browser", "luna-browser",
+      "../Resources/luna-browser/luna-browser", "../Resources/luna-browser",
+#if defined(_WIN32)
+      "luna-browser/luna-browser.exe", "luna-browser.exe",
+#endif
+      NULL
+   };
+   for (int i = 0; rel[i]; ++i) {
+      snprintf(path, sizeof path, "%s/%s", exe, rel[i]);
+      struct stat st;
+      if (luna_file_stat_follow(path, &st) == 0 && S_ISREG(st.st_mode) &&
+          luna_file_access(path, X_OK) == 0)
+         return path;
+   }
    return NULL;
 }
 
@@ -46098,10 +46368,9 @@ static struct webview_host_view *webview_host_find(dvm_ref view)
    return NULL;
 }
 
-/* Starts the slot's browser with the engine currently chosen. */
-static bool webview_host_open(struct webview_host_view *slot)
+/* Starts one browser for the slot and opens its DevTools page. */
+static bool webview_host_start(struct webview_host_view *slot, const char *browser)
 {
-   const char *browser = webview_browser_binary();
    if (!browser) return false;
    if (lunaria_cdp_host_open(&slot->host, browser, slot->profile) != 0)
       return false;
@@ -46109,6 +46378,26 @@ static bool webview_host_open(struct webview_host_view *slot)
        lunaria_cdp_page_begin(&slot->page, &slot->host.cdp) != 0) {
       lunaria_cdp_host_close(&slot->host);
       return false;
+   }
+   return true;
+}
+
+/* Starts the slot's browser with the engine currently chosen.  In `auto` an
+ * installed Chrome that fails to start (sandbox, headless or pipe refusal)
+ * falls back to luna-browser, as a missing Chrome does. */
+static bool webview_host_open(struct webview_host_view *slot)
+{
+   const char *browser = webview_browser_binary();
+   if (!webview_host_start(slot, browser)) {
+      const char *configured = getenv("LUNARIA_WEB_BROWSER");
+      const bool automatic = !strcmp(webview_engine(), "auto") &&
+                             !(configured && *configured);
+      const char *luna = automatic ? webview_luna_browser() : NULL;
+      if (!luna || (browser && !strcmp(browser, luna)) ||
+          !webview_host_start(slot, luna))
+         return false;
+      fprintf(stderr, "[webview] %s did not start; using luna-browser\n",
+              browser ? browser : "no Chrome");
    }
    slot->host_open = true;
    slot->sent_width = slot->sent_height = 0;
@@ -46407,6 +46696,10 @@ static void webview_host_capture_image(struct webview_host_view *slot,
 static void webview_send_text(struct lunaria_cdp_page *page,
                                const struct webview_text_event *event)
 {
+   if (event->text) {
+      (void)lunaria_cdp_page_insert_text(page, event->text, NULL);
+      return;
+   }
    if (event->codepoint) {
       const uint32_t c = event->codepoint;
       if (c < 0x20 || (c >= 0xd800 && c <= 0xdfff)) return;
@@ -46429,6 +46722,7 @@ static void webview_send_text(struct lunaria_cdp_page *page,
       return;
    }
    const char *name = NULL;
+   char letter[2] = { 0 };
    int virtual_code = 0;
    switch (event->key) {
    case 259: name = "Backspace"; virtual_code = 8; break;
@@ -46439,9 +46733,20 @@ static void webview_send_text(struct lunaria_cdp_page *page,
    case 262: name = "ArrowRight"; virtual_code = 39; break;
    case 265: name = "ArrowUp"; virtual_code = 38; break;
    case 264: name = "ArrowDown"; virtual_code = 40; break;
+   case 268: name = "Home"; virtual_code = 36; break;
+   case 269: name = "End"; virtual_code = 35; break;
+   case 256: name = "Escape"; virtual_code = 27; break;
    }
+   if (!name && event->key >= 65 && event->key <= 90) {
+      letter[0] = (char)(event->key + ((event->mods & 1) ? 0 : 'a' - 'A'));
+      name = letter;
+      virtual_code = event->key;
+   }
+   const unsigned mods = ((event->mods & 1) ? 8u : 0u) |
+      ((event->mods & 2) ? 2u : 0u) | ((event->mods & 4) ? 1u : 0u) |
+      ((event->mods & 8) ? 4u : 0u);
    if (name) (void)lunaria_cdp_page_key(page, name, virtual_code,
-                                        event->action != 0);
+                                        event->action != 0, mods);
 }
 
 static void webview_host_tick(struct dvm *vm)
@@ -46476,6 +46781,7 @@ static void webview_host_tick(struct dvm *vm)
       struct webview_host_view *slot = webview_host_find(text_events[j].view);
       if (slot && slot->host_open && slot->page.stage == 4)
          webview_send_text(&slot->page, &text_events[j]);
+      free(text_events[j].text);
    }
    /* The menu: another engine re-opens every page on it; a reload
     * navigates each one again. */
@@ -46582,6 +46888,19 @@ static void webview_host_tick(struct dvm *vm)
             (void)lunaria_cdp_page_command(&slot->page, "Network.getAllCookies", NULL,
                                            &slot->cookie_pull_id);
             webview_finish(vm, slot->view, slot->url_ref);
+         } else if (strstr(message, "\"method\":\"Page.frameRequestedNavigation\"") &&
+                    strstr(message, slot->page.session_id) && !slot->navigating) {
+            /* Chromium's network interceptor never sees external protocols.
+             * Android still offers these page-initiated navigations to the
+             * WebViewClient (including authentication return URLs). HTTP(S)
+             * stays on Fetch.requestPaused so each navigation is offered once. */
+            char *nav_url = lunaria_cdp_json_string_dup(message, "url");
+            /* External protocols do not replace Chromium's document. Do not
+             * stop the page: that also cancels unrelated in-flight requests,
+             * including authentication started alongside a progress URL. */
+            if (webview_unknown_scheme(nav_url))
+               (void)webview_should_override_url(vm, slot->view, nav_url);
+            free(nav_url);
          } else if (strstr(message, "\"method\":\"Fetch.requestPaused\"") &&
                     strstr(message, slot->page.session_id)) {
             /* Navigation interception for shouldOverrideUrlLoading.
@@ -57114,6 +57433,9 @@ static const struct rt_method rt_alert_dialog[] = {
      dialog_init),
    M("getContext", "()Landroid/content/Context;", dialog_get_context),
    M("getWindow", "()Landroid/view/Window;", dialog_get_window),
+   /* Touches reach a dialog the way they reach an Activity: its content view
+    * first, then the dialog's own onTouchEvent. */
+   M("dispatchTouchEvent", "(Landroid/view/MotionEvent;)Z", activity_dispatch_touch),
    /* Dialog.onCreate/onStart/onStop are empty on Android: they exist to be
     * overridden, and the base class's own setup happens in show().  A
     * subclass's onCreate() opens with super.onCreate(state), which is this. */
@@ -58571,13 +58893,22 @@ static const struct rt_method rt_multicast_lock[] = {
    M_END,
 };
 
+static bool elv_getPackedPositionType(struct dvm *vm, dvm_ref self,
+                                      const union dvm_value *args, int nargs,
+                                      union dvm_value *out)
+{
+   (void)vm; (void)self; (void)nargs;
+   uint64_t packed = (uint64_t)ARG(0).j;
+   RETI(packed == UINT64_C(0xffffffff) ? 2 : (int32_t)(packed >> 63));
+}
+
 static bool elv_getPackedPositionChild(struct dvm *vm, dvm_ref self,
                                        const union dvm_value *args, int nargs,
                                        union dvm_value *out)
 {
    (void)vm; (void)self; (void)nargs;
-   /* Android: child = (int)(packed >> 32); -1 means group type. */
-   RETI((int32_t)(ARG(0).j >> 32));
+   uint64_t packed = (uint64_t)ARG(0).j;
+   RETI(packed >> 63 ? (int32_t)(uint32_t)packed : -1);
 }
 
 static bool elv_getPackedPositionGroup(struct dvm *vm, dvm_ref self,
@@ -58585,17 +58916,19 @@ static bool elv_getPackedPositionGroup(struct dvm *vm, dvm_ref self,
                                        union dvm_value *out)
 {
    (void)vm; (void)self; (void)nargs;
-   RETI((int32_t)ARG(0).j);
+   uint64_t packed = (uint64_t)ARG(0).j;
+   RETI(packed == UINT64_C(0xffffffff) ? -1 :
+        (int32_t)((packed >> 32) & UINT64_C(0x7fffffff)));
 }
 
-/* The inverse of getPackedPositionGroup/Child.  AOSP packs the type in the
- * top nibble, the group in bits 32..62 and the child in the low 32. */
+/* AOSP packs the type in bit 63, group in bits 32..62 and child in bits 0..31.
+ * Shift unsigned values so the sign bit never invokes C signed overflow. */
 static bool elv_getPackedPositionForGroup(struct dvm *vm, dvm_ref self,
                                           const union dvm_value *args,
                                           int nargs, union dvm_value *out)
 {
    (void)vm; (void)self; (void)nargs;
-   RETJ(((int64_t)(uint32_t)ARG(0).i << 32) | 0xffffffffLL);
+   RETJ((int64_t)((uint64_t)((uint32_t)ARG(0).i & UINT32_C(0x7fffffff)) << 32));
 }
 
 static bool elv_getPackedPositionForChild(struct dvm *vm, dvm_ref self,
@@ -58603,11 +58936,13 @@ static bool elv_getPackedPositionForChild(struct dvm *vm, dvm_ref self,
                                           int nargs, union dvm_value *out)
 {
    (void)vm; (void)self; (void)nargs;
-   RETJ((1LL << 63) | ((int64_t)(uint32_t)ARG(0).i << 32) |
-        (uint32_t)(nargs > 1 ? ARG(1).i : 0));
+   RETJ((int64_t)(UINT64_C(0x8000000000000000) |
+        ((uint64_t)((uint32_t)ARG(0).i & UINT32_C(0x7fffffff)) << 32) |
+        (uint32_t)ARG(1).i));
 }
 
 static const struct rt_method rt_expandable_list[] = {
+   SM("getPackedPositionType", "(J)I", elv_getPackedPositionType),
    SM("getPackedPositionChild", "(J)I", elv_getPackedPositionChild),
    SM("getPackedPositionGroup", "(J)I", elv_getPackedPositionGroup),
    SM("getPackedPositionForGroup", "(I)J", elv_getPackedPositionForGroup),
@@ -62679,44 +63014,17 @@ static bool color_argb(struct dvm *vm, dvm_ref self,
 /* Settings.Global.getString(): every key the emulator does not model is unset,
  * and unset is null on a device — not the empty string, which callers would
  * take for a real value. */
-/* Settings.Secure/Global.getString(resolver, name).
- *
- * Null is the right answer for a setting the device does not carry, but
- * ANDROID_ID is not one of those: every device has it, apps use it as *the*
- * device identifier, and an SDK that finds it empty refuses to register the
- * install ("ANDROID_ID is null or empty" out of Netmarble's RequiredLog).  It
- * has to be the same 64-bit value on every run, so derive it from the host's
- * machine id and the package name — the same pair Android hashes (device
- * secret + app signing key) to keep it stable per app per device. */
+/* Settings values use the same provider as native JNI calls. */
 static bool settings_get_string(struct dvm *vm, dvm_ref self,
                                 const union dvm_value *args, int nargs,
                                 union dvm_value *out)
 {
    (void)self;
    const char *name = nargs > 1 && ARG(1).l ? dvm_string_utf8(vm, ARG(1).l) : NULL;
-   if (!name || strcmp(name, "android_id") != 0) RETL(0);
-
-   static char android_id[17];
-   if (!android_id[0]) {
-      uint64_t h = 1469598103934665603ull;         /* FNV-1a */
-      char seed[512];
-      seed[0] = '\0';
-      FILE *f = luna_file_fopen("/etc/machine-id", "r");
-      if (f) {
-         if (!fgets(seed, sizeof seed, f)) seed[0] = '\0';
-         fclose(f);
-      }
-      const char *package = getenv("ANDROID_PACKAGE_NAME");
-      snprintf(seed + strlen(seed), sizeof seed - strlen(seed), "|%s",
-               package ? package : "");
-      for (const char *p = seed; *p; ++p) {
-         h ^= (unsigned char)*p;
-         h *= 1099511628211ull;
-      }
-      snprintf(android_id, sizeof android_id, "%016llx",
-               (unsigned long long)h);
-   }
-   RETL(dvm_new_string(vm, android_id));
+   const struct dvm_method *method = dvm__builtin_method();
+   const char *owner = method && method->cls ? method->cls->name : "";
+   const char *value = lunaria_android_setting(settings_table(owner), name);
+   RETL(value ? dvm_new_string(vm, value) : 0);
 }
 
 /* Context file streams.  openFileInput/openFileOutput and getFileStreamPath
@@ -73172,7 +73480,6 @@ static void view_touch_from_overlay(struct dvm *vm,dvm_ref view,int x,int y,int 
    if(!act_window_present(vm,receiver)) return;
    struct dvm_class *c=dvm_object_class(vm,receiver);
    struct dvm_method *method=c ? dvm_find_method(vm,c,"dispatchTouchEvent","(Landroid/view/MotionEvent;)Z") : NULL;
-   if (!method) return;
    struct dvm_class *event_class=dvm__class_by_desc(vm,"Landroid/view/MotionEvent;");
    dvm_ref event=event_class ? dvm_new_object(vm,event_class) : 0;
    if (!event) return;
@@ -74602,6 +74909,8 @@ static const struct rt_class rt_classes[] = {
    { "Ljava/nio/Buffer;", "Ljava/lang/Object;", rt_nio_buffer, NULL, NULL },
    { "Ljava/nio/ByteBuffer;", "Ljava/nio/Buffer;", rt_bytebuffer,
      rt_bytes_stream_fields, NULL },
+   { "Ljava/nio/DirectByteBuffer;", "Ljava/nio/ByteBuffer;", NULL, NULL, NULL },
+   { "Ljava/nio/CharBuffer;", "Ljava/nio/Buffer;", rt_charbuffer, rt_charbuffer_fields, rt_charbuffer_interfaces },
    { "Ljava/nio/MappedByteBuffer;", "Ljava/nio/ByteBuffer;", rt_mapped_bytebuffer,
      NULL, NULL },
    { "Ljava/nio/ShortBuffer;", "Ljava/nio/Buffer;", rt_shortbuffer,
@@ -74717,14 +75026,17 @@ static const struct rt_class rt_classes[] = {
      rt_secret_key, NULL, NULL },
    { "Ljavax/crypto/SecretKeyFactory;", "Ljava/lang/Object;",
      rt_secret_key_factory, rt_key_fields, NULL },
-   { "Ljavax/crypto/spec/PBEKeySpec;", "Ljava/security/spec/KeySpec;",
-     rt_pbe_key_spec, rt_pbe_key_spec_fields, NULL },
-   { "Ljava/security/spec/KeySpec;", "Ljava/lang/Object;", rt_key_spec,
-     rt_spec_fields, NULL },
-   { "Ljava/security/spec/PKCS8EncodedKeySpec;", "Ljava/security/spec/KeySpec;",
+   { "Ljavax/crypto/spec/PBEKeySpec;", "Ljava/lang/Object;",
+     rt_pbe_key_spec, rt_pbe_key_spec_fields, rt_iface_key_spec },
+   { .desc="Ljava/security/spec/KeySpec;", .super="Ljava/lang/Object;", .is_interface=true },
+   { "Ljava/security/spec/EncodedKeySpec;", "Ljava/lang/Object;", rt_key_spec,
+     rt_encoded_key_spec_fields, rt_iface_key_spec },
+   { "Ljava/security/spec/PKCS8EncodedKeySpec;", "Ljava/security/spec/EncodedKeySpec;",
      rt_key_spec, NULL, NULL },
-   { "Ljava/security/spec/X509EncodedKeySpec;", "Ljava/security/spec/KeySpec;",
+   { "Ljava/security/spec/X509EncodedKeySpec;", "Ljava/security/spec/EncodedKeySpec;",
      rt_key_spec, NULL, NULL },
+   { "Ljava/security/spec/RSAPublicKeySpec;", "Ljava/lang/Object;",
+     rt_rsa_public_spec, rt_rsa_public_spec_fields, rt_iface_key_spec },
    { "Ljava/security/spec/AlgorithmParameterSpec;", "Ljava/lang/Object;",
      rt_iv_spec, rt_spec_fields, NULL },
    { "Ljavax/crypto/spec/IvParameterSpec;",
@@ -76422,12 +76734,15 @@ bool dvm__builtin_borrows_jni_payloads(const struct dvm_method *method)
     * getBytes creates a separate byte array; it retains neither the String
     * receiver nor the charset argument.  SharedPreferences primitive getters
     * and contains() only look the key up in the backing map and return a
-    * primitive.
+    * primitive. getString also borrows its key and default: it returns the
+    * stored value or default without publishing either argument. The JNI
+    * bridge promotes the result before releasing imported argument copies,
+    * so returning the default preserves its identity and local ownership.
     * Unknown builtins and DEX methods retain the normal owning conversion. */
    return method && (method->builtin==s_init || method->builtin==s_init_hibyte ||
                      method->builtin==s_length || method->builtin==s_charAt ||
                      method->builtin==s_getBytes ||
                      method->builtin==prefs_getInt || method->builtin==prefs_getLong ||
                      method->builtin==prefs_getFloat || method->builtin==prefs_getBoolean ||
-                     method->builtin==prefs_contains);
+                     method->builtin==prefs_contains || method->builtin==prefs_getString);
 }

@@ -2313,6 +2313,7 @@ static bool text_set_compound_drawables(struct dvm *vm, dvm_ref self,
 static const struct rt_field rt_text_view_fields[] = {
    { "paintFlags", "I" },
    { "textPaint", "Landroid/text/TextPaint;" },
+   { "drawablePadding", "I" },
    { "drawableLeft", "Landroid/graphics/drawable/Drawable;" },
    { "drawableTop", "Landroid/graphics/drawable/Drawable;" },
    { "drawableRight", "Landroid/graphics/drawable/Drawable;" },
@@ -9511,6 +9512,22 @@ static void ax_apply_attribute(struct dvm *vm, dvm_ref view, const char *name,
       }
       return;
    }
+   /* android:drawableStart & co. name a drawable resource (the terms dialog's
+    * check box is one: button=@null, the picture comes from here).  Start/end
+    * are kept beside left/right; text_on_draw reads whichever is set. */
+   if (!strncmp(name, "drawable", 8) && strcmp(name, "drawablePadding") &&
+       (!strcmp(name + 8, "Left") || !strcmp(name + 8, "Right") || !strcmp(name + 8, "Top") ||
+        !strcmp(name + 8, "Bottom") || !strcmp(name + 8, "Start") || !strcmp(name + 8, "End"))) {
+      if (type != AX_REFERENCE) return;
+      union dvm_value theme = {0};
+      if (!view_drawable_theme(vm, view, &theme)) return;
+      dvm_ref d = drawable_from_resource(vm, data, 0, theme.l);
+      if (dvm_exception(vm)) return;
+      (void)dvm_set_field(vm, view, name, "Landroid/graphics/drawable/Drawable;", (union dvm_value){ .l = d });
+      return;
+   }
+   if (!strcmp(name, "drawablePadding"))
+      { ax_set_int(vm, view, "drawablePadding", ax_dimension_px(vm, context.l, type, data)); return; }
    if (!strcmp(name, "src") || !strcmp(name, "srcCompat"))
       { ax_set_int(vm, view, "imageResource", (int32_t)data); return; }
    if (!strcmp(name, "cropToPadding")) {
@@ -11433,10 +11450,36 @@ static void ui_text_extent(struct dvm *vm, dvm_ref view, float *width, int *hard
    *hard_lines=layout ? (int)layout->count : 1;
 }
 
+/* The drawables a TextView carries beside its text (android:drawableStart, a
+ * check box's picture) and the room they take: width plus drawablePadding.
+ * Layout is left-to-right here; start/end stand in for left/right. */
+struct text_compound {dvm_ref left,right;int left_w,left_h,right_w,right_h,left_inset,right_inset;};
+static void text_compound_get(struct dvm *vm,dvm_ref view,struct text_compound *c)
+{
+   memset(c,0,sizeof *c);
+   const char *const names[2][2]={{"drawableLeft","drawableStart"},{"drawableRight","drawableEnd"}};
+   dvm_ref found[2]={0,0};
+   for(int side=0;side<2;++side) for(int k=0;k<2 && !found[side];++k) {
+      union dvm_value v={0};
+      if(dvm_get_field(vm,view,names[side][k],"Landroid/graphics/drawable/Drawable;",&v) && v.l) found[side]=v.l;
+   }
+   const int padding=ui_int(vm,view,"drawablePadding");
+   for(int side=0;side<2;++side) {
+      if(!found[side]) continue;
+      union dvm_value w={0},h={0};
+      if(!am_vcall(vm,found[side],"getIntrinsicWidth","()I",NULL,0,&w) ||
+         !am_vcall(vm,found[side],"getIntrinsicHeight","()I",NULL,0,&h)) {dvm_clear_exception(vm);continue;}
+      if(w.i<=0 || h.i<=0) continue;
+      if(side==0) {c->left=found[0];c->left_w=w.i;c->left_h=h.i;c->left_inset=w.i+padding;}
+      else {c->right=found[1];c->right_w=w.i;c->right_h=h.i;c->right_inset=w.i+padding;}
+   }
+}
+
 static struct textview_layout *textview_current_layout(struct dvm *vm,dvm_ref view)
 {
    const struct ui_node *n=ui_node(vm,view);int32_t pad[4];ui_pad(vm,view,pad);
-   int width=(n ? n->w : ui_int(vm,view,"right")-ui_int(vm,view,"left"))-pad[0]-pad[2];
+   struct text_compound compound;text_compound_get(vm,view,&compound);
+   int width=(n ? n->w : ui_int(vm,view,"right")-ui_int(vm,view,"left"))-pad[0]-pad[2]-compound.left_inset-compound.right_inset;
    return textview_layout_get(vm,view,width>0 ? width : INT_MAX);
 }
 
@@ -13023,7 +13066,9 @@ static const char *ui_stylesheet(void)
        * roots (see ui_emit_view) matches how the window's own box is sized. */
       ".root{position:fixed;box-sizing:border-box;}"
       ".w{box-sizing:border-box;}"
-      ".label{flex:0 1 auto;}"
+      /* TextView already supplies the line-box width. CSS's automatic
+       * min-content size must not widen its text beyond that measured box. */
+      ".label{flex:0 1 auto;min-width:0;max-width:100%;}"
       /* The check box a CompoundButton would have drawn from its drawable. */
       ".cbox{width:18px;height:18px;flex:0 0 auto;margin-right:8px;"
       "border:2px solid #8a8f9a;border-radius:3px;background:#ffffff;}"
@@ -13362,7 +13407,8 @@ static void ui_window_shown(struct dvm *vm, dvm_ref window)
    luna_overlay_set_click_handler(ui_click_from_overlay);
    luna_overlay_set_web_pointer_handler(webview_pointer_from_overlay);
    luna_overlay_set_web_text_handlers(webview_char_from_overlay,
-                                      webview_key_from_overlay);
+                                      webview_key_from_overlay,
+                                      webview_text_from_overlay);
    dvm_pin(vm, window);
    g_ui_windows[g_ui_nwindows++] = window;
    fprintf(stderr, "[ui] window %u shown (%d up)\n", (unsigned)window,

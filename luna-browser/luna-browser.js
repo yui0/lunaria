@@ -33,6 +33,8 @@ const T0 = L.now();
 /* The engine's own Promise: a page may replace the global one with a
  * polyfill built on queueMicrotask, which must not come back here. */
 const NativePromise = Promise;
+const mutationObservers = new Set();
+let mutationDeliveryPending = false;
 const hide = (o, k, v) => Object.defineProperty(o, k, { value: v, writable: true, configurable: true });
 
 /* ---------------------------------------------------------------- console */
@@ -92,6 +94,9 @@ class Event {
 }
 Event.NONE = 0; Event.CAPTURING_PHASE = 1; Event.AT_TARGET = 2; Event.BUBBLING_PHASE = 3;
 class CustomEvent extends Event { constructor(t, i = {}) { super(t, i); this.detail = i.detail === undefined ? null : i.detail; } }
+class SubmitEvent extends Event {
+   constructor(type, init = {}) { super(type, init); this.submitter = init.submitter || null; }
+}
 class UIEvent extends Event { constructor(t, i = {}) { super(t, i); this.view = g; this.detail = i.detail || 0; } }
 class MouseEvent extends UIEvent {
    constructor(t, i = {}) {
@@ -262,6 +267,7 @@ const list = a => { const l = new NodeList(); for (const x of a) l.push(x); retu
 
 class Node extends EventTarget {
    get ownerDocument() { return this === document ? null : document; }
+   get baseURI() { return document.baseURI; }
    get isConnected() {
       if (this._uid) return L.connected(this._uid);
       for (let n = this; n; n = n.parentNode) if (n === document) return true;
@@ -317,6 +323,7 @@ class Node extends EventTarget {
             hide(c, '_host', this);
             hide(this, '_folded', c);
             L.setText(this._uid, c._data);
+            if (mutationObservers.size) queueMutation({ type: 'childList', target: this, addedNodes: [c], previousSibling: null, nextSibling: null });
             return c;
          }
          c._materialize();
@@ -333,6 +340,7 @@ class Node extends EventTarget {
          hide(c, '_vparent', this);
          if (c._uid && !this._uid) L.remove(c._uid);   /* kept, not rendered */
       }
+      if (mutationObservers.size) queueMutation({ type: 'childList', target: this, addedNodes: [c], previousSibling: c.previousSibling, nextSibling: c.nextSibling });
       connected(c);
       return c;
    }
@@ -360,6 +368,9 @@ Node.DOCUMENT_POSITION_PRECEDING = 2; Node.DOCUMENT_POSITION_FOLLOWING = 4;
 Node.DOCUMENT_POSITION_CONTAINS = 8; Node.DOCUMENT_POSITION_CONTAINED_BY = 16;
 
 function detach(c) {
+   const parent = mutationObservers.size ? c.parentNode : null;
+   const previousSibling = parent ? c.previousSibling : null;
+   const nextSibling = parent ? c.nextSibling : null;
    if (c._vparent) {
       domVer++;
       const k = c._vparent._vkids, i = k ? k.indexOf(c) : -1;
@@ -371,6 +382,7 @@ function detach(c) {
       c._host = null;
    }
    if (c._uid) L.remove(c._uid);
+   if (parent) queueMutation({ type: 'childList', target: parent, removedNodes: [c], previousSibling, nextSibling });
 }
 
 /* Custom elements: define() upgrades what is already in the document; elements
@@ -427,12 +439,21 @@ function connected(n) {
       if (type && !/^(text|application)\/(x-)?(java|ecma)script$/.test(type) && type !== 'module') return;
       const src = n.getAttribute('src');
       if (src) {
+         /* Scripts inserted by startup scripts also delay window.load. A
+          * loader's onload may insert another one, so release this count only
+          * after its handlers have run. This does not postpone first paint. */
+         parserAsyncPending++;
          const run = ok0 => {
             const prev = document._current;
-            document._current = n;
-            const ok = ok0();
-            document._current = prev;
-            n.dispatchEvent(new Event(ok ? 'load' : 'error'));
+            document._current = type === 'module' ? null : n;
+            let ok = false;
+            try { ok = ok0(); }
+            finally {
+               document._current = prev;
+               n.dispatchEvent(new Event(ok ? 'load' : 'error'));
+               parserAsyncPending--;
+               parserLoadComplete();
+            }
          };
          setTimeout(() => {
             if (L.isCached(src)) return run(() => L.evalURL(src, type === 'module'));
@@ -455,7 +476,7 @@ function connected(n) {
       /* off the main thread: a slow stylesheet must not freeze the page */
       const done = r => {
          const ok = r && !r.error && r.status >= 200 && r.status < 300;
-         if (ok) L.css(r.body);
+         if (ok) L.css(r.body, r.url || L.resolve(href));
          n.dispatchEvent(new Event(ok ? 'load' : 'error'));
       };
       if (href) setTimeout(() => httpAsync('GET', href, '', '', false, done), 0);
@@ -475,9 +496,11 @@ class Text extends CharacterData {
    get nodeName() { return '#text'; }
    get data() { return this._uid ? L.text(this._uid) : this._data; }
    set data(v) {
+      const oldValue = mutationObservers.size ? this.data : null;
       this._data = String(v);
       if (this._uid) L.setText(this._uid, this._data);
       else if (this._host) L.setText(this._host._uid, this._data);
+      if (mutationObservers.size) queueMutation({ type: 'characterData', target: this, oldValue });
    }
    get nodeValue() { return this.data; } set nodeValue(v) { this.data = v; }
    get textContent() { return this.data; } set textContent(v) { this.data = v; }
@@ -652,12 +675,16 @@ class Element extends Node {
    }
    setAttribute(n, v) {
       n = String(n).toLowerCase(); v = String(v);
+      const oldValue = mutationObservers.size ? this.getAttribute(n) : null;
       if (this._uid) L.setAttr(this._uid, n, v);
       else { if (!this._attrs) hide(this, '_attrs', new Map()); this._attrs.set(n, v); }
+      if (mutationObservers.size) queueMutation({ type: 'attributes', target: this, attributeName: n, oldValue });
    }
    removeAttribute(n) {
       n = String(n).toLowerCase();
+      const oldValue = mutationObservers.size ? this.getAttribute(n) : null;
       if (this._uid) L.removeAttr(this._uid, n); else if (this._attrs) this._attrs.delete(n);
+      if (mutationObservers.size && oldValue !== null) queueMutation({ type: 'attributes', target: this, attributeName: n, oldValue });
    }
    hasAttribute(n) { return this.getAttribute(n) !== null; }
    getAttributeNode(n) {
@@ -695,7 +722,11 @@ class Element extends Node {
    }
    set textContent(v) {
       v = v === null || v === undefined ? '' : String(v);
-      if (this._uid) { this._vkids = null; domVer++; L.setText(this._uid, v); }
+      if (this._uid) {
+         const removedNodes = mutationObservers.size ? Array.from(this.childNodes) : [];
+         this._vkids = null; domVer++; L.setText(this._uid, v);
+         if (mutationObservers.size && (removedNodes.length || v)) queueMutation({ type: 'childList', target: this, removedNodes, addedNodes: Array.from(this.childNodes) });
+      }
       else { this._vkids = null; domVer++; this._text = v; if (this.localName === 'style' && this.isConnected) L.css(v); }
    }
    get innerText() { return this.textContent; } set innerText(v) { this.textContent = v; }
@@ -707,7 +738,11 @@ class Element extends Node {
    }
    set innerHTML(v) {
       v = v === null || v === undefined ? '' : String(v);
-      if (this._uid) { this._vkids = null; domVer++; L.setHTML(this._uid, v); }
+      if (this._uid) {
+         const removedNodes = mutationObservers.size ? Array.from(this.childNodes) : [];
+         this._vkids = null; domVer++; L.setHTML(this._uid, v);
+         if (mutationObservers.size) queueMutation({ type: 'childList', target: this, removedNodes, addedNodes: Array.from(this.childNodes) });
+      }
       else if (/^(script|style|title|textarea)$/.test(this.localName)) this._text = v;
       else {
          /* Parse through a rendered holder, then move the nodes here. */
@@ -789,7 +824,7 @@ class Element extends Node {
    }
    focus() { if (this._uid) L.focus(this._uid); syncFocus(); }
    blur() { if (this._uid && L.focus() === this._uid) L.focus(0); syncFocus(); }
-   click() { const e = new MouseEvent('click', { bubbles: true, cancelable: true }); if (dispatch(this, e)) activate(this); }
+   click() { if (/^(button|input|select|textarea)$/.test(this.localName) && controlDisabled(this)) return; const e = new MouseEvent('click', { bubbles: true, cancelable: true }); if (dispatch(this, e)) activate(this); }
    get style() { return styleProxy(this); }
    set style(v) { this.setAttribute('style', v); }
    get dataset() { return datasetProxy(this); }
@@ -902,7 +937,7 @@ class HTMLInputElement extends HTMLElement {
    set defaultValue(v) { this.setAttribute('value', v); }
    get defaultChecked() { return this.hasAttribute('checked'); }
    set defaultChecked(v) { this.toggleAttribute('checked', !!v); }
-   get form() { return this.closest('form'); }
+   get form() { return formOwner(this); }
    select() { this.focus(); }
    setSelectionRange() {}
    get selectionStart() { return this.value.length; } get selectionEnd() { return this.value.length; }
@@ -919,7 +954,7 @@ class HTMLSelectElement extends HTMLElement {
    set selectedIndex(i) { this.options.forEach((o, k) => { o.selected = k === i; }); }
    get value() { const o = this.options[this.selectedIndex]; return o ? o.value : ''; }
    set value(v) { this.options.forEach(o => { o.selected = o.value === String(v); }); }
-   get form() { return this.closest('form'); }
+   get form() { return formOwner(this); }
 }
 reflect(HTMLSelectElement, ['name', ['disabled', 'disabled', 'b'], ['multiple', 'multiple', 'b']]);
 class HTMLOptionElement extends HTMLElement {
@@ -928,7 +963,7 @@ class HTMLOptionElement extends HTMLElement {
    get text() { return this.textContent; }
    get selected() { return this.hasAttribute('selected'); } set selected(v) { this.toggleAttribute('selected', !!v); }
 }
-class HTMLButtonElement extends HTMLElement { get form() { return this.closest('form'); } }
+class HTMLButtonElement extends HTMLElement { get form() { return formOwner(this); } }
 reflect(HTMLButtonElement, ['type', 'name', 'value', ['disabled', 'disabled', 'b']]);
 class HTMLAnchorElement extends HTMLElement {
    toString() { return this.href; }
@@ -989,9 +1024,12 @@ Object.defineProperty(HTMLImageElement.prototype, 'src', {
    set(v) { this.setAttribute('src', v); },
 });
 class HTMLFormElement extends HTMLElement {
-   get elements() { return this.querySelectorAll('input,select,textarea,button'); }
+   get elements() { return list(Array.from(document.querySelectorAll('input,select,textarea,button')).filter(el => formOwner(el) === this)); }
    submit() { submitForm(this); }
-   requestSubmit() { if (this.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))) submitForm(this); }
+   requestSubmit(submitter = null) {
+      validateSubmitter(this, submitter);
+      if (this.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true, submitter }))) submitForm(this, submitter);
+   }
    reset() {}
    checkValidity() { return true; } reportValidity() { return true; }
 }
@@ -1109,7 +1147,7 @@ class Document extends Node {
    get title() { return L.title(); } set title(v) { L.title(String(v)); }
    get URL() { return L.url(); }
    get documentURI() { return L.url(); }
-   get baseURI() { return L.url(); }
+   get baseURI() { return L.baseURL(); }
    get domain() { return location.hostname; }
    get referrer() { return ''; }
    get lastModified() { if (!this._lastModified) { const d = new Date(), p = n => String(n).padStart(2, '0'); this._lastModified = `${p(d.getMonth()+1)}/${p(d.getDate())}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; } return this._lastModified; }
@@ -1621,15 +1659,25 @@ class FileReader extends EventTarget {
    abort() {}
 }
 class FormData {
-   constructor(form) {
+   constructor(form, submitter = null) {
       hide(this, '_l', []);
+      if (form) validateSubmitter(form, submitter);
       if (form && form.elements) for (const el of form.elements) {
          const n = el.getAttribute('name');
-         if (!n || el.hasAttribute('disabled')) continue;
-         const t = (el.getAttribute('type') || '').toLowerCase();
-         if ((t === 'checkbox' || t === 'radio') && !el.checked) continue;
-         if (t === 'submit' || t === 'button') continue;
-         this._l.push([n, el.value]);
+         if (!n || controlDisabled(el)) continue;
+         const type = controlType(el);
+         if ((type === 'checkbox' || type === 'radio') && !el.checked) continue;
+         if (type === 'reset' || type === 'button' || type === 'file' || type === 'image') continue;
+         if (type === 'submit' && el !== submitter) continue;
+         if (el.localName === 'select') {
+            let options = Array.from(el.options).filter(o => o.selected);
+            if (!el.multiple && !options.length) options = Array.from(el.options).filter(o => !o.hasAttribute('disabled')).slice(0, 1);
+            if (!el.multiple) options = options.slice(0, 1);
+            for (const o of options) if (!o.hasAttribute('disabled') && !(o.parentElement && o.parentElement.localName === 'optgroup' && o.parentElement.hasAttribute('disabled'))) this._l.push([n, o.value]);
+         } else {
+            const value = (type === 'checkbox' || type === 'radio') && !el.hasAttribute('value') ? 'on' : el.value;
+            this._l.push([n, value]);
+         }
       }
    }
    append(k, v) { this._l.push([String(k), v]); }
@@ -1799,8 +1847,12 @@ class XMLHttpRequest extends EventTarget {
       this.upload = new EventTarget();
       hide(this, '_h', new Headers());
       hide(this, '_rh', new Headers());
+      hide(this, '_seq', 0); hide(this, '_active', false);
    }
    open(method, url, async = true) {
+      this._seq++; this._active = false; clearTimeout(this._timeoutTimer);
+      this._h = new Headers(); this._rh = new Headers();
+      this.status = 0; this.statusText = ''; this.response = null; this.responseText = ''; this.responseURL = '';
       hide(this, '_m', String(method).toUpperCase());
       hide(this, '_u', L.resolve(String(url)) || String(url));
       hide(this, '_async', async !== false);
@@ -1810,22 +1862,58 @@ class XMLHttpRequest extends EventTarget {
    getResponseHeader(k) { return this._rh.get(k); }
    getAllResponseHeaders() { let t = ''; this._rh.forEach((v, k) => { t += k + ': ' + v + '\r\n'; }); return t; }
    overrideMimeType() {}
-   abort() { hide(this, '_aborted', true); }
+   get timeout() { return this._timeout || 0; }
+   set timeout(value) {
+      this._timeout = Number(value) >>> 0;
+      if (this._active && this._async) this._armTimeout();
+   }
+   _armTimeout() {
+      clearTimeout(this._timeoutTimer);
+      if (!this.timeout) return;
+      const seq = this._seq;
+      this._timeoutTimer = setTimeout(() => {
+         if (this._active && this._seq === seq) this._fail('timeout');
+      }, Math.max(0, this.timeout - (L.now() - this._startedAt)));
+   }
+   _fail(type) {
+      this._active = false; clearTimeout(this._timeoutTimer);
+      const seq = ++this._seq;
+      this.status = 0; this.statusText = ''; this.response = null; this.responseText = ''; this.responseURL = '';
+      this._rh = new Headers();
+      this._state(4);
+      if (this._seq !== seq) return;
+      this.dispatchEvent(new ProgressEvent(type));
+      if (this._seq !== seq) return;
+      this.dispatchEvent(new ProgressEvent('loadend'));
+      if (type === 'abort' && this._seq === seq) this.readyState = 0;
+   }
+   abort() {
+      if (this._active) this._fail('abort');
+      else {
+         this._seq++; this.readyState = 0;
+         this.status = 0; this.statusText = ''; this.response = null; this.responseText = ''; this.responseURL = '';
+         this._rh = new Headers();
+      }
+   }
    _state(s) { this.readyState = s; this.dispatchEvent(new Event('readystatechange')); }
    send(body) {
+      if (this.readyState !== 1 || this._active) throw new DOMException('Request is not open', 'InvalidStateError');
+      const seq = ++this._seq;
+      this._active = true; this._startedAt = L.now();
       const bin = this.responseType === 'arraybuffer' || this.responseType === 'blob';
       const finish = r => {
-         if (this._aborted) { this.dispatchEvent(new ProgressEvent('abort')); return; }
+         if (!this._active || this._seq !== seq) return;
          if (r.error && !r.status) {
-            this.status = 0; this._state(4);
-            this.dispatchEvent(new ProgressEvent('error'));
-            this.dispatchEvent(new ProgressEvent('loadend'));
+            this._fail('error');
             return;
          }
          this.status = r.status; this.responseURL = r.url;
          this.statusText = r.status === 200 ? 'OK' : '';
          hide(this, '_rh', parseHeaders(r.headers));
-         this._state(2); this._state(3);
+         this._state(2);
+         if (!this._active || this._seq !== seq) return;
+         this._state(3);
+         if (!this._active || this._seq !== seq) return;
          if (this.responseType === 'arraybuffer') this.response = r.body;
          else if (this.responseType === 'blob') this.response = new Blob([r.body], { type: this._rh.get('content-type') || '' });
          else {
@@ -1833,16 +1921,19 @@ class XMLHttpRequest extends EventTarget {
             if (this.responseType === 'json') { try { this.response = JSON.parse(r.body); } catch (e) { this.response = null; } }
             else this.response = r.body;
          }
+         this._active = false; clearTimeout(this._timeoutTimer);
          this._state(4);
+         if (this._seq !== seq) return;
          const n = typeof r.body === 'string' ? r.body.length : r.body.byteLength;
          this.dispatchEvent(new ProgressEvent('load', { loaded: n, total: n, lengthComputable: true }));
-         this.dispatchEvent(new ProgressEvent('loadend', { loaded: n, total: n }));
+         if (this._seq === seq) this.dispatchEvent(new ProgressEvent('loadend', { loaded: n, total: n }));
       };
+      this.dispatchEvent(new ProgressEvent('loadstart'));
+      if (!this._active || this._seq !== seq) return;
       if (this._async) {
-         setTimeout(() => this.dispatchEvent(new ProgressEvent('loadstart')), 0);
+         this._armTimeout();
          httpAsync(this._m, this._u, headerText(this._h, body), bodyString(body), bin, finish);
       } else {
-         this.dispatchEvent(new ProgressEvent('loadstart'));
          finish(L.http(this._m, this._u, headerText(this._h, body), bodyString(body), bin));
       }
    }
@@ -1862,7 +1953,65 @@ WebSocket.CONNECTING = 0; WebSocket.OPEN = 1; WebSocket.CLOSING = 2; WebSocket.C
 
 /* ------------------------------------------------------------- observers */
 
-class MutationObserver { constructor(cb) { this._cb = cb; } observe() {} disconnect() {} takeRecords() { return []; } }
+class MutationRecord {
+   constructor() { throw new TypeError('Illegal constructor'); }
+}
+class MutationObserver {
+   constructor(callback) {
+      if (typeof callback !== 'function') throw new TypeError('MutationObserver callback must be a function');
+      hide(this, '_callback', callback); hide(this, '_targets', new Map()); hide(this, '_records', []);
+   }
+   observe(target, options = {}) {
+      if (!(target instanceof Node)) throw new TypeError('MutationObserver target must be a Node');
+      const o = Object.assign({}, options);
+      if (o.attributes === undefined && (o.attributeOldValue !== undefined || o.attributeFilter !== undefined)) o.attributes = true;
+      if (o.characterData === undefined && o.characterDataOldValue !== undefined) o.characterData = true;
+      if ((!o.childList && !o.attributes && !o.characterData) ||
+          (!o.attributes && (o.attributeOldValue || o.attributeFilter !== undefined)) ||
+          (!o.characterData && o.characterDataOldValue)) throw new TypeError('Invalid MutationObserver options');
+      if (o.attributeFilter !== undefined) o.attributeFilter = Array.from(o.attributeFilter, String);
+      this._targets.set(target, o); mutationObservers.add(this);
+   }
+   disconnect() { this._targets.clear(); this._records = []; mutationObservers.delete(this); }
+   takeRecords() { const records = this._records; this._records = []; return records; }
+}
+Object.defineProperty(MutationObserver.prototype, Symbol.toStringTag, { value: 'MutationObserver' });
+Object.defineProperty(MutationRecord.prototype, Symbol.toStringTag, { value: 'MutationRecord' });
+function queueMutation(change) {
+   if (!mutationObservers.size) return;
+   let queued = false;
+   for (const observer of mutationObservers) {
+      let matched = false, oldValue = false;
+      for (const [target, options] of observer._targets) {
+         if (!options[change.type]) continue;
+         if (change.type === 'attributes' && options.attributeFilter && !options.attributeFilter.includes(change.attributeName)) continue;
+         let ancestor = change.target;
+         while (ancestor && ancestor !== target && options.subtree) ancestor = ancestor.parentNode;
+         if (ancestor !== target) continue;
+         matched = true;
+         oldValue = oldValue || (change.type === 'attributes' ? options.attributeOldValue : options.characterDataOldValue);
+      }
+      if (!matched) continue;
+      const record = Object.assign(Object.create(MutationRecord.prototype), {
+         type: change.type, target: change.target,
+         addedNodes: list(change.addedNodes || []), removedNodes: list(change.removedNodes || []),
+         previousSibling: change.previousSibling || null, nextSibling: change.nextSibling || null,
+         attributeName: change.attributeName || null, attributeNamespace: null,
+         oldValue: oldValue && change.oldValue !== undefined ? change.oldValue : null,
+      });
+      observer._records.push(record); queued = true;
+   }
+   if (!queued || mutationDeliveryPending) return;
+   mutationDeliveryPending = true;
+   NativePromise.resolve().then(() => {
+      mutationDeliveryPending = false;
+      for (const observer of Array.from(mutationObservers)) {
+         const records = observer.takeRecords();
+         if (records.length) { try { observer._callback.call(observer, records, observer); } catch (e) { reportError(e); } }
+      }
+   });
+}
+
 class ResizeObserver {
    constructor(cb) { this._cb = cb; }
    observe(el) { setTimeout(() => { const r = el.getBoundingClientRect(); try { this._cb([{ target: el, contentRect: r, borderBoxSize: [{ inlineSize: r.width, blockSize: r.height }], contentBoxSize: [{ inlineSize: r.width, blockSize: r.height }] }], this); } catch (e) { reportError(e); } }, 0); }
@@ -1911,7 +2060,7 @@ g.CSS = CSS;
 /* Constructors pages test for or instantiate. */
 Object.assign(g, {
    Event, CustomEvent, UIEvent, MouseEvent, PointerEvent, WheelEvent, KeyboardEvent, FocusEvent, InputEvent,
-   TouchEvent, Touch, MessageEvent, ProgressEvent, ErrorEvent, PromiseRejectionEvent, PopStateEvent, EventTarget,
+   SubmitEvent, TouchEvent, Touch, MessageEvent, ProgressEvent, ErrorEvent, PromiseRejectionEvent, PopStateEvent, EventTarget,
    Node, Element, HTMLElement, Text, Comment, CharacterData, Document, HTMLDocument: Document, DocumentFragment,
    DOMPoint, DOMPointReadOnly, NodeList, HTMLCollection: NodeList, DOMTokenList, DOMRect, DOMException,
    HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLButtonElement,
@@ -1921,8 +2070,24 @@ Object.assign(g, {
    HTMLSpanElement, HTMLParagraphElement, HTMLUListElement, HTMLLIElement, HTMLTitleElement, SVGElement,
    URL, URLSearchParams, TextEncoder, TextDecoder, Blob, File, FileReader, FormData, Headers, Request, Response,
    AbortController, AbortSignal, XMLHttpRequest, WebSocket, Storage,
-   MutationObserver, ResizeObserver, IntersectionObserver, PerformanceObserver, Image, Audio, DOMParser, XMLSerializer, Window: Object,
+   MutationObserver, MutationRecord, ResizeObserver, IntersectionObserver, PerformanceObserver, Image, Audio, DOMParser, XMLSerializer, Window: Object,
 });
+
+/* Platform objects must identify themselves as DOM types. Libraries test
+ * Object.prototype.toString, not only instanceof; reporting every element
+ * as Object silently disabled their event and navigation callbacks. */
+for (const C of new Set([EventTarget, Node, Element, HTMLElement, ...Object.values(TAGS),
+                         Document, DocumentFragment, Text, Comment, CharacterData, NodeList,
+                         DOMTokenList, DOMRect, Event, CustomEvent, UIEvent, MouseEvent,
+                         PointerEvent, KeyboardEvent, SubmitEvent, FocusEvent, InputEvent,
+                         WheelEvent, TouchEvent, MessageEvent, ProgressEvent, ErrorEvent])) {
+   Object.defineProperty(C.prototype, Symbol.toStringTag, {
+      value: C === Document ? 'HTMLDocument' : C.name, configurable: true,
+   });
+}
+for (const [object, name] of [[g, 'Window'], [g.navigator, 'Navigator'], [location, 'Location'], [g.screen, 'Screen']]) {
+   Object.defineProperty(object, Symbol.toStringTag, { value: name, configurable: true });
+}
 
 /* -------------------------------------------------------------- input */
 
@@ -1954,9 +2119,9 @@ function activate(t) {
       return;
    }
    const btn = t.closest ? t.closest('button,input[type=submit],input[type=image]') : null;
-   if (btn && ((btn.getAttribute('type') || 'submit').toLowerCase() === 'submit')) {
-      const f = btn.closest('form');
-      if (f) f.requestSubmit();
+   if (btn && controlType(btn) === 'submit' && !controlDisabled(btn)) {
+      const f = formOwner(btn);
+      if (f) f.requestSubmit(btn);
    }
    const box = t.localName === 'input' && /^(checkbox|radio)$/i.test(t.getAttribute('type') || '') ? t : null;
    if (box) {
@@ -1971,15 +2136,42 @@ function activate(t) {
    const label = t.closest ? t.closest('label') : null;
    if (label && !box) { const c = label.control; if (c && c !== t) c.click(); }
 }
-function submitForm(f) {
-   const fd = new FormData(f);
-   const q = new URLSearchParams(fd._l.map(([k, v]) => [k, String(v)])).toString();
-   const action = f.getAttribute('action') ? L.resolve(f.getAttribute('action')) : L.url().replace(/[?#].*$/, '');
-   const method = (f.getAttribute('method') || 'get').toLowerCase();
-   if (method === 'post') {
-      const r = L.http('POST', action, 'content-type: application/x-www-form-urlencoded\r\n', q, false);
-      L.navigate(r.url || action);
-   } else L.navigate(action.replace(/\?.*$/, '') + '?' + q);
+function formOwner(el) {
+   const id = el.getAttribute('form');
+   if (id !== null) { const f = document.getElementById(id); return f && f.localName === 'form' ? f : null; }
+   return el.closest('form');
+}
+function controlType(el) {
+   return (el.getAttribute('type') || (el.localName === 'button' ? 'submit' : 'text')).toLowerCase();
+}
+function controlDisabled(el) {
+   if (el.hasAttribute('disabled')) return true;
+   for (let p = el.parentElement; p; p = p.parentElement) {
+      if (p.localName !== 'fieldset' || !p.hasAttribute('disabled')) continue;
+      const legend = Array.from(p.children).find(n => n.localName === 'legend');
+      if (!legend || !legend.contains(el)) return true;
+   }
+   return false;
+}
+function validateSubmitter(form, el) {
+   if (el === null) return;
+   if (!el || (el.localName !== 'button' && el.localName !== 'input') || !/^(submit|image)$/.test(controlType(el))) throw new TypeError('Not a submit button');
+   if (formOwner(el) !== form) throw new DOMException('Submit button belongs to another form', 'NotFoundError');
+}
+function submitForm(f, submitter = null) {
+   const fd = new FormData(f, submitter);
+   const crlf = s => String(s).replace(/\r\n|\r|\n/g, '\r\n');
+   const q = new URLSearchParams(fd._l.map(([k, v]) => [crlf(k), crlf(v)])).toString();
+   const actionAttr = submitter && submitter.hasAttribute('formaction') ? submitter.getAttribute('formaction') : f.getAttribute('action');
+   const action = actionAttr ? L.resolve(actionAttr) : L.url();
+   const method = ((submitter && submitter.getAttribute('formmethod')) || f.getAttribute('method') || 'get').toLowerCase();
+   if (method === 'dialog') return;
+   if (method === 'post') L.navigate(action, q);
+   else {
+      const url = new URL(action);
+      url.search = q;
+      L.navigate(url.href);
+   }
 }
 
 g.__lb_pointer = function (kind, uid, x, y, button, dragged, touch) {
@@ -2033,9 +2225,12 @@ g.__lb_key = function (type, key, code) {
    /* keypress follows an unprevented keydown for Enter, as in a browser; many sites listen for it */
    const pressed = ok && type === 'keydown' && key === 'Enter'
       ? dispatch(t, new KeyboardEvent('keypress', { bubbles: true, cancelable: true, key, code: key, keyCode: 13, charCode: 13 })) : ok;
-   if (ok && pressed && type === 'keydown' && key === 'Enter' && t.localName === 'input') {
-      const f = t.closest('form');
-      if (f) f.requestSubmit();
+   if (ok && pressed && type === 'keydown' && key === 'Enter' && t.localName === 'input' && /^(text|search|url|tel|email|password|number)$/.test(controlType(t))) {
+      const f = formOwner(t);
+      if (f && !controlDisabled(t)) {
+         const button = Array.from(f.elements).find(el => controlType(el) === 'submit' && !controlDisabled(el));
+         if (button) button.click(); else f.requestSubmit();
+      }
    }
    return !(ok && pressed);
 };
@@ -2055,20 +2250,46 @@ g.__lb_resize = function () { dispatch(g, new UIEvent('resize')); };
 let parserScripts = [];
 g.__lb_parser_scripts = function () { parserScripts = Array.from(document.scripts); };
 g.__lb_current_script = function (index) { document._current = parserScripts[index] || null; };
+let parserAsyncPending = 0, parserLoadRequested = false;
+function parserLoadComplete() {
+   if (!parserLoadRequested || parserAsyncPending) return;
+   parserLoadRequested = false;
+   document._ready = 'complete';
+   performance.timing.domComplete = performance.timing.loadEventEnd = Date.now();
+   dispatch(document, new Event('readystatechange'));
+   const b = document.body;
+   const src = b && b.getAttribute('onload');
+   if (src && typeof g.onload !== 'function') { try { g.onload = new Function('event', src); } catch (e) { reportError(e); } }
+   dispatch(g, new Event('load'));
+   dispatch(g, new Event('pageshow'));
+   L.loadComplete();
+}
+g.__lb_async_script = function (index, src, module) {
+   const node = parserScripts[index];
+   parserAsyncPending++;
+   httpAsync('GET', src, '', '', false, r => {
+      const prev = document._current;
+      document._current = module ? null : node;
+      let ok = false;
+      try {
+         ok = !!r && !r.error && r.status >= 200 && r.status < 300 &&
+              L.evalCode(r.body, r.url || L.resolve(src), module);
+      } finally {
+         document._current = prev;
+         if (node) node.dispatchEvent(new Event(ok ? 'load' : 'error'));
+         parserAsyncPending--;
+         parserLoadComplete();
+      }
+   });
+};
 g.__lb_ready = function (stage) {
    if (stage === 1) {
       document._ready = 'interactive';
       dispatch(document, new Event('readystatechange'));
       dispatch(document, new Event('DOMContentLoaded', { bubbles: true }));
    } else {
-      document._ready = 'complete';
-      performance.timing.domComplete = performance.timing.loadEventEnd = Date.now();
-      dispatch(document, new Event('readystatechange'));
-      const b = document.body;
-      const src = b && b.getAttribute('onload');
-      if (src && typeof g.onload !== 'function') { try { g.onload = new Function('event', src); } catch (e) { reportError(e); } }
-      dispatch(g, new Event('load'));
-      dispatch(g, new Event('pageshow'));
+      parserLoadRequested = true;
+      parserLoadComplete();
    }
 };
 g.__lb_add_binding = function (name) {

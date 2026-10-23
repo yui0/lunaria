@@ -80,10 +80,34 @@
 #define LH_NBINS       (LH_SMALL_BINS + 32u)
 #define LH_MAP_WORDS   ((LH_NBINS + 63u) / 64u)
 
+/* Per-thread free cache.  bionic's allocator (jemalloc, later scudo) hands a
+ * freed small block to the freeing thread's own cache and keeps it out of
+ * every other thread's reach until that cache overflows; the bytes of a
+ * cached block are never touched by the allocator, because the cache links
+ * live in the block header, not in its payload.  A guest that writes to a
+ * block just after freeing it (an integrity SDK probing the allocator does
+ * exactly that) therefore damages nothing that another thread owns.  A
+ * cached block keeps its header but carries LH_CACHED_MAGIC, so it is not
+ * owned (a second free is ignored), never coalesced and never seen as free. */
+#define LH_CACHED_MAGIC 0xCAC4ED01u
+#define LH_TC_SLOTS     128u
+#define LH_TC_CLASSES   (LH_SMALL_MAX / LH_ALIGN + 1u)
+#define LH_TC_CAP       64u                         /* blocks per size class */
+#define LH_TC_BYTES     (256u * 1024u)              /* bytes per thread */
+#define LH_TC_DEAD      (~0ull)                     /* released slot */
+
 /* Values for `owner`: 0 is free, LH_OWNER_HOST an emulator handler, and
  * anything else a guest thread's TPIDR_EL0 (unique per thread, readable
  * without a trap). */
 #define LH_OWNER_HOST  1u
+
+struct lh_tc {
+   uint64_t tid;                  /* 0 empty, LH_TC_DEAD released */
+   uint32_t bytes;                /* cached payload bytes */
+   uint32_t pad;
+   uint16_t cnt[LH_TC_CLASSES];
+   uint32_t top[LH_TC_CLASSES];   /* newest cached block of the class */
+};
 
 struct lh_ctl {
    uint32_t magic;
@@ -100,11 +124,13 @@ struct lh_ctl {
    uint64_t contended;            /* lock waits, for the perf report */
    uint64_t bin_map[LH_MAP_WORDS];
    uint32_t bin[LH_NBINS];
+   struct lh_tc tc[LH_TC_SLOTS];
 };
 
 struct lh_heap {
    uintptr_t mem;                 /* where offset 0 of the window is */
    struct lh_ctl *ctl;
+   uint64_t tid;                  /* the thread using it; 0 bypasses its cache */
 };
 
 static inline uint32_t lh_r32(const struct lh_heap *h, uint32_t off)
@@ -296,6 +322,84 @@ static inline void lh_release(struct lh_heap *h, uint32_t va, uint32_t size)
    else lh_bin_put(h, va, size);
 }
 
+
+/* The calling thread's cache slot: open addressing on the thread id, the
+ * table living in the control block so the guest's own malloc and the
+ * emulator's share it.  Without a free slot the thread simply bypasses the
+ * cache. */
+static inline struct lh_tc *lh_tc_slot(struct lh_heap *h, bool create)
+{
+   if (!h->tid) return 0;
+   struct lh_ctl *c = h->ctl;
+   struct lh_tc *spare = 0;
+   uint32_t i = (uint32_t)((h->tid * 0x9E3779B97F4A7C15ull) >> 57);
+   for (uint32_t n = 0; n < LH_TC_SLOTS; ++n, i = (i + 1u) & (LH_TC_SLOTS - 1u)) {
+      struct lh_tc *t = &c->tc[i];
+      if (t->tid == h->tid) return t;
+      if (t->tid == LH_TC_DEAD) { if (!spare) spare = t; continue; }
+      if (t->tid == 0) { if (!spare) spare = t; break; }
+   }
+   if (!create || !spare) return 0;
+   memset(spare, 0, sizeof *spare);
+   spare->tid = h->tid;
+   return spare;
+}
+
+/* The newest cached block of exactly `size`, or 0.  A chain whose header was
+ * overwritten is abandoned rather than followed. */
+static inline uint32_t lh_tc_take(struct lh_heap *h, uint32_t size)
+{
+   struct lh_tc *t = lh_tc_slot(h, false);
+   const uint32_t k = size / LH_ALIGN;
+   if (!t || !t->cnt[k]) return 0;
+   const uint32_t va = t->top[k];
+   if (va < h->ctl->start + LH_HDR || va >= h->ctl->ptr ||
+       lh_r32(h, va - 4u) != LH_CACHED_MAGIC || lh_r32(h, va - LH_HDR) != size) {
+      const uint32_t lost = (uint32_t)t->cnt[k] * size;
+      t->bytes = t->bytes > lost ? t->bytes - lost : 0u;
+      t->cnt[k] = 0;
+      t->top[k] = 0;
+      return 0;
+   }
+   t->top[k] = lh_r32(h, va - LH_HDR + 8u);
+   --t->cnt[k];
+   t->bytes -= size;
+   lh_w32(h, va - 4u, LH_ALLOC_MAGIC);
+   return va;
+}
+
+static inline bool lh_tc_put(struct lh_heap *h, uint32_t va, uint32_t size)
+{
+   if (size > LH_SMALL_MAX) return false;
+   struct lh_tc *t = lh_tc_slot(h, true);
+   const uint32_t k = size / LH_ALIGN;
+   if (!t || t->cnt[k] >= LH_TC_CAP || t->bytes + size > LH_TC_BYTES) return false;
+   lh_w32(h, va - LH_HDR + 8u, t->top[k]);
+   lh_w32(h, va - 4u, LH_CACHED_MAGIC);
+   t->top[k] = va;
+   ++t->cnt[k];
+   t->bytes += size;
+   return true;
+}
+
+/* A thread is gone: its cached blocks return to the shared heap. */
+static inline void lh_tc_drop(struct lh_heap *h)
+{
+   struct lh_tc *t = lh_tc_slot(h, false);
+   if (!t) return;
+   for (uint32_t k = 1; k < LH_TC_CLASSES; ++k) {
+      while (t->cnt[k]) {
+         const uint32_t va = t->top[k];
+         if (va < h->ctl->start + LH_HDR || va >= h->ctl->ptr ||
+             lh_r32(h, va - 4u) != LH_CACHED_MAGIC) break;
+         t->top[k] = lh_r32(h, va - LH_HDR + 8u);
+         --t->cnt[k];
+         lh_release(h, va, lh_r32(h, va - LH_HDR));
+      }
+   }
+   t->tid = LH_TC_DEAD;
+}
+
 /* `zeroed` reports memory that has never been handed out before. */
 static inline uint32_t lh_malloc(struct lh_heap *h, uint32_t size, bool *zeroed)
 {
@@ -304,6 +408,11 @@ static inline uint32_t lh_malloc(struct lh_heap *h, uint32_t size, bool *zeroed)
    if (size == 0) size = 1;
    size = lh_align(size);
    ++c->malloc_calls;
+
+   if (size <= LH_SMALL_MAX) {
+      const uint32_t cached = lh_tc_take(h, size);
+      if (cached) { ++c->malloc_reused; return cached; }
+   }
 
    for (uint32_t b = lh_bin_next(c, lh_bin_of(size)); b < LH_NBINS;
         b = lh_bin_next(c, b + 1u)) {
@@ -353,6 +462,7 @@ static inline void lh_free(struct lh_heap *h, uint32_t va)
    if (size < LH_MIN || (size & (LH_ALIGN - 1u)) ||
        (uint64_t)va + size > c->ptr) return;        /* corrupt */
    ++c->free_calls;
+   if (lh_tc_put(h, va, size)) return;
    lh_release(h, va, size);
 }
 
@@ -530,6 +640,7 @@ static inline int heap_get(struct lh_heap *h)
 {
    h->ctl = lunaria_heap_ctl;
    h->mem = lunaria_heap_mem;
+   h->tid = self_owner();
    return h->ctl != 0;
 }
 

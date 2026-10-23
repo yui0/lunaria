@@ -481,7 +481,9 @@ jvm_add_object(struct jvm *jvm, const struct jvm_object *o)
             tally[best].n = 0;
          }
       }
-      assert(0 && "jvm object limit reached!");
+      /* An allocation failure, not a reason to kill the host: the caller gets
+       * NULL, as NewObject does when the heap is exhausted. */
+      fprintf(stderr, "[jvm] object limit reached: allocation fails\n");
       jvm_meta_unlock();
       return NULL;
    }
@@ -1540,7 +1542,11 @@ JNIEnv_GetObjectClass(JNIEnv* env, jobject p1)
 static jboolean
 JNIEnv_IsInstanceOf(JNIEnv* p0, jobject p1, jclass p2)
 {
-   assert(p0 && p2);
+   assert(p0);
+   /* A NULL class is a caller bug (CheckJNI aborts the same way), but the
+    * dispatcher has already named the call site; answer false instead of
+    * killing the host so the guest's own failure handling can run. */
+   if (!p2) return JNI_FALSE;
    /* JNI permits a null object: it can be cast to every reference class. */
    if (!p1) return JNI_TRUE;
    verbose("%u, %u", (uint32_t)(uintptr_t)p1, (uint32_t)(uintptr_t)p2);

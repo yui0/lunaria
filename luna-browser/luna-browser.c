@@ -604,6 +604,24 @@ static int url_parse(const char *s, struct url *u)
    return 0;
 }
 
+/* Serialize UTF-8 path/query/fragment bytes for special URLs. Raw spaces
+ * would split an HTTP request line; non-ASCII bytes also need percent encoding.
+ * Keep existing percent escapes and structural delimiters intact. Opaque
+ * data:/javascript: payloads must remain byte-for-byte unchanged. */
+static void url_component(struct buf *out, const char *text, int part, int special)
+{
+   if (!text) return;
+   if (!special) { buf_puts(out, text); return; }
+   for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
+      int encode = *p <= 0x20 || *p >= 0x7f || *p == '"' || *p == '<' || *p == '>';
+      if (part == 0) encode |= *p == '#' || *p == '?' || *p == '`' || *p == '{' || *p == '}';
+      else if (part == 1) encode |= *p == '#' || *p == '\'';
+      else encode |= *p == '`';
+      if (encode) buf_printf(out, "%%%02X", (unsigned)*p);
+      else buf_put(out, p, 1);
+   }
+}
+
 static char *url_format(const struct url *u)
 {
    struct buf b = { 0 };
@@ -614,9 +632,10 @@ static char *url_format(const struct url *u)
       buf_puts(&b, u->host);
       if (u->port >= 0) buf_printf(&b, ":%d", u->port);
    }
-   buf_puts(&b, u->path ? u->path : "");
-   if (u->query) { buf_puts(&b, "?"); buf_puts(&b, u->query); }
-   if (u->fragment) { buf_puts(&b, "#"); buf_puts(&b, u->fragment); }
+   int special = !strcmp(u->scheme, "http") || !strcmp(u->scheme, "https") || !strcmp(u->scheme, "file");
+   url_component(&b, u->path, 0, special);
+   if (u->query) { buf_puts(&b, "?"); url_component(&b, u->query, 1, special); }
+   if (u->fragment) { buf_puts(&b, "#"); url_component(&b, u->fragment, 2, special); }
    return buf_take(&b);
 }
 
@@ -1818,11 +1837,13 @@ static struct {
    JSRuntime *rt;
    JSContext *ctx;
    char *url;
+   char *base_url;              /* document base, independent of location */
    int w, h;                    /* viewport, CSS pixels */
    float scale;                 /* device pixels per CSS pixel */
    int ready;                   /* 0 loading, 1 interactive, 2 complete */
    double last_frame;
    char *nav_url;               /* a navigation requested by the page */
+   char *nav_body;              /* non-NULL for a queued URL-encoded POST */
    char *profile;               /* --user-data-dir */
    char **boot_scripts;         /* Page.addScriptToEvaluateOnNewDocument */
    int nboot;
@@ -1840,6 +1861,11 @@ static struct {
    /* Events for the embedder (CDP), JSON objects without the envelope. */
    void (*emit)(const char *method, const char *params_json);
 } g_page;
+
+static const char *page_base(void)
+{
+   return g_page.base_url ? g_page.base_url : g_page.url;
+}
 
 static void page_emit(const char *method, const char *params)
 {
@@ -1865,12 +1891,11 @@ static void cache_add(char *url, unsigned char *body, size_t len)
    g_page.ncache++;
 }
 
-/* Subresources named by the markup are fetched in parallel before parsing, so
- * a page costs the slowest request rather than the sum of all of them.
- * lb_read_resource and script loading then find them in the cache. */
+/* Fetch styles before parsing, and scripts after publishing the first frame.
+ * Requests within each group run in parallel and populate the page cache. */
 #define LB_PF_MAX  256
 #define PF_THREADS 12
-struct pf_job { char *url; struct response r; };
+struct pf_job { char *url; struct response r; int stylesheet; };
 struct pf_pool { struct pf_job *jobs; int n, next; };
 
 static void *pf_worker(void *arg)
@@ -1883,57 +1908,203 @@ static void *pf_worker(void *arg)
    }
 }
 
+/* Tokenize attributes rather than searching their text: quoted values can
+ * contain spaces, '>' and even markup which must never become requests. */
+static const char *tag_end(const char *p)
+{
+   char q = 0;
+   for (; *p; ++p) {
+      if (q) { if (*p == q) q = 0; }
+      else if (*p == '"' || *p == '\'') q = *p;
+      else if (*p == '>') break;
+   }
+   return p;
+}
+
 static int tag_attr(const char *tag, const char *end, const char *name, char *out, size_t outsz)
 {
-   size_t nl = strlen(name);
-   for (const char *p = tag; p + nl < end; ++p) {
-      if (p == tag || !isspace((unsigned char)p[-1])) continue;
-      if (strncasecmp(p, name, nl)) continue;
-      const char *a = p + nl;
-      while (a < end && isspace((unsigned char)*a)) a++;
-      if (a >= end || *a != '=') continue;
-      a++;
-      while (a < end && isspace((unsigned char)*a)) a++;
-      char q = (*a == '"' || *a == '\'') ? *a++ : 0;
-      size_t k = 0;
-      while (a < end && (q ? *a != q : (!isspace((unsigned char)*a) && *a != '>')) && k + 1 < outsz) out[k++] = *a++;
-      out[k] = 0;
-      return 1;
+   const char *p = tag;
+   while (p < end && !isspace((unsigned char)*p)) p++; /* tag name */
+   while (p < end) {
+      while (p < end && (isspace((unsigned char)*p) || *p == '/')) p++;
+      const char *key = p;
+      while (p < end && !isspace((unsigned char)*p) && *p != '=' && *p != '/') p++;
+      size_t len = (size_t)(p - key);
+      while (p < end && isspace((unsigned char)*p)) p++;
+      const char *value = p;
+      size_t n = 0;
+      if (p < end && *p == '=') {
+         p++;
+         while (p < end && isspace((unsigned char)*p)) p++;
+         char q = p < end && (*p == '"' || *p == '\'') ? *p++ : 0;
+         value = p;
+         while (p < end && (q ? *p != q : !isspace((unsigned char)*p))) p++;
+         n = (size_t)(p - value);
+         if (q && p < end) p++;
+      }
+      if (len == strlen(name) && !strncasecmp(key, name, len)) {
+         if (out && outsz) {
+            if (n >= outsz) n = outsz - 1;
+            memcpy(out, value, n); out[n] = 0;
+         }
+         return 1;
+      }
+      if (p == key) p++;
    }
    return 0;
 }
 
-static void page_prefetch(const char *html)
+static const char *raw_tag_end(const char *p, const char *name)
+{
+   char closing[32];
+   snprintf(closing, sizeof closing, "</%s", name);
+   size_t n = strlen(closing);
+   const char *e = strcasestr(p, closing);
+   while (e && e[n] != '>' && !isspace((unsigned char)e[n])) e = strcasestr(e + 2, closing);
+   return e ? e : p + strlen(p);
+}
+
+/* URL tokens in external CSS are relative to that stylesheet (including its
+ * final redirect URL), not to the HTML document. Keep strings and comments
+ * intact, and leave data URLs and local SVG fragment references alone. */
+static unsigned char *css_rebase(const unsigned char *css, size_t len, const char *base, size_t *outlen)
+{
+   struct buf out = { 0 };
+   const char *p = (const char *)css, *end = p + len;
+   while (p < end) {
+      if (end - p >= 2 && p[0] == '/' && p[1] == '*') {
+         const char *close = memmem(p + 2, (size_t)(end - p - 2), "*/", 2);
+         const char *next = close ? close + 2 : end;
+         buf_put(&out, p, (size_t)(next - p)); p = next; continue;
+      }
+      if (*p == '\"' || *p == '\'') {
+         char q = *p;
+         const char *next = p + 1;
+         while (next < end) {
+            if (*next == '\\' && next + 1 < end) next += 2;
+            else if (*next++ == q) break;
+         }
+         buf_put(&out, p, (size_t)(next - p)); p = next; continue;
+      }
+      if (end - p >= 4 && !strncasecmp(p, "url(", 4) &&
+          (p == (const char *)css || (!isalnum((unsigned char)p[-1]) && p[-1] != '_' && p[-1] != '-'))) {
+         const char *v = p + 4;
+         while (v < end && isspace((unsigned char)*v)) v++;
+         char q = v < end && (*v == '\"' || *v == '\'') ? *v++ : 0;
+         const char *ve = v;
+         int escaped = 0;
+         while (ve < end && (q ? *ve != q : *ve != ')')) {
+            if (*ve == '\\' && ve + 1 < end) { escaped = 1; ve += 2; }
+            else ve++;
+         }
+         const char *close = ve;
+         if (q && close < end) close++;
+         while (close < end && isspace((unsigned char)*close)) close++;
+         const char *value_end = ve;
+         if (!q) while (value_end > v && isspace((unsigned char)value_end[-1])) value_end--;
+         if (close < end && *close == ')' && value_end > v && *v != '#' &&
+             !escaped && strncasecmp(v, "data:", 5)) {
+            char *rel = lb_strndup(v, (size_t)(value_end - v));
+            char *abs = rel ? url_resolve(base, rel) : NULL;
+            free(rel);
+            if (abs) {
+               buf_puts(&out, "url(\"");
+               for (const char *c = abs; *c; ++c) {
+                  if (*c == '\\' || *c == '\"') buf_puts(&out, "\\");
+                  buf_put(&out, c, 1);
+               }
+               buf_puts(&out, "\")");
+               free(abs); p = close + 1; continue;
+            }
+         }
+      }
+      buf_put(&out, p++, 1);
+   }
+   *outlen = out.len;
+   return (unsigned char *)buf_take(&out);
+}
+
+static char *document_base_url(const char *html, const char *url)
+{
+   for (const char *p = html; (p = strchr(p, '<')) != NULL; ) {
+      if (!strncmp(p, "<!--", 4)) {
+         const char *e = strstr(p, "-->"); if (!e) break;
+         p = e + 3; continue;
+      }
+      const char *end = tag_end(p + 1);
+      if (!*end) break;
+      char href[2048];
+      if (!strncasecmp(p, "<base", 5) && (p[5] == '>' || isspace((unsigned char)p[5])) &&
+          tag_attr(p + 1, end, "href", href, sizeof href)) {
+         decode_html_entities(href);
+         char *base = url_resolve(url, href);
+         if (base && strncasecmp(base, "data:", 5) && strncasecmp(base, "javascript:", 11)) return base;
+         free(base);
+         break; /* only the first href counts */
+      }
+      const char *raw[] = { "script", "style", "textarea", "title", "iframe", "noscript", NULL };
+      const char *next = end + 1;
+      for (int i = 0; raw[i]; ++i) {
+         size_t n = strlen(raw[i]);
+         if (!strncasecmp(p + 1, raw[i], n) && (p[n + 1] == '>' || isspace((unsigned char)p[n + 1]))) {
+            const char *close = raw_tag_end(next, raw[i]);
+            next = *close ? tag_end(close) : close;
+            if (*next) next++;
+            break;
+         }
+      }
+      p = next;
+   }
+   return NULL; /* without a base element, history URL changes remain effective */
+}
+
+static void page_prefetch(const char *html, int scripts)
 {
    if (!strncmp(g_page.url, "file:", 5) || !strncmp(g_page.url, "about:", 6)) return;
    struct pf_pool pool = { calloc(LB_PF_MAX, sizeof(struct pf_job)), 0, 0 };
    if (!pool.jobs) return;
    for (const char *p = html; (p = strchr(p, '<')) != NULL && pool.n < LB_PF_MAX; ) {
       if (!strncmp(p, "<!--", 4)) { const char *e = strstr(p, "-->"); if (!e) break; p = e + 3; continue; }
-      int kind = !strncasecmp(p, "<link", 5) ? 1 : !strncasecmp(p, "<script", 7) ? 2 :
-                 0;
-      if (!kind) { p++; continue; }
-      const char *end = p + 1;
-      for (char q = 0; *end && (q || *end != '>'); ++end)
-         if (q) { if (*end == q) q = 0; } else if (*end == '"' || *end == '\'') q = *end;
+      int kind = !strncasecmp(p, "<link", 5) && (p[5] == '>' || isspace((unsigned char)p[5])) ? 1 :
+                 !strncasecmp(p, "<script", 7) && (p[7] == '>' || isspace((unsigned char)p[7])) ? 2 : 0;
+      const char *end = tag_end(p + 1);
+      if (!*end) break;
+      const char *next = end + 1;
+      const char *raw[] = { "script", "style", "textarea", "title", "iframe", "noscript", NULL };
+      for (int i = 0; raw[i]; ++i) {
+         size_t n = strlen(raw[i]);
+         if (!strncasecmp(p + 1, raw[i], n) && (p[n + 1] == '>' || isspace((unsigned char)p[n + 1]))) {
+            const char *close = raw_tag_end(next, raw[i]);
+            next = *close ? tag_end(close) : close;
+            if (*next) next++;
+            break;
+         }
+      }
+      if (!kind || (kind == 2) != scripts) { p = next; continue; }
       char val[1024], rel[128];
       const char *attr = kind == 1 ? "href" : "src";
       int ok = tag_attr(p + 1, end, attr, val, sizeof val) && val[0];
       if (ok && kind == 1)       /* stylesheets, and modules the page says it will import */
          ok = tag_attr(p + 1, end, "rel", rel, sizeof rel) &&
               (strcasestr(rel, "stylesheet") || strcasestr(rel, "modulepreload"));
+      /* async scripts must not hold the first frame behind a slow server. */
+      if (ok && kind == 2 && tag_attr(p + 1, end, "async", NULL, 0)) ok = 0;
       if (ok && !strncasecmp(val, "data:", 5)) ok = 0;
       if (ok) {
          decode_html_entities(val);
-         char *abs = url_resolve(g_page.url, val);
+         char *abs = url_resolve(page_base(), val);
          char *hash = abs ? strchr(abs, '#') : NULL;
          if (hash) *hash = 0;
          int dup = !abs || cache_find(abs) >= 0;
          for (int i = 0; !dup && i < pool.n; ++i) dup = !strcmp(pool.jobs[i].url, abs);
-         if (dup) free(abs); else pool.jobs[pool.n++].url = abs;
+         if (dup) free(abs);
+         else {
+            pool.jobs[pool.n].stylesheet = kind == 1 && strcasestr(rel, "stylesheet") != NULL;
+            pool.jobs[pool.n++].url = abs;
+         }
       }
       if (!*end) break;
-      p = end;
+      p = next;
    }
    if (pool.n > 1) {
       pthread_t th[PF_THREADS];
@@ -1948,6 +2119,11 @@ static void page_prefetch(const char *html)
       if (pool.n == 1) lb_fetch(j->url, "GET", NULL, NULL, 0, &j->r);
       LB_LOG("prefetch %s -> %d %s\n", j->url, j->r.status, j->r.error ? j->r.error : "");
       if (j->r.body && j->r.status >= 200 && j->r.status < 300) {
+         if (j->stylesheet) {
+            size_t n = 0;
+            unsigned char *css = css_rebase(j->r.body, j->r.length, j->r.url ? j->r.url : j->url, &n);
+            if (css) { free(j->r.body); j->r.body = css; j->r.length = n; }
+         }
          cache_add(j->url, j->r.body, j->r.length);
          j->r.body = NULL; j->url = NULL;
       } else {
@@ -1972,7 +2148,7 @@ static void images_arrived(const char *abs)
 {
    for (int i = 0; i < elem_count; ++i) {
       if (!elements[i].has_bg_image || strcmp(elements[i].type, "img")) continue;
-      char *u = url_resolve(g_page.url, luna_expand_path(elements[i].bg_image_path));
+      char *u = url_resolve(page_base(), luna_expand_path(elements[i].bg_image_path));
       int same = u && !strcmp(u, abs);
       free(u);
       if (same) { LB_LOG("image arrived for element %d (%s)\n", i, elements[i].type); luna_image_arrived(i); LB_LOG("  css_w=%g css_h=%g has_w=%d has_h=%d pct_w=%d ar=%g tex=%u hasbg=%d\n", elements[i].css_width, elements[i].css_height, elements[i].has_css_width, elements[i].has_css_height, elements[i].pct_w, elements[i].aspect_ratio, (unsigned)elements[i].bg_image_tex, elements[i].has_bg_image); }
@@ -1986,7 +2162,7 @@ static unsigned char *lb_read_resource(const char *path, size_t *out_size)
    if (path[0] == '/' && path[1] != '/' && (is_font_path(path) ||
        !strncmp(g_page.url, "file:", 5) || !strncmp(g_page.url, "about:", 6)))
       return NULL;
-   char *abs = url_resolve(g_page.url, path);
+   char *abs = url_resolve(page_base(), path);
    if (!abs) return NULL;
    int hit = cache_find(abs);
    if (hit >= 0) {
@@ -2007,6 +2183,16 @@ static unsigned char *lb_read_resource(const char *path, size_t *out_size)
    LB_LOG("resource %s -> %d %s\n", abs, r.status, r.error ? r.error : "");
    unsigned char *data = NULL;
    if (ok && r.body) {
+      char *mime = header_get(r.headers, "content-type");
+      const char *suffix = strpbrk(abs, "?#");
+      size_t pathlen = suffix ? (size_t)(suffix - abs) : strlen(abs);
+      if ((mime && !strncasecmp(mime, "text/css", 8)) ||
+          (pathlen >= 4 && !strncasecmp(abs + pathlen - 4, ".css", 4))) {
+         size_t n = 0;
+         unsigned char *css = css_rebase(r.body, r.length, r.url ? r.url : abs, &n);
+         if (css) { free(r.body); r.body = css; r.length = n; }
+      }
+      free(mime);
       data = malloc(r.length + 1);
       if (data) { memcpy(data, r.body, r.length); data[r.length] = 0; *out_size = r.length; }
       cache_add(abs, r.body, r.length);
@@ -2571,7 +2757,7 @@ static JSValue lb_image_size(JSContext *ctx, JSValueConst this_val, int argc, JS
    if (!u) return JS_NULL;
    size_t n = 0;
    if (argc > 1 && JS_ToBool(ctx, argv[1])) {         /* only what is already cached */
-      char *abs = url_resolve(g_page.url, u);
+      char *abs = url_resolve(page_base(), u);
       int hit = abs && strncmp(abs, "data:", 5) ? cache_find(abs) : 0;
       free(abs);
       if (hit < 0) { JS_FreeCString(ctx, u); return JS_UNDEFINED; }
@@ -2607,7 +2793,7 @@ static JSValue lb_cache_put(JSContext *ctx, JSValueConst this_val, int argc, JSV
    if (!u) return JS_EXCEPTION;
    size_t n = 0;
    uint8_t *src = JS_GetArrayBuffer(ctx, &n, argv[1]);
-   char *abs = src ? url_resolve(g_page.url, u) : NULL;
+   char *abs = src ? url_resolve(page_base(), u) : NULL;
    JS_FreeCString(ctx, u);
    if (abs && cache_find(abs) < 0) {
       unsigned char *copy = malloc(n + 1);
@@ -2973,7 +3159,12 @@ static JSValue lb_css(JSContext *ctx, JSValueConst this_val, int argc, JSValueCo
    const char *s = JS_ToCString(ctx, argv[0]);
    if (!s) return JS_EXCEPTION;
    LB_LOG("css (%zu bytes): %.160s\n", strlen(s), s);
-   luna_parse_css(s);
+   const char *base = argc > 1 && JS_IsString(argv[1]) ? JS_ToCString(ctx, argv[1]) : NULL;
+   size_t len = 0;
+   unsigned char *css = base ? css_rebase((const unsigned char *)s, strlen(s), base, &len) : NULL;
+   luna_parse_css(css ? (const char *)css : s);
+   free(css);
+   if (base) JS_FreeCString(ctx, base);
    JS_FreeCString(ctx, s);
    g_page.dirty = 1;
    return JS_UNDEFINED;
@@ -2992,7 +3183,7 @@ static JSValue lb_http(JSContext *ctx, JSValueConst this_val, int argc, JSValueC
    int binary = argc > 4 && JS_ToBool(ctx, argv[4]);
    JSValue out = JS_NewObject(ctx);
    if (method && rel) {
-      char *url = url_resolve(g_page.url, rel);
+      char *url = url_resolve(page_base(), rel);
       struct response r;
       lb_fetch(url, method, headers, (const unsigned char *)body, body_len, &r);
       LB_LOG("%s %s -> %d %s\n", method, url, r.status, r.error ? r.error : "");
@@ -3081,7 +3272,7 @@ static int js_eval(const char *code, size_t len, const char *filename, int modul
 /* Fetch and run a classic script (or module) by URL. */
 static int js_eval_url(const char *rel, int module)
 {
-   char *url = url_resolve(g_page.url, rel);
+   char *url = url_resolve(page_base(), rel);
    struct response r;
    int hit = cache_find(url), ok;
    if (hit >= 0) {
@@ -3117,7 +3308,7 @@ static JSValue lb_is_cached(JSContext *ctx, JSValueConst this_val, int argc, JSV
    (void)this_val; (void)argc;
    const char *u = JS_ToCString(ctx, argv[0]);
    if (!u) return JS_EXCEPTION;
-   char *abs = url_resolve(g_page.url, u);
+   char *abs = url_resolve(page_base(), u);
    JS_FreeCString(ctx, u);
    int hit = abs && cache_find(abs) >= 0;
    free(abs);
@@ -3133,7 +3324,7 @@ static JSValue lb_eval_code(JSContext *ctx, JSValueConst this_val, int argc, JSV
    const char *u = JS_ToCString(ctx, argv[1]);
    if (!code || !u) { if (code) JS_FreeCString(ctx, code); if (u) JS_FreeCString(ctx, u); return JS_EXCEPTION; }
    char *src = lb_strndup(code, n);
-   char *name = url_resolve(g_page.url, u);
+   char *name = url_resolve(page_base(), u);
    JS_FreeCString(ctx, code);
    JS_FreeCString(ctx, u);
    int ok = src && js_eval(src, n, name ? name : "script", argc > 2 && JS_ToBool(ctx, argv[2])) == 0;
@@ -3168,6 +3359,11 @@ static JSValue lb_log(JSContext *ctx, JSValueConst this_val, int argc, JSValueCo
    return JS_UNDEFINED;
 }
 
+static JSValue lb_base_url(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+   return JS_NewString(ctx, page_base() ? page_base() : "about:blank");
+}
+
 static JSValue lb_url(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
 {
    (void)this_val; (void)argc; (void)argv;
@@ -3179,8 +3375,14 @@ static JSValue lb_navigate(JSContext *ctx, JSValueConst this_val, int argc, JSVa
    (void)this_val; (void)argc;
    const char *u = JS_ToCString(ctx, argv[0]);
    if (!u) return JS_EXCEPTION;
+   const char *body = argc > 1 && JS_IsString(argv[1]) ? JS_ToCString(ctx, argv[1]) : NULL;
+   if (argc > 1 && JS_IsString(argv[1]) && !body) { JS_FreeCString(ctx, u); return JS_EXCEPTION; }
+   free(g_page.nav_body);
+   g_page.nav_body = NULL;
    free(g_page.nav_url);
-   g_page.nav_url = url_resolve(g_page.url, u);
+   g_page.nav_url = url_resolve(page_base(), u);
+   g_page.nav_body = body ? lb_strdup(body) : NULL;
+   if (body) JS_FreeCString(ctx, body);
    JS_FreeCString(ctx, u);
    return JS_UNDEFINED;
 }
@@ -3282,7 +3484,7 @@ static JSValue lb_resolve(JSContext *ctx, JSValueConst this_val, int argc, JSVal
    JSValue r = JS_NULL;
    if (rel) {
       struct url probe;
-      const char *b = base ? base : g_page.url;
+      const char *b = base ? base : page_base();
       /* An absolute reference, or a relative one against a valid base. */
       if (url_parse(rel, &probe) == 0 || (b && url_parse(b, &probe) == 0)) {
          char *s = url_resolve(url_parse(rel, &probe) == 0 ? NULL : b, rel);
@@ -3426,7 +3628,7 @@ static JSValue lb_http_async(JSContext *ctx, JSValueConst this_val, int argc, JS
    j->id = ++seq;
    j->gen = g_page_gen;
    j->method = lb_strdup(method ? method : "GET");
-   j->url = url_resolve(g_page.url, rel ? rel : "");
+   j->url = url_resolve(page_base(), rel ? rel : "");
    j->headers = headers ? lb_strdup(headers) : NULL;
    j->body = body ? lb_strndup(body, body_len) : NULL;
    j->body_len = body_len;
@@ -3502,6 +3704,18 @@ static JSValue lb_set_url(JSContext *ctx, JSValueConst this_val, int argc, JSVal
    return JS_UNDEFINED;
 }
 
+static int g_page_loading;
+
+static JSValue lb_load_complete(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+   g_page.ready = 2;
+   if (!g_page_loading) {
+      page_emit("Page.loadEventFired", "{}");
+      page_emit("Page.frameStoppedLoading", "{}");
+   }
+   return JS_UNDEFINED;
+}
+
 static const JSCFunctionListEntry lb_funcs[] = {
    JS_CFUNC_DEF("body", 0, lb_body),
    JS_CFUNC_DEF("byId", 1, lb_by_id),
@@ -3543,6 +3757,7 @@ static const JSCFunctionListEntry lb_funcs[] = {
    JS_CFUNC_DEF("now", 0, lb_now),
    JS_CFUNC_DEF("log", 2, lb_log),
    JS_CFUNC_DEF("url", 0, lb_url),
+   JS_CFUNC_DEF("baseURL", 0, lb_base_url),
    JS_CFUNC_DEF("navigate", 1, lb_navigate),
    JS_CFUNC_DEF("viewport", 0, lb_viewport),
    JS_CFUNC_DEF("storage", 1, lb_storage),
@@ -3552,6 +3767,7 @@ static const JSCFunctionListEntry lb_funcs[] = {
    JS_CFUNC_DEF("resolve", 2, lb_resolve),
    JS_CFUNC_DEF("random", 1, lb_random),
    JS_CFUNC_DEF("setURL", 1, lb_set_url),
+   JS_CFUNC_DEF("loadComplete", 0, lb_load_complete),
 };
 
 /* Calls a prelude hook: globalThis[name](args...).  Returns the result
@@ -3621,7 +3837,7 @@ static void importmap_add(const char *json)
          if (!g) break;
          g_imap = g;
          g_imap[g_nimap].spec = lb_strdup(k->key);
-         g_imap[g_nimap].url = url_resolve(g_page.url, k->str);
+         g_imap[g_nimap].url = url_resolve(page_base(), k->str);
          g_nimap++;
       }
    jv_free(root);
@@ -3632,7 +3848,7 @@ static char *lb_mod_normalize(JSContext *ctx, const char *base, const char *name
    (void)opaque;
    char *out = NULL;
    if (strstr(name, "://") || name[0] == '/' || !strncmp(name, "./", 2) || !strncmp(name, "../", 3)) {
-      out = url_resolve(strstr(base, "://") ? base : g_page.url, name);
+      out = url_resolve(strstr(base, "://") ? base : page_base(), name);
    } else {
       for (int i = 0; i < g_nimap && !out; ++i)
          if (!strcmp(g_imap[i].spec, name)) out = lb_strdup(g_imap[i].url);
@@ -3846,9 +4062,9 @@ static int js_open(void)
  * Loading a document
  * ======================================================================== */
 
-struct script_tag { char *src, *code; int module, ordinal; };
+struct script_tag { char *src, *code; int module, ordinal, async, defer; };
 
-/* Execute the document's scripts once in source order, after its DOM exists. */
+/* Collect executable scripts; classic, deferred and async execution differ. */
 static int scan_scripts(const char *html, struct script_tag **out)
 {
    int n = 0, ordinal = 0;
@@ -3873,9 +4089,8 @@ static int scan_scripts(const char *html, struct script_tag **out)
       }
       if (skipped) continue;
       if (strncasecmp(p, "<script", 7) || (p[7] != '>' && !isspace((unsigned char)p[7]))) { p++; continue; }
-      const char *gt = strchr(p, '>');
-      if (!gt) break;
-      char *attrs = lb_strndup(p + 7, (size_t)(gt - p - 7));
+      const char *gt = tag_end(p + 1);
+      if (!*gt) break;
       const char *close = strcasestr(gt + 1, "</script");
       while (close && close[8] != '>' && !isspace((unsigned char)close[8]))
          close = strcasestr(close + 2, "</script");
@@ -3883,23 +4098,10 @@ static int scan_scripts(const char *html, struct script_tag **out)
       struct script_tag t = { 0 };
       t.ordinal = ordinal++;
       char type[64] = "", src[1024] = "";
-      /* A tiny attribute read, same rules as luna-ui's (quoted values). */
-      const char *a;
-      if ((a = strcasestr(attrs, "type=")) && (a == attrs || isspace((unsigned char)a[-1]))) {
-         a += 5;
-         char q = (*a == '"' || *a == '\'') ? *a++ : ' ';
-         size_t k = 0;
-         while (*a && *a != q && *a != '>' && k + 1 < sizeof type) type[k++] = *a++;
-         type[k] = 0;
-      }
-      if ((a = strcasestr(attrs, "src=")) && (a == attrs || isspace((unsigned char)a[-1]))) {
-         a += 4;
-         char q = (*a == '"' || *a == '\'') ? *a++ : ' ';
-         size_t k = 0;
-         while (*a && *a != q && *a != '>' && k + 1 < sizeof src) src[k++] = *a++;
-         src[k] = 0;
-      }
-      free(attrs);
+      tag_attr(p + 1, gt, "type", type, sizeof type);
+      tag_attr(p + 1, gt, "src", src, sizeof src);
+      t.async = src[0] && tag_attr(p + 1, gt, "async", NULL, 0);
+      t.defer = src[0] && tag_attr(p + 1, gt, "defer", NULL, 0);
       if (!strcasecmp(type, "importmap")) {            /* before any module runs */
          char *map = lb_strndup(gt + 1, (size_t)(end - gt - 1));
          if (map) { importmap_add(map); free(map); }
@@ -3945,6 +4147,8 @@ static const char lb_ua_css[] =
 
 static void page_teardown(void)
 {
+   free(g_page.base_url);
+   g_page.base_url = NULL;
    g_page_gen++;              /* requests still in flight belong to the old page */
    for (int i = 0; i < g_ninflight; ++i) free(g_inflight[i]);
    g_ninflight = 0;
@@ -3961,11 +4165,11 @@ static void page_teardown(void)
 }
 
 static double page_pump(void);
-static int g_page_loading;
+static int cast_pump(void);
 
 static void ready_state(int stage)
 {
-   g_page.ready = stage;
+   if (stage < 2) g_page.ready = stage;
    JSValue a = JS_NewInt32(g_page.ctx, stage);
    JS_FreeValue(g_page.ctx, js_hook("__lb_ready", 1, &a));
 }
@@ -3975,23 +4179,26 @@ static void page_load_html(const char *html, const char *url)
    double stage = lb_now_ms(), total = stage;
    g_page_loading++;
    page_teardown();
+   free(g_page.nav_body);
+   g_page.nav_body = NULL;
    free(g_page.nav_url);
    g_page.nav_url = NULL;
    free(g_page.url);
    g_page.url = lb_strdup(url && url[0] ? url : "about:blank");
+   g_page.base_url = document_base_url(html, g_page.url);
    /* luna-ui joins relative references onto this base; lb_read_resource then
     * resolves the result against the page URL. */
-   if (!strncmp(g_page.url, "file://", 7)) {
+   if (!strncmp(page_base(), "file://", 7)) {
       struct url u;
-      if (url_parse(g_page.url, &u) == 0) {
+      if (url_parse(page_base(), &u) == 0) {
          char *path = percent_decode(u.path, strlen(u.path));
          luna_set_html_base_dir(path);
          free(path);
       }
       url_free(&u);
-   } else luna_set_html_base_dir(g_page.url);
+   } else luna_set_html_base_dir(page_base());
    snprintf(luna_doc_title, sizeof luna_doc_title, "%s", "");
-   page_prefetch(html);
+   page_prefetch(html, 0);
    LB_LOG("load prefetch %.0fms\n", lb_now_ms() - stage); stage = lb_now_ms();
    js_open();
    luna_parse_css(lb_ua_css);
@@ -4008,15 +4215,28 @@ static void page_load_html(const char *html, const char *url)
    LB_LOG("load parse %.0fms (%d elements, %d rules)\n", lb_now_ms() - stage, elem_count, rule_count); stage = lb_now_ms();
    luna_inject_body_background();
    luna_resize((float)g_page.w, (float)g_page.h);
+   /* Publish the parsed document before page scripts can occupy the thread. */
+   g_page.dirty = 1;
+   cast_pump();
+   page_prefetch(html, 1);
    struct script_tag *scripts = NULL;
    int n = scan_scripts(html, &scripts);
    JS_FreeValue(g_page.ctx, js_hook("__lb_parser_scripts", 0, NULL));
-   for (int i = 0; i < n; ++i) {
+   for (int pass = 0; pass < 2; ++pass) for (int i = 0; i < n; ++i) {
+      int deferred = !scripts[i].async && (scripts[i].defer || scripts[i].module);
+      if (deferred != pass) continue;
       JSValue index = JS_NewInt32(g_page.ctx, scripts[i].module ? -1 : scripts[i].ordinal);
-      JS_FreeValue(g_page.ctx, js_hook("__lb_current_script", 1, &index));
+      if (scripts[i].async) {
+         JSValue args[3] = { JS_NewInt32(g_page.ctx, scripts[i].ordinal),
+                            JS_NewString(g_page.ctx, scripts[i].src), JS_NewBool(g_page.ctx, scripts[i].module) };
+         JS_FreeValue(g_page.ctx, js_hook("__lb_async_script", 3, args));
+         for (int k = 0; k < 3; ++k) JS_FreeValue(g_page.ctx, args[k]);
+      } else {
+         JS_FreeValue(g_page.ctx, js_hook("__lb_current_script", 1, &index));
+         if (scripts[i].src) js_eval_url(scripts[i].src, scripts[i].module);
+         else if (scripts[i].code) js_eval(scripts[i].code, strlen(scripts[i].code), g_page.url, scripts[i].module);
+      }
       JS_FreeValue(g_page.ctx, index);
-      if (scripts[i].src) js_eval_url(scripts[i].src, scripts[i].module);
-      else if (scripts[i].code) js_eval(scripts[i].code, strlen(scripts[i].code), g_page.url, scripts[i].module);
       free(scripts[i].src);
       free(scripts[i].code);
    }
@@ -4041,12 +4261,14 @@ static void page_load_html(const char *html, const char *url)
    LB_LOG("load events %.0fms, total %.0fms\n", lb_now_ms() - stage, lb_now_ms() - total);
 }
 
-static int page_navigate(const char *url)
+static int page_navigate_request(const char *url, const char *post_body)
 {
    struct response r;
-   char *abs = url_resolve(g_page.url, url);
+   char *abs = url_resolve(page_base(), url);
    t_fetch_navigation = 1;
-   int rc = lb_fetch(abs, "GET", NULL, NULL, 0, &r);
+   int rc = lb_fetch(abs, post_body ? "POST" : "GET",
+                     post_body ? "Content-Type: application/x-www-form-urlencoded\r\n" : NULL,
+                     (const unsigned char *)post_body, post_body ? strlen(post_body) : 0, &r);
    t_fetch_navigation = 0;
    LB_LOG("navigate %s -> %d %s\n", abs, r.status, r.error ? r.error : "");
    if (rc != 0 || !r.body) {
@@ -4080,6 +4302,11 @@ static int page_navigate(const char *url)
    response_free(&r);
    free(abs);
    return rc;
+}
+
+static int page_navigate(const char *url)
+{
+   return page_navigate_request(url, NULL);
 }
 
 /* ======================================================================== *
@@ -4304,13 +4531,17 @@ static void page_key(const char *key, int vk, int down, const char *text, int mo
 /* Runs due timers and animation callbacks and any navigation the page asked
  * for.  Returns milliseconds until the next timer (-1: none). */
 static void cdp_navigate_now(const char *url);
+static void cdp_navigate_request(const char *url, const char *post_body);
 
 static double page_pump(void)
 {
    if (!g_page_loading && g_page.nav_url) {             /* the page's own navigation (a link, location) */
       char *u = g_page.nav_url;
+      char *body = g_page.nav_body;
       g_page.nav_url = NULL;
-      cdp_navigate_now(u);
+      g_page.nav_body = NULL;
+      cdp_navigate_request(u, body);
+      free(body);
       free(u);
    }
    http_drain();
@@ -4350,7 +4581,8 @@ static void page_render(void)
                  e->cur_r, e->cur_g, e->cur_b, e->cur_a, e->z_index, e->text);
       }
    }
-   if (g_gl.finish) g_gl.finish();
+   /* read_pixels in page_capture waits for rendering; an extra glFinish
+    * here serialized the GPU twice for every streamed frame. */
    g_page.dirty = 0;
 }
 
@@ -4373,21 +4605,36 @@ static unsigned char *page_capture(size_t *len, int jpeg_quality)
    *len = 0;
    page_render();
    int w = fb_w(), h = fb_h();
-   unsigned char *rgba = malloc((size_t)w * (size_t)h * 4);
-   unsigned char *rgb = malloc((size_t)w * (size_t)h * 3);
-   if (!rgba || !rgb) { free(rgba); free(rgb); return NULL; }
+   /* The tab captures on its main thread. Reuse readback storage instead of
+    * allocating several megabytes at every animation/scroll frame. */
+   static unsigned char *rgba;
+   static size_t capacity;
+   size_t needed = (size_t)w * (size_t)h * 4;
+   if (needed > capacity) {
+      unsigned char *grown = realloc(rgba, needed);
+      if (!grown) return NULL;
+      rgba = grown; capacity = needed;
+   }
    if (g_gl.pixel_storei) g_gl.pixel_storei(0x0D05 /* GL_PACK_ALIGNMENT */, 1);
    g_gl.read_pixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-   for (int y = 0; y < h; ++y) {
-      const unsigned char *src = rgba + (size_t)(h - 1 - y) * (size_t)w * 4;
-      unsigned char *dst = rgb + (size_t)y * (size_t)w * 3;
-      for (int x = 0; x < w; ++x) { dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; src += 4; dst += 3; }
-   }
-   free(rgba);
    struct buf b = { 0 };
-   if (jpeg_quality > 0) stbi_write_jpg_to_func(png_sink, &b, w, h, 3, rgb, jpeg_quality);
-   else stbi_write_png_to_func(png_sink, &b, w, h, 3, rgb, w * 3);
-   free(rgb);
+   if (jpeg_quality > 0) {
+      /* stb can read RGBA and reverse the rows itself. The old path copied
+       * and converted the entire frame to RGB before encoding it again. */
+      stbi_flip_vertically_on_write(1);
+      stbi_write_jpg_to_func(png_sink, &b, w, h, 4, rgba, jpeg_quality);
+      stbi_flip_vertically_on_write(0);
+   } else {
+      unsigned char *rgb = malloc((size_t)w * (size_t)h * 3);
+      if (!rgb) return NULL;
+      for (int y = 0; y < h; ++y) {
+         const unsigned char *src = rgba + (size_t)(h - 1 - y) * (size_t)w * 4;
+         unsigned char *dst = rgb + (size_t)y * (size_t)w * 3;
+         for (int x = 0; x < w; ++x) { dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; src += 4; dst += 3; }
+      }
+      stbi_write_png_to_func(png_sink, &b, w, h, 3, rgb, w * 3);
+      free(rgb);
+   }
    *len = b.len;
    return (unsigned char *)b.p;
 }
@@ -4538,14 +4785,21 @@ static void set_viewport(int w, int h, float scale)
    g_page.dirty = 1;
 }
 
-static void cdp_navigate_now(const char *url)
+static void cdp_navigate_request(const char *url, const char *post_body)
 {
    g_loader_seq++;
    cdp_emit("Page.frameStartedLoading", "{}");
-   page_navigate(url);
+   page_navigate_request(url, post_body);
    cdp_navigated();
-   cdp_emit("Page.loadEventFired", "{}");
-   cdp_emit("Page.frameStoppedLoading", "{}");
+   if (g_page.ready == 2) {
+      cdp_emit("Page.loadEventFired", "{}");
+      cdp_emit("Page.frameStoppedLoading", "{}");
+   }
+}
+
+static void cdp_navigate_now(const char *url)
+{
+   cdp_navigate_request(url, NULL);
 }
 
 /* One CDP Network.CookieParam into the jar. */
@@ -4647,6 +4901,8 @@ static void cdp_handle(const char *text)
       cdp_event_session("Target.targetCreated", r.p, 0);
       const char *url = jstr(params, "url");
       if (url && strcmp(url, "about:blank")) {
+         free(g_page.nav_body);
+         g_page.nav_body = NULL;
          free(g_page.nav_url);
          g_page.nav_url = lb_strdup(url);
       }
@@ -4688,7 +4944,7 @@ static void cdp_handle(const char *text)
       char *u = lb_strdup(g_page.url ? g_page.url : "about:blank");
       page_load_html(html ? html : "", u);
       free(u);
-      cdp_emit("Page.loadEventFired", "{}");
+      if (g_page.ready == 2) cdp_emit("Page.loadEventFired", "{}");
    } else if (!strcmp(method, "Page.getFrameTree")) {
       buf_puts(&r, "{\"frameTree\":{\"frame\":");
       frame_info(&r);
@@ -4835,7 +5091,7 @@ static void cdp_handle(const char *text)
       for (int i = luna_element_at_point(x, y), g = 0; i >= 0 && i < elem_count && g < 64; i = elements[i].parent_idx, ++g) {
          if (strcmp(elements[i].type, "img") || !elements[i].has_bg_image) continue;
          const char *p = luna_expand_path(elements[i].bg_image_path);
-         if (p && strncmp(p, "data:", 5)) image = url_resolve(g_page.url, p);
+         if (p && strncmp(p, "data:", 5)) image = url_resolve(page_base(), p);
          break;
       }
       int f = luna_focused_element();
@@ -4954,7 +5210,7 @@ static int cast_pump(void)
       if (!m) return -1;
       if (!(m & (LUNA_REDRAW_LAYOUT | LUNA_REDRAW_ANIM))) gap = CAST_CARET_MS;
    }
-   if (now - g_cast.last_ms < gap) return (int)ceil(gap - (now - g_cast.last_ms));
+   if (g_page.ready && now - g_cast.last_ms < gap) return (int)ceil(gap - (now - g_cast.last_ms));
    size_t len = 0;
    unsigned char *img = page_capture(&len, g_cast.quality);
    if (!img) return -1;
@@ -5029,7 +5285,7 @@ static void lb_set_clipboard(const char *utf8)
 
 static char *lb_get_clipboard(void) { return g_page_clip ? lb_strdup(g_page_clip) : NULL; }
 
-static char *lb_resolve_href(const char *href) { return url_resolve(g_page.url, href); }
+static char *lb_resolve_href(const char *href) { return url_resolve(page_base(), href); }
 
 static void setup_luna_platform(void)
 {

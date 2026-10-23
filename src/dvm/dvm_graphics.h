@@ -2775,12 +2775,31 @@ static bool text_on_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args
    int width=node ? node->w : ui_int(vm,self,"right")-ui_int(vm,self,"left");
    int height=node ? node->h : ui_int(vm,self,"bottom")-ui_int(vm,self,"top");
    int32_t pad[4];ui_pad(vm,self,pad);
+   struct text_compound compound;text_compound_get(vm,self,&compound);
+   union dvm_value saved_all={0},ignored_all={0};
+   for(int side=0;side<2;++side) {
+      dvm_ref drawable=side ? compound.right : compound.left;
+      if(!drawable) continue;
+      int dw=side ? compound.right_w : compound.left_w,dh=side ? compound.right_h : compound.left_h;
+      /* A selector drawable shows the view's current state (checked, pressed)
+       * only once it has been told it. */
+      union dvm_value state={0};
+      if(am_vcall(vm,self,"getDrawableState","()[I",NULL,0,&state) && state.l)
+         (void)am_vcall(vm,drawable,"setState","([I)Z",&state,1,&ignored_all);
+      int x=side ? width-pad[2]-dw : pad[0],y=(height-dh)/2;
+      union dvm_value bounds[]={{.i=x},{.i=y},{.i=x+dw},{.i=y+dh}};
+      if(!am_vcall(vm,drawable,"setBounds","(IIII)V",bounds,4,&ignored_all) ||
+         !am_vcall(vm,drawable,"draw","(Landroid/graphics/Canvas;)V",args,1,&saved_all)) return false;
+   }
+   pad[0]+=compound.left_inset;pad[2]+=compound.right_inset;
    dvm_ref content=ui_obj(vm,self,"text","Ljava/lang/CharSequence;");
    bool hint=layout->source!=content;
    union dvm_value color={.i=ui_int(vm,self,hint ? "hintTextColor" : "textColor")};
    (void)dvm_set_field(vm,layout->paint,"color","I",color);
    int gravity=ui_int(vm,self,"gravity");
-   if(!gravity) gravity=ui_is_a(vm,self,"android/widget/Button") ? 0x11 :
+   /* CheckBox/RadioButton default to CENTER_VERTICAL|START, unlike a Button. */
+   if(!gravity) gravity=ui_is_a(vm,self,"android/widget/CompoundButton") ? 0x13 :
+      ui_is_a(vm,self,"android/widget/Button") ? 0x11 :
       ui_is_a(vm,self,"android/widget/EditText") ? 0x13 : 0x33;
    int horizontal=gravity&7,vertical=gravity&0x70;
    if((gravity&0x800000) && ui_int(vm,self,"layoutDirection")==1)
@@ -3307,7 +3326,14 @@ static bool view_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
    }
    dvm_ref bg=ui_obj(vm,self,"background","Landroid/graphics/drawable/Drawable;");
    if (bg) {
-      union dvm_value bounds[]={{.i=0},{.i=0},{.i=width},{.i=height}},ignored={0};
+      union dvm_value bounds[]={{.i=0},{.i=0},{.i=width},{.i=height}},ignored={0},stateful={0},state={0};
+      /* A background is told the view's state when that changes; a view drawn
+       * before any refresh (the rows of a RecyclerView raster) has not been, so
+       * a selector background would otherwise show no state at all. */
+      if (am_vcall(vm,bg,"isStateful","()Z",NULL,0,&stateful) && stateful.i &&
+          am_vcall(vm,self,"getDrawableState","()[I",NULL,0,&state) && state.l)
+         (void)am_vcall(vm,bg,"setState","([I)Z",&state,1,&ignored);
+      if (dvm_exception(vm)) return false;
       if (!am_vcall(vm,bg,"setBounds","(IIII)V",bounds,4,&ignored) ||
           !am_vcall(vm,bg,"draw","(Landroid/graphics/Canvas;)V",args,1,out)) return false;
    } else {

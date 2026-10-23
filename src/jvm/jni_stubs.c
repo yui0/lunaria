@@ -2864,12 +2864,19 @@ jstring java_lang_Object_ANDROID_ID(JNIEnv *e, jobject o)
 jstring java_lang_Class_ANDROID_ID(JNIEnv *e, jobject o)
 { return android_provider_Settings_Secure_ANDROID_ID(e, o); }
 
-/* Settings.Secure.getString(ContentResolver cr, String name) → fake device ID */
+/* Settings.Secure.getString(ContentResolver cr, String name). */
 jstring
 android_provider_Settings_Secure_getString(JNIEnv *e, jobject o, va_list a)
 {
-   (void)o; (void)a;
-   return (*e)->NewStringUTF(e, "berry000000000000");
+   (void)o;
+   if (!JVM_VA_HAS_ARGS(a)) return NULL;
+   (void)va_arg(a, jobject);
+   jstring key = va_arg(a, jstring);
+   if (!key) return NULL;
+   const char *name = (*e)->GetStringUTFChars(e, key, NULL);
+   const char *value = lunaria_android_setting("secure", name);
+   if (name) (*e)->ReleaseStringUTFChars(e, key, name);
+   return value ? (*e)->NewStringUTF(e, value) : NULL;
 }
 
 /* ---- android.telephony.TelephonyManager ---- */
@@ -3035,12 +3042,7 @@ jstring
 com_epicgames_ue4_GameActivity_AndroidThunkJava_GetAndroidId(JNIEnv *e, jobject o, va_list a)
 {
    (void)o; (void)a;
-   static int once;
-   if (!once) {
-      once = 1;
-      fprintf(stderr, "[arm_jni] AndroidThunkJava_GetAndroidId -> berry000000000000\n");
-   }
-   return (*e)->NewStringUTF(e, "berry000000000000");
+   return (*e)->NewStringUTF(e, lunaria_android_setting("secure", "android_id"));
 }
 jstring java_lang_Object_AndroidThunkJava_GetAndroidId(JNIEnv *e, jobject o, va_list a)
 { return com_epicgames_ue4_GameActivity_AndroidThunkJava_GetAndroidId(e, o, a); }

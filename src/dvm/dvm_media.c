@@ -24,6 +24,177 @@
 #include <strings.h>
 #include <unistd.h>
 
+struct liq_image {
+    struct liq_image *next;
+    struct liq_queue *queue;
+    uint8_t *pixels;
+    unsigned width, height;
+    int64_t timestamp;
+};
+struct liq_queue {
+    atomic_uint refs;
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+    struct liq_image *head, *tail;
+    unsigned max_images, capacity, buffers, acquired;
+    uint64_t sequence;
+    bool closed;
+    liq_notify_fn notify;
+    void *notify_context;
+};
+static void image_free(struct liq_image *image)
+{
+    free(image->pixels);
+    free(image);
+}
+struct liq_queue *liq_new(unsigned max_images, unsigned capacity)
+{
+    if (!max_images || capacity < max_images) return NULL;
+    struct liq_queue *queue = calloc(1, sizeof *queue);
+    if (!queue) return NULL;
+    if (pthread_mutex_init(&queue->mutex, NULL)) { free(queue); return NULL; }
+    if (pthread_cond_init(&queue->changed, NULL)) {
+        pthread_mutex_destroy(&queue->mutex); free(queue); return NULL;
+    }
+    atomic_init(&queue->refs, 1);
+    queue->max_images = max_images;
+    queue->capacity = capacity;
+    return queue;
+}
+void liq_ref(struct liq_queue *queue)
+{
+    if (queue) atomic_fetch_add_explicit(&queue->refs, 1, memory_order_relaxed);
+}
+void liq_unref(struct liq_queue *queue)
+{
+    if (!queue || atomic_fetch_sub_explicit(&queue->refs, 1, memory_order_acq_rel) != 1) return;
+    struct liq_image *image = queue->head;
+    while (image) { struct liq_image *next = image->next; image_free(image); image = next; }
+    pthread_mutex_destroy(&queue->mutex);
+    pthread_cond_destroy(&queue->changed);
+    free(queue);
+}
+void liq_close(struct liq_queue *queue)
+{
+    if (!queue) return;
+    pthread_mutex_lock(&queue->mutex);
+    if (queue->closed) { pthread_mutex_unlock(&queue->mutex); return; }
+    queue->closed = true;
+    struct liq_image *image = queue->head;
+    queue->head = queue->tail = NULL;
+    queue->buffers = queue->acquired;
+    pthread_cond_broadcast(&queue->changed);
+    if (queue->notify) queue->notify(queue->notify_context, queue->sequence, true);
+    pthread_mutex_unlock(&queue->mutex);
+    while (image) { struct liq_image *next = image->next; image_free(image); image = next; }
+}
+int liq_submit(struct liq_queue *queue, uint8_t **pixels, size_t bytes,
+               unsigned width, unsigned height, int64_t timestamp_ns)
+{
+    if (!queue) return LIQ_INVALID_OBJECT;
+    if (!pixels || !*pixels || !width || !height || width > SIZE_MAX / 4u / height ||
+        bytes < (size_t)width * height * 4u) return LIQ_INVALID_PARAMETER;
+    pthread_mutex_lock(&queue->mutex);
+    int status = queue->closed ? LIQ_INVALID_OBJECT : queue->buffers >= queue->capacity ? LIQ_WOULD_BLOCK : LIQ_OK;
+    struct liq_image *image = status == LIQ_OK ? calloc(1, sizeof *image) : NULL;
+    if (status == LIQ_OK && !image) status = LIQ_NO_MEMORY;
+    if (status == LIQ_OK) {
+        image->queue = queue;
+        image->pixels = *pixels;
+        image->width = width;
+        image->height = height;
+        image->timestamp = timestamp_ns;
+        if (queue->tail) queue->tail->next = image;
+        else queue->head = image;
+        queue->tail = image;
+        ++queue->buffers;
+        ++queue->sequence;
+        *pixels = NULL;
+        if (queue->notify) queue->notify(queue->notify_context, queue->sequence, false);
+    }
+    pthread_mutex_unlock(&queue->mutex);
+    return status;
+}
+int liq_acquire(struct liq_queue *queue, bool latest, struct liq_image **out)
+{
+    if (!out) return LIQ_INVALID_PARAMETER;
+    *out = NULL;
+    if (!queue) return LIQ_INVALID_OBJECT;
+    pthread_mutex_lock(&queue->mutex);
+    int status = queue->closed ? LIQ_INVALID_OBJECT : queue->acquired >= queue->max_images ? LIQ_MAX_ACQUIRED : !queue->head ? LIQ_NO_BUFFER : LIQ_OK;
+    if (status == LIQ_OK) {
+        /* acquireLatest needs room to temporarily acquire two images. With
+         * less margin, Android cannot discard the older image for a newer one. */
+        if (latest && queue->max_images - queue->acquired >= 2) {
+            while (queue->head->next) {
+                struct liq_image *old = queue->head;
+                queue->head = old->next;
+                --queue->buffers;
+                image_free(old);
+                pthread_cond_broadcast(&queue->changed);
+            }
+        }
+        struct liq_image *image = queue->head;
+        queue->head = image->next;
+        if (!queue->head) queue->tail = NULL;
+        image->next = NULL;
+        ++queue->acquired;
+        liq_ref(queue);
+        *out = image;
+    }
+    pthread_mutex_unlock(&queue->mutex);
+    return status;
+}
+void liq_release(struct liq_image *image)
+{
+    if (!image) return;
+    struct liq_queue *queue = image->queue;
+    pthread_mutex_lock(&queue->mutex);
+    --queue->acquired;
+    --queue->buffers;
+    pthread_cond_broadcast(&queue->changed);
+    pthread_mutex_unlock(&queue->mutex);
+    image_free(image);
+    liq_unref(queue);
+}
+const uint8_t *liq_pixels(const struct liq_image *image) { return image ? image->pixels : NULL; }
+unsigned liq_width(const struct liq_image *image) { return image ? image->width : 0; }
+unsigned liq_height(const struct liq_image *image) { return image ? image->height : 0; }
+int64_t liq_timestamp(const struct liq_image *image) { return image ? image->timestamp : 0; }
+uint64_t liq_sequence(struct liq_queue *queue)
+{
+    if (!queue) return 0;
+    pthread_mutex_lock(&queue->mutex);
+    uint64_t sequence = queue->sequence;
+    pthread_mutex_unlock(&queue->mutex);
+    return sequence;
+}
+void liq_set_notify(struct liq_queue *queue, liq_notify_fn notify, void *context)
+{
+    if (!queue) return;
+    pthread_mutex_lock(&queue->mutex);
+    queue->notify = notify;
+    queue->notify_context = notify ? context : NULL;
+    if (notify) notify(context, queue->sequence, queue->closed);
+    pthread_mutex_unlock(&queue->mutex);
+}
+int liq_wait_space(struct liq_queue *queue, unsigned timeout_ms)
+{
+    if (!queue) return LIQ_INVALID_OBJECT;
+    struct timespec until;
+    if (clock_gettime(CLOCK_REALTIME, &until)) return LIQ_INVALID_OBJECT;
+    uint64_t ns = (uint64_t)until.tv_nsec + (uint64_t)timeout_ms * 1000000;
+    until.tv_sec += (time_t)(ns / 1000000000);
+    until.tv_nsec = (long)(ns % 1000000000);
+    pthread_mutex_lock(&queue->mutex);
+    while (!queue->closed && queue->buffers >= queue->capacity && timeout_ms) {
+        if (pthread_cond_timedwait(&queue->changed, &queue->mutex, &until)) break;
+    }
+    int status = queue->closed ? LIQ_INVALID_OBJECT : queue->buffers >= queue->capacity ? LIQ_WOULD_BLOCK : LIQ_OK;
+    pthread_mutex_unlock(&queue->mutex);
+    return status;
+}
+
 /* ------------------------------------------------------------------------ *
  * openh264, through its C binding
  *
@@ -366,6 +537,8 @@ struct lm_sink {
    int64_t ts_ns;           /* of the newest committed frame */
    uint64_t commit_id;
    bool abandoned;
+   struct liq_queue *images;
+   int commit_status;       /* producer-owned; explains a rejected commit */
 };
 
 struct lm_sink *lm_sink_new(void)
@@ -376,6 +549,19 @@ struct lm_sink *lm_sink_new(void)
       pthread_mutex_init(&s->mu, NULL);
    }
    return s;
+}
+
+struct lm_sink *lm_sink_new_reader(unsigned max_images, unsigned capacity)
+{
+   struct lm_sink *s = lm_sink_new();
+   if (!s) return NULL;
+   s->images = liq_new(max_images, capacity);
+   if (!s->images) { lm_sink_free(s); return NULL; }
+   return s;
+}
+struct liq_queue *lm_sink_image_queue(struct lm_sink *s)
+{
+   return s ? s->images : NULL;
 }
 
 void lm_sink_ref(struct lm_sink *s)
@@ -389,6 +575,8 @@ void lm_sink_free(struct lm_sink *s)
    free(s->front.rgba);
    free(s->mid.rgba);
    free(s->back.rgba);
+   liq_close(s->images);
+   liq_unref(s->images);
    pthread_mutex_destroy(&s->mu);
    free(s);
 }
@@ -398,6 +586,7 @@ uint8_t *lm_sink_begin(struct lm_sink *s, int w, int h)
    if (!s || w <= 0 || h <= 0) return NULL;
    pthread_mutex_lock(&s->mu);bool abandoned=s->abandoned;pthread_mutex_unlock(&s->mu);
    if(abandoned) return NULL;
+   if ((size_t)w > SIZE_MAX / 4u / (size_t)h) return NULL;
    size_t need = (size_t)w * (size_t)h * 4u;
    struct lm_sinkbuf *b = &s->back;
    if (need > b->cap) {
@@ -411,18 +600,34 @@ uint8_t *lm_sink_begin(struct lm_sink *s, int w, int h)
 
 bool lm_sink_commit(struct lm_sink *s, int w, int h, int64_t timestamp_ns)
 {
+   if (s) s->commit_status = LIQ_INVALID_PARAMETER;
    if (!s || !s->back.rgba || w <= 0 || h <= 0) return false;
+   if ((size_t)w > SIZE_MAX / 4u / (size_t)h ||
+       (size_t)w * (size_t)h * 4u > s->back.cap) return false;
    s->back.w = w;
    s->back.h = h;
    s->back.ts_ns = timestamp_ns;
    pthread_mutex_lock(&s->mu);
-   if(s->abandoned) {pthread_mutex_unlock(&s->mu);return false;}
+   if(s->abandoned) {s->commit_status=LIQ_INVALID_OBJECT;pthread_mutex_unlock(&s->mu);return false;}
+   if (s->images) {
+      int status = liq_submit(s->images, &s->back.rgba, s->back.cap,
+                              (unsigned)w, (unsigned)h, timestamp_ns);
+      s->commit_status = status;
+      if (status == LIQ_OK) {
+         s->back.cap = 0;
+         s->ts_ns = timestamp_ns;
+         ++s->commit_id;
+      }
+      pthread_mutex_unlock(&s->mu);
+      return status == LIQ_OK;
+   }
    struct lm_sinkbuf t = s->mid;
    s->mid = s->back;
    s->back = t;
    s->pending = true;
    s->ts_ns = timestamp_ns;
    ++s->commit_id;
+   s->commit_status = LIQ_OK;
    pthread_mutex_unlock(&s->mu);
    return true;
 }
@@ -431,6 +636,7 @@ void lm_sink_abandon(struct lm_sink *s)
 {
    if(!s) return;
    pthread_mutex_lock(&s->mu);s->abandoned=true;s->pending=false;pthread_mutex_unlock(&s->mu);
+   liq_close(s->images);
 }
 uint64_t lm_sink_commit_id(struct lm_sink *s)
 {
@@ -936,6 +1142,25 @@ static bool codec_job_push(struct lm_codec *c, const struct lm_job *j)
    return true;
 }
 
+/* A full ImageReader owns its buffers until the consumer releases them.
+ * Keep the converted frame and its output slot while waiting; do not report
+ * a render or drop the frame. Cancellation is sampled under the codec lock,
+ * independently of the sink's mutex, so flush/stop/free can finish. */
+static bool codec_commit_sink(struct lm_codec *c, struct lm_sink *sink,
+                               int w, int h, int64_t timestamp, unsigned epoch)
+{
+   for (;;) {
+      pthread_mutex_lock(&c->mu);
+      const bool cancelled = c->th_stop || epoch != c->epoch;
+      pthread_mutex_unlock(&c->mu);
+      if (cancelled) return false;
+      if (lm_sink_commit(sink, w, h, timestamp)) return true;
+      if (!sink->images || sink->commit_status != LIQ_WOULD_BLOCK) return false;
+      int status = liq_wait_space(sink->images, 10);
+      if (status != LIQ_OK && status != LIQ_WOULD_BLOCK) return false;
+   }
+}
+
 static void *codec_thread_main(void *arg)
 {
    struct lm_codec *c = arg;
@@ -993,7 +1218,8 @@ static void *codec_thread_main(void *arg)
             int64_t rendered_ns=0;
             if (rgba) {
                i420_to_rgba(o->yuv, o->w, o->h, rgba);
-               if(lm_sink_commit(j.sink, o->w, o->h, j.surface_timestamp_ns)) rendered_ns=codec_render_clock();
+               if(codec_commit_sink(c, j.sink, o->w, o->h,
+                     j.surface_timestamp_ns, j.epoch)) rendered_ns=codec_render_clock();
             }
             pthread_mutex_lock(&c->mu);
             if(rendered_ns && j.epoch==c->epoch && render_generation==c->render_generation)
@@ -1236,6 +1462,10 @@ int lm_codec_error(struct lm_codec *c)
 bool lm_codec_is_video(const struct lm_codec *c)
 {
    return c && c->video;
+}
+bool lm_codec_image_reader_supported(const struct lm_codec *c)
+{
+   return c && c->vctx;
 }
 
 const char *lm_codec_mime(const struct lm_codec *c)
@@ -1555,6 +1785,11 @@ static void codec_release_output(struct lm_codec *c, int idx, bool render,
                                   int64_t timestamp_ns)
 {
    if (!c || idx < 0 || idx >= LM_OUT_BUFS) return;
+   if (render && sink && sink->images && !lm_codec_image_reader_supported(c)) {
+      c->error = -1010; /* ERROR_UNSUPPORTED: this decoder has no async renderer */
+      c->out[idx].busy = c->out[idx].ready = false;
+      return;
+   }
    if (c->vctx) {
       pthread_mutex_lock(&c->mu);
       if (c->out[idx].busy) {

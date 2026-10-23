@@ -46,6 +46,8 @@ case "$os" in
     linux|macos) executable=lunaria ;;
     *) err "unknown os \"$os\"" ;;
 esac
+exe_suffix=
+[ "$os" = windows ] && exe_suffix=.exe
 binary="${4:-./$executable}"
 syslib="${5:-syslib-arm64}"
 decoder="${6:-}"
@@ -75,6 +77,17 @@ else
     cp -p runtime/*.dylib "$stage/runtime/" 2>/dev/null || true
 fi
 [ -z "$decoder" ] || cp -p "$decoder" "$stage/runtime/"
+
+# luna-browser, the WebView engine used when no Chrome is installed (and the
+# fallback when Chrome does not start).  The emulator looks for it next to
+# itself, or in an app bundle's Resources.  It is built by the Makefile's
+# dist step; a tree without it still packs, with Chrome as the only engine.
+if [ -f luna-browser/"luna-browser$exe_suffix" ]; then
+    mkdir -p "$stage/luna-browser"
+    cp -p luna-browser/"luna-browser$exe_suffix" "$stage/luna-browser/"
+else
+    msg 'luna-browser is not built: WebView content needs an installed Chrome'
+fi
 
 # The guest-side AArch64 system libraries, when they have been built.  Without
 # them every libm call leaves the JIT for an SVC; with them the launcher finds
@@ -106,7 +119,7 @@ done
 # kernel and to the dynamic loader that is already running this process.
 bundle_linux() {
     _keep="$1"
-    for _bin in "$stage/lunaria" "$stage"/runtime/*.so; do
+    for _bin in "$stage/lunaria" "$stage/luna-browser/luna-browser" "$stage"/runtime/*.so; do
         [ -f "$_bin" ] || continue
         ldd "$_bin" 2>/dev/null | while read -r _name _arrow _path _rest; do
             [ "$_arrow" = '=>' ] || continue

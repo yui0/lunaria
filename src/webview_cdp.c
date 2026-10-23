@@ -632,7 +632,7 @@ int lunaria_cdp_page_insert_text(struct lunaria_cdp_page *page,
 }
 
 int lunaria_cdp_page_key(struct lunaria_cdp_page *page,
-                         const char *key, int virtual_code, int pressed)
+                         const char *key, int virtual_code, int pressed, unsigned modifiers)
 {
    if (!page || !page->transport || !page->session_id[0] ||
        !key || strlen(key) > 32 || virtual_code < 0) return -1;
@@ -641,9 +641,9 @@ int lunaria_cdp_page_key(struct lunaria_cdp_page *page,
       "{\"id\":%u,\"sessionId\":\"%s\","
       "\"method\":\"Input.dispatchKeyEvent\","
       "\"params\":{\"type\":\"key%s\",\"key\":\"%s\","
-      "\"windowsVirtualKeyCode\":%d}}",
+      "\"windowsVirtualKeyCode\":%d,\"modifiers\":%u}}",
       page->next_id++, page->session_id,
-      pressed ? "Down" : "Up", key, virtual_code);
+      pressed ? "Down" : "Up", key, virtual_code, modifiers & 15u);
    return lunaria_cdp_send(page->transport, command);
 }
 

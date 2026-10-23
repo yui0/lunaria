@@ -146,12 +146,17 @@ typedef void (*luna_overlay_web_pointer_fn)(const char *id,
                                             int x, int y, int action);
 void luna_overlay_set_web_pointer_handler(luna_overlay_web_pointer_fn fn);
 typedef void (*luna_overlay_web_char_fn)(const char *id, uint32_t codepoint);
-typedef void (*luna_overlay_web_key_fn)(const char *id, int key, int action);
+typedef void (*luna_overlay_web_key_fn)(const char *id, int key, int action, int mods);
+typedef void (*luna_overlay_web_text_fn)(const char *id, const char *utf8);
 void luna_overlay_set_web_text_handlers(luna_overlay_web_char_fn char_fn,
-                                        luna_overlay_web_key_fn key_fn);
+                                        luna_overlay_web_key_fn key_fn,
+                                        luna_overlay_web_text_fn text_fn);
 /* Host keyboard callbacks use these after a WebView was focused by touch. */
 bool luna_overlay_web_char(uint32_t codepoint);
-bool luna_overlay_web_key(int key, int action);
+bool luna_overlay_host_key(int key, int action, int mods);
+bool luna_overlay_host_char(uint32_t codepoint);
+bool luna_overlay_web_key(int key, int action, int mods);
+bool luna_overlay_web_text(const char *utf8);
 
 /* Called on the presenting thread, with the document parsed and luna-ui's
  * state live, immediately before the frame is drawn.  It is the only place a

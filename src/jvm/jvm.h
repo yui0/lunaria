@@ -133,6 +133,9 @@ const struct lunaria_device *const *lunaria_device_list(void);
  * the ARM SVC layer.  Returns "" for a property this device does not have. */
 const char *lunaria_android_property(const char *name);
 
+/* Android settings shared by native JNI and dex. NULL means unset. */
+const char *lunaria_android_setting(const char *table, const char *name);
+
 /* Where this install lives, spelled the way a device spells it.
  *
  * Everything the guest is told about its own package has to agree: an app

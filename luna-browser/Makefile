@@ -15,7 +15,11 @@ CFLAGS   ?= $(OPT) -g
 CFLAGS   += -std=c11 -D_GNU_SOURCE
 WARN     := -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare \
             -Wno-missing-field-initializers
-LIBS     := -lEGL -ldl -lm -lpthread
+# Where EGL comes from: the system's, or ANGLE's on macOS (the emulator's own
+# Makefile passes its HOST_GL_LIBS and include flags for a packaged build).
+LB_GL_LIBS ?= -lEGL
+CFLAGS   += $(LB_CPPFLAGS)
+LIBS     := $(LB_GL_LIBS) -ldl -lm -lpthread
 
 LB_WINDOW ?= $(shell pkg-config --exists glfw3 2>/dev/null && echo 1 || echo 0)
 ifeq ($(LB_WINDOW),1)
@@ -25,7 +29,8 @@ endif
 ifeq ($(LB_NO_TLS),1)
 CFLAGS   += -DLB_NO_TLS
 else
-LIBS     += $(shell pkg-config --libs openssl 2>/dev/null || echo -lssl -lcrypto)
+LB_SSL_LIBS ?= $(shell pkg-config --libs openssl 2>/dev/null || echo -lssl -lcrypto)
+LIBS     += $(LB_SSL_LIBS)
 endif
 
 ifeq ($(LB_NO_ZLIB),1)
@@ -61,7 +66,7 @@ build/luna-browser.o: luna-browser.c build/luna-browser.js.h build/run_cat.png.h
 luna-browser: build/luna-browser.o $(QJS_OBJ)
 	$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
 
-test: script-dom-test http-framing-test document-layout-test css-robust-test text-edit-test image-loading-test
+test: mutation-observer-test xhr-lifecycle-test form-navigation-test page-resources-test page-loading-test script-dom-test http-framing-test document-layout-test css-robust-test text-edit-test image-loading-test
 
 script-dom-test: luna-browser
 	python3 test/script_dom.py
@@ -85,3 +90,28 @@ clean:
 	rm -rf build luna-browser
 
 .PHONY: all test script-dom-test http-framing-test document-layout-test css-robust-test text-edit-test image-loading-test clean
+
+page-loading-test: luna-browser
+	python3 test/page_loading.py
+
+.PHONY: page-loading-test
+
+page-resources-test: luna-browser
+	python3 test/page_resources.py
+
+.PHONY: page-resources-test
+
+form-navigation-test: luna-browser
+	python3 test/form_navigation.py
+
+.PHONY: form-navigation-test
+
+xhr-lifecycle-test: luna-browser
+	python3 test/xhr_lifecycle.py
+
+.PHONY: xhr-lifecycle-test
+
+mutation-observer-test: luna-browser
+	python3 test/mutation_observer.py
+
+.PHONY: mutation-observer-test

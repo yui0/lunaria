@@ -627,13 +627,24 @@ static void qfkey_host_touch(int action, float x, float y)
 }
 static void qfkey_host_key(int hid, int down)
 {
+    static int shift;
+    static const char lo[] = "1234567890", hi[] = "!@#$%^&*()";
     int key = 0;
-    switch (hid) {
+    unsigned ch = 0;
+    if (hid == 0xe1 || hid == 0xe5) { shift = down; return; }
+    if (hid >= 0x04 && hid <= 0x1d) { key = GLFW_KEY_A + hid - 0x04; ch = (shift ? 'A' : 'a') + hid - 0x04; }
+    else if (hid >= 0x1e && hid <= 0x27) { key = GLFW_KEY_1 + hid - 0x1e; if (hid == 0x27) key = GLFW_KEY_0; ch = (shift ? hi : lo)[hid - 0x1e]; }
+    else switch (hid) {
     case 0x29: key = GLFW_KEY_ESCAPE; break;
     case 0x28: key = GLFW_KEY_ENTER; break;
     case 0x2a: key = GLFW_KEY_BACKSPACE; break;
-    case 0x2c: key = GLFW_KEY_SPACE; break;
+    case 0x2c: key = GLFW_KEY_SPACE; ch = ' '; break;
     case 0x2b: key = GLFW_KEY_TAB; break;
+    case 0x4c: key = GLFW_KEY_DELETE; break;
+    case 0x4f: key = GLFW_KEY_RIGHT; break;
+    case 0x50: key = GLFW_KEY_LEFT; break;
+    case 0x51: key = GLFW_KEY_DOWN; break;
+    case 0x52: key = GLFW_KEY_UP; break;
     default: break;
     }
     if (!key) return;
@@ -641,7 +652,8 @@ static void qfkey_host_key(int hid, int down)
     if (luna_file_dialog_handle_key(key, 0, action, 0)) return;
     if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS && pick_select_for < 0)
         cancelled = 1;
-    luna_key(key, 0, action, 0);
+    luna_key(key, 0, action, shift ? GLFW_MOD_SHIFT : 0);
+    if (ch && down) luna_char(ch);
 }
 
 static void launcher_qfkey_title(char *buf, size_t n)
@@ -1046,6 +1058,11 @@ static void pick_select_label(size_t i)
     snprintf(id, sizeof id, "set%zu", i);
     snprintf(label, sizeof label, "%s", *pick_settings[i].value ?
              pick_settings[i].value : "Default (pixel6)");
+    if (pick_settings[i].choice_labels)
+        for (size_t k = 0; pick_settings[i].choices[k]; ++k)
+            if (!strcmp(pick_settings[i].value, pick_settings[i].choices[k])) {
+                snprintf(label, sizeof label, "%s", pick_settings[i].choice_labels[k]); break;
+            }
     luna_set_text(luna_get_element_by_id(id), label);
 }
 
@@ -1406,8 +1423,8 @@ static int launcher_form(char *path, size_t capacity,
                         "<div id=\"select%zu\" class=\"select-panel hidden\" role=\"listbox\">", field, field);
                     for (size_t option = 0; settings[field].choices[option]; ++option)
                         at += (size_t)snprintf(html + at, html_size - at,
-                            "<div id=\"option%zu_%zu\" class=\"select_option\" role=\"option\" tabindex=\"0\">%s</div>",
-                            field, option, *settings[field].choices[option] ? settings[field].choices[option] : "Default (pixel6)");
+                            "<div id=\"option%zu_%zu\" class=\"select_option\" role=\"option\" tabindex=\"0\"></div>",
+                            field, option);
                     at += (size_t)snprintf(html + at, html_size - at, "</div>");
                 } else at += (size_t)snprintf(html + at, html_size - at,
                             "<input id=\"set%zu\" value=\"\">", field);
@@ -1460,7 +1477,10 @@ static int launcher_form(char *path, size_t capacity,
             luna_set_on_click(luna_get_element_by_id(id), pick_select_toggle);
             for (size_t k = 0; settings[i].choices[k]; ++k) {
                 char option_id[48]; snprintf(option_id, sizeof option_id, "option%zu_%zu", i, k);
-                luna_set_on_click(luna_get_element_by_id(option_id), pick_select_option);
+                int node = luna_get_element_by_id(option_id);
+                const char *text = settings[i].choice_labels ? settings[i].choice_labels[k] : settings[i].choices[k];
+                luna_set_text(node, *text ? text : "Default (pixel6)");
+                luna_set_on_click(node, pick_select_option);
             }
         }
         pick_set_field(i, settings[i].value);
@@ -1541,7 +1561,7 @@ int luna_launcher_pick(char *path, size_t capacity,
     return launcher_form(path, capacity, settings, count, NULL);
 }
 
-int luna_launcher_choose(const char *package, const char *const *profiles,
+int luna_launcher_choose(const char *package, const char *const *profiles, const char *const *labels,
                          size_t count, char *choice, size_t capacity)
 {
     if (!ready || !count || count >= SIZE_MAX / sizeof(char *)) return -1;
@@ -1549,7 +1569,7 @@ int luna_launcher_choose(const char *package, const char *const *profiles,
     if (!values) return -1;
     for (size_t i = 0; i < count; ++i) values[i] = profiles[i];
     luna_launcher_setting settings[2] = {
-        {.label="Profile", .compact=1, .choices=values},
+        {.label="Profile", .compact=1, .choices=values, .choice_labels=labels},
         {.label="New profile (optional)", .compact=1}
     };
     const char *selected = getenv("LUNARIA_PROFILE");

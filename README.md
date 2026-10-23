@@ -477,7 +477,10 @@ By default, Lunaria looks for `lunaria.conf` in its startup working directory an
 ./lunaria --choose-profile game.xapk
 ./lunaria --profile account2 game.xapk
 ./lunaria --list-profiles game.xapk
+./lunaria --profile account2 --rename-profile "Main account" game.xapk
 ```
+
+Use **Profile → Rename Profile…** in the right-click menu to change the current profile’s display name, including Japanese names. Names persist across launches; account IDs and data directories stay fixed. `--list-profiles` shows the ID followed by the display name when renamed.
 
 Set `LUNARIA_PROFILE_PROMPT=1` to select a profile at every launch. `LUNARIA_SHARED_ASSETS` accepts colon-separated shared resource names; `LUNARIA_PROFILE_SEED_FILES` lists resource files to copy once into a new profile. The sample configuration includes the Genshin Impact resource layout. Each new profile starts with its own login state.
 

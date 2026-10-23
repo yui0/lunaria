@@ -583,7 +583,7 @@ static uint32_t dvm_direct_buffer_to_host(struct dvm *vm, dvm_ref r)
    }
    uint64_t cap = 0;
    void *dst = arm_exec_direct_buffer_host(handle, &cap);
-   if (dst && cap) memcpy(dst, src, cap < len ? (size_t)cap : (size_t)len);
+   if (dst && dst!=src && cap) memcpy(dst, src, cap < len ? (size_t)cap : (size_t)len);
    return handle;
 }
 
@@ -599,7 +599,32 @@ static void dvm_direct_buffer_from_host(struct dvm *vm, dvm_ref r)
    if (!dst || !len || !handle) return;
    uint64_t cap = 0;
    const void *src = arm_exec_direct_buffer_host(handle, &cap);
-   if (src && cap) memcpy(dst, src, cap < len ? (size_t)cap : (size_t)len);
+   if (src && src!=dst && cap) memcpy(dst, src, cap < len ? (size_t)cap : (size_t)len);
+}
+
+/* NewDirectByteBuffer wraps caller-owned native storage. Its Java view must
+ * alias those bytes, rather than becoming an opaque object or a copy whose
+ * writes cannot be observed by native code. */
+static void native_buffer_data_release(void *data) { (void)data; }
+static dvm_ref native_buffer_import(struct dvm *vm,JNIEnv *env,jobject host,
+                                     void *address,uint64_t capacity)
+{
+   if(capacity>INT32_MAX) {dvm__throw(vm,"java/lang/IllegalArgumentException","direct buffer capacity");return 0;}
+   struct dvm_class *cls=dvm_find_class(vm,"java/nio/DirectByteBuffer");
+   dvm_ref buffer=cls ? dvm_new_object(vm,cls) : 0;
+   dvm_ref bytes=buffer ? dvm_new_array(vm,'B',"B",0) : 0;
+   struct dvm_object *array=bytes ? dvm__obj(vm,bytes) : NULL;
+   if(!array)return 0;
+   free(array->data);
+   array->data=address;array->length=(uint32_t)capacity;
+   array->data_destroy=native_buffer_data_release;
+   (void)dvm_set_field(vm,buffer,"buf","[B",(union dvm_value){.l=bytes});
+   (void)dvm_set_field(vm,buffer,"pos","I",(union dvm_value){.i=0});
+   (void)dvm_set_field(vm,buffer,"count","I",(union dvm_value){.i=(int32_t)capacity});
+   (void)dvm_set_field(vm,buffer,"mark","I",(union dvm_value){.i=-1});
+   (void)dvm_set_field(vm,buffer,"direct","Z",(union dvm_value){.i=1});
+   (void)dvm_set_field(vm,buffer,"nativeBacked","Z",(union dvm_value){.i=1});
+   return bind_payload(vm,env,buffer,host);
 }
 
 /* jobject → dvm_ref.  A jstring becomes a real VM string so bytecode can call
@@ -706,6 +731,11 @@ static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
     * implements itself (AssetManager, File, …) was unreachable through an
     * object that arrived this way. */
    const char *cn = class_name_of(env, o);
+   if(cn && (!strcmp(cn,"java/nio/DirectByteBuffer") || !strcmp(cn,"java.nio.DirectByteBuffer"))) {
+      uint64_t capacity=0;
+      void *address=arm_exec_direct_buffer_host((uint32_t)(uintptr_t)o,&capacity);
+      if(address)return native_buffer_import(vm,env,o,address,capacity);
+   }
    /* A ProviderInfo allocated by the framework bridge has its fields in the
     * host JVM.  Read them before registering the DVM wrapper: once registered,
     * JNI field access correctly resolves to the DVM object instead. */
@@ -775,6 +805,7 @@ static jobject dvm_array_to_host(struct dvm *vm, JNIEnv *env, dvm_ref r)
           * refers back to this array then finds it instead of building a
           * second one. */
          o->host_handle = (uint32_t)(uintptr_t)h;
+         remember_wrapper(o->host_handle, r);
          bridge_record(h, r, false);
          const dvm_ref *items = (const dvm_ref *)o->data;
          for (jsize i = 0; items && i < n; ++i)
@@ -786,6 +817,10 @@ static jobject dvm_array_to_host(struct dvm *vm, JNIEnv *env, dvm_ref r)
    if (!h) return NULL;
    if (n > 0 && o->data) ARRAY_REGION(env, Set, kind, h, n, o->data);
    o->host_handle = (uint32_t)(uintptr_t)h;
+   /* A JNI local can be deleted while Java still holds this array. Remember
+    * its slot generation so a later export cannot write into a different
+    * array which has reused that local's handle. */
+   remember_wrapper(o->host_handle, r);
    bridge_record(h, r, false);
    return h;
 }
@@ -2045,6 +2080,34 @@ void dvm_jni_show_activity(JNIEnv *env, jobject activity)
    dvm_ref ref = from_jobject(vm, env, activity);
    if (ref) dvm__activity_visible(vm, ref);
    dvm_gil_leave_to_guest(vm, cookie);
+}
+
+jobject dvm_jni_surface_from_sink(JNIEnv *env, struct lm_sink *sink)
+{
+   struct dvm *vm=dvm_jni_vm();
+   if (!vm || !env || !sink) return NULL;
+   unsigned cookie=dvm_gil_enter_from_guest(vm);
+   JNIEnv *saved=g_env;
+   g_env=env;g_env_any=env;
+   dvm_ref surface=dvm_surface_from_sink(vm,sink);
+   jobject result=surface ? to_jobject(vm,env,surface) : NULL;
+   g_env=saved;
+   dvm_gil_leave_to_guest(vm,cookie);
+   return result;
+}
+
+struct lm_sink *dvm_jni_surface_acquire_sink(JNIEnv *env, jobject surface)
+{
+   struct dvm *vm=dvm_jni_vm();
+   if (!vm || !env || !surface) return NULL;
+   unsigned cookie=dvm_gil_enter_from_guest(vm);
+   JNIEnv *saved=g_env;
+   g_env=env;g_env_any=env;
+   dvm_ref ref=from_jobject(vm,env,surface);
+   struct lm_sink *sink=ref ? dvm_surface_acquire_sink(vm,ref) : NULL;
+   g_env=saved;
+   dvm_gil_leave_to_guest(vm,cookie);
+   return sink;
 }
 
 void dvm_jni_main_transaction(JNIEnv *env, bool begin)

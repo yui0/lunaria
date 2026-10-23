@@ -669,6 +669,14 @@ static void perf_tick(void)
            (unsigned long long)composites, (double)(composites - last_composites) / dt,
            (double)gticks / 1e6, (double)(gticks - last_ticks) / dt / 1e6,
            (double)xlat / 1e6, (double)(xlat - last_xlat) / dt / 1e6);
+   {
+      uint64_t a32[3];
+      arm_exec_translated_insn_a32(a32);
+      if (a32[0] | a32[1] | a32[2])
+         fprintf(stderr, "[perf]   a32 xlat by engine: threads=%.1fM main=%.1fM "
+                 "callbacks=%.1fM\n", (double)a32[0] / 1e6, (double)a32[1] / 1e6,
+                 (double)a32[2] / 1e6);
+   }
 
    arm_exec_ticks_report();
    frame_stage_report(dt, frames - last_frames);
@@ -737,6 +745,8 @@ static void stall_watch_tick(void)
  * every guest thread is doing.  Polled from the pump rather than raised by a
  * signal because the dump is not async-signal-safe — the handler route took
  * the process down instead of printing. */
+int arm_exec_il2cpp_symbols(const char *path);
+
 static void thread_dump_request_tick(void)
 {
    static int every;
@@ -746,6 +756,12 @@ static void thread_dump_request_tick(void)
     * bare name is whichever process polls it first. */
    char own[64];
    snprintf(own, sizeof own, "/tmp/lunaria-threads.%d", (int)getpid());
+   if (access("/tmp/lunaria-il2cpp-syms", F_OK) == 0) {
+      unlink("/tmp/lunaria-il2cpp-syms");
+      const int rc = arm_exec_il2cpp_symbols("/tmp/lunaria-il2cpp-syms.txt");
+      if (rc) fprintf(stderr, "[il2cpp-syms] failed (%d)\n", rc);
+      return;
+   }
    if (access(own, F_OK) == 0) unlink(own);
    else if (access("/tmp/lunaria-threads", F_OK) == 0) unlink("/tmp/lunaria-threads");
    else return;

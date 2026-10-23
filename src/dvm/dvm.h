@@ -124,6 +124,11 @@ struct dvm *dvm_create(const struct dvm_hooks *hooks);
 void dvm_destroy(struct dvm *vm);
 void dvm_glsurface_tick(struct dvm *vm);
 void dvm_glsurface_finish(struct dvm *vm);
+struct lm_sink;
+/* Native producers and Java MediaCodec must share one BufferQueue. */
+dvm_ref dvm_surface_from_sink(struct dvm *vm, struct lm_sink *sink);
+/* Returns an owned sink reference, or NULL for a released/invalid Surface. */
+struct lm_sink *dvm_surface_acquire_sink(struct dvm *vm, dvm_ref surface);
 /* Process teardown: stop admission and wake platform waits, then join Java
  * host threads before releasing the JNI table or execution engines. */
 bool dvm_is_stopping(struct dvm *vm);

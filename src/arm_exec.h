@@ -708,6 +708,7 @@ uint64_t arm_exec_sched_ticks(void);
  * arm_exec_sched_ticks(): translating far more than the guest runs means the
  * emulator is recompiling, not working. */
 uint64_t arm_exec_translated_insn(void);
+void arm_exec_translated_insn_a32(uint64_t out[3]);
 
 /* Pre-create Mono generic JIT trampolines before initJni maps mscorlib. */
 void arm_exec_ensure_mono_trampolines(void);
