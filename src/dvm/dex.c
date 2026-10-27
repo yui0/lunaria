@@ -670,8 +670,45 @@ bool dex_field_annotation(struct dex_file *d, uint32_t class_def_idx,
    return set_off && dex_annotation_set_find(d,set_off,annotation_desc,true,encoded_off);
 }
 
+/* Field generic metadata uses the same fragmented String[] payload as a
+ * class Signature, but lives in the field's annotation set.  It is a system
+ * annotation (visibility 2), so it must stay separate from the public
+ * runtime-annotation lookup used by Field.getAnnotation(). */
+/* The text of a dalvik.annotation.Signature annotation at `signature_off`:
+ * its "value" array of string fragments, concatenated. */
 static bool dex_signature_text(struct dex_file *d, uint32_t signature_off,
-                               char *out, size_t out_sz);
+                               char *out, size_t out_sz)
+{
+   struct dex_value value;
+   if (!dex_annotation_element(d, signature_off, "value", &value) ||
+       value.type != DEX_VALUE_ARRAY)
+      return false;
+   int count = dex_value_array(d, &value, NULL, 0);
+   if (count <= 0) return false;
+   struct dex_value *fragments = calloc((size_t)count, sizeof *fragments);
+   if (!fragments) return false;
+   bool ok = dex_value_array(d, &value, fragments, count) == count;
+   size_t used = 0;
+   for (int i = 0; ok && i < count; ++i) {
+      if (fragments[i].type != DEX_VALUE_STRING ||
+          fragments[i].bits > UINT32_MAX) {
+         ok = false;
+         break;
+      }
+      const char *fragment = dex_string(d, (uint32_t)fragments[i].bits);
+      size_t n = fragment ? strlen(fragment) : 0;
+      if (!fragment || n >= out_sz - used) {
+         ok = false;
+         break;
+      }
+      memcpy(out + used, fragment, n);
+      used += n;
+      out[used] = '\0';
+   }
+   free(fragments);
+   if (!ok || !used) out[0] = '\0';
+   return ok && used;
+}
 
 /* ---- method and parameter annotations -----------------------------------
  *
@@ -931,46 +968,6 @@ bool dex_class_signature(struct dex_file *d, uint32_t class_def_idx,
       }
    }
    return false;
-}
-
-/* Field generic metadata uses the same fragmented String[] payload as a
- * class Signature, but lives in the field's annotation set.  It is a system
- * annotation (visibility 2), so it must stay separate from the public
- * runtime-annotation lookup used by Field.getAnnotation(). */
-/* The text of a dalvik.annotation.Signature annotation at `signature_off`:
- * its "value" array of string fragments, concatenated. */
-static bool dex_signature_text(struct dex_file *d, uint32_t signature_off,
-                               char *out, size_t out_sz)
-{
-   struct dex_value value;
-   if (!dex_annotation_element(d, signature_off, "value", &value) ||
-       value.type != DEX_VALUE_ARRAY)
-      return false;
-   int count = dex_value_array(d, &value, NULL, 0);
-   if (count <= 0) return false;
-   struct dex_value *fragments = calloc((size_t)count, sizeof *fragments);
-   if (!fragments) return false;
-   bool ok = dex_value_array(d, &value, fragments, count) == count;
-   size_t used = 0;
-   for (int i = 0; ok && i < count; ++i) {
-      if (fragments[i].type != DEX_VALUE_STRING ||
-          fragments[i].bits > UINT32_MAX) {
-         ok = false;
-         break;
-      }
-      const char *fragment = dex_string(d, (uint32_t)fragments[i].bits);
-      size_t n = fragment ? strlen(fragment) : 0;
-      if (!fragment || n >= out_sz - used) {
-         ok = false;
-         break;
-      }
-      memcpy(out + used, fragment, n);
-      used += n;
-      out[used] = '\0';
-   }
-   free(fragments);
-   if (!ok || !used) out[0] = '\0';
-   return ok && used;
 }
 
 bool dex_field_signature(struct dex_file *d, uint32_t class_def_idx,

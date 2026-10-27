@@ -11,6 +11,10 @@ int luna_temp_mkstemp(char *pattern,size_t capacity);
 char *luna_temp_mkdtemp(char *pattern,size_t capacity);
 
 typedef const char *(*luna_symlink_mapper)(const char *,char *,size_t);
+/* Return nonzero for modeled inodes, projecting guest uid/gid/mode.
+ * Unmanaged host scratch paths retain host semantics. */
+typedef int (*luna_file_inode_mapper)(const char *,luna_file_info *);
+void luna_file_set_credentials(unsigned uid,unsigned gid,luna_file_inode_mapper mapper);
 void luna_symlink_set_mapper(luna_symlink_mapper mapper,luna_symlink_mapper reverse);
 int luna_symlink_namespace(const char *path,char *out,size_t capacity,luna_symlink_mapper raw);
 int luna_symlink_create(const char *target,const char *path);
@@ -25,6 +29,8 @@ int luna_symlink_set_modified(const char *path,int64_t milliseconds);
 int luna_file_stat_follow(const char *path,struct stat *info);
 int luna_file_stat_nofollow(const char *path,struct stat *info);
 FILE *luna_symlink_fopen(const char *path,const char *mode);
+int luna_symlink_fd_info(int fd,luna_file_info *info);
+int luna_symlink_fd_chmod(int fd,unsigned mode);
 int luna_symlink_infoat(int dirfd,const char *path,luna_file_info *info,int flags);
 int luna_symlink_unlinkat(int dirfd,const char *path,int flags);
 int luna_symlink_unlink(const char *path);

@@ -349,7 +349,7 @@ static bool nsp_parse(struct nsp_policy *p,const unsigned char *bytes,size_t len
          const char *first=strings[si],*last=first+strlen(first);
          while(first<last && (unsigned char)*first<=32)++first;
          while(last>first && (unsigned char)last[-1]<=32)--last;
-         char *trim=strndup(first,(size_t)(last-first));
+         char *trim=luna_strndup(first,(size_t)(last-first));
          if(!trim){p->oom=true;ok=false;break;}
          d->name=nsp_lower(trim);free(trim);
          if(!d->name){p->oom=true;ok=false;break;}

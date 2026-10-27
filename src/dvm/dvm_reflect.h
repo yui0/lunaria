@@ -78,7 +78,21 @@ static bool cl_getMethod(struct dvm *vm, dvm_ref self, const union dvm_value *ar
 }
 
 static dvm_ref reflect_field_object(struct dvm *vm, struct dvm_class *owner,
-                                    const struct dvm_field *fd);
+                                    const struct dvm_field *fd)
+{
+   struct dvm_class *fc = dvm__class_by_desc(vm, "Ljava/lang/reflect/Field;");
+   dvm_ref field = fc ? dvm_new_object(vm, fc) : 0;
+   if (!field) return 0;
+   union dvm_value v = { .l = dvm_class_object(vm, owner) };
+   (void)dvm_set_field(vm, field, "owner", "Ljava/lang/Class;", v);
+   v.l = dvm_new_string(vm, fd->name ? fd->name : "");
+   (void)dvm_set_field(vm, field, "name", "Ljava/lang/String;", v);
+   v.l = dvm_new_string(vm, fd->type ? fd->type : "Ljava/lang/Object;");
+   (void)dvm_set_field(vm, field, "sig", "Ljava/lang/String;", v);
+   v.i = (int32_t)fd->access;
+   (void)dvm_set_field(vm, field, "access", "I", v);
+   return field;
+}
 
 static struct dvm_field *reflect_find_public_field(struct dvm_class *cls,
                                                    const char *name, unsigned depth)
@@ -117,23 +131,6 @@ static bool cl_getField(struct dvm *vm, dvm_ref self,
       return false;
    }
    RETL(reflect_field_object(vm,found->cls,found));
-}
-
-static dvm_ref reflect_field_object(struct dvm *vm, struct dvm_class *owner,
-                                    const struct dvm_field *fd)
-{
-   struct dvm_class *fc = dvm__class_by_desc(vm, "Ljava/lang/reflect/Field;");
-   dvm_ref field = fc ? dvm_new_object(vm, fc) : 0;
-   if (!field) return 0;
-   union dvm_value v = { .l = dvm_class_object(vm, owner) };
-   (void)dvm_set_field(vm, field, "owner", "Ljava/lang/Class;", v);
-   v.l = dvm_new_string(vm, fd->name ? fd->name : "");
-   (void)dvm_set_field(vm, field, "name", "Ljava/lang/String;", v);
-   v.l = dvm_new_string(vm, fd->type ? fd->type : "Ljava/lang/Object;");
-   (void)dvm_set_field(vm, field, "sig", "Ljava/lang/String;", v);
-   v.i = (int32_t)fd->access;
-   (void)dvm_set_field(vm, field, "access", "I", v);
-   return field;
 }
 
 /* Visit each declaring type once, including shared interface ancestors.
@@ -712,13 +709,37 @@ static bool ao_isAccessible(struct dvm *vm, dvm_ref self,
 }
 
 static bool rf_isSynthetic(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out);
+static bool rf_isVarArgs(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   RETI((rt_get_int(vm, self, "access") & DEX_ACC_VARARGS) != 0);
+}
+static bool rm_isBridge(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   RETI((rt_get_int(vm, self, "access") & DEX_ACC_BRIDGE) != 0);
+}
+static bool ao_setAccessibleAll(struct dvm *vm, dvm_ref self,
+                                const union dvm_value *args, int nargs,
+                                union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   if (!ARG(0).l) { dvm__throw(vm, "java/lang/NullPointerException", "array"); return false; }
+   const dvm_ref *items = dvm_array_data(vm, ARG(0).l);
+   const uint32_t n = dvm_array_length(vm, ARG(0).l);
+   union dvm_value v = { .i = ARG(1).i != 0 };
+   for (uint32_t i = 0; items && i < n; ++i)
+      if (items[i]) (void)dvm_set_field(vm, items[i], "accessible", "Z", v);
+   RETV();
+}
 static const struct rt_method rt_accessible_object[]={
    M("setAccessible","(Z)V",ao_setAccessible),
+   SM("setAccessible","([Ljava/lang/reflect/AccessibleObject;Z)V",ao_setAccessibleAll),
    M("isAccessible","()Z",ao_isAccessible),M_END
 };
 static const struct rt_method rt_executable[]={
    {"getName","()Ljava/lang/String;",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
-   M("isSynthetic","()Z",rf_isSynthetic),M_END
+   M("isSynthetic","()Z",rf_isSynthetic), M("isVarArgs","()Z",rf_isVarArgs), M_END
 };
 static const struct rt_method rt_reflect_member[]={
    {"getName","()Ljava/lang/String;",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
@@ -733,9 +754,15 @@ static bool rm_getAnnotations(struct dvm *vm, dvm_ref self,
 static bool rm_getAnnotation(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
                              union dvm_value *out);
+
 static bool rm_isAnnotationPresent(struct dvm *vm, dvm_ref self,
                                    const union dvm_value *args, int nargs,
-                                   union dvm_value *out);
+                                   union dvm_value *out)
+{
+   union dvm_value r = { 0 };
+   if (!rm_getAnnotation(vm, self, args, nargs, &r)) return false;
+   RETI(r.l != 0);
+}
 static bool rm_getParameterAnnotations(struct dvm *vm, dvm_ref self,
                                        const union dvm_value *args, int nargs,
                                        union dvm_value *out);
@@ -766,6 +793,7 @@ static const struct rt_method rt_reflect_method[] = {
    M("getGenericParameterTypes", "()[Ljava/lang/reflect/Type;", rm_generic),
    M("getGenericReturnType", "()Ljava/lang/reflect/Type;", rm_generic),
    M("isDefault", "()Z", rm_isDefault),
+   M("isBridge", "()Z", rm_isBridge),
    M_END,
 };
 
@@ -1269,6 +1297,15 @@ static bool rf_isSynthetic(struct dvm *vm, dvm_ref self,
    RETI((rt_get_int(vm, self, "access") & 0x1000) != 0);
 }
 
+/* ACC_ENUM (0x4000) is the same bit in dex and in Java reflection. */
+static bool rf_isEnumConstant(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   RETI((rt_get_int(vm, self, "access") & 0x4000) != 0);
+}
+
 /* Field.set(): the write half of rf_get().  A Field table that can only read
  * makes every configure-by-reflection path (a test double, a feature flag a
  * library flips on its own static) silently do nothing. */
@@ -1418,6 +1455,7 @@ static const struct rt_method rt_reflect_field[] = {
    M("getGenericType", "()Ljava/lang/reflect/Type;", rf_getGenericType),
    M("getModifiers", "()I", rm_getModifiers),
    M("isSynthetic", "()Z", rf_isSynthetic),
+   M("isEnumConstant", "()Z", rf_isEnumConstant),
    M("setAccessible", "(Z)V", ao_setAccessible),
    M("isAccessible", "()Z", ao_isAccessible),
    M("getAnnotations", "()[Ljava/lang/annotation/Annotation;", rf_getAnnotations),
@@ -1447,6 +1485,28 @@ static const struct rt_method rt_reflect_field[] = {
    M("setDouble", "(Ljava/lang/Object;D)V", rf_set),
    M("getAnnotation", "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
      ret_zero),
+   M_END,
+};
+
+/* RecordComponent.getAccessor: the record's no-argument method of that name. */
+static bool rc_getAccessor(struct dvm *vm, dvm_ref self,
+                           const union dvm_value *args, int nargs,
+                           union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value owner = { 0 }, name = { 0 };
+   (void)dvm_get_field(vm, self, "owner", "Ljava/lang/Class;", &owner);
+   (void)dvm_get_field(vm, self, "name", "Ljava/lang/String;", &name);
+   union dvm_value a[2] = { { .l = name.l }, { .l = 0 } };
+   return cl_getMethod(vm, owner.l, a, 2, out);
+}
+
+static const struct rt_method rt_reflect_record_component[] = {
+   M("getName", "()Ljava/lang/String;", rm_getName),
+   M("getDeclaringRecord", "()Ljava/lang/Class;", rf_getDeclaringClass),
+   M("getType", "()Ljava/lang/Class;", rf_getType),
+   M("getGenericType", "()Ljava/lang/reflect/Type;", rf_getGenericType),
+   M("getAccessor", "()Ljava/lang/reflect/Method;", rc_getAccessor),
    M_END,
 };
 
@@ -2418,6 +2478,48 @@ static bool cl_isEnum(struct dvm *vm, dvm_ref self,
    (void)args; (void)nargs;
    struct dvm_object *object = dvm__obj(vm, self);
    RETI(class_is_enum(object ? object->klass : NULL));
+}
+
+/* Class.isRecord / getRecordComponents (API 34): a record is a direct subclass
+ * of java.lang.Record and its components are its instance fields in
+ * declaration order.  The IMA ads SDK serialises its messages through them. */
+static bool cl_isRecord(struct dvm *vm, dvm_ref self,
+                        const union dvm_value *args, int nargs,
+                        union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   struct dvm_object *object = dvm__obj(vm, self);
+   const struct dvm_class *k = object ? object->klass : NULL;
+   const char *super = k && k->super ? dvm_class_name(k->super) : NULL;
+   RETI(super && !strcmp(super, "java/lang/Record"));
+}
+
+static bool cl_getRecordComponents(struct dvm *vm, dvm_ref self,
+                                   const union dvm_value *args, int nargs,
+                                   union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   struct dvm_object *co = dvm__obj(vm, self);
+   struct dvm_class *cls = co ? co->klass : NULL;
+   const char *super = cls && cls->super ? dvm_class_name(cls->super) : NULL;
+   if (!super || strcmp(super, "java/lang/Record")) RETL(0);
+   struct dvm_class *rc = dvm__class_by_desc(vm, "Ljava/lang/reflect/RecordComponent;");
+   dvm_ref arr = rc ? dvm_new_array(vm, 'L', "Ljava/lang/reflect/RecordComponent;",
+                                    (uint32_t)cls->nifields) : 0;
+   dvm_ref *items = arr ? (dvm_ref *)dvm_array_data(vm, arr) : NULL;
+   for (int i = 0; items && i < cls->nifields; ++i) {
+      const struct dvm_field *fd = &cls->ifields[i];
+      dvm_ref c = dvm_new_object(vm, rc);
+      if (!c) return false;
+      union dvm_value v = { .l = self };
+      (void)dvm_set_field(vm, c, "owner", "Ljava/lang/Class;", v);
+      v.l = dvm_new_string(vm, fd->name ? fd->name : "");
+      (void)dvm_set_field(vm, c, "name", "Ljava/lang/String;", v);
+      v.l = dvm_new_string(vm, fd->type ? fd->type : "Ljava/lang/Object;");
+      (void)dvm_set_field(vm, c, "sig", "Ljava/lang/String;", v);
+      items[i] = c;
+   }
+   RETL(arr);
 }
 
 static bool cl_getEnumConstants(struct dvm *vm, dvm_ref self,
@@ -3420,15 +3522,6 @@ static bool rm_getAnnotation(struct dvm *vm, dvm_ref self,
    RETL(refl_annotation_object(vm, d.cls->dex, off, ann->desc));
 }
 
-static bool rm_isAnnotationPresent(struct dvm *vm, dvm_ref self,
-                                   const union dvm_value *args, int nargs,
-                                   union dvm_value *out)
-{
-   union dvm_value r = { 0 };
-   if (!rm_getAnnotation(vm, self, args, nargs, &r)) return false;
-   RETI(r.l != 0);
-}
-
 /* getParameterAnnotations(): one Annotation[] per parameter.  The dex list
  * is authoritative when the method has one (its length is what ART
  * returns); otherwise every parameter has none. */
@@ -3929,6 +4022,8 @@ static const struct rt_method rt_class[] = {
    M("isAnnotation", "()Z", cl_has_flag),
    M("isSynthetic", "()Z", cl_has_flag),
    M("isEnum", "()Z", cl_isEnum),
+   M("isRecord", "()Z", cl_isRecord),
+   M("getRecordComponents", "()[Ljava/lang/reflect/RecordComponent;", cl_getRecordComponents),
    M("getEnumConstants", "()[Ljava/lang/Object;", cl_getEnumConstants),
    M("getAnnotation", "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
      cl_getAnnotation),

@@ -324,6 +324,219 @@ DIGEST_IN_FORWARD(digest_in_reset, "reset", "()V")
 DIGEST_IN_FORWARD(digest_in_mark_supported, "markSupported", "()Z")
 #undef DIGEST_IN_FORWARD
 
+/* javax.crypto.CipherInputStream: reads the wrapped stream a chunk at a time
+ * through Cipher.update() and hands the result out; at end of input the
+ * Cipher.doFinal() tail (padding removed, or a bad-padding exception) follows.
+ * HLS players decrypt AES-128 segments with it, so without it a stream opens
+ * and then yields nothing. */
+static bool cin_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                     int nargs, union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   dvm_set_field(vm, self, "in", "Ljava/io/InputStream;", args[0]);
+   dvm_set_field(vm, self, "cipher", "Ljavax/crypto/Cipher;", args[1]);
+   RETV();
+}
+
+/* Make sure there is pending plaintext, or that the source is exhausted. */
+static bool cin_fill(struct dvm *vm, dvm_ref self)
+{
+   for (;;) {
+      union dvm_value pend = {0}, ppos = {0}, done = {0};
+      dvm_get_field(vm, self, "pend", "[B", &pend);
+      dvm_get_field(vm, self, "ppos", "I", &ppos);
+      dvm_get_field(vm, self, "done", "Z", &done);
+      if (pend.l && (uint32_t)ppos.i < dvm_array_length(vm, pend.l)) return true;
+      if (done.i) return true;
+      union dvm_value source = {0}, cipher = {0}, next = {0};
+      dvm_get_field(vm, self, "in", "Ljava/io/InputStream;", &source);
+      dvm_get_field(vm, self, "cipher", "Ljavax/crypto/Cipher;", &cipher);
+      if (!source.l || !cipher.l) {
+         dvm__throw(vm, "java/lang/NullPointerException", "cipher stream");
+         return false;
+      }
+      dvm_ref chunk = dvm_new_array(vm, 'B', "B", 4096);
+      if (!chunk) return false;
+      dvm_pin(vm, chunk);
+      union dvm_value arg = { .l = chunk }, got = {0};
+      bool ok = stream_forward(vm, source.l, "read", "([B)I", &arg, 1, &got) && !vm->exception;
+      if (ok && got.i == 0) { dvm_unpin(vm, chunk); continue; }
+      if (ok && got.i > 0) {
+         union dvm_value up[3] = { { .l = chunk }, { .i = 0 }, { .i = got.i } };
+         ok = stream_forward(vm, cipher.l, "update", "([BII)[B", up, 3, &next) && !vm->exception;
+      } else if (ok) {
+         ok = stream_forward(vm, cipher.l, "doFinal", "()[B", NULL, 0, &next) && !vm->exception;
+         dvm_set_field(vm, self, "done", "Z", (union dvm_value){ .i = 1 });
+      }
+      dvm_unpin(vm, chunk);
+      if (!ok) return false;
+      dvm_set_field(vm, self, "pend", "[B", next);
+      dvm_set_field(vm, self, "ppos", "I", (union dvm_value){ .i = 0 });
+   }
+}
+
+static bool cin_read(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                     int nargs, union dvm_value *out)
+{
+   if (!cin_fill(vm, self)) return false;
+   union dvm_value pend = {0}, ppos = {0};
+   dvm_get_field(vm, self, "pend", "[B", &pend);
+   dvm_get_field(vm, self, "ppos", "I", &ppos);
+   const uint32_t have = pend.l ? dvm_array_length(vm, pend.l) : 0;
+   const uint32_t left = have > (uint32_t)ppos.i ? have - (uint32_t)ppos.i : 0;
+   const uint8_t *src = left ? (const uint8_t *)dvm_array_data(vm, pend.l) + ppos.i : NULL;
+   if (nargs == 0) {                       /* read() */
+      if (!left) RETI(-1);
+      dvm_set_field(vm, self, "ppos", "I", (union dvm_value){ .i = ppos.i + 1 });
+      RETI(src[0]);
+   }
+   int32_t off = nargs >= 3 ? args[1].i : 0;
+   int32_t len = nargs >= 3 ? args[2].i : -1;
+   if (!args[0].l) { dvm__throw(vm, "java/lang/NullPointerException", "buffer"); return false; }
+   const uint32_t size = dvm_array_length(vm, args[0].l);
+   if (len < 0) len = (int32_t)size;
+   if (off < 0 || (uint32_t)off > size || (uint32_t)len > size - (uint32_t)off) {
+      dvm__throw(vm, "java/lang/IndexOutOfBoundsException", "off=%d len=%d", off, len);
+      return false;
+   }
+   if (!len) RETI(0);
+   if (!left) RETI(-1);
+   const uint32_t n = left < (uint32_t)len ? left : (uint32_t)len;
+   memcpy((uint8_t *)dvm_array_data(vm, args[0].l) + off, src, n);
+   dvm_set_field(vm, self, "ppos", "I", (union dvm_value){ .i = ppos.i + (int32_t)n });
+   RETI((int32_t)n);
+}
+
+static bool cin_available(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                          int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value pend = {0}, ppos = {0};
+   dvm_get_field(vm, self, "pend", "[B", &pend);
+   dvm_get_field(vm, self, "ppos", "I", &ppos);
+   const uint32_t have = pend.l ? dvm_array_length(vm, pend.l) : 0;
+   RETI(have > (uint32_t)ppos.i ? (int32_t)(have - (uint32_t)ppos.i) : 0);
+}
+
+static bool cin_close(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                      int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs; (void)out;
+   union dvm_value source = {0};
+   dvm_get_field(vm, self, "in", "Ljava/io/InputStream;", &source);
+   dvm_set_field(vm, self, "done", "Z", (union dvm_value){ .i = 1 });
+   dvm_set_field(vm, self, "pend", "[B", (union dvm_value){ .l = 0 });
+   if (source.l) return stream_forward(vm, source.l, "close", "()V", NULL, 0, NULL);
+   RETV();
+}
+
+static bool cin_false(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                      int nargs, union dvm_value *out)
+{
+   (void)vm; (void)self; (void)args; (void)nargs;
+   RETI(0);
+}
+
+static const struct rt_field rt_cipher_in_fields[] = {
+   {"cipher", "Ljavax/crypto/Cipher;"}, {"pend", "[B"}, {"ppos", "I"}, {"done", "Z"}, F_END
+};
+static const struct rt_method rt_cipher_in[] = {
+   M("<init>", "(Ljava/io/InputStream;Ljavax/crypto/Cipher;)V", cin_init),
+   M("read", "()I", cin_read),
+   M("read", "([B)I", cin_read),
+   M("read", "([BII)I", cin_read),
+   M("available", "()I", cin_available),
+   M("close", "()V", cin_close),
+   M("markSupported", "()Z", cin_false),
+   M_END
+};
+
+/* javax.crypto.CipherOutputStream: bytes go through Cipher.update() on their
+ * way to the wrapped stream; close() writes the Cipher.doFinal() tail. */
+static bool cout_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                      int nargs, union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   dvm_set_field(vm, self, "cout", "Ljava/io/OutputStream;", args[0]);
+   dvm_set_field(vm, self, "cipher", "Ljavax/crypto/Cipher;", args[1]);
+   RETV();
+}
+
+static bool cout_emit(struct dvm *vm, dvm_ref self, dvm_ref bytes)
+{
+   if (!bytes) return true;
+   union dvm_value sink = {0}, arg = { .l = bytes };
+   dvm_get_field(vm, self, "cout", "Ljava/io/OutputStream;", &sink);
+   return sink.l && stream_forward(vm, sink.l, "write", "([B)V", &arg, 1, NULL) && !vm->exception;
+}
+
+static bool cout_write(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                       int nargs, union dvm_value *out)
+{
+   (void)out;
+   union dvm_value cipher = {0}, produced = {0};
+   dvm_get_field(vm, self, "cipher", "Ljavax/crypto/Cipher;", &cipher);
+   if (!cipher.l) { dvm__throw(vm, "java/lang/NullPointerException", "cipher"); return false; }
+   dvm_ref one = 0;
+   union dvm_value up[3];
+   const char *sig = nargs == 3 ? "([BII)[B" : "([B)[B";
+   if (nargs == 1 && !strcmp(builtin_sig(), "(I)V")) {
+      one = dvm_new_array(vm, 'B', "B", 1);
+      if (!one) return false;
+      ((uint8_t *)dvm_array_data(vm, one))[0] = (uint8_t)args[0].i;
+      up[0].l = one; sig = "([B)[B";
+   } else {
+      up[0] = args[0];
+      if (nargs == 3) { up[1] = args[1]; up[2] = args[2]; }
+   }
+   if (!stream_forward(vm, cipher.l, "update", sig, up, nargs == 3 ? 3 : 1, &produced) ||
+       vm->exception) return false;
+   if (!cout_emit(vm, self, produced.l)) return false;
+   RETV();
+}
+
+static bool cout_flush(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                       int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs; (void)out;
+   union dvm_value sink = {0};
+   dvm_get_field(vm, self, "cout", "Ljava/io/OutputStream;", &sink);
+   if (sink.l) return stream_forward(vm, sink.l, "flush", "()V", NULL, 0, NULL);
+   RETV();
+}
+
+static bool cout_close(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                       int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs; (void)out;
+   union dvm_value cipher = {0}, tail = {0}, sink = {0}, done = {0};
+   dvm_get_field(vm, self, "done", "Z", &done);
+   if (done.i) RETV();
+   dvm_set_field(vm, self, "done", "Z", (union dvm_value){ .i = 1 });
+   dvm_get_field(vm, self, "cipher", "Ljavax/crypto/Cipher;", &cipher);
+   if (cipher.l && (!stream_forward(vm, cipher.l, "doFinal", "()[B", NULL, 0, &tail) ||
+                    vm->exception || !cout_emit(vm, self, tail.l))) return false;
+   dvm_get_field(vm, self, "cout", "Ljava/io/OutputStream;", &sink);
+   if (sink.l) {
+      if (!stream_forward(vm, sink.l, "flush", "()V", NULL, 0, NULL)) return false;
+      return stream_forward(vm, sink.l, "close", "()V", NULL, 0, NULL);
+   }
+   RETV();
+}
+
+static const struct rt_field rt_cipher_out_fields[] = {
+   {"cout", "Ljava/io/OutputStream;"}, {"cipher", "Ljavax/crypto/Cipher;"}, {"done", "Z"}, F_END
+};
+static const struct rt_method rt_cipher_out[] = {
+   M("<init>", "(Ljava/io/OutputStream;Ljavax/crypto/Cipher;)V", cout_init),
+   M("write", "(I)V", cout_write),
+   M("write", "([B)V", cout_write),
+   M("write", "([BII)V", cout_write),
+   M("flush", "()V", cout_flush),
+   M("close", "()V", cout_close),
+   M_END
+};
+
 static const struct rt_field rt_digest_in_fields[] = {
    {"digest", "Ljava/security/MessageDigest;"}, {"on", "Z"}, F_END
 };
@@ -1829,6 +2042,17 @@ static int sig_finish(struct dvm *vm, dvm_ref self, bool verify,
    dvm_gil_relock(vm, depth);
    char why[160] = "";
    if (result == -2) ERR_error_string_n(ERR_peek_last_error(), why, sizeof why);
+   if (getenv("LUNARIA_TRACE_SIG")) {
+      uint8_t h[32] = { 0 };
+      unsigned hl = 0;
+      if (db) (void)EVP_Digest(db, dlen, h, &hl, EVP_sha256(), NULL);
+      fprintf(stderr, "[sig] %s %s key=%u data=%u sig=%u result=%d data-sha256=%02x%02x%02x%02x%02x%02x%02x%02x sig-head=%02x%02x%02x%02x err=%s\n",
+              verify ? "verify" : "sign", av.l ? dvm_string_utf8(vm, av.l) : "?", klen, dlen, sig_in_len,
+              result, h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
+              sig_in && sig_in_len >= 4 ? sig_in[0] : 0, sig_in && sig_in_len >= 4 ? sig_in[1] : 0,
+              sig_in && sig_in_len >= 4 ? sig_in[2] : 0, sig_in && sig_in_len >= 4 ? sig_in[3] : 0,
+              ERR_error_string(ERR_peek_last_error(), NULL));
+   }
    ERR_clear_error();
    if (result == -2) {
       if (sig_out) { free(*sig_out); *sig_out = NULL; }

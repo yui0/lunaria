@@ -246,7 +246,56 @@ static bool x_scrollview_range(struct dvm *vm, dvm_ref self, const union dvm_val
    RETI(content > own ? content : own);
 }
 
+/* ViewGroup.onInterceptTouchEvent / View.onTouchEvent of ScrollView and
+ * HorizontalScrollView.  A press that travels past the touch slop along the
+ * view's axis becomes this view's drag: the child that had the press gets a
+ * cancel (view_dispatch_touch does that when this returns true) and every
+ * following sample scrolls the content by how far the finger moved. */
+static bool x_scroll_touch(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                           int nargs, union dvm_value *out)
+{
+   luna_touch_event sample;
+   if (!nargs || !dvm_motion_event_read(vm, ARG(0).l, &sample)) RETI(0);
+   const bool intercept = !strcmp(builtin_name(), "onInterceptTouchEvent");
+   const bool vertical = !ui_is_a(vm, self, "android/widget/HorizontalScrollView");
+   const int action = sample.action & 255;
+   const float pos = vertical ? sample.y : sample.x;
+   union dvm_value dragging = { 0 };
+   (void)dvm_get_field(vm, self, "scrollDragging", "Z", &dragging);
+   if (action == 0) {
+      (void)dvm_set_field(vm, self, "scrollDownX", "F", (union dvm_value){ .f = sample.x });
+      (void)dvm_set_field(vm, self, "scrollDownY", "F", (union dvm_value){ .f = sample.y });
+      (void)dvm_set_field(vm, self, "scrollLastX", "F", (union dvm_value){ .f = sample.x });
+      (void)dvm_set_field(vm, self, "scrollLastY", "F", (union dvm_value){ .f = sample.y });
+      (void)dvm_set_field(vm, self, "scrollDragging", "Z", (union dvm_value){ .i = 0 });
+      RETI(!intercept && ui_scroll_max(vm, self, vertical) > 0);
+   }
+   if (action == 1 || action == 3) {
+      (void)dvm_set_field(vm, self, "scrollDragging", "Z", (union dvm_value){ .i = 0 });
+      RETI(!intercept && dragging.i);
+   }
+   if (action != 2) RETI(0);
+   union dvm_value down = { 0 }, last = { 0 };
+   (void)dvm_get_field(vm, self, vertical ? "scrollDownY" : "scrollDownX", "F", &down);
+   (void)dvm_get_field(vm, self, vertical ? "scrollLastY" : "scrollLastX", "F", &last);
+   if (intercept) {
+      if (dragging.i) RETI(1);
+      if (ui_scroll_max(vm, self, vertical) <= 0) RETI(0);
+      if (fabsf(pos - down.f) <= 8.0f * rt_density()) RETI(0);
+      (void)dvm_set_field(vm, self, "scrollDragging", "Z", (union dvm_value){ .i = 1 });
+      (void)dvm_set_field(vm, self, vertical ? "scrollLastY" : "scrollLastX", "F", (union dvm_value){ .f = pos });
+      RETI(1);
+   }
+   /* The finger moved (last - pos) pixels the other way: the content follows it. */
+   (void)ui_scroll_by(vm, self, vertical, (int32_t)lroundf(last.f - pos));
+   (void)dvm_set_field(vm, self, vertical ? "scrollLastY" : "scrollLastX", "F", (union dvm_value){ .f = pos });
+   (void)dvm_set_field(vm, self, "scrollDragging", "Z", (union dvm_value){ .i = 1 });
+   RETI(1);
+}
+
 static const struct rt_method rt_x_scroll_view[] = {
+   M("onInterceptTouchEvent", "(Landroid/view/MotionEvent;)Z", x_scroll_touch),
+   M("onTouchEvent", "(Landroid/view/MotionEvent;)Z", x_scroll_touch),
    M("computeVerticalScrollRange", "()I", x_scrollview_range),
    M("computeHorizontalScrollRange", "()I", x_scrollview_range),
    M_END,

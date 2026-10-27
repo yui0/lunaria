@@ -17,6 +17,7 @@ void stbi_image_free(void *p);
 void stbi_set_flip_vertically_on_load_thread(int flag);
 int stbi_write_png(const char *path, int w, int h, int comp, const void *data,
                    int stride);
+extern int stbi_write_png_compression_level, stbi_write_force_png_filter;
 unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, int stride,
                                      int x, int y, int n, int *out_len);
 
@@ -146,7 +147,15 @@ static const char *bitmap_png_path(struct dvm *vm, dvm_ref b)
    }
    char temporary[DVM_PATH_MAX+8];
    snprintf(temporary,sizeof temporary,"%s.tmp",bm->png);
+   /* A scratch file the overlay reads straight back, rewritten whenever the app
+    * redraws the bitmap: speed over size (stb's default tries all five row
+    * filters and a deep match search, most of a frame's cost for a big bitmap). */
+   const int level = stbi_write_png_compression_level, filter = stbi_write_force_png_filter;
+   stbi_write_png_compression_level = 1;
+   stbi_write_force_png_filter = 1;
    const int ok = stbi_write_png(temporary, bm->w, bm->h, 4, rgba, bm->w * 4);
+   stbi_write_png_compression_level = level;
+   stbi_write_force_png_filter = filter;
    free(rgba);
    if (!ok || luna_file_rename(temporary,bm->png)) {
       (void)luna_file_unlink(temporary); return NULL;
@@ -1972,6 +1981,10 @@ static bool canvas_path_color(struct dvm *vm,dvm_ref self,const luna_path *path,
          limits[3]=(int)fminf(limits[3],fmaxf(0,ceilf(box[3])));
       }
    }
+   static int cprof=-1;static unsigned long long cn,cpx,cns,cmask;static struct timespec clast;
+   struct timespec c0;if(cprof<0) cprof=getenv("LUNARIA_TRACE_CANVAS")!=NULL;
+   if(cprof) clock_gettime(CLOCK_MONOTONIC,&c0);
+   if(limits[2]<=limits[0] || limits[3]<=limits[1]) RETV();
    bool mask_cached=false;
    unsigned char *mask=canvas_mask_cached(path,width,height,local,style,
       hairline ? 1 : stroke*scale,cap,join,miter,aa,&mask_cached);
@@ -1980,18 +1993,40 @@ static bool canvas_path_color(struct dvm *vm,dvm_ref self,const luna_path *path,
    canvas_prepare_clip(state);
    const bool simple_clip=state->clip_simple;
    const float *cb=state->clip_bounds;
-   for(int y=limits[1];y<limits[3];++y) for(int x=limits[0];x<limits[2];++x) {
-      if(simple_clip ? !(x+.5f>=cb[0] && y+.5f>=cb[1] && x+.5f<cb[2] && y+.5f<cb[3]) :
-         !canvas_clip_contains(state,x+.5f,y+.5f)) continue;
-      float u=x+.5f,v=y+.5f;
-      if(!device_coverage) {float px,py;mat_map(inverse,u,v,&px,&py);u=px*scale-bounds[0];v=py*scale-bounds[1];}
-      if(!isfinite(u) || !isfinite(v) || u<0 || v<0 || u>=width || v>=height) continue;
-      unsigned coverage=mask[4*((size_t)(int)v*width+(int)u)+3];if(!coverage) continue;
-      float lx,ly;mat_map(inverse,x+.5f,y+.5f,&lx,&ly);
-      uint32_t sample=canvas_shader_sample(&shader,lx,ly,color);
-      size_t index=(size_t)y*dst->w+x;dst->px[index]=canvas_blend(sample,dst->px[index],mode,coverage,!dst->has_alpha);
+   const bool solid=!shader.gradient && !shader.bitmap;
+   const bool opaque_dst=!dst->has_alpha;
+   const unsigned solid_alpha=color>>24;
+   for(int y=limits[1];y<limits[3];++y) {
+      if(simple_clip && !(y+.5f>=cb[1] && y+.5f<cb[3])) continue;
+      for(int x=limits[0];x<limits[2];++x) {
+         if(simple_clip ? !(x+.5f>=cb[0] && x+.5f<cb[2]) : !canvas_clip_contains(state,x+.5f,y+.5f)) continue;
+         float lx,ly;mat_map(inverse,x+.5f,y+.5f,&lx,&ly);
+         float u=x+.5f,v=y+.5f;
+         if(!device_coverage) {u=lx*scale-bounds[0];v=ly*scale-bounds[1];}
+         if(!isfinite(u) || !isfinite(v) || u<0 || v<0 || u>=width || v>=height) continue;
+         unsigned coverage=mask[4*((size_t)(int)v*width+(int)u)+3];if(!coverage) continue;
+         size_t index=(size_t)y*dst->w+x;
+         if(solid && coverage==255 && solid_alpha==255) {
+            /* An opaque, fully covered pixel: SRC_OVER replaces it, and
+             * DST_IN (a rounded-corner mask) leaves it as it is. */
+            if(mode==3) {dst->px[index]=color;continue;}
+            if(mode==6 && !opaque_dst) continue;
+         }
+         uint32_t sample=solid ? color : canvas_shader_sample(&shader,lx,ly,color);
+         dst->px[index]=canvas_blend(sample,dst->px[index],mode,coverage,opaque_dst);
+      }
    }
    if(!mask_cached) free(mask);
+   if(cprof) {
+      struct timespec c1;clock_gettime(CLOCK_MONOTONIC,&c1);
+      cns+=(c1.tv_sec-c0.tv_sec)*1000000000ull+(c1.tv_nsec-c0.tv_nsec);++cn;
+      cpx+=(unsigned long long)(limits[2]-limits[0])*(limits[3]-limits[1]);cmask+=(unsigned long long)width*height;
+      if(c1.tv_sec!=clast.tv_sec) {
+         fprintf(stderr,"[canvas] %llu paths, %.1f ms, scan %llu px, mask %llu px; last style=%d dev=%d %dx%d clip=%dx%d\n",
+                 cn,cns/1e6,cpx,cmask,style,device_coverage,width,height,limits[2]-limits[0],limits[3]-limits[1]);
+         clast=c1;cn=cpx=cns=cmask=0;
+      }
+   }
    ++dst->gen;RETV();
 }
 static bool canvas_path_paint(struct dvm *vm,dvm_ref self,const luna_path *path,dvm_ref paint,union dvm_value *out)
@@ -3103,6 +3138,8 @@ static const struct rt_method rt_recording_canvas[] = {
 static bool x_clip_to_outline(struct dvm *vm,dvm_ref canvas,dvm_ref outline);
 static bool x_view_clip_to_outline(struct dvm *vm,dvm_ref view,dvm_ref canvas);
 static const struct rt_field rt_render_node_fields[]={
+   {"outline","Landroid/graphics/Outline;"},{"clipToOutline","Z"},
+   {"hasOverlappingRendering","Z"},{"usesCompositingLayer","Z"},
    {"recording","Landroid/graphics/RecordingCanvas;"},
    {"displayList","Landroid/graphics/RecordingCanvas;"},
    {"left","I"},{"top","I"},{"right","I"},{"bottom","I"},
@@ -3878,12 +3915,37 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
    if (!custom || !node || node->w<=0 || node->h<=0 || ui_int(vm,view,"visibility")) return NULL;
    dvm_ref bitmap=ui_obj(vm,view,"drawingBitmap","Landroid/graphics/Bitmap;");
    struct rt_bitmap *bm=bitmap_of(vm,bitmap);
+   /* The pixels already in the bitmap stand for everything this rebuild's
+    * damage does not touch, but only if they were left by the rebuild just
+    * before it — a view that sat out a rebuild (hidden, detached) missed that
+    * rebuild's damage. */
+   bool partial=bm && bm->w==node->w && bm->h==node->h && !g_ui_frame_damage.full &&
+      (uint32_t)ui_int(vm,view,"drawingSeq")+1==g_ui_build_seq && bm->overlay_key[0] && bm->overlay_gen==bm->gen;
+   int32_t area[4]={0,0,node->w,node->h};
+   if (partial) {
+      float ox,oy;
+      if (!ui_view_to_root(vm,view,&ox,&oy)) partial=false;
+      else if (!g_ui_frame_damage.any) {
+         (void)dvm_set_field(vm,view,"drawingSeq","I",(union dvm_value){.i=(int32_t)g_ui_build_seq});
+         return bm->overlay_key;
+      } else {
+         area[0]=(int32_t)fmaxf(0,floorf((float)g_ui_frame_damage.l-ox));
+         area[1]=(int32_t)fmaxf(0,floorf((float)g_ui_frame_damage.t-oy));
+         area[2]=(int32_t)fminf((float)node->w,ceilf((float)g_ui_frame_damage.r-ox));
+         area[3]=(int32_t)fminf((float)node->h,ceilf((float)g_ui_frame_damage.b-oy));
+         if (area[2]<=area[0] || area[3]<=area[1]) {
+            (void)dvm_set_field(vm,view,"drawingSeq","I",(union dvm_value){.i=(int32_t)g_ui_build_seq});
+            return bm->overlay_key;             /* the damage is elsewhere */
+         }
+      }
+   }
    if (!bm || bm->w!=node->w || bm->h!=node->h) {
       bitmap=bitmap_new(vm,node->w,node->h);
       if (!bitmap) return NULL;
       bm=bitmap_of(vm,bitmap);
       bm->is_mutable=true;
       (void)dvm_set_field(vm,view,"drawingBitmap","Landroid/graphics/Bitmap;",(union dvm_value){.l=bitmap});
+      partial=false;
    }
    dvm_ref canvas=ui_obj(vm,view,"drawingCanvas","Landroid/graphics/Canvas;");
    if (!canvas) {
@@ -3891,11 +3953,22 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
       if (!canvas) return NULL;
       (void)dvm_set_field(vm,view,"drawingCanvas","Landroid/graphics/Canvas;",(union dvm_value){.l=canvas});
    }
-   memset(bm->px,0,(size_t)bm->w*bm->h*sizeof *bm->px); ++bm->gen;
+   /* Until this draw completes the bitmap is not a picture of anything. */
+   (void)dvm_set_field(vm,view,"drawingSeq","I",(union dvm_value){.i=0});
+   if (partial) {
+      for(int32_t y=area[1];y<area[3];++y)
+         memset(bm->px+(size_t)y*bm->w+area[0],0,(size_t)(area[2]-area[0])*sizeof *bm->px);
+   } else memset(bm->px,0,(size_t)bm->w*bm->h*sizeof *bm->px);
+   ++bm->gen;
    uint64_t draw_started=ui_render_ns();
    union dvm_value target={.l=bitmap},argument={.l=canvas},ignored={0};
-   if (!canvas_set_bitmap(vm,canvas,&target,1,&ignored) ||
-       !am_vcall(vm,view,"draw","(Landroid/graphics/Canvas;)V",&argument,1,&ignored)) return NULL;
+   if (!canvas_set_bitmap(vm,canvas,&target,1,&ignored)) return NULL;
+   if (partial) {
+      union dvm_value clip[4]={{.i=area[0]},{.i=area[1]},{.i=area[2]},{.i=area[3]}};
+      if (!am_vcall(vm,canvas,"clipRect","(IIII)Z",clip,4,&ignored)) return NULL;
+   }
+   if (!am_vcall(vm,view,"draw","(Landroid/graphics/Canvas;)V",&argument,1,&ignored)) return NULL;
+   (void)dvm_set_field(vm,view,"drawingSeq","I",(union dvm_value){.i=(int32_t)g_ui_build_seq});
    uint64_t publish_started=ui_render_ns();
    if(!bm->overlay_key[0]) {
       static uint64_t sequence;
@@ -4321,9 +4394,27 @@ static const struct rt_field rt_bitmap_format_sfields[] = {
    F_END
 };
 
-/* --- BitmapDrawable ------------------------------------------------------ */
-
-static bool bd_get_paint(struct dvm *,dvm_ref,const union dvm_value *,int,union dvm_value *);
+/*
+ * Copyright © 2026 Yuichiro Nakada / Project Lunaria
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+/* Private C BitmapDrawable placement and software Canvas bridge. */
+static bool bd_get_paint(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                         int nargs,union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   dvm_ref paint=ui_obj(vm,self,"paint","Landroid/graphics/Paint;");
+   if (!paint) {
+      paint=dvm_new_object(vm,dvm_find_class(vm,"android/graphics/Paint"));
+      if (!paint) return false;
+      (void)dvm_set_field(vm,self,"paint","Landroid/graphics/Paint;",(union dvm_value){.l=paint});
+      union dvm_value flags={.i=6},ignored={0};
+      if (!paint_init(vm,paint,&flags,1,&ignored)) return false;
+   }
+   RETL(paint);
+}
 static int32_t bd_scaled_dimension(int32_t size,int32_t source,int32_t target)
 {
    if (!source || !target || source==target) return size;
@@ -4385,28 +4476,6 @@ static bool bd_intrinsic(struct dvm *vm, dvm_ref self,
 {
    (void)args; (void)nargs;
    RETI(ui_int(vm,self,strstr(builtin_name(),"Width") ? "bitmapWidth" : "bitmapHeight"));
-}
-
-/*
- * Copyright © 2026 Yuichiro Nakada / Project Lunaria
- * This Source Code Form is subject to the terms of the Mozilla Public
- * License, v. 2.0. If a copy of the MPL was not distributed with this
- * file, You can obtain one at https://mozilla.org/MPL/2.0/.
- */
-/* Private C BitmapDrawable placement and software Canvas bridge. */
-static bool bd_get_paint(struct dvm *vm,dvm_ref self,const union dvm_value *args,
-                         int nargs,union dvm_value *out)
-{
-   (void)args; (void)nargs;
-   dvm_ref paint=ui_obj(vm,self,"paint","Landroid/graphics/Paint;");
-   if (!paint) {
-      paint=dvm_new_object(vm,dvm_find_class(vm,"android/graphics/Paint"));
-      if (!paint) return false;
-      (void)dvm_set_field(vm,self,"paint","Landroid/graphics/Paint;",(union dvm_value){.l=paint});
-      union dvm_value flags={.i=6},ignored={0};
-      if (!paint_init(vm,paint,&flags,1,&ignored)) return false;
-   }
-   RETL(paint);
 }
 static bool bd_color_filter(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
@@ -4780,12 +4849,22 @@ static bool image_set_bitmap(struct dvm *vm, dvm_ref self,
    return image_set_drawable(vm,self,&v,1,out);
 }
 
-/* --- GradientDrawable ---------------------------------------------------- */
-
-/* A shape: RECTANGLE 0, OVAL 1, LINE 2, RING 3; a solid colour or a list of
- * gradient colours; corner radius; stroke.  The view layer renders these as
- * the box's background, radius and border. */
-static bool gd_setColors(struct dvm *,dvm_ref,const union dvm_value *,int,union dvm_value *);
+static bool gd_setColors(struct dvm *vm, dvm_ref self,
+                         const union dvm_value *args, int nargs,
+                         union dvm_value *out)
+{
+   dvm_ref colors=0;
+   if (ARG(0).l) {
+      uint32_t n=dvm_array_length(vm,ARG(0).l);
+      colors=dvm_new_array(vm,'I',"I",n);
+      if (!colors) return false;
+      if (n) memcpy(dvm_array_data(vm,colors),dvm_array_data(vm,ARG(0).l),(size_t)n*sizeof(int32_t));
+   }
+   (void)dvm_set_field(vm,self,"colors","[I",(union dvm_value){.l=colors});
+   (void)dvm_set_field(vm,self,"positions","[F",(union dvm_value){.l=nargs>1 ? ARG(1).l : 0});
+   ui_invalidate();
+   RETV();
+}
 
 static bool gd_init(struct dvm *vm, dvm_ref self,
                     const union dvm_value *args, int nargs,
@@ -4851,23 +4930,6 @@ static bool gd_setStroke(struct dvm *vm, dvm_ref self,
    rt_set_int(vm, self, "strokeColor", ARG(1).i);
    (void)dvm_set_field(vm,self,"dashWidth","F",(union dvm_value){.f=nargs>=4 ? ARG(2).f : 0});
    (void)dvm_set_field(vm,self,"dashGap","F",(union dvm_value){.f=nargs>=4 ? ARG(3).f : 0});
-   ui_invalidate();
-   RETV();
-}
-
-static bool gd_setColors(struct dvm *vm, dvm_ref self,
-                         const union dvm_value *args, int nargs,
-                         union dvm_value *out)
-{
-   dvm_ref colors=0;
-   if (ARG(0).l) {
-      uint32_t n=dvm_array_length(vm,ARG(0).l);
-      colors=dvm_new_array(vm,'I',"I",n);
-      if (!colors) return false;
-      if (n) memcpy(dvm_array_data(vm,colors),dvm_array_data(vm,ARG(0).l),(size_t)n*sizeof(int32_t));
-   }
-   (void)dvm_set_field(vm,self,"colors","[I",(union dvm_value){.l=colors});
-   (void)dvm_set_field(vm,self,"positions","[F",(union dvm_value){.l=nargs>1 ? ARG(1).l : 0});
    ui_invalidate();
    RETV();
 }
@@ -5088,28 +5150,38 @@ static bool gd_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
     * rectangle. If a whole device pixel maps inside either strip, all 16
     * coverage samples have the same solid color; evaluate/blend it once.
     * Perspective and boundary pixels retain the exact sampling path below. */
-   const bool solid_interior=shape==0 && !colors && stroke<=0 &&
+   const bool solid_interior=shape==0 &&
       inverse[6]==0 && inverse[7]==0 && inverse[8]!=0;
+   /* A stroke straddles the box edge by half its width either way: stay that
+    * far inside it.  A gradient is linear, so the mean of the 16 samples is
+    * the value at the pixel centre (the stops are sampled there below). */
+   const float margin=stroke>0 ? half+1.f : 0.f;
    float half_x=0,half_y=0;
    if(solid_interior) {
       half_x=(fabsf(inverse[0])+fabsf(inverse[1]))/(2*fabsf(inverse[8]));
       half_y=(fabsf(inverse[3])+fabsf(inverse[4]))/(2*fabsf(inverse[8]));
    }
-   const float inner_left=box[0]+fmaxf(radii[0],radii[6]);
-   const float inner_right=box[2]-fmaxf(radii[2],radii[4]);
-   const float inner_top=box[1]+fmaxf(radii[1],radii[3]);
-   const float inner_bottom=box[3]-fmaxf(radii[5],radii[7]);
+   const float inner_left=box[0]+margin+fmaxf(radii[0],radii[6]);
+   const float inner_right=box[2]-margin-fmaxf(radii[2],radii[4]);
+   const float inner_top=box[1]+margin+fmaxf(radii[1],radii[3]);
+   const float inner_bottom=box[3]-margin-fmaxf(radii[5],radii[7]);
    const uint32_t paint_solid=color_filter_pixel(&filter_state,gd_alpha(solid,alpha));
    for (int y=top;y<bottom;++y) for (int x=left;x<right;++x) {
       if (!canvas_clip_contains(clip,x+0.5f,y+0.5f)) continue;
       if(solid_interior) {
          float lx,ly;mat_map(inverse,x+.5f,y+.5f,&lx,&ly);
-         if(lx-half_x>=box[0] && lx+half_x<=box[2] &&
-            ly-half_y>=box[1] && ly+half_y<=box[3] &&
+         if(lx-half_x>=box[0]+margin && lx+half_x<=box[2]-margin &&
+            ly-half_y>=box[1]+margin && ly+half_y<=box[3]-margin &&
             ((lx-half_x>=inner_left && lx+half_x<=inner_right) ||
              (ly-half_y>=inner_top && ly+half_y<=inner_bottom))) {
             size_t pixel=(size_t)y*dst->w+x;
-            dst->px[pixel]=canvas_src_over(paint_solid,dst->px[pixel],!dst->has_alpha);
+            uint32_t paint=paint_solid;
+            if(colors) {
+               float pos=((lx-x0)*dx+(ly-y0)*dy)/(dx*dx+dy*dy);
+               paint=gd_sample(colors,count,positions,pos,solid);
+               paint=color_filter_pixel(&filter_state,gd_alpha(paint,alpha));
+            }
+            dst->px[pixel]=canvas_src_over(paint,dst->px[pixel],!dst->has_alpha);
             continue;
          }
       }

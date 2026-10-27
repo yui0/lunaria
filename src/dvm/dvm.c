@@ -436,36 +436,8 @@ struct dvm_intern {
     * crashed the host in strcmp(). */
    const char *key;
    dvm_ref ref;
+   uint32_t hash;
 };
-
-dvm_ref dvm__intern(struct dvm *vm, const char *utf8)
-{
-   for (int i = 0; i < vm->ninterns; ++i)
-      if (!strcmp(vm->interns[i].key, utf8))
-         return vm->interns[i].ref;
-
-   dvm_ref r = dvm_new_string(vm, utf8);
-   if (!r) return 0;
-   dvm_pin(vm, r);
-
-   if (vm->ninterns == vm->interns_cap) {
-      int cap = vm->interns_cap ? vm->interns_cap * 2 : 64;
-      struct dvm_intern *n = realloc(vm->interns, (size_t)cap * sizeof *n);
-      if (!n) return r;
-      vm->interns = n;
-      vm->interns_cap = cap;
-   }
-   /* r was pinned above, so its backing object and utf8 allocation live until
-    * dvm_destroy().  Use that storage as the table key: Java intern strings
-    * are immutable, and one allocation per value is both sufficient and the
-    * only failure-atomic representation. */
-   const char *key = dvm_string_utf8(vm, r);
-   if (!key) return r; /* defensive: never publish a NULL comparison key */
-   vm->interns[vm->ninterns].key = key;
-   vm->interns[vm->ninterns].ref = r;
-   ++vm->ninterns;
-   return r;
-}
 
 /* ------------------------------------------------------------------------ *
  * Class registry
@@ -476,6 +448,54 @@ static uint32_t str_hash(const char *s)
    uint32_t h = 2166136261u;
    for (; *s; ++s) h = (h ^ (uint8_t)*s) * 16777619u;
    return h;
+}
+
+dvm_ref dvm__intern(struct dvm *vm, const char *utf8)
+{
+   const uint32_t hash = str_hash(utf8);
+   if (vm->interns_cap) {
+      unsigned slot = hash & (unsigned)(vm->interns_cap - 1);
+      while (vm->interns[slot].ref) {
+         const struct dvm_intern *entry = vm->interns + slot;
+         if (entry->hash == hash && !strcmp(entry->key, utf8)) return entry->ref;
+         slot = (slot + 1u) & (unsigned)(vm->interns_cap - 1);
+      }
+   }
+
+   dvm_ref r = dvm_new_string(vm, utf8);
+   if (!r) return 0;
+   dvm_pin(vm, r);
+
+   /* Literals remain pinned for the VM's lifetime, so the pool has no deletes.
+    * A half-full open-addressed table avoids a scan of every literal on each
+    * const-string and String.intern call, without another allocation per key. */
+   if (vm->ninterns >= vm->interns_cap / 2) {
+      if (vm->interns_cap > INT32_MAX / 2) return r;
+      int cap = vm->interns_cap ? vm->interns_cap * 2 : 64;
+      struct dvm_intern *n = calloc((size_t)cap, sizeof *n);
+      if (!n) return r;
+      for (int i = 0; i < vm->interns_cap; ++i) {
+         if (!vm->interns[i].ref) continue;
+         unsigned slot = vm->interns[i].hash & (unsigned)(cap - 1);
+         while (n[slot].ref) slot = (slot + 1u) & (unsigned)(cap - 1);
+         n[slot] = vm->interns[i];
+      }
+      free(vm->interns);
+      vm->interns = n;
+      vm->interns_cap = cap;
+   }
+   /* r was pinned above, so its backing object and utf8 allocation live until
+    * dvm_destroy().  Use that storage as the table key: Java intern strings
+    * are immutable, and one allocation per value is both sufficient and the
+    * only failure-atomic representation. */
+   const char *key = dvm_string_utf8(vm, r);
+   if (!key) return r; /* defensive: never publish a NULL comparison key */
+   unsigned slot = hash & (unsigned)(vm->interns_cap - 1);
+   while (vm->interns[slot].ref)
+      slot = (slot + 1u) & (unsigned)(vm->interns_cap - 1);
+   vm->interns[slot] = (struct dvm_intern){ .key = key, .ref = r, .hash = hash };
+   ++vm->ninterns;
+   return r;
 }
 
 static struct dvm_class *class_lookup(struct dvm *vm, const char *desc)
@@ -535,10 +555,22 @@ struct dvm_class *dvm__define_primitive(struct dvm *vm, const char *desc)
 static bool class_load_from_dex(struct dvm *vm, struct dvm_class *c,
                                 struct dvm_dex *dd, uint32_t class_def_idx);
 
-/* Finds or creates the class for a descriptor.  Never returns NULL for a
- * well-formed descriptor: an unknown class becomes an `external` placeholder
- * whose methods route to the host stub layer. */
-static void note_missing(struct dvm *vm, const char *what);
+/* --- external / native dispatch ----------------------------------------- */
+
+static void note_missing(struct dvm *vm, const char *what)
+{
+   for (int i = 0; i < vm->nmissing; ++i)
+      if (!strcmp(vm->missing[i], what)) return;
+   if (vm->nmissing == vm->missing_cap) {
+      int cap = vm->missing_cap ? vm->missing_cap * 2 : 64;
+      char **n = realloc(vm->missing, (size_t)cap * sizeof *n);
+      if (!n) return;
+      vm->missing = n;
+      vm->missing_cap = cap;
+   }
+   vm->missing[vm->nmissing++] = strdup(what);
+   fprintf(stderr, "[dvm] WARNING: %s\n", what);
+}
 
 /* Descriptors the boot class loader defines: java/, javax/, android/ and the
  * runtime's own dalvik/ and libcore/.  androidx/ is application code. */
@@ -1249,6 +1281,21 @@ void dvm__throw(struct dvm *vm, const char *class_name, const char *fmt, ...)
       }
    }
 
+   /* LUNARIA_DVM_THROW_STACK=<text>: print the Java call chain of every throw
+    * whose class or message contains <text> — which caller passed the null. */
+   static const char *stack_filter = (const char *)-1;
+   if (stack_filter == (const char *)-1) stack_filter = getenv("LUNARIA_DVM_THROW_STACK");
+   if (stack_filter && *stack_filter && vm &&
+       (strstr(msg, stack_filter) || strstr(class_name, stack_filter))) {
+      fprintf(stderr, "[dvm] throw %s: %s — call chain, innermost first:\n", class_name, msg);
+      const struct dvm_call_frame *f = vm->invoke_frame;
+      for (int shown = 0; f && shown < 14; f = f->previous, ++shown) {
+         const struct dvm_method *fm = f->method;
+         if (fm) fprintf(stderr, "[dvm]     #%d %s.%s%s\n", shown,
+                         fm->cls ? fm->cls->name : "?", fm->name, fm->sig ? fm->sig : "");
+      }
+   }
+
    if (dvm__env_throws()) {
       const struct dvm_method *m =
          vm ? atomic_load_explicit(&vm->cur_method, memory_order_relaxed) : NULL;
@@ -1668,23 +1715,6 @@ static struct dvm_method *virtual_target(struct dvm *vm, dvm_ref self,
    return m;
 }
 
-/* --- external / native dispatch ----------------------------------------- */
-
-static void note_missing(struct dvm *vm, const char *what)
-{
-   for (int i = 0; i < vm->nmissing; ++i)
-      if (!strcmp(vm->missing[i], what)) return;
-   if (vm->nmissing == vm->missing_cap) {
-      int cap = vm->missing_cap ? vm->missing_cap * 2 : 64;
-      char **n = realloc(vm->missing, (size_t)cap * sizeof *n);
-      if (!n) return;
-      vm->missing = n;
-      vm->missing_cap = cap;
-   }
-   vm->missing[vm->nmissing++] = strdup(what);
-   fprintf(stderr, "[dvm] WARNING: %s\n", what);
-}
-
 bool dvm__call_out(struct dvm *vm, struct dvm_class *cls, const char *name,
                    const char *sig, bool is_static, bool is_native,
                    dvm_ref self, const uint32_t *slots, int nslots,
@@ -2016,574 +2046,6 @@ static bool array_check(struct dvm *vm, struct dvm_object *a, uint32_t idx)
       return false;
    }
    return true;
-}
-
-static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out);
-static _Thread_local struct dvm_method *g_builtin_method;
-
-static bool annotation_value_to_dvm(struct dvm *vm, struct dex_file *dex,
-                                    const struct dex_value *value,
-                                    const char *expected,
-                                    union dvm_value *out)
-{
-   memset(out, 0, sizeof *out);
-   if (!value) return false;
-   switch (value->type) {
-      case DEX_VALUE_NULL:
-         return true;
-      case DEX_VALUE_BOOLEAN: case DEX_VALUE_BYTE: case DEX_VALUE_SHORT:
-      case DEX_VALUE_CHAR: case DEX_VALUE_INT: case DEX_VALUE_LONG:
-      case DEX_VALUE_FLOAT: case DEX_VALUE_DOUBLE:
-         out->ju = value->bits;
-         return true;
-      case DEX_VALUE_STRING: {
-         const char *s = dex_string(dex, (uint32_t)value->bits);
-         out->l = s ? dvm__intern(vm, s) : 0;
-         return s != NULL;
-      }
-      case DEX_VALUE_TYPE: {
-         const char *desc = dex_type(dex, (uint32_t)value->bits);
-         out->l = desc ? class_object(vm, dvm__class_by_desc(vm, desc)) : 0;
-         return desc != NULL;
-      }
-      case DEX_VALUE_ENUM: {
-         struct dex_field_id field;
-         if (!dex_field_id(dex, (uint32_t)value->bits, &field)) return false;
-         const char *desc = dex_type(dex, field.class_idx);
-         const char *name = dex_string(dex, field.name_idx);
-         struct dvm_class *cls = desc ? dvm__class_by_desc(vm, desc) : NULL;
-         if (!cls || !name) return false;
-         if (!dvm_init_class(vm, cls)) return false;
-         return dvm_get_static(vm, cls, name, desc, out);
-      }
-      case DEX_VALUE_ANNOTATION: {
-         if (value->bits > UINT32_MAX) return false;
-         const char *desc = dex_annotation_type(dex, (uint32_t)value->bits);
-         struct dvm_class *cls = desc ? dvm__class_by_desc(vm, desc) : NULL;
-         dvm_ref ref = cls ? dvm_new_object(vm, cls) : 0;
-         struct dvm_object *obj = dvm__obj(vm, ref);
-         if (!obj) return false;
-         obj->annotation_dex = dex;
-         obj->annotation_off = (uint32_t)value->bits;
-         out->l = ref;
-         return true;
-      }
-      case DEX_VALUE_ARRAY: {
-         if (!expected || expected[0] != '[') return false;
-         int count = dex_value_array(dex, value, NULL, 0);
-         if (count < 0) return false;
-         struct dex_value *items = count
-            ? calloc((size_t)count, sizeof *items) : NULL;
-         if (count && !items) return false;
-         if (count && dex_value_array(dex, value, items, count) != count) {
-            free(items);
-            return false;
-         }
-         char element_kind = expected[1] == '[' || expected[1] == 'L'
-            ? 'L' : expected[1];
-         dvm_ref array = dvm_new_array(vm, element_kind, expected + 1,
-                                       (uint32_t)count);
-         struct dvm_object *obj = dvm__obj(vm, array);
-         if (!obj) { free(items); return false; }
-         for (int i = 0; i < count; ++i) {
-            union dvm_value item;
-            if (!annotation_value_to_dvm(vm, dex, &items[i], expected + 1,
-                                         &item)) {
-               free(items);
-               return false;
-            }
-            switch (element_kind) {
-               case 'Z': case 'B':
-                  ((uint8_t *)obj->data)[i] = (uint8_t)item.u;
-                  break;
-               case 'C': case 'S':
-                  ((uint16_t *)obj->data)[i] = (uint16_t)item.u;
-                  break;
-               case 'J': case 'D':
-                  ((uint64_t *)obj->data)[i] = item.ju;
-                  break;
-               default:
-                  ((uint32_t *)obj->data)[i] = item.u;
-                  break;
-            }
-         }
-         free(items);
-         out->l = array;
-         return true;
-      }
-      default:
-         return false;
-   }
-}
-
-static bool annotation_element_builtin(struct dvm *vm, dvm_ref self,
-                                       const union dvm_value *args, int nargs,
-                                       union dvm_value *out)
-{
-   (void)args;
-   (void)nargs;
-   struct dvm_method *method = g_builtin_method;
-   struct dvm_object *obj = dvm__obj(vm, self);
-   struct dex_value value;
-   if (!method || !method->name || !method->sig || !obj ||
-       !obj->annotation_dex || !obj->annotation_off) {
-      dvm__throw(vm, "java/lang/annotation/IncompleteAnnotationException",
-                 "annotation element has no encoded value");
-      return false;
-   }
-   /* An encoded value is offsets into the dex it was read from.  An element
-    * the use site left out takes the default declared on the annotation
-    * type, which may live in another dex of a multidex APK; decoding it
-    * against the use site's dex read unrelated bytes as nested arrays. */
-   struct dex_file *value_dex = obj->annotation_dex;
-   bool found = dex_annotation_element(obj->annotation_dex,
-                                       obj->annotation_off,
-                                       method->name, &value);
-   if (!found && method->cls && method->cls->dex) {
-      found = dex_annotation_default(method->cls->dex,
-                                     method->cls->class_def_idx,
-                                     method->name, &value);
-      value_dex = method->cls->dex;
-   }
-   if (!found) {
-      dvm__throw(vm, "java/lang/annotation/IncompleteAnnotationException",
-                 "%s.%s", method->cls && method->cls->name
-                    ? method->cls->name : "?", method->name);
-      return false;
-   }
-   const char *returns = strchr(method->sig, ')');
-   if (!returns || !annotation_value_to_dvm(vm, value_dex, &value,
-                                            returns + 1, out)) {
-      dvm__throw(vm, "java/lang/AnnotationFormatError", "%s.%s",
-                 method->cls && method->cls->name ? method->cls->name : "?",
-                 method->name);
-      return false;
-   }
-   return true;
-}
-
-static uint64_t monitor_thread_token(struct dvm *vm)
-{
-   /* Guest threads can share a host executor or migrate between executors.
-    * Ownership belongs to the Java Thread identity, never the host TLS. */
-   return dvm__current_thread_id(vm);
-}
-
-static uintptr_t monitor_channel(dvm_ref ref, unsigned kind)
-{
-   return ((uintptr_t)ref << 2) | (uintptr_t)kind;
-}
-
-static uint64_t monitor_now_ms(void)
-{
-   struct timespec ts;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
-}
-
-bool dvm__monitor_try_enter(struct dvm *vm, dvm_ref ref)
-{
-   struct dvm_object *o = dvm__obj(vm, ref);
-   if (!o) {
-      dvm__throw(vm, "java/lang/NullPointerException", "monitor-enter null");
-      return false;
-   }
-   const uint64_t me = monitor_thread_token(vm);
-   if (!me) {
-      dvm__throw(vm, "java/lang/OutOfMemoryError", "monitor thread identity");
-      return false;
-   }
-   if (o->monitor_owner && o->monitor_owner != me) return false;
-   o->monitor_owner = me;
-   ++o->monitor_depth;
-   return true;
-}
-
-bool dvm__monitor_enter(struct dvm *vm, dvm_ref ref)
-{
-   for (;;) {
-      if (dvm_is_stopping(vm)) return false;
-      if (dvm__monitor_try_enter(vm, ref)) return true;
-      if (vm->exception) return false;
-      /* Notification is the mechanism.  The long timeout only permits state
-       * validation if a producer disappears; it never grants ownership. */
-      dvm_ref thread = dvm__current_thread(vm);
-      dvm__thread_set_state(vm, thread, DVM_THREAD_BLOCKED);
-      dvm_gil_wait_for(vm, monitor_channel(ref, 1), 60000u);
-      dvm__thread_set_state(vm, thread, DVM_THREAD_RUNNABLE);
-   }
-}
-
-bool dvm__monitor_exit(struct dvm *vm, dvm_ref ref)
-{
-   struct dvm_object *o = dvm__obj(vm, ref);
-   const uint64_t me = monitor_thread_token(vm);
-   if (!o || o->monitor_owner != me || !o->monitor_depth) {
-      dvm__throw(vm, "java/lang/IllegalMonitorStateException",
-                 "monitor-exit without ownership");
-      return false;
-   }
-   if (--o->monitor_depth) return true;
-   o->monitor_owner = 0;
-   dvm_gil_notify_one_for(monitor_channel(ref, 1));
-   return true;
-}
-
-bool dvm__monitor_wait(struct dvm *vm, dvm_ref ref, uint64_t timeout_ms,
-                       bool *notified)
-{
-   struct dvm_object *o = dvm__obj(vm, ref);
-   const uint64_t me = monitor_thread_token(vm);
-   if (!o || o->monitor_owner != me || !o->monitor_depth) {
-      dvm__throw(vm, "java/lang/IllegalMonitorStateException",
-                 "wait without monitor ownership");
-      return false;
-   }
-   if (dvm__thread_take_interrupt(vm)) {
-      dvm__throw(vm, "java/lang/InterruptedException", "wait interrupted");
-      return false;
-   }
-   const uint32_t saved_depth = o->monitor_depth;
-   const uint64_t seen = o->monitor_seq;
-   const uint64_t deadline = timeout_ms ? monitor_now_ms() + timeout_ms : 0;
-   o->monitor_owner = 0;
-   o->monitor_depth = 0;
-   dvm_gil_notify_one_for(monitor_channel(ref, 1));
-
-   bool signalled = false, interrupted = false;
-   for (;;) {
-      if (dvm_is_stopping(vm)) return false;
-      uint64_t now = monitor_now_ms();
-      if (deadline && now >= deadline) break;
-      uint64_t left = deadline ? deadline - now : 60000u;
-      if (left > 60000u) left = 60000u;
-      dvm_ref thread = dvm__current_thread(vm);
-      dvm__thread_set_state(vm, thread, deadline ? DVM_THREAD_TIMED_WAITING : DVM_THREAD_WAITING);
-      dvm__thread_set_wait(vm, monitor_channel(ref, 2));
-      dvm_gil_wait_for(vm, monitor_channel(ref, 2), (unsigned)left);
-      dvm__thread_set_wait(vm, 0);
-      dvm__thread_set_state(vm, thread, DVM_THREAD_RUNNABLE);
-      o = dvm__obj(vm, ref);
-      if (!o) {
-         dvm__throw(vm, "java/lang/NullPointerException", "waited object freed");
-         return false;
-      }
-      if (o->monitor_seq != seen) { signalled = true; break; }
-      if (dvm__thread_take_interrupt(vm)) { interrupted = true; break; }
-   }
-   if (!dvm__monitor_enter(vm, ref)) return false;
-   o = dvm__obj(vm, ref);
-   o->monitor_depth = saved_depth;
-   if (notified) *notified = signalled;
-   /* The monitor is owned again before the interrupt is reported, as
-    * Object.wait() specifies. */
-   if (interrupted) {
-      dvm__throw(vm, "java/lang/InterruptedException", "wait interrupted");
-      return false;
-   }
-   return true;
-}
-
-bool dvm__monitor_notify(struct dvm *vm, dvm_ref ref, bool all)
-{
-   struct dvm_object *o = dvm__obj(vm, ref);
-   if (!o || o->monitor_owner != monitor_thread_token(vm) || !o->monitor_depth) {
-      dvm__throw(vm, "java/lang/IllegalMonitorStateException",
-                 "notify without monitor ownership");
-      return false;
-   }
-   ++o->monitor_seq;
-   if (all) dvm_gil_notify_for(monitor_channel(ref, 2));
-   else     dvm_gil_notify_one_for(monitor_channel(ref, 2));
-   return true;
-}
-
-bool dvm__monitor_state(struct dvm *vm, dvm_ref ref, bool current,
-                        uint32_t *depth)
-{
-   struct dvm_object *o = dvm__obj(vm, ref);
-   if (depth) *depth = o ? o->monitor_depth : 0;
-   if (!o || !o->monitor_owner) return false;
-   return !current || o->monitor_owner == monitor_thread_token(vm);
-}
-
-struct dvm_method *dvm__builtin_method(void) { return g_builtin_method; }
-
-void dvm__warn_placeholder(struct dvm *vm)
-{
-   struct dvm_method *m = g_builtin_method;
-   if (!m || m->placeholder_warned) return;
-   m->placeholder_warned = true;
-   /* Name the caller too.  "Paint.<init> is a no-op" is a fact about the
-    * emulator; "…and app code X called it" is the only half that can explain
-    * what X does next, and it is the reason this is reported at call time
-    * rather than when the method table was built. */
-   struct dvm_method *from = vm ? vm->cur_method : NULL;
-   fprintf(stderr, "[dvm] placeholder no-op invoked: %s.%s%s (from %s.%s)\n",
-           m->cls && m->cls->name ? m->cls->name : "?",
-           m->name ? m->name : "?", m->sig ? m->sig : "",
-           from && from->cls && from->cls->name ? from->cls->name : "?",
-           from && from->name ? from->name : "?");
-}
-
-static bool invoke_body(struct dvm *vm, struct dvm_method *m, dvm_ref self,
-                        const uint32_t *slots, int nslots, union dvm_value *out);
-static void trace_return(struct dvm *, const struct dvm_method *, char,
-                          const union dvm_value *);
-
-static bool trace_call_enabled(struct dvm *vm, const struct dvm_method *m,
-                                const struct dvm_call_frame *caller)
-{
-   if (!vm->trace) return false;
-   const char *filter = dvm__env_trace_class();
-   if (!filter) return true;
-   if (m && m->cls && m->cls->name && strstr(m->cls->name, filter)) return true;
-   return caller && caller->method && caller->method->cls &&
-      caller->method->cls->name && strstr(caller->method->cls->name, filter);
-}
-
-static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
-                   const uint32_t *slots, int nslots, union dvm_value *out)
-{
-   struct dvm_call_frame frame = { .method = m, .previous = vm->invoke_frame };
-   struct dvm_method *caller = vm->cur_method;
-   const uint32_t caller_pc = vm->cur_pc;
-   vm->invoke_frame = &frame;
-   bool ok = invoke_body(vm, m, self, slots, nslots, out);
-   if (ok && m && trace_call_enabled(vm, m, frame.previous))
-      trace_return(vm, m, m->ret_kind, out);
-   vm->invoke_frame = frame.previous;
-   /* A returned bytecode frame is no longer the current frame. Retaining it
-    * misattributes later builtin exceptions and can outlive the method. */
-   vm->cur_method = caller;
-   vm->cur_pc = caller_pc;
-   return ok;
-}
-
-static bool invoke_body(struct dvm *vm, struct dvm_method *m, dvm_ref self,
-                        const uint32_t *slots, int nslots, union dvm_value *out)
-{
-   memset(out, 0, sizeof *out);
-   if (dvm_is_stopping(vm)) return false;
-   if (!m) return true;
-
-   /* The return slot is defined before the callee runs.
-    *
-    * Dalvik's result register always holds a value: a void method leaves it
-    * zero, and a method returning int leaves the upper half of the wide view
-    * zero rather than whatever was there.  Here it is a `union dvm_value ret`
-    * declared on the interpreter's own stack at every call site, and the
-    * builtin path writes only as many bytes as the return type has -- RETI
-    * writes four, RETV writes none -- so without this the caller's
-    * `fr->result` carries the bytes that happened to be in that stack slot.
-    * move-result truncates and hides it; anything that reads the wide value,
-    * or a builtin that returns nothing at all, does not.  That is how a 400
-    * from getResponseCode() reached Volley as 0xb021_0000_0190.
-    *
-    * dvm__call_out() already did this for the calls that leave the VM; doing
-    * it here covers every callee kind at the one point they share. */
-   memset(out, 0, sizeof *out);
-
-   /* Java and native calls share this host thread's stack. Leave room to
-    * construct the exception and unwind rather than limiting Java depth. */
-   size_t stack_remaining = luna_os_stack_remaining();
-   if (stack_remaining < 64u * 1024u ||
-       (stack_remaining == SIZE_MAX && vm->depth >= DVM_MAX_FRAMES)) {
-      if (getenv("LUNARIA_DVM_STACK")) {
-         unsigned depth = 0;
-         for (const struct dvm_call_frame *f = vm->invoke_frame;
-              f && depth <= (unsigned)vm->depth + 1u; f = f->previous, ++depth) {
-            const struct dvm_method *method = f->method;
-            fprintf(stderr, "[dvm-stack] %u %s.%s%s\n", depth,
-               method && method->cls ? method->cls->name : "?",
-               method ? method->name : "?", method && method->sig ? method->sig : "");
-         }
-      }
-      dvm__throw(vm, "java/lang/StackOverflowError", "%d frames", vm->depth);
-      return false;
-   }
-
-   /* Every call passes through here: test the first character before comparing names. */
-   if (nslots >= 2 && m->name && m->name[0] == 'u' && m->sig &&
-       !strcmp(m->name, "uncaughtException") &&
-       !strcmp(m->sig, "(Ljava/lang/Thread;Ljava/lang/Throwable;)V"))
-      log_forwarded_uncaught(vm, (dvm_ref)slots[1], m);
-
-   bool is_static = (m->access & DEX_ACC_STATIC) != 0;
-   if (!is_static && !self && !(m->access & DEX_ACC_NATIVE)) {
-      /* "self" marks the callee-side check, so a null receiver can be told
-       * apart from the call-site one below. */
-      dvm__throw(vm, "java/lang/NullPointerException", "self %s.%s%s",
-                 m->cls->name, m->name, m->sig ? m->sig : "");
-      return false;
-   }
-
-   /* A class is initialised by its first static call or its first
-    * construction.  A host that builds an object through JNI (AllocObject +
-    * constructor, as the process Application is) never executes new-instance,
-    * so its <clinit> -- System.loadLibrary of the app's own natives, say --
-    * has to run here, before the constructor. */
-   if (m->cls && (is_static || (m->name && m->name[0] == '<' && !strcmp(m->name, "<init>"))) &&
-       !dvm_init_class(vm, m->cls)) return false;
-
-   const bool synchronized = (m->access & DEX_ACC_SYNCHRONIZED) != 0;
-   dvm_ref monitor = 0;
-   if (synchronized) {
-      monitor = is_static ? class_object(vm, m->cls) : self;
-      if (!dvm__monitor_enter(vm, monitor)) return false;
-   }
-
-   bool trace_this = trace_call_enabled(vm, m,
-      vm->invoke_frame ? vm->invoke_frame->previous : NULL);
-   if (vm->trace && trace_this) {
-      fprintf(stderr, "[dvm] %*scall %s.%s%s", vm->depth * 2, "",
-              m->cls ? m->cls->name : "?", m->name, m->sig ? m->sig : "");
-      if (self) fprintf(stderr, " on @%x", (unsigned)self);
-      fputc('\n', stderr);
-      /* What the reference arguments are: the declared type says little
-       * when the caller passes a subclass (which Throwable reached an error
-       * handler, which listener was registered). */
-      char one[256];
-      for (int i = 0, slot = 0; m->sig && slot < nslots &&
-           dvm__sig_param(m->sig, i, one, sizeof one); ++i) {
-         const bool wide = one[0] == 'J' || one[0] == 'D';
-         if ((one[0] == 'L' || one[0] == '[') && slots[slot]) {
-            struct dvm_object *o = dvm__obj(vm, (dvm_ref)slots[slot]);
-            char desc[384] = "";
-            if (o && o->cls && o->kind != DVM_OBJ_STRING)
-               dvm_describe_exception(vm, (dvm_ref)slots[slot], desc,
-                                      sizeof desc);
-            fprintf(stderr, "[dvm] %*s  arg%d = %s%s%s\n", vm->depth * 2, "", i,
-                    o && o->kind == DVM_OBJ_STRING ? "\""
-                       : o && o->cls && o->cls->name ? o->cls->name : "?",
-                    o && o->kind == DVM_OBJ_STRING
-                       ? (dvm_string_utf8(vm, (dvm_ref)slots[slot]) ?: "") : "",
-                    o && o->kind == DVM_OBJ_STRING ? "\"" : "");
-            if (desc[0] && (strstr(desc, "Exception") || strstr(desc, "Error")))
-               fprintf(stderr, "[dvm] %*s    (%s)\n", vm->depth * 2, "", desc);
-         } else if (one[0] != 'L' && one[0] != '[') {
-            union dvm_value value = {0};
-            value.ju = slots[slot];
-            if (wide && slot + 1 < nslots) value.ju |= (uint64_t)slots[slot + 1] << 32;
-            if (one[0] == 'F')
-               fprintf(stderr, "[dvm] %*s  arg%d = %.9g (float)\n", vm->depth * 2, "", i, (double)value.f);
-            else if (one[0] == 'D')
-               fprintf(stderr, "[dvm] %*s  arg%d = %.17g (double)\n", vm->depth * 2, "", i, value.d);
-            else if (one[0] == 'J')
-               fprintf(stderr, "[dvm] %*s  arg%d = %lld (wide)\n", vm->depth * 2, "", i, (long long)value.j);
-            else
-               fprintf(stderr, "[dvm] %*s  arg%d = %d\n", vm->depth * 2, "", i, value.i);
-         }
-         slot += wide ? 2 : 1;
-      }
-   }
-
-   if (m->builtin) {
-      union dvm_value args[64];
-      int nargs = slots_to_values(m->sig, slots, nslots, args, 64);
-      ++vm->depth;
-      struct dvm_method *previous_builtin = g_builtin_method;
-      g_builtin_method = m;
-      bool ok = m->builtin(vm, self, args, nargs, out);
-      g_builtin_method = previous_builtin;
-      --vm->depth;
-      if (synchronized && !dvm__monitor_exit(vm, monitor)) ok = false;
-      return ok && !vm->exception;
-   }
-
-   if (!m->has_code) {
-      bool native = (m->access & DEX_ACC_NATIVE) != 0;
-      ++vm->depth;
-      bool ok = dvm__call_out(vm, m->cls, m->name, m->sig, is_static, native,
-                         self, slots, nslots, out);
-      --vm->depth;
-      if (synchronized && !dvm__monitor_exit(vm, monitor)) ok = false;
-      return ok && !vm->exception;
-   }
-
-   uint16_t nregs = m->code.registers_size;
-   uint16_t nins = m->code.ins_size;
-   if (nregs < nins) nregs = nins;
-
-   uint32_t stackbuf[64];
-   uint32_t *regs = nregs <= 64 ? stackbuf : calloc(nregs ? nregs : 1, sizeof *regs);
-   if (!regs) {
-      dvm__throw(vm, "java/lang/OutOfMemoryError", "%u registers", nregs);
-      if (synchronized) (void)dvm__monitor_exit(vm, monitor);
-      return false;
-   }
-   memset(regs, 0, (size_t)nregs * sizeof *regs);
-
-   /* Parameters occupy the last ins_size registers, `this` first. */
-   int base = (int)nregs - (int)nins;
-   int w = base;
-   if (!is_static && w < nregs) regs[w++] = self;
-   for (int i = 0; i < nslots && w < nregs; ++i)
-      regs[w++] = slots[i];
-
-   struct frame fr = { .m = m, .regs = regs, .nregs = nregs, .pc = 0 };
-   ++vm->depth;
-   bool pushed = vm->ncallstack <
-                 (int)(sizeof vm->callstack / sizeof vm->callstack[0]);
-   if (pushed) vm->callstack[vm->ncallstack++] = m;
-   bool ok = execute(vm, &fr, out);
-   if (pushed) --vm->ncallstack;
-   --vm->depth;
-
-   /* Record the frames the exception passes on its way out, innermost first. */
-   if (!ok && vm->exception && m != vm->exc_trace[0] &&
-       vm->nexc_trace < (int)(sizeof vm->exc_trace / sizeof vm->exc_trace[0]))
-      vm->exc_trace[vm->nexc_trace++] = m;
-
-   if (regs != stackbuf) free(regs);
-   if (synchronized && !dvm__monitor_exit(vm, monitor)) ok = false;
-   return ok;
-}
-
-
-/* LUNARIA_DVM_TRACE: what a traced method returned, next to the "call" line
- * that printed its arguments.  A String shows its text, any other object its
- * class, and a collection its size — enough to tell an empty result from a
- * missing one without single-stepping the callee. */
-static void trace_return(struct dvm *vm, const struct dvm_method *m, char kind,
-                         const union dvm_value *v)
-{
-   const char *cls = m && m->cls && m->cls->name ? m->cls->name : "?";
-   const char *name = m && m->name ? m->name : "?";
-   if (kind == 'V') {
-      fprintf(stderr, "[dvm] %*sreturn %s.%s\n", vm->depth * 2, "", cls, name);
-      return;
-   }
-   if (kind == 'J') {
-      fprintf(stderr, "[dvm] %*sreturn %s.%s -> %lld (wide)\n", vm->depth * 2,
-              "", cls, name, (long long)v->j);
-      return;
-   }
-   if (strchr("ZBCSI", kind)) {
-      fprintf(stderr, "[dvm] %*sreturn %s.%s -> %d\n", vm->depth * 2, "", cls,
-              name, v->i);
-      return;
-   }
-   if (kind == 'F' || kind == 'D') {
-      fprintf(stderr, "[dvm] %*sreturn %s.%s -> %.17g (%s)\n", vm->depth * 2,
-              "", cls, name, kind == 'F' ? (double)v->f : v->d,
-              kind == 'F' ? "float" : "double");
-      return;
-   }
-   dvm_ref r = (dvm_ref)v->u;
-   struct dvm_object *o = r ? dvm__obj(vm, r) : NULL;
-   if (!o) {
-      fprintf(stderr, "[dvm] %*sreturn %s.%s -> null\n", vm->depth * 2, "",
-              cls, name);
-   } else if (o->kind == DVM_OBJ_STRING) {
-      fprintf(stderr, "[dvm] %*sreturn %s.%s -> \"%.200s\" (%u bytes)\n",
-              vm->depth * 2, "", cls, name, o->utf8 ? o->utf8 : "",
-              (unsigned)o->utf8_len);
-   } else {
-      fprintf(stderr, "[dvm] %*sreturn %s.%s -> @%x %s\n", vm->depth * 2, "",
-              cls, name, (unsigned)r,
-              o->cls && o->cls->name ? o->cls->name : "?");
-   }
 }
 
 static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
@@ -2989,6 +2451,25 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
                   fprintf(stderr, "[dvm] throw %s (in %s.%s @%04x)\n", desc,
                           m->cls && m->cls->name ? m->cls->name : "?",
                           m->name, pc * 2);
+               }
+               {
+                  /* LUNARIA_DVM_THROW_STACK=<text>: the call chain of an app throw
+                   * whose description contains <text> (see dvm__throw). */
+                  static const char *stack_filter = (const char *)-1;
+                  if (stack_filter == (const char *)-1) stack_filter = getenv("LUNARIA_DVM_THROW_STACK");
+                  char desc[384];
+                  if (stack_filter && *stack_filter) {
+                     dvm_describe_exception(vm, r[AA(u0)], desc, sizeof desc);
+                     if (strstr(desc, stack_filter)) {
+                        fprintf(stderr, "[dvm] throw %s — call chain, innermost first:\n", desc);
+                        const struct dvm_call_frame *f = vm->invoke_frame;
+                        for (int shown = 0; f && shown < 14; f = f->previous, ++shown)
+                           if (f->method)
+                              fprintf(stderr, "[dvm]     #%d %s.%s%s\n", shown,
+                                      f->method->cls ? f->method->cls->name : "?", f->method->name,
+                                      f->method->sig ? f->method->sig : "");
+                     }
+                  }
                }
                vm->exc_ref = r[AA(u0)];
                vm->nexc_trace = 0;
@@ -3768,6 +3249,573 @@ exception:
 #undef REQ
 #undef THROW_AND_DISPATCH
 }
+static _Thread_local struct dvm_method *g_builtin_method;
+
+static bool annotation_value_to_dvm(struct dvm *vm, struct dex_file *dex,
+                                    const struct dex_value *value,
+                                    const char *expected,
+                                    union dvm_value *out)
+{
+   memset(out, 0, sizeof *out);
+   if (!value) return false;
+   switch (value->type) {
+      case DEX_VALUE_NULL:
+         return true;
+      case DEX_VALUE_BOOLEAN: case DEX_VALUE_BYTE: case DEX_VALUE_SHORT:
+      case DEX_VALUE_CHAR: case DEX_VALUE_INT: case DEX_VALUE_LONG:
+      case DEX_VALUE_FLOAT: case DEX_VALUE_DOUBLE:
+         out->ju = value->bits;
+         return true;
+      case DEX_VALUE_STRING: {
+         const char *s = dex_string(dex, (uint32_t)value->bits);
+         out->l = s ? dvm__intern(vm, s) : 0;
+         return s != NULL;
+      }
+      case DEX_VALUE_TYPE: {
+         const char *desc = dex_type(dex, (uint32_t)value->bits);
+         out->l = desc ? class_object(vm, dvm__class_by_desc(vm, desc)) : 0;
+         return desc != NULL;
+      }
+      case DEX_VALUE_ENUM: {
+         struct dex_field_id field;
+         if (!dex_field_id(dex, (uint32_t)value->bits, &field)) return false;
+         const char *desc = dex_type(dex, field.class_idx);
+         const char *name = dex_string(dex, field.name_idx);
+         struct dvm_class *cls = desc ? dvm__class_by_desc(vm, desc) : NULL;
+         if (!cls || !name) return false;
+         if (!dvm_init_class(vm, cls)) return false;
+         return dvm_get_static(vm, cls, name, desc, out);
+      }
+      case DEX_VALUE_ANNOTATION: {
+         if (value->bits > UINT32_MAX) return false;
+         const char *desc = dex_annotation_type(dex, (uint32_t)value->bits);
+         struct dvm_class *cls = desc ? dvm__class_by_desc(vm, desc) : NULL;
+         dvm_ref ref = cls ? dvm_new_object(vm, cls) : 0;
+         struct dvm_object *obj = dvm__obj(vm, ref);
+         if (!obj) return false;
+         obj->annotation_dex = dex;
+         obj->annotation_off = (uint32_t)value->bits;
+         out->l = ref;
+         return true;
+      }
+      case DEX_VALUE_ARRAY: {
+         if (!expected || expected[0] != '[') return false;
+         int count = dex_value_array(dex, value, NULL, 0);
+         if (count < 0) return false;
+         struct dex_value *items = count
+            ? calloc((size_t)count, sizeof *items) : NULL;
+         if (count && !items) return false;
+         if (count && dex_value_array(dex, value, items, count) != count) {
+            free(items);
+            return false;
+         }
+         char element_kind = expected[1] == '[' || expected[1] == 'L'
+            ? 'L' : expected[1];
+         dvm_ref array = dvm_new_array(vm, element_kind, expected + 1,
+                                       (uint32_t)count);
+         struct dvm_object *obj = dvm__obj(vm, array);
+         if (!obj) { free(items); return false; }
+         for (int i = 0; i < count; ++i) {
+            union dvm_value item;
+            if (!annotation_value_to_dvm(vm, dex, &items[i], expected + 1,
+                                         &item)) {
+               free(items);
+               return false;
+            }
+            switch (element_kind) {
+               case 'Z': case 'B':
+                  ((uint8_t *)obj->data)[i] = (uint8_t)item.u;
+                  break;
+               case 'C': case 'S':
+                  ((uint16_t *)obj->data)[i] = (uint16_t)item.u;
+                  break;
+               case 'J': case 'D':
+                  ((uint64_t *)obj->data)[i] = item.ju;
+                  break;
+               default:
+                  ((uint32_t *)obj->data)[i] = item.u;
+                  break;
+            }
+         }
+         free(items);
+         out->l = array;
+         return true;
+      }
+      default:
+         return false;
+   }
+}
+
+static bool annotation_element_builtin(struct dvm *vm, dvm_ref self,
+                                       const union dvm_value *args, int nargs,
+                                       union dvm_value *out)
+{
+   (void)args;
+   (void)nargs;
+   struct dvm_method *method = g_builtin_method;
+   struct dvm_object *obj = dvm__obj(vm, self);
+   struct dex_value value;
+   if (!method || !method->name || !method->sig || !obj ||
+       !obj->annotation_dex || !obj->annotation_off) {
+      dvm__throw(vm, "java/lang/annotation/IncompleteAnnotationException",
+                 "annotation element has no encoded value");
+      return false;
+   }
+   /* An encoded value is offsets into the dex it was read from.  An element
+    * the use site left out takes the default declared on the annotation
+    * type, which may live in another dex of a multidex APK; decoding it
+    * against the use site's dex read unrelated bytes as nested arrays. */
+   struct dex_file *value_dex = obj->annotation_dex;
+   bool found = dex_annotation_element(obj->annotation_dex,
+                                       obj->annotation_off,
+                                       method->name, &value);
+   if (!found && method->cls && method->cls->dex) {
+      found = dex_annotation_default(method->cls->dex,
+                                     method->cls->class_def_idx,
+                                     method->name, &value);
+      value_dex = method->cls->dex;
+   }
+   if (!found) {
+      dvm__throw(vm, "java/lang/annotation/IncompleteAnnotationException",
+                 "%s.%s", method->cls && method->cls->name
+                    ? method->cls->name : "?", method->name);
+      return false;
+   }
+   const char *returns = strchr(method->sig, ')');
+   if (!returns || !annotation_value_to_dvm(vm, value_dex, &value,
+                                            returns + 1, out)) {
+      dvm__throw(vm, "java/lang/AnnotationFormatError", "%s.%s",
+                 method->cls && method->cls->name ? method->cls->name : "?",
+                 method->name);
+      return false;
+   }
+   return true;
+}
+
+static uint64_t monitor_thread_token(struct dvm *vm)
+{
+   /* Guest threads can share a host executor or migrate between executors.
+    * Ownership belongs to the Java Thread identity, never the host TLS. */
+   return dvm__current_thread_id(vm);
+}
+
+static uintptr_t monitor_channel(dvm_ref ref, unsigned kind)
+{
+   return ((uintptr_t)ref << 2) | (uintptr_t)kind;
+}
+
+static uint64_t monitor_now_ms(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+bool dvm__monitor_try_enter(struct dvm *vm, dvm_ref ref)
+{
+   struct dvm_object *o = dvm__obj(vm, ref);
+   if (!o) {
+      dvm__throw(vm, "java/lang/NullPointerException", "monitor-enter null");
+      return false;
+   }
+   const uint64_t me = monitor_thread_token(vm);
+   if (!me) {
+      dvm__throw(vm, "java/lang/OutOfMemoryError", "monitor thread identity");
+      return false;
+   }
+   if (o->monitor_owner && o->monitor_owner != me) return false;
+   o->monitor_owner = me;
+   ++o->monitor_depth;
+   return true;
+}
+
+bool dvm__monitor_enter(struct dvm *vm, dvm_ref ref)
+{
+   for (;;) {
+      if (dvm_is_stopping(vm)) return false;
+      if (dvm__monitor_try_enter(vm, ref)) return true;
+      if (vm->exception) return false;
+      /* Notification is the mechanism.  The long timeout only permits state
+       * validation if a producer disappears; it never grants ownership. */
+      dvm_ref thread = dvm__current_thread(vm);
+      dvm__thread_set_state(vm, thread, DVM_THREAD_BLOCKED);
+      dvm_gil_wait_for(vm, monitor_channel(ref, 1), 60000u);
+      dvm__thread_set_state(vm, thread, DVM_THREAD_RUNNABLE);
+   }
+}
+
+bool dvm__monitor_exit(struct dvm *vm, dvm_ref ref)
+{
+   struct dvm_object *o = dvm__obj(vm, ref);
+   const uint64_t me = monitor_thread_token(vm);
+   if (!o || o->monitor_owner != me || !o->monitor_depth) {
+      dvm__throw(vm, "java/lang/IllegalMonitorStateException",
+                 "monitor-exit without ownership");
+      return false;
+   }
+   if (--o->monitor_depth) return true;
+   o->monitor_owner = 0;
+   dvm_gil_notify_one_for(monitor_channel(ref, 1));
+   return true;
+}
+
+bool dvm__monitor_wait(struct dvm *vm, dvm_ref ref, uint64_t timeout_ms,
+                       bool *notified)
+{
+   struct dvm_object *o = dvm__obj(vm, ref);
+   const uint64_t me = monitor_thread_token(vm);
+   if (!o || o->monitor_owner != me || !o->monitor_depth) {
+      dvm__throw(vm, "java/lang/IllegalMonitorStateException",
+                 "wait without monitor ownership");
+      return false;
+   }
+   if (dvm__thread_take_interrupt(vm)) {
+      dvm__throw(vm, "java/lang/InterruptedException", "wait interrupted");
+      return false;
+   }
+   const uint32_t saved_depth = o->monitor_depth;
+   const uint64_t seen = o->monitor_seq;
+   const uint64_t deadline = timeout_ms ? monitor_now_ms() + timeout_ms : 0;
+   o->monitor_owner = 0;
+   o->monitor_depth = 0;
+   dvm_gil_notify_one_for(monitor_channel(ref, 1));
+
+   bool signalled = false, interrupted = false;
+   for (;;) {
+      if (dvm_is_stopping(vm)) return false;
+      uint64_t now = monitor_now_ms();
+      if (deadline && now >= deadline) break;
+      uint64_t left = deadline ? deadline - now : 60000u;
+      if (left > 60000u) left = 60000u;
+      dvm_ref thread = dvm__current_thread(vm);
+      dvm__thread_set_state(vm, thread, deadline ? DVM_THREAD_TIMED_WAITING : DVM_THREAD_WAITING);
+      dvm__thread_set_wait(vm, monitor_channel(ref, 2));
+      dvm_gil_wait_for(vm, monitor_channel(ref, 2), (unsigned)left);
+      dvm__thread_set_wait(vm, 0);
+      dvm__thread_set_state(vm, thread, DVM_THREAD_RUNNABLE);
+      o = dvm__obj(vm, ref);
+      if (!o) {
+         dvm__throw(vm, "java/lang/NullPointerException", "waited object freed");
+         return false;
+      }
+      if (o->monitor_seq != seen) { signalled = true; break; }
+      if (dvm__thread_take_interrupt(vm)) { interrupted = true; break; }
+   }
+   if (!dvm__monitor_enter(vm, ref)) return false;
+   o = dvm__obj(vm, ref);
+   o->monitor_depth = saved_depth;
+   if (notified) *notified = signalled;
+   /* The monitor is owned again before the interrupt is reported, as
+    * Object.wait() specifies. */
+   if (interrupted) {
+      dvm__throw(vm, "java/lang/InterruptedException", "wait interrupted");
+      return false;
+   }
+   return true;
+}
+
+bool dvm__monitor_notify(struct dvm *vm, dvm_ref ref, bool all)
+{
+   struct dvm_object *o = dvm__obj(vm, ref);
+   if (!o || o->monitor_owner != monitor_thread_token(vm) || !o->monitor_depth) {
+      dvm__throw(vm, "java/lang/IllegalMonitorStateException",
+                 "notify without monitor ownership");
+      return false;
+   }
+   ++o->monitor_seq;
+   if (all) dvm_gil_notify_for(monitor_channel(ref, 2));
+   else     dvm_gil_notify_one_for(monitor_channel(ref, 2));
+   return true;
+}
+
+bool dvm__monitor_state(struct dvm *vm, dvm_ref ref, bool current,
+                        uint32_t *depth)
+{
+   struct dvm_object *o = dvm__obj(vm, ref);
+   if (depth) *depth = o ? o->monitor_depth : 0;
+   if (!o || !o->monitor_owner) return false;
+   return !current || o->monitor_owner == monitor_thread_token(vm);
+}
+
+struct dvm_method *dvm__builtin_method(void) { return g_builtin_method; }
+
+void dvm__warn_placeholder(struct dvm *vm)
+{
+   struct dvm_method *m = g_builtin_method;
+   if (!m || m->placeholder_warned) return;
+   m->placeholder_warned = true;
+   /* Name the caller too.  "Paint.<init> is a no-op" is a fact about the
+    * emulator; "…and app code X called it" is the only half that can explain
+    * what X does next, and it is the reason this is reported at call time
+    * rather than when the method table was built. */
+   struct dvm_method *from = vm ? vm->cur_method : NULL;
+   fprintf(stderr, "[dvm] placeholder no-op invoked: %s.%s%s (from %s.%s)\n",
+           m->cls && m->cls->name ? m->cls->name : "?",
+           m->name ? m->name : "?", m->sig ? m->sig : "",
+           from && from->cls && from->cls->name ? from->cls->name : "?",
+           from && from->name ? from->name : "?");
+}
+
+static bool invoke_body(struct dvm *vm, struct dvm_method *m, dvm_ref self,
+                        const uint32_t *slots, int nslots, union dvm_value *out);
+
+
+/* LUNARIA_DVM_TRACE: what a traced method returned, next to the "call" line
+ * that printed its arguments.  A String shows its text, any other object its
+ * class, and a collection its size — enough to tell an empty result from a
+ * missing one without single-stepping the callee. */
+static void trace_return(struct dvm *vm, const struct dvm_method *m, char kind,
+                         const union dvm_value *v)
+{
+   const char *cls = m && m->cls && m->cls->name ? m->cls->name : "?";
+   const char *name = m && m->name ? m->name : "?";
+   if (kind == 'V') {
+      fprintf(stderr, "[dvm] %*sreturn %s.%s\n", vm->depth * 2, "", cls, name);
+      return;
+   }
+   if (kind == 'J') {
+      fprintf(stderr, "[dvm] %*sreturn %s.%s -> %lld (wide)\n", vm->depth * 2,
+              "", cls, name, (long long)v->j);
+      return;
+   }
+   if (strchr("ZBCSI", kind)) {
+      fprintf(stderr, "[dvm] %*sreturn %s.%s -> %d\n", vm->depth * 2, "", cls,
+              name, v->i);
+      return;
+   }
+   if (kind == 'F' || kind == 'D') {
+      fprintf(stderr, "[dvm] %*sreturn %s.%s -> %.17g (%s)\n", vm->depth * 2,
+              "", cls, name, kind == 'F' ? (double)v->f : v->d,
+              kind == 'F' ? "float" : "double");
+      return;
+   }
+   dvm_ref r = (dvm_ref)v->u;
+   struct dvm_object *o = r ? dvm__obj(vm, r) : NULL;
+   if (!o) {
+      fprintf(stderr, "[dvm] %*sreturn %s.%s -> null\n", vm->depth * 2, "",
+              cls, name);
+   } else if (o->kind == DVM_OBJ_STRING) {
+      fprintf(stderr, "[dvm] %*sreturn %s.%s -> \"%.200s\" (%u bytes)\n",
+              vm->depth * 2, "", cls, name, o->utf8 ? o->utf8 : "",
+              (unsigned)o->utf8_len);
+   } else {
+      fprintf(stderr, "[dvm] %*sreturn %s.%s -> @%x %s\n", vm->depth * 2, "",
+              cls, name, (unsigned)r,
+              o->cls && o->cls->name ? o->cls->name : "?");
+   }
+}
+
+static bool trace_call_enabled(struct dvm *vm, const struct dvm_method *m,
+                                const struct dvm_call_frame *caller)
+{
+   if (!vm->trace) return false;
+   const char *filter = dvm__env_trace_class();
+   if (!filter) return true;
+   if (m && m->cls && m->cls->name && strstr(m->cls->name, filter)) return true;
+   return caller && caller->method && caller->method->cls &&
+      caller->method->cls->name && strstr(caller->method->cls->name, filter);
+}
+
+static void call_histogram(const struct dvm_method *m);
+
+static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
+                   const uint32_t *slots, int nslots, union dvm_value *out)
+{
+   call_histogram(m);
+   struct dvm_call_frame frame = { .method = m, .previous = vm->invoke_frame };
+   struct dvm_method *caller = vm->cur_method;
+   const uint32_t caller_pc = vm->cur_pc;
+   vm->invoke_frame = &frame;
+   bool ok = invoke_body(vm, m, self, slots, nslots, out);
+   if (ok && m && trace_call_enabled(vm, m, frame.previous))
+      trace_return(vm, m, m->ret_kind, out);
+   vm->invoke_frame = frame.previous;
+   /* A returned bytecode frame is no longer the current frame. Retaining it
+    * misattributes later builtin exceptions and can outlive the method. */
+   vm->cur_method = caller;
+   vm->cur_pc = caller_pc;
+   return ok;
+}
+
+static bool invoke_body(struct dvm *vm, struct dvm_method *m, dvm_ref self,
+                        const uint32_t *slots, int nslots, union dvm_value *out)
+{
+   memset(out, 0, sizeof *out);
+   if (dvm_is_stopping(vm)) return false;
+   if (!m) return true;
+
+   /* The return slot is defined before the callee runs.
+    *
+    * Dalvik's result register always holds a value: a void method leaves it
+    * zero, and a method returning int leaves the upper half of the wide view
+    * zero rather than whatever was there.  Here it is a `union dvm_value ret`
+    * declared on the interpreter's own stack at every call site, and the
+    * builtin path writes only as many bytes as the return type has -- RETI
+    * writes four, RETV writes none -- so without this the caller's
+    * `fr->result` carries the bytes that happened to be in that stack slot.
+    * move-result truncates and hides it; anything that reads the wide value,
+    * or a builtin that returns nothing at all, does not.  That is how a 400
+    * from getResponseCode() reached Volley as 0xb021_0000_0190.
+    *
+    * dvm__call_out() already did this for the calls that leave the VM; doing
+    * it here covers every callee kind at the one point they share. */
+   memset(out, 0, sizeof *out);
+
+   /* Java and native calls share this host thread's stack. Leave room to
+    * construct the exception and unwind rather than limiting Java depth. */
+   size_t stack_remaining = luna_os_stack_remaining();
+   if (stack_remaining < 64u * 1024u ||
+       (stack_remaining == SIZE_MAX && vm->depth >= DVM_MAX_FRAMES)) {
+      if (getenv("LUNARIA_DVM_STACK")) {
+         unsigned depth = 0;
+         for (const struct dvm_call_frame *f = vm->invoke_frame;
+              f && depth <= (unsigned)vm->depth + 1u; f = f->previous, ++depth) {
+            const struct dvm_method *method = f->method;
+            fprintf(stderr, "[dvm-stack] %u %s.%s%s\n", depth,
+               method && method->cls ? method->cls->name : "?",
+               method ? method->name : "?", method && method->sig ? method->sig : "");
+         }
+      }
+      dvm__throw(vm, "java/lang/StackOverflowError", "%d frames", vm->depth);
+      return false;
+   }
+
+   /* Every call passes through here: test the first character before comparing names. */
+   if (nslots >= 2 && m->name && m->name[0] == 'u' && m->sig &&
+       !strcmp(m->name, "uncaughtException") &&
+       !strcmp(m->sig, "(Ljava/lang/Thread;Ljava/lang/Throwable;)V"))
+      log_forwarded_uncaught(vm, (dvm_ref)slots[1], m);
+
+   bool is_static = (m->access & DEX_ACC_STATIC) != 0;
+   if (!is_static && !self && !(m->access & DEX_ACC_NATIVE)) {
+      /* "self" marks the callee-side check, so a null receiver can be told
+       * apart from the call-site one below. */
+      dvm__throw(vm, "java/lang/NullPointerException", "self %s.%s%s",
+                 m->cls->name, m->name, m->sig ? m->sig : "");
+      return false;
+   }
+
+   /* A class is initialised by its first static call or its first
+    * construction.  A host that builds an object through JNI (AllocObject +
+    * constructor, as the process Application is) never executes new-instance,
+    * so its <clinit> -- System.loadLibrary of the app's own natives, say --
+    * has to run here, before the constructor. */
+   if (m->cls && (is_static || (m->name && m->name[0] == '<' && !strcmp(m->name, "<init>"))) &&
+       !dvm_init_class(vm, m->cls)) return false;
+
+   const bool synchronized = (m->access & DEX_ACC_SYNCHRONIZED) != 0;
+   dvm_ref monitor = 0;
+   if (synchronized) {
+      monitor = is_static ? class_object(vm, m->cls) : self;
+      if (!dvm__monitor_enter(vm, monitor)) return false;
+   }
+
+   bool trace_this = trace_call_enabled(vm, m,
+      vm->invoke_frame ? vm->invoke_frame->previous : NULL);
+   if (vm->trace && trace_this) {
+      fprintf(stderr, "[dvm] %*scall %s.%s%s", vm->depth * 2, "",
+              m->cls ? m->cls->name : "?", m->name, m->sig ? m->sig : "");
+      if (self) fprintf(stderr, " on @%x", (unsigned)self);
+      fputc('\n', stderr);
+      /* What the reference arguments are: the declared type says little
+       * when the caller passes a subclass (which Throwable reached an error
+       * handler, which listener was registered). */
+      char one[256];
+      for (int i = 0, slot = 0; m->sig && slot < nslots &&
+           dvm__sig_param(m->sig, i, one, sizeof one); ++i) {
+         const bool wide = one[0] == 'J' || one[0] == 'D';
+         if ((one[0] == 'L' || one[0] == '[') && slots[slot]) {
+            struct dvm_object *o = dvm__obj(vm, (dvm_ref)slots[slot]);
+            char desc[384] = "";
+            if (o && o->cls && o->kind != DVM_OBJ_STRING)
+               dvm_describe_exception(vm, (dvm_ref)slots[slot], desc,
+                                      sizeof desc);
+            fprintf(stderr, "[dvm] %*s  arg%d = %s%s%s\n", vm->depth * 2, "", i,
+                    o && o->kind == DVM_OBJ_STRING ? "\""
+                       : o && o->cls && o->cls->name ? o->cls->name : "?",
+                    o && o->kind == DVM_OBJ_STRING
+                       ? (dvm_string_utf8(vm, (dvm_ref)slots[slot]) ?: "") : "",
+                    o && o->kind == DVM_OBJ_STRING ? "\"" : "");
+            if (desc[0] && (strstr(desc, "Exception") || strstr(desc, "Error")))
+               fprintf(stderr, "[dvm] %*s    (%s)\n", vm->depth * 2, "", desc);
+         } else if (one[0] != 'L' && one[0] != '[') {
+            union dvm_value value = {0};
+            value.ju = slots[slot];
+            if (wide && slot + 1 < nslots) value.ju |= (uint64_t)slots[slot + 1] << 32;
+            if (one[0] == 'F')
+               fprintf(stderr, "[dvm] %*s  arg%d = %.9g (float)\n", vm->depth * 2, "", i, (double)value.f);
+            else if (one[0] == 'D')
+               fprintf(stderr, "[dvm] %*s  arg%d = %.17g (double)\n", vm->depth * 2, "", i, value.d);
+            else if (one[0] == 'J')
+               fprintf(stderr, "[dvm] %*s  arg%d = %lld (wide)\n", vm->depth * 2, "", i, (long long)value.j);
+            else
+               fprintf(stderr, "[dvm] %*s  arg%d = %d\n", vm->depth * 2, "", i, value.i);
+         }
+         slot += wide ? 2 : 1;
+      }
+   }
+
+   if (m->builtin) {
+      union dvm_value args[64];
+      int nargs = slots_to_values(m->sig, slots, nslots, args, 64);
+      ++vm->depth;
+      struct dvm_method *previous_builtin = g_builtin_method;
+      g_builtin_method = m;
+      bool ok = m->builtin(vm, self, args, nargs, out);
+      g_builtin_method = previous_builtin;
+      --vm->depth;
+      if (synchronized && !dvm__monitor_exit(vm, monitor)) ok = false;
+      return ok && !vm->exception;
+   }
+
+   if (!m->has_code) {
+      bool native = (m->access & DEX_ACC_NATIVE) != 0;
+      ++vm->depth;
+      bool ok = dvm__call_out(vm, m->cls, m->name, m->sig, is_static, native,
+                         self, slots, nslots, out);
+      --vm->depth;
+      if (synchronized && !dvm__monitor_exit(vm, monitor)) ok = false;
+      return ok && !vm->exception;
+   }
+
+   uint16_t nregs = m->code.registers_size;
+   uint16_t nins = m->code.ins_size;
+   if (nregs < nins) nregs = nins;
+
+   uint32_t stackbuf[64];
+   uint32_t *regs = nregs <= 64 ? stackbuf : calloc(nregs ? nregs : 1, sizeof *regs);
+   if (!regs) {
+      dvm__throw(vm, "java/lang/OutOfMemoryError", "%u registers", nregs);
+      if (synchronized) (void)dvm__monitor_exit(vm, monitor);
+      return false;
+   }
+   memset(regs, 0, (size_t)nregs * sizeof *regs);
+
+   /* Parameters occupy the last ins_size registers, `this` first. */
+   int base = (int)nregs - (int)nins;
+   int w = base;
+   if (!is_static && w < nregs) regs[w++] = self;
+   for (int i = 0; i < nslots && w < nregs; ++i)
+      regs[w++] = slots[i];
+
+   struct frame fr = { .m = m, .regs = regs, .nregs = nregs, .pc = 0 };
+   ++vm->depth;
+   bool pushed = vm->ncallstack <
+                 (int)(sizeof vm->callstack / sizeof vm->callstack[0]);
+   if (pushed) vm->callstack[vm->ncallstack++] = m;
+   bool ok = execute(vm, &fr, out);
+   if (pushed) --vm->ncallstack;
+   --vm->depth;
+
+   /* Record the frames the exception passes on its way out, innermost first. */
+   if (!ok && vm->exception && m != vm->exc_trace[0] &&
+       vm->nexc_trace < (int)(sizeof vm->exc_trace / sizeof vm->exc_trace[0]))
+      vm->exc_trace[vm->nexc_trace++] = m;
+
+   if (regs != stackbuf) free(regs);
+   if (synchronized && !dvm__monitor_exit(vm, monitor)) ok = false;
+   return ok;
+}
 
 /* ------------------------------------------------------------------------ *
  * Public entry points
@@ -3816,8 +3864,9 @@ bool dvm__sched_trace_for(const char *class_name)
 /* `nested` separates the two callers.  The drain at a call boundary is
  * housekeeping and must stay flat: letting it re-enter turns every Runnable
  * that starts another into unbounded recursion.  A blocking wait is the
- * opposite case — the work it waits for is in this very queue, so refusing to
- * nest makes the wait unsatisfiable by construction. */
+ * opposite case for cooperative threads: their work may be in this queue.
+ * Handler callbacks still belong to the waiting main thread and must remain
+ * queued until its current dispatch returns to Looper.loop(). */
 /* How late a due Runnable may run before it is worth reporting.  Two frames:
  * below that it is indistinguishable from a device's own scheduling jitter. */
 #define DVM_LOOPER_LATE_MS 32u
@@ -3874,6 +3923,11 @@ static int drain_pending(struct dvm *vm, bool nested)
             continue;
          if (!vm->pending_is_thread[i] && vm->main_transaction_depth)
             continue;
+         /* sleep/yield/park do not run the caller's next Looper message.
+          * A nested wait may advance cooperative threads, never Handler work
+          * on the main thread whose current call is still on the stack. */
+         if (nested && !vm->pending_is_thread[i])
+            continue;
          if (vm->pending_due_ms[i] <= now) { pick = i; break; }
       }
       if (pick < 0) break;
@@ -3925,6 +3979,8 @@ static int drain_pending(struct dvm *vm, bool nested)
          if ((run && (run->has_code || run->builtin)) || proxy_run) {
             union dvm_value ret;
             uint64_t before = vm->steps;
+            struct timespec looper_t0;
+            clock_gettime(CLOCK_MONOTONIC, &looper_t0);
             /* The Runnable gets a slice of its own, so it starts from zero.
              * call_steps is only reset by dvm_call() at depth 0, and a drain
              * runs nested inside whatever call asked to wait — so without this
@@ -3966,6 +4022,38 @@ static int drain_pending(struct dvm *vm, bool nested)
             vm->quiet_uncaught = saved_quiet;
             vm->step_limit = saved_limit;
             vm->call_steps = saved_steps;
+            /* LUNARIA_TRACE_LOOPER: where the main looper's time goes, by
+             * callback class, every five seconds. */
+            if (!is_thread[i]) {
+               static int looper_trace = -1;
+               static struct { const char *name; unsigned runs; uint64_t ns, steps; } top[24];
+               static struct timespec looper_last;
+               if (looper_trace < 0) looper_trace = getenv("LUNARIA_TRACE_LOOPER") != NULL;
+               if (looper_trace) {
+                  struct timespec t1;
+                  clock_gettime(CLOCK_MONOTONIC, &t1);
+                  const char *cname = c && c->name ? c->name : "?";
+                  int slot = -1;
+                  for (int k = 0; k < 24 && slot < 0; ++k)
+                     if (top[k].name && !strcmp(top[k].name, cname)) slot = k;
+                  for (int k = 0; k < 24 && slot < 0; ++k)
+                     if (!top[k].name) { top[k].name = cname; slot = k; }
+                  if (slot >= 0) {
+                     ++top[slot].runs;
+                     top[slot].ns += (uint64_t)(t1.tv_sec - looper_t0.tv_sec) * 1000000000ull +
+                                     (uint64_t)(t1.tv_nsec - looper_t0.tv_nsec);
+                     top[slot].steps += vm->steps - before;
+                  }
+                  if (t1.tv_sec - looper_last.tv_sec >= 5) {
+                     for (int k = 0; k < 24; ++k)
+                        if (top[k].name && top[k].ns > 20000000ull)
+                           fprintf(stderr, "[looper] %6.0f ms %6u runs %10llu steps  %s\n", top[k].ns / 1e6,
+                                   top[k].runs, (unsigned long long)top[k].steps, top[k].name);
+                     memset(top, 0, sizeof top);
+                     looper_last = t1;
+                  }
+               }
+            }
             char how[256];
             how[0] = '\0';
             if (!ok && vm->exception)
@@ -4822,6 +4910,38 @@ void dvm_gil_yield(struct dvm *vm)
    /* No sched_yield(): dvm_gil_acquire() queues this thread behind everyone
     * who was already waiting, which is the hand-off this call is asking for. */
    dvm_gil_relock(vm, d);
+}
+
+/* LUNARIA_CALL_HISTO=1: which Java methods native code (or the scheduler)
+ * calls most, top 12 every 10 seconds.  The counts are advisory: a lost
+ * increment under a race costs a diagnostic one tick. */
+static void call_histogram(const struct dvm_method *m)
+{
+   static int enabled = -1;
+   static struct { const struct dvm_method *m; uint64_t n; } slot[512];
+   static uint64_t last_report;
+   if (enabled < 0) enabled = getenv("LUNARIA_CALL_HISTO") != NULL;
+   if (!enabled) return;
+   size_t h = ((uintptr_t)m >> 4) & 511;
+   for (size_t k = 0; k < 512; ++k, h = (h + 1) & 511) {
+      if (slot[h].m == m) { ++slot[h].n; break; }
+      if (!slot[h].m) { slot[h].m = m; slot[h].n = 1; break; }
+   }
+   const uint64_t now = dvm__now_ms();
+   if (!last_report) last_report = now;
+   if (now - last_report < 10000) return;
+   last_report = now;
+   for (int pass = 0; pass < 12; ++pass) {
+      size_t best = 512;
+      for (size_t i = 0; i < 512; ++i)
+         if (slot[i].m && (best == 512 || slot[i].n > slot[best].n)) best = i;
+      if (best == 512 || !slot[best].n) break;
+      fprintf(stderr, "[call-histo] %8llu %s.%s%s\n", (unsigned long long)slot[best].n,
+              slot[best].m->cls ? slot[best].m->cls->name : "?", slot[best].m->name,
+              slot[best].m->sig ? slot[best].m->sig : "");
+      slot[best].n = 0;
+   }
+   fprintf(stderr, "[call-histo] ----\n");
 }
 
 bool dvm_call(struct dvm *vm, struct dvm_method *m, dvm_ref self,

@@ -1500,17 +1500,6 @@ void lm_codec_stop(struct lm_codec *c)
    lm_codec_flush(c);
 }
 
-static void codec_flush_locked(struct lm_codec *c);
-
-void lm_codec_flush(struct lm_codec *c)
-{
-   if (!c) return;
-   if (c->vctx) pthread_mutex_lock(&c->mu);
-   codec_flush_locked(c);
-   if(c->actx) av.flush_buffers(c->actx);
-   if (c->vctx) pthread_mutex_unlock(&c->mu);
-}
-
 static void codec_flush_locked(struct lm_codec *c)
 {
    c->rendered_count=c->rendered_head=0;
@@ -1542,6 +1531,15 @@ static void codec_flush_locked(struct lm_codec *c)
       c->draining = c->drained = false;
       pthread_cond_broadcast(&c->cv);
    }
+}
+
+void lm_codec_flush(struct lm_codec *c)
+{
+   if (!c) return;
+   if (c->vctx) pthread_mutex_lock(&c->mu);
+   codec_flush_locked(c);
+   if(c->actx) av.flush_buffers(c->actx);
+   if (c->vctx) pthread_mutex_unlock(&c->mu);
 }
 
 int lm_codec_dequeue_input(struct lm_codec *c)
@@ -1647,21 +1645,6 @@ bool lm_codec_queue_input(struct lm_codec *c, int idx, int offset, int size,
 }
 
 static int codec_dequeue_output_locked(struct lm_codec *c, int64_t *pts_us,
-                                       int *size, int *flags);
-
-int lm_codec_dequeue_output(struct lm_codec *c, int64_t *pts_us, int *size,
-                            int *flags)
-{
-   if (c && c->vctx) {
-      pthread_mutex_lock(&c->mu);
-      int r = codec_dequeue_output_locked(c, pts_us, size, flags);
-      pthread_mutex_unlock(&c->mu);
-      return r;
-   }
-   return codec_dequeue_output_locked(c, pts_us, size, flags);
-}
-
-static int codec_dequeue_output_locked(struct lm_codec *c, int64_t *pts_us,
                                        int *size, int *flags)
 {
    if (pts_us) *pts_us = 0;
@@ -1711,6 +1694,18 @@ static int codec_dequeue_output_locked(struct lm_codec *c, int64_t *pts_us,
       }
    }
    return LM_INFO_TRY_AGAIN_LATER;
+}
+
+int lm_codec_dequeue_output(struct lm_codec *c, int64_t *pts_us, int *size,
+                            int *flags)
+{
+   if (c && c->vctx) {
+      pthread_mutex_lock(&c->mu);
+      int r = codec_dequeue_output_locked(c, pts_us, size, flags);
+      pthread_mutex_unlock(&c->mu);
+      return r;
+   }
+   return codec_dequeue_output_locked(c, pts_us, size, flags);
 }
 
 void lm_codec_output_size(const struct lm_codec *c, int *w, int *h)

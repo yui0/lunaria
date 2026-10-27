@@ -28,6 +28,9 @@
 #define IME_TYPE_TEXT_VARIATION_PASSWORD     0x00000080
 #define IME_TYPE_TEXT_VARIATION_WEB_PASSWORD 0x000000e0
 #define IME_TYPE_NUMBER_VARIATION_PASSWORD   0x00000010
+#define IME_TYPE_CLASS_DATETIME              0x00000004
+#define IME_TYPE_NUMBER_FLAG_SIGNED          0x00001000
+#define IME_TYPE_NUMBER_FLAG_DECIMAL         0x00002000
 
 #define IME_FIELD_ID "luna-ime-field"
 #define IME_TEXT_MAX 512   /* luna-ui's own LunaElement::text is this size */
@@ -278,10 +281,32 @@ bool luna_ime_click(const char *id)
    return true;
 }
 
+/* The key listener Android gives a field of this input type: a number field
+ * (DigitsKeyListener) takes digits, plus the sign and decimal point its flags
+ * allow; a phone field (DialerKeyListener) the dialler's characters; a
+ * date/time field (DateTimeKeyListener) digits and separators.  Text takes
+ * whatever is typed. */
+static bool ime_char_allowed(int input_type, uint32_t cp)
+{
+   if (cp < 0x20 || cp == 0x7f) return true;
+   const int cls = input_type & IME_TYPE_CLASS_MASK;
+   if (cls == IME_TYPE_CLASS_NUMBER) {
+      if (cp >= '0' && cp <= '9') return true;
+      if ((input_type & IME_TYPE_NUMBER_FLAG_SIGNED) && (cp == '-' || cp == '+')) return true;
+      return (input_type & IME_TYPE_NUMBER_FLAG_DECIMAL) && cp == '.';
+   }
+   if (cls == IME_TYPE_CLASS_PHONE)
+      return (cp >= '0' && cp <= '9') || (cp < 0x80 && strchr("#*+()-/.,; N", (int)cp));
+   if (cls == IME_TYPE_CLASS_DATETIME)
+      return (cp >= '0' && cp <= '9') || (cp < 0x80 && strchr("/-:. APMapm", (int)cp));
+   return true;
+}
+
 void luna_ime_frame(bool document_reparsed)
 {
    pthread_mutex_lock(&g_lock);
    bool up = g_active, ml = g_multiline;
+   const int input_type = g_input_type;
    char text[IME_TEXT_MAX];
    memcpy(text, g_text, sizeof text);
    pthread_mutex_unlock(&g_lock);
@@ -314,7 +339,7 @@ void luna_ime_frame(bool document_reparsed)
    bool cancelled = false, accepted = false;
    for (int i = 0; i < n; ++i) {
       if (batch[i].kind == IME_Q_CHAR) {
-         luna_char(batch[i].codepoint);
+         if (ime_char_allowed(input_type, batch[i].codepoint)) luna_char(batch[i].codepoint);
          continue;
       }
       /* Escape is the input method's own dismissal, not the editor's: a device

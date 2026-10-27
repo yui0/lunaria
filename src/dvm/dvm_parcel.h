@@ -17,7 +17,7 @@ enum {
 };
 #define PARCEL_BUNDLE_MAGIC 0x4C444E42
 
-struct rt_parcel { uint8_t *buf; uint32_t size, cap, pos; };
+struct rt_parcel { uint8_t *buf; uint32_t size, cap, pos; bool ipc, failed; unsigned depth; };
 
 static void parcel_destroy(void *data)
 {
@@ -65,7 +65,7 @@ static bool parcel_recycle(struct dvm *vm, dvm_ref self, const union dvm_value *
 static bool parcel_room(struct dvm *vm, struct rt_parcel *p, size_t n)
 {
    size_t need = (size_t)p->pos + n;
-   if (need > INT32_MAX) goto oom;
+   if (need > INT32_MAX || (p->ipc && need > LUNA_PROCESS_MESSAGE_MAX)) goto oom;
    if (need > p->cap) {
       size_t cap = p->cap ? p->cap : 256;
       while (cap < need) cap *= 2;
@@ -103,6 +103,7 @@ static bool parcel_take(struct rt_parcel *p, void *dst, size_t n)
    size_t padded = (n + 3) & ~(size_t)3;
    if (p->pos > p->size || padded > p->size - p->pos) {
       memset(dst, 0, n);
+      p->failed = true;
       p->pos = p->size;
       return false;
    }
@@ -147,9 +148,9 @@ static bool parcel_take_string(struct dvm *vm, struct rt_parcel *p, dvm_ref *out
 {
    *out = 0;
    int32_t units = parcel_take_i32(p);
-   if (units < 0) return true;
+   if (units < 0) {if(p->ipc && units != -1)p->failed=true;return true;}
    size_t bytes = ((size_t)units + 1) * 2;
-   if (p->pos > p->size || ((bytes + 3) & ~(size_t)3) > p->size - p->pos) return true;
+   if (p->pos > p->size || ((bytes + 3) & ~(size_t)3) > p->size - p->pos) {p->failed=true;return true;}
    const uint16_t *w = (const uint16_t *)(p->buf + p->pos);
    char *u = malloc((size_t)units * 3 + 1);
    if (!u) { dvm__throw(vm, "java/lang/OutOfMemoryError", "Parcel string"); return false; }
@@ -341,7 +342,7 @@ static dvm_ref parcel_read_prim_array(struct dvm *vm, struct rt_parcel *p, char 
    if (n < 0) return 0;
    size_t unit = kind == 'B' ? 1 : (kind == 'J' || kind == 'D') ? 8 : 4;
    size_t bytes = (size_t)n * unit;
-   if (p->pos > p->size || ((bytes + 3) & ~(size_t)3) > p->size - p->pos) { p->pos = p->size; return 0; }
+   if (p->pos > p->size || ((bytes + 3) & ~(size_t)3) > p->size - p->pos) { p->failed=true;p->pos = p->size; return 0; }
    dvm_ref a = into;
    if (into) {
       if (dvm_array_length(vm, into) != (uint32_t)n) {
@@ -591,7 +592,7 @@ static bool parcel_createStringArray(struct dvm *vm, dvm_ref self, const union d
    PARCEL_SELF()
    int32_t n = parcel_take_i32(p);
    if (n < 0) RETL(0);
-   if ((uint32_t)n > (p->size - (p->pos > p->size ? p->size : p->pos)) / 4) { p->pos = p->size; RETL(0); }
+   if ((uint32_t)n > (p->size - (p->pos > p->size ? p->size : p->pos)) / 4) { p->failed=true;p->pos = p->size; RETL(0); }
    dvm_ref a = dvm_new_array(vm, 'L', "Ljava/lang/String;", (uint32_t)n);
    if (!a) { dvm__throw(vm, "java/lang/OutOfMemoryError", "String[]"); return false; }
    dvm_pin(vm, a);
@@ -644,10 +645,33 @@ static bool parcel_createStringArrayList(struct dvm *vm, dvm_ref self, const uni
 
 /* ---- generic values, Map, List, Bundle ---------------------------------- */
 
-static bool parcel_write_value(struct dvm *vm, dvm_ref self, struct rt_parcel *p, dvm_ref v);
-static bool parcel_read_value(struct dvm *vm, dvm_ref self, struct rt_parcel *p, dvm_ref *out);
+static bool parcel_write_value_inner(struct dvm *vm, dvm_ref self, struct rt_parcel *p, dvm_ref v);
+static bool parcel_write_value(struct dvm *vm, dvm_ref self, struct rt_parcel *p, dvm_ref v)
+{
+   if(p->ipc && (p->failed || p->depth>=64)){
+      p->failed=true;dvm__throw(vm,"android/os/BadParcelableException","IPC Parcel nesting or bounds");return false;
+   }
+   ++p->depth;
+   bool ok=parcel_write_value_inner(vm,self,p,v);
+   --p->depth;return ok;
+}
 
-static bool parcel_value_is(struct dvm *vm, dvm_ref v, const char *desc);
+static bool parcel_read_value_inner(struct dvm *vm, dvm_ref self, struct rt_parcel *p, dvm_ref *out);
+static bool parcel_read_value(struct dvm *vm, dvm_ref self, struct rt_parcel *p, dvm_ref *out)
+{
+   if(p->ipc && (p->failed || p->depth>=64)){
+      p->failed=true;dvm__throw(vm,"android/os/BadParcelableException","IPC Parcel nesting or bounds");return false;
+   }
+   ++p->depth;
+   bool ok=parcel_read_value_inner(vm,self,p,out);
+   --p->depth;return ok;
+}
+
+static bool parcel_value_is(struct dvm *vm, dvm_ref v, const char *desc)
+{
+   struct dvm_class *c = dvm_object_class(vm, v), *t = dvm__class_by_desc(vm, desc);
+   return c && t && dvm__class_assignable(vm, c, t);
+}
 
 static bool parcel_write_map_body(struct dvm *vm, dvm_ref self, struct rt_parcel *p, dvm_ref map)
 {
@@ -699,6 +723,9 @@ static bool parcel_put_pair(struct dvm *vm, dvm_ref map, dvm_ref k, dvm_ref v)
 
 static bool parcel_read_map_into(struct dvm *vm, dvm_ref self, struct rt_parcel *p, dvm_ref map, int32_t n)
 {
+   if(p->ipc && (n<0 || p->pos>p->size || (uint32_t)n>(p->size-p->pos)/8u)){
+      p->failed=true;return false;
+   }
    for (int32_t i = 0; i < n; ++i) {
       dvm_ref k, v;
       if (!parcel_read_value(vm, self, p, &k)) return false;
@@ -714,7 +741,7 @@ static bool parcel_read_bundle(struct dvm *vm, dvm_ref self, struct rt_parcel *p
 {
    *out = 0;
    int32_t length = parcel_take_i32(p);
-   if (length < 0) return true;
+   if (length < 0) {if(p->ipc && length != -1)p->failed=true;return true;}
    dvm_ref b = parcel_new_instance(vm, "Landroid/os/Bundle;");
    union dvm_value ignored = { 0 };
    if (!b || !map_init(vm, b, NULL, 0, &ignored)) {
@@ -728,21 +755,17 @@ static bool parcel_read_bundle(struct dvm *vm, dvm_ref self, struct rt_parcel *p
       return false;
    }
    uint32_t start = p->pos;
+   if(p->ipc && ((uint32_t)length>p->size-start || length<4)){p->failed=true;return false;}
    int32_t n = parcel_take_i32(p);
    dvm_pin(vm, b);
    bool ok = parcel_read_map_into(vm, self, p, b, n);
    dvm_unpin(vm, b);
+   if(p->ipc && p->pos!=start+(uint32_t)length){p->failed=true;return false;}
    p->pos = start + (uint32_t)length > p->size ? p->size : start + (uint32_t)length;
    return ok;
 }
 
-static bool parcel_value_is(struct dvm *vm, dvm_ref v, const char *desc)
-{
-   struct dvm_class *c = dvm_object_class(vm, v), *t = dvm__class_by_desc(vm, desc);
-   return c && t && dvm__class_assignable(vm, c, t);
-}
-
-static bool parcel_write_value(struct dvm *vm, dvm_ref self, struct rt_parcel *p, dvm_ref v)
+static bool parcel_write_value_inner(struct dvm *vm, dvm_ref self, struct rt_parcel *p, dvm_ref v)
 {
    if (!v) return parcel_put_i32(vm, p, PARCEL_VAL_NULL);
    struct dvm_object *o = dvm__obj(vm, v);
@@ -794,6 +817,9 @@ static bool parcel_write_value(struct dvm *vm, dvm_ref self, struct rt_parcel *p
          }
          return true;
       }
+      if (p->ipc && parcel_value_is(vm,v,"Landroid/os/Parcelable;")) {
+         dvm__throw(vm,"java/lang/UnsupportedOperationException","Parcelable IPC transport is not implemented for %s",cn);return false;
+      }
       if (parcel_value_is(vm, v, "Landroid/os/Parcelable;"))
          return parcel_put_i32(vm, p, PARCEL_VAL_PARCELABLE) && parcel_write_class_name(vm, p, v) &&
                 parcel_write_parcelable_body(vm, self, v, 0);
@@ -808,7 +834,7 @@ static bool parcel_write_value(struct dvm *vm, dvm_ref self, struct rt_parcel *p
    return false;
 }
 
-static bool parcel_read_value(struct dvm *vm, dvm_ref self, struct rt_parcel *p, dvm_ref *out)
+static bool parcel_read_value_inner(struct dvm *vm, dvm_ref self, struct rt_parcel *p, dvm_ref *out)
 {
    *out = 0;
    int32_t type = parcel_take_i32(p);
@@ -847,6 +873,7 @@ static bool parcel_read_value(struct dvm *vm, dvm_ref self, struct rt_parcel *p,
    }
    case PARCEL_VAL_LIST: {
       int32_t n = parcel_take_i32(p);
+      if(p->ipc && (n<0 || p->pos>p->size || (uint32_t)n>(p->size-p->pos)/4u)){p->failed=true;return false;}
       dvm_ref l = coll_new_list(vm, "Ljava/util/ArrayList;");
       if (!l) { dvm__throw(vm, "java/lang/OutOfMemoryError", "ArrayList"); return false; }
       dvm_pin(vm, l);
@@ -862,6 +889,7 @@ static bool parcel_read_value(struct dvm *vm, dvm_ref self, struct rt_parcel *p,
       return true;
    }
    case PARCEL_VAL_PARCELABLE: {
+      if(p->ipc){p->failed=true;return false;}
       dvm_ref name, creator;
       if (!parcel_take_string(vm, p, &name) && dvm_exception(vm)) return false;
       if (!name) return true;
@@ -1091,3 +1119,146 @@ static const struct rt_method rt_parcel_methods[] = {
    M("readException", "()V", parcel_readException),
    M_END
 };
+
+/* Internal component transport, version 1. The envelope is not an Android
+ * Intent parcel layout; its values use the same Parcel/Bundle implementation
+ * as application calls. No VM object references or native pointers cross it. */
+int dvm_service_pack(struct dvm *vm,uint32_t intent,int operation,void **bytes,size_t *size)
+{
+   *bytes=NULL;*size=0;
+   if(!intent || (operation!=1 && operation!=2))return -EINVAL;
+   union dvm_value parcel={0},value={0},ignored={0};
+   if(!parcel_obtain(vm,0,NULL,0,&parcel))return -ENOMEM;
+   dvm_pin(vm,parcel.l);dvm_pin(vm,intent);
+   struct rt_parcel *p=parcel_of(vm,parcel.l);p->ipc=true;
+   bool ok=parcel_put_i32(vm,p,0x3156534c) && parcel_put_i32(vm,p,operation);
+   for(const struct rt_field *f=rt_intent_fields;ok && f->name;++f){
+      value.l=0;(void)dvm_get_field(vm,intent,f->name,f->type,&value);
+      if(!strcmp(f->name,"flags"))ok=parcel_put_i32(vm,p,value.i);
+      else if(!strcmp(f->name,"data")){
+         union dvm_value text={0};
+         ok=!value.l || uri_toString(vm,value.l,NULL,0,&text);
+         if(ok)ok=parcel_put_string(vm,p,text.l);
+      } else if(!strcmp(f->name,"component")){
+         ok=parcel_put_i32(vm,p,value.l!=0);
+         const char *fields[]={"pkg","cls"};
+         for(unsigned i=0;ok && value.l && i<2;++i){
+            union dvm_value text={0};
+            (void)dvm_get_field(vm,value.l,fields[i],"Ljava/lang/String;",&text);
+            ok=parcel_put_string(vm,p,text.l);
+         }
+      } else if(!strcmp(f->name,"categories")){
+         union dvm_value array={0};
+         ok=!value.l || am_vcall(vm,value.l,"toArray","()[Ljava/lang/Object;",NULL,0,&array);
+         uint32_t n=array.l ? dvm_array_length(vm,array.l) : 0;
+         if(ok)ok=parcel_put_i32(vm,p,value.l ? (int32_t)n : -1);
+         for(uint32_t i=0;ok && i<n;++i)
+            ok=parcel_put_string(vm,p,((dvm_ref *)dvm_array_data(vm,array.l))[i]);
+      } else ok=parcel_put_string(vm,p,value.l);
+   }
+   if(ok){
+      ok=intent_getExtras(vm,intent,NULL,0,&value);
+      if(ok){if(value.l)dvm_pin(vm,value.l);ok=parcel_write_bundle(vm,parcel.l,p,value.l);if(value.l)dvm_unpin(vm,value.l);}
+   }
+   if(ok && !p->failed && !dvm_exception(vm)){
+      *bytes=p->buf;*size=p->size;p->buf=NULL;p->size=p->cap=p->pos=0;
+   } else ok=false;
+   (void)parcel_recycle(vm,parcel.l,NULL,0,&ignored);
+   dvm_unpin(vm,intent);dvm_unpin(vm,parcel.l);
+   return ok ? 0 : -EINVAL;
+}
+
+int dvm_service_unpack(struct dvm *vm,const void *bytes,size_t size,int *operation,uint32_t *intent)
+{
+   *intent=0;*operation=0;
+   if(!bytes || size<8 || size>LUNA_PROCESS_MESSAGE_MAX)return -EINVAL;
+   union dvm_value parcel={0},ignored={0};
+   if(!parcel_obtain(vm,0,NULL,0,&parcel))return -ENOMEM;
+   dvm_pin(vm,parcel.l);
+   struct rt_parcel *p=parcel_of(vm,parcel.l);p->ipc=true;
+   p->buf=malloc(size);bool ok=p->buf!=NULL;
+   if(ok){memcpy(p->buf,bytes,size);p->size=p->cap=(uint32_t)size;}
+   int op=0;
+   if(ok){ok=parcel_take_i32(p)==0x3156534c;op=parcel_take_i32(p);ok=ok && (op==1 || op==2);}
+   dvm_ref result=ok ? dvm_new_object(vm,dvm_find_class(vm,"android/content/Intent")) : 0;
+   if(result)dvm_pin(vm,result);else ok=false;
+   if(ok)ok=map_init(vm,result,NULL,0,&ignored);
+   for(const struct rt_field *f=rt_intent_fields;ok && f->name;++f){
+      union dvm_value value={0};
+      if(!strcmp(f->name,"flags"))value.i=parcel_take_i32(p);
+      else if(!strcmp(f->name,"data")){
+         union dvm_value text={0};ok=parcel_take_string(vm,p,&text.l);
+         if(ok && text.l)ok=uri_parse(vm,0,&text,1,&value);
+      } else if(!strcmp(f->name,"component")){
+         int present=parcel_take_i32(p);if(present!=0 && present!=1)ok=false;
+         if(present && ok){
+            value.l=dvm_new_object(vm,dvm_find_class(vm,"android/content/ComponentName"));
+            if(!value.l){ok=false;break;}
+            dvm_pin(vm,value.l);
+            const char *fields[]={"pkg","cls"};
+            for(unsigned i=0;ok && i<2;++i){
+               union dvm_value text={0};ok=parcel_take_string(vm,p,&text.l) && text.l;
+               if(ok)ok=dvm_set_field(vm,value.l,fields[i],"Ljava/lang/String;",text);
+            }
+            dvm_unpin(vm,value.l);
+         }
+      } else if(!strcmp(f->name,"categories")){
+         int32_t n=parcel_take_i32(p);
+         if(n < -1 || (n>=0 && (uint32_t)n>(p->size-p->pos)/4u)){ok=false;break;}
+         if(n>=0){
+            value.l=coll_new_list(vm,"Ljava/util/HashSet;");if(!value.l){ok=false;break;}
+            dvm_pin(vm,value.l);
+            for(int32_t i=0;ok && i<n;++i){
+               union dvm_value text={0};ok=parcel_take_string(vm,p,&text.l) && text.l;
+               if(ok)ok=list_add(vm,value.l,&text,1,&ignored);
+            }
+            dvm_unpin(vm,value.l);
+         }
+      } else ok=parcel_take_string(vm,p,&value.l);
+      if(ok)ok=!p->failed && dvm_set_field(vm,result,f->name,f->type,value);
+   }
+   dvm_ref extras=0;
+   if(ok)ok=parcel_read_bundle(vm,parcel.l,p,&extras);
+   if(ok && extras){dvm_pin(vm,extras);union dvm_value source={.l=extras};ok=map_putAll(vm,result,&source,1,&ignored);dvm_unpin(vm,extras);}
+   ok=ok && !p->failed && p->pos==p->size && !dvm_exception(vm);
+   if(ok){*intent=result;*operation=op;}
+   if(result)dvm_unpin(vm,result);
+   (void)parcel_recycle(vm,parcel.l,NULL,0,&ignored);dvm_unpin(vm,parcel.l);
+   return ok ? 0 : -EINVAL;
+}
+
+/* Called on the component process's main loop, outside the interpreter lock. */
+int dvm_service_dispatch(struct dvm *vm,const void *bytes,size_t size)
+{
+   if(!vm)return -EINVAL;
+   unsigned cookie=dvm_gil_enter_from_guest(vm);
+   struct dvm_tstate saved,main_turn={0};dvm__tstate_save(vm,&saved);
+   main_turn.cur_thread=vm->main_thread;dvm__tstate_load(vm,&main_turn);
+   uint32_t intent=0;int op=0;
+   int status=dvm_service_unpack(vm,bytes,size,&op,&intent);
+   if(!status){
+      dvm_pin(vm,intent);
+      union dvm_value args[2]={{.l=intent},{0}},resolved={0},result={0};
+      /* Only enabled, declared components in this process may be dispatched. */
+      bool found=pm_resolveService(vm,0,args,2,&resolved) && resolved.l &&
+                 svc_process_is_current(vm,resolved.l);
+      if(found){
+         bool ok=op==1 ? ctx_startService(vm,0,args,1,&result) : ctx_stopService(vm,0,args,1,&result);
+         status=ok && !dvm_exception(vm) ? (result.l ? 1 : 0) : -EIO;
+      } else status=dvm_exception(vm) ? -EIO : -ENOENT;
+      dvm_unpin(vm,intent);
+   }
+   if(dvm_exception(vm)){
+      fprintf(stderr,"[service] component command raised a Java exception\n");
+      if(status>=0)status=-EIO;
+   }
+   dvm__tstate_load(vm,&saved);dvm_gil_leave_to_guest(vm,cookie);return status;
+}
+
+void dvm_service_set_submit(struct dvm *vm,int (*submit)(void *,const char *,const void *,size_t),void *user)
+{
+   if(!vm)return;
+   unsigned cookie=dvm_gil_enter_from_guest(vm);
+   vm->service_submit=submit;vm->service_submit_user=user;
+   dvm_gil_leave_to_guest(vm,cookie);
+}

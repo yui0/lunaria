@@ -107,6 +107,8 @@
 
 # Android hardware reports (memory in MiB). These do not reserve host RAM.
 #LUNARIA_MEM_TOTAL_MB=6144
+# CPU count accepts 1..32; the default follows the device profile.
+# Host CPU topology is never exposed to Android.
 #LUNARIA_CPU_COUNT=4
 
 # Execution engines for the A64 scheduler.

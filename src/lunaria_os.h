@@ -1929,6 +1929,8 @@ static inline int luna_vma_protect(struct luna_vma_table *t, uint64_t lo,
 #define luna_file_openat luna_symlink_openat
 #define luna_file_fopen luna_symlink_fopen
 #define luna_file_infoat luna_symlink_infoat
+#define luna_file_fd_info luna_symlink_fd_info
+#define luna_file_fd_chmod luna_symlink_fd_chmod
 #define luna_file_unlink luna_symlink_unlink
 #define luna_file_unlinkat luna_symlink_unlinkat
 #define luna_file_rename luna_symlink_rename
@@ -1946,4 +1948,46 @@ static inline int luna_vma_protect(struct luna_vma_table *t, uint64_t lo,
 #define luna_directory_read luna_symlink_directory_read
 #define luna_directory_close luna_symlink_directory_close
 #endif
+
+/* ---- Independent Android component process IPC ---- */
+#ifdef __cplusplus
+extern "C" {
+#endif
+#define LUNA_PROCESS_MESSAGE_MAX (1024u * 1024u)
+struct luna_process_channel;
+struct luna_process_pool;
+/* Payloads are owned by the channel until this callback returns. Callbacks
+ * run outside its lock and may enqueue a reply. Object references must be
+ * serialized by the VM before entering this transport. */
+typedef void (*luna_process_message_fn)(void *,const void *,size_t);
+typedef void (*luna_process_reply_fn)(void *,const char *,uint32_t,const void *,size_t);
+/* Takes ownership of fd. The endpoint is nonblocking and close-on-exec. */
+struct luna_process_channel *luna_process_channel_open(int fd);
+int luna_process_channel_send(struct luna_process_channel *,const void *,size_t);
+/* Returns a message count or negative errno; -EPIPE means peer shutdown. */
+int luna_process_channel_tick(struct luna_process_channel *,luna_process_message_fn,void *);
+void luna_process_channel_close(struct luna_process_channel *);
+/* Each process is exec'd as executable mode 3, with only stdin/stdout/stderr
+ * and control fd 3 inherited. One VM is reused per Android process name.
+ * Guest PID ranges are disjoint, each reserving 4096 thread IDs. */
+struct luna_process_pool *luna_process_pool_open(const char *executable,const char *mode,
+                                                uint32_t parent_pid,uint32_t first_pid);
+int luna_process_pool_send(struct luna_process_pool *,const char *process,
+                            const void *,size_t,uint32_t *guest_pid);
+/* A reply callback may enqueue another message, including to another VM.
+ * -EPIPE reports a closed channel; the corresponding death notice becomes
+ * available once the child is reaped. Other VMs' replies are still delivered. */
+int luna_process_pool_tick(struct luna_process_pool *,luna_process_reply_fn,void *);
+/* Death notices follow any final replies already written by that VM.
+ * Returns 1 for a notice, 0 when empty, or negative errno. status is a
+ * waitpid-encoded status, or -ECHILD when another reaper collected it. */
+int luna_process_pool_next_exit(struct luna_process_pool *,char *name,size_t capacity,
+                                 uint32_t *guest_pid,int *status);
+/* Closes IPC, then reaps only this pool's own children. A bounded grace
+ * period precedes termination of a child that does not close voluntarily. */
+void luna_process_pool_close(struct luna_process_pool *);
+#ifdef __cplusplus
+}
+#endif
+
 #endif /* LUNARIA_OS_H */

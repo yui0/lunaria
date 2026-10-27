@@ -17,7 +17,6 @@
 #include <stdatomic.h>
 #include "lunaria_os.h"
 #include "jvm.h"
-#include "java_type.h"
 #include "trace.h"
 #include "dvm/dvm_jni.h"
 #include "dvm/dvm.h"
@@ -3637,4 +3636,43 @@ jvm_init(struct jvm *jvm)
    vm_init(&jvm->vm, &jvm->invoke);
    env_init(&jvm->env, &jvm->native);
    jvm_make_class(jvm, "java/lang/Class");
+}
+
+/* ---- Process Application startup ---- */
+/* No Activity, window, native engine, or host event loop is created here.
+ * Constructors and attachBaseContext precede providers; Application.onCreate
+ * follows them. Failure leaves the original Java exception pending. */
+int luna_application_start(struct jvm *jvm,const char *manifest_class,
+      bool (*in_dex)(const char *),int (*providers)(struct jvm *,jobject),
+      jobject *base_out,jobject *application_out)
+{
+   *base_out=NULL;*application_out=NULL;
+   char name[512];
+   const char *source=manifest_class && *manifest_class ? manifest_class : "android/app/Application";
+   size_t n=strlen(source);if(n>=sizeof name)return -1;
+   for(size_t i=0;i<=n;++i)name[i]=source[i]=='.' ? '/' : source[i];
+   bool custom=strcmp(name,"android/app/Application")!=0;
+   if(custom && !in_dex(name))return -1;
+   jclass context=jvm->native.FindClass(&jvm->env,"android/content/Context");
+   if(!context || jvm->native.ExceptionCheck(&jvm->env))return -1;
+   jobject base=jvm->native.AllocObject(&jvm->env,context);
+   if(!base || jvm->native.ExceptionCheck(&jvm->env))return -1;
+   jclass cls=jvm->native.FindClass(&jvm->env,name);
+   if(!cls || jvm->native.ExceptionCheck(&jvm->env))return -1;
+   jmethodID ctor=jvm->native.GetMethodID(&jvm->env,cls,"<init>","()V");
+   if(!ctor || jvm->native.ExceptionCheck(&jvm->env))return -1;
+   jobject application=jvm->native.NewObjectA(&jvm->env,cls,ctor,NULL);
+   if(!application || jvm->native.ExceptionCheck(&jvm->env))return -1;
+   jmethodID attach=jvm->native.GetMethodID(&jvm->env,cls,"attachBaseContext",
+                                           "(Landroid/content/Context;)V");
+   if(!attach || jvm->native.ExceptionCheck(&jvm->env))return -1;
+   jvalue arg={.l=base};
+   jvm->native.CallVoidMethodA(&jvm->env,application,attach,&arg);
+   if(jvm->native.ExceptionCheck(&jvm->env))return -1;
+   if(providers(jvm,application)<0 || jvm->native.ExceptionCheck(&jvm->env))return -1;
+   jmethodID create=jvm->native.GetMethodID(&jvm->env,cls,"onCreate","()V");
+   if(!create || jvm->native.ExceptionCheck(&jvm->env))return -1;
+   jvm->native.CallVoidMethodA(&jvm->env,application,create,NULL);
+   if(jvm->native.ExceptionCheck(&jvm->env))return -1;
+   *base_out=base;*application_out=application;return 0;
 }

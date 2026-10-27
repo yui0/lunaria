@@ -237,7 +237,18 @@ static char *encode(const struct points *v)
    s[w] = 0;
    return s;
 }
-static unsigned prep_flags(uint32_t cp);
+static unsigned prep_flags(uint32_t cp)
+{
+   size_t lo = 0, hi = COUNT(prep_ranges);
+   while (lo < hi) {
+      size_t m = lo + (hi - lo) / 2;
+      if (prep_ranges[m].last < cp)
+         lo = m + 1;
+      else
+         hi = m;
+   }
+   return lo < COUNT(prep_ranges) && prep_ranges[lo].first <= cp ? prep_ranges[lo].flags : 0;
+}
 static bool decompose(struct points *v, uint32_t cp, bool compat, bool legacy)
 {
    if (legacy) {
@@ -346,18 +357,6 @@ char *luna_unicode_normalize(const char *s, int form)
       r = encode(&v);
    free(v.p);
    return r;
-}
-static unsigned prep_flags(uint32_t cp)
-{
-   size_t lo = 0, hi = COUNT(prep_ranges);
-   while (lo < hi) {
-      size_t m = lo + (hi - lo) / 2;
-      if (prep_ranges[m].last < cp)
-         lo = m + 1;
-      else
-         hi = m;
-   }
-   return lo < COUNT(prep_ranges) && prep_ranges[lo].first <= cp ? prep_ranges[lo].flags : 0;
 }
 static bool nameprep(struct points *v, unsigned flags)
 {

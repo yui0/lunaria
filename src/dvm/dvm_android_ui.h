@@ -1855,7 +1855,7 @@ static const struct rt_method rt_context[] = {
     * SDKs posted their work to nowhere. */
    M("getMainLooper", "()Landroid/os/Looper;", looper_get),
    M("createDeviceProtectedStorageContext", "()Landroid/content/Context;",
-     context_create_package),
+     return_self),
    M("getSharedPreferences",
      "(Ljava/lang/String;I)Landroid/content/SharedPreferences;",
      context_get_shared_preferences),
@@ -2099,9 +2099,34 @@ static bool text_set_text_resource(struct dvm *vm, dvm_ref self,
    return text_set_text(vm, self, &text, 1, out);
 }
 
+/* The colour of the first row whose spec the state set satisfies
+ * (StateSet.stateSetMatches: every positive state present, every negated
+ * one absent; an empty spec matches anything), else `fallback`. */
 static int32_t color_state_lookup(struct dvm *vm, dvm_ref self,
                                   const int32_t *set, uint32_t nset,
-                                  int32_t fallback);
+                                  int32_t fallback)
+{
+   union dvm_value specs = { 0 }, colors = { 0 };
+   (void)dvm_get_field(vm, self, "stateSpecs", "[[I", &specs);
+   (void)dvm_get_field(vm, self, "colors", "[I", &colors);
+   struct dvm_object *rows = specs.l ? dvm__obj(vm, specs.l) : NULL;
+   struct dvm_object *vals = colors.l ? dvm__obj(vm, colors.l) : NULL;
+   if (!rows || !vals || !rows->data || !vals->data) return fallback;
+   const uint32_t n = rows->length < vals->length ? rows->length : vals->length;
+   for (uint32_t i = 0; i < n; ++i) {
+      struct dvm_object *row = dvm__obj(vm, ((dvm_ref *)rows->data)[i]);
+      bool match = true;
+      for (uint32_t k = 0; row && row->data && k < row->length && match; ++k) {
+         const int32_t st = ((int32_t *)row->data)[k];
+         bool present = false;
+         for (uint32_t j = 0; j < nset; ++j)
+            if (set[j] == (st > 0 ? st : -st)) { present = true; break; }
+         match = st > 0 ? present : !present;
+      }
+      if (match) return ((int32_t *)vals->data)[i];
+   }
+   return fallback;
+}
 
 /* setTextColor(ColorStateList): the list replaces the text colour; what is
  * drawn is its colour for the view's state — at rest, {state_enabled}. */
@@ -2577,12 +2602,38 @@ static bool text_get_key_listener(struct dvm *vm, dvm_ref self,
    RETL(v.l);
 }
 
+/* TextView.setTypeface(tf[, style]): the style is what the text shows. */
 static bool text_set_typeface(struct dvm *vm, dvm_ref self,
                               const union dvm_value *args, int nargs,
-                              union dvm_value *out);
+                              union dvm_value *out)
+{
+   (void)out;
+   int32_t style = ARG(0).l ? rt_get_int(vm, ARG(0).l, "style") : 0;
+   if (nargs >= 2) style = ARG(1).i;
+   (void)dvm_set_field(vm, self, "typeface", "Landroid/graphics/Typeface;", ARG(0));
+   union dvm_value paint = {0};
+   (void)dvm_get_field(vm, self, "textPaint", "Landroid/text/TextPaint;", &paint);
+   if (paint.l)
+      (void)dvm_set_field(vm, paint.l, "typeface", "Landroid/graphics/Typeface;", ARG(0));
+   rt_set_int(vm, self, "textStyle", style & 3);
+   ui_layout_changed();
+   RETV();
+}
+
 static bool text_set_gravity(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
-                             union dvm_value *out);
+                             union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   int32_t g = ARG(0).i;
+   /* No horizontal part means START, no vertical part TOP (TextView). */
+   if (!(g & 0x07) && !(g & 0x800007)) g |= 0x800003;
+   if (!(g & 0x70)) g |= 0x30;
+   rt_set_int(vm, self, "gravity", g);
+   ui_layout_changed();
+   ui_invalidate();
+   RETV();
+}
 
 static bool text_get_typeface(struct dvm *vm, dvm_ref self,
                               const union dvm_value *args, int nargs,
@@ -2977,8 +3028,19 @@ static bool image_get_scale_type(struct dvm *vm, dvm_ref self,
    struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/widget/ImageView$ScaleType;");
    RETL(c && o < c->nsslots ? c->sslots[o].l : 0);
 }
-
-static bool image_matrix_storage(struct dvm *,dvm_ref,const union dvm_value *,int,union dvm_value *);
+static bool image_matrix_storage(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                             int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "imageMatrix", "Landroid/graphics/Matrix;", &v);
+   if (!v.l) {
+      struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/graphics/Matrix;");
+      v.l = c ? dvm_new_object(vm, c) : 0;
+      (void)dvm_set_field(vm, self, "imageMatrix", "Landroid/graphics/Matrix;", v);
+   }
+   RETL(v.l);
+}
 static bool image_get_matrix(struct dvm *,dvm_ref,const union dvm_value *,int,union dvm_value *);
 static bool image_on_draw(struct dvm *,dvm_ref,const union dvm_value *,int,union dvm_value *);
 
@@ -2994,19 +3056,6 @@ static bool image_set_matrix(struct dvm *vm, dvm_ref self, const union dvm_value
    } else if (!am_vcall(vm,matrix.l,"reset","()V",NULL,0,out)) return false;
    ui_invalidate();
    RETV();
-}
-static bool image_matrix_storage(struct dvm *vm, dvm_ref self, const union dvm_value *args,
-                             int nargs, union dvm_value *out)
-{
-   (void)args; (void)nargs;
-   union dvm_value v = { 0 };
-   (void)dvm_get_field(vm, self, "imageMatrix", "Landroid/graphics/Matrix;", &v);
-   if (!v.l) {
-      struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/graphics/Matrix;");
-      v.l = c ? dvm_new_object(vm, c) : 0;
-      (void)dvm_set_field(vm, self, "imageMatrix", "Landroid/graphics/Matrix;", v);
-   }
-   RETL(v.l);
 }
 
 static bool image_crop_padding(struct dvm *vm,dvm_ref self,const union dvm_value *args,
@@ -3248,7 +3297,62 @@ static bool compound_set_listener(struct dvm *vm, dvm_ref self,
    RETV();
 }
 
+/* CompoundButton.setButtonDrawable / setButtonTintList / getButtonDrawable.
+ * The button's picture is what a check box or radio button shows beside its
+ * label; text_compound_get() lays it out as the leading drawable and
+ * text_on_draw() paints it in the view's current state. */
+static bool compound_apply_tint(struct dvm *vm, dvm_ref self)
+{
+   union dvm_value drawable = { 0 }, tint = { 0 }, ignored = { 0 };
+   (void)dvm_get_field(vm, self, "buttonDrawable", "Landroid/graphics/drawable/Drawable;", &drawable);
+   (void)dvm_get_field(vm, self, "buttonTint", "Landroid/content/res/ColorStateList;", &tint);
+   if (!drawable.l || !tint.l) return true;
+   return am_vcall(vm, drawable.l, "setTintList", "(Landroid/content/res/ColorStateList;)V", &tint, 1, &ignored);
+}
+
+static bool compound_set_button_drawable(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                                         int nargs, union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   union dvm_value drawable = { .l = 0 };
+   if (!strcmp(builtin_sig(), "(I)V")) {
+      union dvm_value context = { 0 };
+      (void)dvm_get_field(vm, self, "context", "Landroid/content/Context;", &context);
+      if (ARG(0).i && context.l &&
+          !am_vcall(vm, context.l, "getDrawable", "(I)Landroid/graphics/drawable/Drawable;", args, 1, &drawable))
+         return false;
+   } else {
+      drawable.l = ARG(0).l;
+   }
+   (void)dvm_set_field(vm, self, "buttonDrawable", "Landroid/graphics/drawable/Drawable;", drawable);
+   if (!compound_apply_tint(vm, self)) return false;
+   ui_view_layout_changed(vm, self);
+   ui_invalidate();
+   RETV();
+}
+
+static bool compound_get_button_drawable(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                                         int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value v = { 0 };
+   (void)dvm_get_field(vm, self, "buttonDrawable", "Landroid/graphics/drawable/Drawable;", &v);
+   RETL(v.l);
+}
+
+static bool compound_set_button_tint(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                                     int nargs, union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   (void)dvm_set_field(vm, self, "buttonTint", "Landroid/content/res/ColorStateList;", args[0]);
+   if (!compound_apply_tint(vm, self)) return false;
+   ui_invalidate();
+   RETV();
+}
+
 static const struct rt_field rt_compound_fields[] = {
+   { "buttonDrawable", "Landroid/graphics/drawable/Drawable;" },
+   { "buttonTint", "Landroid/content/res/ColorStateList;" },
    { "broadcastingChecked", "Z" },
    { "radioGroup", "Landroid/widget/RadioGroup;" },
    { "checked", "Z" },
@@ -3269,9 +3373,10 @@ static const struct rt_method rt_compound_button[] = {
    M("setOnCheckedChangeListener",
      "(Landroid/widget/CompoundButton$OnCheckedChangeListener;)V",
      compound_set_listener),
-   M("setButtonDrawable", "(Landroid/graphics/drawable/Drawable;)V", nop_void),
-   M("setButtonDrawable", "(I)V", nop_void),
-   M("setButtonTintList", "(Landroid/content/res/ColorStateList;)V", nop_void),
+   M("setButtonDrawable", "(Landroid/graphics/drawable/Drawable;)V", compound_set_button_drawable),
+   M("setButtonDrawable", "(I)V", compound_set_button_drawable),
+   M("getButtonDrawable", "()Landroid/graphics/drawable/Drawable;", compound_get_button_drawable),
+   M("setButtonTintList", "(Landroid/content/res/ColorStateList;)V", compound_set_button_tint),
    M_END,
 };
 
@@ -4412,11 +4517,32 @@ static bool res_get_drawable(struct dvm *vm, dvm_ref self,
    RETL(c ? dvm_new_object(vm, c) : 0);
 }
 
-/* Resources.getDisplayMetrics(): one live object per Resources, as on a
- * device.  Unimplemented, it answered an empty DisplayMetrics — widthPixels
- * 0 — and every SDK that sizes its widgets from the screen width sized them
- * all to nothing (HoYoverse's getDesignPx() is width * design / 680). */
-static bool res_getConfiguration(struct dvm *,dvm_ref,const union dvm_value *,int,union dvm_value *);
+static bool res_getConfiguration(struct dvm *vm, dvm_ref self,
+                                 const union dvm_value *args, int nargs,
+                                 union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value stored = { 0 };
+   (void)dvm_get_field(vm, self, "configuration",
+                       "Landroid/content/res/Configuration;", &stored);
+   dvm_ref configuration = stored.l;
+   if (!configuration) {
+      struct dvm_class *c =
+         dvm__class_by_desc(vm, "Landroid/content/res/Configuration;");
+      configuration = c ? dvm_new_object(vm, c) : 0;
+      if (configuration) {
+         dvm_set_field(vm,configuration,"fontScale","F",(union dvm_value){.f=1});
+         configuration_ensure_locale(vm, configuration);
+         stored.l = configuration;
+         (void)dvm_set_field(vm, self, "configuration",
+                             "Landroid/content/res/Configuration;", stored);
+         dvm_pin(vm, configuration);
+      }
+   } else {
+      configuration_ensure_locale(vm, configuration);
+   }
+   RETL(configuration);
+}
 
 static void resources_scale_metrics(struct dvm *vm,dvm_ref configuration,dvm_ref metrics)
 {
@@ -4450,33 +4576,6 @@ static bool res_get_display_metrics(struct dvm *vm, dvm_ref self,
       }
    }
    RETL(dm.l);
-}
-
-static bool res_getConfiguration(struct dvm *vm, dvm_ref self,
-                                 const union dvm_value *args, int nargs,
-                                 union dvm_value *out)
-{
-   (void)args; (void)nargs;
-   union dvm_value stored = { 0 };
-   (void)dvm_get_field(vm, self, "configuration",
-                       "Landroid/content/res/Configuration;", &stored);
-   dvm_ref configuration = stored.l;
-   if (!configuration) {
-      struct dvm_class *c =
-         dvm__class_by_desc(vm, "Landroid/content/res/Configuration;");
-      configuration = c ? dvm_new_object(vm, c) : 0;
-      if (configuration) {
-         dvm_set_field(vm,configuration,"fontScale","F",(union dvm_value){.f=1});
-         configuration_ensure_locale(vm, configuration);
-         stored.l = configuration;
-         (void)dvm_set_field(vm, self, "configuration",
-                             "Landroid/content/res/Configuration;", stored);
-         dvm_pin(vm, configuration);
-      }
-   } else {
-      configuration_ensure_locale(vm, configuration);
-   }
-   RETL(configuration);
 }
 
 static bool res_update_configuration(struct dvm *vm, dvm_ref self,
@@ -4675,8 +4774,13 @@ static bool xml_as_attribute_set(struct dvm *vm, dvm_ref self,
                                  const union dvm_value *args, int nargs,
                                  union dvm_value *out)
 { (void)vm; (void)self; RETL(nargs ? ARG(0).l : 0); }
-
-static bool xml_new_pull(struct dvm *,dvm_ref,const union dvm_value *,int,union dvm_value *);
+static bool xml_new_pull(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+ (void)self;(void)args;(void)nargs;
+ dvm_ref parser=dvm_new_object(vm,dvm_find_class(vm,"org/kxml2/io/KXmlParser"));if(!parser)return false;
+ dvm_set_field(vm,parser,"namespaceAware","Z",(union dvm_value){.i=1});
+ dvm_set_field(vm,parser,"processDocDecl","Z",(union dvm_value){.i=1});rt_set_int(vm,parser,"attributeCount",-1);RETL(parser);
+}
 static const struct rt_method rt_xml[] = {
    SM("newPullParser","()Lorg/xmlpull/v1/XmlPullParser;",xml_new_pull),
    SM("asAttributeSet",
@@ -5225,13 +5329,6 @@ static bool pull_factory_new(struct dvm *vm,dvm_ref self,const union dvm_value *
  if(!factory){union dvm_value ns={0};dvm_get_field(vm,self,"namespaceAware","Z",&ns);dvm_set_field(vm,ref,"namespaceAware","Z",ns);rt_set_int(vm,ref,"attributeCount",-1);}
  RETL(ref);
 }
-static bool xml_new_pull(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
-{
- (void)self;(void)args;(void)nargs;
- dvm_ref parser=dvm_new_object(vm,dvm_find_class(vm,"org/kxml2/io/KXmlParser"));if(!parser)return false;
- dvm_set_field(vm,parser,"namespaceAware","Z",(union dvm_value){.i=1});
- dvm_set_field(vm,parser,"processDocDecl","Z",(union dvm_value){.i=1});rt_set_int(vm,parser,"attributeCount",-1);RETL(parser);
-}
 static bool pull_set_input(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
  if(!ARG(0).l){dvm__throw(vm,"java/lang/IllegalArgumentException","null XML input");return false;}
@@ -5725,35 +5822,6 @@ static bool color_state_default(struct dvm *vm, dvm_ref self,
    RETI(color.i);
 }
 
-/* The colour of the first row whose spec the state set satisfies
- * (StateSet.stateSetMatches: every positive state present, every negated
- * one absent; an empty spec matches anything), else `fallback`. */
-static int32_t color_state_lookup(struct dvm *vm, dvm_ref self,
-                                  const int32_t *set, uint32_t nset,
-                                  int32_t fallback)
-{
-   union dvm_value specs = { 0 }, colors = { 0 };
-   (void)dvm_get_field(vm, self, "stateSpecs", "[[I", &specs);
-   (void)dvm_get_field(vm, self, "colors", "[I", &colors);
-   struct dvm_object *rows = specs.l ? dvm__obj(vm, specs.l) : NULL;
-   struct dvm_object *vals = colors.l ? dvm__obj(vm, colors.l) : NULL;
-   if (!rows || !vals || !rows->data || !vals->data) return fallback;
-   const uint32_t n = rows->length < vals->length ? rows->length : vals->length;
-   for (uint32_t i = 0; i < n; ++i) {
-      struct dvm_object *row = dvm__obj(vm, ((dvm_ref *)rows->data)[i]);
-      bool match = true;
-      for (uint32_t k = 0; row && row->data && k < row->length && match; ++k) {
-         const int32_t st = ((int32_t *)row->data)[k];
-         bool present = false;
-         for (uint32_t j = 0; j < nset; ++j)
-            if (set[j] == (st > 0 ? st : -st)) { present = true; break; }
-         match = st > 0 ? present : !present;
-      }
-      if (match) return ((int32_t *)vals->data)[i];
-   }
-   return fallback;
-}
-
 /* getColorForState(int[] stateSet, int defaultColor). */
 static bool color_state_for_state(struct dvm *vm, dvm_ref self,
                                   const union dvm_value *args, int nargs,
@@ -5895,7 +5963,8 @@ static bool application_get_process_name(struct dvm *vm, dvm_ref self,
                                           int nargs, union dvm_value *out)
 {
    (void)self; (void)args; (void)nargs;
-   const char *name = getenv("ANDROID_PACKAGE_NAME");
+   const char *name = getenv("ANDROID_PROCESS_NAME");
+   if(!name || !*name)name=getenv("ANDROID_PACKAGE_NAME");
    RETL(dvm_new_string(vm, name && *name ? name : "com.lunaria.app"));
 }
 
@@ -5974,24 +6043,30 @@ static bool cp_attach_info(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out)
 {
-   (void)out;
-   union dvm_value value = { .l = nargs > 0 ? ARG(0).l : 0 };
-   (void)dvm_set_field(vm, self, "context", "Landroid/content/Context;", value);
-   value.l = nargs > 1 ? ARG(1).l : 0;
-   (void)dvm_set_field(vm, self, "info",
-                       "Landroid/content/pm/ProviderInfo;", value);
-   /* Retain the actual attached instance: constructing another provider for
-    * each resolver call loses the state established during onCreate. */
-   for (dvm_ref p = vm->content_providers; p;) {
-      if (p == self) RETV();
-      union dvm_value next = {0};
-      (void)dvm_get_field(vm, p, "resolverNext", "Landroid/content/ContentProvider;", &next);
-      p = next.l;
+   union dvm_value context={0};
+   (void)dvm_get_field(vm,self,"context","Landroid/content/Context;",&context);
+   if(context.l)RETV();
+   context.l=nargs ? ARG(0).l : 0;
+   (void)dvm_set_field(vm,self,"context","Landroid/content/Context;",context);
+   (void)dvm_set_field(vm,self,"info","Landroid/content/pm/ProviderInfo;",
+                       (union dvm_value){.l=nargs>1 ? ARG(1).l : 0});
+   bool registered=false;
+   for(dvm_ref p=vm->content_providers;p;){
+      if(p==self){registered=true;break;}
+      union dvm_value next={0};
+      (void)dvm_get_field(vm,p,"resolverNext","Landroid/content/ContentProvider;",&next);
+      p=next.l;
    }
-   (void)dvm_set_field(vm, self, "resolverNext", "Landroid/content/ContentProvider;",
-                       (union dvm_value){ .l = vm->content_providers });
-   dvm_pin(vm, self);
-   vm->content_providers = self;
+   if(!registered){
+      (void)dvm_set_field(vm,self,"resolverNext","Landroid/content/ContentProvider;",
+                          (union dvm_value){.l=vm->content_providers});
+      dvm_pin(vm,self);vm->content_providers=self;
+   }
+   /* AOSP ContentProvider.attachInfo owns this virtual callback, including
+    * an override that calls super.attachInfo from its own attachInfo. */
+   struct dvm_method *method=dvm_find_method(vm,dvm_object_class(vm,self),"onCreate","()Z");
+   union dvm_value ignored={0};
+   if(method && !dvm_call(vm,method,self,NULL,0,&ignored))return false;
    RETV();
 }
 
@@ -6078,8 +6153,30 @@ static bool act_get_local_class_name(struct dvm *vm, dvm_ref self,
 }
 
 static bool li_from(struct dvm *vm, dvm_ref self,
-                     const union dvm_value *args, int nargs,
-                     union dvm_value *out);
+                    const union dvm_value *args, int nargs,
+                    union dvm_value *out)
+{
+   (void)self;
+   dvm_ref context = nargs ? ARG(0).l : 0;
+   if (!context) {
+      dvm__throw(vm, "java/lang/NullPointerException", "null inflater context");
+      return false;
+   }
+   struct dvm_method *get = dvm_find_method(vm, dvm_object_class(vm, context),
+      "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+   union dvm_value name = { .l = dvm_new_string(vm, "layout_inflater") };
+   if (!get || !dvm_call(vm, get, context, &name, 1, out)) return false;
+   if (!out->l) {
+      dvm__throw(vm, "java/lang/AssertionError", "LayoutInflater not found.");
+      return false;
+   }
+   if (!dvm__class_assignable(vm, dvm_object_class(vm, out->l),
+                              dvm_find_class(vm, "android/view/LayoutInflater"))) {
+      dvm__throw(vm, "java/lang/ClassCastException", "service is not LayoutInflater");
+      return false;
+   }
+   return true;
+}
 static bool act_get_layout_inflater(struct dvm *vm, dvm_ref self,
                                     const union dvm_value *args, int nargs,
                                     union dvm_value *out)
@@ -6401,25 +6498,76 @@ static void svc_call_void(struct dvm *vm, dvm_ref obj, const char *name,
 /* The app's own service an intent names: new Intent(ctx, Foo.class) or an
  * explicit ComponentName in this package.  Anything else belongs to another
  * package this device does not have. */
-static struct dvm_class *svc_resolve(struct dvm *vm, dvm_ref intent)
+static bool svc_process_is_current(struct dvm *vm, dvm_ref resolve)
 {
-   if (!intent) return NULL;
-   union dvm_value cn = { 0 };
-   (void)dvm_get_field(vm, intent, "component",
-                       "Landroid/content/ComponentName;", &cn);
-   if (!cn.l) return NULL;
-   union dvm_value pkg = { 0 }, cls = { 0 };
-   (void)dvm_get_field(vm, cn.l, "pkg", "Ljava/lang/String;", &pkg);
-   (void)dvm_get_field(vm, cn.l, "cls", "Ljava/lang/String;", &cls);
+   union dvm_value info = { 0 }, process = { 0 }, name = { 0 };
+   (void)dvm_get_field(vm, resolve, "serviceInfo", "Landroid/content/pm/ServiceInfo;", &info);
+   (void)dvm_get_field(vm, info.l, "processName", "Ljava/lang/String;", &process);
+   const char *wanted = process.l ? dvm_string_utf8(vm, process.l) : NULL;
+   const char *current = getenv("ANDROID_PROCESS_NAME");
+   if (!current || !*current) current = getenv("ANDROID_PACKAGE_NAME");
+   if (!wanted || !*wanted || !current || !strcmp(wanted, current)) return true;
+   /* A separate VM/address space is required. Never run its native library
+    * against the caller's globals or acknowledge a fake start. */
+   (void)dvm_get_field(vm, info.l, "name", "Ljava/lang/String;", &name);
+   fprintf(stderr, "[service] separate process required: %s (%s)\n",
+           name.l ? dvm_string_utf8(vm, name.l) : "?", wanted);
+   return false;
+}
+
+static struct dvm_class *svc_resolve_mode(struct dvm *vm, dvm_ref intent,bool allow_remote,char **remote_process)
+{
+   if(remote_process)*remote_process=NULL;
+   if (!intent) {
+      dvm__throw(vm, "java/lang/NullPointerException", "service intent");
+      return NULL;
+   }
+   union dvm_value cn = { 0 }, pkg = { 0 }, cls = { 0 };
+   (void)dvm_get_field(vm, intent, "component", "Landroid/content/ComponentName;", &cn);
+   if (!cn.l) {
+      (void)dvm_get_field(vm, intent, "package", "Ljava/lang/String;", &pkg);
+      const char *sdk = getenv("ANDROID_TARGET_SDK");
+      if (!pkg.l && sdk && atoi(sdk) >= 21) {
+         dvm__throw(vm, "java/lang/IllegalArgumentException", "Service Intent must be explicit");
+         return NULL;
+      }
+   }
+   /* A package-scoped action shares PackageManager's manifest resolver. */
+   union dvm_value a[2] = { { .l = intent }, { .i = 0 } }, result = { 0 };
+   if (!pm_resolveService(vm, 0, a, 2, &result)) return NULL;
+   if (result.l && !svc_process_is_current(vm, result.l)) {
+      if(!allow_remote || !remote_process)return NULL;
+      union dvm_value info={0},process={0};
+      (void)dvm_get_field(vm,result.l,"serviceInfo","Landroid/content/pm/ServiceInfo;",&info);
+      (void)dvm_get_field(vm,info.l,"processName","Ljava/lang/String;",&process);
+      const char *name=process.l ? dvm_string_utf8(vm,process.l) : NULL;
+      if(!name || !*name)return NULL;
+      *remote_process=strdup(name);
+      if(!*remote_process){dvm__throw(vm,"java/lang/OutOfMemoryError","service process");return NULL;}
+   }
+   if (!cn.l) {
+      if (!result.l) return NULL;
+      union dvm_value info = { 0 };
+      (void)dvm_get_field(vm, result.l, "serviceInfo", "Landroid/content/pm/ServiceInfo;", &info);
+      (void)dvm_get_field(vm, info.l, "name", "Ljava/lang/String;", &cls);
+   } else {
+      (void)dvm_get_field(vm, cn.l, "pkg", "Ljava/lang/String;", &pkg);
+      (void)dvm_get_field(vm, cn.l, "cls", "Ljava/lang/String;", &cls);
+      const char *self_pkg = getenv("ANDROID_PACKAGE_NAME");
+      const char *p = pkg.l ? dvm_string_utf8(vm, pkg.l) : NULL;
+      if (!p || !self_pkg || strcmp(p, self_pkg)) return NULL;
+   }
    const char *self_pkg = getenv("ANDROID_PACKAGE_NAME");
-   const char *p = pkg.l ? dvm_string_utf8(vm, pkg.l) : NULL;
    const char *c = cls.l ? dvm_string_utf8(vm, cls.l) : NULL;
-   if (!p || !c || !self_pkg || strcmp(p, self_pkg)) return NULL;
+   if (!c || !self_pkg) return NULL;
    char name[512];
-   snprintf(name, sizeof name, "%s%s", c[0] == '.' ? p : "", c);
+   snprintf(name, sizeof name, "%s%s", c[0] == '.' ? self_pkg : "", c);
    for (char *q = name; *q; ++q) if (*q == '.') *q = '/';
    return dvm_find_class(vm, name);
 }
+
+static struct dvm_class *svc_resolve(struct dvm *vm,dvm_ref intent)
+{ return svc_resolve_mode(vm,intent,false,NULL); }
 
 static struct svc_rec *svc_find(struct dvm_class *cls)
 {
@@ -6571,7 +6719,10 @@ static bool ctx_bindService(struct dvm *vm, dvm_ref self,
       c->next = g_service_conns;
       g_service_conns = c;
    }
-   if (!svc_resolve(vm, intent)) RETI(0);
+   if (!svc_resolve(vm, intent)) {
+      if (vm->exception) return false;
+      RETI(0);
+   }
    struct dvm_class *bind = dvm__class_by_desc(vm, "Llunaria/ServiceBind;");
    dvm_ref job = bind ? dvm_new_object(vm, bind) : 0;
    if (!job) RETI(0);
@@ -6630,8 +6781,24 @@ static bool ctx_startService(struct dvm *vm, dvm_ref self,
 {
    (void)self; (void)nargs;
    dvm_ref intent = ARG(0).l;
-   struct dvm_class *cls = svc_resolve(vm, intent);
-   if (!cls) RETL(0);
+   char *remote_process=NULL;
+   struct dvm_class *cls = svc_resolve_mode(vm,intent,vm->service_submit!=NULL,&remote_process);
+   if (!cls) {
+      free(remote_process);
+      if (vm->exception) return false;
+      RETL(0);
+   }
+   if(remote_process){
+      void *bytes=NULL;size_t size=0;
+      int rc=dvm_service_pack(vm,intent,1,&bytes,&size);
+      if(!rc)rc=vm->service_submit(vm->service_submit_user,remote_process,bytes,size);
+      free(bytes);free(remote_process);
+      if(rc<0){
+         if(!vm->exception)dvm__throw(vm,"java/lang/RuntimeException","Cannot start service process: %s",strerror(-rc));
+         return false;
+      }
+      RETL(service_component_name(vm,cls));
+   }
    struct svc_rec *r = svc_create(vm, cls);
    if (!r) RETL(0);
    r->started = true;
@@ -6649,6 +6816,7 @@ static bool ctx_stopService(struct dvm *vm, dvm_ref self,
 {
    (void)self; (void)nargs;
    struct dvm_class *cls = svc_resolve(vm, ARG(0).l);
+   if (vm->exception) return false;
    struct svc_rec *r = cls ? svc_find(cls) : NULL;
    if (!r || !r->started) RETI(0);
    r->started = false;
@@ -6718,8 +6886,24 @@ static const struct rt_method rt_service[] = {
  * Registrations belong to the Application instance. Dispatch snapshots the
  * list before entering Java, so callback mutations affect the next event. */
 struct lifecycle_registration { dvm_ref owner, callback; };
+
+/* A lifecycle method, called virtually so the app's override runs (and, via
+ * its super call, the framework's part). */
 static void act_call(struct dvm *vm, dvm_ref activity, const char *name,
-                     const char *sig, union dvm_value *a, int n);
+                     const char *sig, union dvm_value *a, int n)
+{
+   struct dvm_class *c = dvm_object_class(vm, activity);
+   struct dvm_method *m = c ? dvm_find_method(vm, c, name, sig) : NULL;
+   if (!m) return;
+   union dvm_value ret;
+   if (!dvm_call(vm, m, activity, a, n, &ret) && dvm_exception(vm)) {
+      char how[256];
+      dvm_describe_exception(vm, dvm_exception(vm), how, sizeof how);
+      fprintf(stderr, "[activity] %s.%s threw %s\n",
+              c->name ? c->name : "?", name, how);
+      dvm_clear_exception(vm);
+   }
+}
 static struct lifecycle_registration *g_lifecycle_callbacks;
 static size_t g_nlifecycle_callbacks, g_lifecycle_capacity;
 
@@ -6936,7 +7120,20 @@ static bool g_task_background, g_task_move_back;
 
 static void ui_window_shown(struct dvm *vm, dvm_ref window);
 static void ui_window_hidden(struct dvm *vm, dvm_ref window);
-static dvm_ref ui_window_content(struct dvm *, dvm_ref);
+
+/* The content view of a Dialog, or of a Window. */
+static dvm_ref ui_window_content(struct dvm *vm, dvm_ref window)
+{
+   if (ui_is_a(vm, window, "android/widget/PopupWindow")) {
+      dvm_ref decor = ui_obj(vm, window, "decorView", "Landroid/view/View;");
+      if (decor) return decor;
+   }
+   dvm_ref v = ui_obj(vm, window, "contentView", "Landroid/view/View;");
+   if (v) return v;
+   dvm_ref w = ui_obj(vm, window, "window", "Landroid/view/Window;");
+   if (w) return ui_obj(vm, w, "contentView", "Landroid/view/View;");
+   return 0;
+}
 static dvm_ref ui_window_root(struct dvm *, dvm_ref);
 static void act_reconcile_visibility(struct dvm *);
 
@@ -6963,24 +7160,6 @@ void dvm__activity_visible(struct dvm *vm, dvm_ref activity)
    g_task_background = false;
    ui_window_shown(vm, activity);
    act_reconcile_visibility(vm);
-}
-
-/* A lifecycle method, called virtually so the app's override runs (and, via
- * its super call, the framework's part). */
-static void act_call(struct dvm *vm, dvm_ref activity, const char *name,
-                     const char *sig, union dvm_value *a, int n)
-{
-   struct dvm_class *c = dvm_object_class(vm, activity);
-   struct dvm_method *m = c ? dvm_find_method(vm, c, name, sig) : NULL;
-   if (!m) return;
-   union dvm_value ret;
-   if (!dvm_call(vm, m, activity, a, n, &ret) && dvm_exception(vm)) {
-      char how[256];
-      dvm_describe_exception(vm, dvm_exception(vm), how, sizeof how);
-      fprintf(stderr, "[activity] %s.%s threw %s\n",
-              c->name ? c->name : "?", name, how);
-      dvm_clear_exception(vm);
-   }
 }
 
 static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
@@ -7751,32 +7930,6 @@ static dvm_ref li_new(struct dvm *vm, dvm_ref context)
                              (union dvm_value){.l=context});
    }
    return inflater;
-}
-
-static bool li_from(struct dvm *vm, dvm_ref self,
-                    const union dvm_value *args, int nargs,
-                    union dvm_value *out)
-{
-   (void)self;
-   dvm_ref context = nargs ? ARG(0).l : 0;
-   if (!context) {
-      dvm__throw(vm, "java/lang/NullPointerException", "null inflater context");
-      return false;
-   }
-   struct dvm_method *get = dvm_find_method(vm, dvm_object_class(vm, context),
-      "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
-   union dvm_value name = { .l = dvm_new_string(vm, "layout_inflater") };
-   if (!get || !dvm_call(vm, get, context, &name, 1, out)) return false;
-   if (!out->l) {
-      dvm__throw(vm, "java/lang/AssertionError", "LayoutInflater not found.");
-      return false;
-   }
-   if (!dvm__class_assignable(vm, dvm_object_class(vm, out->l),
-                              dvm_find_class(vm, "android/view/LayoutInflater"))) {
-      dvm__throw(vm, "java/lang/ClassCastException", "service is not LayoutInflater");
-      return false;
-   }
-   return true;
 }
 
 static bool li_get_context(struct dvm *vm, dvm_ref self,
@@ -9560,6 +9713,16 @@ static void ax_apply_attribute(struct dvm *vm, dvm_ref view, const char *name,
       { ax_set_int(vm, view, "textStyle", (int32_t)data); return; }
    if (!strcmp(name, "maxLines") || !strcmp(name, "lines"))
       { ax_set_int(vm, view, "maxLines", (int32_t)data); return; }
+   /* An EditText's editor: the keyboard it asks for, its action key, and
+    * whether it is one line.  Without them every field is plain text. */
+   if (!strcmp(name, "inputType"))
+      { ax_set_int(vm, view, "inputType", (int32_t)data); return; }
+   if (!strcmp(name, "imeOptions"))
+      { ax_set_int(vm, view, "imeOptions", (int32_t)data); return; }
+   if (!strcmp(name, "singleLine")) {
+      (void)dvm_set_field(vm, view, "singleLine", "Z", (union dvm_value){ .i = data != 0 });
+      return;
+   }
 
    /* app: namespace attributes the SDK's own layouts use. */
    if (!strcmp(name, "cardCornerRadius") || !strcmp(name, "radius"))
@@ -10412,39 +10575,6 @@ static const struct rt_method rt_typeface[] = {
    M("isItalic", "()Z", typeface_getStyle),
    M_END,
 };
-
-/* TextView.setTypeface(tf[, style]): the style is what the text shows. */
-static bool text_set_typeface(struct dvm *vm, dvm_ref self,
-                              const union dvm_value *args, int nargs,
-                              union dvm_value *out)
-{
-   (void)out;
-   int32_t style = ARG(0).l ? rt_get_int(vm, ARG(0).l, "style") : 0;
-   if (nargs >= 2) style = ARG(1).i;
-   (void)dvm_set_field(vm, self, "typeface", "Landroid/graphics/Typeface;", ARG(0));
-   union dvm_value paint = {0};
-   (void)dvm_get_field(vm, self, "textPaint", "Landroid/text/TextPaint;", &paint);
-   if (paint.l)
-      (void)dvm_set_field(vm, paint.l, "typeface", "Landroid/graphics/Typeface;", ARG(0));
-   rt_set_int(vm, self, "textStyle", style & 3);
-   ui_layout_changed();
-   RETV();
-}
-
-static bool text_set_gravity(struct dvm *vm, dvm_ref self,
-                             const union dvm_value *args, int nargs,
-                             union dvm_value *out)
-{
-   (void)nargs; (void)out;
-   int32_t g = ARG(0).i;
-   /* No horizontal part means START, no vertical part TOP (TextView). */
-   if (!(g & 0x07) && !(g & 0x800007)) g |= 0x800003;
-   if (!(g & 0x70)) g |= 0x30;
-   rt_set_int(vm, self, "gravity", g);
-   ui_layout_changed();
-   ui_invalidate();
-   RETV();
-}
 
 /* android.app.NativeActivity.
  *
@@ -11457,9 +11587,9 @@ struct text_compound {dvm_ref left,right;int left_w,left_h,right_w,right_h,left_
 static void text_compound_get(struct dvm *vm,dvm_ref view,struct text_compound *c)
 {
    memset(c,0,sizeof *c);
-   const char *const names[2][2]={{"drawableLeft","drawableStart"},{"drawableRight","drawableEnd"}};
+   const char *const names[2][3]={{"buttonDrawable","drawableLeft","drawableStart"},{"drawableRight","drawableEnd",NULL}};
    dvm_ref found[2]={0,0};
-   for(int side=0;side<2;++side) for(int k=0;k<2 && !found[side];++k) {
+   for(int side=0;side<2;++side) for(int k=0;k<3 && names[side][k] && !found[side];++k) {
       union dvm_value v={0};
       if(dvm_get_field(vm,view,names[side][k],"Landroid/graphics/drawable/Drawable;",&v) && v.l) found[side]=v.l;
    }
@@ -11682,20 +11812,28 @@ static void ui_measure_leaf(struct dvm *vm, dvm_ref view, struct ui_ms ws,
       float tw = 0.f;
       int hard_lines = 0;
       ui_text_extent(vm, view, &tw, &hard_lines);
+      /* The picture beside the text (a check box's button, drawableStart)
+       * takes its width from the line and may be taller than it. */
+      struct text_compound compound;
+      text_compound_get(vm, view, &compound);
+      const int32_t beside = compound.left_inset + compound.right_inset;
       int32_t w;
       if (ws.mode == UI_MS_EXACT) w = ws.size;
       else {
-         w = (int32_t)ceilf(tw) + pad[0] + pad[2];
+         w = (int32_t)ceilf(tw) + pad[0] + pad[2] + beside;
          int32_t min_w = view_suggested_minimum(vm, view, false);
          if (w < min_w) w = min_w;
          if (is_button && w < 88) w = 88;         /* Widget.Button minWidth */
          if (ws.mode == UI_MS_ATMOST && w > ws.size) w = ws.size;
       }
       /* Soft wrapping inside what is left of the width. */
-      const int32_t avail = w - pad[0] - pad[2];
+      const int32_t avail = w - pad[0] - pad[2] - beside;
       struct textview_layout *layout=textview_layout_get(vm,view,avail>0 ? avail : INT_MAX);
       if(!layout) return;
-      want_h = (int32_t)ceilf(layout->height) + pad[1] + pad[3];
+      want_h = (int32_t)ceilf(layout->height);
+      if (want_h < compound.left_h) want_h = compound.left_h;
+      if (want_h < compound.right_h) want_h = compound.right_h;
+      want_h += pad[1] + pad[3];
       if (is_button && want_h < 48) want_h = 48;   /* Widget.Button minHeight */
       int32_t min_h = view_suggested_minimum(vm, view, true);
       if (want_h < min_h) want_h = min_h;
@@ -12513,9 +12651,47 @@ static bool view_get_measured_state(struct dvm *vm, dvm_ref self,
          ((uint32_t)ui_int(vm, self, "measuredHeight") >> 16 & 0x0000ff00u));
 }
 
-/* onLayout for every group, top down.  Measurement already left the
- * positions a RelativeLayout and a list decided; the rest are placed here. */
-static void ui_layout(struct dvm *vm, dvm_ref view, unsigned depth);
+static void ui_layout(struct dvm *vm, dvm_ref view, unsigned depth)
+{
+   struct ui_node *n = ui_node(vm, view);
+   if (!n || depth > 48 || ui_gone(vm, view)) return;
+   struct dvm_class *klass = dvm_object_class(vm, view);
+   struct dvm_method *callback = klass
+      ? dvm_find_method(vm, klass, "onLayout", "(ZIIII)V") : NULL;
+   /* An app override owns its child placement. Do not overwrite it with a
+    * FrameLayout pass after the callback returns. */
+   if (callback && callback->builtin != empty_void) {
+      union dvm_value a[4] = {{.i=n->x}, {.i=n->y},
+         {.i=(int32_t)((uint32_t)n->x + (uint32_t)n->w)},
+         {.i=(int32_t)((uint32_t)n->y + (uint32_t)n->h)}}, ignored = {0};
+      (void)view_layout_api(vm, view, a, 4, &ignored);
+      return;
+   }
+   union dvm_value bounds[4] = {{.i=n->x}, {.i=n->y},
+      {.i=(int32_t)((uint32_t)n->x + (uint32_t)n->w)},
+      {.i=(int32_t)((uint32_t)n->y + (uint32_t)n->h)}}, ignored = {0};
+   if (!view_layout_api(vm, view, bounds, 4, &ignored)) return;
+   if (ui_is_a(vm, view, "android/widget/LinearLayout"))
+      ui_layout_linear(vm, view, n);
+   else if (ui_is_a(vm, view, "android/widget/RelativeLayout") ||
+            ui_is_a(vm, view, "android/widget/ListView"))
+      ;
+   else
+      ui_layout_frame(vm, view, n);
+   dvm_ref kids[UI_MAX_KIDS];
+   const uint32_t nk = ui_children(vm, view, kids, UI_MAX_KIDS);
+   for (uint32_t i = 0; i < nk; ++i) {
+      ui_layout(vm, kids[i], depth + 1);
+      /* View.layout(): the frame the app reads back through getLeft(),
+       * getWidth() and friends, relative to the parent. */
+      const struct ui_node *c = ui_node(vm, kids[i]);
+      if (!c) continue;
+      rt_set_int(vm, kids[i], "left", c->x);
+      rt_set_int(vm, kids[i], "top", c->y);
+      rt_set_int(vm, kids[i], "right", c->x + c->w);
+      rt_set_int(vm, kids[i], "bottom", c->y + c->h);
+   }
+}
 
 static bool view_layout_api(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
@@ -12607,48 +12783,6 @@ static bool widget_on_layout(struct dvm *vm, dvm_ref self,
       if (dvm_exception(vm)) return false;
    }
    RETV();
-}
-
-static void ui_layout(struct dvm *vm, dvm_ref view, unsigned depth)
-{
-   struct ui_node *n = ui_node(vm, view);
-   if (!n || depth > 48 || ui_gone(vm, view)) return;
-   struct dvm_class *klass = dvm_object_class(vm, view);
-   struct dvm_method *callback = klass
-      ? dvm_find_method(vm, klass, "onLayout", "(ZIIII)V") : NULL;
-   /* An app override owns its child placement. Do not overwrite it with a
-    * FrameLayout pass after the callback returns. */
-   if (callback && callback->builtin != empty_void) {
-      union dvm_value a[4] = {{.i=n->x}, {.i=n->y},
-         {.i=(int32_t)((uint32_t)n->x + (uint32_t)n->w)},
-         {.i=(int32_t)((uint32_t)n->y + (uint32_t)n->h)}}, ignored = {0};
-      (void)view_layout_api(vm, view, a, 4, &ignored);
-      return;
-   }
-   union dvm_value bounds[4] = {{.i=n->x}, {.i=n->y},
-      {.i=(int32_t)((uint32_t)n->x + (uint32_t)n->w)},
-      {.i=(int32_t)((uint32_t)n->y + (uint32_t)n->h)}}, ignored = {0};
-   if (!view_layout_api(vm, view, bounds, 4, &ignored)) return;
-   if (ui_is_a(vm, view, "android/widget/LinearLayout"))
-      ui_layout_linear(vm, view, n);
-   else if (ui_is_a(vm, view, "android/widget/RelativeLayout") ||
-            ui_is_a(vm, view, "android/widget/ListView"))
-      ;
-   else
-      ui_layout_frame(vm, view, n);
-   dvm_ref kids[UI_MAX_KIDS];
-   const uint32_t nk = ui_children(vm, view, kids, UI_MAX_KIDS);
-   for (uint32_t i = 0; i < nk; ++i) {
-      ui_layout(vm, kids[i], depth + 1);
-      /* View.layout(): the frame the app reads back through getLeft(),
-       * getWidth() and friends, relative to the parent. */
-      const struct ui_node *c = ui_node(vm, kids[i]);
-      if (!c) continue;
-      rt_set_int(vm, kids[i], "left", c->x);
-      rt_set_int(vm, kids[i], "top", c->y);
-      rt_set_int(vm, kids[i], "right", c->x + c->w);
-      rt_set_int(vm, kids[i], "bottom", c->y + c->h);
-   }
 }
 
 static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
@@ -12868,20 +13002,6 @@ static void ui_scroll_from_overlay(double x, double y, double dx, double dy)
    if (g_ui_nscrolls < (int)(sizeof g_ui_scrolls / sizeof g_ui_scrolls[0]))
       g_ui_scrolls[g_ui_nscrolls++] = (struct ui_scroll_event){ x, y, dx, dy };
    pthread_mutex_unlock(&g_ui_click_lock);
-}
-
-/* The content view of a Dialog, or of a Window. */
-static dvm_ref ui_window_content(struct dvm *vm, dvm_ref window)
-{
-   if (ui_is_a(vm, window, "android/widget/PopupWindow")) {
-      dvm_ref decor = ui_obj(vm, window, "decorView", "Landroid/view/View;");
-      if (decor) return decor;
-   }
-   dvm_ref v = ui_obj(vm, window, "contentView", "Landroid/view/View;");
-   if (v) return v;
-   dvm_ref w = ui_obj(vm, window, "window", "Landroid/view/Window;");
-   if (w) return ui_obj(vm, w, "contentView", "Landroid/view/View;");
-   return 0;
 }
 
 /* Content may be a subtree below PhoneWindow's content parent and DecorView.
@@ -13115,6 +13235,7 @@ static bool ui_compute_scroll(struct dvm *vm,dvm_ref view,unsigned depth)
    return true;
 }
 
+
 static void ui_rebuild(struct dvm *vm)
 {
    uint64_t started=ui_render_ns();
@@ -13151,6 +13272,10 @@ static void ui_rebuild(struct dvm *vm)
    }
    struct ui_buf b = { 0 }, css = { 0 };
    g_ui_building = true;
+   /* What this rebuild repaints; what changes while it runs is the next one's. */
+   g_ui_frame_damage = g_ui_damage;
+   g_ui_damage = (struct ui_damage){ 0 };
+   ++g_ui_build_seq;
    if (g_ui_measure_dirty) ui_nodes_reset();
    ui_puts(&css, ui_stylesheet());
    ui_puts(&b, "<body>");
@@ -13191,6 +13316,7 @@ static void ui_rebuild(struct dvm *vm)
       if(started) g_ui_render_prof.emit_ns+=ui_render_ns()-phase;
       if (dvm_exception(vm)) {
          g_ui_building=false;
+         g_ui_damage.full = true;
          free(b.p); free(css.p);
          return;
       }
@@ -13366,14 +13492,18 @@ static bool view_perform_click(struct dvm *vm, dvm_ref self,
 
 /* --- what the rest of the runtime calls -------------------------------- */
 
+/* Rebuilding the document runs guest code (a RecyclerView's adapter creates
+ * and binds its item views), and that code sets exactly the fields this
+ * watches.  Without the guard the rebuild would mark itself stale for ever. */
+static void ui_mark_dirty(void)
+{
+   if (g_ui_nwindows && !g_ui_building) g_ui_dirty = true;
+}
+
 /* A view changed in a way that changes pixels. */
 static void ui_invalidate(void)
 {
-   /* Building the document runs guest code (a RecyclerView's adapter creates
-    * and binds its item views), and that code sets exactly the fields this
-    * watches.  Without the guard the rebuild would mark itself stale for
-    * ever. */
-   if (g_ui_nwindows && !g_ui_building) g_ui_dirty = true;
+   if (g_ui_nwindows && !g_ui_building) {ui_damage_full();g_ui_dirty = true;}
 }
 
 static void ui_layout_changed(void)

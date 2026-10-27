@@ -1,3 +1,85 @@
+/* SPDX-License-Identifier: MPL-2.0 */
+/* Small, freestanding initialization entry points. gen-guest-init.py compiles
+ * one operation at a time from this same C source for each Android ABI. */
+#if defined(LUNARIA_GUEST_INIT)
+/* Raw Linux/Android futex ABI, shared by freestanding guest C helpers. */
+static __attribute__((always_inline)) inline void
+guest_futex(unsigned *control,unsigned operation,unsigned value)
+{
+#if defined(__aarch64__)
+    register unsigned *a0 __asm__("x0")=control;
+    register unsigned long a1 __asm__("x1")=operation;
+    register unsigned long a2 __asm__("x2")=value;
+    register unsigned long a3 __asm__("x3")=0;
+    register unsigned long number __asm__("x8")=98;
+    __asm__ volatile("svc #0" : "+r"(a0)
+                     : "r"(a1),"r"(a2),"r"(a3),"r"(number) : "memory","cc");
+#elif defined(__arm__)
+    register unsigned *a0 __asm__("r0")=control;
+    register unsigned a1 __asm__("r1")=operation;
+    register unsigned a2 __asm__("r2")=value;
+    register unsigned a3 __asm__("r3")=0;
+    register unsigned number __asm__("r7")=240;
+    __asm__ volatile("svc #0" : "+r"(a0)
+                     : "r"(a1),"r"(a2),"r"(a3),"r"(number) : "memory","cc");
+#else
+#error Android ARM guest target required
+#endif
+}
+
+
+#if LUNA_GUARD_OPERATION == 0
+int luna_guest_pthread_once(unsigned *control,void (*initialize)(void))
+{
+    unsigned state=__atomic_load_n(control,__ATOMIC_ACQUIRE);
+    for (;;) {
+        if (state==2) return 0;
+        unsigned expected=0;
+        if (__atomic_compare_exchange_n(control,&expected,1,1,
+                                         __ATOMIC_ACQUIRE,__ATOMIC_ACQUIRE)) {
+            initialize();
+            __atomic_store_n(control,2,__ATOMIC_RELEASE);
+            guest_futex(control,129,0x7fffffff); /* FUTEX_WAKE_PRIVATE */
+            return 0;
+        }
+        if (expected==1) guest_futex(control,128,1); /* FUTEX_WAIT_PRIVATE */
+        state=__atomic_load_n(control,__ATOMIC_ACQUIRE);
+    }
+}
+#endif
+
+#if LUNA_GUARD_OPERATION == 1
+int luna_guest_cxa_guard_acquire(unsigned *guard)
+{
+    unsigned state=__atomic_load_n(guard,__ATOMIC_ACQUIRE);
+    for (;;) {
+        if ((state&0xff) || (state&0x100)) return 0;
+        if (!(state&0x200)) {
+            if (__atomic_compare_exchange_n(guard,&state,0x200,1,
+                                             __ATOMIC_ACQUIRE,__ATOMIC_ACQUIRE)) return 1;
+            continue;
+        }
+        if (!(state&0x400)) {
+            unsigned waiting=state|0x400;
+            if (!__atomic_compare_exchange_n(guard,&state,waiting,1,
+                                              __ATOMIC_ACQUIRE,__ATOMIC_ACQUIRE)) continue;
+            state=waiting;
+        }
+        guest_futex(guard,128,state);
+        state=__atomic_load_n(guard,__ATOMIC_ACQUIRE);
+    }
+}
+#elif LUNA_GUARD_OPERATION == 2 || LUNA_GUARD_OPERATION == 3
+int luna_guest_cxa_guard_finish(unsigned *guard)
+{
+    unsigned state=__atomic_exchange_n(guard,LUNA_GUARD_OPERATION==2 ? 0x101 : 0,
+                                       __ATOMIC_RELEASE);
+    if (state&0x400) guest_futex(guard,129,0x7fffffff);
+    return 0;
+}
+#endif
+
+#else /* ordinary guest libc / host-shared heap */
 /*
  * Copyright © 2026 Yuichiro Nakada / Project Lunaria
  *
@@ -75,6 +157,10 @@
 #define LH_MIN         LH_ALIGN
 #define LH_ALLOC_MAGIC 0xA110C8EDu
 #define LH_FREE_MAGIC  0xF2EEB10Cu
+/* A freed block waiting out the host's quarantine (arm_free in arm_exec.cpp).
+ * Neither allocated nor on a free list, so lh_owns() refuses it: a second free
+ * of it is ignored instead of being queued twice. */
+#define LH_QUAR_MAGIC  0x9A7A171Eu
 #define LH_SMALL_MAX   4096u                        /* exact bins up to here */
 #define LH_SMALL_BINS  (LH_SMALL_MAX / LH_ALIGN + 1u)
 #define LH_NBINS       (LH_SMALL_BINS + 32u)
@@ -1343,3 +1429,5 @@ void __cxa_guard_abort(uint64_t *guard)
 
 #endif /* !LUNARIA_GUEST_SHARED */
 #endif /* LUNARIA_LIB_GUEST_C */
+
+#endif /* LUNARIA_GUEST_INIT */

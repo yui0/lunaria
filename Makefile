@@ -493,10 +493,11 @@ runtime/libOpenSLES.so: src/trace.h
 # shortcut. Implement missing Android/Java behavior in C with existing tools.
 # IMPORTANT: The user requires ICU-independent number formatting. Do not add
 # ICU compile/link flags or an ICU package dependency to implement DVM APIs.
-DVM_SRC = src/jvm/settings.c src/jvm/log_buffer.c src/apkpure.c src/dvm/calendar.c src/dvm/dvm_path.c src/luna_unicode.c src/dvm/dex.c src/dvm/dvm.c src/dvm/dvm_runtime.c src/dvm/dvm_jni.c \
+DVM_SRC = src/apkpure.c src/dvm/calendar.c src/dvm/dvm_path.c src/luna_unicode.c src/dvm/dex.c src/dvm/dvm.c src/dvm/dvm_runtime.c src/dvm/dvm_jni.c \
           src/dvm/dvm_net.c src/dvm/dvm_media.c src/dvm/regex.c src/dvm/charset.c src/dvm/apk_signers.c src/dvm/dvm_sqlite.c \
           src/webview_cdp.c $(WEBVIEW_CDP_HOST_SRC)
-DVM_HDR = src/dvm/dvm_parcel.h src/dvm/dvm_html.h src/dvm/color_blend.h src/luna_overlay.h src/dvm/dvm_path.h src/lunaria_file.h src/jvm/java_type.h src/simplewebp.h src/luna_unicode.h src/unicode/character_data.h src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
+DVM_SRC += src/luna_process_ipc.c
+DVM_HDR = src/jvm/jvm.h src/dvm/dvm_parcel.h src/dvm/dvm_html.h src/dvm/color_blend.h src/luna_overlay.h src/dvm/dvm_path.h src/lunaria_file.h src/simplewebp.h src/luna_unicode.h src/unicode/character_data.h src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
           src/dvm/dvm_net.h src/lunaria_os.h src/dvm/dvm_media.h src/dvm/apk_signers.h src/dvm/dvm_sqlite.h \
           src/dvm/regex.h src/dvm/charset.h src/dvm/locale_names.h src/dvm/date_symbols_data.h src/dvm/framework.h \
           src/webview_cdp.h
@@ -505,7 +506,6 @@ DVM_HDR += src/dvm/calendar.h src/dvm/calendar_data.h
 DVM_HDR += src/unicode/bidi_data.h src/dvm/dvm_reflect.h src/dvm/dvm_android_ui.h src/dvm/dvm_graphics.h src/dvm/dvm_text.h src/dvm/dvm_time.h src/dvm/dvm_crypto.h
 DVM_HDR += src/dvm/dvm_videoview.h src/apkpure.h
 DVM_HDR += src/dvm/dvm_nio_file.h
-DVM_HDR += src/jvm/log_policy.h
 DVM_HDR += src/dvm/dvm_alarm.h
 DVM_HDR += src/dvm/platform_classes.h
 # The Dalvik bytecode emulator lives in libjvm.so: it is reached from jvm.c
@@ -516,7 +516,7 @@ DVM_HDR += src/dvm/platform_classes.h
 # presents it.  Both sides then resolve to the same single instance of the
 # engine — two copies would each hold half of the state.
 # Link a new inode before replacing a runtime that may still be mapped.
-runtime/libjvm.so: src/trace.h src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c src/jvm/jvm.h src/jvm/jni.h $(DVM_SRC) $(DVM_HDR) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o $(BUILD_DIR)/luna_input.o
+runtime/libjvm.so: src/trace.h src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c src/jvm/jvm.h src/jvm/jni.h src/jvm/screen_orientation.h $(DVM_SRC) $(DVM_HDR) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o $(BUILD_DIR)/luna_input.o
 	mkdir -p runtime
 	$(CC) $(CFLAGS) $(SANITIZE) -fPIC $(CPPFLAGS) -D_GNU_SOURCE -Wno-pedantic $(LDFLAGS) $(HOST_SO_LDFLAGS) -shared \
 	    src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c $(DVM_SRC) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o $(BUILD_DIR)/luna_input.o \
@@ -552,8 +552,7 @@ $(BUILD_DIR)/luna_fnmatch.o: src/lib/musl/fnmatch.c src/lunaria_os.h src/luna_un
 
 # arm_exec.o: compiled with C++20 and dynarmic headers; linked into lunaria
 $(BUILD_DIR)/arm_exec.o: | $(BUILD_DIR)
-$(BUILD_DIR)/arm_exec.o: src/luna_prng31.h
-$(BUILD_DIR)/arm_exec.o: src/arm_exec.cpp src/jvm/java_type.h src/arm_exec.h src/lunaria_os.h src/luna_boot.h      src/luna_input.h src/arm.h src/svc_ids.h src/lib/guest.c src/jvm/jvm.h src/binary128.h src/linker64.h src/trace.h $(DYNARMIC_LIB)
+$(BUILD_DIR)/arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/lunaria_os.h src/luna_boot.h      src/luna_input.h src/arm.h src/svc_ids.h src/lib/guest.c src/jvm/jvm.h src/binary128.h src/linker64.h src/trace.h $(DYNARMIC_LIB)
 	$(CXX) -std=c++20 $(OPTFLAGS) -fPIC \
 	    $(SANITIZE) \
 	    $(DYNARMIC_INCS) \
@@ -695,6 +694,37 @@ path-geometry-test: test/path_geometry_test.c src/dvm/dvm_path.c src/dvm/dvm_pat
 	$(CC) -std=c11 -g -O1 -Wall -Wextra $(DVM_TEST_SAN) -Isrc test/path_geometry_test.c src/dvm/dvm_path.c -lm -o $(BUILD_DIR)/path_geometry_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/path_geometry_test
 
+$(BUILD_DIR)/aeabi-memory32.so: test/aeabi_memory_test.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabihf $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
+.PHONY: aeabi-memory-test
+aeabi-memory-test: lunaria $(BUILD_DIR)/aeabi-memory32.so
+	@python3 test/run_guest_results.py $(BUILD_DIR)/aeabi-memory32.so
+
+$(BUILD_DIR)/execute-fault32.so: test/guest_execute_fault_test.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabihf $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
+$(BUILD_DIR)/execute-fatal32.so: test/guest_execute_fault_test.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabihf $(ABI_TEST_CFLAGS) -std=c11 -DGUEST_EXECUTE_FATAL -Wno-unused-function -o $@ $<
+.PHONY: execute-fault-test
+execute-fault-test: lunaria $(BUILD_DIR)/execute-fault32.so $(BUILD_DIR)/execute-fatal32.so
+	@python3 test/run_guest_results.py $(BUILD_DIR)/execute-fault32.so
+	@python3 -c 'import pathlib,subprocess,sys; p=subprocess.run(["./lunaria",sys.argv[1]],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=30); out=p.stdout.decode(errors="replace"); pathlib.Path(sys.argv[1]+".out").write_text(out); ok=p.returncode==139 and "Fatal signal 11 (SIGSEGV), code 1, fault addr 0x00000000" in out and "RESULT FAIL" not in out and "retired: NULL" not in out and "host-abort" not in out; print("Unhandled worker execute fault: "+("PASS" if ok else "FAIL")); sys.exit(0 if ok else 1)' $(BUILD_DIR)/execute-fatal32.so
+
+$(BUILD_DIR)/guest-dac64.so: test/guest_dac_test.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
+$(BUILD_DIR)/guest-dac32.so: test/guest_dac_test.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabihf $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
+.PHONY: guest-dac-test
+guest-dac-test: lunaria $(BUILD_DIR)/guest-dac64.so $(BUILD_DIR)/guest-dac32.so test/dvm_test.dex
+	@mkdir -p $(BUILD_DIR)/guest-dac-pkg $(BUILD_DIR)/guest-dac-self/device-root/data/data/com.example.other/files $(BUILD_DIR)/guest-dac-self/device-root/data/data/com.example.other/private $(BUILD_DIR)/guest-dac-self/files
+	@cp test/dvm_test.dex $(BUILD_DIR)/guest-dac-pkg/classes.dex
+	@chmod 755 $(BUILD_DIR)/guest-dac-self/device-root/data/data/com.example.other $(BUILD_DIR)/guest-dac-self/device-root/data/data/com.example.other/files
+	@chmod 700 $(BUILD_DIR)/guest-dac-self/device-root/data/data/com.example.other/private
+	@env LUNARIA_PACKAGES=none ANDROID_PACKAGE_NAME=com.example.self \
+	    LUNARIA_GUEST_ROOT="$(abspath $(BUILD_DIR))/guest-dac-self/device-root" \
+	    ANDROID_FILES_DIR="$(abspath $(BUILD_DIR))/guest-dac-self/files" \
+	    ANDROID_PACKAGE_CODE_PATH="$(abspath $(BUILD_DIR))/guest-dac-pkg" \
+	    python3 test/run_guest_results.py $(BUILD_DIR)/guest-dac64.so $(BUILD_DIR)/guest-dac32.so
+
 .PHONY: symlink-file-test
 symlink-file-test: test/symlink_file_test.c src/lunaria_file.c src/lunaria_file.h src/lunaria_os.h | $(BUILD_DIR)
 	$(CC) -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Isrc test/symlink_file_test.c src/lunaria_file.c -lpthread -o $(BUILD_DIR)/symlink_file_test
@@ -729,6 +759,7 @@ $(BUILD_DIR)/wj_$(subst /,_,$(patsubst %.c,%.o,$(1))): $(1) $$(DVM_HDR) src/jvm/
 	$$(CC) $$(CFLAGS) $$(CPPFLAGS) -D_GNU_SOURCE -Wno-pedantic -c $(1) -o $$@
 endef
 $(foreach s,$(WINDOWS_JVM_SRC),$(eval $(call WINDOWS_JVM_COMPILE,$(s))))
+$(BUILD_DIR)/wj_src_jvm_jni_stubs.o: src/jvm/screen_orientation.h
 HOST_DL_LIBS = $(WINDOWS_DL_OBJS)
 HOST_JVM_LIB = $(WINDOWS_JVM_OBJS) $(WINDOWS_JVM_UI)
 $(HOST_EXPORT): scripts/windows-exports.py $(LUNARIA_OBJECTS) $(HOST_DL_LIBS) $(HOST_JVM_LIB) $(WINDOWS_STUB_OBJECTS)
@@ -799,9 +830,14 @@ UNITY_TEST_GC = -Wl,-dead_strip
 else
 UNITY_TEST_GC = -Wl,--gc-sections
 endif
-test/test_unity: test/test_unity.c src/jvm/jni_stubs.c src/jvm/log_buffer.c src/jvm/jni.h
+test/test_unity: test/test_unity.c src/jvm/jni_stubs.c src/jvm/jvm.h src/jvm/jni.h src/jvm/screen_orientation.h
 	$(CC) -std=c11 -g -Isrc -D_GNU_SOURCE -ffunction-sections -fdata-sections \
-	    test/test_unity.c src/jvm/jni_stubs.c src/jvm/log_buffer.c $(UNITY_TEST_GC) -o $@
+	    test/test_unity.c src/jvm/jni_stubs.c $(UNITY_TEST_GC) -o $@
+
+.PHONY: screen-orientation-test
+screen-orientation-test: test/screen_orientation_test.c src/jvm/screen_orientation.h | $(BUILD_DIR)
+	$(CC) -std=c11 -Wall -Wextra -Werror -Isrc test/screen_orientation_test.c -o $(BUILD_DIR)/screen_orientation_test
+	$(BUILD_DIR)/screen_orientation_test
 unity-reflection-test: test/test_unity
 	./test/test_unity
 
@@ -1087,6 +1123,24 @@ gl-uniform-test: lunaria test/libgluniform64.so test/libgluniform32.so
 	    ! grep -q 'RESULT FAIL' .gluniform$$abi.out; \
 	done
 
+.PHONY: gl-matrix-test
+test/libglmatrix64.so: test/gl_uniform_matrix_test.c
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
+	    -Wl,--unresolved-symbols=ignore-all -o $@ $<
+
+test/libglmatrix32.so: test/gl_uniform_matrix_test.c
+	clang -target armv7a-linux-gnueabihf -mfloat-abi=softfp -fPIC -shared -nostdlib -O1 -fuse-ld=lld \
+	    -Wl,--unresolved-symbols=ignore-all -o $@ $<
+
+gl-matrix-test: lunaria test/libglmatrix64.so test/libglmatrix32.so
+	@set -e; for abi in 64 32; do \
+	    LD_LIBRARY_PATH="$(CURDIR):$(CURDIR)/runtime" ./lunaria test/libglmatrix$$abi.so \
+	        > .glmatrix$$abi.out 2>&1 || test "$$?" -eq 1; \
+	    grep 'glmatrixtest' .glmatrix$$abi.out; \
+	    grep -q 'RESULT PASS' .glmatrix$$abi.out; \
+	    ! grep -q 'RESULT FAIL' .glmatrix$$abi.out; \
+	done
+
 gl-map-test: lunaria test/libglmaptest.so
 	@LD_LIBRARY_PATH="$(CURDIR):$(CURDIR)/runtime" ./lunaria test/libglmaptest.so \
 	    > .glmaptest.out 2>&1; \
@@ -1231,6 +1285,19 @@ $(BUILD_DIR)/dvm_signal_wait64.so: test/dvm_signal_wait.c | $(BUILD_DIR)
 	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -o $@ $<
 
 .PHONY: dvm-tls-exit-test
+$(BUILD_DIR)/dvm_tid_exhaustion_pkg/classes.dex: test/make_dvm_tls_exit_dex.py test/make_dex.py
+	python3 test/make_dvm_tls_exit_dex.py $@ --tid-exhaustion
+$(BUILD_DIR)/dvm_tid_exhaustion32.so: test/dvm_tls_exit.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabi -mfloat-abi=softfp -mfpu=vfpv3 $(ABI_TEST_CFLAGS) -DTID_EXHAUSTION -o $@ $<
+$(BUILD_DIR)/dvm_tid_exhaustion64.so: test/dvm_tls_exit.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -DTID_EXHAUSTION -o $@ $<
+.PHONY: dvm-tid-exhaustion-test
+dvm-tid-exhaustion-test: lunaria $(BUILD_DIR)/dvm_tid_exhaustion_pkg/classes.dex $(BUILD_DIR)/dvm_tid_exhaustion32.so $(BUILD_DIR)/dvm_tid_exhaustion64.so
+	@for abi in 32 64; do \
+	  ANDROID_PACKAGE_CODE_PATH=$(BUILD_DIR)/dvm_tid_exhaustion_pkg LUNARIA_AUDIO=0 timeout 90s ./lunaria $(BUILD_DIR)/dvm_tid_exhaustion$$abi.so > $(BUILD_DIR)/dvm_tid_exhaustion$$abi.log 2>&1; \
+	  grep 'dvm-tid-exhaustion' $(BUILD_DIR)/dvm_tid_exhaustion$$abi.log; \
+	  grep -q 'RESULT PASS' $(BUILD_DIR)/dvm_tid_exhaustion$$abi.log || exit 1; \
+	done
 $(BUILD_DIR)/tls_key32.so: test/tls_key_test.c | $(BUILD_DIR)
 	clang -target armv7a-linux-gnueabi -mfloat-abi=softfp -mfpu=vfpv3 $(ABI_TEST_CFLAGS) -o $@ $<
 $(BUILD_DIR)/tls_key64.so: test/tls_key_test.c | $(BUILD_DIR)
@@ -1490,6 +1557,35 @@ $(BUILD_DIR)/jniweak64.so: test/jni_weak_test.c | $(BUILD_DIR)
 $(BUILD_DIR)/jniweak32.so: test/jni_weak_test.c | $(BUILD_DIR)
 	clang -target armv7a-linux-gnueabi -mfloat-abi=softfp -mfpu=vfpv3 $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
 .PHONY: jni-weak-test
+$(BUILD_DIR)/guest-namespace64.so: test/guest_namespace_test.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
+$(BUILD_DIR)/guest-namespace32.so: test/guest_namespace_test.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabi -mfloat-abi=softfp -mfpu=vfpv3 $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
+.PHONY: guest-namespace-test
+guest-namespace-test: lunaria $(BUILD_DIR)/guest-namespace64.so $(BUILD_DIR)/guest-namespace32.so test/dvm_test.dex
+	@mkdir -p $(BUILD_DIR)/guest-namespace-pkg
+	@cp test/dvm_test.dex $(BUILD_DIR)/guest-namespace-pkg/classes.dex
+	@ANDROID_PACKAGE_CODE_PATH="$(abspath $(BUILD_DIR))/guest-namespace-pkg" \
+	    python3 test/run_guest_results.py $(BUILD_DIR)/guest-namespace64.so $(BUILD_DIR)/guest-namespace32.so
+
+$(BUILD_DIR)/cpu-topology64.so: test/cpu_topology_test.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
+$(BUILD_DIR)/cpu-topology32.so: test/cpu_topology_test.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabi -mfloat-abi=softfp -mfpu=vfpv3 $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
+.PHONY: cpu-topology-test
+cpu-topology-test: lunaria $(BUILD_DIR)/cpu-topology64.so $(BUILD_DIR)/cpu-topology32.so test/dvm_test.dex
+	@mkdir -p $(BUILD_DIR)/cpu-topology-pkg
+	@cp test/dvm_test.dex $(BUILD_DIR)/cpu-topology-pkg/classes.dex
+	@rc=0; for count in default 1 4 8 16 32 0 33 -1 invalid; do \
+	    output="$(BUILD_DIR)/cpu-topology-$$count.log"; \
+	    configured=$$count; test "$$count" != default || configured=; \
+	    env LUNARIA_DEVICE=pixel6 LUNARIA_CPU_COUNT="$$configured" \
+	        ANDROID_PACKAGE_CODE_PATH="$(abspath $(BUILD_DIR))/cpu-topology-pkg" \
+	        python3 test/run_guest_results.py $(BUILD_DIR)/cpu-topology64.so $(BUILD_DIR)/cpu-topology32.so > "$$output" 2>&1 || rc=1; \
+	    cat "$$output"; \
+	    case "$$count" in default|0|33|-1|invalid) expected=8;; *) expected=$$count;; esac; \
+	    awk -v expected="$$expected" 'index($$0,"RESULT PASS: java="expected" cpus="expected" proc="expected" mask="){n++} END{exit n!=2}' "$$output" || rc=1; \
+	done; exit $$rc
 jni-weak-test: lunaria runtime/libjvm.so $(BUILD_DIR)/jniweak64.so $(BUILD_DIR)/jniweak32.so test/dvm_test.dex
 	@mkdir -p $(BUILD_DIR)/jniweak-pkg
 	@cp test/dvm_test.dex $(BUILD_DIR)/jniweak-pkg/classes.dex
@@ -2271,9 +2367,16 @@ else
 LB_DIST_VARS =
 endif
 .PHONY: dist-luna-browser
+# luna-browser is a POSIX program (dlopen, BSD sockets, poll, fork); it has no
+# Windows port, so a Windows distribution ships without it and the emulator
+# uses an installed Chromium-family browser for WebView.
 dist-luna-browser:
+ifeq ($(DIST_OS),windows)
+	@echo "dist-luna-browser: skipped (luna-browser has no Windows port)"
+else
 	-$(MAKE) -C luna-browser -B LB_WINDOW=0 LUNA_UI=$(abspath $(LUNA_UI_DIR)) \
 	    OPT="$(DIST_OPTFLAGS)" $(LB_DIST_VARS)
+endif
 
 .PHONY: syslib-for-dist
 syslib-for-dist:
@@ -2403,7 +2506,7 @@ $(BUILD_DIR)/random-family/code/classes.dex: test/dvm_test.dex
 random-family-test: lunaria $(BUILD_DIR)/random-family/code/classes.dex $(BUILD_DIR)/random-family64.so $(BUILD_DIR)/random-family32.so
 	@ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/random-family/code" python3 test/run_guest_results.py $(BUILD_DIR)/random-family64.so $(BUILD_DIR)/random-family32.so
 .PHONY: prng31-test
-prng31-test: test/prng31_test.c src/luna_prng31.h | $(BUILD_DIR)
+prng31-test: test/prng31_test.c src/arm_exec.h src/jvm/jvm.h | $(BUILD_DIR)
 	$(CC) -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=undefined $< -o $(BUILD_DIR)/test_prng31
 	$(BUILD_DIR)/test_prng31
 test/libsession64.so: test/session_test.c src/jvm/jni.h
@@ -2804,16 +2907,98 @@ resource-index-test:
 disk-read-pool-test:
 	python3 test/disk_read_pool_test.py
 
+.PHONY: pthread-once-publication-test
+.PHONY: cxa-guard-publication-test
+$(BUILD_DIR)/guard_publication64.so: test/cxa_guard_publication_test.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
+
+$(BUILD_DIR)/guard_publication32.so: test/cxa_guard_publication_test.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabihf -mfloat-abi=softfp $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
+
+$(BUILD_DIR)/guard_svc_addresses: test/cxa_guard_svc_addresses.cpp src/arm_exec.h src/arm.h src/svc_ids.h src/lunaria_os.h $(LUNA_OS_OBJ) | $(BUILD_DIR)
+	$(CXX) -std=c++20 -Isrc $< $(LUNA_OS_OBJ) \
+	    $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_SYSTEM_DL_LIBS) \
+	    $(HOST_CHARSET_LIBS) $(HOST_OS_TEST_LIBS) -lpthread -o $@
+
+$(BUILD_DIR)/guard_svc_addresses.h: $(BUILD_DIR)/guard_svc_addresses
+	$< > $@
+
+$(BUILD_DIR)/guard_svc_publication64.so: test/cxa_guard_publication_test.c $(BUILD_DIR)/guard_svc_addresses.h
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -I$(BUILD_DIR) -DLUNA_GUARD_SVC -std=c11 -o $@ $<
+
+$(BUILD_DIR)/guard_svc_publication32.so: test/cxa_guard_publication_test.c $(BUILD_DIR)/guard_svc_addresses.h
+	clang -target armv7a-linux-gnueabihf -mfloat-abi=softfp $(ABI_TEST_CFLAGS) -I$(BUILD_DIR) -DLUNA_GUARD_SVC -std=c11 -o $@ $<
+
+cxa-guard-publication-test: lunaria $(BUILD_DIR)/guard_publication64.so $(BUILD_DIR)/guard_publication32.so $(BUILD_DIR)/guard_svc_publication64.so $(BUILD_DIR)/guard_svc_publication32.so
+	@set -e; for mode in guard_publication guard_svc_publication; do for abi in 64 32; do \
+	    timeout -k 2s 15s env LUNARIA_AUDIO=0 ./lunaria $(BUILD_DIR)/$$mode$$abi.so \
+	        > $(BUILD_DIR)/$$mode$$abi.log 2>&1 || test "$$?" -eq 1; \
+	    grep 'guardpublication.*RESULT' $(BUILD_DIR)/$$mode$$abi.log; \
+	    grep -q 'guardpublication.*RESULT PASS' $(BUILD_DIR)/$$mode$$abi.log; \
+	done; done
+
+$(BUILD_DIR)/once_publication64.so: test/pthread_once_publication_test.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
+
+$(BUILD_DIR)/once_publication32.so: test/pthread_once_publication_test.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabihf -mfloat-abi=softfp $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
+
+.PHONY: kuser-helpers-test
+$(BUILD_DIR)/kuser_helpers32.so: test/kuser_helpers_test.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabihf -mfloat-abi=softfp $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
+
+$(BUILD_DIR)/kuser_helpers_thumb32.so: test/kuser_helpers_test.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabihf -mfloat-abi=softfp -mthumb $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
+
+kuser-helpers-test: lunaria $(BUILD_DIR)/kuser_helpers32.so $(BUILD_DIR)/kuser_helpers_thumb32.so
+	@set -e; for mode in 32 _thumb32; do \
+	    timeout -k 2s 30s env LUNARIA_AUDIO=0 ./lunaria $(BUILD_DIR)/kuser_helpers$$mode.so \
+	        > $(BUILD_DIR)/kuser_helpers$$mode.log 2>&1 || test "$$?" -eq 1; \
+	    grep 'kuser.*RESULT' $(BUILD_DIR)/kuser_helpers$$mode.log; \
+	    grep -q 'kuser.*RESULT PASS' $(BUILD_DIR)/kuser_helpers$$mode.log; \
+	done
+
+pthread-once-publication-test: lunaria $(BUILD_DIR)/once_publication64.so $(BUILD_DIR)/once_publication32.so
+	@set -e; for abi in 64 32; do \
+	    timeout -k 2s 15s env LUNARIA_AUDIO=0 ./lunaria $(BUILD_DIR)/once_publication$$abi.so \
+	        > $(BUILD_DIR)/once_publication$$abi.log 2>&1 || test "$$?" -eq 1; \
+	    grep 'oncepublication.*RESULT' $(BUILD_DIR)/once_publication$$abi.log; \
+	    grep -q 'oncepublication.*RESULT PASS' $(BUILD_DIR)/once_publication$$abi.log; \
+	done
+
+.PHONY: thread-join-publication-test
+$(BUILD_DIR)/join_publication64.so: test/thread_join_publication_test.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
+
+$(BUILD_DIR)/join_publication32.so: test/thread_join_publication_test.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabihf -mfloat-abi=softfp $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
+
+thread-join-publication-test: lunaria $(BUILD_DIR)/join_publication64.so $(BUILD_DIR)/join_publication32.so
+	@set -e; for abi in 64 32; do \
+	    timeout -k 2s 15s env LUNARIA_AUDIO=0 ./lunaria $(BUILD_DIR)/join_publication$$abi.so \
+	        > $(BUILD_DIR)/join_publication$$abi.log 2>&1 || test "$$?" -eq 1; \
+	    grep 'joinpublication.*RESULT' $(BUILD_DIR)/join_publication$$abi.log; \
+	    grep -q 'joinpublication.*RESULT PASS' $(BUILD_DIR)/join_publication$$abi.log; \
+	done
+
 .PHONY: thread-tls-test
 $(BUILD_DIR)/thread_tls_test.so: test/thread_tls_test.c | $(BUILD_DIR)
 	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
 
-thread-tls-test: lunaria $(BUILD_DIR)/thread_tls_test.so
+$(BUILD_DIR)/thread_tls_test32.so: test/thread_tls_test.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabihf -mfloat-abi=softfp $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
+
+thread-tls-test: lunaria $(BUILD_DIR)/thread_tls_test.so $(BUILD_DIR)/thread_tls_test32.so
 	@timeout -k 2s 30s env LUNARIA_A64_ENGINES=4 LUNARIA_AUDIO=0 \
 	    ./lunaria $(BUILD_DIR)/thread_tls_test.so > $(BUILD_DIR)/thread_tls_test.log 2>&1 || true
 	@grep 'threadtls.*RESULT' $(BUILD_DIR)/thread_tls_test.log
 	@grep -q 'threadtls.*RESULT PASS' $(BUILD_DIR)/thread_tls_test.log && \
 	    ! grep -q 'no caller stack.*skipped' $(BUILD_DIR)/thread_tls_test.log
+	@timeout -k 2s 30s env LUNARIA_AUDIO=0 \
+	    ./lunaria $(BUILD_DIR)/thread_tls_test32.so > $(BUILD_DIR)/thread_tls_test32.log 2>&1 || true
+	@grep 'threadtls.*RESULT' $(BUILD_DIR)/thread_tls_test32.log
+	@grep -q 'threadtls.*RESULT PASS' $(BUILD_DIR)/thread_tls_test32.log && \
+	    ! grep -q 'no caller stack.*skipped' $(BUILD_DIR)/thread_tls_test32.log
 
 .PHONY: yield-hint-test
 $(BUILD_DIR)/test_yield_hint: test/yield_hint_test.cpp $(DYNARMIC_LIB) | $(BUILD_DIR)
@@ -2968,3 +3153,74 @@ $(BUILD_DIR)/classloader64.so: test/classloader_lifetime_test.c | $(BUILD_DIR)
 .PHONY: classloader-lifetime-test
 classloader-lifetime-test: lunaria $(BUILD_DIR)/classloader32.so $(BUILD_DIR)/classloader64.so
 	@python3 test/run_guest_results.py $(BUILD_DIR)/classloader32.so $(BUILD_DIR)/classloader64.so
+
+# /proc is the emulator's, never the host's (POLICY block above synthetic_proc_path
+# in src/arm_exec.cpp): stat/access/readlink/chdir on it answer for the modeled
+# Android process, through bionic and through the raw syscall.
+$(BUILD_DIR)/proc_ns32.so: test/proc_namespace_test.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabi $(ABI_TEST_CFLAGS) -o $@ $<
+$(BUILD_DIR)/proc_ns64.so: test/proc_namespace_test.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -o $@ $<
+.PHONY: proc-namespace-test
+proc-namespace-test: lunaria $(BUILD_DIR)/proc_ns32.so $(BUILD_DIR)/proc_ns64.so
+	@python3 test/run_guest_results.py $(BUILD_DIR)/proc_ns32.so $(BUILD_DIR)/proc_ns64.so
+
+# A freed small block is parked (scudo-like quarantine) before it is reused.
+$(BUILD_DIR)/heap_q32.so: test/heap_quarantine_test.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabi $(ABI_TEST_CFLAGS) -o $@ $<
+$(BUILD_DIR)/heap_q64.so: test/heap_quarantine_test.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -o $@ $<
+.PHONY: heap-quarantine-test
+heap-quarantine-test: lunaria $(BUILD_DIR)/heap_q32.so $(BUILD_DIR)/heap_q64.so
+	@python3 test/run_guest_results.py $(BUILD_DIR)/heap_q32.so $(BUILD_DIR)/heap_q64.so
+
+# kill uses a process ID and errno, unlike pthread_kill's handle/error number.
+KILL_PROCESS_FIXTURES = $(foreach abi,32 64,$(foreach route,0 1 2,$(BUILD_DIR)/kill_process$(abi)_$(route).so))
+$(BUILD_DIR)/kill_process32_%.so: test/kill_process_test.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabi -mfloat-abi=softfp -mfpu=vfpv3 $(ABI_TEST_CFLAGS) -std=c11 -DKILL_ROUTE=$* -o $@ $<
+$(BUILD_DIR)/kill_process64_%.so: test/kill_process_test.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -DKILL_ROUTE=$* -o $@ $<
+.PHONY: kill-process-test
+$(BUILD_DIR)/kill_process_worker32.so: test/kill_process_test.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabi -mfloat-abi=softfp -mfpu=vfpv3 $(ABI_TEST_CFLAGS) -std=c11 -DKILL_FROM_WORKER -o $@ $<
+$(BUILD_DIR)/kill_process_worker64.so: test/kill_process_test.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -DKILL_FROM_WORKER -o $@ $<
+KILL_PROCESS_FIXTURES += $(BUILD_DIR)/kill_process_worker32.so $(BUILD_DIR)/kill_process_worker64.so
+kill-process-test: lunaria $(KILL_PROCESS_FIXTURES)
+	@python3 test/run_kill_process_test.py $(KILL_PROCESS_FIXTURES)
+
+$(BUILD_DIR)/apk_service_manifest_probe: test/apk_service_manifest_probe.c src/apk.c src/dvm/charset.c | $(BUILD_DIR)
+	$(CC) -std=c11 -D_GNU_SOURCE -O1 -ffunction-sections -fdata-sections $(CPPFLAGS) -Isrc test/apk_service_manifest_probe.c src/dvm/charset.c -Wl,--gc-sections -o $@
+.PHONY: apk-service-manifest-test
+apk-service-manifest-test: $(BUILD_DIR)/apk_service_manifest_probe
+	python3 test/apk_service_manifest_test.py $<
+
+.PHONY: service-context-test
+service-context-test: test/test_dvm
+	./test/test_dvm --service-context-test
+
+$(BUILD_DIR)/process_ipc_test: test/process_ipc_test.c src/luna_process_ipc.c src/lunaria_os.h | $(BUILD_DIR)
+	$(CC) -std=c11 -g -O1 -Wall -Wextra $(DVM_TEST_SAN) -Isrc test/process_ipc_test.c src/luna_process_ipc.c -lpthread -o $@
+.PHONY: process-ipc-test
+process-ipc-test: $(BUILD_DIR)/process_ipc_test
+	$(BUILD_DIR)/process_ipc_test
+
+$(BUILD_DIR)/provider_plan_test: test/provider_plan_test.c src/jvm/jvm.h src/jvm/packages.c | $(BUILD_DIR)
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -Wall -Wextra $(DVM_TEST_SAN) -ffunction-sections -fdata-sections -Isrc $< src/jvm/packages.c -Wl,--gc-sections -o $@
+.PHONY: provider-plan-test
+provider-plan-test: $(BUILD_DIR)/provider_plan_test
+	$<
+
+$(BUILD_DIR)/application_bootstrap_test: test/application_bootstrap_test.c src/jvm/jvm.h src/jvm/jvm.c | $(BUILD_DIR)
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -Wall -Wextra $(DVM_TEST_SAN) -ffunction-sections -fdata-sections -Isrc $< src/jvm/jvm.c -Wl,--gc-sections -o $@
+.PHONY: application-bootstrap-test
+application-bootstrap-test: $(BUILD_DIR)/application_bootstrap_test
+	$<
+
+.PHONY: provider-lifecycle-test
+provider-lifecycle-test: test/test_dvm
+	./test/test_dvm --provider-lifecycle-test
+
+.PHONY: service-wire-test
+service-wire-test: test/test_dvm
+	./test/test_dvm --service-wire-test

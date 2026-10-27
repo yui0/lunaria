@@ -1209,37 +1209,6 @@ static void dvm_fill_registered_application_info(
 static bool hook_call_external_inner(void *user, struct dvm *vm, const char *class_name,
                                      const char *method, const char *sig, dvm_ref self,
                                      const union dvm_value *args, int nargs,
-                                     union dvm_value *out);
-
-/* A call from bytecode into the host's Java stub layer converts every argument
- * into a host handle (an Object[] becomes a host array with a handle per element,
- * a boxed Long a host Long).  Those handles are locals of this call: nothing
- * released them, so a loop that logs or formats a value (Long in an Object[]) filled
- * the 65,536-entry object table in a few minutes of play and the process aborted
- * ("jvm object limit reached").  Collect them in a bridge frame and release them when the call
- * returns, exactly as a call into guest native code does (hook_call_native). A stub
- * that keeps an argument beyond the call has to hold its own global reference, which
- * bridge_end() honours. */
-static bool hook_call_external(void *user, struct dvm *vm, const char *class_name,
-                               const char *method, const char *sig, dvm_ref self,
-                               const union dvm_value *args, int nargs,
-                               union dvm_value *out)
-{
-   JNIEnv *env = current_env();
-   if (!env)
-      return hook_call_external_inner(user, vm, class_name, method, sig, self,
-                                      args, nargs, out);
-   struct bridge_frame frame = { .prev = g_bridge_frame };
-   g_bridge_frame = &frame;
-   const bool ok = hook_call_external_inner(user, vm, class_name, method, sig,
-                                            self, args, nargs, out);
-   bridge_end(vm, env, &frame);
-   return ok;
-}
-
-static bool hook_call_external_inner(void *user, struct dvm *vm, const char *class_name,
-                                     const char *method, const char *sig, dvm_ref self,
-                                     const union dvm_value *args, int nargs,
                                      union dvm_value *out)
 {
    (void)user;
@@ -1571,6 +1540,32 @@ static bool hook_call_external_inner(void *user, struct dvm *vm, const char *cla
    return true;
 }
 
+/* A call from bytecode into the host's Java stub layer converts every argument
+ * into a host handle (an Object[] becomes a host array with a handle per element,
+ * a boxed Long a host Long).  Those handles are locals of this call: nothing
+ * released them, so a loop that logs or formats a value (Long in an Object[]) filled
+ * the 65,536-entry object table in a few minutes of play and the process aborted
+ * ("jvm object limit reached").  Collect them in a bridge frame and release them when the call
+ * returns, exactly as a call into guest native code does (hook_call_native). A stub
+ * that keeps an argument beyond the call has to hold its own global reference, which
+ * bridge_end() honours. */
+static bool hook_call_external(void *user, struct dvm *vm, const char *class_name,
+                               const char *method, const char *sig, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   JNIEnv *env = current_env();
+   if (!env)
+      return hook_call_external_inner(user, vm, class_name, method, sig, self,
+                                      args, nargs, out);
+   struct bridge_frame frame = { .prev = g_bridge_frame };
+   g_bridge_frame = &frame;
+   const bool ok = hook_call_external_inner(user, vm, class_name, method, sig,
+                                            self, args, nargs, out);
+   bridge_end(vm, env, &frame);
+   return ok;
+}
+
 static dvm_ref hook_new_external(void *user, struct dvm *vm, const char *class_name)
 {
    (void)user;
@@ -1667,6 +1662,14 @@ static bool hook_call_native(void *user, struct dvm *vm, const char *class_name,
    jvalue ret;
    memset(&ret, 0, sizeof ret);
    jobject jself = self ? to_jobject(vm, env, self) : NULL;
+   if (getenv("LUNARIA_TRACE_UNITY_MSG") && !strcmp(method, "nativeUnitySendMessage") && nargs >= 3) {
+      uint32_t blen = args[2].l ? dvm_array_length(vm, args[2].l) : 0;
+      const uint8_t *bytes = args[2].l ? dvm_array_data(vm, args[2].l) : NULL;
+      const char *go = args[0].l ? dvm_string_utf8(vm, args[0].l) : "?";
+      const char *fn = args[1].l ? dvm_string_utf8(vm, args[1].l) : "?";
+      fprintf(stderr, "[unity-msg] %s.%s(%u bytes): %.*s\n", go ? go : "?", fn ? fn : "?",
+              blen, blen > 120 ? 120 : (int)blen, bytes ? (const char *)bytes : "");
+   }
    if (getenv("LUNARIA_TOUCH_DIAG") && !strcmp(method, "nativeInjectEvent") && nargs) {
       lunaria_touch_event event = {0};
       bool valid = jvm_motion_event_read(jnienv_get_jvm(env), jargs[0].l, &event);

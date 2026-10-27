@@ -1951,6 +1951,26 @@ static const struct rt_method rt_instant[] = {
    M_END,
 };
 
+static bool duration_ofMinutes(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   int64_t minutes = ARG(0).j;
+   if (minutes > INT64_MAX / 60 || minutes < INT64_MIN / 60) {
+      dvm__throw(vm, "java/lang/ArithmeticException", "long overflow");
+      return false;
+   }
+   RETL(jt_new_parts(vm, "Ljava/time/Duration;", minutes * 60, 0, 0));
+}
+
+static const struct rt_method rt_duration[] = {
+   SM("ofMinutes", "(J)Ljava/time/Duration;", duration_ofMinutes),
+   M("getSeconds", "()J", jt_getEpochSecond),
+   M("getNano", "()I", jt_getNano),
+   M_END,
+};
+
 /* ISO-8601 date-time with an offset: yyyy-MM-dd'T'HH:mm[:ss[.fraction]](Z|+hh:mm[:ss])
  * and, for ZonedDateTime, an optional trailing [Region/City].  Stored like every
  * other temporal here: epoch seconds, nanos and the offset in effect. */

@@ -607,3 +607,69 @@ int lunaria_android_install_source_set_allowed(const char *package_name, int all
    if (fclose(f)) ok = 0;
    return ok;
 }
+
+/* Process-local provider selection and initialization order. */
+void luna_providers_close(struct luna_providers *p)
+{ free(p->items);free(p->storage);memset(p,0,sizeof *p); }
+static int luna_provider_integer(const char *s,int *out)
+{
+   char *end;long n;errno=0;n=strtol(s,&end,10);
+   if(!*s || *end || errno || n<INT_MIN || n>INT_MAX)return -EINVAL;
+   *out=(int)n;return 0;
+}
+static int luna_provider_compare(const void *a,const void *b)
+{
+   const struct luna_provider *x=a,*y=b;
+   if(x->init_order!=y->init_order)return x->init_order>y->init_order ? -1 : 1;
+   return x->ordinal<y->ordinal ? -1 : x->ordinal!=y->ordinal;
+}
+/* v2 uses newline records so an authority list can contain semicolons.
+ * Legacy name|authority|metadata records retain their original separator. */
+int luna_providers_open(struct luna_providers *p,const char *text,
+                                     const char *package)
+{
+   memset(p,0,sizeof *p);if(!text || !*text)return 0;
+   int version2=!strncmp(text,"!2\n",3);
+   if(version2)text+=3;
+   const char separator=version2 ? '\n' : ';';
+   size_t capacity=1;
+   for(const char *s=text;*s;++s)if(*s==separator)++capacity;
+   p->storage=strdup(text);p->items=calloc(capacity,sizeof *p->items);
+   if(!p->storage || !p->items){luna_providers_close(p);return -ENOMEM;}
+   char *entry=p->storage;
+   while(entry && *entry){
+      char *next=strchr(entry,separator);if(next)*next++=0;
+      char *fields[8]={0};fields[0]=entry;size_t count=1;
+      for(char *s=entry;*s;++s)if(*s=='|'){
+         if(count==8)goto invalid;
+         *s=0;fields[count++]=s+1;
+      }
+      if(count!=(version2 ? 8u : 3u) || !*fields[0] || !*fields[1])goto invalid;
+      struct luna_provider *r=&p->items[p->count];
+      r->name=fields[0];r->authority=fields[1];r->metadata=fields[2];
+      r->process=version2 ? fields[3] : (char *)(package ? package : "");
+      r->enabled=1;r->ordinal=p->count;
+      if(version2 && (!*r->process || luna_provider_integer(fields[4],&r->enabled) ||
+         luna_provider_integer(fields[5],&r->init_order) ||
+         luna_provider_integer(fields[6],&r->grant_uri) ||
+         luna_provider_integer(fields[7],&r->multiprocess) ||
+         (r->enabled!=0 && r->enabled!=1) || (r->grant_uri!=0 && r->grant_uri!=1) ||
+         (r->multiprocess!=0 && r->multiprocess!=1)))goto invalid;
+      ++p->count;entry=next;
+   }
+   qsort(p->items,p->count,sizeof *p->items,luna_provider_compare);return 0;
+invalid:
+   luna_providers_close(p);return -EINVAL;
+}
+int luna_provider_local(const struct luna_provider *p,const char *process)
+{ return p->enabled && process && (!strcmp(p->process,process) || p->multiprocess); }
+int luna_provider_authority(const struct luna_provider *p,const char *wanted)
+{
+   if(!wanted || !*wanted)return 0;
+   size_t n=strlen(wanted);const char *s=p->authority;
+   while(s && *s){const char *end=strchr(s,';');size_t len=end ? (size_t)(end-s) : strlen(s);
+      if(len==n && !memcmp(s,wanted,n))return 1;
+      s=end ? end+1 : NULL;
+   }
+   return 0;
+}

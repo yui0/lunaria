@@ -15,6 +15,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Shared primitive descriptor names for JNI and dex callers. */
+static inline const char *luna_java_primitive_name(const char *desc)
+{
+   if (!desc || !desc[0] || desc[1]) return NULL;
+   switch (desc[0]) {
+   case 'Z': return "boolean";
+   case 'B': return "byte";
+   case 'C': return "char";
+   case 'S': return "short";
+   case 'I': return "int";
+   case 'J': return "long";
+   case 'F': return "float";
+   case 'D': return "double";
+   case 'V': return "void";
+   default: return NULL;
+   }
+}
+
 /* Host stubs take `va_list` and treat a null/empty list as "no arguments".
  * Darwin and x86_64 Linux expose va_list as a pointer (or an array that decays
  * to one), so `!ap` works.  AArch64 Linux uses a five-field struct, so the
@@ -119,6 +137,7 @@ struct lunaria_screen {
    int width;      /* px, as oriented */
    int height;     /* px, as oriented */
    int density;    /* dpi             */
+   int rotation;   /* Surface.ROTATION_* relative to the natural panel */
 };
 const struct lunaria_screen *lunaria_screen(void);
 
@@ -132,6 +151,9 @@ const struct lunaria_device *const *lunaria_device_list(void);
  * SystemProperties.get() in the bytecode VM and __system_property_get() in
  * the ARM SVC layer.  Returns "" for a property this device does not have. */
 const char *lunaria_android_property(const char *name);
+
+/* Shared guest topology for Java, libc, procfs, sysfs and affinity masks. */
+unsigned lunaria_cpu_count(void);
 
 /* Android settings shared by native JNI and dex. NULL means unset. */
 const char *lunaria_android_setting(const char *table, const char *name);
@@ -449,3 +471,37 @@ void jni_file_bind_ctor_a(JNIEnv *env, jobject file, jmethodID ctor, const jvalu
 /* Diagnostics for the JNI stub-resolution cache (see jvm::wrap_cache). */
 void jvm_wrap_stats(unsigned long long *resolves, unsigned long long *ns,
                     unsigned long long *hits);
+
+/* Android log policy shared by JNI and dex callers. */
+bool lunaria_log_is_loggable(const char *tag, int priority,
+                             const char *(*property)(const char *));
+
+/* logd's main buffer.  Every android.util.Log call lands here as well as on
+ * stderr, so `logcat -d` -- which crash reporters run and attach -- has the
+ * app's own log to dump.  Lines are kept in logcat's threadtime format. */
+void lunaria_logbuf_write(char priority,const char *tag,const char *message);
+/* The newest lines that fit in `capacity`-1 bytes, oldest first, whole lines
+ * only; NUL-terminated.  Returns the length. */
+size_t lunaria_logbuf_read(char *out,size_t capacity);
+void lunaria_logbuf_clear(void);
+
+/* Process Application bootstrap: constructor, attachment, providers, onCreate. */
+int luna_application_start(struct jvm *jvm,const char *manifest_class,
+      bool (*in_dex)(const char *),int (*providers)(struct jvm *,jobject),
+      jobject *base_out,jobject *application_out);
+
+/* Manifest provider installation plan, shared by loader and PackageManager. */
+struct luna_provider {
+   char *name, *authority, *metadata, *process;
+   int enabled, init_order, grant_uri, multiprocess;
+   size_t ordinal;
+};
+struct luna_providers {
+   char *storage;
+   struct luna_provider *items;
+   size_t count;
+};
+void luna_providers_close(struct luna_providers *);
+int luna_providers_open(struct luna_providers *,const char *text,const char *package);
+int luna_provider_local(const struct luna_provider *,const char *process);
+int luna_provider_authority(const struct luna_provider *,const char *authority);

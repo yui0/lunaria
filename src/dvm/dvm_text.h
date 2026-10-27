@@ -166,7 +166,16 @@ static bool decfmt_applyPattern(struct dvm *vm, dvm_ref self,
    RETV();
 }
 
-static dvm_ref text_from_utf16(struct dvm *vm,const uint16_t *units,size_t length);
+/* MPL-2.0. Included by dvm_runtime.c after NumberFormat.
+ * ChoiceFormat intervals and quoting follow Android libcore. */
+static dvm_ref text_from_utf16(struct dvm *vm,const uint16_t *units,size_t length)
+{
+   if (length>SIZE_MAX/3) { dvm__throw(vm,"java/lang/OutOfMemoryError","UTF-16 text"); return 0; }
+   char *text=malloc(length ? length*3 : 1);
+   if (!text) { dvm__throw(vm,"java/lang/OutOfMemoryError","UTF-16 text"); return 0; }
+   size_t bytes=jcs_utf16_to_wtf8(units,length,text);
+   dvm_ref result=dvm_new_string_n(vm,text,bytes); free(text); return result;
+}
 static bool decfmt_ascii(struct dvm *vm,dvm_ref self,const char *ascii,union dvm_value *out)
 {
    uint16_t units[2048];size_t used=0;
@@ -441,17 +450,6 @@ static const struct rt_method rt_decimal_format[] = {
    M("setGroupingUsed", "(Z)V", decfmt_set_grouping),
    M_END,
 };
-
-/* MPL-2.0. Included by dvm_runtime.c after NumberFormat.
- * ChoiceFormat intervals and quoting follow Android libcore. */
-static dvm_ref text_from_utf16(struct dvm *vm,const uint16_t *units,size_t length)
-{
-   if (length>SIZE_MAX/3) { dvm__throw(vm,"java/lang/OutOfMemoryError","UTF-16 text"); return 0; }
-   char *text=malloc(length ? length*3 : 1);
-   if (!text) { dvm__throw(vm,"java/lang/OutOfMemoryError","UTF-16 text"); return 0; }
-   size_t bytes=jcs_utf16_to_wtf8(units,length,text);
-   dvm_ref result=dvm_new_string_n(vm,text,bytes); free(text); return result;
-}
 static uint16_t *text_to_utf16(struct dvm *vm,dvm_ref string,size_t *length)
 {
    size_t bytes=0; const char *text=sdata(vm,string,&bytes);

@@ -532,15 +532,20 @@ static void touch_test_tick(int frame_count)
 {
    touch_fifo_tick(frame_count);
 #define TT_MAX 8
-   static float tt_x[TT_MAX], tt_y[TT_MAX];
+   static float tt_x[TT_MAX], tt_y[TT_MAX], tt_x2[TT_MAX], tt_y2[TT_MAX];
    static int tt_n = -1, tt_frame = 60, tt_hold = 10, tt_gap = 60;
    if (tt_n < 0) {
       tt_n = 0;
       const char *tt = getenv("LUNARIA_TOUCH_TEST");
       for (const char *p = tt; p && *p && tt_n < TT_MAX; ) {
-         float x = -1, y = -1;
-         if (touch_parse_xy(p, &x, &y, NULL)) {
-            tt_x[tt_n] = x; tt_y[tt_n] = y; ++tt_n;
+         float x = -1, y = -1, x2 = -1, y2 = -1;
+         const char *after = NULL;
+         if (touch_parse_xy(p, &x, &y, &after)) {
+            /* "x,y>x2,y2" drags: the press travels to the second point over
+             * the hold, one MOVE a frame, and lifts there. */
+            if (*after == '>' && !touch_parse_xy(after + 1, &x2, &y2, NULL)) x2 = y2 = -1;
+            if (x2 < 0) { x2 = x; y2 = y; }
+            tt_x[tt_n] = x; tt_y[tt_n] = y; tt_x2[tt_n] = x2; tt_y2[tt_n] = y2; ++tt_n;
          }
          const char *semi = strchr(p, ';');
          if (!semi) break;
@@ -555,20 +560,28 @@ static void touch_test_tick(int frame_count)
    }
    if (tt_n <= 0) return;
    const int stride = tt_hold + tt_gap;
+   /* The pump can step more than one frame between ticks; an edge is crossed,
+    * not landed on. */
+   static int prev_frame = -1;
+   const int prev = prev_frame;
+   prev_frame = frame_count;
    for (int t = 0; t < tt_n; ++t) {
       const int down = tt_frame + t * stride;
-      if (frame_count == down) {
+      if (prev < down && frame_count >= down) {
          arm_exec_touch_push(0, tt_x[t], tt_y[t]);  /* ACTION_DOWN */
          fprintf(stderr, "[loader] TOUCH_TEST[%d] DOWN (%.0f,%.0f) frame %d\n",
                  t, tt_x[t], tt_y[t], frame_count);
       }
       /* ACTION_MOVE every frame while held: Unity keeps the touch active */
-      if (frame_count > down && frame_count < down + tt_hold)
-         arm_exec_touch_push(2, tt_x[t], tt_y[t]);
-      if (frame_count == down + tt_hold) {
-         arm_exec_touch_push(1, tt_x[t], tt_y[t]);  /* ACTION_UP */
+      if (frame_count > down && frame_count < down + tt_hold) {
+         const float f = (float)(frame_count - down) / (float)tt_hold;
+         arm_exec_touch_push(2, tt_x[t] + (tt_x2[t] - tt_x[t]) * f,
+                                tt_y[t] + (tt_y2[t] - tt_y[t]) * f);
+      }
+      if (prev < down + tt_hold && frame_count >= down + tt_hold) {
+         arm_exec_touch_push(1, tt_x2[t], tt_y2[t]);  /* ACTION_UP */
          fprintf(stderr, "[loader] TOUCH_TEST[%d] UP (%.0f,%.0f) frame %d (hold=%d)\n",
-                 t, tt_x[t], tt_y[t], frame_count, tt_hold);
+                 t, tt_x2[t], tt_y2[t], frame_count, tt_hold);
       }
    }
 #undef TT_MAX
@@ -1039,6 +1052,48 @@ pump_now_us(void)
  * when Unity happened to call into Java, apply()'d preferences never reached
  * the disk (the account a login stored was gone next launch), and typed text
  * waited for the guest to call Java before the input method saw it. */
+/* ActivityManager-side transport. Each remote process gets its own exec VM;
+ * creation is accepted before Android delivers the component lifecycle. */
+static struct luna_process_pool *g_component_pool;
+static int component_submit(void *user,const char *process,const void *bytes,size_t size)
+{
+   uint32_t pid=0;
+   int rc=luna_process_pool_send(user,process,bytes,size,&pid);
+   if(!rc)fprintf(stderr,"[service-broker] accepted start for %s pid=%u\n",process,pid);
+   return rc;
+}
+static void component_reply(void *user,const char *name,uint32_t pid,const void *bytes,size_t size)
+{
+   (void)user;
+   const unsigned char *p=bytes;
+   if(size!=8 || memcmp(p,"LSR1",4)){
+      fprintf(stderr,"[service-broker] invalid reply from %s pid=%u\n",name,pid);return;
+   }
+   uint32_t bits=0;for(unsigned i=0;i<4;++i)bits|=(uint32_t)p[4+i]<<(i*8);
+   int64_t status=bits>INT32_MAX ? (int64_t)bits-INT64_C(4294967296) : bits;
+   fprintf(stderr,"[service-broker] %s pid=%u lifecycle result=%lld\n",name,pid,(long long)status);
+}
+static void component_pool_tick(void)
+{
+   if(!g_component_pool)return;
+   int rc=luna_process_pool_tick(g_component_pool,component_reply,NULL);
+   if(rc<0 && rc!=-EPIPE)fprintf(stderr,"[service-broker] IPC error: %s\n",strerror(-rc));
+   char name[512];uint32_t pid;int status;
+   while(luna_process_pool_next_exit(g_component_pool,name,sizeof name,&pid,&status)>0)
+      fprintf(stderr,"[service-broker] %s pid=%u exited status=%d\n",name,pid,status);
+}
+static void component_pool_install(struct dvm *vm,int is_a64)
+{
+   if(!vm)return;
+   char executable[4096];
+   if(luna_os_executable_path(executable,sizeof executable)<0)return;
+   /* The Android parent is zygote, independent of the host spawn parent.
+    * Reserve ranges above the application's 1000..5095 namespace. */
+   g_component_pool=luna_process_pool_open(executable,is_a64 ? "--service-process-arm64" : "--service-process-arm32",811,5096);
+   if(!g_component_pool){fprintf(stderr,"[service-broker] unavailable: %s\n",strerror(errno));return;}
+   dvm_service_set_submit(vm,component_submit,g_component_pool);
+}
+
 static bool process_exit_status(int *status)
 {
    if (dvm_jni_process_exited(status)) return true;
@@ -1050,6 +1105,7 @@ static bool process_exit_status(int *status)
 static void
 pump_java_frame(void)
 {
+   component_pool_tick();
    if (luna_guest_paused() || process_exit_status(NULL) || arm_exec_guest_abort_count()) return;
    thread_dump_request_tick();
    arm_exec_main_choreographer_tick();
@@ -1134,17 +1190,6 @@ pump_run_frame(void (*run_threads)(void))
    java_us = pump_now_us() - java_start;
 }
 
-/* --- dex startup --------------------------------------------------------
- *
- * An Android process starts at the manifest's Application and launcher
- * Activity and runs their real bytecode; whatever the app needs from the
- * platform (an engine's NativeActivity glue, its window, its lifecycle) is the
- * framework's job and is provided behind the framework classes, not here. */
-static int dex_call_lifecycle(struct jvm *jvm, jobject self, const char *cls,
-                              const char *method, const char *sig,
-                              int takes_null_arg);
-static int start_manifest_providers(struct jvm *jvm, jobject context);
-
 /* Calls one no-argument (or single-null-argument) lifecycle method through the
  * ordinary JNI entry points, which route into the bytecode VM whenever the dex
  * defines the method.  Returns 0 when there is no such method. */
@@ -1166,45 +1211,6 @@ dex_call_lifecycle(struct jvm *jvm, jobject self, const char *cls,
    return 1;
 }
 
-static uint32_t
-arm_lookup_native_two(const char *primary, const char *fallback,
-                      const char *name)
-{
-   uint32_t va = arm_exec_lookup_native(primary, name);
-   return va ? va : arm_exec_lookup_native(fallback, name);
-}
-
-static uint32_t
-arm_lookup_native_sig_two(const char *primary, const char *fallback,
-                          const char *name, char *sig, size_t sig_size)
-{
-   uint32_t va = arm_exec_lookup_native_sig(primary, name, sig, sig_size);
-   return va ? va : arm_exec_lookup_native_sig(fallback, name, sig, sig_size);
-}
-
-/* Activity.attach() gives every Activity a base Context before any native
- * code can ask it for a system service.  A bare AllocObject() Activity has
- * none, so getSystemService() failed with "unattached ContextWrapper" and the
- * engine went on to dereference the null result. */
-static jobject
-alloc_attached_activity(struct jvm *jvm)
-{
-   jobject activity = jvm->native.AllocObject(&jvm->env,
-      jvm->native.FindClass(&jvm->env, "android/app/Activity"));
-   jclass context_class = jvm->native.FindClass(&jvm->env,
-                                                "android/content/Context");
-   jobject base = context_class
-      ? jvm->native.AllocObject(&jvm->env, context_class) : NULL;
-   jclass ac = jvm->native.FindClass(&jvm->env, "android/app/Activity");
-   jmethodID attach = ac ? jvm->native.GetMethodID(&jvm->env, ac,
-      "attachBaseContext", "(Landroid/content/Context;)V") : NULL;
-   if (activity && base && attach) {
-      jvalue arg = { .l = base };
-      jvm->native.CallVoidMethodA(&jvm->env, activity, attach, &arg);
-   }
-   return activity;
-}
-
 /* Start the package the way Android does: construct the launcher Activity and
  * run its lifecycle out of the dex.  `ANDROID_LAUNCH_ACTIVITY` comes from
  * the native APK launcher, which already parses the APK's AndroidManifest.
@@ -1223,22 +1229,22 @@ start_manifest_providers(struct jvm *jvm, jobject context)
 {
    const char *encoded = getenv("ANDROID_CONTENT_PROVIDERS");
    if (!encoded || !*encoded) return 0;
-   char *providers = strdup(encoded);
-   if (!providers) return 0;
-   int started = 0;
-   char *save = NULL;
-   for (char *entry = strtok_r(providers, ";", &save); entry;
-        entry = strtok_r(NULL, ";", &save)) {
-      char *authority = strchr(entry, '|');
-      if (authority) *authority++ = '\0';
-      char *metadata = authority ? strchr(authority, '|') : NULL;
-      if (metadata) *metadata++ = '\0';
+   const char *package=getenv("ANDROID_PACKAGE_NAME");
+   const char *process=getenv("ANDROID_PROCESS_NAME");
+   if(!process || !*process)process=package;
+   struct luna_providers providers;
+   if(luna_providers_open(&providers,encoded,package)<0)return -1;
+   int started=0;
+   for(size_t index=0;index<providers.count;++index){
+      struct luna_provider *row=&providers.items[index];
+      if(!luna_provider_local(row,process))continue;
+      char *entry=row->name,*authority=row->authority,*metadata=row->metadata;
       char cls[256];
       size_t n = 0;
       for (const char *p = entry; *p && n + 1 < sizeof cls; ++p)
          cls[n++] = (*p == '.') ? '/' : *p;
       cls[n] = '\0';
-      if (!*cls || !dvm_jni_class_in_dex(cls)) continue;
+      if (!*cls || !dvm_jni_class_in_dex(cls)) goto provider_failed;
 
       jclass provider_class = jvm->native.FindClass(&jvm->env, cls);
       jmethodID ctor = provider_class ? jvm->native.GetMethodID(
@@ -1247,8 +1253,9 @@ start_manifest_providers(struct jvm *jvm, jobject context)
          &jvm->env, provider_class, ctor, NULL) : NULL;
       if (!provider) {
          fprintf(stderr, "[loader] content provider: cannot construct %s\n", cls);
-         continue;
+         goto provider_failed;
       }
+      if(jvm->native.ExceptionCheck(&jvm->env))goto provider_failed;
 
       jclass info_class = jvm->native.FindClass(&jvm->env,
                                                  "android/content/pm/ProviderInfo");
@@ -1313,7 +1320,13 @@ start_manifest_providers(struct jvm *jvm, jobject context)
          jfieldID grant = jvm->native.GetFieldID(&jvm->env, info_class,
                                                   "grantUriPermissions", "Z");
          if (grant)
-            jvm->native.SetBooleanField(&jvm->env, info, grant, JNI_TRUE);
+            jvm->native.SetBooleanField(&jvm->env, info, grant, row->grant_uri ? JNI_TRUE : JNI_FALSE);
+         jfieldID field=jvm->native.GetFieldID(&jvm->env,info_class,"processName","Ljava/lang/String;");
+         if(field)jvm->native.SetObjectField(&jvm->env,info,field,
+                                     jvm->native.NewStringUTF(&jvm->env,row->process));
+         field=jvm->native.GetFieldID(&jvm->env,info_class,"name","Ljava/lang/String;");
+         if(field)jvm->native.SetObjectField(&jvm->env,info,field,
+                                     jvm->native.NewStringUTF(&jvm->env,row->name));
       }
       jmethodID attach = jvm->native.GetMethodID(
          &jvm->env, provider_class, "attachInfo",
@@ -1322,13 +1335,56 @@ start_manifest_providers(struct jvm *jvm, jobject context)
          jvalue args[2] = { { .l = context }, { .l = info } };
          jvm->native.CallVoidMethodA(&jvm->env, provider, attach, args);
       }
-      if (dex_call_lifecycle(jvm, provider, cls, "onCreate", "()Z", 0)) {
-         fprintf(stderr, "[loader] content provider: started %s\n", cls);
-         ++started;
-      }
+      /* ContentProvider.attachInfo calls onCreate itself; calling it again
+       * here initializes each provider twice. */
+      if(!attach || jvm->native.ExceptionCheck(&jvm->env))goto provider_failed;
+      fprintf(stderr,"[loader] content provider: started %s (%s)\n",cls,process);
+      ++started;
    }
-   free(providers);
+   luna_providers_close(&providers);
    return started;
+provider_failed:
+   luna_providers_close(&providers);
+   return -1;
+}
+
+static uint32_t
+arm_lookup_native_two(const char *primary, const char *fallback,
+                      const char *name)
+{
+   uint32_t va = arm_exec_lookup_native(primary, name);
+   return va ? va : arm_exec_lookup_native(fallback, name);
+}
+
+static uint32_t
+arm_lookup_native_sig_two(const char *primary, const char *fallback,
+                          const char *name, char *sig, size_t sig_size)
+{
+   uint32_t va = arm_exec_lookup_native_sig(primary, name, sig, sig_size);
+   return va ? va : arm_exec_lookup_native_sig(fallback, name, sig, sig_size);
+}
+
+/* Activity.attach() gives every Activity a base Context before any native
+ * code can ask it for a system service.  A bare AllocObject() Activity has
+ * none, so getSystemService() failed with "unattached ContextWrapper" and the
+ * engine went on to dereference the null result. */
+static jobject
+alloc_attached_activity(struct jvm *jvm)
+{
+   jobject activity = jvm->native.AllocObject(&jvm->env,
+      jvm->native.FindClass(&jvm->env, "android/app/Activity"));
+   jclass context_class = jvm->native.FindClass(&jvm->env,
+                                                "android/content/Context");
+   jobject base = context_class
+      ? jvm->native.AllocObject(&jvm->env, context_class) : NULL;
+   jclass ac = jvm->native.FindClass(&jvm->env, "android/app/Activity");
+   jmethodID attach = ac ? jvm->native.GetMethodID(&jvm->env, ac,
+      "attachBaseContext", "(Landroid/content/Context;)V") : NULL;
+   if (activity && base && attach) {
+      jvalue arg = { .l = base };
+      jvm->native.CallVoidMethodA(&jvm->env, activity, attach, &arg);
+   }
+   return activity;
 }
 
 static int
@@ -1355,52 +1411,13 @@ run_dex_activity(struct jvm *jvm, int is_a64)
    if (!(is_a64 ? arm64_exec_host_egl_init() : arm_exec_host_egl_init()))
       fprintf(stderr, "[loader] host EGL init failed\n");
 
-   /* ActivityThread first creates the process Application and attaches a base
-    * Context.  Activity.getApplication() is therefore non-null even when the
-    * manifest uses the default android.app.Application. */
-   jclass context_class = jvm->native.FindClass(&jvm->env,
-                                                 "android/content/Context");
-   jobject base_context = context_class
-      ? jvm->native.AllocObject(&jvm->env, context_class) : NULL;
-   const char *app_env = getenv("ANDROID_APPLICATION_CLASS");
-   char app_cls[256] = "android/app/Application";
-   if (app_env && *app_env) {
-      size_t an = 0;
-      for (const char *p = app_env; *p && an + 1 < sizeof app_cls; ++p)
-         app_cls[an++] = (*p == '.') ? '/' : *p;
-      app_cls[an] = '\0';
+   jobject base_context=NULL,application=NULL;
+   if(luna_application_start(jvm,getenv("ANDROID_APPLICATION_CLASS"),
+                            dvm_jni_class_in_dex,start_manifest_providers,
+                            &base_context,&application)<0){
+      fprintf(stderr,"[loader] process Application initialization failed\n");
+      return EXIT_FAILURE;
    }
-   jclass application_class = jvm->native.FindClass(&jvm->env, app_cls);
-   jobject application = NULL;
-   if (application_class && dvm_jni_class_in_dex(app_cls)) {
-      jmethodID app_ctor = jvm->native.GetMethodID(&jvm->env,
-                                      application_class, "<init>", "()V");
-      if (app_ctor)
-         application = jvm->native.NewObjectA(&jvm->env, application_class,
-                                               app_ctor, NULL);
-   }
-   if (!application) {
-      application_class = jvm->native.FindClass(&jvm->env,
-                                                 "android/app/Application");
-      application = application_class
-         ? jvm->native.AllocObject(&jvm->env, application_class) : NULL;
-   }
-   if (application && base_context) {
-      jmethodID attach = jvm->native.GetMethodID(
-         &jvm->env, application_class, "attachBaseContext",
-         "(Landroid/content/Context;)V");
-      if (attach) {
-         jvalue arg = { .l = base_context };
-         jvm->native.CallVoidMethodA(&jvm->env, application, attach, &arg);
-      }
-   }
-   /* ActivityThread installs all manifest providers before delivering the
-    * process Application.onCreate().  Firebase and AndroidX Startup rely on
-    * this ordering for process-wide initialisation. */
-   start_manifest_providers(jvm, application ? application : base_context);
-
-   if (application && app_env && *app_env && dvm_jni_class_in_dex(app_cls))
-      (void)dex_call_lifecycle(jvm, application, app_cls, "onCreate", "()V", 0);
 
    /* ActivityThread uses Instrumentation.newActivity(), which invokes the
     * launcher's no-argument constructor before attach()/onCreate().  Using
@@ -1543,6 +1560,54 @@ run_dex_activity(struct jvm *jvm, int is_a64)
    if (max_frames > 0 && frame == max_frames)
       fprintf(stderr, "[loader] LUNARIA_MAX_FRAMES=%d reached — exiting dex loop\n", max_frames);
    return EXIT_SUCCESS;
+}
+
+/* Independent component VM entry: no launcher Activity or EGL/window setup. */
+struct service_process {
+   struct dvm *vm;
+   struct luna_process_channel *channel;
+   int fatal;
+};
+static void service_process_command(void *user,const void *bytes,size_t size)
+{
+   struct service_process *process=user;
+   if(process->fatal)return;
+   int status=dvm_service_dispatch(process->vm,bytes,size);
+   unsigned char reply[8]={'L','S','R','1',0,0,0,0};
+   for(unsigned i=0;i<4;++i)reply[4+i]=(unsigned char)((uint32_t)status>>(i*8));
+   int rc=luna_process_channel_send(process->channel,reply,sizeof reply);
+   if(rc<0 || status==-EIO)process->fatal=1;
+   fprintf(stderr,"[service-process] command result=%d\n",status);
+}
+static int run_service_process(struct jvm *jvm,int is_a64,int control_fd)
+{
+   struct service_process process={0};
+   process.channel=luna_process_channel_open(control_fd);
+   if(!process.channel){fprintf(stderr,"[service-process] control channel: %s\n",strerror(errno));return EXIT_FAILURE;}
+   process.vm=dvm_jni_vm();
+   jobject base=NULL,application=NULL;
+   int result=EXIT_FAILURE;
+   if(!process.vm || luna_application_start(jvm,getenv("ANDROID_APPLICATION_CLASS"),
+        dvm_jni_class_in_dex,start_manifest_providers,&base,&application)<0){
+      fprintf(stderr,"[service-process] Application initialization failed\n");
+      goto done;
+   }
+   fprintf(stderr,"[service-process] ready: %s pid=%d\n",
+           getenv("ANDROID_PROCESS_NAME") ? getenv("ANDROID_PROCESS_NAME") : "?",arm_exec_guest_pid());
+   void (*run_threads)(void)=is_a64 ? arm64_exec_run_pending_threads : arm_exec_run_pending_threads;
+   result=EXIT_SUCCESS;
+   while(!process.fatal){
+      int status=0;
+      if(process_exit_status(&status)){result=status;break;}
+      int rc=luna_process_channel_tick(process.channel,service_process_command,&process);
+      if(rc==-EPIPE)break;
+      if(rc<0){fprintf(stderr,"[service-process] IPC error: %s\n",strerror(-rc));result=EXIT_FAILURE;break;}
+      run_threads();dvm_main_looper_tick(process.vm);dvm_prefs_flush(process.vm);
+      usleep(1000);
+   }
+   if(process.fatal)result=EXIT_FAILURE;
+done:
+   luna_process_channel_close(process.channel);return result;
 }
 
 static int
@@ -1995,8 +2060,13 @@ main(int argc, const char *argv[])
     * an arbitrary .so here inverted that order and also rejected APKs whose
     * alphabetically first helper library had no JNI_OnLoad. */
    if (!strcmp(argv[1], "--apk-process-arm64") ||
-       !strcmp(argv[1], "--apk-process-arm32")) {
-      const int is_a64 = !strcmp(argv[1], "--apk-process-arm64");
+       !strcmp(argv[1], "--apk-process-arm32") ||
+       !strcmp(argv[1], "--service-process-arm64") ||
+       !strcmp(argv[1], "--service-process-arm32")) {
+      const int service_process=!strncmp(argv[1],"--service-process-",18);
+      const int is_a64 = !strcmp(argv[1], "--apk-process-arm64") || !strcmp(argv[1], "--service-process-arm64");
+      if(service_process && (argc!=3 || strcmp(argv[2],"3")))
+         errx(EXIT_FAILURE,"component process requires control descriptor 3");
       const char *libdir = getenv("ANDROID_NATIVE_LIB_DIR");
       if (!libdir || !*libdir)
          errx(EXIT_FAILURE, "ANDROID_NATIVE_LIB_DIR is required for APK process startup");
@@ -2009,13 +2079,18 @@ main(int argc, const char *argv[])
          errx(EXIT_FAILURE, "%s context init failed",
               is_a64 ? "arm64" : "arm32");
       arm_exec_set_main_lib_dir(libdir);
-      if (!arm_exec_host_egl_init())
+      if (!service_process && !arm_exec_host_egl_init())
          fprintf(stderr, "[loader] early APK-process host EGL init failed\n");
       /* Same platform images a device maps before zygote forks the app. */
       if (is_a64)
          a64_preload_platform_libs();
 
-      int ret = run_dex_activity(&jvm, is_a64);
+      if(!service_process)component_pool_install(dvm_jni_vm(),is_a64);
+      int ret = service_process ? run_service_process(&jvm,is_a64,3) : run_dex_activity(&jvm, is_a64);
+      if(g_component_pool){
+         dvm_service_set_submit(dvm_jni_vm(),NULL,NULL);
+         luna_process_pool_close(g_component_pool);g_component_pool=NULL;
+      }
       (void)process_exit_status(&ret);
       arm_exec_begin_shutdown();
       dvm_jni_shutdown();

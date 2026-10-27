@@ -395,3 +395,16 @@ bool dvm_on_bytecode_thread(void);
 /* True in Android's main-thread context. Guest native threads sharing the
  * frame-pump host thread retain their own Android thread identity. */
 bool dvm_on_main_thread(void);
+
+struct dvm;
+
+/* Internal IPC envelope. Pack/unpack require the VM lock; dispatch enters a
+ * main-looper transaction and takes the lock itself. operation: 1=start, 2=stop.
+ * No VM handles are present in the serialized result. Caller frees bytes. */
+int dvm_service_pack(struct dvm *,uint32_t intent,int operation,void **bytes,size_t *size);
+int dvm_service_unpack(struct dvm *,const void *bytes,size_t size,int *operation,uint32_t *intent);
+int dvm_service_dispatch(struct dvm *,const void *bytes,size_t size);
+
+/* The ActivityManager-side transport accepts a serialized start request.
+ * Returning 0 means accepted; negative errno means no request was accepted. */
+void dvm_service_set_submit(struct dvm *,int (*submit)(void *,const char *,const void *,size_t),void *user);

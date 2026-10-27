@@ -1906,6 +1906,15 @@ enum SvcId : uint32_t {
     SVC_IMAGE_PLANE_DATA,
     SVC_IMAGE_READER_LISTENER,
     SVC_IMAGE_READER_WAIT,
+    SVC_GL_UniformMatrix2x3fv,
+    SVC_GL_UniformMatrix3x2fv,
+    SVC_GL_UniformMatrix2x4fv,
+    SVC_GL_UniformMatrix4x2fv,
+    SVC_GL_UniformMatrix3x4fv,
+    SVC_GL_UniformMatrix4x3fv,
+    SVC_GL_GetUniformfv,
+    SVC_KILL,
+    SVC_KUSER_CMPXCHG64,
     SVC_TRAMP_TOTAL,
 };
 

@@ -202,6 +202,9 @@ struct dvm_dex {
 struct dvm_attached_thread { uint64_t token; dvm_ref thread; };
 struct dvm_network_callback { dvm_ref callback, network; bool online; };
 struct dvm {
+   /* ui_is_a(): view class names already resolved to their classes, keyed by
+    * the caller's string literal.  Per VM because classes belong to one. */
+   struct { const char *key; struct dvm_class *cls; } is_a_cache[64];
    _Atomic bool stopping;
    _Atomic int process_exit_phase; /* 0 live, 1 publishing, 2 terminal */
    _Atomic int process_exit_status;
@@ -212,6 +215,8 @@ struct dvm {
    int io_cancel[2]; /* readable until destruction once process stop is requested */
    struct bytecode_thread *host_threads; /* joinable Java threads, under GIL */
    struct dvm_hooks hooks;
+   int (*service_submit)(void *,const char *,const void *,size_t);
+   void *service_submit_user; /* configured before Application startup, under GIL */
    dvm_ref pending_intents; /* live IntentSender tokens, under GIL */
    uint64_t executor_sequence; /* FIFO order of equal-deadline tasks, under GIL */
    struct dvm_alarm *alarms; /* process-local AlarmManager service, under GIL */

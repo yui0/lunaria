@@ -490,7 +490,7 @@ static int zip_extract(struct zip *z, const char *root, bool overwrite)
    return 0;
 }
 struct manifest {
-   char package[256], split[256], activity[512], application[512];
+   char package[256], split[256], activity[512], application[512], application_process[512], activity_process[512];
    char orientation[32], theme[32], min_sdk[32], target_sdk[32], config_changes[32];
    char cleartext[8], network_security[32];
    char receivers[APK_META], services[APK_META];
@@ -667,9 +667,11 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
    int receiver_depth = -1, enabled = 1, app_enabled = 1, exported = -1, boot = 0, app_boot = 0;
    bool receiver_filter = false;
    int service_depth = -1, service_enabled = 1, service_exported = -1;
-   char service[512] = "", service_actions[2048] = "";
+   char service[512] = "", service_actions[2048] = "", service_process[512] = "";
    char receiver[512] = "", permission[512] = "", process[512] = "";
    char app_permission[512] = "", app_process[512] = "";
+   char provider_process[512] = "", activity_process[512] = "";
+   int provider_enabled=1,provider_order=0,provider_grant=0,provider_multi=0;
    for (size_t at = 0; at < size;) {
       if (size - at < 8)
          goto done;
@@ -729,6 +731,10 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
             if (v) app_boot = attr_boolean(v);
             if (copy_text(app_permission, sizeof app_permission, attr_text(a, count, "permission")) ||
                 copy_text(app_process, sizeof app_process, attr_text(a, count, "process"))) goto done;
+            if (*app_process == ':') {
+               int n=snprintf(m->application_process,sizeof m->application_process,"%s%s",m->package,app_process);
+               if(n<0 || (size_t)n>=sizeof m->application_process)goto done;
+            } else if(copy_text(m->application_process,sizeof m->application_process,*app_process ? app_process : m->package))goto done;
          } else if (!strcmp(tag, "receiver")) {
             if (class_name(receiver, sizeof receiver, m->package, attr_text(a, count, "name"))) goto done;
             const struct attr *v = attribute(a, count, "enabled");
@@ -754,11 +760,24 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
             service_enabled = v ? attr_boolean(v) : 1;
             v = attribute(a, count, "exported");
             service_exported = v ? attr_boolean(v) : -1;
+            v = attribute(a, count, "process");
+            const char *proc = v ? v->text : app_process;
+            if (!*proc) proc = m->package;
+            if (*proc == ':') {
+               int n = snprintf(service_process, sizeof service_process, "%s%s", m->package, proc);
+               if (n < 0 || (size_t)n >= sizeof service_process) goto done;
+            } else if (copy_text(service_process, sizeof service_process, proc)) goto done;
             service_actions[0] = 0;
             service_depth = depth;
          } else if (!strcmp(tag, "intent-filter") && receiver_depth >= 0) {
             receiver_filter = true;
          } else if (!strcmp(tag, "activity") || !strcmp(tag, "activity-alias")) {
+            const struct attr *pv=attribute(a,count,"process");
+            const char *proc=pv ? pv->text : m->application_process;
+            if(*proc==':'){
+               int n=snprintf(activity_process,sizeof activity_process,"%s%s",m->package,proc);
+               if(n<0 || (size_t)n>=sizeof activity_process)goto done;
+            } else if(copy_text(activity_process,sizeof activity_process,proc))goto done;
             if (attr_number(changes, sizeof changes, a, count, "configChanges")) goto done;
             if (copy_text(activity, sizeof activity, attr_text(a, count, "name")) || copy_text(target, sizeof target, attr_text(a, count, "targetActivity")) || attr_number(orient, sizeof orient, a, count, "screenOrientation") || attr_number(theme, sizeof theme, a, count, "theme"))
                goto done;
@@ -783,6 +802,17 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
             if (append(m->query_packages, sizeof m->query_packages, attr_text(a, count, "name"), ","))
                goto done;
          } else if (!strcmp(tag, "provider")) {
+            const struct attr *pv=attribute(a,count,"process");
+            const char *proc=pv ? pv->text : m->application_process;
+            if(*proc==':'){
+               int n=snprintf(provider_process,sizeof provider_process,"%s%s",m->package,proc);
+               if(n<0 || (size_t)n>=sizeof provider_process)goto done;
+            } else if(copy_text(provider_process,sizeof provider_process,proc))goto done;
+            pv=attribute(a,count,"enabled");provider_enabled=app_enabled && (!pv || attr_boolean(pv));
+            pv=attribute(a,count,"grantUriPermissions");provider_grant=pv && attr_boolean(pv);
+            pv=attribute(a,count,"multiprocess");provider_multi=pv && attr_boolean(pv);
+            pv=attribute(a,count,"initOrder");
+            provider_order=pv ? (int32_t)(pv->type==3 ? strtol(pv->text,NULL,10) : pv->value) : 0;
             char qualified[512];
             if (class_name(qualified, sizeof qualified, m->package, attr_text(a, count, "name")))
                goto done;
@@ -821,7 +851,8 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
          }
          if (depth == activity_depth) {
             if (activity_launch && !*m->activity) {
-               if (copy_text(m->config_changes, sizeof m->config_changes, changes)) goto done;
+               if (copy_text(m->config_changes, sizeof m->config_changes, changes) ||
+                   copy_text(m->activity_process,sizeof m->activity_process,activity_process)) goto done;
                if (class_name(m->activity, sizeof m->activity, m->package, *target ? target : activity) || copy_text(m->orientation, sizeof m->orientation, orient) || copy_text(m->theme, sizeof m->theme, *theme ? theme : app_theme))
                   goto done;
             }
@@ -837,14 +868,19 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
          }
          if (depth == service_depth) {
             char row[APK_META];
-            int n = snprintf(row, sizeof row, "%s|%d|%d|%s", service, service_enabled,
-                             service_exported, service_actions);
+            int n = snprintf(row, sizeof row, "%s|%d|%d|%s|%s", service, service_enabled && app_enabled,
+                             service_exported, service_actions, service_process);
             if (n < 0 || (size_t)n >= sizeof row || append(m->services, sizeof m->services, row, ";")) goto done;
             service_depth = -1;
          }
          if (depth == provider_depth) {
-            if (append(m->providers, sizeof m->providers, provider, ";"))
-               goto done;
+            char suffix[640];
+            int n=snprintf(suffix,sizeof suffix,"|%s|%d|%d|%d|%d",provider_process,
+                           provider_enabled,provider_order,provider_grant,provider_multi);
+            if(n<0 || (size_t)n>=sizeof suffix || append(provider,sizeof provider,suffix,""))goto done;
+            if(!*m->providers && copy_text(m->providers,sizeof m->providers,"!2\n"))goto done;
+            if (append(m->providers, sizeof m->providers, provider,
+                       !strcmp(m->providers,"!2\n") ? "" : "\n"))goto done;
             provider_depth = -1;
          }
          if (depth == queries_depth)
@@ -1937,7 +1973,8 @@ static int launcher_ask(int *argc, const char ***argv)
 static void restart_remember(int argc, const char **argv);
 static int apk_prepare_inner(int *argc, const char ***argv)
 {
-   if (*argc >= 2 && (!strcmp((*argv)[1], "--apk-process-arm64") || !strcmp((*argv)[1], "--apk-process-arm32")))
+   if (*argc >= 2 && (!strcmp((*argv)[1], "--apk-process-arm64") || !strcmp((*argv)[1], "--apk-process-arm32") ||
+                      !strcmp((*argv)[1], "--service-process-arm64") || !strcmp((*argv)[1], "--service-process-arm32")))
       return 0;
    if (*argc < 2) {
       /* Started with nothing to run (a double-clicked app, a launcher icon).
@@ -2233,6 +2270,8 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       const char *key, *value;
    } metadata[] = {
       {"ANDROID_LAUNCH_ACTIVITY", m->activity}, {"ANDROID_APPLICATION_CLASS", m->application},
+      {"ANDROID_APPLICATION_PROCESS", m->application_process},
+      {"ANDROID_PROCESS_NAME", *m->activity_process ? m->activity_process : m->application_process},
       {"ANDROID_LAUNCH_CONFIG_CHANGES", m->config_changes},
       {"ANDROID_SCREEN_ORIENTATION", m->orientation}, {"ANDROID_THEME_RESOURCE", m->theme},
       {"ANDROID_RECEIVERS", m->receivers}, {"ANDROID_SERVICES", m->services},

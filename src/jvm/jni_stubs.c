@@ -26,8 +26,7 @@
 #include <unistd.h>
 #include "jvm/jni.h"
 #include "jvm.h"
-#include "java_type.h"
-#include "log_policy.h"
+#include "screen_orientation.h"
 #include "arm_exec.h"
 #include "dvm/dvm_jni.h"
 
@@ -860,15 +859,8 @@ screen_is_landscape(void)
 {
    const char *o = getenv("ANDROID_SCREEN_ORIENTATION");
    if (!o || !*o) return 0;
-   switch (strtol(o, NULL, 10)) {
-   case 0:   /* SCREEN_ORIENTATION_LANDSCAPE         */
-   case 6:   /* SCREEN_ORIENTATION_SENSOR_LANDSCAPE  */
-   case 8:   /* SCREEN_ORIENTATION_REVERSE_LANDSCAPE */
-   case 11:  /* SCREEN_ORIENTATION_USER_LANDSCAPE    */
-      return 1;
-   default:
-      return 0;
-   }
+   int rotation = lunaria_orientation_rotation(strtol(o, NULL, 10));
+   return rotation == 1 || rotation == 3;
 }
 
 const struct lunaria_screen *
@@ -880,6 +872,9 @@ lunaria_screen(void)
    resolved = 1;
 
    const struct lunaria_device *d = lunaria_device();
+   const char *orientation = getenv("ANDROID_SCREEN_ORIENTATION");
+   long requested = orientation && *orientation ? strtol(orientation, NULL, 10) : -1;
+   s.rotation = lunaria_orientation_rotation(requested);
    const int operator_chose_panel =
       (getenv("LUNARIA_DEVICE_SCREEN_WIDTH")   && *getenv("LUNARIA_DEVICE_SCREEN_WIDTH")) ||
       (getenv("LUNARIA_DEVICE_SCREEN_HEIGHT")  && *getenv("LUNARIA_DEVICE_SCREEN_HEIGHT")) ||

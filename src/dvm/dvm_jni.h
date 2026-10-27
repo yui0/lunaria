@@ -169,3 +169,16 @@ struct dvm *dvm_current(void);
 void dvm_gil_yield(struct dvm *vm);
 
 void dvm_glsurface_tick(struct dvm *vm);
+
+struct dvm;
+
+/* Internal IPC envelope. Pack/unpack require the VM lock; dispatch enters a
+ * main-looper transaction and takes the lock itself. operation: 1=start, 2=stop.
+ * No VM handles are present in the serialized result. Caller frees bytes. */
+int dvm_service_pack(struct dvm *,uint32_t intent,int operation,void **bytes,size_t *size);
+int dvm_service_unpack(struct dvm *,const void *bytes,size_t size,int *operation,uint32_t *intent);
+int dvm_service_dispatch(struct dvm *,const void *bytes,size_t size);
+
+/* The ActivityManager-side transport accepts a serialized start request.
+ * Returning 0 means accepted; negative errno means no request was accepted. */
+void dvm_service_set_submit(struct dvm *,int (*submit)(void *,const char *,const void *,size_t),void *user);

@@ -103,7 +103,7 @@ exec "${1:-make}" dist \
     BUILD_DIR="$work" LUNARIA_BIN="$work/lunaria.exe" \
     OPENH264_SO="$work/runtime/openh264.dll" SYSLIB_DIR="$SYSLIB_DIR" \
     DIST_BUILD_DIR="${WIN_DIST_BUILD_DIR:-/tmp/lunaria-dist-build/cross-windows-x86_64}" \
-    HOST_CPPFLAGS="-I$angle/include -I$deps/include" \
+    HOST_CPPFLAGS="-I$angle/include -I$deps/include -I$boost" \
     HOST_WINDOW_LIBS="$glfw" \
     HOST_GL_LIBS="-L$angle/lib -lEGL -lGLESv2" \
     HOST_CRYPTO_LIBS="-L$angle/lib -L$deps/lib -lssl -lcrypto" \
