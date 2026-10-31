@@ -1,7 +1,7 @@
 /* MPL-2.0. Gregorian/Julian calendar arithmetic and deferred field resolution.
  * Gregorian default cutover: 1582-10-15. Buddhist years share this chronology.
  * Host adapters supply zone offsets and local wall-time resolution only. */
-#include "calendar.h"
+#include "dvm_lib.h"
 #include <limits.h>
 #include <string.h>
 int64_t lc_floor(int64_t n,int64_t d) {int64_t q=n/d;return q-(n%d<0);}

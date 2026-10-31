@@ -6,7 +6,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-#include "dvm/dex.h"
+#include "dvm/dvm.h"
 
 #include <limits.h>
 #include <stdio.h>

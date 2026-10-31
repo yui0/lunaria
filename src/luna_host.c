@@ -120,6 +120,133 @@ void luna_fd_monitor_stop(void) {
     close(epfd); close(wakefd); epfd = wakefd = -1;
     free(watched); watched = NULL; watched_count = 0;
 }
+#elif defined(__APPLE__)
+#include <limits.h>
+#include <pthread.h>
+#include <sys/event.h>
+#include <time.h>
+/* The same contract as the epoll monitor above, on kqueue: every watched
+ * descriptor is armed one-shot, and the scheduler re-arms after it has looked
+ * at its waiters.  A kqueue descriptor (a guest epoll instance here) is
+ * itself readable when it has events pending, so it is watched like any
+ * other. */
+enum { WAKE_IDENT = 1 };
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t thread;
+static int kq = -1, stopping;
+static struct pollfd *watched;
+static size_t watched_count;
+static int64_t deadline = INT64_MAX;
+static void (*on_ready)(void);
+static void notify(void) {
+    struct kevent k;
+    EV_SET(&k, WAKE_IDENT, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+    (void)kevent(kq, &k, 1, NULL, 0, NULL);
+}
+static int64_t now_ms(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+static void *run(void *unused) {
+    (void)unused;
+    for (;;) {
+        struct timespec wait, *timeout = NULL;
+        pthread_mutex_lock(&lock);
+        int stop = stopping;
+        if (deadline != INT64_MAX) {
+            int64_t left = deadline - now_ms();
+            if (left < 0) left = 0;
+            wait.tv_sec = (time_t)(left / 1000);
+            wait.tv_nsec = (long)(left % 1000) * 1000000L;
+            timeout = &wait;
+        }
+        pthread_mutex_unlock(&lock);
+        if (stop) break;
+        struct kevent events[16];
+        int n = kevent(kq, NULL, 0, events, 16, timeout);
+        if (n < 0) { if (errno == EINTR) continue; break; }
+        int ready = 0;
+        for (int i = 0; i < n; ++i)
+            if (events[i].filter != EVFILT_USER) ready = 1;
+        /* Only the current, expired deadline may fire; disarm it before
+         * notifying, as the one-shot descriptors are. */
+        pthread_mutex_lock(&lock);
+        if (deadline != INT64_MAX && deadline <= now_ms()) {
+            deadline = INT64_MAX;
+            ready = 1;
+        }
+        stop = stopping;
+        pthread_mutex_unlock(&lock);
+        if (ready && !stop) on_ready();
+    }
+    return NULL;
+}
+int luna_fd_monitor_start(void (*ready)(void)) {
+    if (kq >= 0) return 0;
+    kq = kqueue();
+    if (kq < 0) return -1;
+    struct kevent k;
+    EV_SET(&k, WAKE_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    stopping = 0; deadline = INT64_MAX; on_ready = ready;
+    if (kevent(kq, &k, 1, NULL, 0, NULL) < 0) goto fail;
+    int error = pthread_create(&thread, NULL, run, NULL);
+    if (error) { errno = error; goto fail; }
+    return 0;
+fail:
+    { int error = errno; close(kq); kq = -1; errno = error; return -1; }
+}
+static void watch_change(struct kevent *k, int fd, short filter, unsigned short flags) {
+    EV_SET(k, (uintptr_t)fd, filter, flags, 0, 0, NULL);
+}
+int luna_fd_monitor_update(const struct pollfd *fds, size_t count, int64_t due) {
+    if (kq < 0) { errno = ENOSYS; return -1; }
+    struct pollfd *next = count ? malloc(count * sizeof *next) : NULL;
+    if (count && !next) return -1;
+    size_t n = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (fds[i].fd < 0) continue;
+        size_t j;
+        for (j = 0; j < n && next[j].fd != fds[i].fd; ++j) {}
+        if (j == n) { next[n] = fds[i]; next[n++].revents = 0; }
+        else next[j].events |= fds[i].events;
+    }
+    pthread_mutex_lock(&lock);
+    int failed = 0;
+    /* A descriptor no longer waited on is dropped; a one-shot that already
+     * fired is gone, so ENOENT is the normal answer. */
+    for (size_t i = 0; i < watched_count; ++i) {
+        size_t j;
+        for (j = 0; j < n && next[j].fd != watched[i].fd; ++j) {}
+        if (j != n) continue;
+        struct kevent k[2];
+        watch_change(&k[0], watched[i].fd, EVFILT_READ, EV_DELETE);
+        watch_change(&k[1], watched[i].fd, EVFILT_WRITE, EV_DELETE);
+        for (int f = 0; f < 2; ++f) (void)kevent(kq, &k[f], 1, NULL, 0, NULL);
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const short ev = next[i].events;
+        struct kevent k;
+        if (ev & (POLLIN | POLLPRI)) {
+            watch_change(&k, next[i].fd, EVFILT_READ, EV_ADD | EV_ONESHOT);
+            if (kevent(kq, &k, 1, NULL, 0, NULL) < 0) failed = 1;
+        }
+        if (ev & POLLOUT) {
+            watch_change(&k, next[i].fd, EVFILT_WRITE, EV_ADD | EV_ONESHOT);
+            if (kevent(kq, &k, 1, NULL, 0, NULL) < 0) failed = 1;
+        }
+    }
+    free(watched); watched = next; watched_count = n; deadline = due;
+    notify();
+    pthread_mutex_unlock(&lock);
+    return failed ? -1 : 0;
+}
+void luna_fd_monitor_stop(void) {
+    if (kq < 0) return;
+    pthread_mutex_lock(&lock); stopping = 1; notify(); pthread_mutex_unlock(&lock);
+    pthread_join(thread, NULL);
+    close(kq); kq = -1;
+    free(watched); watched = NULL; watched_count = 0;
+}
 #else
 int luna_fd_monitor_start(void (*ready)(void)) { (void)ready; errno = ENOSYS; return -1; }
 int luna_fd_monitor_update(const struct pollfd *fds, size_t count, int64_t due) {

@@ -25,6 +25,7 @@
 #define LUNARIA_SYMLINK_NATIVE
 #include "lunaria_os.h"
 
+#include <ifaddrs.h>
 #include <locale.h>
 #include <xlocale.h>
 #include <errno.h>
@@ -62,6 +63,57 @@ int luna_os_setenv(const char *name, const char *value, int overwrite)
    if (!name || !*name || strchr(name, '=') || !value) { errno = EINVAL; return -1; }
    return setenv(name, value, overwrite);
 }
+static unsigned netif_prefix(const struct sockaddr *mask, size_t len)
+{
+   if (!mask) return 0;
+   const uint8_t *bytes = mask->sa_family == AF_INET
+      ? (const uint8_t *)&((const struct sockaddr_in *)mask)->sin_addr
+      : (const uint8_t *)&((const struct sockaddr_in6 *)mask)->sin6_addr;
+   unsigned bits = 0;
+   for (size_t i = 0; i < len; ++i)
+      for (int b = 7; b >= 0 && (bytes[i] >> b & 1); --b) ++bits;
+   return bits;
+}
+
+int luna_os_net_list(struct luna_os_netif *out, int capacity)
+{
+   struct ifaddrs *list = NULL;
+   if (!out || capacity <= 0 || getifaddrs(&list) != 0) return 0;
+   int count = 0;
+   for (const struct ifaddrs *it = list; it; it = it->ifa_next) {
+      if (!it->ifa_name) continue;
+      int at = 0;
+      while (at < count && strcmp(out[at].name, it->ifa_name)) ++at;
+      if (at == count) {
+         if (count == capacity) continue;
+         memset(&out[count], 0, sizeof out[count]);
+         snprintf(out[count].name, sizeof out[count].name, "%s", it->ifa_name);
+         out[count].index = if_nametoindex(it->ifa_name);
+         out[count].up = (it->ifa_flags & IFF_UP) && (it->ifa_flags & IFF_RUNNING);
+         out[count].loopback = (it->ifa_flags & IFF_LOOPBACK) != 0;
+         out[count].multicast = (it->ifa_flags & IFF_MULTICAST) != 0;
+         out[count].point_to_point = (it->ifa_flags & IFF_POINTOPOINT) != 0;
+         out[count].mtu = it->ifa_data ? ((const struct if_data *)it->ifa_data)->ifi_mtu : 0;
+         ++count;
+      }
+      struct luna_os_netif *netif = &out[at];
+      const struct sockaddr *sa = it->ifa_addr;
+      if (!sa) continue;
+      if ((sa->sa_family == AF_INET || sa->sa_family == AF_INET6) && netif->naddr < LUNA_OS_NETIF_ADDRS) {
+         const bool v4 = sa->sa_family == AF_INET;
+         const size_t size = v4 ? 4 : 16;
+         netif->addr[netif->naddr].family = v4 ? 4 : 6;
+         memcpy(netif->addr[netif->naddr].bytes, v4
+                ? (const void *)&((const struct sockaddr_in *)sa)->sin_addr
+                : (const void *)&((const struct sockaddr_in6 *)sa)->sin6_addr, size);
+         netif->addr[netif->naddr].prefix = (uint8_t)netif_prefix(it->ifa_netmask, size);
+         ++netif->naddr;
+      }
+   }
+   freeifaddrs(list);
+   return count;
+}
+
 int luna_os_random(void *buffer, size_t length)
 {
    if (length && !buffer) { errno = EFAULT; return -1; }
@@ -110,6 +162,8 @@ void luna_os_backtrace_print(void *const *frames, int count)
 #include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <sys/types.h>
+#include <net/if.h>
+#include <netinet/in.h>
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -445,7 +499,19 @@ int luna_os_fd_path(int fd, char *buf, size_t bufsz)
 {
    char full[PATH_MAX];
    if (fd < 0 || !buf || bufsz < 2) return -1;
-   if (fcntl(fd, F_GETPATH, full) != 0) return -1;
+   if (fcntl(fd, F_GETPATH, full) != 0) {
+      /* F_GETPATH only names vnodes.  A pipe or socket reads, on Linux, as
+       * "pipe:[inode]" / "socket:[inode]". */
+      struct stat st;
+      const char *kind = fstat(fd, &st) != 0 ? NULL :
+                         S_ISFIFO(st.st_mode) ? "pipe" :
+                         S_ISSOCK(st.st_mode) ? "socket" : NULL;
+      if (!kind) return -1;
+      int n = snprintf(full, sizeof full, "%s:[%llu]", kind, (unsigned long long)st.st_ino);
+      if (n < 0 || (size_t)n >= bufsz) return -1;
+      memcpy(buf, full, (size_t)n + 1);
+      return 0;
+   }
    if (strlen(full) >= bufsz) return -1;
    strcpy(buf, full);
    return 0;

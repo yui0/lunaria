@@ -1374,6 +1374,24 @@ void luna_os_command_pipe_close(intptr_t pipe);
 
 /* Fill with bytes from the host's cryptographic random source. */
 int luna_os_random(void *buffer, size_t length);
+
+/* The host's network interfaces, for java.net.NetworkInterface.  Fills `out`
+ * with at most `capacity` entries and returns how many; an interface is listed
+ * once with all of its addresses; `index` is the host's interface index.  The
+ * hardware address is left out: Android 11+ withholds it from apps. */
+#define LUNA_OS_NETIF_ADDRS 8
+struct luna_os_netif {
+   char name[40];
+   unsigned index, mtu;
+   bool up, loopback, multicast, point_to_point;
+   int naddr;
+   struct {
+      uint8_t family;          /* 4 or 6 */
+      uint8_t bytes[16];
+      uint8_t prefix;          /* prefix length in bits */
+   } addr[LUNA_OS_NETIF_ADDRS];
+};
+int luna_os_net_list(struct luna_os_netif *out, int capacity);
 void *luna_os_library_symbol(void *handle, const char *name);
 /* Search one already-loaded host module without loading a new GL driver. */
 void *luna_os_library_loaded_symbol(const char *module, const char *name);
@@ -1920,6 +1938,11 @@ static inline int luna_vma_protect(struct luna_vma_table *t, uint64_t lo,
     }
     return 0;
 }
+
+/* Namespace reverse mapping must canonicalize the host staging root without
+ * entering the guest symlink resolver (which calls the reverse mapper). */
+static inline char *luna_host_realpath(const char *path, char *result, size_t capacity)
+{ return luna_file_realpath(path, result, capacity); }
 
 /* Host-backed guest files share the same link representation across C and
  * native guests. Backend implementations and scratch cleanup use raw APIs. */

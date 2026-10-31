@@ -1,7 +1,8 @@
 /* MPL-2.0. APK v2/v3 certificate metadata. No new library dependencies.
  * Format: https://source.android.com/docs/security/features/apksigning/v2
  *         https://source.android.com/docs/security/features/apksigning/v3 */
-#include "dvm/apk_signers.h"
+#include <openssl/x509.h>
+#include "dvm/dvm.h"
 #include "lunaria_os.h"
 #include <limits.h>
 #include <stdint.h>

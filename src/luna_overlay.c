@@ -1629,7 +1629,7 @@ static bool text_hb_load(void)
 #if defined(_WIN32)
  "libharfbuzz-0.dll","harfbuzz.dll",
 #elif defined(__APPLE__)
- "libharfbuzz.0.dylib","/opt/homebrew/lib/libharfbuzz.0.dylib","/usr/local/lib/libharfbuzz.0.dylib",
+ "@rpath/libharfbuzz.0.dylib","libharfbuzz.0.dylib","/opt/homebrew/lib/libharfbuzz.0.dylib","/usr/local/lib/libharfbuzz.0.dylib",
 #else
  "libharfbuzz.so.0","libharfbuzz.so",
 #endif

@@ -3807,35 +3807,72 @@ static bool cl_getMethods(struct dvm *vm, dvm_ref self,
                           const union dvm_value *args, int nargs,
                           union dvm_value *out);
 
-/* java.lang.reflect.Array.newInstance(componentType, length).  The element
- * descriptor comes from the Class the caller passed, so the array the VM makes
- * really is of that component type and a later check-cast to it holds. */
-static bool reflect_array_newInstance(struct dvm *vm, dvm_ref self,
-                                      const union dvm_value *args, int nargs,
-                                      union dvm_value *out)
+/* Allocate exactly the dimensions requested. If the supplied component is
+ * already an array, those extra dimensions remain null at the leaves. */
+static dvm_ref reflect_array_allocate(struct dvm *vm,const char *descriptor,
+                                      const int32_t *lengths,unsigned count)
 {
-   (void)self; (void)nargs;
-   struct dvm_object *co = dvm__obj(vm, ARG(0).l);
-   struct dvm_class *component = co ? co->klass : NULL;
-   int32_t length = ARG(1).i;
-   if (length < 0) {
-      dvm__throw(vm, "java/lang/NegativeArraySizeException", "%d", length);
-      return false;
+   dvm_ref result=dvm_new_array(vm,dvm__kind_of(descriptor+1),descriptor+1,(uint32_t)lengths[0]);
+   if (!result) return 0;
+   dvm_pin(vm,result);
+   if (count>1) {
+      for (int32_t i=0;i<lengths[0];++i) {
+         dvm_ref child=reflect_array_allocate(vm,descriptor+1,lengths+1,count-1);
+         if (!child) {dvm_unpin(vm,result);return 0;}
+         ((dvm_ref *)dvm_array_data(vm,result))[i]=child;
+      }
    }
-   if (!component) {
-      dvm__throw(vm, "java/lang/NullPointerException", "componentType");
-      return false;
+   dvm_unpin(vm,result);return result;
+}
+static dvm_ref reflect_array_create(struct dvm *vm,dvm_ref component_ref,
+                                    const int32_t *lengths,unsigned count)
+{
+   if (!count || count>255) {dvm__throw(vm,"java/lang/IllegalArgumentException","invalid number of array dimensions");return 0;}
+   struct dvm_object *co=dvm__obj(vm,component_ref);
+   if (!co || !co->klass) {dvm__throw(vm,"java/lang/NullPointerException","componentType");return 0;}
+   const char *component=co->klass->desc;
+   unsigned existing=0;while(component && component[existing]=='[')++existing;
+   if (!component || !strcmp(component,"V") || existing+count>255) {
+      dvm__throw(vm,"java/lang/IllegalArgumentException","invalid array component or rank");return 0;
    }
-   const char *desc = component->desc;
-   unsigned dimensions = 0;
-   while (desc && desc[dimensions] == '[') ++dimensions;
-   if (!desc || desc[0] == 'V' || dimensions >= 255) {
-      dvm__throw(vm, "java/lang/IllegalArgumentException", "invalid array component type");
-      return false;
+   /* Validate every length before allocating, even after a zero-length axis. */
+   for (unsigned i=0;i<count;++i) if(lengths[i]<0) {
+      dvm__throw(vm,"java/lang/NegativeArraySizeException","%d",lengths[i]);return 0;
    }
-   /* dvm_new_array adds the new dimension itself. Its argument is the
-    * component descriptor, including any dimensions the component has. */
-   RETL(dvm_new_array(vm, dvm__kind_of(desc), desc, (uint32_t)length));
+   size_t size=strlen(component)+count+1;
+   char *descriptor=malloc(size);
+   if (!descriptor) {dvm__throw(vm,"java/lang/OutOfMemoryError","array descriptor");return 0;}
+   memset(descriptor,'[',count);memcpy(descriptor+count,component,strlen(component)+1);
+   dvm_ref result=reflect_array_allocate(vm,descriptor,lengths,count);
+   free(descriptor);
+   if (!result && !dvm_exception(vm)) dvm__throw(vm,"java/lang/OutOfMemoryError","array allocation");
+   return result;
+}
+static bool reflect_array_newInstance(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                                      int nargs,union dvm_value *out)
+{
+   (void)self;(void)nargs;
+   int32_t length=ARG(1).i;
+   dvm_ref result=reflect_array_create(vm,ARG(0).l,&length,1);
+   if (!result) return false;
+   RETL(result);
+}
+static bool reflect_array_newMultiInstance(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                                           int nargs,union dvm_value *out)
+{
+   (void)self;(void)nargs;
+   struct dvm_object *dimensions=dvm__obj(vm,ARG(1).l);
+   if (!dimensions) {dvm__throw(vm,"java/lang/NullPointerException","dimensions");return false;}
+   if (dimensions->kind!=DVM_OBJ_ARRAY || dimensions->elem_kind!='I') {
+      dvm__throw(vm,"java/lang/IllegalArgumentException","dimensions must be int[]");return false;
+   }
+   if (!dimensions->length || dimensions->length>255) {
+      dvm__throw(vm,"java/lang/IllegalArgumentException","invalid number of array dimensions");return false;
+   }
+   int32_t lengths[255];memcpy(lengths,dimensions->data,dimensions->length*sizeof *lengths);
+   dvm_ref result=reflect_array_create(vm,ARG(0).l,lengths,dimensions->length);
+   if (!result) return false;
+   RETL(result);
 }
 
 static bool reflect_array_length(struct dvm *vm, dvm_ref self,
@@ -3979,6 +4016,8 @@ static const struct rt_method rt_reflect_array[] = {
    SM("getLength", "(Ljava/lang/Object;)I", reflect_array_length),
    SM("newInstance", "(Ljava/lang/Class;I)Ljava/lang/Object;",
       reflect_array_newInstance),
+   SM("newInstance", "(Ljava/lang/Class;[I)Ljava/lang/Object;",
+      reflect_array_newMultiInstance),
    M_END,
 };
 
@@ -4129,8 +4168,12 @@ static const struct rt_method rt_class_loader[] = {
  * materialises and every combo_invoke reports "cannot found extern module".
  * The VM already has the app dexes loaded, so loadClass delegates to the
  * same Class.forName path ClassLoader uses. */
+static bool dex_path_list_build(struct dvm *, dvm_ref, int, int, const char *);
+static bool dexcl_library_path(struct dvm *, dvm_ref, const union dvm_value *, int, union dvm_value *);
+static bool dexcl_find_library(struct dvm *, dvm_ref, const union dvm_value *, int, union dvm_value *);
 static const struct rt_field rt_dex_class_loader_fields[] = {
-   { "parent", "Ljava/lang/ClassLoader;" },
+   { "sharedLibraryLoaders", "[Ljava/lang/ClassLoader;" },
+   { "pathList", "Ldalvik/system/DexPathList;" },
    { "dexPath", "Ljava/lang/String;" },
    F_END
 };
@@ -4144,6 +4187,7 @@ static bool dexcl_init(struct dvm *vm, dvm_ref self, const union dvm_value *args
     * PathClassLoader(String dexPath, String librarySearchPath, ClassLoader parent)
     * DexClassLoader(String dexPath, String optimizedDirectory,
     *                String librarySearchPath, ClassLoader parent) */
+   int first_dex = vm->ndexes;
    union dvm_value path = { 0 }, parent = { 0 };
    (void)out;
    if (nargs >= 1) path.l = ARG(0).l;
@@ -4183,6 +4227,9 @@ static bool dexcl_init(struct dvm *vm, dvm_ref self, const union dvm_value *args
          }
       }
    }
+   const char *library_path = nargs >= 3 && ARG(nargs - 2).l
+                               ? dvm_string_utf8(vm, ARG(nargs - 2).l) : "";
+   if (!dex_path_list_build(vm, self, first_dex, vm->ndexes, library_path)) return false;
    RETV();
 }
 
@@ -4196,7 +4243,403 @@ static const struct rt_method rt_dex_class_loader[] = {
      dexcl_init),
    M("loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", cl_forName),
    M("getParent", "()Ljava/lang/ClassLoader;", clsl_get_parent),
-   M("findLibrary", "(Ljava/lang/String;)Ljava/lang/String;", ret_null),
+   M("findLibrary", "(Ljava/lang/String;)Ljava/lang/String;", dexcl_find_library),
+   M("getLdLibraryPath", "()Ljava/lang/String;", dexcl_library_path),
    M_END,
 };
 
+/* MPL-2.0. Application class-path objects backed by the VM's parsed DEXes.
+ * Included after dvm_reflect.h in dvm_runtime.c. */
+static dvm_ref loader_file(struct dvm *vm, const char *path)
+{
+   dvm_ref file = dvm_new_object(vm, dvm_find_class(vm, "java/io/File"));
+   union dvm_value value = {.l = dvm_new_string(vm, path)};
+   if (!file || !value.l || !dvm_set_field(vm, file, "path", "Ljava/lang/String;", value)) return 0;
+   return file;
+}
+
+static bool loader_add_directory(struct dvm *vm, dvm_ref list, const char *path)
+{
+   union dvm_value value = {.l = loader_file(vm, path)}, ignored = {0};
+   return value.l && list_add(vm, list, &value, 1, &ignored);
+}
+
+static bool dex_path_list_build(struct dvm *vm, dvm_ref loader,
+                                int first, int end, const char *library_path)
+{
+   dvm_ref path_list = dvm_new_object(vm, dvm_find_class(vm, "dalvik/system/DexPathList"));
+   if (!path_list) return false;
+   (void)dvm_set_field(vm, loader, "pathList", "Ldalvik/system/DexPathList;",
+                      (union dvm_value){.l = path_list});
+   (void)dvm_set_field(vm, path_list, "definingContext", "Ljava/lang/ClassLoader;",
+                      (union dvm_value){.l = loader});
+   char **origins = calloc((size_t)(end - first + 1), sizeof *origins);
+   if (!origins) return false;
+   int count = 0;
+   for (int i = first; i < end; ++i) {
+      const char *name = vm->dexes[i]->file.path;
+      if (!name) continue;
+      const char *bang = strchr(name, '!');
+      size_t length = bang ? (size_t)(bang - name) : strlen(name);
+      bool found = false;
+      for (int j = 0; j < count; ++j)
+         if (strlen(origins[j]) == length && !memcmp(origins[j], name, length)) {found = true;break;}
+      if (found) continue;
+      origins[count] = luna_strndup(name, length);
+      if (!origins[count]) goto failed;
+      ++count;
+   }
+   union dvm_value elements = {.l = dvm_new_array(vm, 'L', "Ldalvik/system/DexPathList$Element;", count)};
+   if (!elements.l) goto failed;
+   (void)dvm_set_field(vm, path_list, "dexElements", "[Ldalvik/system/DexPathList$Element;", elements);
+   for (int i = 0; i < count; ++i) {
+      dvm_ref element = dvm_new_object(vm, dvm_find_class(vm, "dalvik/system/DexPathList$Element"));
+      dvm_ref dexfile = dvm_new_object(vm, dvm_find_class(vm, "dalvik/system/DexFile"));
+      dvm_ref classes = coll_new_list(vm, "Ljava/util/ArrayList;");
+      dvm_ref file = loader_file(vm, origins[i]);
+      if (!element || !dexfile || !classes || !file) goto failed;
+      ((dvm_ref *)dvm_array_data(vm, elements.l))[i] = element;
+      (void)dvm_set_field(vm, element, "path", "Ljava/io/File;", (union dvm_value){.l = file});
+      (void)dvm_set_field(vm, element, "dexFile", "Ldalvik/system/DexFile;", (union dvm_value){.l = dexfile});
+      (void)dvm_set_field(vm, dexfile, "path", "Ljava/lang/String;", (union dvm_value){.l = dvm_new_string(vm, origins[i])});
+      (void)dvm_set_field(vm, dexfile, "classes", "Ljava/util/List;", (union dvm_value){.l = classes});
+      size_t length = strlen(origins[i]);
+      for (int j = first; j < end; ++j) {
+         struct dex_file *dex = &vm->dexes[j]->file;
+         if (!dex->path || strncmp(dex->path, origins[i], length) ||
+             (dex->path[length] && dex->path[length] != '!')) continue;
+         for (uint32_t k = 0; k < dex->class_defs_size; ++k) {
+            struct dex_class_def def;
+            if (!dex_class_def(dex, k, &def)) goto failed;
+            const char *desc = dex_type(dex, def.class_idx);
+            size_t n = desc ? strlen(desc) : 0;
+            if (n < 2 || desc[0] != 'L' || desc[n-1] != ';') continue;
+            char *name = luna_strndup(desc + 1, n - 2);
+            if (!name) goto failed;
+            for (char *p = name; *p; ++p) if (*p == '/') *p = '.';
+            union dvm_value value = {.l = dvm_new_string(vm, name)}, ignored = {0};
+            free(name);
+            if (!value.l || !list_add(vm, classes, &value, 1, &ignored)) goto failed;
+         }
+      }
+   }
+   dvm_ref native = coll_new_list(vm, "Ljava/util/ArrayList;");
+   dvm_ref system = coll_new_list(vm, "Ljava/util/ArrayList;");
+   if (!native || !system) goto failed;
+   (void)dvm_set_field(vm, path_list, "nativeLibraryDirectories", "Ljava/util/List;", (union dvm_value){.l = native});
+   (void)dvm_set_field(vm, path_list, "systemNativeLibraryDirectories", "Ljava/util/List;", (union dvm_value){.l = system});
+   char *paths = strdup(library_path ? library_path : ""), *save = NULL;
+   if (!paths) goto failed;
+   for (char *p = strtok_r(paths, ":", &save); p; p = strtok_r(NULL, ":", &save)) {
+      if (!loader_add_directory(vm, native, p)) {free(paths);goto failed;}
+   }
+   free(paths);
+   bool arm64 = strstr(lunaria_android_native_lib_path(), "arm64") != NULL;
+   if (!loader_add_directory(vm, system, arm64 ? "/system/lib64" : "/system/lib") ||
+       !loader_add_directory(vm, system, arm64 ? "/system_ext/lib64" : "/system_ext/lib")) goto failed;
+   struct rt_list *app_dirs = list_of(vm, native), *system_dirs = list_of(vm, system);
+   uint32_t n = app_dirs->size + system_dirs->size;
+   union dvm_value native_elements = {.l = dvm_new_array(vm, 'L', "Ldalvik/system/DexPathList$NativeLibraryElement;", n)};
+   if (!native_elements.l) goto failed;
+   (void)dvm_set_field(vm, path_list, "nativeLibraryPathElements", "[Ldalvik/system/DexPathList$NativeLibraryElement;", native_elements);
+   for (uint32_t i = 0; i < n; ++i) {
+      dvm_ref element = dvm_new_object(vm, dvm_find_class(vm, "dalvik/system/DexPathList$NativeLibraryElement"));
+      dvm_ref file = i < app_dirs->size ? app_dirs->items[i] : system_dirs->items[i - app_dirs->size];
+      if (!element) goto failed;
+      ((dvm_ref *)dvm_array_data(vm, native_elements.l))[i] = element;
+      (void)dvm_set_field(vm, element, "path", "Ljava/io/File;", (union dvm_value){.l = file});
+   }
+   for (int i = 0; i < count; ++i) free(origins[i]);
+   free(origins);
+   return true;
+failed:
+   for (int i = 0; i < count; ++i) free(origins[i]);
+   free(origins);
+   if (!dvm_exception(vm)) dvm__throw(vm, "java/lang/OutOfMemoryError", "class path");
+   return false;
+}
+
+static dvm_ref application_class_loader(struct dvm *vm)
+{
+   if (vm->application_class_loader) return vm->application_class_loader;
+   dvm_ref loader = dvm_new_object(vm, dvm_find_class(vm, "dalvik/system/PathClassLoader"));
+   if (!loader) return 0;
+   dvm_pin(vm, loader);
+   (void)dvm_set_field(vm, loader, "parent", "Ljava/lang/ClassLoader;",
+                      (union dvm_value){.l = bootstrap_class_loader(vm)});
+   (void)dvm_set_field(vm, loader, "dexPath", "Ljava/lang/String;",
+                      (union dvm_value){.l = dvm_new_string(vm, lunaria_android_apk_path())});
+   if (!dex_path_list_build(vm, loader, 0, vm->ndexes, lunaria_android_native_lib_path())) {
+      dvm_unpin(vm, loader); return 0;
+   }
+   if(!legacy_http_attach(vm,loader)){dvm_unpin(vm,loader);return 0;}
+   vm->application_class_loader = loader;
+   return loader;
+}
+
+static bool dexcl_library_path(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs, union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   union dvm_value path_list = {0}, directories = {0}, path = {0};
+   (void)dvm_get_field(vm, self, "pathList", "Ldalvik/system/DexPathList;", &path_list);
+   (void)dvm_get_field(vm, path_list.l, "nativeLibraryDirectories", "Ljava/util/List;", &directories);
+   struct rt_list *list = list_of(vm, directories.l);
+   size_t size = 1;
+   for (uint32_t i = 0; list && i < list->size; ++i) {
+      (void)dvm_get_field(vm, list->items[i], "path", "Ljava/lang/String;", &path);
+      const char *s = dvm_string_utf8(vm, path.l);if(s)size += strlen(s) + 1;
+   }
+   char *text = calloc(size, 1);if(!text)return false;
+   for (uint32_t i = 0; list && i < list->size; ++i) {
+      (void)dvm_get_field(vm, list->items[i], "path", "Ljava/lang/String;", &path);
+      const char *s = dvm_string_utf8(vm, path.l);if(!s)continue;
+      if (*text) strcat(text, ":");strcat(text, s);
+   }
+   dvm_ref result = dvm_new_string(vm, text);free(text);RETL(result);
+}
+
+static bool dexcl_find_library(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs, union dvm_value *out)
+{
+   (void)nargs;
+   const char *name = dvm_string_utf8(vm, ARG(0).l);
+   if(!name) {dvm__throw(vm,"java/lang/NullPointerException","library name");return false;}
+   if(strchr(name,'/'))RETL(0);
+   union dvm_value path_list={0},elements={0},file={0},path={0};
+   (void)dvm_get_field(vm,self,"pathList","Ldalvik/system/DexPathList;",&path_list);
+   (void)dvm_get_field(vm,path_list.l,"nativeLibraryPathElements","[Ldalvik/system/DexPathList$NativeLibraryElement;",&elements);
+   uint32_t count=dvm_array_length(vm,elements.l);
+   for(uint32_t i=0;i<count;++i) {
+      dvm_ref element=((dvm_ref *)dvm_array_data(vm,elements.l))[i];
+      (void)dvm_get_field(vm,element,"path","Ljava/io/File;",&file);
+      (void)dvm_get_field(vm,file.l,"path","Ljava/lang/String;",&path);
+      const char *directory=dvm_string_utf8(vm,path.l);if(!directory)continue;
+      char guest[DVM_PATH_MAX],host[DVM_PATH_MAX];
+      int n=snprintf(guest,sizeof guest,"%s/lib%s.so",directory,name);
+      if(n<0 || n>=(int)sizeof guest)continue;
+      const char *mapped=arm_exec_map_guest_path(guest,host,sizeof host);
+      struct stat st;
+      if(mapped && !luna_file_stat_follow(mapped,&st) && S_ISREG(st.st_mode))RETL(dvm_new_string(vm,guest));
+   }
+   RETL(0);
+}
+
+static const struct rt_field rt_dex_path_list_fields[] = {
+   {"definingContext","Ljava/lang/ClassLoader;"},
+   {"dexElements","[Ldalvik/system/DexPathList$Element;"},
+   {"nativeLibraryDirectories","Ljava/util/List;"},
+   {"systemNativeLibraryDirectories","Ljava/util/List;"},
+   {"nativeLibraryPathElements","[Ldalvik/system/DexPathList$NativeLibraryElement;"},F_END
+};
+static const struct rt_field rt_dex_element_fields[] = {
+   {"path","Ljava/io/File;"},{"dexFile","Ldalvik/system/DexFile;"},F_END
+};
+static const struct rt_field rt_native_element_fields[] = {
+   {"path","Ljava/io/File;"},{"zipDir","Ljava/lang/String;"},F_END
+};
+static const struct rt_method rt_dex_path_list[] = {M_END};
+
+static bool map_keySet(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                       int nargs, union dvm_value *out);
+static dvm_ref legacy_enumeration_new(struct dvm *vm,dvm_ref target,int kind);
+/* MPL-2.0. Android 12 System.java and java.util.Properties contracts.
+ * One VM owns one System.props object. Protected platform properties live in
+ * its defaults, so getProperty sees them while ordinary Map views do not. */
+static dvm_ref props_defaults(struct dvm *vm,dvm_ref self)
+{
+   union dvm_value value={0};dvm_get_field(vm,self,"defaults","Ljava/util/Properties;",&value);return value.l;
+}
+static bool props_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   if(!map_init(vm,self,NULL,0,out))return false;
+   dvm_set_field(vm,self,"defaults","Ljava/util/Properties;",(union dvm_value){.l=nargs ? ARG(0).l : 0});RETV();
+}
+static bool props_get(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   if(!ARG(0).l){dvm__throw(vm,"java/lang/NullPointerException","key");return false;}
+   union dvm_value value={0};if(!map_get(vm,self,args,1,&value))return false;
+   struct dvm_object *object=dvm__obj(vm,value.l);
+   if(object && object->kind==DVM_OBJ_STRING)RETL(value.l);
+   dvm_ref defaults=props_defaults(vm,self);
+   if(defaults){
+      if(!am_vcall(vm,defaults,"getProperty","(Ljava/lang/String;)Ljava/lang/String;",args,1,&value))return false;
+      if(value.l)RETL(value.l);
+   }
+   RETL(nargs>1 ? ARG(1).l : 0);
+}
+static bool props_put_virtual(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;return am_vcall(vm,self,"put","(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",args,2,out);
+}
+static bool props_putAll(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   if(!ARG(0).l){dvm__throw(vm,"java/lang/NullPointerException","map");return false;}
+   union dvm_value set={0},iterator={0},entry={0},more={0},pair[2]={{0}},ignored={0};
+   if(!am_vcall(vm,ARG(0).l,"entrySet","()Ljava/util/Set;",NULL,0,&set) ||
+      !am_vcall(vm,set.l,"iterator","()Ljava/util/Iterator;",NULL,0,&iterator))return false;
+   for(;;){
+      if(!am_vcall(vm,iterator.l,"hasNext","()Z",NULL,0,&more))return false;
+      if(!more.i)break;
+      if(!am_vcall(vm,iterator.l,"next","()Ljava/lang/Object;",NULL,0,&entry) ||
+         !am_vcall(vm,entry.l,"getKey","()Ljava/lang/Object;",NULL,0,&pair[0]) ||
+         !am_vcall(vm,entry.l,"getValue","()Ljava/lang/Object;",NULL,0,&pair[1]) ||
+         !props_put_virtual(vm,self,pair,2,&ignored))return false;
+   }
+   RETV();
+}
+static bool props_clone(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   if(!o_clone(vm,self,args,nargs,out))return false;dvm_ref copy=out->l;if(!copy)return false;
+   struct dvm_object *source=dvm__obj(vm,self),*target=dvm__obj(vm,copy);
+   struct rt_map *original=source ? source->data : NULL;
+   if(original){
+      size_t bytes=sizeof *original+(size_t)original->cap*sizeof original->e[0];
+      struct rt_map *cloned=malloc(bytes);
+      if(!cloned){dvm__throw(vm,"java/lang/OutOfMemoryError","Properties clone");return false;}
+      memcpy(cloned,original,bytes);memset(cloned->views,0,sizeof cloned->views);cloned->mod_count=0;
+      for(uint32_t i=0;i<cloned->size;++i){cloned->e[i].node=0;dvm_pin(vm,cloned->e[i].k);dvm_pin(vm,cloned->e[i].v);}
+      target->data=cloned;target->data_destroy=map_destroy;
+   }
+   RETL(copy);
+}
+/* Snapshot defaults first, then own entries. Non-string own values do not
+ * conceal a string in defaults when stringPropertyNames is requested. */
+static dvm_ref props_name_snapshot(struct dvm *vm,dvm_ref self,bool strings_only)
+{
+   dvm_ref *chain=NULL;size_t count=0,capacity=0;
+   for(dvm_ref p=self;p;p=props_defaults(vm,p)){
+      for(size_t i=0;i<count;++i)if(chain[i]==p){free(chain);dvm__throw(vm,"java/lang/StackOverflowError","Cyclic Properties defaults");return 0;}
+      if(count==capacity){
+         size_t next=capacity ? capacity*2 : 8;dvm_ref *grown=realloc(chain,next*sizeof *chain);
+         if(!grown){free(chain);dvm__throw(vm,"java/lang/OutOfMemoryError","Properties defaults");return 0;}
+         chain=grown;capacity=next;
+      }
+      chain[count++]=p;
+   }
+   dvm_ref snapshot=dvm_new_object(vm,dvm_find_class(vm,"java/util/Hashtable"));if(!snapshot){free(chain);return 0;}
+   dvm_pin(vm,snapshot);
+   bool good=true;
+   while(count && good){
+      dvm_ref p=chain[--count];struct dvm_object *o=dvm__obj(vm,p);struct rt_map *map=o ? o->data : NULL;
+      for(uint32_t i=0;map && i<map->size;++i){
+         dvm_ref key=map->e[i].k,value=map->e[i].v;
+         struct dvm_object *k=dvm__obj(vm,key),*v=dvm__obj(vm,value);
+         if(!k || k->kind!=DVM_OBJ_STRING){
+            if(strings_only)continue;
+            dvm__throw(vm,"java/lang/ClassCastException","Property key is not a String");good=false;break;
+         }
+         if(strings_only && (!v || v->kind!=DVM_OBJ_STRING))continue;
+         union dvm_value pair[2]={{.l=key},{.l=value}},ignored={0};
+         if(!map_put(vm,snapshot,pair,2,&ignored)){good=false;break;}
+         o=dvm__obj(vm,p);map=o ? o->data : NULL;
+      }
+   }
+   free(chain);dvm_unpin(vm,snapshot);return good ? snapshot : 0;
+}
+static bool props_names(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;bool strings=!strcmp(builtin_name(),"stringPropertyNames");
+   dvm_ref snapshot=props_name_snapshot(vm,self,strings);if(!snapshot)return false;
+   if(strings)return map_keySet(vm,snapshot,NULL,0,out);
+   RETL(legacy_enumeration_new(vm,snapshot,0));
+}
+static bool sys_property_key_present(struct dvm *vm,dvm_ref key)
+{
+   size_t length=0;return key && sdata(vm,key,&length) && length>0;
+}
+static bool sys_check_key(struct dvm *vm,dvm_ref key)
+{
+   if(!key){dvm__throw(vm,"java/lang/NullPointerException","key");return false;}
+   if(!sys_property_key_present(vm,key)){dvm__throw(vm,"java/lang/IllegalArgumentException","key is empty");return false;}
+   return true;
+}
+static bool sys_seed_pair(struct dvm *vm,dvm_ref properties,const char *key,const char *value)
+{
+   union dvm_value pair[2]={{.l=dvm_new_string(vm,key)},{.l=dvm_new_string(vm,value)}},ignored={0};
+   return pair[0].l && pair[1].l && map_put(vm,properties,pair,2,&ignored);
+}
+static dvm_ref sys_readonly_properties(struct dvm *vm)
+{
+   struct dvm_class *system=dvm_find_class(vm,"java/lang/System");union dvm_value value={0};
+   if(!system || !dvm_get_static(vm,system,"unchangeableProps","Ljava/util/Properties;",&value))return 0;
+   if(value.l)return value.l;
+   dvm_ref defaults=dvm_new_object(vm,dvm_find_class(vm,"java/util/Properties"));if(!defaults)return 0;
+   dvm_pin(vm,defaults);bool good=true;
+   for(size_t i=0;good && i<sizeof sys_props/sizeof *sys_props;++i){
+      if(!strcmp(sys_props[i].k,"user.home"))continue;
+      good=sys_seed_pair(vm,defaults,sys_props[i].k,sys_props[i].v);
+   }
+   const char *locale_keys[]={"user.language","user.region"};
+   for(unsigned i=0;good && i<2;++i){char text[512];const char *v=sys_dynamic_prop(locale_keys[i],text,sizeof text);if(v)good=sys_seed_pair(vm,defaults,locale_keys[i],v);}
+   if(good)good=dvm_set_static(vm,system,"unchangeableProps","Ljava/util/Properties;",(union dvm_value){.l=defaults});
+   dvm_unpin(vm,defaults);return good ? defaults : 0;
+}
+static dvm_ref sys_new_properties(struct dvm *vm,bool initial,bool seed_changeable)
+{
+   dvm_ref defaults=sys_readonly_properties(vm);if(!defaults)return 0;
+   dvm_ref properties=dvm_new_object(vm,dvm_find_class(vm,"java/lang/System$PropertiesWithNonOverrideableDefaults"));if(!properties)return 0;
+   union dvm_value arg={.l=defaults},ignored={0};if(!props_init(vm,properties,&arg,1,&ignored))return 0;
+   if(seed_changeable){
+      char text[DVM_PATH_MAX];const char *tmp=initial ? sys_dynamic_prop("java.io.tmpdir",text,sizeof text) : "/tmp";
+      if(!sys_seed_pair(vm,properties,"java.io.tmpdir",tmp ? tmp : "/tmp") || !sys_seed_pair(vm,properties,"user.home",""))return 0;
+      if(initial){char ua[512];const char *agent=sys_dynamic_prop("http.agent",ua,sizeof ua);if(agent && !sys_seed_pair(vm,properties,"http.agent",agent))return 0;}
+   }
+   return properties;
+}
+static dvm_ref sys_properties(struct dvm *vm)
+{
+   struct dvm_class *system=dvm_find_class(vm,"java/lang/System");union dvm_value value={0};
+   if(!system || !dvm_get_static(vm,system,"props","Ljava/util/Properties;",&value))return 0;
+   if(!value.l){value.l=sys_new_properties(vm,true,true);if(!value.l || !dvm_set_static(vm,system,"props","Ljava/util/Properties;",value))return 0;}
+   return value.l;
+}
+static bool sys_getProperties(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)args;(void)nargs;dvm_ref properties=sys_properties(vm);if(!properties)return false;RETL(properties);
+}
+static bool sys_getProperty(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;if(!sys_check_key(vm,ARG(0).l))return false;
+   dvm_ref properties=sys_properties(vm);return properties && props_get(vm,properties,args,nargs,out);
+}
+static bool sys_setProperty(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;if(!sys_check_key(vm,ARG(0).l))return false;
+   if(!ARG(1).l){dvm__throw(vm,"java/lang/NullPointerException","value");return false;}
+   dvm_ref properties=sys_properties(vm);if(!properties || !props_put_virtual(vm,properties,args,nargs,out))return false;
+   if(out->l){struct dvm_object *previous=dvm__obj(vm,out->l);if(previous && previous->kind!=DVM_OBJ_STRING){dvm__throw(vm,"java/lang/ClassCastException","Previous value is not a String");return false;}}
+   return true;
+}
+static bool sys_clearProperty(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)nargs;if(!sys_check_key(vm,ARG(0).l))return false;
+   dvm_ref properties=sys_properties(vm),protected=0;if(!properties || !system_properties_protected(vm,properties,ARG(0).l,&protected))return false;
+   if(protected)RETL(0);
+   if(!map_remove(vm,properties,args,1,out))return false;
+   if(out->l){struct dvm_object *previous=dvm__obj(vm,out->l);if(previous && previous->kind!=DVM_OBJ_STRING){dvm__throw(vm,"java/lang/ClassCastException","Previous value is not a String");return false;}}
+   return true;
+}
+static bool sys_setProperties(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)nargs;dvm_ref properties=sys_new_properties(vm,false,!ARG(0).l);if(!properties)return false;
+   dvm_pin(vm,properties);union dvm_value ignored={0};
+   bool good=!ARG(0).l || props_putAll(vm,properties,args,1,&ignored);
+   if(good)good=dvm_set_static(vm,dvm_find_class(vm,"java/lang/System"),"props","Ljava/util/Properties;",(union dvm_value){.l=properties});
+   dvm_unpin(vm,properties);if(!good)return false;RETV();
+}
+static bool sys_lineSeparator(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)args;(void)nargs;RETL(dvm_new_string(vm,"\n"));
+}
+static const struct rt_field rt_properties_fields[]={{"defaults","Ljava/util/Properties;"},F_END};
+static const struct rt_method rt_properties[]={
+   M("<init>","()V",props_init),M("<init>","(Ljava/util/Properties;)V",props_init),
+   M("getProperty","(Ljava/lang/String;)Ljava/lang/String;",props_get),
+   M("getProperty","(Ljava/lang/String;)Ljava/lang/Object;",props_get),
+   M("getProperty","(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",props_get),
+   M("setProperty","(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;",props_put_virtual),
+   M("putAll","(Ljava/util/Map;)V",props_putAll),M("clone","()Ljava/lang/Object;",props_clone),
+   M("propertyNames","()Ljava/util/Enumeration;",props_names),M("stringPropertyNames","()Ljava/util/Set;",props_names),M_END
+};

@@ -5,7 +5,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-/* A java.util.regex engine — see regex.h for why the host's POSIX ERE is not
+/* A java.util.regex engine — see dvm_lib.h for why the host's POSIX ERE is not
  * one.
  *
  * The shape is the ordinary one for a language with reluctant quantifiers,
@@ -19,7 +19,7 @@
  * String; quantifiers and classes still work on whole code points.
  */
 
-#include "regex.h"
+#include "dvm_lib.h"
 
 #include <ctype.h>
 #include <pthread.h>

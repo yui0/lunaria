@@ -11,8 +11,8 @@
 
 #if defined(LUNARIA_STUB_LOG)
 # include "inc/log.c"
-#elif defined(LUNARIA_STUB_EGL)
-# include "inc/egl.c"
+#elif defined(LUNARIA_STUB_EGL) || defined(LUNARIA_STUB_GLESV3)
+# include "inc/gl.c"
 #elif defined(LUNARIA_STUB_MEDIANDK)
 # include "inc/mediandk.c"
 #elif defined(LUNARIA_STUB_MATH)
@@ -23,8 +23,6 @@
 # include "inc/android.c"
 #elif defined(LUNARIA_STUB_OPENSLES)
 # include "inc/opensles.c"
-#elif defined(LUNARIA_STUB_GLESV3)
-# include "inc/glesv3.c"
 #elif defined(LUNARIA_STUB_SVC_RUNTIME)
 /* System library identities for hosts using the emulator's guest ABI.
  * pthread objects, libc calls, FILE objects, errno and libc data symbols are

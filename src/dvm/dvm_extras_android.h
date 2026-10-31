@@ -846,8 +846,34 @@ static bool x_resolver_call(struct dvm *vm, dvm_ref self, const union dvm_value 
                    &args[1], 3, out);
 }
 
+/* CRUD operates on the attached provider, including its real storage and
+ * exceptions. An empty cursor or a success count from the framework would
+ * discard the application's reads/writes. */
+static bool x_resolver_operation(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                                  int nargs,union dvm_value *out)
+{
+   (void)self;
+   const struct dvm_method *operation=dvm__builtin_method();
+   if (!ARG(0).l) {dvm__throw(vm,"java/lang/NullPointerException","uri");return false;}
+   union dvm_value scheme={0},authority={0};
+   if (!am_vcall(vm,ARG(0).l,"getScheme","()Ljava/lang/String;",NULL,0,&scheme) ||
+       !am_vcall(vm,ARG(0).l,"getAuthority","()Ljava/lang/String;",NULL,0,&authority)) return false;
+   const char *protocol=dvm_string_utf8(vm,scheme.l);
+   const char *name=dvm_string_utf8(vm,authority.l);
+   dvm_ref provider=protocol && !strcmp(protocol,"content") && name ? x_find_provider(vm,name) : 0;
+   if (!provider) {
+      if (!strcmp(operation->name,"query")) RETL(0);
+      dvm__throw(vm,"java/lang/IllegalArgumentException","Unknown content provider %s",name ? name : "");
+      return false;
+   }
+   return am_vcall(vm,provider,operation->name,operation->sig,args,nargs,out);
+}
+
 static const struct rt_method rt_x_content_resolver[] = {
    M("call", "(Landroid/net/Uri;Ljava/lang/String;Ljava/lang/String;Landroid/os/Bundle;)Landroid/os/Bundle;", x_resolver_call),
+   M("insert","(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;",x_resolver_operation),
+   M("update","(Landroid/net/Uri;Landroid/content/ContentValues;Ljava/lang/String;[Ljava/lang/String;)I",x_resolver_operation),
+   M("delete","(Landroid/net/Uri;Ljava/lang/String;[Ljava/lang/String;)I",x_resolver_operation),
    M_END,
 };
 
@@ -1013,4 +1039,791 @@ static const struct rt_method rt_x_webview[] = {
    M_END,
 };
 
+
+/* ------------------------------------------------------------ WindowManager */
+
+/* The windows added straight to a WindowManager (an SDK's login overlay, a
+ * floating button).  Each view gets a window object of its own that carries the
+ * view and its WindowManager.LayoutParams, which is all the UI layer asks of a
+ * window; presenting it, measuring it against the display and hiding it again
+ * are the UI layer's, exactly as for a Dialog or a PopupWindow. */
+static const struct rt_field rt_managed_window_fields[] = {
+   { "contentView", "Landroid/view/View;" },
+   { "attributes", "Landroid/view/WindowManager$LayoutParams;" },
+   F_END
+};
+
+static struct { dvm_ref view, window; } g_wm_added[UI_MAX_WINDOWS];
+static int g_wm_nadded;
+
+static int wm_find(dvm_ref view)
+{
+   for (int i = 0; i < g_wm_nadded; ++i)
+      if (g_wm_added[i].view == view) return i;
+   return -1;
+}
+
+/* A WindowManager.LayoutParams for `lp`: itself when it already is one, else a
+ * fresh one with the same size (a plain ViewGroup.LayoutParams has no window
+ * attributes of its own). */
+static dvm_ref wm_attributes(struct dvm *vm, dvm_ref lp)
+{
+   struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/view/WindowManager$LayoutParams;");
+   if (!c || ui_is_a(vm, lp, "android/view/WindowManager$LayoutParams")) return lp;
+   dvm_ref fresh = dvm_new_object(vm, c);
+   struct dvm_method *init = fresh ? dvm_find_method(vm, c, "<init>", "()V") : NULL;
+   union dvm_value ignored = {0};
+   if (!fresh || !init || !dvm_call(vm, init, fresh, NULL, 0, &ignored)) return 0;
+   rt_set_int(vm, fresh, "width", rt_get_int(vm, lp, "width"));
+   rt_set_int(vm, fresh, "height", rt_get_int(vm, lp, "height"));
+   return fresh;
+}
+
+static bool x_wm_addView(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                         int nargs, union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   if (!ARG(0).l) { dvm__throw(vm, "java/lang/IllegalArgumentException", "View must not be null"); return false; }
+   if (!ARG(1).l) { dvm__throw(vm, "java/lang/IllegalArgumentException", "Params must not be null"); return false; }
+   if (wm_find(ARG(0).l) >= 0 || ui_obj(vm, ARG(0).l, "parent", "Landroid/view/ViewParent;")) {
+      dvm__throw(vm, "java/lang/IllegalStateException",
+                 "The specified view has already been added to a parent or the WindowManager");
+      return false;
+   }
+   if (g_wm_nadded >= UI_MAX_WINDOWS) {
+      dvm__throw(vm, "android/view/WindowManager$BadTokenException", "too many windows");
+      return false;
+   }
+   struct dvm_class *c = dvm__class_by_desc(vm, "Llunaria/ManagedWindow;");
+   dvm_ref window = c ? dvm_new_object(vm, c) : 0;
+   dvm_ref attributes = window ? wm_attributes(vm, ARG(1).l) : 0;
+   if (!window || !attributes) return false;
+   (void)dvm_set_field(vm, window, "contentView", "Landroid/view/View;", ARG(0));
+   (void)dvm_set_field(vm, window, "attributes", "Landroid/view/WindowManager$LayoutParams;",
+                       (union dvm_value){ .l = attributes });
+   dvm_pin(vm, ARG(0).l);
+   dvm_pin(vm, window);
+   g_wm_added[g_wm_nadded].view = ARG(0).l;
+   g_wm_added[g_wm_nadded++].window = window;
+   ui_window_shown(vm, window);
+   RETV();
+}
+
+static bool x_wm_removeView(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                            int nargs, union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   const int i = ARG(0).l ? wm_find(ARG(0).l) : -1;
+   if (i < 0) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException", "View not attached to window manager");
+      return false;
+   }
+   const dvm_ref view = g_wm_added[i].view, window = g_wm_added[i].window;
+   ui_window_hidden(vm, window);
+   memmove(&g_wm_added[i], &g_wm_added[i + 1], (size_t)(g_wm_nadded - i - 1) * sizeof g_wm_added[0]);
+   --g_wm_nadded;
+   dvm_unpin(vm, window);
+   dvm_unpin(vm, view);
+   RETV();
+}
+
+static bool x_wm_updateViewLayout(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                                  int nargs, union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   const int i = ARG(0).l ? wm_find(ARG(0).l) : -1;
+   if (i < 0 || !ARG(1).l) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException", i < 0 ? "View not attached to window manager"
+                                                                : "Params must not be null");
+      return false;
+   }
+   dvm_ref attributes = wm_attributes(vm, ARG(1).l);
+   if (!attributes) return false;
+   (void)dvm_set_field(vm, g_wm_added[i].window, "attributes", "Landroid/view/WindowManager$LayoutParams;",
+                       (union dvm_value){ .l = attributes });
+   ui_layout_changed();
+   ui_invalidate();
+   RETV();
+}
+
+static const struct rt_method rt_x_window_manager[] = {
+   M("addView", "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V", x_wm_addView),
+   M("removeView", "(Landroid/view/View;)V", x_wm_removeView),
+   M("removeViewImmediate", "(Landroid/view/View;)V", x_wm_removeView),
+   M("updateViewLayout", "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V", x_wm_updateViewLayout),
+   M_END,
+};
+
+/* --------------------------------------------------------------- ImageFormat */
+
+/* Bits per pixel of the formats Camera, MediaCodec and ImageReader name; -1
+ * for the ones with no fixed density (JPEG, the private and compressed ones). */
+static bool x_imageformat_bits(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                               int nargs, union dvm_value *out)
+{
+   (void)vm; (void)self; (void)nargs;
+   switch (args[0].i) {
+   case 4:  case 16: case 20: case 0x44363159: case 0x20363159: case 0x101: RETI(16);  /* RGB_565 NV16 YUY2 DEPTH16 Y16 DEPTH_POINT_CLOUD */
+   case 17: case 0x32315659: case 35: RETI(12);                                       /* NV21 YV12 YUV_420_888 */
+   case 39: RETI(16);                                                                 /* YUV_422_888 */
+   case 40: case 41: RETI(24);                                                        /* YUV_444_888 FLEX_RGB_888 */
+   case 42: RETI(32);                                                                 /* FLEX_RGBA_8888 */
+   case 32: RETI(16);                                                                 /* RAW_SENSOR */
+   case 37: RETI(10);                                                                 /* RAW10 */
+   case 38: RETI(12);                                                                 /* RAW12 */
+   case 0x20203859: RETI(8);                                                          /* Y8 */
+   default: RETI(-1);
+   }
+}
+
+static const struct rt_method rt_x_image_format[] = {
+   SM("getBitsPerPixel", "(I)I", x_imageformat_bits),
+   M_END,
+};
+
+/* ------------------------------------------------------ AudioFormat / AudioTrack */
+
+/* android.media.AudioFormat and the API 21+ AudioTrack surface.  Media3's
+ * DefaultAudioSink builds its track as
+ *   new AudioTrack(AudioAttributes, new AudioFormat.Builder()...build(), size, mode, session)
+ * (or AudioTrack.Builder) and feeds it ByteBuffers; the legacy
+ * AudioTrack(int,int,int,int,int,int) constructor and write(byte[]) were the only
+ * entry points modelled, so the first video with sound stopped in
+ * AudioFormat$Builder.setChannelMask.  Everything here lands on the same
+ * luna_audio_track the legacy path drives. */
+
+static const struct rt_field rt_audio_format_fields[] = {
+   { "rate", "I" }, { "mask", "I" }, { "encoding", "I" }, F_END
+};
+
+static bool af_builder_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                            int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs; (void)out;
+   rt_set_int(vm, self, "encoding", 1);          /* ENCODING_DEFAULT */
+   RETV();
+}
+
+static bool af_builder_set(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                           int nargs, union dvm_value *out)
+{
+   (void)nargs;
+   const char *n = builtin_name();
+   if (!strcmp(n, "setEncoding")) rt_set_int(vm, self, "encoding", args[0].i);
+   else if (!strcmp(n, "setSampleRate")) {
+      if (args[0].i <= 0) { dvm__throw(vm, "java/lang/IllegalArgumentException", "Invalid sample rate %d", args[0].i); return false; }
+      rt_set_int(vm, self, "rate", args[0].i);
+   } else if (!strcmp(n, "setChannelMask")) rt_set_int(vm, self, "mask", args[0].i);
+   RETL(self);                                   /* setChannelIndexMask and friends are ignored */
+}
+
+static bool af_builder_build(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                             int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/media/AudioFormat;");
+   dvm_ref f = c ? dvm_new_object(vm, c) : 0;
+   if (!f) return false;
+   static const char *const names[] = { "rate", "mask", "encoding" };
+   for (int i = 0; i < 3; ++i) rt_set_int(vm, f, names[i], rt_get_int(vm, self, names[i]));
+   RETL(f);
+}
+
+static bool af_get(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                   int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   const char *n = builtin_name();
+   if (!strcmp(n, "getSampleRate")) RETI(rt_get_int(vm, self, "rate"));
+   if (!strcmp(n, "getEncoding")) RETI(rt_get_int(vm, self, "encoding"));
+   if (!strcmp(n, "getChannelCount")) RETI(audiotrack_channel_count(rt_get_int(vm, self, "mask")));
+   RETI(rt_get_int(vm, self, "mask"));           /* getChannelMask */
+}
+
+static const struct rt_method rt_audio_format_builder[] = {
+   M("<init>", "()V", af_builder_init),
+   M("setEncoding", "(I)Landroid/media/AudioFormat$Builder;", af_builder_set),
+   M("setSampleRate", "(I)Landroid/media/AudioFormat$Builder;", af_builder_set),
+   M("setChannelMask", "(I)Landroid/media/AudioFormat$Builder;", af_builder_set),
+   M("setChannelIndexMask", "(I)Landroid/media/AudioFormat$Builder;", af_builder_set),
+   M("build", "()Landroid/media/AudioFormat;", af_builder_build),
+   M_END,
+};
+
+static const struct rt_method rt_audio_format[] = {
+   M("getSampleRate", "()I", af_get), M("getEncoding", "()I", af_get),
+   M("getChannelMask", "()I", af_get), M("getChannelCount", "()I", af_get),
+   M_END,
+};
+
+/* AudioTrack(AudioAttributes, AudioFormat, bufferSizeInBytes, mode, sessionId). */
+static bool at_init_format(struct dvm *vm, dvm_ref self, int rate, int mask, int encoding,
+                           int buffer_size, int mode)
+{
+   union dvm_value query[3] = { { .i = rate }, { .i = mask }, { .i = encoding } }, min = {0};
+   if (buffer_size <= 0) {
+      (void)audiotrack_getMinBufferSize(vm, self, query, 3, &min);
+      buffer_size = min.i > 0 ? min.i : 0;
+   }
+   union dvm_value init[6] = { { .i = 3 }, { .i = rate }, { .i = mask }, { .i = encoding },
+                               { .i = buffer_size }, { .i = mode } }, ignored = {0};
+   return audiotrack_init(vm, self, init, 6, &ignored);
+}
+
+static bool at_init_modern(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                           int nargs, union dvm_value *out)
+{
+   (void)out;
+   dvm_ref fmt = args[1].l;
+   if (!fmt) { dvm__throw(vm, "java/lang/IllegalArgumentException", "Illegal null AudioFormat"); return false; }
+   if (!at_init_format(vm, self, rt_get_int(vm, fmt, "rate"), rt_get_int(vm, fmt, "mask"),
+                       rt_get_int(vm, fmt, "encoding"), args[2].i, nargs > 3 ? args[3].i : 1))
+      return false;
+   if (nargs > 4 && args[4].i > 0) rt_set_int(vm, self, "mSessionId", args[4].i);
+   RETV();
+}
+
+static const struct rt_field rt_audio_track_builder_fields[] = {
+   { "format", "Landroid/media/AudioFormat;" }, { "size", "I" }, { "mode", "I" }, { "session", "I" }, F_END
+};
+
+static bool atb_set(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                    int nargs, union dvm_value *out)
+{
+   (void)nargs;
+   const char *n = builtin_name();
+   if (!strcmp(n, "setAudioFormat")) (void)dvm_set_field(vm, self, "format", "Landroid/media/AudioFormat;", args[0]);
+   else if (!strcmp(n, "setBufferSizeInBytes")) rt_set_int(vm, self, "size", args[0].i);
+   else if (!strcmp(n, "setTransferMode")) rt_set_int(vm, self, "mode", args[0].i);
+   else if (!strcmp(n, "setSessionId")) rt_set_int(vm, self, "session", args[0].i);
+   RETL(self);              /* setAudioAttributes, setPerformanceMode, setOffloadedPlayback ... */
+}
+
+static bool atb_build(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                      int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value fmt = {0};
+   (void)dvm_get_field(vm, self, "format", "Landroid/media/AudioFormat;", &fmt);
+   if (!fmt.l) { dvm__throw(vm, "java/lang/UnsupportedOperationException", "Audio format must be set"); return false; }
+   struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/media/AudioTrack;");
+   dvm_ref track = c ? dvm_new_object(vm, c) : 0;
+   if (!track) return false;
+   const int mode = rt_get_int(vm, self, "mode");
+   if (!at_init_format(vm, track, rt_get_int(vm, fmt.l, "rate"), rt_get_int(vm, fmt.l, "mask"),
+                       rt_get_int(vm, fmt.l, "encoding"), rt_get_int(vm, self, "size"), mode ? mode : 1))
+      return false;
+   if (rt_get_int(vm, self, "session") > 0) rt_set_int(vm, track, "mSessionId", rt_get_int(vm, self, "session"));
+   RETL(track);
+}
+
+static const struct rt_method rt_audio_track_builder[] = {
+   M("<init>", "()V", nop_void),
+   M("setAudioAttributes", "(Landroid/media/AudioAttributes;)Landroid/media/AudioTrack$Builder;", atb_set),
+   M("setAudioFormat", "(Landroid/media/AudioFormat;)Landroid/media/AudioTrack$Builder;", atb_set),
+   M("setBufferSizeInBytes", "(I)Landroid/media/AudioTrack$Builder;", atb_set),
+   M("setTransferMode", "(I)Landroid/media/AudioTrack$Builder;", atb_set),
+   M("setSessionId", "(I)Landroid/media/AudioTrack$Builder;", atb_set),
+   M("setPerformanceMode", "(I)Landroid/media/AudioTrack$Builder;", atb_set),
+   M("setOffloadedPlayback", "(Z)Landroid/media/AudioTrack$Builder;", atb_set),
+   M("build", "()Landroid/media/AudioTrack;", atb_build),
+   M_END,
+};
+
+/* write(ByteBuffer, size, mode[, timestamp]): the buffer's remaining bytes go
+ * through the byte[] writer and its position advances by what was taken. */
+static bool at_write_buffer(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                            int nargs, union dvm_value *out)
+{
+   dvm_ref buffer = args[0].l;
+   if (!buffer) { dvm__throw(vm, "java/lang/IllegalArgumentException", "buffer is null"); return false; }
+   const int8_t *bytes;
+   int32_t remaining, pos = 0;
+   if (!bb_window(vm, buffer, &bytes, &remaining)) RETI(AT_ERROR_BAD_VALUE);
+   (void)stream_field(vm, buffer, "pos", &pos);
+   int32_t size = args[1].i;
+   if (size < 0 || size > remaining) RETI(AT_ERROR_BAD_VALUE);
+   if (!size) RETI(0);
+   dvm_ref copy = dvm_new_array(vm, 'B', "B", (uint32_t)size);
+   if (!copy) return false;
+   dvm_pin(vm, copy);
+   memcpy(dvm_array_data(vm, copy), bytes, (size_t)size);
+   union dvm_value w[4] = { { .l = copy }, { .i = 0 }, { .i = size }, { .i = nargs > 2 ? args[2].i : 0 } };
+   union dvm_value written = {0};
+   const bool ok = audiotrack_write(vm, self, w, 4, &written);
+   dvm_unpin(vm, copy);
+   if (!ok) return false;
+   if (written.i > 0) stream_set_field(vm, buffer, "pos", pos + written.i);
+   RETI(written.i);
+}
+
+static bool at_false(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                     int nargs, union dvm_value *out)
+{ (void)vm; (void)self; (void)args; (void)nargs; RETI(0); }
+
+static bool at_channel_config(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                              int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   RETI(rt_get_int(vm, self, "mChannelConfig"));
+}
+
+static const struct rt_method rt_x_audio_track[] = {
+   M("<init>", "(Landroid/media/AudioAttributes;Landroid/media/AudioFormat;III)V", at_init_modern),
+   M("<init>", "(Landroid/media/AudioAttributes;Landroid/media/AudioFormat;II)V", at_init_modern),
+   M("write", "(Ljava/nio/ByteBuffer;II)I", at_write_buffer),
+   M("write", "(Ljava/nio/ByteBuffer;III)I", at_write_buffer),
+   M("write", "(Ljava/nio/ByteBuffer;IIJ)I", at_write_buffer),
+   M("getTimestamp", "(Landroid/media/AudioTimestamp;)Z", at_false),
+   M("getUnderrunCount", "()I", at_false),
+   M("isOffloadedPlayback", "()Z", at_false),
+   M("setOffloadDelayPadding", "(II)V", nop_void),
+   M("setOffloadEndOfStream", "()V", nop_void),
+   M("setPlaybackParams", "(Landroid/media/PlaybackParams;)V", nop_void),
+   M("setPreferredDevice", "(Landroid/media/AudioDeviceInfo;)Z", at_false),
+   M("attachAuxEffect", "(I)I", at_false),
+   M("setAuxEffectSendLevel", "(F)I", at_false),
+   M("addOnRoutingChangedListener", "(Landroid/media/AudioRouting$OnRoutingChangedListener;Landroid/os/Handler;)V", nop_void),
+   M("removeOnRoutingChangedListener", "(Landroid/media/AudioRouting$OnRoutingChangedListener;)V", nop_void),
+   M("getBufferCapacityInFrames", "()I", audiotrack_getBufferSizeInFrames),
+   M("setBufferSizeInFrames", "(I)I", audiotrack_getBufferSizeInFrames),
+   M("getChannelConfiguration", "()I", at_channel_config),
+   M_END,
+};
+
+/* ---------------------------------------------------- CloseGuard / platform hooks */
+
+/* Small platform APIs apps and SDKs call that had no implementation: the
+ * dalvik.system.CloseGuard leak detector, Configuration.setToDefaults(),
+ * FileObserver(String), and the Activity entry points with nothing to do on
+ * this device. */
+
+/* CloseGuard: get() makes a guard, open(what) arms it with the caller's
+ * description, close() disarms it, warnIfOpen() reports a guard still armed. */
+static const struct rt_field rt_close_guard_fields[] = {
+   { "opener", "Ljava/lang/String;" }, F_END
+};
+
+static bool close_guard_get(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                            int nargs, union dvm_value *out)
+{
+   (void)self; (void)args; (void)nargs;
+   struct dvm_class *c = dvm__class_by_desc(vm, "Ldalvik/system/CloseGuard;");
+   RETL(c ? dvm_new_object(vm, c) : 0);
+}
+
+static bool close_guard_open(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                             int nargs, union dvm_value *out)
+{
+   (void)out;
+   if (!ARG(0).l) {
+      dvm__throw(vm, "java/lang/NullPointerException", "closer == null");
+      return false;
+   }
+   (void)dvm_set_field(vm, self, "opener", "Ljava/lang/String;", ARG(0));
+   RETV();
+}
+
+static bool close_guard_close(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                              int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs; (void)out;
+   (void)dvm_set_field(vm, self, "opener", "Ljava/lang/String;", (union dvm_value){ .l = 0 });
+   RETV();
+}
+
+static bool close_guard_warn(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                             int nargs, union dvm_value *out)
+{
+   union dvm_value opener = { 0 };
+   (void)args; (void)nargs; (void)out;
+   (void)dvm_get_field(vm, self, "opener", "Ljava/lang/String;", &opener);
+   if (opener.l)
+      fprintf(stderr, "[dvm] CloseGuard: A resource was acquired at attached stack trace "
+                      "but never released (%s)\n", dvm_string_utf8(vm, opener.l));
+   RETV();
+}
+
+static const struct rt_method rt_close_guard[] = {
+   SM("get", "()Ldalvik/system/CloseGuard;", close_guard_get),
+   M("open", "(Ljava/lang/String;)V", close_guard_open),
+   M("close", "()V", close_guard_close),
+   M("warnIfOpen", "()V", close_guard_warn),
+   M_END,
+};
+
+/* Configuration.setToDefaults(): font scale 1, no locale override, nothing
+ * else set. */
+static bool cfg_set_to_defaults(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                                int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs; (void)out;
+   (void)dvm_set_field(vm, self, "fontScale", "F", (union dvm_value){ .f = 1.0f });
+   (void)dvm_set_field(vm, self, "screenLayout", "I", (union dvm_value){ .i = 0 });
+   configuration_ensure_locale(vm, self);
+   RETV();
+}
+
+static const struct rt_method rt_x_configuration[] = {
+   M("setToDefaults", "()V", cfg_set_to_defaults),
+   M_END,
+};
+
+/* FileObserver(String path) watches for every event. */
+static const struct rt_method rt_x_file_observer[] = {
+   M("<init>", "(Ljava/lang/String;)V", file_observer_init),
+   M_END,
+};
+
+/* Activity: no touch-outside dismissal on a full-screen window; Unity reports
+ * first-frame completion for a system that has no startup trace; a plain launch
+ * has no calling package; onContentChanged() is empty in the base class. */
+static const struct rt_method rt_x_activity[] = {
+   M("setFinishOnTouchOutside", "(Z)V", empty_void),
+   M("reportFullyDrawn", "()V", empty_void),
+   M("getCallingPackage", "()Ljava/lang/String;", ret_null),
+   M("onContentChanged", "()V", empty_void),
+   M_END,
+};
+
 #endif
+
+/* MPL-2.0. Alarm service for the running virtual device. All state is under
+ * the VM lock. The Looper polls clock domains without a timer thread per app. */
+struct dvm_alarm {
+   struct dvm_alarm *next;
+   dvm_ref token,listener,handler;
+   int type;
+   int64_t when,interval,min_elapsed;
+};
+static void alarm_free(struct dvm *vm,struct dvm_alarm *a)
+{
+   if(a->token)dvm_unpin(vm,a->token);
+   if(a->listener)dvm_unpin(vm,a->listener);
+   if(a->handler)dvm_unpin(vm,a->handler);
+   free(a);
+}
+static void alarm_remove(struct dvm *vm,dvm_ref token,dvm_ref listener)
+{
+   struct dvm_alarm **link=&vm->alarms;
+   while(*link) {
+      struct dvm_alarm *a=*link;
+      if((token && a->token==token) || (listener && a->listener==listener)) {
+         *link=a->next;alarm_free(vm,a);
+      } else link=&a->next;
+   }
+}
+static void alarm_cancel_token(struct dvm *vm,dvm_ref token)
+{ alarm_remove(vm,token,0); }
+void dvm_alarm_finish(struct dvm *vm)
+{
+   while(vm->alarms){struct dvm_alarm *a=vm->alarms;vm->alarms=a->next;alarm_free(vm,a);}
+}
+static bool pending_send_token(struct dvm *vm,dvm_ref token,int alarm_count)
+{
+   if(!token || rt_get_int(vm,token,"cancelled")) {
+      dvm__throw(vm,"android/app/PendingIntent$CanceledException","PendingIntent is cancelled");return false;
+   }
+   dvm_ref original=pending_field(vm,token,"intent","Landroid/content/Intent;");
+   dvm_ref intent=dvm_new_object(vm,dvm_find_class(vm,"android/content/Intent"));
+   if(!intent)return false;dvm_pin(vm,intent);
+   if(!intent_copy_into(vm,intent,original,false)){dvm_unpin(vm,intent);return false;}
+   uint32_t flags=(uint32_t)rt_get_int(vm,token,"flags");
+   /* FLAG_IMMUTABLE ignores sender fill-in extras, including alarm counts. */
+   if(alarm_count>0 && !(flags&UINT32_C(0x04000000)))
+      intent_put_int(vm,intent,"android.intent.extra.ALARM_COUNT",alarm_count);
+   if(flags&UINT32_C(0x40000000))pending_cancel_token(vm,token);
+   dvm_ref context=pending_field(vm,token,"context","Landroid/content/Context;");
+   union dvm_value a={.l=intent},ignored={0};
+   bool handled=dvm_runtime_context_broadcast(vm,"sendBroadcast","(Landroid/content/Intent;)V",context,&a,1,&ignored);
+   dvm_unpin(vm,intent);return handled && !dvm_exception(vm);
+}
+static bool alarm_listener_run(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;(void)out;
+   dvm_ref listener=pending_field(vm,self,"listener","Landroid/app/AlarmManager$OnAlarmListener;");
+   struct dvm_class *cls=dvm_object_class(vm,listener);
+   struct dvm_method *method=cls ? dvm_find_method(vm,cls,"onAlarm","()V") : NULL;
+   if(!method){dvm__throw(vm,"java/lang/AbstractMethodError","OnAlarmListener.onAlarm");return false;}
+   union dvm_value ignored={0};return dvm_call(vm,method,listener,NULL,0,&ignored);
+}
+static bool alarm_queue_listener(struct dvm *vm,dvm_ref listener,dvm_ref handler)
+{
+   dvm_ref job=dvm_new_object(vm,dvm_find_class(vm,"lunaria/AlarmDelivery"));
+   if(!job)return false;dvm_pin(vm,job);
+   dvm_set_field(vm,job,"listener","Landroid/app/AlarmManager$OnAlarmListener;",(union dvm_value){.l=listener});
+   bool ok;
+   if(handler) {
+      struct dvm_class *cls=dvm_object_class(vm,handler);
+      struct dvm_method *post=cls ? dvm_find_method(vm,cls,"post","(Ljava/lang/Runnable;)Z") : NULL;
+      union dvm_value arg={.l=job},result={0};
+      ok=post && dvm_call(vm,post,handler,&arg,1,&result) && result.i;
+   } else ok=dvm__queue_runnable_at(vm,job,false,0);
+   dvm_unpin(vm,job);return ok;
+}
+void dvm_alarm_poll_at(struct dvm *vm,int64_t wall_ms,int64_t elapsed_ms)
+{
+   if(!vm || dvm_exception(vm) || dvm_is_stopping(vm))return;
+   /* Queue delivery, never invoke application callbacks in the scheduler. A
+    * fresh search also remains safe when a one-shot token cancels its alarm. */
+   for(unsigned dispatched=0;dispatched<500;++dispatched) {
+      struct dvm_alarm **link=&vm->alarms;
+      while(*link) {
+         struct dvm_alarm *a=*link;
+         if(a->token && rt_get_int(vm,a->token,"cancelled")){*link=a->next;alarm_free(vm,a);continue;}
+         int64_t now=a->type<2 ? wall_ms : elapsed_ms;
+         if(now>=a->when && elapsed_ms>=a->min_elapsed)break;
+         link=&a->next;
+      }
+      struct dvm_alarm *a=*link;if(!a)break;
+      dvm_ref token=a->token,listener=a->listener,handler=a->handler;
+      if(token)dvm_pin(vm,token);if(listener)dvm_pin(vm,listener);if(handler)dvm_pin(vm,handler);
+      int64_t now=a->type<2 ? wall_ms : elapsed_ms;
+      int64_t count=a->interval>0 ? 1+(now-a->when)/a->interval : 1;
+      if(a->interval>0 && now<INT64_MAX) {
+         int64_t increment=a->interval-(now-a->when)%a->interval;
+         a->when=now>INT64_MAX-increment ? INT64_MAX : now+increment;
+         a->min_elapsed=0;
+      } else {*link=a->next;alarm_free(vm,a);}
+      bool ok=token ? pending_send_token(vm,token,count>INT_MAX ? INT_MAX : (int)count)
+                    : alarm_queue_listener(vm,listener,handler);
+      if(!ok) {
+         struct dvm_class *error=dvm_object_class(vm,dvm_exception(vm));
+         fprintf(stderr,"[alarm] unable to enqueue delivery: %s\n",error ? error->name : "queue unavailable");
+         dvm_clear_exception(vm);
+      }
+      if(token)dvm_unpin(vm,token);if(listener)dvm_unpin(vm,listener);if(handler)dvm_unpin(vm,handler);
+   }
+}
+void dvm_alarm_poll(struct dvm *vm)
+{
+   if(!vm || !vm->alarms)return;
+   dvm_alarm_poll_at(vm,(int64_t)(luna_os_realtime_ns()/1000000),
+                        (int64_t)(luna_os_boottime_ns()/1000000));
+}
+static bool alarm_can_exact(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)vm;(void)self;(void)args;(void)nargs;
+   RETI(lunaria_app_target_sdk()<31 || arm_exec_guest_uid()<10000 ||
+        manifest_has_permission("android.permission.SCHEDULE_EXACT_ALARM"));
+}
+static bool alarm_set(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)out;
+   struct dvm_method *method=dvm__builtin_method();
+   const char *name=method->name,*sig=method->sig;
+   bool repeating=!strcmp(name,"setRepeating") || !strcmp(name,"setInexactRepeating");
+   bool window=!strcmp(name,"setWindow"),direct=strstr(sig,"OnAlarmListener;")!=NULL;
+   int operation_index=(repeating || window) ? 3 : 2;
+   dvm_ref operation=direct ? 0 : ARG(operation_index).l;
+   dvm_ref listener=direct ? ARG(nargs-2).l : 0,handler=direct ? ARG(nargs-1).l : 0;
+   if(!operation && !listener)RETV(); /* AlarmManagerService's invalid-pair contract. */
+   bool exact=!strcmp(name,"setExact") || !strcmp(name,"setExactAndAllowWhileIdle") ||
+              (window && ARG(2).j==0) || (!strcmp(name,"set") && lunaria_app_target_sdk()<19);
+   union dvm_value permitted={0};
+   if(exact && (!alarm_can_exact(vm,0,NULL,0,&permitted) || !permitted.i)) {
+      dvm__throw(vm,"java/lang/SecurityException","SCHEDULE_EXACT_ALARM permission required");return false;
+   }
+   int type=ARG(0).i;
+   if(type<0 || type>3){dvm__throw(vm,"java/lang/IllegalArgumentException","Invalid alarm type %d",type);return false;}
+   dvm_ref token=operation ? pending_field(vm,operation,"token","Landroid/app/PendingIntent;") : 0;
+   if(operation && (!token || rt_get_int(vm,token,"cancelled")))RETV();
+   int64_t wall=(int64_t)(luna_os_realtime_ns()/1000000),elapsed=(int64_t)(luna_os_boottime_ns()/1000000);
+   int64_t futurity=arm_exec_guest_uid()<10000 ? 0 : 5000;
+   int64_t minimum=(type<2 ? wall : elapsed)+futurity;
+   int64_t when=ARG(1).j;if(when<minimum)when=minimum;
+   int64_t interval=repeating ? ARG(2).j : 0;
+   if(interval<0)interval=0;
+   if(interval>0 && interval<60000)interval=60000;
+   if(interval>INT64_C(31536000000))interval=INT64_C(31536000000);
+   size_t count=0;bool replacement=false;
+   for(struct dvm_alarm *a=vm->alarms;a;a=a->next){++count;replacement |= (token && a->token==token) || (listener && a->listener==listener);}
+   if(count>=500 && !replacement){dvm__throw(vm,"java/lang/IllegalStateException","Maximum concurrent alarms reached");return false;}
+   struct dvm_alarm *a=calloc(1,sizeof *a);
+   if(!a){dvm__throw(vm,"java/lang/OutOfMemoryError","AlarmManager record");return false;}
+   *a=(struct dvm_alarm){NULL,token,listener,handler,type,when,interval,elapsed+futurity};
+   if(token)dvm_pin(vm,token);if(listener)dvm_pin(vm,listener);if(handler)dvm_pin(vm,handler);
+   alarm_remove(vm,token,listener);a->next=vm->alarms;vm->alarms=a;RETV();
+}
+static bool alarm_cancel(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)nargs;const struct dvm_method *method=dvm__builtin_method();
+   bool direct=strstr(method->sig,"OnAlarmListener;")!=NULL;
+   if(!ARG(0).l) {
+      if(direct || lunaria_app_target_sdk()>=24){dvm__throw(vm,"java/lang/NullPointerException","cancel called with null operation");return false;}
+      RETV();
+   }
+   alarm_remove(vm,direct ? 0 : pending_field(vm,ARG(0).l,"token","Landroid/app/PendingIntent;"),direct ? ARG(0).l : 0);RETV();
+}
+static const struct rt_field rt_alarm_delivery_fields[]={{"listener","Landroid/app/AlarmManager$OnAlarmListener;"},F_END};
+static const struct rt_method rt_alarm_delivery[]={M("run","()V",alarm_listener_run),M_END};
+static const struct rt_method rt_alarm_listener[]={{"onAlarm","()V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},M_END};
+static const struct rt_field rt_alarm_static[]={
+   {"RTC_WAKEUP","I"},{"RTC","I"},{"ELAPSED_REALTIME_WAKEUP","I"},{"ELAPSED_REALTIME","I"},
+   {"INTERVAL_FIFTEEN_MINUTES","J"},{"INTERVAL_HALF_HOUR","J"},{"INTERVAL_HOUR","J"},{"INTERVAL_HALF_DAY","J"},{"INTERVAL_DAY","J"},F_END
+};
+static const struct rt_method rt_alarm_manager[]={
+   M("set","(IJLandroid/app/PendingIntent;)V",alarm_set),
+   M("setExact","(IJLandroid/app/PendingIntent;)V",alarm_set),
+   M("setAndAllowWhileIdle","(IJLandroid/app/PendingIntent;)V",alarm_set),
+   M("setExactAndAllowWhileIdle","(IJLandroid/app/PendingIntent;)V",alarm_set),
+   M("setRepeating","(IJJLandroid/app/PendingIntent;)V",alarm_set),
+   M("setInexactRepeating","(IJJLandroid/app/PendingIntent;)V",alarm_set),
+   M("setWindow","(IJJLandroid/app/PendingIntent;)V",alarm_set),
+   M("set","(IJLjava/lang/String;Landroid/app/AlarmManager$OnAlarmListener;Landroid/os/Handler;)V",alarm_set),
+   M("setExact","(IJLjava/lang/String;Landroid/app/AlarmManager$OnAlarmListener;Landroid/os/Handler;)V",alarm_set),
+   M("setWindow","(IJJLjava/lang/String;Landroid/app/AlarmManager$OnAlarmListener;Landroid/os/Handler;)V",alarm_set),
+   M("cancel","(Landroid/app/PendingIntent;)V",alarm_cancel),
+   M("cancel","(Landroid/app/AlarmManager$OnAlarmListener;)V",alarm_cancel),
+   M("canScheduleExactAlarms","()Z",alarm_can_exact),M_END
+};
+
+/* SQLiteQueryBuilder composes SQL; execution and binding belong to SQLiteDatabase. */
+static bool qb_field(struct dvm *vm,dvm_ref self,const char *name,const char *type,union dvm_value *value)
+{ return dvm_get_field(vm,self,name,type,value); }
+static bool qb_property(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;const char *method=builtin_name();
+   const char *name=!strcmp(method,"setProjectionMap") ? "projection" :
+      strstr(method,"Distinct") ? "distinct" : "tables";
+   const char *type=!strcmp(name,"projection") ? "Ljava/util/Map;" :
+      !strcmp(name,"distinct") ? "Z" : "Ljava/lang/String;";
+   if(!strncmp(method,"set",3)){dvm_set_field(vm,self,name,type,ARG(0));RETV();}
+   return qb_field(vm,self,name,type,out);
+}
+static bool qb_append_where(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;const char *method=builtin_name();
+   bool escape=!strcmp(method,"appendWhereEscapeString"),standalone=!strcmp(method,"appendWhereStandalone");
+   union dvm_value previous={0},chunk={0};
+   if(!ARG(0).l){dvm__throw(vm,"java/lang/NullPointerException","where");return false;}
+   if(!am_vcall(vm,ARG(0).l,"toString","()Ljava/lang/String;",NULL,0,&chunk))return false;
+   qb_field(vm,self,"where","Ljava/lang/String;",&previous);
+   const char *old=dvm_string_utf8(vm,previous.l),*text=dvm_string_utf8(vm,chunk.l);
+   struct rt_bytes b={0};bool good=bytes_printf(&b,"%s",old ? old : "");
+   if(standalone)good &= bytes_printf(&b,"%s(",old && *old ? " AND " : "");
+   if(escape){
+      good &= bytes_append(&b,"'",1);
+      for(const char *p=text;good && p && *p;++p){good &= bytes_append(&b,p,1);if(*p=='\'')good &= bytes_append(&b,p,1);}
+      good &= bytes_append(&b,"'",1);
+   }else good &= bytes_printf(&b,"%s",text ? text : "");
+   if(standalone)good &= bytes_append(&b,")",1);
+   if(good){chunk.l=dvm_new_string_n(vm,(const char *)b.p,b.len);good=chunk.l && dvm_set_field(vm,self,"where","Ljava/lang/String;",chunk);}
+   free(b.p);if(!good)return false;RETV();
+}
+static bool qb_limit_valid(const char *s)
+{
+   if(!s || !*s)return true;
+   const unsigned char *p=(const unsigned char *)s;
+   if(*p<'0' || *p>'9')return false;
+   while(*p>='0' && *p<='9')++p;
+   if(!*p)return true;
+   while(*p && strchr(" \t\n\r\f\v",*p))++p;
+   if(*p++!=',')return false;
+   while(*p && strchr(" \t\n\r\f\v",*p))++p;
+   if(*p<'0' || *p>'9')return false;
+   while(*p>='0' && *p<='9')++p;
+   return !*p;
+}
+static bool qb_build_sql(struct dvm *vm,bool distinct,dvm_ref tables,dvm_ref projection,
+   const char *where,dvm_ref group,dvm_ref having,dvm_ref order,dvm_ref limit,union dvm_value *out)
+{
+   const char *g=dvm_string_utf8(vm,group),*h=dvm_string_utf8(vm,having),*l=dvm_string_utf8(vm,limit);
+   if(h && *h && (!g || !*g)){dvm__throw(vm,"java/lang/IllegalArgumentException","HAVING requires GROUP BY");return false;}
+   if(!qb_limit_valid(l)){dvm__throw(vm,"java/lang/IllegalArgumentException","Invalid LIMIT");return false;}
+   struct rt_bytes b={0};bool good=bytes_printf(&b,"SELECT %s",distinct ? "DISTINCT " : "");
+   uint32_t count=projection ? dvm_array_length(vm,projection) : 0;
+   if(count){
+      dvm_ref *columns=dvm_array_data(vm,projection);bool first=true;
+      for(uint32_t i=0;good && i<count;++i)if(columns[i]){
+         good &= bytes_printf(&b,"%s%s",first ? "" : ", ",dvm_string_utf8(vm,columns[i]));first=false;
+      }
+   }else good &= bytes_append(&b,"*",1);
+   const char *table=dvm_string_utf8(vm,tables);good &= bytes_printf(&b," FROM %s",table ? table : "null");
+   const char *o=dvm_string_utf8(vm,order);
+   const char *clauses[]={where,g,h,o,l},*names[]={" WHERE "," GROUP BY "," HAVING "," ORDER BY "," LIMIT "};
+   for(unsigned i=0;good && i<5;++i)if(clauses[i] && *clauses[i])good &= bytes_printf(&b,"%s%s",names[i],clauses[i]);
+   if(good)out->l=dvm_new_string_n(vm,(const char *)b.p,b.len);
+   free(b.p);if(!good){dvm__throw(vm,"java/lang/OutOfMemoryError","SQL query");return false;}return out->l!=0;
+}
+static bool qb_projection(struct dvm *vm,dvm_ref mapping,dvm_ref input,dvm_ref *output)
+{
+   *output=input;if(!mapping)return true;
+   union dvm_value r={0};
+   if(input && dvm_array_length(vm,input)){
+      uint32_t n=dvm_array_length(vm,input);
+      *output=dvm_new_array(vm,'L',"Ljava/lang/String;",n);if(!*output)return false;
+      dvm_pin(vm,*output);bool good=true;
+      for(uint32_t i=0;good && i<n;++i){
+         union dvm_value key={.l=((dvm_ref *)dvm_array_data(vm,input))[i]};
+         good=am_vcall(vm,mapping,"get","(Ljava/lang/Object;)Ljava/lang/Object;",&key,1,&r);
+         if(good && !r.l){
+            const char *column=dvm_string_utf8(vm,key.l);
+            if(column && (strstr(column," AS ") || strstr(column," as ")))r=key;
+            else{dvm__throw(vm,"java/lang/IllegalArgumentException","Invalid projection %s",column ? column : "null");good=false;}
+         }
+         if(good)((dvm_ref *)dvm_array_data(vm,*output))[i]=r.l;
+      }
+      dvm_unpin(vm,*output);return good;
+   }
+   if(!am_vcall(vm,mapping,"entrySet","()Ljava/util/Set;",NULL,0,&r))return false;
+   if(!am_vcall(vm,r.l,"iterator","()Ljava/util/Iterator;",NULL,0,&r))return false;
+   dvm_ref iterator=r.l;dvm_pin(vm,iterator);
+   dvm_ref columns=coll_new_list(vm,"Ljava/util/ArrayList;");dvm_pin(vm,columns);
+   bool good=columns!=0;
+   while(good){
+      good=am_vcall(vm,iterator,"hasNext","()Z",NULL,0,&r);if(!good || !r.i)break;
+      good=am_vcall(vm,iterator,"next","()Ljava/lang/Object;",NULL,0,&r);if(!good)break;
+      dvm_ref entry=r.l;union dvm_value key={0};
+      good=am_vcall(vm,entry,"getKey","()Ljava/lang/Object;",NULL,0,&key);
+      const char *name=dvm_string_utf8(vm,key.l);if(name && !strcmp(name,"_count"))continue;
+      good=good && am_vcall(vm,entry,"getValue","()Ljava/lang/Object;",NULL,0,&r);
+      union dvm_value ignored={0};if(good)good=list_add(vm,columns,&r,1,&ignored);
+   }
+   if(good){union dvm_value array={.l=dvm_new_array(vm,'L',"Ljava/lang/String;",0)};good=list_toArray(vm,columns,&array,1,&r);if(good)*output=r.l;}
+   dvm_unpin(vm,columns);dvm_unpin(vm,iterator);return good;
+}
+static bool qb_build(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;union dvm_value tables={0},distinct={0},where={0},mapping={0};
+   qb_field(vm,self,"tables","Ljava/lang/String;",&tables);qb_field(vm,self,"distinct","Z",&distinct);
+   qb_field(vm,self,"where","Ljava/lang/String;",&where);qb_field(vm,self,"projection","Ljava/util/Map;",&mapping);
+   dvm_ref projection=0;if(!qb_projection(vm,mapping.l,ARG(0).l,&projection))return false;
+   dvm_pin(vm,projection);
+   const char *fixed=dvm_string_utf8(vm,where.l),*selection=dvm_string_utf8(vm,ARG(1).l);
+   struct rt_bytes combined={0};bool good=true;
+   if(fixed && *fixed)good &= bytes_printf(&combined,"(%s)",fixed);
+   if(selection && *selection)good &= bytes_printf(&combined,"%s(%s)",combined.len ? " AND " : "",selection);
+   if(good)good=bytes_append(&combined,"",1);
+   if(good)good=qb_build_sql(vm,distinct.i,tables.l,projection,(const char *)combined.p,ARG(2).l,ARG(3).l,ARG(4).l,ARG(5).l,out);
+   free(combined.p);dvm_unpin(vm,projection);return good;
+}
+static bool qb_query(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   union dvm_value tables={0};qb_field(vm,self,"tables","Ljava/lang/String;",&tables);if(!tables.l)RETL(0);
+   union dvm_value build[]={ARG(1),ARG(2),ARG(4),ARG(5),ARG(6),{0}};
+   if(nargs>7)build[5]=ARG(7);
+   union dvm_value sql={0};if(!qb_build(vm,self,build,6,&sql))return false;
+   union dvm_value query[]={sql,ARG(3)};
+   return am_vcall(vm,ARG(0).l,"rawQuery","(Ljava/lang/String;[Ljava/lang/String;)Landroid/database/Cursor;",query,2,out);
+}
+static bool qb_build_static(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)nargs;return qb_build_sql(vm,ARG(0).i,ARG(1).l,ARG(2).l,dvm_string_utf8(vm,ARG(3).l),ARG(4).l,ARG(5).l,ARG(6).l,ARG(7).l,out);
+}
+static const struct rt_field rt_query_builder_fields[]={
+   {"tables","Ljava/lang/String;"},{"where","Ljava/lang/String;"},{"distinct","Z"},{"projection","Ljava/util/Map;"},F_END
+};
+static const struct rt_method rt_query_builder[]={
+   M("<init>","()V",empty_void),
+   M("setTables","(Ljava/lang/String;)V",qb_property),M("getTables","()Ljava/lang/String;",qb_property),
+   M("setDistinct","(Z)V",qb_property),M("isDistinct","()Z",qb_property),
+   M("setProjectionMap","(Ljava/util/Map;)V",qb_property),
+   M("appendWhere","(Ljava/lang/CharSequence;)V",qb_append_where),
+   M("appendWhereEscapeString","(Ljava/lang/String;)V",qb_append_where),
+   M("appendWhereStandalone","(Ljava/lang/CharSequence;)V",qb_append_where),
+   M("buildQuery","([Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",qb_build),
+   SM("buildQueryString","(ZLjava/lang/String;[Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",qb_build_static),
+   M("query","(Landroid/database/sqlite/SQLiteDatabase;[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Landroid/database/Cursor;",qb_query),
+   M("query","(Landroid/database/sqlite/SQLiteDatabase;[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Landroid/database/Cursor;",qb_query),M_END
+};

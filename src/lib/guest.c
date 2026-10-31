@@ -1427,6 +1427,49 @@ void __cxa_guard_abort(uint64_t *guard)
       raw_futex(g, FUTEX_WAKE_PRIVATE, 0x7fffffff);
 }
 
+/* ---- dlopen, android_dlopen_ext -------------------------------------------
+ * bionic's dlopen and android_dlopen_ext are thin wrappers: each calls the
+ * dynamic linker's __loader_dlopen / __loader_android_dlopen_ext with the
+ * caller's address.  Programs that bypass linker namespaces (libadrenotools,
+ * linked into SDL2 here) do not call them: they read the wrapper's machine
+ * code, take the target of its first bl, and call that directly.  So these
+ * must be code of that shape, not traps, or such a program scans whatever
+ * happens to follow the entry point in memory.  The linker itself is the
+ * emulator's dlopen service. */
+extern void *lunaria_host_dlopen(const char *file, int flags);
+
+__attribute__((noinline))
+static void *lunaria_loader_dlopen(const char *file, int flags, const void *caller)
+{
+   (void)caller;
+   return lunaria_host_dlopen(file, flags);
+}
+
+__attribute__((noinline))
+static void *lunaria_loader_android_dlopen_ext(const char *file, int flags,
+                                               const void *extinfo, const void *caller)
+{
+   (void)extinfo; (void)caller;
+   return lunaria_host_dlopen(file, flags);
+}
+
+__attribute__((visibility("default")))
+void *dlopen(const char *file, int flags)
+{
+   void *handle = lunaria_loader_dlopen(file, flags, __builtin_return_address(0));
+   __asm__ volatile("" ::: "memory");   /* a call, never a tail jump */
+   return handle;
+}
+
+__attribute__((visibility("default")))
+void *android_dlopen_ext(const char *file, int flags, const void *extinfo)
+{
+   void *handle = lunaria_loader_android_dlopen_ext(file, flags, extinfo,
+                                                    __builtin_return_address(0));
+   __asm__ volatile("" ::: "memory");
+   return handle;
+}
+
 #endif /* !LUNARIA_GUEST_SHARED */
 #endif /* LUNARIA_LIB_GUEST_C */
 

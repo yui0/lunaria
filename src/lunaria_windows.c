@@ -35,6 +35,9 @@
 #include <mmsystem.h>
 #include <realtimeapiset.h>
 #include <stdatomic.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
 
 size_t luna_os_stack_remaining(void)
 {
@@ -95,6 +98,50 @@ int luna_os_setenv(const char *name, const char *value, int overwrite)
    if (error) { errno = error; return -1; }
    return 0;
 }
+int luna_os_net_list(struct luna_os_netif *out, int capacity)
+{
+   if (!out || capacity <= 0) return 0;
+   ULONG size = 16 * 1024;
+   IP_ADAPTER_ADDRESSES *list = NULL;
+   ULONG rc = ERROR_BUFFER_OVERFLOW;
+   for (int attempt = 0; attempt < 3 && rc == ERROR_BUFFER_OVERFLOW; ++attempt) {
+      free(list);
+      list = malloc(size);
+      if (!list) return 0;
+      rc = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                                GAA_FLAG_SKIP_DNS_SERVER, NULL, list, &size);
+   }
+   int count = 0;
+   for (const IP_ADAPTER_ADDRESSES *a = rc == NO_ERROR ? list : NULL; a && count < capacity; a = a->Next) {
+      struct luna_os_netif *netif = &out[count];
+      memset(netif, 0, sizeof *netif);
+      /* The adapter's AdapterName is a GUID; its friendly name is what a
+       * java.net.NetworkInterface shows. */
+      if (!WideCharToMultiByte(CP_UTF8, 0, a->FriendlyName, -1, netif->name, (int)sizeof netif->name, NULL, NULL))
+         snprintf(netif->name, sizeof netif->name, "%s", a->AdapterName);
+      netif->index = a->IfIndex;
+      netif->mtu = a->Mtu;
+      netif->up = a->OperStatus == IfOperStatusUp;
+      netif->loopback = a->IfType == IF_TYPE_SOFTWARE_LOOPBACK;
+      netif->multicast = !(a->Flags & IP_ADAPTER_NO_MULTICAST);
+      netif->point_to_point = a->IfType == IF_TYPE_PPP;
+      for (const IP_ADAPTER_UNICAST_ADDRESS *u = a->FirstUnicastAddress; u && netif->naddr < LUNA_OS_NETIF_ADDRS; u = u->Next) {
+         const struct sockaddr *sa = u->Address.lpSockaddr;
+         if (!sa || (sa->sa_family != AF_INET && sa->sa_family != AF_INET6)) continue;
+         const bool v4 = sa->sa_family == AF_INET;
+         netif->addr[netif->naddr].family = v4 ? 4 : 6;
+         memcpy(netif->addr[netif->naddr].bytes, v4
+                ? (const void *)&((const struct sockaddr_in *)sa)->sin_addr
+                : (const void *)&((const struct sockaddr_in6 *)sa)->sin6_addr, v4 ? 4u : 16u);
+         netif->addr[netif->naddr].prefix = u->OnLinkPrefixLength;
+         ++netif->naddr;
+      }
+      ++count;
+   }
+   free(list);
+   return count;
+}
+
 int luna_os_random(void *buffer, size_t length)
 {
    if (length && !buffer) { errno = EFAULT; return -1; }

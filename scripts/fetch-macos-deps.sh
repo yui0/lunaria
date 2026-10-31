@@ -173,34 +173,9 @@ fi
 # capabilities; ANGLE then correctly exposes only GLES 2.0.  Khronos ships the
 # private-API variant specifically to expose those capabilities on macOS.
 moltenvk_version=1.4.2
-moltenvk_stamp="$deps/lib/.moltenvk-version"
-old_moltenvk=$(sed -n '1p' "$moltenvk_stamp" 2>/dev/null || true)
-if [ "$old_moltenvk" != "$moltenvk_version-privateapi" ] || \
-   [ ! -f "$deps/lib/libMoltenVK.dylib" ] || \
-   [ ! -f "$deps/moltenvk/include/vulkan/vulkan.h" ] || \
-   [ ! -f "$deps/moltenvk/include/vk_video/vulkan_video_codecs_common.h" ]; then
-    archive=$(mktemp "${TMPDIR:-/tmp}/lunaria-moltenvk.XXXXXX.tar")
-    trap 'rm -f "$archive"' EXIT HUP INT TERM
-    if [ -n "${LUNARIA_MOLTENVK_ARCHIVE:-}" ]; then
-        cp "$LUNARIA_MOLTENVK_ARCHIVE" "$archive"
-    else
-        curl --fail --location --silent --show-error \
-            "https://github.com/KhronosGroup/MoltenVK/releases/download/v${moltenvk_version}/MoltenVK-macos-privateapi.tar" \
-            --output "$archive"
-    fi
-    mkdir -p "$deps/moltenvk"
-    tar -xf "$archive" -C "$deps/moltenvk" --strip-components=5 \
-        MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib
-    tar -xf "$archive" -C "$deps/moltenvk" --strip-components=2 \
-        MoltenVK/MoltenVK/include/vulkan \
-        MoltenVK/MoltenVK/include/vk_video
-    cp "$deps/moltenvk/libMoltenVK.dylib" "$deps/lib/libMoltenVK.dylib"
-    install_name_tool -id @rpath/libMoltenVK.dylib "$deps/lib/libMoltenVK.dylib"
-    codesign --force --sign - --timestamp=none "$deps/lib/libMoltenVK.dylib"
-    printf '%s\n' "$moltenvk_version-privateapi" > "$moltenvk_stamp"
-    rm -f "$archive"
-    trap - EXIT HUP INT TERM
-fi
+# Rebuild this existing dependency with the SPIRV-Cross fragment-output fix.
+# The upstream binary emits invalid Metal for partially enabled output arrays.
+sh "$root/scripts/build-macos-moltenvk.sh"
 
 # ANGLE's Vulkan loader discovers a driver through an ICD manifest.  Merely
 # placing libMoltenVK beside libEGL leaves a Vulkan-enabled ANGLE falling back
@@ -214,7 +189,39 @@ with open(manifest, 'w', encoding='utf-8') as out:
     out.write('\n')
 PYEOF
 
+# Android text layout requires OpenType shaping. Ship the same shaping engine
+# instead of depending on an optional Homebrew installation or glyph reversal.
+harfbuzz_version=10.2.0
+harfbuzz_source="$deps/harfbuzz-$harfbuzz_version"
+harfbuzz_build="$deps/harfbuzz-$harfbuzz_version-build"
+harfbuzz_library="$deps/lib/libharfbuzz.0.dylib"
+if [ ! -s "$harfbuzz_library" ] || [ ! -s "$deps/lib/harfbuzz-LICENSE.txt" ] || \
+   [ "$(cat "$deps/lib/.harfbuzz-version" 2>/dev/null || true)" != "$harfbuzz_version" ]; then
+    if [ ! -f "$harfbuzz_source/src/hb.h" ]; then
+        archive=$(mktemp "${TMPDIR:-/tmp}/lunaria-harfbuzz.XXXXXX")
+        trap 'rm -f "$archive"' EXIT HUP INT TERM
+        curl --fail --location --silent --show-error \
+            "https://github.com/harfbuzz/harfbuzz/archive/refs/tags/$harfbuzz_version.tar.gz" \
+            --output "$archive"
+        mkdir -p "$harfbuzz_source"
+        tar -xzf "$archive" -C "$harfbuzz_source" --strip-components=1
+        rm -f "$archive"
+        trap - EXIT HUP INT TERM
+    fi
+    "$deps/bin/cmake" -S "$harfbuzz_source" -B "$harfbuzz_build" \
+        -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+        -DHB_HAVE_CORETEXT=OFF -DHB_BUILD_SUBSET=OFF -DHB_BUILD_UTILS=OFF \
+        -DCMAKE_OSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
+    "$deps/bin/cmake" --build "$harfbuzz_build" --target harfbuzz \
+        --parallel "${DYNARMIC_JOBS:-4}"
+    cp -L "$harfbuzz_build/libharfbuzz.dylib" "$harfbuzz_library"
+    cp "$harfbuzz_source/COPYING" "$deps/lib/harfbuzz-LICENSE.txt"
+    install_name_tool -id @rpath/libharfbuzz.0.dylib "$harfbuzz_library"
+    codesign --force --sign - --timestamp=none "$harfbuzz_library"
+    printf '%s\n' "$harfbuzz_version" > "$deps/lib/.harfbuzz-version"
+fi
+
 printf '%s\n' "macOS dependencies ready" "  GLFW:  $glfw" \
     "  headers: $khr" "  Vulkan: $deps/vulkan/include" "  ELF ABI: $linux_abi/elf.h" \
     "  CMake: $deps/bin/cmake" "  Boost: $deps/boost" "  ANGLE: $angle" \
-    "  MoltenVK: $moltenvk_version-privateapi"
+    "  MoltenVK: $moltenvk_version-privateapi" "  HarfBuzz: $harfbuzz_version"

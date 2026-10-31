@@ -26,9 +26,8 @@
 #include <unistd.h>
 #include "jvm/jni.h"
 #include "jvm.h"
-#include "screen_orientation.h"
 #include "arm_exec.h"
-#include "dvm/dvm_jni.h"
+#include "dvm/dvm.h"
 
 extern void arm_exec_drain_gl_thread_jobs(void);
 const char *arm_exec_get_main_lib_dir(void);
@@ -63,8 +62,9 @@ jni_file_set_path(jobject file, const char *path)
    uintptr_t idx = (uintptr_t)file;
    if (idx >= JNI_FILE_PATHS_MAX)
       return;
-   free(g_file_paths[idx]);
-   g_file_paths[idx] = (path && *path) ? strdup(path) : NULL;
+   char *copy=path ? luna_java_file_normalize(path) : NULL;
+   if(path && !copy)return;
+   free(g_file_paths[idx]);g_file_paths[idx]=copy;
 }
 
 const char *
@@ -76,170 +76,57 @@ jni_file_get_path(jobject file)
    return (idx < JNI_FILE_PATHS_MAX) ? g_file_paths[idx] : NULL;
 }
 
-static void
-jni_file_join(char *out, size_t outsz, const char *parent, const char *child)
-{
-   /* Match java.io.UnixFileSystem.resolve: empty parent → child alone.
-    * Inserting '/' here made absolute paths out of relative names. */
-   if (!parent || !*parent) {
-      snprintf(out, outsz, "%s", child ? child : "");
-      return;
-   }
-   if (!child || !*child) {
-      snprintf(out, outsz, "%s", parent);
-      return;
-   }
-   if (child[0] == '/') {
-      snprintf(out, outsz, "%s", child);
-      return;
-   }
-   const size_t plen = strlen(parent);
-   if (plen > 0 && parent[plen - 1] == '/')
-      snprintf(out, outsz, "%s%s", parent, child);
-   else
-      snprintf(out, outsz, "%s/%s", parent, child);
-}
-
-static const char *
-jni_file_default_dir(void)
-{
-   const char *p = getenv("ANDROID_EXTERNAL_FILES_DIR");
-   return (p && *p) ? p : "/tmp";
-}
-
 static jstring
-jni_file_path_string(JNIEnv *env, jobject object)
+jni_file_path_string(JNIEnv *env,jobject object)
 {
-   const char *p = jni_file_get_path(object);
-   if (!p || !*p)
-      p = jni_file_default_dir();
-   return (*env)->NewStringUTF(env, p);
+   const char *path=jni_file_get_path(object);
+   return (*env)->NewStringUTF(env,path ? path : "");
 }
 
 void
-jni_file_bind_ctor(JNIEnv *env, jobject file, jmethodID ctor, va_list ap)
+jni_file_bind_ctor_a(JNIEnv *env,jobject file,jmethodID ctor,const jvalue *args)
 {
-   struct jvm *jvm = jnienv_get_jvm(env);
-   if (!jvm || !file || !ctor)
-      return;
-   struct jvm_object *m = &jvm->objects[(uintptr_t)ctor - 1];
-   if (m->type != JVM_OBJECT_METHOD || !m->method.signature.data)
-      return;
-   const char *sig = m->method.signature.data;
-   char path[PATH_MAX];
-   if (!strcmp(sig, "(Ljava/lang/String;)V")) {
-      jstring js = va_arg(ap, jstring);
-      const char *utf = js ? (*env)->GetStringUTFChars(env, js, NULL) : NULL;
-      if (utf) {
-         jni_file_set_path(file, utf);
-         (*env)->ReleaseStringUTFChars(env, js, utf);
-      }
-   } else if (!strcmp(sig, "(Ljava/io/File;Ljava/lang/String;)V")) {
-      jobject parent = va_arg(ap, jobject);
-      jstring child = va_arg(ap, jstring);
-      const char *base = jni_file_get_path(parent);
-      if (!base)
-         base = jni_file_default_dir();
-      const char *utf = child ? (*env)->GetStringUTFChars(env, child, NULL) : NULL;
-      if (utf) {
-         jni_file_join(path, sizeof path, base, utf);
-         jni_file_set_path(file, path);
-         (*env)->ReleaseStringUTFChars(env, child, utf);
-      }
-   } else if (!strcmp(sig, "(Ljava/lang/String;Ljava/lang/String;)V")) {
-      jstring p1 = va_arg(ap, jstring);
-      jstring p2 = va_arg(ap, jstring);
-      const char *u1 = p1 ? (*env)->GetStringUTFChars(env, p1, NULL) : NULL;
-      const char *u2 = p2 ? (*env)->GetStringUTFChars(env, p2, NULL) : NULL;
-      if (u1 && u2) {
-         jni_file_join(path, sizeof path, u1, u2);
-         jni_file_set_path(file, path);
-      } else if (u1) {
-         jni_file_set_path(file, u1);
-      }
-      if (u1)
-         (*env)->ReleaseStringUTFChars(env, p1, u1);
-      if (u2)
-         (*env)->ReleaseStringUTFChars(env, p2, u2);
+   struct jvm *jvm=jnienv_get_jvm(env);
+   if(!jvm || !file || !ctor || !args)return;
+   struct jvm_object *method=&jvm->objects[(uintptr_t)ctor-1];
+   if(method->type!=JVM_OBJECT_METHOD || !method->method.signature.data)return;
+   const char *sig=method->method.signature.data;
+   bool single=!strcmp(sig,"(Ljava/lang/String;)V");
+   bool parent_file=!strcmp(sig,"(Ljava/io/File;Ljava/lang/String;)V");
+   if(!single && !parent_file && strcmp(sig,"(Ljava/lang/String;Ljava/lang/String;)V"))return;
+   jstring child=(jstring)args[single ? 0 : 1].l;
+   if(!child){
+      jclass exception=(*env)->FindClass(env,"java/lang/NullPointerException");
+      (*env)->ThrowNew(env,exception,"pathname");return;
    }
+   const char *tail=(*env)->GetStringUTFChars(env,child,NULL);
+   jstring parent_string=!single && !parent_file ? (jstring)args[0].l : NULL;
+   const char *parent=single ? NULL : parent_file ? jni_file_get_path((jobject)args[0].l) :
+      parent_string ? (*env)->GetStringUTFChars(env,parent_string,NULL) : NULL;
+   char *path=single ? luna_java_file_normalize(tail) : luna_java_file_resolve(!parent_file && parent && !*parent ? NULL : parent,tail);
+   if(path){jni_file_set_path(file,path);free(path);}
+   else {jclass exception=(*env)->FindClass(env,"java/lang/OutOfMemoryError");(*env)->ThrowNew(env,exception,"pathname");}
+   if(parent_string && parent)(*env)->ReleaseStringUTFChars(env,parent_string,parent);
+   if(tail)(*env)->ReleaseStringUTFChars(env,child,tail);
 }
 
 void
-jni_file_bind_ctor_a(JNIEnv *env, jobject file, jmethodID ctor, const jvalue *args)
+jni_file_bind_ctor(JNIEnv *env,jobject file,jmethodID ctor,va_list ap)
 {
-   struct jvm *jvm = jnienv_get_jvm(env);
-   if (!jvm || !file || !ctor || !args)
-      return;
-   struct jvm_object *m = &jvm->objects[(uintptr_t)ctor - 1];
-   if (m->type != JVM_OBJECT_METHOD || !m->method.signature.data)
-      return;
-   const char *sig = m->method.signature.data;
-   char path[PATH_MAX];
-   if (!strcmp(sig, "(Ljava/lang/String;)V")) {
-      jstring js = (jstring)args[0].l;
-      const char *utf = js ? (*env)->GetStringUTFChars(env, js, NULL) : NULL;
-      if (utf) {
-         jni_file_set_path(file, utf);
-         (*env)->ReleaseStringUTFChars(env, js, utf);
-      }
-   } else if (!strcmp(sig, "(Ljava/io/File;Ljava/lang/String;)V")) {
-      jobject parent = (jobject)args[0].l;
-      jstring child = (jstring)args[1].l;
-      const char *base = jni_file_get_path(parent);
-      if (!base)
-         base = jni_file_default_dir();
-      const char *utf = child ? (*env)->GetStringUTFChars(env, child, NULL) : NULL;
-      if (utf) {
-         jni_file_join(path, sizeof path, base, utf);
-         jni_file_set_path(file, path);
-         (*env)->ReleaseStringUTFChars(env, child, utf);
-      }
-   } else if (!strcmp(sig, "(Ljava/lang/String;Ljava/lang/String;)V")) {
-      jstring p1 = (jstring)args[0].l;
-      jstring p2 = (jstring)args[1].l;
-      const char *u1 = p1 ? (*env)->GetStringUTFChars(env, p1, NULL) : NULL;
-      const char *u2 = p2 ? (*env)->GetStringUTFChars(env, p2, NULL) : NULL;
-      if (u1 && u2) {
-         jni_file_join(path, sizeof path, u1, u2);
-         jni_file_set_path(file, path);
-      } else if (u1) {
-         jni_file_set_path(file, u1);
-      }
-      if (u1)
-         (*env)->ReleaseStringUTFChars(env, p1, u1);
-      if (u2)
-         (*env)->ReleaseStringUTFChars(env, p2, u2);
-   }
+   struct jvm *jvm=jnienv_get_jvm(env);
+   if(!jvm || !file || !ctor)return;
+   struct jvm_object *method=&jvm->objects[(uintptr_t)ctor-1];
+   if(method->type!=JVM_OBJECT_METHOD || !method->method.signature.data)return;
+   const char *sig=method->method.signature.data;jvalue values[2]={{0}};
+   if(!strcmp(sig,"(Ljava/lang/String;)V"))values[0].l=va_arg(ap,jobject);
+   else if(!strcmp(sig,"(Ljava/io/File;Ljava/lang/String;)V") ||
+           !strcmp(sig,"(Ljava/lang/String;Ljava/lang/String;)V")){
+      values[0].l=va_arg(ap,jobject);values[1].l=va_arg(ap,jobject);
+   }else return;
+   jni_file_bind_ctor_a(env,file,ctor,values);
 }
-
 
 /* Forward declaration — implemented in arm_exec.cpp */
-
-jstring
-java_lang_System_getProperty(JNIEnv *env, jobject object, va_list args)
-{
-   assert(env && object);
-   // The ARM JNI bridge dispatches through CallObjectMethodA with a NULL
-   // argument vector, so `args` may be NULL.
-   if (!JVM_VA_HAS_ARGS(args)) return NULL;
-   const char *key = (*env)->GetStringUTFChars(env, va_arg(args, jstring), NULL);
-   if (!key) return NULL;
-
-   if (!strcmp(key, "java.vm.version"))
-       return (*env)->NewStringUTF(env, "1.6");
-
-   union {
-      void *ptr;
-      int (*fun)(const char*, char*);
-   } __system_property_get;
-
-   if (!(__system_property_get.ptr = luna_os_library_symbol(NULL, "__system_property_get")))
-      return NULL;
-
-   char value[92]; // PROP_VALUE_MAX 92
-   __system_property_get.fun(key, value);
-   return (*env)->NewStringUTF(env, value);
-}
 
 void
 java_lang_System_load(JNIEnv *env, jobject object, va_list args)
@@ -361,8 +248,7 @@ jobject
 java_lang_Class_getClassLoader(JNIEnv *env, jobject object)
 {
    assert(env && object);
-   static jobject sv;
-   return jvm_cached_object(env, &sv, "java/lang/ClassLoader");
+   return dvm_jni_get_class_loader(env, object);
 }
 
 jclass
@@ -425,12 +311,12 @@ java_io_File_getParent(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
    (void)args;
-   char path[PATH_MAX];
-   const char *p = jni_file_get_path(object);
-   if (!p || !*p)
-      p = jni_file_default_dir();
-   snprintf(path, sizeof path, "%s", p);
-   return (*env)->NewStringUTF(env, dirname(path));
+   const char *p=jni_file_get_path(object);
+   const char *slash=p ? strrchr(p,'/') : NULL;
+   if(!slash || !strcmp(p,"/"))return NULL;
+   char *parent=strndup(p,slash==p ? 1 : (size_t)(slash-p));
+   jstring result=parent ? (*env)->NewStringUTF(env,parent) : NULL;
+   free(parent);return result;
 }
 
 jboolean
@@ -993,7 +879,9 @@ int lunaria_app_min_sdk(void)
 
 int lunaria_app_target_sdk(void)
 {
-   return manifest_sdk("ANDROID_TARGET_SDK", lunaria_sdk_int());
+   /* PackageParser defaults an omitted target to the manifest's minimum,
+    * which itself defaults to API 1. The device API is independent. */
+   return manifest_sdk("ANDROID_TARGET_SDK", lunaria_app_min_sdk());
 }
 
 /* See jvm.h: the device spelling of this install.  The installer segment
@@ -1125,11 +1013,9 @@ lunaria_android_release(void)
  *
  * Values that follow from the platform level come from the same two functions
  * that decide it, so the build string cannot drift from SDK_INT either. */
-const char *
-lunaria_android_property(const char *name)
+static const char *
+android_property_entry(const char *name, size_t index)
 {
-   if (!name || !*name) return "";
-
    const struct lunaria_device *dev = lunaria_device();
    static char sdk[8], fingerprint[192], display[96], build_id[48];
    if (!sdk[0]) {
@@ -1187,21 +1073,30 @@ lunaria_android_property(const char *name)
        * platform answers Build.UNKNOWN rather than a number. */
       { "ro.serialno",              "unknown" },
       { "gsm.version.baseband",     "unknown" },
+      { "ro.build.version.sdk", sdk },
+      { "ro.build.version.release", lunaria_android_release() },
+      { "ro.build.id", build_id },
+      { "ro.build.display.id", display },
+      { "ro.build.fingerprint", fingerprint },
+      { "ro.bootimage.build.fingerprint", fingerprint },
+      { "ro.system.build.fingerprint", fingerprint },
+      { "ro.vendor.build.fingerprint", fingerprint },
    };
 
-   if (!strcmp(name, "ro.build.version.sdk"))     return sdk;
-   if (!strcmp(name, "ro.build.version.release")) return lunaria_android_release();
-   if (!strcmp(name, "ro.build.id"))              return build_id;
-   if (!strcmp(name, "ro.build.display.id"))      return display;
-   if (!strcmp(name, "ro.build.fingerprint") ||
-       !strcmp(name, "ro.bootimage.build.fingerprint") ||
-       !strcmp(name, "ro.system.build.fingerprint") ||
-       !strcmp(name, "ro.vendor.build.fingerprint"))
-      return fingerprint;
-
+   if (!name) return index < sizeof fixed / sizeof fixed[0] ? fixed[index].name : NULL;
    for (size_t i = 0; i < sizeof fixed / sizeof fixed[0]; ++i)
       if (!strcmp(name, fixed[i].name)) return fixed[i].value;
    return "";
+}
+
+const char *lunaria_android_property(const char *name)
+{
+   return name && *name ? android_property_entry(name, 0) : "";
+}
+
+const char *lunaria_android_property_name(size_t index)
+{
+   return android_property_entry(NULL, index);
 }
 
 /* Every android.os.Build string field is the property of the same name.
@@ -1322,7 +1217,8 @@ static void cached_file_initialize(JNIEnv *env, jobject file, void *data)
    if ((!path || !*path) && spec->fallback_environment)
       path = getenv(spec->fallback_environment);
    if (!path || !*path) path = spec->fallback;
-   jni_file_set_path(file, path);
+   char guest[PATH_MAX];const char *published=arm_exec_unmap_host_path(path,guest,sizeof guest);
+   if(published)jni_file_set_path(file,published);
    if (spec->make_directory) luna_file_mkdir(path, 0755);
 }
 
@@ -1498,6 +1394,18 @@ android_content_pm_ApplicationInfo_dataDir(JNIEnv *env, jobject object)
 {
    assert(env && object);
    return (*env)->NewStringUTF(env, lunaria_android_data_path());
+}
+
+jobject
+android_content_pm_ApplicationInfo_storageUuid(JNIEnv *env, jobject object)
+{
+   assert(env && object);
+   jclass cls = (*env)->FindClass(env, "android/os/storage/StorageManager");
+   if (!cls) return NULL;
+   jfieldID field = (*env)->GetStaticFieldID(env, cls, "UUID_DEFAULT", "Ljava/util/UUID;");
+   jobject uuid = field ? (*env)->GetStaticObjectField(env, cls, field) : NULL;
+   (*env)->DeleteLocalRef(env, cls);
+   return uuid;
 }
 
 jstring
@@ -2428,6 +2336,13 @@ android_content_Context_STORAGE_SERVICE(JNIEnv *env, jobject obj)
 {
    (void)obj;
    return (*env)->NewStringUTF(env, "storage");
+}
+
+jstring
+android_content_Context_STORAGE_STATS_SERVICE(JNIEnv *env, jobject obj)
+{
+   (void)obj;
+   return (*env)->NewStringUTF(env, "storagestats");
 }
 
 jstring

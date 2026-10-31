@@ -25,7 +25,6 @@
 #include "luna_boot.h"
 #include "luna_overlay.h"
 #include "luna_qfkey.h"
-#include "apkpure.h"
 #include "lunaria_os.h"
 #include "jvm/jvm.h"
 #include <GLFW/glfw3.h>

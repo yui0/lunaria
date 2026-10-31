@@ -11,6 +11,14 @@ int luna_temp_mkstemp(char *pattern,size_t capacity);
 char *luna_temp_mkdtemp(char *pattern,size_t capacity);
 
 typedef const char *(*luna_symlink_mapper)(const char *,char *,size_t);
+/* Android java.io.File pathname syntax (independent of host OS and storage
+ * mappings). Returned strings are allocated; callers free them. */
+char *luna_java_file_normalize(const char *path);
+char *luna_java_file_resolve(const char *parent,const char *child);
+/* Canonicalize a logical path across mounts, including nonexistent names.
+ * Resolve links before '..', then project existing targets into that namespace. */
+char *luna_file_canonical_namespace(const char *path,char *out,size_t capacity,
+   luna_symlink_mapper mapper,luna_symlink_mapper reverse);
 /* Return nonzero for modeled inodes, projecting guest uid/gid/mode.
  * Unmanaged host scratch paths retain host semantics. */
 typedef int (*luna_file_inode_mapper)(const char *,luna_file_info *);
@@ -43,6 +51,9 @@ luna_directory *luna_symlink_directory_open(const char *path);
 luna_directory *luna_symlink_directory_open_fd(int fd);
 luna_directory_entry *luna_symlink_directory_read(luna_directory *dir);
 int luna_symlink_directory_close(luna_directory *dir);
+/* Device directories created before Android application processes. */
+int luna_android_fs_prepare(const char *root);
+int luna_android_fs_inode(const char *guest_path, luna_file_info *info);
 #ifdef __cplusplus
 }
 #endif

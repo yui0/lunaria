@@ -122,6 +122,7 @@ static void ignore_host_sigpipe(void)
  * ------------------------------------------------------------------------ */
 
 struct stream {
+   struct dvm_http_io io;
    int fd;
    SSL_CTX *ctx;
    SSL *ssl;
@@ -129,6 +130,7 @@ struct stream {
 
 static void stream_close(struct stream *s)
 {
+   if(s->io.close){struct dvm_http_io io=s->io;memset(&s->io,0,sizeof s->io);io.close(io.context);}
    if (s->ssl) {
       SSL_shutdown(s->ssl);
       SSL_free(s->ssl);
@@ -150,7 +152,8 @@ static ssize_t stream_write(struct stream *s, const void *buf, size_t len)
    while (done < len) {
       if (!dvm_network_enabled()) { errno = ENETUNREACH; return -1; }
       ssize_t n;
-      if (s->ssl)
+      if(s->io.write) n=s->io.write(s->io.context,(const char*)buf+done,len-done);
+      else if (s->ssl)
          n = SSL_write(s->ssl, (const char *)buf + done, (int)(len - done));
       else
          n = luna_fd_write(s->fd, (const char *)buf + done, len - done);
@@ -158,6 +161,7 @@ static ssize_t stream_write(struct stream *s, const void *buf, size_t len)
          if (!s->ssl && n < 0 && errno == EINTR) continue;
          return -1;
       }
+      if((size_t)n>len-done){errno=EIO;return -1;}
       done += (size_t)n;
    }
    return (ssize_t)done;
@@ -174,6 +178,7 @@ static ssize_t stream_read(struct stream *s, void *buf, size_t len)
    for (;;) {
       if (!dvm_network_enabled()) { errno = ENETUNREACH; return -1; }
       ssize_t n;
+      if(s->io.read){long got=s->io.read(s->io.context,buf,len);if(got>0 && (size_t)got>len){errno=EIO;return -1;}return got;}
       if (s->ssl) {
          ERR_clear_error();
          errno = 0;
@@ -340,6 +345,7 @@ static int connect_one(const struct addrinfo *a, const char *local_addr,
 static bool connect_to(const struct url *u, int timeout_ms, struct stream *s,
                        char *err, size_t errsz)
 {
+   memset(&s->io,0,sizeof s->io);
    s->fd = -1;
    s->ctx = NULL;
    s->ssl = NULL;
@@ -658,6 +664,10 @@ static bool exchange(void **transport, const char *method, const struct url *u,
    }
    const char *sp = memchr(p, ' ', (size_t)(eol - p));
    out->status = sp ? atoi(sp + 1) : 0;
+   const char *status_end=eol;
+   while(status_end>p && (status_end[-1]=='\r' || status_end[-1]=='\n'))--status_end;
+   out->status_line=luna_strndup(p,(size_t)(status_end-p));
+   if(!out->status_line){free(raw.p);stream_close(&s);snprintf(out->error,sizeof out->error,"out of memory");return false;}
 
    /* Headers */
    const char *hp = eol + 1;
@@ -944,6 +954,12 @@ bool dvm_http_slurp(struct dvm_http_response *r)
  * Entry point
  * ------------------------------------------------------------------------ */
 
+void *dvm_http_transport_from_io(const struct dvm_http_io *io)
+{
+   if(!io || !io->read || !io->write || !io->close){errno=EINVAL;return NULL;}
+   struct stream *s=calloc(1,sizeof *s);if(!s)return NULL;s->fd=-1;s->io=*io;return s;
+}
+
 void dvm_http_transport_close(void *transport)
 {
    if (!transport) return;
@@ -985,6 +1001,14 @@ bool dvm_http_perform_connected(void **transport, const char *method, const char
                       const uint8_t *body, size_t body_len, int timeout_ms,
                       bool follow_redirects, struct dvm_http_response *out)
 {
+   return dvm_http_perform_with_connector(transport,method,url,headers,nheaders,body,body_len,timeout_ms,follow_redirects,out,NULL,NULL);
+}
+
+bool dvm_http_perform_with_connector(void **transport,const char *method,const char *url,
+   const struct dvm_http_header *headers,int nheaders,const uint8_t *body,size_t body_len,
+   int timeout_ms,bool follow_redirects,struct dvm_http_response *out,
+   dvm_http_connector connector,void *context)
+{
    (void)pthread_once(&host_sigpipe_once, ignore_host_sigpipe);
    memset(out, 0, sizeof *out);
    out->status = -1;
@@ -1010,7 +1034,11 @@ bool dvm_http_perform_connected(void **transport, const char *method, const char
       struct dvm_http_response r;
       memset(&r, 0, sizeof r);
       r.status = -1;
-      if (!exchange(transport, cur_method, &u, headers, nheaders, body, body_len,
+      void *opened=NULL;void **active=transport ? transport : &opened;
+      if(!*active && connector){*active=connector(context,cur,timeout_ms,r.error,sizeof r.error);
+         if(!*active){snprintf(out->error,sizeof out->error,"%s",r.error[0] ? r.error : "connector failed");return false;}}
+      bool custom=*active && ((struct stream*)*active)->io.read;
+      if (!exchange(active, cur_method, &u, headers, nheaders, body, body_len,
                     timeout_ms, &r)) {
          snprintf(out->error, sizeof out->error, "%s", r.error);
          dvm_http_response_free(&r);
@@ -1026,6 +1054,7 @@ bool dvm_http_perform_connected(void **transport, const char *method, const char
          return true;
       }
 
+      if(custom && !connector){dvm_http_response_free(&r);snprintf(out->error,sizeof out->error,"Custom transport redirects require a connector");return false;}
       char next[4608];
       if (!url_resolve(&u, loc, next, sizeof next)) {
          *out = r;
@@ -1050,6 +1079,7 @@ bool dvm_http_perform_connected(void **transport, const char *method, const char
 void dvm_http_response_free(struct dvm_http_response *r)
 {
    if (!r) return;
+   free(r->status_line);r->status_line=NULL;
    http_stream_done(r);
    free(r->pre);
    r->pre = NULL;

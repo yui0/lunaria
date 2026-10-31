@@ -297,4 +297,33 @@ int apkenv_dl_iterate_phdr(int (*cb)(struct dl_phdr_info *, size_t, void *), voi
 void apkenv_notify_gdb_of_libraries(void);
 int apkenv_add_sopath(const char *path);
 
+
+/* ---- linker_environ ---- */
+/* Call this function before anything else. 'vecs' must be the pointer
+ * to the environment block in the ELF data block. The function returns
+ * the start of the aux vectors after the env block.
+ */
+#include <stdint.h>
+extern uintptr_t*  apkenv_linker_env_init(uintptr_t* vecs);
+
+/* Unset a given environment variable. In case the variable is defined
+ * multiple times, unset all instances. This modifies the environment
+ * block, so any pointer returned by linker_env_get() after this call
+ * might become invalid */
+extern void        apkenv_linker_env_unset(const char* name);
+
+
+/* Returns the value of environment variable 'name' if defined and not
+ * empty, or NULL otherwise. Note that the returned pointer may become
+ * invalid if linker_env_unset() or linker_env_secure() are called
+ * after this function. */
+extern const char* apkenv_linker_env_get(const char* name);
+
+/* Remove unsecure environment variables. This should be used when
+ * running setuid programs. */
+extern void        apkenv_linker_env_secure(void);
+
+#include <sys/types.h>
+size_t apkenv_strlcpy(char *dst, const char *src, size_t siz);
+
 #endif

@@ -15,6 +15,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* The emulated device profiles have a portrait-natural panel.  Sensor/user
+ * orientations without an actual sensor select the normal orientation. */
+static inline int lunaria_orientation_rotation(long orientation)
+{
+   switch (orientation) {
+   case 0: case 6: case 11: return 1; /* landscape */
+   case 8: return 3;                  /* reverse landscape */
+   case 9: return 2;                  /* reverse portrait */
+   default: return 0;
+   }
+}
+
 /* Shared primitive descriptor names for JNI and dex callers. */
 static inline const char *luna_java_primitive_name(const char *desc)
 {
@@ -151,6 +163,8 @@ const struct lunaria_device *const *lunaria_device_list(void);
  * SystemProperties.get() in the bytecode VM and __system_property_get() in
  * the ARM SVC layer.  Returns "" for a property this device does not have. */
 const char *lunaria_android_property(const char *name);
+/* Property names in enumeration order; NULL marks the end. */
+const char *lunaria_android_property_name(size_t index);
 
 /* Shared guest topology for Java, libc, procfs, sysfs and affinity masks. */
 unsigned lunaria_cpu_count(void);

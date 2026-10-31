@@ -42,7 +42,6 @@ typedef struct {
     void *dli_saddr;
 } Dl_info;
 #endif
-#include "linker_format.h"
 
 #include "trace.h"
 #include "linker_debug.h"
@@ -349,3 +348,12 @@ construct(void)
   };
   memcpy(apkenv_libdl_symtab, symtab, sizeof(symtab));
 }
+
+/*
+ * This function is an empty stub where GDB locates a breakpoint to get notified
+ * about linker activity.
+ */
+void __attribute__((noinline)) apkenv_rtld_db_dlactivity(void)
+{
+}
+

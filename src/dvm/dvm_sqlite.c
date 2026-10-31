@@ -22,10 +22,10 @@
  * the framework does.
  */
 
-#include "dvm/dvm_sqlite.h"
 
-#include "dvm/dex.h"
+#include "dvm/dvm.h"
 #include "dvm/dvm_internal.h"
+#include "arm_exec.h"
 #include "lunaria_os.h"
 
 #include <errno.h>
@@ -292,7 +292,15 @@ dvm_ref dvm_sqlite_open(struct dvm *vm, const char *path, int flags)
 {
    if (!sq_load()) { sq_unavailable(vm); return 0; }
    const bool memory = !path || !*path || !strcmp(path, ":memory:");
-   if (!memory && !(flags & 1) && (flags & 0x10000000)) sq_make_parent_dirs(path);
+   /* The path names the guest's filesystem (/data/data/<pkg>/no_backup/...);
+    * SQLite opens it on the host, so it goes through the same mapping as File. */
+   char host[1024];
+   const char *guest = path;
+   if (!memory) {
+      const char *mapped = arm_exec_map_guest_path(path, host, sizeof host);
+      if (!mapped) { dvm__throw(vm, "android/database/sqlite/SQLiteCantOpenDatabaseException", "unable to open database file: %s", path); return 0; }
+      path = mapped;
+   }
    if (!memory && !(flags & 1)) sq_make_parent_dirs(path);
    const int mode = (flags & 1) ? SQ_OPEN_READONLY
                   : (flags & 0x10000000) ? SQ_OPEN_READWRITE | SQ_OPEN_CREATE
@@ -304,7 +312,7 @@ dvm_ref dvm_sqlite_open(struct dvm *vm, const char *path, int flags)
       char text[1024];
       snprintf(text, sizeof text, "%s (code %d): , while opening the database file: %s",
                d->db ? sq.errmsg(d->db) : "unable to open database file", rc & 0xff,
-               memory ? ":memory:" : path);
+               memory ? ":memory:" : guest);
       dvm__throw(vm, sq_exception_class(rc), "%s", text);
       if (d->db) sq.close_v2(d->db);
       free(d);
@@ -317,7 +325,7 @@ dvm_ref dvm_sqlite_open(struct dvm *vm, const char *path, int flags)
    if (!obj) { sq.close_v2(d->db); free(d); return 0; }
    host_data_set(vm, obj, d, db_destroy);
    (void)dvm_set_field(vm, obj, "path", "Ljava/lang/String;",
-                       (union dvm_value){ .l = dvm_new_string(vm, memory ? ":memory:" : path) });
+                       (union dvm_value){ .l = dvm_new_string(vm, memory ? ":memory:" : guest) });
    dvm_pin(vm, obj);
    if (flags & 0x20000000) {
       if (!sq_exec(vm, d, "PRAGMA journal_mode=WAL")) return 0;

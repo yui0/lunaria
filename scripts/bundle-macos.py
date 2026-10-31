@@ -28,6 +28,13 @@ queue.append((libdir/driver.name, driver))
 driver_info = json.loads(manifest.read_text())
 driver_info['ICD']['library_path'] = './' + driver.name
 (libdir/manifest.name).write_text(json.dumps(driver_info) + '\n')
+# HarfBuzz is opened dynamically by the text renderer. Include its dependency
+# closure explicitly so a clean Mac gets the same shaping as the build host.
+shaper = here/'.deps/lib/libharfbuzz.0.dylib'
+if not shaper.is_file():
+    sys.exit('bundle-macos: missing HarfBuzz; run make macos-deps')
+shutil.copy2(shaper, libdir/shaper.name)
+queue.append((libdir/shaper.name, shaper))
 seen=set()
 def install_id(path):
     # A dylib lists its own install name among its load commands (the first

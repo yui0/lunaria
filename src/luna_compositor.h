@@ -63,6 +63,11 @@ void luna_comp_submit(int w, int h, int swap_interval);
 void luna_comp_submit_pixels(int w, int h, const void *pixels, int stride,
                              bool bgra, int swap_interval);
 
+/* The same, for rows bottom row first (what glReadPixels returns): the pixels
+ * are already in the compositor's texture order, so nothing is flipped. */
+void luna_comp_submit_pixels_bottom_up(int w, int h, const void *pixels,
+                                       int stride, bool bgra, int swap_interval);
+
 /* Something the compositor draws besides the guest's frame changed (a
  * document, a keystroke, a pointer event): draw a frame soon. */
 void luna_comp_wake(void);

@@ -219,8 +219,8 @@ void luna_comp_submit(int w, int h, int swap_interval)
    pthread_mutex_unlock(&g_mu);
 }
 
-void luna_comp_submit_pixels(int w, int h, const void *pixels, int stride,
-                             bool bgra, int swap_interval)
+static void submit_pixels(int w, int h, const void *pixels, int stride,
+                          bool bgra, int swap_interval, bool bottom_up)
 {
    if (!atomic_load_explicit(&g_active, memory_order_acquire) || w <= 0 ||
        h <= 0 || !pixels)
@@ -242,10 +242,13 @@ void luna_comp_submit_pixels(int w, int h, const void *pixels, int stride,
       g_px_buf = nb;
       g_px_cap = need;
    }
-   /* GL's texture rows run bottom-up; the frame's run top-down. */
-   for (int y = 0; y < h; ++y) {
+   /* GL's texture rows run bottom-up; a top-down frame is flipped on the way
+    * in, a glReadPixels result is already in texture order. */
+   if (bottom_up && !bgra && (size_t)stride == row) {
+      memcpy(g_px_buf, pixels, need);
+   } else for (int y = 0; y < h; ++y) {
       const uint8_t *src = (const uint8_t *)pixels + (size_t)y * (size_t)stride;
-      uint8_t *dst = g_px_buf + (size_t)(h - 1 - y) * row;
+      uint8_t *dst = g_px_buf + (size_t)(bottom_up ? y : h - 1 - y) * row;
       if (!bgra) {
          memcpy(dst, src, row);
          continue;
@@ -262,6 +265,18 @@ void luna_comp_submit_pixels(int w, int h, const void *pixels, int stride,
    g_px_pending = true;
    pthread_cond_signal(&g_cv_comp);
    pthread_mutex_unlock(&g_mu);
+}
+
+void luna_comp_submit_pixels(int w, int h, const void *pixels, int stride,
+                             bool bgra, int swap_interval)
+{
+   submit_pixels(w, h, pixels, stride, bgra, swap_interval, false);
+}
+
+void luna_comp_submit_pixels_bottom_up(int w, int h, const void *pixels,
+                                       int stride, bool bgra, int swap_interval)
+{
+   submit_pixels(w, h, pixels, stride, bgra, swap_interval, true);
 }
 
 void luna_comp_wake(void)

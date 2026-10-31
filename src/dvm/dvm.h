@@ -35,8 +35,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "jvm/jni.h"
+#include <stdarg.h>
 
-#include "dvm/dex.h"
 
 struct dvm;
 struct dvm_class;
@@ -118,6 +119,17 @@ enum {
    DVM_NATIVE_ACTIVITY_RESUME = 2,   /* NativeActivity.onResume  */
 };
 
+/* Device/system-UI state, independent of app-owned Java objects. A new
+ * virtual device has no enrolled credential or displayed lock screen. The
+ * device owner publishes changes; this API never verifies credentials. */
+enum {
+   DVM_KEYGUARD_SHOWING=1u,
+   DVM_KEYGUARD_DEVICE_SECURE=2u,
+   DVM_KEYGUARD_SIM_LOCKED=4u,
+   DVM_KEYGUARD_DEVICE_LOCKED=8u,
+};
+void dvm_set_keyguard_state(struct dvm *vm,unsigned state);
+
 /* --- lifecycle ---------------------------------------------------------- */
 
 struct dvm *dvm_create(const struct dvm_hooks *hooks);
@@ -129,6 +141,9 @@ struct lm_sink;
 dvm_ref dvm_surface_from_sink(struct dvm *vm, struct lm_sink *sink);
 /* Returns an owned sink reference, or NULL for a released/invalid Surface. */
 struct lm_sink *dvm_surface_acquire_sink(struct dvm *vm, dvm_ref surface);
+/* Bind ContextImpl/LoadedApk before app construction; publish Application
+ * after attachBaseContext and before providers/onCreate. */
+bool dvm_bind_application(struct dvm *vm, dvm_ref base, dvm_ref application);
 /* Process teardown: stop admission and wake platform waits, then join Java
  * host threads before releasing the JNI table or execution engines. */
 bool dvm_is_stopping(struct dvm *vm);
@@ -153,6 +168,8 @@ bool dvm_add_dex_memory(struct dvm *vm, const void *data, size_t len,
  * its base/ subdirectory, which is where an App Bundle split keeps them).
  * Returns how many were loaded. */
 int dvm_add_apk_dir(struct dvm *vm, const char *dir);
+int dvm_add_apk_archive(struct dvm *vm, const char *host_path, const char *guest_path);
+dvm_ref dvm_get_class_loader(struct dvm *vm, dvm_ref class_object);
 
 /* --- classes and methods ------------------------------------------------ */
 
@@ -395,6 +412,463 @@ bool dvm_on_bytecode_thread(void);
 /* True in Android's main-thread context. Guest native threads sharing the
  * frame-pump host thread retain their own Android thread identity. */
 bool dvm_on_main_thread(void);
+
+struct dvm;
+
+/* Internal IPC envelope. Pack/unpack require the VM lock; dispatch enters a
+ * main-looper transaction and takes the lock itself. operation: 1=start, 2=stop.
+ * No VM handles are present in the serialized result. Caller frees bytes. */
+int dvm_service_pack(struct dvm *,uint32_t intent,int operation,void **bytes,size_t *size);
+int dvm_service_unpack(struct dvm *,const void *bytes,size_t size,int *operation,uint32_t *intent);
+int dvm_service_dispatch(struct dvm *,const void *bytes,size_t size);
+
+/* The ActivityManager-side transport accepts a serialized start request.
+ * Returning 0 means accepted; negative errno means no request was accepted. */
+void dvm_service_set_submit(struct dvm *,int (*submit)(void *,const char *,const void *,size_t),void *user);
+
+/* ---- DEX / APK container readers (dex.c, apk_signers.c) ---- */
+/* Access flags (dex, class/field/method share the space). */
+#define DEX_ACC_PUBLIC       0x00001
+#define DEX_ACC_PRIVATE      0x00002
+#define DEX_ACC_PROTECTED    0x00004
+#define DEX_ACC_STATIC       0x00008
+#define DEX_ACC_FINAL        0x00010
+#define DEX_ACC_SYNCHRONIZED 0x00020
+#define DEX_ACC_VOLATILE     0x00040
+#define DEX_ACC_BRIDGE       0x00040
+#define DEX_ACC_TRANSIENT    0x00080
+#define DEX_ACC_VARARGS      0x00080
+#define DEX_ACC_NATIVE       0x00100
+#define DEX_ACC_INTERFACE    0x00200
+#define DEX_ACC_ABSTRACT     0x00400
+#define DEX_ACC_STRICT       0x00800
+#define DEX_ACC_SYNTHETIC    0x01000
+#define DEX_ACC_ANNOTATION   0x02000
+#define DEX_ACC_ENUM         0x04000
+#define DEX_ACC_CONSTRUCTOR  0x10000
+
+#define DEX_NO_INDEX 0xffffffffu
+
+struct dex_file {
+   const uint8_t *p;
+   size_t len;
+   char *path;      /* owned; for diagnostics */
+   uint8_t *owned;  /* owned mapping when dex_open() read the file */
+
+   uint32_t string_ids_size, string_ids_off;
+   uint32_t type_ids_size, type_ids_off;
+   uint32_t proto_ids_size, proto_ids_off;
+   uint32_t field_ids_size, field_ids_off;
+   uint32_t method_ids_size, method_ids_off;
+   uint32_t class_defs_size, class_defs_off;
+
+   /* Decoded string pool: one pointer per string_id, filled lazily.  The
+    * pointers alias the mapping (MUTF-8 is NUL-terminated in the file), except
+    * where a string contains an encoded surrogate pair or an embedded NUL, in
+    * which case the entry owns a converted copy (see `fixups`). */
+   const char **strings;
+   char **fixups;
+
+   /* descriptor → class_def index, built on the first lookup.  Without it
+    * dex_find_class() is a strcmp against every class in the file, and
+    * dvm_class_is_known() runs that over every dex — which the JNI bridge
+    * does on each Call*Method.  With three dexes and 16,500 classes that was
+    * the single largest non-guest cost in a profile of world loading. */
+   uint32_t *cls_hash;      /* open addressing; 0 empty, else index + 1 */
+   uint32_t  cls_hash_cap;  /* power of two */
+};
+
+struct dex_method_id {
+   uint16_t class_idx;
+   uint16_t proto_idx;
+   uint32_t name_idx;
+};
+
+struct dex_field_id {
+   uint16_t class_idx;
+   uint16_t type_idx;
+   uint32_t name_idx;
+};
+
+struct dex_class_def {
+   uint32_t class_idx;
+   uint32_t access_flags;
+   uint32_t superclass_idx;
+   uint32_t interfaces_off;
+   uint32_t source_file_idx;
+   uint32_t annotations_off;
+   uint32_t class_data_off;
+   uint32_t static_values_off;
+};
+
+struct dex_code {
+   uint16_t registers_size;
+   uint16_t ins_size;
+   uint16_t outs_size;
+   uint16_t tries_size;
+   uint32_t insns_size;      /* in 16-bit code units */
+   const uint16_t *insns;
+   const uint8_t *tries;     /* try_item[tries_size], or NULL */
+   const uint8_t *handlers;  /* encoded_catch_handler_list, or NULL */
+};
+
+/* One decoded entry of a class_data_item. */
+struct dex_encoded_field {
+   uint32_t field_idx;
+   uint32_t access_flags;
+};
+
+struct dex_encoded_method {
+   uint32_t method_idx;
+   uint32_t access_flags;
+   uint32_t code_off;
+};
+
+struct dex_class_data {
+   struct dex_encoded_field *static_fields;
+   struct dex_encoded_field *instance_fields;
+   struct dex_encoded_method *direct_methods;
+   struct dex_encoded_method *virtual_methods;
+   uint32_t static_fields_size, instance_fields_size;
+   uint32_t direct_methods_size, virtual_methods_size;
+};
+
+/* An encoded_value, as found in a static_values array. */
+enum dex_value_type {
+   DEX_VALUE_BYTE = 0x00, DEX_VALUE_SHORT = 0x02, DEX_VALUE_CHAR = 0x03,
+   DEX_VALUE_INT = 0x04, DEX_VALUE_LONG = 0x06, DEX_VALUE_FLOAT = 0x10,
+   DEX_VALUE_DOUBLE = 0x11, DEX_VALUE_METHOD_TYPE = 0x15,
+   DEX_VALUE_METHOD_HANDLE = 0x16, DEX_VALUE_STRING = 0x17,
+   DEX_VALUE_TYPE = 0x18, DEX_VALUE_FIELD = 0x19, DEX_VALUE_METHOD = 0x1a,
+   DEX_VALUE_ENUM = 0x1b, DEX_VALUE_ARRAY = 0x1c,
+   DEX_VALUE_ANNOTATION = 0x1d, DEX_VALUE_NULL = 0x1e,
+   DEX_VALUE_BOOLEAN = 0x1f,
+};
+
+struct dex_value {
+   enum dex_value_type type;
+   uint64_t bits;   /* primitive payload, or the pool index for string/type/… */
+};
+
+/* --- container ---------------------------------------------------------- */
+
+/* Takes ownership of nothing; `data` must outlive the view. */
+bool dex_open_memory(struct dex_file *d, const uint8_t *data, size_t len,
+                     const char *path);
+/* Reads the whole file; dex_close() frees it. */
+bool dex_open(struct dex_file *d, const char *path);
+void dex_close(struct dex_file *d);
+
+/* --- pools -------------------------------------------------------------- */
+
+/* NULL when the index is out of range.  Never NULL for a valid index. */
+const char *dex_string(struct dex_file *d, uint32_t idx);
+/* Type descriptor, e.g. "Ljava/lang/String;" or "[I" or "I". */
+const char *dex_type(struct dex_file *d, uint32_t idx);
+bool dex_method_id(const struct dex_file *d, uint32_t idx, struct dex_method_id *out);
+bool dex_field_id(const struct dex_file *d, uint32_t idx, struct dex_field_id *out);
+bool dex_class_def(const struct dex_file *d, uint32_t idx, struct dex_class_def *out);
+
+/* Concatenates the string fragments in a class' dalvik.annotation.Signature
+ * annotation.  The annotation is how the generic reflection API obtains
+ * information erased from the ordinary superclass/type pools. */
+bool dex_class_signature(struct dex_file *d, uint32_t class_def_idx,
+                         char *out, size_t out_sz);
+/* Generic signature of a declared field, from its system-visible
+ * dalvik.annotation.Signature annotation. */
+bool dex_field_signature(struct dex_file *d, uint32_t class_def_idx,
+                         const char *field_name, char *out, size_t out_sz);
+/* Declaring/enclosing class recorded by EnclosingClass or EnclosingMethod. */
+const char *dex_class_enclosing_type(struct dex_file *d,
+                                     uint32_t class_def_idx);
+/* EnclosingMethod's method_id, including constructors and class initializers. */
+bool dex_class_enclosing_method(struct dex_file *d, uint32_t class_def_idx,
+                                 uint32_t *method_idx);
+
+/* Member classes declare EnclosingClass; local/anonymous classes use EnclosingMethod. */
+bool dex_class_is_member(struct dex_file *d, uint32_t class_def_idx);
+
+/* InnerClass.name: true when present, with NULL for an anonymous class. */
+bool dex_class_inner_name(struct dex_file *d, uint32_t class_def_idx,
+                           const char **name);
+
+/* Source-level access flags retained in the InnerClass system annotation. */
+bool dex_class_inner_flags(struct dex_file *d, uint32_t class_def_idx,
+                            uint32_t *flags);
+
+/* MemberClasses system metadata: total count, or -1 for malformed data.
+ * Fill up to max descriptors; NULL/0 queries the count. */
+int dex_class_member_types(struct dex_file *d, uint32_t class_def_idx,
+                            const char **types, int max);
+
+/* Runtime-visible class annotations.  `encoded_off` points at the
+ * encoded_annotation (its type_idx, not the preceding visibility byte).
+ * AnnotationDefault is kept on the annotation interface itself and is used
+ * when an instance omits an element with a Java default. */
+bool dex_class_annotation(struct dex_file *d, uint32_t class_def_idx,
+                          const char *annotation_desc,
+                          uint32_t *encoded_off);
+/* Fill `encoded_offs`/`types` with every runtime-visible annotation on the
+ * class.  Returns the total count (may exceed `max`; only the first `max`
+ * slots are written).  `types` entries point into the dex string pool. */
+int dex_class_annotations(struct dex_file *d, uint32_t class_def_idx,
+                          uint32_t *encoded_offs, const char **types, int max);
+bool dex_field_annotation(struct dex_file *d, uint32_t class_def_idx,
+                          const char *field_name, const char *annotation_desc,
+                          uint32_t *encoded_off);
+/* Runtime-visible annotations on the named field; same count/capacity
+ * convention as dex_class_annotations. */
+int dex_field_annotations(struct dex_file *d, uint32_t class_def_idx,
+                           const char *field_name, uint32_t *encoded_offs,
+                           const char **types, int max);
+/* A method's annotations, named by its name and signature
+ * ("(Ljava/lang/String;I)V").  Same conventions as the class forms. */
+int dex_method_annotations(struct dex_file *d, uint32_t class_def_idx,
+                           const char *name, const char *sig,
+                           uint32_t *encoded_offs, const char **types, int max);
+bool dex_method_annotation(struct dex_file *d, uint32_t class_def_idx,
+                           const char *name, const char *sig,
+                           const char *annotation_desc, uint32_t *encoded_off);
+/* How many parameter annotation sets the method has (the dex list's size),
+ * or -1 when it has none recorded. */
+int dex_parameter_annotation_lists(struct dex_file *d, uint32_t class_def_idx,
+                                   const char *name, const char *sig);
+/* The runtime-visible annotations of parameter `param`. */
+int dex_parameter_annotations(struct dex_file *d, uint32_t class_def_idx,
+                              const char *name, const char *sig, int param,
+                              uint32_t *encoded_offs, const char **types,
+                              int max);
+/* The method's generic signature, from its dalvik.annotation.Signature. */
+bool dex_method_signature(struct dex_file *d, uint32_t class_def_idx,
+                          const char *name, const char *sig,
+                          char *out, size_t out_sz);
+const char *dex_annotation_type(struct dex_file *d, uint32_t encoded_off);
+bool dex_annotation_element(struct dex_file *d, uint32_t encoded_off,
+                            const char *name, struct dex_value *out);
+bool dex_annotation_default(struct dex_file *d, uint32_t class_def_idx,
+                            const char *name, struct dex_value *out);
+
+/* Shorty of a proto: return type first, then one char per parameter. */
+const char *dex_proto_shorty(struct dex_file *d, uint32_t proto_idx);
+const char *dex_proto_return(struct dex_file *d, uint32_t proto_idx);
+/* Parameter type descriptors.  Returns the count and fills `out` (at most
+ * `max`).  Returns -1 when the proto index is invalid. */
+int dex_proto_params(struct dex_file *d, uint32_t proto_idx,
+                     const char **out, int max);
+
+/* Builds "(Ljava/lang/String;I)V" into `buf`.  Returns false when it does not
+ * fit or the proto is invalid. */
+/* Allocated full descriptor; caller owns the returned string. */
+char *dex_proto_signature_alloc(struct dex_file *d, uint32_t proto_idx);
+bool dex_proto_signature(struct dex_file *d, uint32_t proto_idx,
+                         char *buf, size_t buf_sz);
+
+/* Index of the class_def for a type descriptor, or -1. */
+int dex_find_class(struct dex_file *d, const char *descriptor);
+
+/* --- class data --------------------------------------------------------- */
+
+/* Allocates the four arrays; free with dex_class_data_release(). */
+bool dex_class_data(const struct dex_file *d, uint32_t off, struct dex_class_data *out);
+void dex_class_data_release(struct dex_class_data *cd);
+
+bool dex_code(const struct dex_file *d, uint32_t off, struct dex_code *out);
+
+/* Interface type indices of a class_def.  Returns the count, fills at most
+ * `max` entries. */
+int dex_interfaces(const struct dex_file *d, uint32_t interfaces_off,
+                   uint16_t *out, int max);
+
+/* --- encoded values ----------------------------------------------------- */
+
+/* Decodes the encoded_array at `off` (a static_values_off).  Returns the
+ * element count and fills at most `max`.  Returns -1 when `off` is 0. */
+int dex_static_values(const struct dex_file *d, uint32_t off,
+                      struct dex_value *out, int max);
+/* Decodes the array payload referenced by a DEX_VALUE_ARRAY. */
+int dex_value_array(const struct dex_file *d, const struct dex_value *array,
+                    struct dex_value *out, int max);
+
+/* --- low level (exposed for the interpreter's payload decoding) ---------- */
+
+static inline uint32_t dex_u32_at(const struct dex_file *d, size_t off)
+{
+   if (off + 4 > d->len) return 0;
+   uint32_t v;
+   __builtin_memcpy(&v, d->p + off, 4);
+   return v;
+}
+
+static inline uint16_t dex_u16_at(const struct dex_file *d, size_t off)
+{
+   if (off + 2 > d->len) return 0;
+   uint16_t v;
+   __builtin_memcpy(&v, d->p + off, 2);
+   return v;
+}
+
+size_t dex_uleb(const struct dex_file *d, size_t off, uint32_t *out);
+size_t dex_sleb(const struct dex_file *d, size_t off, int32_t *out);
+
+/* ---- APK signing certificates (apk_signers.c; needs <openssl/x509.h>) ---- */
+struct stack_st_X509;
+/* MPL-2.0. APK signing certificate metadata, using the existing OpenSSL. */
+
+/* 1: certificates read; 0: no supported scheme; -1: malformed or unreadable.
+ * Returned stacks own their X509 objects. History is oldest-first, including
+ * the current certificate, and is NULL unless v3 records key rotation.
+ * This reads installed-package metadata; it is not an APK installation verifier. */
+int dvm_apk_signers_read(const char *path, unsigned sdk,
+                         struct stack_st_X509 **current, struct stack_st_X509 **history);
+
+/* ---- JNI bridge to the guest (dvm_jni.c) ---- */
+void dvm_jni_shutdown(void);
+
+/* LUNARIA_DVM: 0 disables the emulator, 1 (default) runs dex bytecode only
+ * where no host stub exists, 2 prefers dex bytecode over host stubs. */
+enum dvm_jni_mode { DVM_JNI_OFF = 0, DVM_JNI_FILL_GAPS = 1, DVM_JNI_PREFER = 2 };
+
+enum dvm_jni_mode dvm_jni_mode(void);
+
+/* Runs the method.  Exactly one of `ap` and `jargs` may be non-NULL; both NULL
+ * means a no-argument call.  Returns false when the method is not in any dex
+ * (the caller then falls back to its stub). */
+bool dvm_jni_invoke(JNIEnv *env, const char *class_name, const char *method,
+                    const char *sig, jobject self, bool is_static,
+                    va_list *ap, const jvalue *jargs, jvalue *out);
+bool dvm_jni_invoke_nonvirtual(JNIEnv *env, const char *class_name, const char *method,
+                    const char *sig, jobject self, bool is_static,
+                    va_list *ap, const jvalue *jargs, jvalue *out);
+
+/* Called by arm_exec once the guest's libraries are loaded, so bytecode can
+ * reach methods the guest declared `native`. */
+typedef bool (*dvm_guest_native_fn)(const char *class_name, const char *method,
+                                    const char *sig, bool is_static, jobject self,
+                                    const jvalue *args, int nargs, jvalue *out);
+void dvm_jni_set_guest_native_caller(dvm_guest_native_fn fn);
+
+typedef bool (*dvm_guest_library_fn)(const char *name);
+void dvm_jni_set_guest_library_loader(dvm_guest_library_fn fn);
+
+/* android.app.NativeActivity's framework half, run by the guest: stage is a
+ * DVM_NATIVE_ACTIVITY_* value and activity the Activity object. */
+typedef bool (*dvm_guest_activity_fn)(int stage, jobject activity);
+void dvm_jni_set_guest_native_activity(dvm_guest_activity_fn fn);
+
+/* True when the APK's dex declares this class (slash-separated name).  A guest
+ * uses ClassLoader.loadClass() to feature-detect optional Java components; the
+ * emulator must answer "absent" for a class the APK does not ship, or the guest
+ * commits to a code path whose Java half can never run. */
+bool dvm_jni_class_in_dex(const char *class_name);
+
+/* PackageManager.getPackageInfo(name, flags) for native callers: the VM's own
+ * PackageInfo, as a host handle.  NULL with NameNotFoundException pending when
+ * the package is not installed. */
+jobject dvm_jni_package_info(JNIEnv *env, jstring name, jint flags);
+jobject dvm_jni_application_info(JNIEnv *env, jstring name, jint flags);
+
+/* True when the device we present has the class: the APK's dex or the
+ * platform (see dvm_class_exists()).  What FindClass answers from. */
+bool dvm_jni_class_exists(const char *class_name);
+
+/* True when the APK's dex carries bytecode for this method (`sig` may be NULL
+ * to match on the name alone).  A canned answer in the stub layer must never
+ * take precedence over Java the APK actually ships: the app's own
+ * implementation is the one the rest of the app agrees with.  Ask this first,
+ * and keep the stub only for titles that do not ship the method. */
+bool dvm_jni_method_in_dex(const char *class_name, const char *method,
+                           const char *sig);
+
+/* Register a dex the guest loaded at runtime (InMemoryDexClassLoader over a
+ * direct ByteBuffer, or a DexClassLoader over a file).  See
+ * dvm_add_dex_memory(). */
+bool dvm_jni_add_dex_memory(const void *data, size_t len, const char *name);
+/* Bumped whenever a dex arrives; anything memoised from the class hierarchy
+ * has to be dropped when this changes. */
+unsigned dvm_jni_dex_epoch(void);
+
+/* Instance field of an object whose class the APK's dex defines, reached from
+ * native through Get/SetXxxField.  The bytecode VM owns that object's fields,
+ * so a write from native has to land there and not in the stub layer's own
+ * side table — otherwise the two halves disagree about the same field.  `bits`
+ * is the raw value, the way the JNI accessor macros carry it.  False when the
+ * field is not one the VM owns; the caller then keeps its own handling. */
+bool dvm_jni_field(JNIEnv *env, jobject obj, jfieldID field, bool set,
+                   uint64_t *bits);
+
+/* The same for a *static* field.  The dex owns these too: GameActivity's
+ * <clinit> fills ANDROID_BUILD_VERSION from Build.VERSION.SDK_INT, and native
+ * code reads it back with GetStaticIntField.  Answering from the stub layer's
+ * side table instead reported 0 — an Android older than 1.0 — and the engine
+ * then disabled every feature gated on the OS version. */
+bool dvm_jni_static_field(JNIEnv *env, jclass cls, jfieldID field, bool set,
+                          uint64_t *bits);
+
+/* Superclass of a dex-defined class, slash-separated, or NULL when the APK
+ * does not define the class (the framework hierarchy is not in the dex).
+ * The stub layer needs it to resolve an inherited framework method called on
+ * an app's own subclass. */
+const char *dvm_jni_super_name(const char *class_name);
+
+/* Assignability as the dex declares it, interfaces included (`sub instanceof
+ * sup`).  Both names are slash-separated.  False when either class is not one
+ * the dex defines — the caller then continues through the framework
+ * hierarchy, which no dex declares. */
+bool dvm_jni_class_assignable(const char *sub, const char *sup);
+
+/* Attach the launcher Activity to the framework window/Activity stack after
+ * its lifecycle returns. Used for dex apps whose UI is owned by the framework. */
+struct dvm;
+struct luna_touch_event;
+bool dvm_ui_dispatch_touch(struct dvm *vm, const struct luna_touch_event *sample);
+void dvm_jni_show_activity(JNIEnv *env, jobject activity);
+struct lm_sink;
+jobject dvm_jni_surface_from_sink(JNIEnv *env, struct lm_sink *sink);
+struct lm_sink *dvm_jni_surface_acquire_sink(JNIEnv *env, jobject surface);
+void dvm_jni_main_transaction(JNIEnv *env, bool begin);
+void dvm_jni_activity_dispatch(JNIEnv *env, jobject activity, const char *step,
+                               int post);
+bool dvm_jni_activity_finishing(JNIEnv *env, jobject activity);
+
+/* Diagnostics for the loader's summary line. */
+void dvm_jni_report(void);
+
+/* Publish the process framework graph into the VM before application code. */
+bool dvm_jni_bind_application(JNIEnv *env, jobject base, jobject application);
+jobject dvm_jni_get_class_loader(JNIEnv *env, jobject object);
+/* Publish the process Activity into UnityPlayer.currentActivity (static field
+ * in the APK dex).  Plugins such as IronSource read that field via sget. */
+void dvm_jni_bind_unity_activity(JNIEnv *env, jobject activity);
+
+struct dvm;
+struct dvm *dvm_jni_vm(void);
+/* Process status must not initialize bytecode from a native SVC poll. */
+bool dvm_jni_process_exited(int *status);
+void dvm_jni_exit_process(int status);
+/* Write out any preferences an apply() left pending; declared in dvm.h too,
+ * and repeated here because the frame pump calls it and does not (and cannot)
+ * include the interpreter's own header. */
+void dvm_prefs_flush(struct dvm *vm);
+/* Declared in dvm.h too; repeated here for the loader's frame pump, which
+ * reaches the VM through this header. */
+void dvm_ime_frame(struct dvm *vm);
+/* One turn of the main thread's Looper — see dvm.c.  The frame pump calls it
+ * so a Handler.postDelayed() callback runs near its due time instead of
+ * waiting for the guest to call into Java. */
+void dvm_main_looper_tick(struct dvm *vm);
+
+/* The interpreter lock, for callers that cannot include dvm.h.
+ *
+ * dvm/dex.h declares dex_uleb() and dex_string(); loader.c has its own
+ * functions by those names for the manifest reader it runs before any VM
+ * exists, so pulling dvm.h in there is a redeclaration.  These two are the
+ * whole of what the frame pump needs — see the commentary on dvm_gil_acquire()
+ * in dvm.h for what the lock is and when to give it up. */
+struct dvm;
+struct dvm *dvm_current(void);
+void dvm_gil_yield(struct dvm *vm);
+
+void dvm_glsurface_tick(struct dvm *vm);
 
 struct dvm;
 

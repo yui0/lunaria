@@ -428,19 +428,67 @@ extern "C" void dynarmic_a64_set_progress_hook(void (*fn)(uint64_t compiles,
 
 extern "C" {
 #include "arm_exec.h"
+#include "aaudio_stream.h"
 #include "luna_input.h"
 #include "luna_qfkey.h"
 #include "linker64.h"
 #include "jvm/jvm.h"
 #include "jvm/jni.h"
 #include "dvm/dvm.h"
-#include "dvm/dvm_jni.h"
 #include "dvm/dvm_media.h"
 #include "dvm/dvm_net.h"
 #include "lib/stb_vorbis.h"
 void android_view_Display_fillMetrics(JNIEnv *e, jobject out);
 }
 #include "arm.h"
+#ifndef LUNARIA_SYMLINK_NATIVE
+/* The execution lock protects emulator state, not the host filesystem: a
+ * path walk, an open or a directory read can wait on a device (or just cost a
+ * syscall per component), and with the lock held every other guest thread
+ * waits with it.  Each host file operation therefore runs with the lock
+ * dropped and takes it back for the caller, which is how stat already worked.
+ * A caller that does not hold the lock is unaffected.  Arguments are host
+ * paths and buffers, never emulator tables. */
+template <class F, class... A>
+static inline auto luna_file_unlocked(F f, A... a) {
+    ArmLockDropped dropped;
+    return f(a...);
+}
+#undef luna_file_open
+#undef luna_file_openat
+#undef luna_file_unlink
+#undef luna_file_unlinkat
+#undef luna_file_rename
+#undef luna_file_readlink
+#undef luna_file_access
+#undef luna_file_accessat
+#undef luna_file_realpath
+#undef luna_file_mkdir
+#undef luna_file_link
+#undef luna_file_chmodat
+#undef luna_file_timesat
+#undef luna_file_set_modified
+#undef luna_directory_open
+#undef luna_directory_open_fd
+#undef luna_directory_read
+#define luna_file_open(...) luna_file_unlocked(luna_symlink_open, __VA_ARGS__)
+#define luna_file_openat(...) luna_file_unlocked(luna_symlink_openat, __VA_ARGS__)
+#define luna_file_unlink(...) luna_file_unlocked(luna_symlink_unlink, __VA_ARGS__)
+#define luna_file_unlinkat(...) luna_file_unlocked(luna_symlink_unlinkat, __VA_ARGS__)
+#define luna_file_rename(...) luna_file_unlocked(luna_symlink_rename, __VA_ARGS__)
+#define luna_file_readlink(...) luna_file_unlocked(luna_symlink_readlink, __VA_ARGS__)
+#define luna_file_access(...) luna_file_unlocked(luna_symlink_access, __VA_ARGS__)
+#define luna_file_accessat(...) luna_file_unlocked(luna_symlink_accessat, __VA_ARGS__)
+#define luna_file_realpath(...) luna_file_unlocked(luna_symlink_realpath, __VA_ARGS__)
+#define luna_file_mkdir(...) luna_file_unlocked(luna_symlink_mkdir, __VA_ARGS__)
+#define luna_file_link(...) luna_file_unlocked(luna_symlink_link, __VA_ARGS__)
+#define luna_file_chmodat(...) luna_file_unlocked(luna_symlink_chmodat, __VA_ARGS__)
+#define luna_file_timesat(...) luna_file_unlocked(luna_symlink_timesat, __VA_ARGS__)
+#define luna_file_set_modified(...) luna_file_unlocked(luna_symlink_set_modified, __VA_ARGS__)
+#define luna_directory_open(...) luna_file_unlocked(luna_symlink_directory_open, __VA_ARGS__)
+#define luna_directory_open_fd(...) luna_file_unlocked(luna_symlink_directory_open_fd, __VA_ARGS__)
+#define luna_directory_read(...) luna_file_unlocked(luna_symlink_directory_read, __VA_ARGS__)
+#endif
 #define LUNARIA_GUEST_SHARED 1
 #include "lib/guest.c"   /* the heap shared with the guest */
 
@@ -616,6 +664,13 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"__android_log_print",  SVC_LOG_PRINT},
     {"__android_log_write",  SVC_LOG_WRITE},
     {"dlopen",               SVC_DLOPEN},
+    /* android_dlopen_ext(path, flags, extinfo): bionic's namespace-aware
+     * dlopen.  The first two arguments are dlopen's; the extended info (a
+     * library namespace, a load address hint) has no counterpart here. */
+    {"android_dlopen_ext",   SVC_DLOPEN},
+    /* The emulator's dlopen service under a name the guest's own dlopen wrappers
+     * (src/lib/guest.c) can import without resolving to themselves. */
+    {"lunaria_host_dlopen",  SVC_DLOPEN},
     {"dlsym",                SVC_DLSYM},
     {"dlclose",              SVC_DLCLOSE},
     {"__cfi_slowpath",       SVC_CFI_SLOWPATH},
@@ -739,6 +794,7 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"eglQueryString",        SVC_EGL_QUERYSTR},
     {"eglSurfaceAttrib",      SVC_EGL_SURFACEATTRIB},
     {"eglSwapInterval",           SVC_EGL_SWAPINTERVAL},
+    {"eglWaitClient",             SVC_EGL_WAIT_CLIENT},
     {"eglGetCurrentContext",      SVC_EGL_GETCURCTX},
     {"eglGetCurrentSurface",      SVC_EGL_GETCURSURF},
     
@@ -965,6 +1021,25 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"glBlendEquation",         SVC_GL_BlendEquation},
     {"glBlendColor",            SVC_GL_BlendColor},
     {"glReleaseShaderCompiler", SVC_GL_ReleaseShaderCompiler},
+    {"glShaderBinary",          SVC_GL_ShaderBinary},
+    /* OES framebuffer/blend entry points of the GLES 1.x extension set share
+     * the signature and semantics of their GLES 2 counterparts. */
+    {"glBindFramebufferOES",        SVC_GL_BindFramebuffer},
+    {"glBlendEquationOES",          SVC_GL_BlendEquation},
+    {"glBlendEquationSeparateOES",  SVC_GL_BlendEquationSeparate},
+    {"glBlendFuncSeparateOES",      SVC_GL_BlendFuncSeparate},
+    {"glCheckFramebufferStatusOES", SVC_GL_CheckFramebufferStatus},
+    {"glDeleteFramebuffersOES",     SVC_GL_DeleteFramebuffers},
+    {"glFramebufferTexture2DOES",   SVC_GL_FramebufferTexture2D},
+    {"glGenFramebuffersOES",        SVC_GL_GenFramebuffers},
+    /* The GLES 1.x fixed-function pipeline is not emulated.  Libraries such as
+     * SDL2 reference these for their optional GLES1 renderer, so they must
+     * resolve at load time even though a GLES 2+ context never calls them. */
+    {"glColor4f",                   SVC_GLES1_UNSUPPORTED},
+    {"glLoadIdentity",              SVC_GLES1_UNSUPPORTED},
+    {"glOrthof",                    SVC_GLES1_UNSUPPORTED},
+    {"glTexEnvf",                   SVC_GLES1_UNSUPPORTED},
+    {"glDrawTexfOES",               SVC_GLES1_UNSUPPORTED},
     {"glGetShaderPrecisionFormat", SVC_GL_GetShaderPrecisionFormat},
     {"glUniformMatrix2fv",      SVC_GL_UniformMatrix2fv},
     
@@ -1360,6 +1435,7 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"dirfd",                   SVC_DIRFD},
     {"settimeofday",            SVC_SETTIMEOFDAY},
     {"__system_property_find_nth", SVC_SYSPROP_FIND_NTH},
+    {"__system_property_foreach", SVC_SYSPROP_FOREACH},
     {"cacheflush",              SVC_CACHEFLUSH},
     {"fstatat64",               SVC_LIBC_FSTATAT},
     {"getpriority",             SVC_GETPRIORITY},
@@ -1570,6 +1646,8 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"__umask_chk",             SVC_UMASK_CHK},
     {"fchmod",                  SVC_FCHMOD},
     {"chdir",                   SVC_CHDIR},
+    {"fchdir",                  SVC_FCHDIR},
+    {"fchown",                  SVC_FCHOWN},
     {"isatty",                  SVC_RET0},
     {"dladdr",                  SVC_DLADDR},
     {"dlerror",                 SVC_DLERROR},
@@ -1598,6 +1676,8 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"pthread_attr_getschedparam",  SVC_PTHREAD_ATTR_GETSCHEDPARAM},
     {"pthread_attr_getschedpolicy", SVC_PTHREAD_ATTR_GETSCHEDPOLICY},
     {"pthread_getschedparam",   SVC_PTHREAD_GETSCHEDPARAM},
+    {"pthread_gettid_np",        SVC_PTHREAD_GETTID_NP},
+    {"__pthread_gettid",         SVC_PTHREAD_GETTID_NP},
     {"pthread_setschedparam",   SVC_PTHREAD_SETSCHEDPARAM},
     {"pthread_kill",            SVC_PTHREAD_KILL},
     {"sched_getcpu",            SVC_RET0},
@@ -1633,31 +1713,54 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"ALooper_addFd",               SVC_ALOOPER_ADDFD},
     {"ALooper_removeFd",            SVC_ALOOPER_REMOVEFD},
     // AAudio streams run data callbacks on their own guest threads.
-    {"AAudio_createStreamBuilder",              SVC_AAUDIO_CREATE_BUILDER},
-    {"AAudioStreamBuilder_setDirection",        SVC_AAUDIO_SET_DIRECTION},
-    {"AAudioStreamBuilder_setSampleRate",       SVC_AAUDIO_SET_RATE},
-    {"AAudioStreamBuilder_setChannelCount",     SVC_AAUDIO_SET_CHANNELS},
-    {"AAudioStreamBuilder_setFormat",           SVC_AAUDIO_SET_FORMAT},
-    {"AAudioStreamBuilder_setSharingMode",      SVC_RET0},
-    {"AAudioStreamBuilder_setPerformanceMode",  SVC_RET0},
-    {"AAudioStreamBuilder_setBufferCapacityInFrames", SVC_RET0},
-    {"AAudioStreamBuilder_setFramesPerDataCallback",  SVC_AAUDIO_SET_CALLBACK_FRAMES},
-    {"AAudioStreamBuilder_setDataCallback",     SVC_AAUDIO_SET_DATA_CB},
-    {"AAudioStreamBuilder_setErrorCallback",    SVC_RET0},
-    {"AAudioStreamBuilder_setDeviceId",         SVC_RET0},
-    {"AAudioStreamBuilder_openStream",          SVC_AAUDIO_OPEN_STREAM},
-    {"AAudioStreamBuilder_delete",              SVC_RET0},
-    {"AAudioStream_requestStart",               SVC_AAUDIO_START},
-    {"AAudioStream_requestStop",                SVC_AAUDIO_STOP},
-    {"AAudioStream_close",                      SVC_AAUDIO_STOP},
-    {"AAudioStream_getFramesPerBurst",          SVC_AAUDIO_GET_FPB},
-    {"AAudioStream_getBufferSizeInFrames",      SVC_AAUDIO_GET_BUFSIZE},
-    {"AAudioStream_setBufferSizeInFrames",      SVC_AAUDIO_SET_BUFSIZE},
-    {"AAudioStream_getBufferCapacityInFrames",  SVC_AAUDIO_GET_BUFCAP},
-    {"AAudioStream_getXRunCount",               SVC_RET0},
-    {"AAudioStream_getDeviceId",                SVC_RET0},
-    {"AAudioStream_isMMapUsed",                 SVC_RET0},
-    {"AAudioStream_waitForStateChange",         SVC_AAUDIO_WAIT_STATE},
+    {"AAudio_createStreamBuilder", SVC_AAUDIO_CREATE_BUILDER},
+    {"AAudioStreamBuilder_openStream", SVC_AAUDIO_OPEN_STREAM},
+    {"AAudioStreamBuilder_delete", SVC_AAUDIO_DELETE_BUILDER},
+    {"AAudioStreamBuilder_setDirection", SVC_AAUDIO_SET_DIRECTION},
+    {"AAudioStreamBuilder_setSampleRate", SVC_AAUDIO_SET_RATE},
+    {"AAudioStreamBuilder_setChannelCount", SVC_AAUDIO_SET_CHANNELS},
+    {"AAudioStreamBuilder_setSamplesPerFrame", SVC_AAUDIO_SET_CHANNELS},
+    {"AAudioStreamBuilder_setFormat", SVC_AAUDIO_SET_FORMAT},
+    {"AAudioStreamBuilder_setSharingMode", SVC_AAUDIO_SET_SHARING},
+    {"AAudioStreamBuilder_setPerformanceMode", SVC_AAUDIO_SET_PERFORMANCE},
+    {"AAudioStreamBuilder_setBufferCapacityInFrames", SVC_AAUDIO_SET_CAPACITY},
+    {"AAudioStreamBuilder_setFramesPerDataCallback", SVC_AAUDIO_SET_CALLBACK_FRAMES},
+    {"AAudioStreamBuilder_setDataCallback", SVC_AAUDIO_SET_DATA_CB},
+    {"AAudioStreamBuilder_setErrorCallback", SVC_AAUDIO_SET_ERROR_CB},
+    {"AAudioStreamBuilder_setDeviceId", SVC_AAUDIO_SET_DEVICE},
+    {"AAudioStreamBuilder_setUsage",SVC_AAUDIO_SET_USAGE},
+    {"AAudioStreamBuilder_setContentType",SVC_AAUDIO_SET_CONTENT},
+    {"AAudioStreamBuilder_setInputPreset",SVC_AAUDIO_SET_PRESET},
+    {"AAudioStream_getUsage",SVC_AAUDIO_GET_USAGE},
+    {"AAudioStream_getContentType",SVC_AAUDIO_GET_CONTENT},
+    {"AAudioStream_getInputPreset",SVC_AAUDIO_GET_PRESET},
+    {"AAudioStream_requestStart", SVC_AAUDIO_START},
+    {"AAudioStream_requestStop", SVC_AAUDIO_STOP},
+    {"AAudioStream_requestPause", SVC_AAUDIO_PAUSE},
+    {"AAudioStream_requestFlush", SVC_AAUDIO_FLUSH},
+    {"AAudioStream_close", SVC_AAUDIO_CLOSE},
+    {"AAudioStream_getFramesPerBurst", SVC_AAUDIO_GET_FPB},
+    {"AAudioStream_getBufferSizeInFrames", SVC_AAUDIO_GET_BUFSIZE},
+    {"AAudioStream_setBufferSizeInFrames", SVC_AAUDIO_SET_BUFSIZE},
+    {"AAudioStream_getBufferCapacityInFrames", SVC_AAUDIO_GET_BUFCAP},
+    {"AAudioStream_getFormat", SVC_AAUDIO_GET_FORMAT},
+    {"AAudioStream_getSampleRate", SVC_AAUDIO_GET_RATE},
+    {"AAudioStream_getChannelCount", SVC_AAUDIO_GET_CHANNELS},
+    {"AAudioStream_getSamplesPerFrame", SVC_AAUDIO_GET_CHANNELS},
+    {"AAudioStream_getDirection", SVC_AAUDIO_GET_DIRECTION},
+    {"AAudioStream_getState", SVC_AAUDIO_GET_STATE},
+    {"AAudioStream_getSharingMode", SVC_AAUDIO_GET_SHARING},
+    {"AAudioStream_getPerformanceMode", SVC_AAUDIO_GET_PERFORMANCE},
+    {"AAudioStream_getDeviceId", SVC_AAUDIO_GET_DEVICE},
+    {"AAudioStream_getFramesPerDataCallback", SVC_AAUDIO_GET_CALLBACK_FRAMES},
+    {"AAudioStream_getFramesWritten", SVC_AAUDIO_GET_WRITTEN},
+    {"AAudioStream_getFramesRead", SVC_AAUDIO_GET_READ},
+    {"AAudioStream_getXRunCount", SVC_AAUDIO_GET_XRUN},
+    {"AAudioStream_isMMapUsed", SVC_AAUDIO_IS_MMAP},
+    {"AAudioStream_waitForStateChange", SVC_AAUDIO_WAIT_STATE},
+    {"AAudioStream_write", SVC_AAUDIO_WRITE},
+    {"AAudioStream_read", SVC_AAUDIO_READ},
+    {"AAudioStream_getTimestamp", SVC_AAUDIO_TIMESTAMP},
     {"getauxval",                               SVC_GETAUXVAL},
     {"ALooper_acquire",             SVC_ALOOPER_ACQUIRE},
     {"ALooper_release",             SVC_ALOOPER_RELEASE},
@@ -2244,6 +2347,8 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"logb",                      SVC_LOGB},
     {"lrintf",                    SVC_LRINTF},
     {"expm1f",                    SVC_EXPM1F},
+    {"expm1",                     SVC_EXPM1},
+    {"nan",                       SVC_NAN},
     {"nanf",                      SVC_NANF},
     
     {"wmemcmp",                   SVC_WMEMCMP},
@@ -2384,6 +2489,7 @@ static const A64SoftFpAbi kA64SoftFpAbi[] = {
     { SVC_WCSTOD,  0, 8, 8 }, { SVC_WCSTOF,  0, 4, 4 },
     { SVC_DIFFTIME, 0, 8, 8 }, { SVC_STRTOF,  0, 4, 4 },
     { SVC_NANF,     0, 4, 4 },
+    { SVC_NAN,      0, 8, 8 }, { SVC_EXPM1, 1, 8, 8 },
     { SVC_RINT,     1, 8, 8 }, { SVC_LOGB,    1, 8, 8 },
     { SVC_FREXP,    1, 8, 8 }, { SVC_MODF,    1, 8, 8 },
     { SVC_LDEXP,    1, 8, 8 }, { SVC_SCALBN,  1, 8, 8 },
@@ -6763,6 +6869,17 @@ static const char *maps_device_path(const char *host, char *buf, size_t bufsz)
     const char *device = unmap_guest_file(host, buf, bufsz);
     if (device != host) return device ? device : "";
 
+    /* The ART runtime is an updatable APEX module on a device, not part of
+     * /system, and is already mapped when the zygote forks the app. */
+    static const char *const art[] = {
+        "libart.so", "libartbase.so", "libdexfile.so", "libnativeloader.so", nullptr
+    };
+    for (const char *const *p = art; *p; ++p)
+        if (!strcmp(base, *p)) {
+            snprintf(buf, bufsz, "/apex/com.android.art/lib64/%s", base);
+            return buf;
+        }
+
     const size_t n = strlen(base);
     if (n > 3 && !strcmp(base + n - 3, ".so")) {
         /* A platform library lives in /system/lib64; anything else shipped in
@@ -10799,6 +10916,7 @@ static GuestVA sysprop_find_or_create(ArmExecCtx &ctx, const char *name) {
     GuestSysProp entry;
     entry.name = name;
     entry.value = sysprop_value_for(name, ctx.is_arm64);
+    entry.serial = (uint32_t)entry.value.size() << 24;
     const size_t idx = g_sysprops.size();
     g_sysprops.push_back(std::move(entry));
     g_sysprop_handle_by_name.emplace(name, handle);
@@ -11220,7 +11338,7 @@ static void mutex_owner_sanity(uint32_t tid, GuestVA mva, uint32_t word,
  * guest threads progress.  No unlock-enter, no steal of the owner byte. */
 struct CbLockWait {
     enum Kind : uint8_t { Idle = 0, Mu = 1, Rd = 2, Wr = 3, Cond = 4,
-                          Sleep = 5, Futex = 6, Sem = 7 };
+                          Sleep = 5, Futex = 6, Sem = 7, RetrySleep = 8 };
     Kind     kind = Idle;
     GuestVA  mva = 0;
     uint32_t owner = 0; /* mutex: (tid+1)&0xff */
@@ -12079,6 +12197,11 @@ struct GlTextureBindings {
     std::map<GLenum, std::map<GLenum, GLuint>> units;
 };
 static std::map<uint32_t, GlTextureBindings> g_gl_texture_bindings_by_ctx;
+/* glDepthMask is the only way the guest changes GL_DEPTH_WRITEMASK, so the
+ * value it last set on each context answers glGetBooleanv(GL_DEPTH_WRITEMASK)
+ * without asking the driver: on the host a Get* call waits for every queued
+ * draw, and Cocos2d-x asks once per draw.  A new context starts at GL_TRUE. */
+static std::map<uint32_t, GLboolean> g_gl_depth_mask_by_ctx;
 static thread_local GLenum g_gl_active_texture = 0x84C0;
 static thread_local std::map<GLenum, std::map<GLenum, GLuint>> g_gl_texture_bindings;
 
@@ -12601,6 +12724,8 @@ static const char *memmem_buf(const void *hay, size_t hlen, const char *needle) 
 
 struct ArmExecCtx;
 
+
+
 static int run_arm(ArmExecCtx &ctx, uint32_t entry_va,
                    uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3,
                    uint64_t tick_budget);
@@ -12753,33 +12878,15 @@ static constexpr uint32_t ARM_LIBAAUDIO   = 0xAB10D100u; /* fake dlopen handle f
 static constexpr uint32_t ARM_LIBC        = 0xAB10D200u; /* fake dlopen handle for libc.so */
 static constexpr uint32_t ARM_LIBOPENSLES = 0xAB10D300u; /* fake dlopen handle for libOpenSLES.so */
 static constexpr uint32_t ARM_LIBVULKAN   = 0xAB10D400u; /* fake dlopen handle for libvulkan.so */
-static constexpr uint32_t ARM_AAUDIO_BUILDER = 0xAB10D110u; /* opaque AAudioStreamBuilder* */
-static constexpr uint32_t ARM_AAUDIO_STREAM  = 0xAB10D120u; /* opaque AAudioStream* (16B stride) */
 static constexpr uint32_t ARM_ACHOREOGRAPHER = 0xC0FEBEEFu;
 static constexpr uint32_t ARM_AINPUTQUEUE     = 0xC0FEBE10u; /* opaque AInputQueue* */
 static constexpr uint32_t ARM_AINPUTEVENT     = 0xC0FEBE11u; /* opaque AInputEvent* */
 
-// Guest-visible audio buffer handed to AAudio data callbacks (above CB stack)
-static constexpr uint32_t AAUDIO_BURST_FRAMES = 480u;     /* 10ms @ 48kHz */
-
-// FMOD's mixer — and its async command processing, which resolves e.
-struct AAudioStreamState {
-    bool     started   = false;
-    bool     input     = false;    /* AAUDIO_DIRECTION_INPUT */
-    uint64_t data_cb   = 0;
-    uint64_t user_data = 0;
-    uint32_t channels  = 2;
-    uint32_t format    = 2;        /* AAUDIO_FORMAT_PCM_FLOAT */
-    uint32_t sample_rate = 48000;
-    uint32_t callback_frames = AAUDIO_BURST_FRAMES;
-    uint32_t worker_tid = 0;
-    uint32_t callback_args = 0;
-    uint64_t next_due_ns = 0;
-    bool callback_pending = false;
-};
-static AAudioStreamState g_aaudio_builder;
-static std::map<uint32_t, AAudioStreamState> g_aaudio_streams;
-static uint32_t g_aaudio_stream_count = 0;
+using AAudioStreamState = luna_aaudio::Stream;
+static std::map<uint32_t,luna_aaudio::Config> g_aaudio_builders;
+static std::map<uint32_t,AAudioStreamState> g_aaudio_streams;
+struct AAudioWait {uint32_t stream=0;int32_t state=0;uint64_t deadline=0;uint32_t transferred=0;};
+static std::map<uint32_t,AAudioWait> g_aaudio_waits;
 
 // Typed arguments for guest calls.
 struct GuestArg {
@@ -12914,6 +13021,7 @@ static std::map<uint32_t, std::vector<GuestCleanup>> g_thread_cleanup;
 
 static void guest_thread_cleanup_run(ArmExecCtx &ctx, uint32_t tid)
 {
+   g_aaudio_waits.erase(tid);
    /* A stream this thread still owns would never be released, and the next
     * flockfile() on it would re-execute its SVC for ever.  The kernel has no
     * such problem because the lock dies with the process; here the thread is
@@ -13858,6 +13966,30 @@ static void *host_gl_proc(std::initializer_list<const char *> names) {
     return nullptr;
 }
 
+/* An exported core symbol is not proof that the current GLES context supports
+ * it. ANGLE exports 3.2 entry points on a 3.1 context too; extension calls must
+ * use their enabled extension entry points there. Resolve per current context,
+ * rather than retaining a choice made on the first context used by the app. */
+static void *host_gl_promoted_proc(const char *core, int major, int minor,
+        std::initializer_list<std::pair<const char *, const char *>> extensions) {
+    const char *version = (const char *)glGetString(GL_VERSION);
+    int host_major = 0, host_minor = 0;
+    if (version && sscanf(version, "OpenGL ES %d.%d", &host_major, &host_minor) == 2 &&
+        (host_major > major || (host_major == major && host_minor >= minor)))
+        return host_gl_proc({core});
+    const char *supported = (const char *)glGetString(GL_EXTENSIONS);
+    if (!supported) return nullptr;
+    for (auto entry : extensions) {
+        size_t length = strlen(entry.second);
+        for (const char *at = strstr(supported, entry.second); at;
+             at = strstr(at + length, entry.second)) {
+            if ((at == supported || at[-1] == ' ') && (!at[length] || at[length] == ' '))
+                if (auto proc = host_gl_proc({entry.first})) return proc;
+        }
+    }
+    return nullptr;
+}
+
 /* Query ids this process actually began.  Only used to tell "the driver is
  * still working on it" from "nobody ever ran this query", which is the
  * difference between a wait that ends and one that does not. */
@@ -14017,6 +14149,7 @@ GL_DECL(GLboolean, glIsRenderbuffer,     GLuint)
 GL_DECL(void,    glBlendEquation,        GLenum)
 GL_DECL(void,    glBlendColor,           GLclampf,GLclampf,GLclampf,GLclampf)
 GL_DECL(void,    glReleaseShaderCompiler, void)
+GL_DECL(void,    glShaderBinary, GLsizei,const GLuint*,GLenum,const void*,GLsizei)
 GL_DECL(void,    glGetShaderPrecisionFormat, GLenum,GLenum,GLint*,GLint*)
 GL_DECL(void,    glUniformMatrix2fv,     GLint,GLsizei,GLboolean,const GLfloat*)
 
@@ -14246,7 +14379,7 @@ static void load_gl_procs() {
     GL_LOAD(glIsEnabled); GL_LOAD(glIsProgram); GL_LOAD(glIsShader); GL_LOAD(glIsTexture);
     GL_LOAD(glIsBuffer); GL_LOAD(glIsFramebuffer); GL_LOAD(glIsRenderbuffer);
     GL_LOAD(glBlendEquation); GL_LOAD(glBlendColor);
-    GL_LOAD(glReleaseShaderCompiler); GL_LOAD(glGetShaderPrecisionFormat);
+    GL_LOAD(glReleaseShaderCompiler); GL_LOAD(glShaderBinary); GL_LOAD(glGetShaderPrecisionFormat);
     GL_LOAD(glUniformMatrix2fv);
     GL_LOAD(glUniformMatrix2x3fv);
     GL_LOAD(glUniformMatrix3x2fv);
@@ -14267,7 +14400,6 @@ static void load_gl_procs() {
     GL_LOAD(glFenceSync); GL_LOAD(glClientWaitSync); GL_LOAD(glDeleteSync);
     GL_LOAD(glIsSync); GL_LOAD(glTexParameterfv);
     GL_LOAD(glInvalidateFramebuffer); GL_LOAD(glDetachShader); GL_LOAD(glDrawBuffers);
-    GL_LOAD(glDrawElementsBaseVertex);
     GL_LOAD(glVertexAttribDivisor); GL_LOAD(glIsQuery);
     if (!pfn_glVertexAttribDivisor)      /* desktop GL / ES2 extension spellings */
         pfn_glVertexAttribDivisor = (decltype(pfn_glVertexAttribDivisor))
@@ -14275,12 +14407,6 @@ static void load_gl_procs() {
                           "glVertexAttribDivisorNV", "glVertexAttribDivisorANGLE"});
     if (!pfn_glIsQuery)
         pfn_glIsQuery = (decltype(pfn_glIsQuery))host_gl_proc({"glIsQueryEXT"});
-    if (!pfn_glDrawElementsBaseVertex)   /* GLES 3.2 core; try the EXT/OES forms */
-        pfn_glDrawElementsBaseVertex = (decltype(pfn_glDrawElementsBaseVertex))
-            eglGetProcAddress("glDrawElementsBaseVertexEXT");
-    if (!pfn_glDrawElementsBaseVertex)
-        pfn_glDrawElementsBaseVertex = (decltype(pfn_glDrawElementsBaseVertex))
-            eglGetProcAddress("glDrawElementsBaseVertexOES");
     fprintf(stderr, "[arm_exec] GL procs loaded (%s, GLES3 %s)\n",
             pfn_glCreateProgram ? "ok" : "FAILED",
             pfn_glGetProgramInterfaceiv ? "ok" : "missing");
@@ -16005,9 +16131,16 @@ static bool on_glfw_thread() {
     return g_glfw && std::this_thread::get_id() == g_glfw_thread;
 }
 
+/* GLFW's event pump belongs to the thread that owns the host window. Guest
+ * JNI/render threads may reach the same scheduling and present paths, but
+ * must leave event delivery to that owner (AppKit requires the main thread). */
+static void poll_glfw_events() {
+    if (on_glfw_thread()) glfwPollEvents();
+}
+
 extern "C" void arm_exec_pause_poll(void) {
     if (on_glfw_thread()) {
-        glfwPollEvents();
+        poll_glfw_events();
         luna_menu_tick();
         if (glfwWindowShouldClose(g_glfw)) arm_exec_request_quit();
     }
@@ -17573,14 +17706,20 @@ extern "C" int arm_exec_egl_present_surface(uint32_t handle) {
                             n - 1, width, height, version, nz, rfb);
                 }
             }
-            for (int y = 0; y < height / 2; ++y) {
-                uint8_t *lo = pixels.data() + stride * (size_t)y;
-                uint8_t *hi = pixels.data() + stride * (size_t)(height - 1 - y);
-                memcpy(row.data(), lo, stride); memcpy(lo, hi, stride); memcpy(hi, row.data(), stride);
-            }
             ArmLockDropped unlocked;
-            luna_qfkey_publish(pixels.data(), width, height, (int)stride, false);
-            luna_comp_submit_pixels(width, height, pixels.data(), (int)stride, false, 1);
+            if (luna_qfkey_wants_frame()) {
+                /* qfkey frames run top-down; the compositor takes the
+                 * read-back order as it is, so flip a copy only for qfkey. */
+                for (int y = 0; y < height / 2; ++y) {
+                    uint8_t *lo = pixels.data() + stride * (size_t)y;
+                    uint8_t *hi = pixels.data() + stride * (size_t)(height - 1 - y);
+                    memcpy(row.data(), lo, stride); memcpy(lo, hi, stride); memcpy(hi, row.data(), stride);
+                }
+                luna_qfkey_publish(pixels.data(), width, height, (int)stride, false);
+                luna_comp_submit_pixels(width, height, pixels.data(), (int)stride, false, 1);
+            } else {
+                luna_comp_submit_pixels_bottom_up(width, height, pixels.data(), (int)stride, false, 1);
+            }
         } else {
             ArmLockDropped unlocked;
             luna_comp_submit(width, height, 1);
@@ -20195,20 +20334,26 @@ static int apk_path_locate(const char *path, char *buf, size_t bufsz,
 // Android filesystem prefixes that exist on every device but not on the host — remapped into a writable sandbox.
 
 static const char *guest_sys_cpu_file(const char *tag, const char *content) {
-    // Stable paths under /tmp; rewritten each process start is fine.
-    static char topo[64] = "", cap[64] = "", freq[64] = "";
+    static char topo[PATH_MAX] = "", cap[PATH_MAX] = "", freq[PATH_MAX] = "";
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> guard(mutex);
     char *slot = nullptr;
     if (strcmp(tag, "topo") == 0) slot = topo;
     else if (strcmp(tag, "cap") == 0) slot = cap;
     else if (strcmp(tag, "freq") == 0) slot = freq;
     else return nullptr;
     if (!slot[0]) {
-        char name[32]; snprintf(name, sizeof name, "syscpu-%s", tag);
-        if (luna_temp_path(slot, 64, name)) return nullptr;
-        if (FILE *f = luna_file_fopen(slot, "w")) {
-            fputs(content, f);
-            fclose(f);
-        }
+        char name[32], path[PATH_MAX];
+        snprintf(name, sizeof name, "syscpu-%s", tag);
+        if (luna_temp_path(path, sizeof path, name)) return nullptr;
+        FILE *file = luna_file_fopen(path, "w");
+        if (!file) return nullptr;
+        const bool written = fputs(content, file) >= 0;
+        const int closed = fclose(file);
+        if (!written || closed) return nullptr;
+        /* Publish only a complete file. In particular a failed path copy must
+         * not turn the next lookup into a cached truncated pathname. */
+        memcpy(slot, path, strlen(path) + 1);
     }
     return slot;
 }
@@ -20221,7 +20366,9 @@ static const char *guest_sys_cpu_file(const char *tag, const char *content) {
  * the directory once from the host trust store; the file names are
  * irrelevant, the loaders only iterate. */
 static const char *guest_android_cacerts_dir(void) {
-    static char root[64];
+    static char root[PATH_MAX];
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> guard(mutex);
     static bool tried = false;
     if (tried) return root[0] ? root : nullptr;
     tried = true;
@@ -20240,7 +20387,7 @@ static const char *guest_android_cacerts_dir(void) {
         return nullptr;
     }
 
-    if (luna_temp_path(root, sizeof root, "cacerts")) { fclose(src); return nullptr; }
+    if (luna_temp_path(root, sizeof root, "cacerts")) { root[0] = 0; fclose(src); return nullptr; }
     luna_file_mkdir(root, 0755);
 
     char line[512];
@@ -20248,8 +20395,9 @@ static const char *guest_android_cacerts_dir(void) {
     int n = 0;
     while (fgets(line, sizeof line, src)) {
         if (!out && strncmp(line, "-----BEGIN CERTIFICATE-----", 27) == 0) {
-            char p[128];
-            snprintf(p, sizeof p, "%s/%d.0", root, n);
+            char p[PATH_MAX];
+            int length = snprintf(p, sizeof p, "%s/%d.0", root, n);
+            if (length < 0 || length >= (int)sizeof p) break;
             out = luna_file_fopen(p, "wb");
             if (!out) break;
             ++n;
@@ -20289,14 +20437,16 @@ static bool path_under(const char *path, const char *prefix, size_t n) {
     return strncmp(path, prefix, n) == 0 && (path[n] == '\0' || path[n] == '/');
 }
 
-/* Where confined Android roots land.  Empty on purpose: an app has no read
- * access to most of the system image either, so ENOENT is the honest answer
- * and it costs the host nothing. */
+/* Backing tree for the Android namespace. Device data mount points exist
+ * before applications run; absent system-image contents remain absent. */
 static const char *guest_root_dir() {
     static const char *root = [] {
         const char *r = lunaria_env("LUNARIA_GUEST_ROOT");
         if (!r || !*r) r = "/tmp/lunaria-guest-root";
-        luna_file_mkdir(r, 0755);
+        if (luna_file_mkdir(r,0755) && errno!=EEXIST)
+            fprintf(stderr,"[fs] cannot create device root %s: %s\n",r,strerror(errno));
+        else if (luna_android_fs_prepare(r))
+            fprintf(stderr,"[fs] cannot prepare device root %s: %s\n",r,strerror(errno));
         return r;
     }();
     return root;
@@ -20323,16 +20473,55 @@ static const char *guest_app_data_dir() {
  * machine's, so they must be recognised before any confinement runs: the
  * staging tree lives wherever the script was run from, and that can perfectly
  * well be under a directory that also names an Android root. */
+/* The mount roots are fixed for the life of the process, but a path check asks
+ * for their spelling once per guest stat/access/open, and on the host each
+ * realpath is a syscall walk made while the execution lock is held.  Resolve a
+ * root once and remember it; a root that does not resolve yet (not created)
+ * is retried, never remembered. */
+static const char *host_root_canonical(const char *root, char *out, size_t cap) {
+    struct entry { std::string root, canonical; };
+    static std::mutex mu;
+    static std::vector<entry> cache;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        for (const entry &e : cache)
+            if (e.root == root) {
+                if (e.canonical.size() >= cap) return nullptr;
+                memcpy(out, e.canonical.c_str(), e.canonical.size() + 1);
+                return out;
+            }
+    }
+    char resolved[PATH_MAX];
+    if (!luna_host_realpath(root, resolved, sizeof resolved) || strlen(resolved) >= cap)
+        return nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        cache.push_back({root, resolved});
+    }
+    memcpy(out, resolved, strlen(resolved) + 1);
+    return out;
+}
+
+static bool path_under_staged_root(const char *path,const char *root) {
+    if (!path || !root || !*root) return false;
+    if (path_under(path,root,strlen(root))) return true;
+    char canonical[PATH_MAX];
+    return host_root_canonical(root,canonical,sizeof canonical) &&
+           path_under(path,canonical,strlen(canonical));
+}
+
 static bool path_is_host_staging(const char *path) {
     static const char *const vars[] = {
         "ANDROID_FILES_DIR", "ANDROID_CACHE_DIR", "ANDROID_DATABASES_DIR",
         "ANDROID_NO_BACKUP_DIR", "ANDROID_PREFS_DIR",
         "ANDROID_EXTERNAL_FILES_DIR", "ANDROID_EXTERNAL_OBB_DIR",
-        "ANDROID_APK_FILE", "LUNARIA_GUEST_ROOT",
+        "ANDROID_EXTERNAL_CACHE_DIR", "ANDROID_EXTERNAL_STORAGE_DIR", "ANDROID_CODE_CACHE_DIR",
+        "ANDROID_PACKAGE_CODE_PATH", "ANDROID_NATIVE_LIB_DIR",
+        "ANDROID_APK_FILE", "LUNARIA_GUEST_ROOT", "LUNARIA_DATA_ROOT",
     };
     for (const char *v : vars) {
         const char *d = lunaria_env(v);
-        if (d && *d && path_under(path, d, strlen(d))) return true;
+        if (path_under_staged_root(path,d)) return true;
     }
     /* The whole staged app-data tree, not just the five leaves above (files,
      * cache, databases, no_backup, shared_prefs): an app writes elsewhere under
@@ -20344,13 +20533,13 @@ static bool path_is_host_staging(const char *path) {
      * (AppsFlyer decrypts a dex to a temp file under its data directory and
      * loads it with DexFile.loadDex(); the load saw a 0-byte file). */
     if (const char *app = guest_app_data_dir())
-        if (*app && path_under(path, app, strlen(app))) return true;
+        if (path_under_staged_root(path,app)) return true;
     /* The script derives most of those from its working directory, and some
      * paths reach us relative to it rather than through one of the vars. */
     static char cwd[PATH_MAX];
     static bool cwd_ready = false;
     if (!cwd_ready) { cwd_ready = true; if (!getcwd(cwd, sizeof cwd)) cwd[0] = '\0'; }
-    if (cwd[0] && cwd[1] && path_under(path, cwd, strlen(cwd))) return true;
+    if (cwd[0] && cwd[1] && path_under_staged_root(path,cwd)) return true;
     return false;
 }
 
@@ -20482,11 +20671,10 @@ static const char *map_guest_path_raw(const char *path, char *buf, size_t bufsz)
         const char *code = lunaria_env("ANDROID_PACKAGE_CODE_PATH");
         size_t n = strlen(path);
         while (n > 1 && path[n - 1] == '/') --n;
-        const bool app_root = n == 9 && !strncmp(path, "/data/app", 9);
         const bool installer = n > 14 && !strncmp(path, "/data/app/~~", 12) &&
                                !memchr(path + 12, '/', n - 12) &&
                                path[n - 1] == '=' && path[n - 2] == '=';
-        if ((app_root || installer) && code && *code) {
+        if (installer && code && *code) {
             size_t len = strlen(code);
             while (len > 1 && code[len - 1] == '/') --len;
             while (len > 1 && code[len - 1] != '/') --len;
@@ -20588,41 +20776,15 @@ static const char *map_guest_path_raw(const char *path, char *buf, size_t bufsz)
             return buf;
         }
     }
-    /* UE OBB search uses "/Android/obb/<pkg>/main.<ver>.<pkg>.obb" (and a
-     * shorter "/obb/...") when getExternalStorageDirectory is empty/"/".
-     * lunaria-apk.sh stages the expansion under $ANDROID_EXTERNAL_FILES_DIR. */
-    if (strncmp(path, "/Android/obb/", 13) == 0 ||
-        strcmp(path, "/Android/obb") == 0) {
-        const char *ext = lunaria_env("ANDROID_EXTERNAL_FILES_DIR");
-        if (!ext || !*ext) ext = "/tmp";
-        snprintf(buf, bufsz, "%s%s", ext, path);
-        return buf;
-    }
-    if (strncmp(path, "/obb/", 5) == 0 || strcmp(path, "/obb") == 0) {
-        const char *ext = lunaria_env("ANDROID_EXTERNAL_FILES_DIR");
-        if (!ext || !*ext) ext = "/tmp";
-        snprintf(buf, bufsz, "%s/Android%s", ext, path);
-        return buf;
-    }
-    if (strncmp(path, "/data/local/tmp", 15) == 0 &&
-        (path[15] == '\0' || path[15] == '/')) {
-        static const char *root = [] {
-            const char *r = "/tmp/lunaria-data-local-tmp";
-            luna_file_mkdir(r, 0755);
-            return r;
-        }();
-        snprintf(buf, bufsz, "%s%s", root, path + 15);
-        return buf;
-    }
     // The host /proc/cpuinfo is x86_64; guests parsing it for the ARM "Features:" line (FMOD probes NEON before registering.
     if (strcmp(path, "/proc/cpuinfo") == 0) {
         bool arm64 = g_ctx && g_ctx->is_arm64;
         static const char *synth32 = nullptr, *synth64 = nullptr;
         const char **pp = arm64 ? &synth64 : &synth32;
         if (!*pp) {
-            static char cpu32[64], cpu64[64];
+            static char cpu32[PATH_MAX], cpu64[PATH_MAX];
             char *p = arm64 ? cpu64 : cpu32;
-            if (luna_temp_path(p, 64, arm64 ? "proc-cpuinfo64" : "proc-cpuinfo")) return nullptr;
+            if (luna_temp_path(p, PATH_MAX, arm64 ? "proc-cpuinfo64" : "proc-cpuinfo")) return nullptr;
             if (FILE *f = luna_file_fopen(p, "w")) {
                 if (arm64) {
                     const char *platform =
@@ -20677,8 +20839,8 @@ static const char *map_guest_path_raw(const char *path, char *buf, size_t bufsz)
                                "Revision\t: 0000\n"
                                "Serial\t\t: 0000000000000000\n");
                 }
-                fclose(f);
-            }
+                if (fclose(f) != 0) return nullptr;
+            } else return nullptr;
             *pp = p;
         }
         return *pp;
@@ -20741,17 +20903,35 @@ static const char *map_guest_path_raw(const char *path, char *buf, size_t bufsz)
         return buf;
     }
 
-    /* Shared external storage, in every spelling a device offers for it. */
-    static const char *const ext_alias[] = {
-        "/sdcard", "/storage/emulated/0", "/storage/self/primary",
-        "/mnt/sdcard", "/storage/sdcard0",
-    };
-    for (const char *a : ext_alias) {
-        if (!path_under(path, a, strlen(a))) continue;
-        const char *ext = lunaria_env("ANDROID_EXTERNAL_FILES_DIR");
-        if (!ext || !*ext) break;
-        snprintf(buf, bufsz, "%s%s", ext, path + strlen(a));
+    /* init binds user 0 credential storage to /data/data. Resolve the
+     * directory itself and every non-app child to the same backing inode. */
+    if (path_under(path,"/data/user/0",12)) {
+        int n=snprintf(buf,bufsz,"%s/data/data%s",guest_root_dir(),path+12);
+        if(n<0 || (size_t)n>=bufsz){errno=ENAMETOOLONG;return nullptr;}
         return buf;
+    }
+
+    /* A volume root and app-private external directories are different
+     * mount points. Resolve the most specific Android mount before its root. */
+    static const char *const ext_alias[]={"/sdcard","/storage/emulated/0","/storage/self/primary","/mnt/sdcard","/storage/sdcard0"};
+    for(const char *alias:ext_alias){
+        if(!path_under(path,alias,strlen(alias)))continue;
+        const char *tail=path+strlen(alias),*pkg=lunaria_env("ANDROID_PACKAGE_NAME");
+        if(pkg && *pkg){
+            const char *patterns[]={"/Android/data/%s/files","/Android/data/%s/cache","/Android/obb/%s"};
+            const char *variables[]={"ANDROID_EXTERNAL_FILES_DIR","ANDROID_EXTERNAL_CACHE_DIR","ANDROID_EXTERNAL_OBB_DIR"};
+            for(unsigned i=0;i<3;++i){
+                char prefix[PATH_MAX];snprintf(prefix,sizeof prefix,patterns[i],pkg);
+                if(!path_under(tail,prefix,strlen(prefix)))continue;
+                const char *mount=lunaria_env(variables[i]);
+                if(mount && *mount){int n=snprintf(buf,bufsz,"%s%s",mount,tail+strlen(prefix));
+                    if(n<0 || (size_t)n>=bufsz){errno=ENAMETOOLONG;return nullptr;}return buf;}
+            }
+        }
+        const char *mount=lunaria_env("ANDROID_EXTERNAL_STORAGE_DIR");
+        if(mount && *mount){int n=snprintf(buf,bufsz,"%s%s",mount,tail);
+            if(n<0 || (size_t)n>=bufsz){errno=ENAMETOOLONG;return nullptr;}return buf;}
+        break; /* Unconfigured volumes remain in the confined device root. */
     }
 
     /* procfs has no host fallback, including Java and metadata operations. */
@@ -20860,13 +21040,31 @@ static const char *unmap_guest_file(const char *path,char *buf,size_t capacity)
     const char *extcache=lunaria_env("ANDROID_EXTERNAL_CACHE_DIR");
     const char *obb=lunaria_env("ANDROID_EXTERNAL_OBB_DIR");
     const char *app=guest_app_data_dir();
-    const char *roots[]={external,extcache,obb,app,guest_root_dir()};
-    for (unsigned i=0;i<5;++i) {
-        const char *root=roots[i];if (!root || !*root || !path_under(path,root,strlen(root))) continue;
-        const char *tail=path+strlen(root);int n;
-        if (i<2) n=snprintf(buf,capacity,"/storage/emulated/0/Android/data/%s/%s%s",pkg,i==0 ? "files" : "cache",tail);
-        else if (i==2) n=snprintf(buf,capacity,"/storage/emulated/0/Android/obb/%s%s",pkg,tail);
-        else if (i==3) n=snprintf(buf,capacity,"/data/data/%s%s",pkg,tail);
+    const char *roots[]={external,extcache,obb,app,guest_root_dir(),lunaria_env("ANDROID_EXTERNAL_STORAGE_DIR")};
+    int selected=-1;
+    size_t selected_length=0;
+    for (unsigned i=0;i<6;++i) {
+        const char *root=roots[i];
+        if (!root || !*root) continue;
+        /* Descriptor paths may be canonical while configured mounts contain
+         * symlinks. Compare all mounts in the same spelling as this path. */
+        char resolved[PATH_MAX];
+        if (!path_under(path,root,strlen(root))) {
+            if (!host_root_canonical(root,resolved,sizeof resolved) ||
+                !path_under(path,resolved,strlen(resolved))) continue;
+            root=resolved;
+        }
+        size_t length=strlen(root);
+        /* Like forward lookup, reverse lookup must prefer the most specific
+         * mount. A device root can be nested inside the app's backing tree. */
+        if (selected<0 || length>selected_length) {selected=(int)i;selected_length=length;}
+    }
+    if (selected>=0) {
+        const char *tail=path+selected_length;int n;
+        if (selected<2) n=snprintf(buf,capacity,"/storage/emulated/0/Android/data/%s/%s%s",pkg,selected==0 ? "files" : "cache",tail);
+        else if (selected==2) n=snprintf(buf,capacity,"/storage/emulated/0/Android/obb/%s%s",pkg,tail);
+        else if (selected==3) n=snprintf(buf,capacity,"/data/data/%s%s",pkg,tail);
+        else if(selected==5)n=snprintf(buf,capacity,"/storage/emulated/0%s",tail);
         else n=snprintf(buf,capacity,"%s",*tail ? tail : "/");
         if (n<0 || (size_t)n>=capacity) {errno=ENAMETOOLONG;return nullptr;}
         return buf;
@@ -20954,12 +21152,20 @@ static ptrdiff_t synth_proc_readlink(const char *path, char *out, size_t cap)
  * running Lunaria. Package ownership comes from the same ledger as JNI/pm. */
 static int guest_file_inode(const char *host,luna_file_info *info)
 {
+    /* The app's own data directory is the app's even when the device root
+     * happens to contain it (its name there is not /data/data/<pkg>). */
+    const char *data=guest_app_data_dir();
+    if (data && *data && path_under(host,data,strlen(data))) {
+        info->uid=info->gid=(unsigned)arm_exec_guest_uid();
+        return 1;
+    }
     char buf[PATH_MAX];const char *root=guest_root_dir();
     const char *path;
     if (path_under(host,root,strlen(root))) {
         const char *tail=host+strlen(root);path=*tail ? tail : "/";
     } else path=unmap_guest_file(host,buf,sizeof buf);
     if (!path || path==host) return 0;
+    if (luna_android_fs_inode(path,info)) return 1;
     const char *prefixes[]={"/data/data","/data/user/0","/data/user_de/0"};
     for (unsigned i=0;i<sizeof prefixes/sizeof prefixes[0];++i) {
         const char *prefix=prefixes[i];
@@ -20976,9 +21182,6 @@ static int guest_file_inode(const char *host,luna_file_info *info)
         struct lunaria_android_package record;
         info->uid=info->gid=lunaria_android_package_find(package,&record) ? (unsigned)record.uid : 0;
         return 1;
-    }
-    if (!strcmp(path,"/data") || !strcmp(path,"/data/user") || !strcmp(path,"/data/user_de")) {
-        info->uid=info->gid=1000;info->mode=(info->mode&~0777u)|0771u;return 1;
     }
     return 0;
 }
@@ -21028,6 +21231,21 @@ static const char *map_guest_mkdir_path(const char *path, char *buf, size_t capa
         return buf;
     }
     return mapped;
+}
+
+extern "C" const char *arm_exec_unmap_host_path(const char *path,char *buf,size_t capacity)
+{
+    return path ? unmap_guest_file(path,buf,capacity) : nullptr;
+}
+extern "C" const char *arm_exec_canonical_guest_path(const char *path,char *buf,size_t capacity)
+{
+    if(!path){errno=EFAULT;return nullptr;}
+    char initialized[PATH_MAX];(void)map_guest_path("/",initialized,sizeof initialized);
+    char absolute[PATH_MAX];
+    int n=path[0]=='/' ? snprintf(absolute,sizeof absolute,"%s",path) :
+       snprintf(absolute,sizeof absolute,"%s/%s",g_guest_cwd.load(std::memory_order_acquire),path);
+    if(n<0 || (size_t)n>=sizeof absolute){errno=ENAMETOOLONG;return nullptr;}
+    return luna_file_canonical_namespace(absolute,buf,capacity,map_guest_path_raw,unmap_guest_file);
 }
 
 extern "C" const char *arm_exec_map_guest_path(const char *path, char *buf,
@@ -23817,7 +24035,27 @@ static void fixup_host_sockaddr_for_guest(void *address, socklen_t length) {
 }
 #else
 static void fixup_guest_sockaddr(struct sockaddr_storage &, socklen_t) {}
-static void map_unix_socket_path(struct sockaddr_storage &, socklen_t &) {}
+/* A path socket is a file in the guest's Android namespace (Netmarble's nmss
+ * binds /data/data/<pkg>/files/nmss), so its name goes through the same
+ * guest-to-host mapping as open() and stat().  An abstract name has no file
+ * behind it and the host kernel has the same namespace, so it is left alone.
+ * The kernel rejects a path that does not fit sun_path, and so does this. */
+static void map_unix_socket_path(struct sockaddr_storage &ss, socklen_t &alen) {
+    if (ss.ss_family != AF_UNIX) return;
+    auto &un = *(struct sockaddr_un *)&ss;
+    const size_t head = offsetof(struct sockaddr_un, sun_path);
+    if (alen <= head || un.sun_path[0] == '\0') return;
+    char guest[sizeof un.sun_path + 1];
+    const size_t n = strnlen(un.sun_path, std::min<size_t>(alen - head, sizeof un.sun_path));
+    memcpy(guest, un.sun_path, n);
+    guest[n] = '\0';
+    char buf[PATH_MAX];
+    const char *host = map_guest_path(guest, buf, sizeof buf);
+    if (!host || strlen(host) >= sizeof un.sun_path) return;
+    memset(un.sun_path, 0, sizeof un.sun_path);
+    memcpy(un.sun_path, host, strlen(host));
+    alen = (socklen_t)(head + strlen(host) + 1);
+}
 static void clear_stale_unix_socket(const struct sockaddr_storage &, socklen_t) {}
 static void fixup_host_sockaddr_for_guest(void *, socklen_t) {}
 #endif
@@ -25980,6 +26218,20 @@ void guest_sleep_ns(uint64_t req_ns)
 }
 
 
+/* A retrying primitive needs its original argument registers after a wait.
+ * Sleep's normal callback completion writes a zero return value instead, so
+ * use a distinct wait kind when the SVC itself must be executed again. The
+ * direct main entrypoint has no suspended-thread driver and waits in place. */
+static bool guest_svc_retry_after_ns(uint64_t delay)
+{
+    const bool callback=ctx_innermost_is_cb();
+    if(!callback && !g_current_tid && !g_scheduling){guest_sleep_ns(delay);return true;}
+    guest_sleep_ns(delay);
+    if(callback)g_cb_lock_wait.kind=CbLockWait::RetrySleep;
+    g_svc_retry=true;return false;
+}
+
+
 static int run_arm(ArmExecCtx &ctx, uint32_t entry_va,
                    uint32_t r0_arg, uint32_t r1_arg,
                    uint32_t r2_arg, uint32_t r3_arg,
@@ -26718,6 +26970,28 @@ static void fast_svc_realloc(ArmExecCtx &ctx, std::array<uint64_t, 16> &regs)
     alloc_watch(addr, (uint32_t)want, (uint32_t)regs[14], "realloc");
     g_svc_retptr = true;
     regs[0] = addr;
+}
+
+/* Not adjacent to the four above, so they are tested by number in
+ * dispatch_svc; same reason, and the same body as their switch cases. */
+static void fast_svc_malloc_usable_size(ArmExecCtx &ctx, std::array<uint64_t, 16> &regs)
+{
+    /* arm_malloc lays a block out as {size at payload-8, ALLOC_MAGIC at
+     * payload-4}; an A64 payload is a 64-bit VA whose low half is the heap
+     * address, so the lookup is on the canonical address.  0 for a pointer the
+     * allocator does not own. */
+    const uint32_t va = ctx.is_arm64 ? a64_canon_va(g_svc_args64[0])
+                                     : (uint32_t)regs[0];
+    regs[0] = arm_malloc_usable_size(ctx, va);
+}
+
+static void fast_svc_memalign(ArmExecCtx &ctx, std::array<uint64_t, 16> &regs)
+{
+    const uint64_t align = ctx.is_arm64 ? g_svc_args64[0] : regs[0];
+    const uint64_t size  = ctx.is_arm64 ? g_svc_args64[1] : regs[1];
+    /* bionic memalign rounds arbitrary alignments up to a power of two. */
+    g_svc_retptr = true;
+    regs[0] = arm_memalign(ctx, align, size);
 }
 
 static const std::array<FastSvcHandler, 4> &fast_svc_table()
@@ -27679,6 +27953,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         fast[fast_index](ctx, regs);
         return;
     }
+    if (svc_no == SVC_MALLOC_USABLE_SIZE) { fast_svc_malloc_usable_size(ctx, regs); return; }
+    if (svc_no == SVC_MEMALIGN) { fast_svc_memalign(ctx, regs); return; }
 
     // Feed the A64 slice heuristic (see a64_is_wait_svc).
     /* Productive SVCs only.  sched_yield is what a spin *is*: a thread whose
@@ -28833,6 +29109,21 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 ret64((uint64_t)-(int64_t)e);
             }
         };
+        if (nr == (ctx.is_arm64 ? 50u : 133u)) {
+            raw_via_libc(SVC_FCHDIR);
+            break;
+        }
+        if (nr == (ctx.is_arm64 ? 55u : 207u) || (!ctx.is_arm64 && nr == 95u)) {
+            if (!ctx.is_arm64 && nr == 95u) {
+                /* Legacy ARM fchown has 16-bit IDs; fchown32 is number 207. */
+                for (unsigned i = 1; i <= 2; ++i) {
+                    const uint32_t id = (uint16_t)regs[i];
+                    regs[i] = id == 0xffffu ? UINT32_MAX : id;
+                }
+            }
+            raw_via_libc(SVC_FCHOWN);
+            break;
+        }
         if (nr == (ctx.is_arm64 ? 90u : 184u)) {
             raw_via_libc(SVC_CAPGET);
             break;
@@ -33909,6 +34200,16 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             const uint64_t now = host_mono_ns();
             sem_until_ns = rel > UINT64_MAX - now ? UINT64_MAX : now + rel;
         }
+        if (timed && lunaria_env("LUNARIA_TRACE_SEM_SITES")) {
+            /* Who sleeps where: one line per (thread, call site) as its count
+             * passes a power of two, with the requested timeout. */
+            static std::unordered_map<uint64_t, unsigned> sites;
+            unsigned n = ++sites[((uint64_t)g_current_tid << 32) | lr];
+            if ((n & (n - 1)) == 0)
+                fprintf(stderr, "[sem-site] tid=%u lr=0x%08x count=%u rel=%.3fms\n",
+                        g_current_tid, lr, n,
+                        (double)(sem_until_ns - host_mono_ns()) / 1e6);
+        }
         if (lunaria_env("LUNARIA_TRACE_SEM")) {
             static int en = 0;
             if (en++ < 200)
@@ -35087,145 +35388,221 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
 
-    // ---- AAudio (see SVC constant block for scope) ----
-
-    case SVC_AAUDIO_CREATE_BUILDER:
-        // AAudio_createStreamBuilder(AAudioStreamBuilder **builder)
-        fprintf(stderr, "[arm_exec] AAudio_createStreamBuilder tid=%u\n", g_current_tid);
-        if (!r0) { ret32((uint32_t)-1); break; }
-        g_aaudio_builder = AAudioStreamState{};   /* reset accumulated config */
-        if (ctx.is_arm64) ctx.mem.write64(argp_n(0), ARM_AAUDIO_BUILDER);
-        else ctx.mem.write32(r0, ARM_AAUDIO_BUILDER);
-        ret32(0u); break;
-    case SVC_AAUDIO_SET_DIRECTION:
-        g_aaudio_builder.input = (r1 == 1u);      /* AAUDIO_DIRECTION_INPUT */
-        ret32(0u); break;
-    case SVC_AAUDIO_SET_DATA_CB:
-        g_aaudio_builder.data_cb   = argp_n(1);
-        g_aaudio_builder.user_data = argp_n(2);
-        ret32(0u); break;
-    case SVC_AAUDIO_SET_FORMAT:
-        if ((int32_t)r1 > 0) g_aaudio_builder.format = r1;
-        ret32(0u); break;
-    case SVC_AAUDIO_SET_CHANNELS:
-        if ((int32_t)r1 > 0 && r1 <= 8u) g_aaudio_builder.channels = r1;
-        ret32(0u); break;
-    case SVC_AAUDIO_SET_RATE:
-        if ((int32_t)r1 > 0) g_aaudio_builder.sample_rate = r1;
-        ret32(0u); break;
-    case SVC_AAUDIO_SET_CALLBACK_FRAMES:
-        g_aaudio_builder.callback_frames = r1 ? (uint32_t)r1 : AAUDIO_BURST_FRAMES;
-        ret32(0u); break;
-    case SVC_AAUDIO_OPEN_STREAM: {
-        // AAudioStreamBuilder_openStream(builder, AAudioStream **stream)
-        if (!r1) { ret32((uint32_t)-1); break; }
-        if ((int32_t)g_aaudio_builder.callback_frames <= 0 ||
-            (uint64_t)g_aaudio_builder.callback_frames * g_aaudio_builder.channels * 4u > UINT32_MAX - 32u) {
-            ret32((uint32_t)-898); break;
+    // ---- AAudio: independent builders, negotiated streams and owned PCM ----
+    case SVC_AAUDIO_CREATE_BUILDER: {
+        if(!argp_n(0)){ret32((uint32_t)luna_aaudio::null_pointer);break;}
+        const uint32_t handle=arm_calloc(ctx,16);
+        if(!handle){ret32((uint32_t)luna_aaudio::no_memory);break;}
+        g_aaudio_builders.emplace(handle,luna_aaudio::Config{});
+        if(ctx.is_arm64)ctx.mem.write64(argp_n(0),a64_guest_va(handle));else ctx.mem.write32(r0,handle);
+        ret32(0);break;
+    }
+    case SVC_AAUDIO_DELETE_BUILDER: {
+        auto it=g_aaudio_builders.find((uint32_t)r0);
+        if(it==g_aaudio_builders.end()){ret32((uint32_t)luna_aaudio::invalid_handle);break;}
+        g_aaudio_builders.erase(it);arm_free(ctx,(uint32_t)r0);ret32(0);break;
+    }
+    case SVC_AAUDIO_SET_DIRECTION:case SVC_AAUDIO_SET_DATA_CB:
+    case SVC_AAUDIO_SET_FORMAT:case SVC_AAUDIO_SET_CHANNELS:
+    case SVC_AAUDIO_SET_RATE:case SVC_AAUDIO_SET_CALLBACK_FRAMES:
+    case SVC_AAUDIO_SET_SHARING:case SVC_AAUDIO_SET_PERFORMANCE:
+    case SVC_AAUDIO_SET_CAPACITY:case SVC_AAUDIO_SET_ERROR_CB:case SVC_AAUDIO_SET_DEVICE:
+    case SVC_AAUDIO_SET_USAGE:case SVC_AAUDIO_SET_CONTENT:case SVC_AAUDIO_SET_PRESET: {
+        auto it=g_aaudio_builders.find((uint32_t)r0);
+        if(it==g_aaudio_builders.end()){ret32((uint32_t)luna_aaudio::invalid_handle);break;}
+        auto &b=it->second;
+        switch(svc_no){
+        case SVC_AAUDIO_SET_DIRECTION:b.direction=(int32_t)r1;break;
+        case SVC_AAUDIO_SET_FORMAT:b.format=(int32_t)r1;break;
+        case SVC_AAUDIO_SET_CHANNELS:b.channels=(int32_t)r1;break;
+        case SVC_AAUDIO_SET_RATE:b.sample_rate=(int32_t)r1;break;
+        case SVC_AAUDIO_SET_CALLBACK_FRAMES:b.callback_frames=(int32_t)r1;break;
+        case SVC_AAUDIO_SET_SHARING:b.sharing=(int32_t)r1;break;
+        case SVC_AAUDIO_SET_PERFORMANCE:b.performance=(int32_t)r1;break;
+        case SVC_AAUDIO_SET_CAPACITY:b.capacity=(int32_t)r1;break;
+        case SVC_AAUDIO_SET_DEVICE:b.device=(int32_t)r1;break;
+        case SVC_AAUDIO_SET_USAGE:b.usage=(int32_t)r1;break;
+        case SVC_AAUDIO_SET_CONTENT:b.content_type=(int32_t)r1;break;
+        case SVC_AAUDIO_SET_PRESET:b.input_preset=(int32_t)r1;break;
+        case SVC_AAUDIO_SET_DATA_CB:b.data_cb=argp_n(1);b.user_data=argp_n(2);break;
+        case SVC_AAUDIO_SET_ERROR_CB:b.error_cb=argp_n(1);b.error_user=argp_n(2);break;
         }
-        uint32_t handle = ARM_AAUDIO_STREAM + 16u * g_aaudio_stream_count++;
-        g_aaudio_streams[handle] = g_aaudio_builder;
-        fprintf(stderr, "[arm_exec] AAudio openStream -> 0x%08x dir=%s cb=0x%llx "
-                "ch=%u fmt=%u rate=%u tid=%u\n",
-                handle, g_aaudio_builder.input ? "in" : "out",
-                (unsigned long long)g_aaudio_builder.data_cb, g_aaudio_builder.channels,
-                g_aaudio_builder.format, g_aaudio_builder.sample_rate, g_current_tid);
-        if (ctx.is_arm64) ctx.mem.write64(argp_n(1), handle);
-        else ctx.mem.write32(r1, handle);
-        ret32(0u); break;
+        ret32(0);break;
+    }
+    case SVC_AAUDIO_OPEN_STREAM: {
+        if(!argp_n(1)){ret32((uint32_t)luna_aaudio::null_pointer);break;}
+        if(ctx.is_arm64)ctx.mem.write64(argp_n(1),0);else ctx.mem.write32(r1,0);
+        auto it=g_aaudio_builders.find((uint32_t)r0);
+        if(it==g_aaudio_builders.end()){ret32((uint32_t)luna_aaudio::invalid_handle);break;}
+        AAudioStreamState stream(it->second);int error=stream.negotiate();
+        if(error){ret32((uint32_t)error);break;}
+        uint32_t handle=arm_calloc(ctx,16);if(!handle){ret32((uint32_t)luna_aaudio::no_memory);break;}
+        fprintf(stderr,"[aaudio] open 0x%x %d Hz %d ch format=%d capacity=%d callback=%d\n",handle,stream.sample_rate,stream.channels,stream.format,stream.capacity,stream.callback_frames);
+        g_aaudio_streams.emplace(handle,std::move(stream));
+        if(ctx.is_arm64)ctx.mem.write64(argp_n(1),a64_guest_va(handle));else ctx.mem.write32(r1,handle);
+        ret32(0);break;
     }
     case SVC_AAUDIO_START: {
-        auto it = g_aaudio_streams.find(r0);
-        if (it == g_aaudio_streams.end()) { ret32((uint32_t)-892); break; }
-        AAudioStreamState *stream = &it->second;
-        stream->started = true;
-        if (stream->data_cb && !stream->worker_tid) {
-            if (!stream->callback_args)
-                stream->callback_args = arm_calloc(ctx, (uint64_t)stream->callback_frames *
-                    stream->channels * (stream->format == 1u ? 2u : 4u) + 32u);
-            if (!stream->callback_args) {
-                stream->started = false;
-                ret32((uint32_t)-887); break;
+        auto it=g_aaudio_streams.find((uint32_t)r0);
+        if(it==g_aaudio_streams.end()){ret32((uint32_t)luna_aaudio::invalid_handle);break;}
+        auto &s=it->second;
+        if(s.state==luna_aaudio::started || s.state>=luna_aaudio::closing ||
+           (s.callback_pending && s.worker_tid==g_current_tid)){ret32((uint32_t)luna_aaudio::invalid_state);break;}
+        s.state=luna_aaudio::started;s.drain_on_stop=false;s.next_due_ns=host_mono_ns();
+        if(s.data_cb && !s.worker_tid){
+            uint64_t bytes=(uint64_t)(uint32_t)s.callback_frames*(uint32_t)s.channels*s.sample_bytes()+32;
+            if(bytes>UINT32_MAX || (!s.callback_args && !(s.callback_args=arm_calloc(ctx,bytes)))){
+                s.state=luna_aaudio::stopped;ret32((uint32_t)luna_aaudio::no_memory);break;
             }
-            stream->next_due_ns = host_mono_ns();
-            int error = guest_pthread_create(ctx, 0, 0,
-                ctx.is_arm64 ? a64_guest_va(AAUDIO_CALLBACK_STUB) : AAUDIO_CALLBACK_STUB,
-                r0, lr, true, &stream->worker_tid);
-            if (error) { stream->started = false; ret32((uint32_t)-896); break; }
-            thread_name_set(stream->worker_tid, "AAudioCallback");
+            int error=guest_pthread_create(ctx,0,0,ctx.is_arm64 ? a64_guest_va(AAUDIO_CALLBACK_STUB) : AAUDIO_CALLBACK_STUB,
+                ctx.is_arm64 ? a64_guest_va((uint32_t)r0) : (uint32_t)r0,lr,true,&s.worker_tid);
+            if(error){s.state=luna_aaudio::stopped;ret32((uint32_t)luna_aaudio::no_handles);break;}
+            thread_name_set(s.worker_tid,"AAudioCallback");
         }
-        fprintf(stderr, "[arm_exec] AAudioStream_requestStart 0x%08" PRIx64 " %s tid=%u\n",
-                r0, it != g_aaudio_streams.end() ? "ok" : "unknown", g_current_tid);
-        ret32(0u); break;
+        ret32(0);break;
     }
     case SVC_AAUDIO_CALLBACK_WAIT: {
-        /* The wrapper belongs to an ordinary guest pthread. Blocking inside
-         * the callback parks that thread, leaving the UI pump and other audio
-         * streams runnable. No host callback or borrowed thread identity. */
-        auto it = g_aaudio_streams.find((uint32_t)r0);
-        ArmThread *thread = arm_thread_by_tid(g_current_tid);
-        if (it == g_aaudio_streams.end() || !thread ||
-            it->second.worker_tid != g_current_tid) { ret_pair(0, 0); break; }
-        AAudioStreamState *stream = &it->second;
-        if (stream->callback_pending) {
-            stream->callback_pending = false;
-            if ((int32_t)r1 == 1) stream->started = false;
+      aaudio_callback_retry:
+        auto it=g_aaudio_streams.find((uint32_t)r0);
+        ArmThread *thread=arm_thread_by_tid(g_current_tid);
+        if(it==g_aaudio_streams.end() || !thread || it->second.worker_tid!=g_current_tid){ret_pair(0,0);break;}
+        auto &s=it->second;
+        if(s.state!=luna_aaudio::started){s.callback_pending=false;s.worker_tid=0;ret_pair(0,0);break;}
+        if(s.callback_pending){
+            if((int32_t)r1!=0){s.callback_pending=false;s.state=luna_aaudio::stopping;s.drain_on_stop=true;s.worker_tid=0;s.update_state(host_mono_ns());ret_pair(0,0);break;}
+            if(s.available()<(uint32_t)s.callback_frames){
+                if(guest_svc_retry_after_ns(1000000))goto aaudio_callback_retry;break;
+            }
+            s.enqueue(ctx.mem.ptr(s.callback_args+32u),(uint32_t)s.callback_frames);
+            s.callback_pending=false;
         }
-        if (!stream->started) {
-            stream->worker_tid = 0;
-            ret_pair(0, 0); break;
+        uint64_t now=host_mono_ns();
+        if(now<s.next_due_ns || s.available()<(uint32_t)s.callback_frames){
+            uint64_t delay=now<s.next_due_ns ? s.next_due_ns-now : 1000000;
+            if(guest_svc_retry_after_ns(delay))goto aaudio_callback_retry;break;
         }
-        uint64_t now = host_mono_ns();
-        if (now < stream->next_due_ns) {
-            thread->sleep_until_ns = stream->next_due_ns;
-            sleep_heap_push(g_current_tid, stream->next_due_ns);
-            g_svc_retry = true;
-            g_yield_requested = true;
-            break;
+        const uint32_t base=s.callback_args,word=ctx.is_arm64 ? 8u : 4u;
+        const uint64_t values[4]={ctx.is_arm64 ? a64_guest_va((uint32_t)r0) : (uint32_t)r0,s.user_data,
+            ctx.is_arm64 ? a64_guest_va(base+32u) : base+32u,(uint32_t)s.callback_frames};
+        for(unsigned i=0;i<4;++i){if(ctx.is_arm64)ctx.mem.write64(base+i*word,values[i]);else ctx.mem.write32(base+i*word,(uint32_t)values[i]);}
+        memset(ctx.mem.ptr(base+32u),0,(size_t)(uint32_t)s.callback_frames*(uint32_t)s.channels*s.sample_bytes());
+        s.callback_pending=true;s.next_due_ns=now+(uint64_t)(uint32_t)s.callback_frames*1000000000u/(uint32_t)s.sample_rate;
+        ret_pair(s.data_cb,ctx.is_arm64 ? a64_guest_va(base) : base);break;
+    }
+    case SVC_AAUDIO_STOP:case SVC_AAUDIO_PAUSE:case SVC_AAUDIO_FLUSH:case SVC_AAUDIO_CLOSE: {
+      aaudio_control_retry:
+        auto it=g_aaudio_streams.find((uint32_t)r0);
+        if(it==g_aaudio_streams.end()){ret32((uint32_t)luna_aaudio::invalid_handle);break;}
+        auto &s=it->second;
+        if(s.callback_pending && s.worker_tid==g_current_tid){ret32((uint32_t)luna_aaudio::invalid_state);break;}
+        if((svc_no==SVC_AAUDIO_PAUSE && (s.state==luna_aaudio::stopping || s.state==luna_aaudio::flushing)) ||
+           (svc_no==SVC_AAUDIO_STOP && (s.state==luna_aaudio::pausing || s.state==luna_aaudio::flushing))){
+            ret32((uint32_t)luna_aaudio::invalid_state);break;
         }
-        const uint32_t base = stream->callback_args;
-        const uint32_t word = ctx.is_arm64 ? 8u : 4u;
-        const uint64_t values[4] = {(uint32_t)r0, stream->user_data,
-            ctx.is_arm64 ? a64_guest_va(base + 32u) : base + 32u, stream->callback_frames};
-        for (unsigned i = 0; i < 4; ++i) {
-            if (ctx.is_arm64) ctx.mem.write64(base + i * word, values[i]);
-            else ctx.mem.write32(base + i * word, (uint32_t)values[i]);
+        if(svc_no==SVC_AAUDIO_FLUSH){
+            if(s.state!=luna_aaudio::open && s.state!=luna_aaudio::paused && s.state!=luna_aaudio::stopped && s.state!=luna_aaudio::flushed){ret32((uint32_t)luna_aaudio::invalid_state);break;}
+            s.clear();s.state=luna_aaudio::flushed;ret32(0);break;
         }
-        memset(ctx.mem.ptr(base + 32u), 0, (size_t)stream->callback_frames *
-            stream->channels * (stream->format == 1u ? 2u : 4u));
-        stream->callback_pending = true;
-        stream->next_due_ns = now + (uint64_t)stream->callback_frames * 1000000000u / stream->sample_rate;
-        ret_pair(stream->data_cb, ctx.is_arm64 ? a64_guest_va(base) : base);
+        if(s.state>=luna_aaudio::closing && svc_no!=SVC_AAUDIO_CLOSE){ret32((uint32_t)luna_aaudio::invalid_state);break;}
+        if(svc_no==SVC_AAUDIO_STOP && s.state!=luna_aaudio::stopping)s.drain_on_stop=s.state==luna_aaudio::started || s.state==luna_aaudio::starting;
+        s.state=svc_no==SVC_AAUDIO_CLOSE ? luna_aaudio::closing : svc_no==SVC_AAUDIO_PAUSE ? luna_aaudio::pausing : luna_aaudio::stopping;
+        if(s.worker_tid){
+            ArmThread *worker=arm_thread_by_tid(s.worker_tid);
+            if(!worker || worker->finished){s.worker_tid=0;s.callback_pending=false;}
+            else{
+                if(!s.callback_pending){worker->sleep_until_ns=0;sleep_heap_remove(worker->id);thread_mark_ready(worker->id);}
+                if(guest_svc_retry_after_ns(1000000))goto aaudio_control_retry;break;
+            }
+        }
+        if(svc_no==SVC_AAUDIO_CLOSE){
+            if(s.callback_args)arm_free(ctx,s.callback_args);
+            g_aaudio_streams.erase(it);arm_free(ctx,(uint32_t)r0);
+        }else{
+            s.state=svc_no==SVC_AAUDIO_PAUSE ? luna_aaudio::paused : luna_aaudio::stopping;
+            s.update_state(host_mono_ns());
+        }
+        ret32(0);break;
+    }
+    case SVC_AAUDIO_GET_FPB:case SVC_AAUDIO_GET_BUFSIZE:case SVC_AAUDIO_SET_BUFSIZE:
+    case SVC_AAUDIO_GET_BUFCAP:case SVC_AAUDIO_GET_FORMAT:case SVC_AAUDIO_GET_RATE:
+    case SVC_AAUDIO_GET_CHANNELS:case SVC_AAUDIO_GET_DIRECTION:case SVC_AAUDIO_GET_STATE:
+    case SVC_AAUDIO_GET_SHARING:case SVC_AAUDIO_GET_PERFORMANCE:case SVC_AAUDIO_GET_DEVICE:
+    case SVC_AAUDIO_GET_CALLBACK_FRAMES:case SVC_AAUDIO_GET_WRITTEN:case SVC_AAUDIO_GET_READ:
+    case SVC_AAUDIO_GET_XRUN:case SVC_AAUDIO_IS_MMAP:
+    case SVC_AAUDIO_GET_USAGE:case SVC_AAUDIO_GET_CONTENT:case SVC_AAUDIO_GET_PRESET: {
+        auto it=g_aaudio_streams.find((uint32_t)r0);
+        if(it==g_aaudio_streams.end()){ret32((uint32_t)luna_aaudio::invalid_handle);break;}
+        auto &s=it->second;s.update_state(host_mono_ns());int value=0;
+        switch(svc_no){
+        case SVC_AAUDIO_GET_FPB:value=(int)s.burst;break;
+        case SVC_AAUDIO_GET_BUFSIZE:value=(int)s.buffer_size;break;
+        case SVC_AAUDIO_SET_BUFSIZE:value=s.resize((int32_t)r1);break;
+        case SVC_AAUDIO_GET_BUFCAP:value=s.capacity;break;
+        case SVC_AAUDIO_GET_FORMAT:value=s.format;break;
+        case SVC_AAUDIO_GET_RATE:value=s.sample_rate;break;
+        case SVC_AAUDIO_GET_CHANNELS:value=s.channels;break;
+        case SVC_AAUDIO_GET_DIRECTION:value=s.direction;break;
+        case SVC_AAUDIO_GET_STATE:value=s.state;break;
+        case SVC_AAUDIO_GET_SHARING:value=s.sharing;break;
+        case SVC_AAUDIO_GET_PERFORMANCE:value=s.performance;break;
+        case SVC_AAUDIO_GET_DEVICE:value=s.device;break;
+        case SVC_AAUDIO_GET_USAGE:value=s.usage;break;
+        case SVC_AAUDIO_GET_CONTENT:value=s.content_type;break;
+        case SVC_AAUDIO_GET_PRESET:value=s.input_preset;break;
+        case SVC_AAUDIO_GET_CALLBACK_FRAMES:value=s.callback_frames;break;
+        case SVC_AAUDIO_GET_WRITTEN:ret64(s.frames_written);break;
+        case SVC_AAUDIO_GET_READ:ret64(s.frames_read);break;
+        case SVC_AAUDIO_GET_XRUN:value=s.xruns;break;
+        case SVC_AAUDIO_IS_MMAP:value=0;break; // the host sink is a copied shared ring
+        }
+        if(svc_no!=SVC_AAUDIO_GET_WRITTEN && svc_no!=SVC_AAUDIO_GET_READ)ret32((uint32_t)value);
         break;
     }
-    case SVC_AAUDIO_STOP: {
-        auto it = g_aaudio_streams.find(r0);
-        if (it != g_aaudio_streams.end()) it->second.started = false;
-        ret32(0u); break;
-    }
-    case SVC_AAUDIO_GET_FPB:
-        // 480 frames/burst = 10 ms @ 48 kHz, a typical device value
-        ret32(480u); break;
-    case SVC_AAUDIO_GET_BUFSIZE:
-        ret32(1920u); break;
-    case SVC_AAUDIO_SET_BUFSIZE:
-        // returns the actual size set (or negative error)
-        ret32(r1); break;
-    case SVC_AAUDIO_GET_BUFCAP:
-        ret32(3840u); break;
     case SVC_AAUDIO_WAIT_STATE: {
-        // AAudioStream_waitForStateChange(stream, inputState, *nextState, timeoutNs).
-        uint32_t in = r1, next;
-        switch (in) {
-        case 3u:  next = 4u;  break;   /* STARTING -> STARTED */
-        case 5u:  next = 6u;  break;   /* PAUSING -> PAUSED */
-        case 7u:  next = 8u;  break;   /* FLUSHING -> FLUSHED */
-        case 9u:  next = 10u; break;   /* STOPPING -> STOPPED */
-        case 11u: next = 12u; break;   /* CLOSING -> CLOSED */
-        default:  next = 2u;  break;   /* -> OPEN */
+      aaudio_state_retry:
+        auto it=g_aaudio_streams.find((uint32_t)r0);
+        if(it==g_aaudio_streams.end()){g_aaudio_waits.erase(g_current_tid);ret32((uint32_t)luna_aaudio::invalid_handle);break;}
+        if(!argp_n(2)){ret32((uint32_t)luna_aaudio::null_pointer);break;}
+        it->second.update_state(host_mono_ns());int32_t current=it->second.state;ctx.mem.write32(argp_n(2),(uint32_t)current);
+        if(current!=(int32_t)r1){g_aaudio_waits.erase(g_current_tid);ret32(0);break;}
+        int64_t duration=ctx.is_arm64 ? (int64_t)g_svc_args64[3] : (int64_t)((uint64_t)arg32(4)|(uint64_t)arg32(5)<<32);
+        if(duration<=0){g_aaudio_waits.erase(g_current_tid);ret32((uint32_t)luna_aaudio::timeout);break;}
+        uint64_t now=host_mono_ns();auto &wait=g_aaudio_waits[g_current_tid];
+        if(wait.stream!=(uint32_t)r0 || wait.state!=(int32_t)r1){wait={(uint32_t)r0,(int32_t)r1,now+std::min((uint64_t)duration,UINT64_MAX-now),0};}
+        if(now>=wait.deadline){g_aaudio_waits.erase(g_current_tid);ret32((uint32_t)luna_aaudio::timeout);break;}
+        if(guest_svc_retry_after_ns(std::min<uint64_t>(wait.deadline-now,1000000)))goto aaudio_state_retry;break;
+    }
+    case SVC_AAUDIO_WRITE: {
+      aaudio_write_retry:
+        auto it=g_aaudio_streams.find((uint32_t)r0);
+        if(it==g_aaudio_streams.end()){g_aaudio_waits.erase(g_current_tid);ret32((uint32_t)luna_aaudio::invalid_handle);break;}
+        auto &s=it->second;
+        if(s.state>=luna_aaudio::closing || s.data_cb){ret32((uint32_t)luna_aaudio::invalid_state);break;}
+        if((int32_t)r2<0){ret32((uint32_t)luna_aaudio::illegal);break;}
+        if(!r2){ret32(0);break;}
+        if(!argp_n(1)){ret32((uint32_t)luna_aaudio::null_pointer);break;}
+        int64_t duration=ctx.is_arm64 ? (int64_t)g_svc_args64[3] : (int64_t)((uint64_t)arg32(4)|(uint64_t)arg32(5)<<32);
+        auto &wait=g_aaudio_waits[g_current_tid];uint64_t now=host_mono_ns();
+        if(wait.stream!=(uint32_t)r0 || wait.state!=INT32_MIN){wait={(uint32_t)r0,INT32_MIN,now+(duration>0 ? std::min((uint64_t)duration,UINT64_MAX-now) : 0),0};}
+        uint64_t offset=(uint64_t)wait.transferred*(uint32_t)s.channels*s.sample_bytes();
+        int n=s.enqueue(ctx.mem.ptr(argp_n(1)+offset),(uint32_t)r2-wait.transferred);
+        if(n<0){g_aaudio_waits.erase(g_current_tid);ret32((uint32_t)n);break;}
+        wait.transferred+=(uint32_t)n;
+        if(wait.transferred==r2 || duration<=0 || now>=wait.deadline){
+            uint32_t count=wait.transferred;g_aaudio_waits.erase(g_current_tid);ret32(count);break;
         }
-        if (r2) ctx.mem.write32(r2, next);
-        ret32(0u); break;
+        if(guest_svc_retry_after_ns(std::min<uint64_t>(wait.deadline-now,1000000)))goto aaudio_write_retry;break;
+    }
+    case SVC_AAUDIO_READ:
+        ret32((uint32_t)(g_aaudio_streams.count((uint32_t)r0) ? luna_aaudio::unimplemented : luna_aaudio::invalid_handle));break;
+    case SVC_AAUDIO_TIMESTAMP: {
+        auto it=g_aaudio_streams.find((uint32_t)r0);
+        if(it==g_aaudio_streams.end()){ret32((uint32_t)luna_aaudio::invalid_handle);break;}
+        if(r1!=1 && r1!=7){ret32((uint32_t)luna_aaudio::illegal);break;}
+        if(!argp_n(2) || !argp_n(3)){ret32((uint32_t)luna_aaudio::null_pointer);break;}
+        /* The host exposes queued frames, not DAC presentation timestamps.
+         * An estimated wall-clock position must not masquerade as one. */
+        ret32((uint32_t)(it->second.state==luna_aaudio::started ? luna_aaudio::unavailable : luna_aaudio::invalid_state));break;
     }
     case SVC_GETAUXVAL: {
         /* getauxval(type). The host's own auxv describes an x86-64 process, so it is
@@ -35404,7 +35781,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         // Present always needs the window surface current on this context.
         egl_ensure_window_surface_current();
-        if (g_glfw) glfwPollEvents();
+        poll_glfw_events();
         if (g_guest_egl_swap_count <= 2)
             gl_sample_fbos_at_present();
         /* Present, and everything the emulator composites into it, is host GL and
@@ -35479,6 +35856,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         ret32((uint32_t)egl_host_destroy_context(r1));
         break;
     case SVC_EGL_TERMINATE:   ret32(EGL_TRUE); break;
+    case SVC_EGL_WAIT_CLIENT:
+        ret32(eglWaitClient());
+        break;
     case SVC_EGL_SWAPINTERVAL: {
         g_guest_swap_interval = (int)(int32_t)r1 < 0 ? 0 : (int)(int32_t)r1;
         EGLBoolean ok = (g_egl_dpy != EGL_NO_DISPLAY)
@@ -36007,6 +36387,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_GL_DepthFunc:
         if (pfn_glDepthFunc) pfn_glDepthFunc((GLenum)r0); break;
     case SVC_GL_DepthMask:
+        g_gl_depth_mask_by_ctx[g_egl_bound_handle] = (GLboolean)(r0 != 0);
         if (pfn_glDepthMask) pfn_glDepthMask((GLboolean)r0); break;
     case SVC_GL_ColorMask:
         if (pfn_glColorMask) pfn_glColorMask((GLboolean)r0,(GLboolean)r1,(GLboolean)r2,(GLboolean)r3); break;
@@ -37343,6 +37724,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             std::memcpy(ctx.mem.ptr(r1), &value, sizeof value);
             break;
         }
+        if (r1 && (GLenum)r0 == GL_DEPTH_WRITEMASK) {
+            auto it = g_gl_depth_mask_by_ctx.find(g_egl_bound_handle);
+            const GLboolean value = it == g_gl_depth_mask_by_ctx.end() ? GL_TRUE : it->second;
+            std::memcpy(ctx.mem.ptr(r1), &value, sizeof value);
+            break;
+        }
         if (pfn_glGetBooleanv && r1) pfn_glGetBooleanv((GLenum)r0,(GLboolean*)ctx.mem.ptr(r1)); break;
     }
     case SVC_GL_IsEnabled:
@@ -37366,6 +37753,25 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (pfn_glBlendColor) pfn_glBlendColor(rf(r0),rf(r1),rf(r2),rf(r3)); break;
     case SVC_GL_ReleaseShaderCompiler:
         if (pfn_glReleaseShaderCompiler) pfn_glReleaseShaderCompiler(); break;
+    case SVC_GLES1_UNSUPPORTED: {
+        static int reported = 0;
+        if (reported++ < 8)
+            fprintf(stderr, "[gl] GLES 1.x fixed-function call ignored (not emulated), lr=0x%08x\n", lr);
+        break;
+    }
+    case SVC_GL_ShaderBinary: {
+        // r0=count r1=shaders_va r2=binaryformat arg3=binary_va arg4=length
+        if (pfn_glShaderBinary) {
+            const GuestVA shaders_p = argp(1), bin_p = argp(3);
+            ArmLockDropped gl_unlocked;
+            pfn_glShaderBinary((GLsizei)r0,
+                shaders_p ? (const GLuint*)ctx.mem.ptr(shaders_p) : nullptr,
+                (GLenum)r2,
+                bin_p ? (const void*)ctx.mem.ptr(bin_p) : nullptr,
+                (GLsizei)arg32(4));
+        }
+        break;
+    }
     case SVC_GL_GetShaderPrecisionFormat: {
         // r0=shadertype r1=precisiontype r2=range_va r3=precision_va
         if (pfn_glGetShaderPrecisionFormat)
@@ -40092,11 +40498,42 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         arm_set_errno(ctx, EPERM);
         ret32(~0u);
         break;
-    case SVC_SYSPROP_FIND_NTH:
-        /* The property table is a lookup by name, not a list: there is no
-         * n-th entry to hand out, which is what a NULL answer means. */
-        if (ctx.is_arm64) ret64(0); else ret32(0);
+    case SVC_SYSPROP_FIND_NTH: {
+        GuestVA handle = 0;
+        uint32_t index = 0;
+        for (size_t i = 0; const char *name = lunaria_android_property_name(i); ++i) {
+            if (!sysprop_exists(ctx, name)) continue;
+            if (index++ == (uint32_t)r0) { handle = sysprop_find_or_create(ctx, name); break; }
+        }
+        if (ctx.is_arm64) ret64(handle); else ret32((uint32_t)handle);
         break;
+    }
+    case SVC_SYSPROP_FOREACH: {
+        const GuestVA cb = argp(0), cookie = argp(1);
+        if (!cb) { arm_set_errno(ctx, EINVAL); ret32(~0u); break; }
+        /* Snapshot handles before entering guest code: callbacks may call find,
+         * read_callback or foreach again and grow the property backing table. */
+        std::vector<GuestVA> handles;
+        bool failed = false;
+        for (size_t i = 0; const char *name = lunaria_android_property_name(i); ++i) {
+            if (!sysprop_exists(ctx, name)) continue;
+            const GuestVA handle = sysprop_find_or_create(ctx, name);
+            if (!handle) { failed = true; break; }
+            handles.push_back(handle);
+        }
+        if (failed) { arm_set_errno(ctx, ENOMEM); ret32(~0u); break; }
+        for (GuestVA handle : handles) {
+            if (ctx.is_arm64) {
+                g_cb_lr_override = 0;
+                (void)call_guest_cb64(ctx, cb, handle, cookie, 0, 0, nullptr, 0);
+            } else {
+                (void)call_guest_cb(ctx, (uint32_t)cb, (uint32_t)handle,
+                                    (uint32_t)cookie, 0, 0);
+            }
+        }
+        ret32(0);
+        break;
+    }
     case SVC_CACHEFLUSH: {
         int error = guest_cacheflush(ctx, (uint32_t)argp(0), (uint32_t)argp(1), arg32(2));
         if (error) arm_set_errno(ctx, error);
@@ -40320,6 +40757,67 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_GET_H_ERRNO: {
         /* `int *__get_h_errno(void)` — the cell h_errno expands to. */
         retptr(h_errno_va(ctx, g_current_tid));
+        break;
+    }
+    case SVC_FCHOWN: {
+        /* An Android app has neither CAP_CHOWN nor CAP_FSETID. Check the
+         * modeled inode owner, not the host account owning its backing file.
+         * This process's primary group is its app uid; no supplementary groups
+         * are currently installed in the guest credential model. */
+        const int fd = (int)(int32_t)argp(0);
+        const uint32_t owner = (uint32_t)argp(1), group = (uint32_t)argp(2);
+        luna_file_info info;
+        if (luna_file_fd_info(fd, &info) != 0) {
+            arm_set_errno(ctx, errno); ret32(~0u); break;
+        }
+        const uint32_t uid = (uint32_t)arm_exec_guest_uid();
+        if (info.uid != uid || (owner != UINT32_MAX && owner != uid) ||
+            (group != UINT32_MAX && group != uid)) {
+            arm_set_errno(ctx, EPERM); ret32(~0u); break;
+        }
+        /* Projected app inodes share their owner's primary group. A host
+         * scratch inode is not silently reassigned to an Android principal. */
+        if (group != UINT32_MAX && info.gid != group) {
+            arm_set_errno(ctx, EPERM); ret32(~0u); break;
+        }
+        unsigned mode = info.mode & 07777u;
+        if ((info.mode & 0170000u) == 0100000u) {
+            mode &= ~04000u;
+            if (mode & 0010u) mode &= ~02000u;
+        }
+        /* A successful ownership operation updates ctime and strips privilege
+         * bits on regular files, even when uid/gid themselves are unchanged. */
+        /* Ownership is modeled, not stored, so the host only has to drop the
+         * privilege bits.  A filesystem without Unix modes (exFAT, FAT, NTFS
+         * mounts) refuses the chmod or has nothing to drop: that is not an
+         * ownership failure. */
+        if (mode != (info.mode & 07777u)) {
+            const int rc = luna_file_fd_chmod(fd, mode);
+            if (rc < 0 && errno != EPERM && errno != ENOTSUP && errno != EINVAL) {
+                arm_set_errno(ctx, errno); ret32(~0u); break;
+            }
+        }
+        ret32(0);
+        break;
+    }
+    case SVC_FCHDIR: {
+        const int fd = (int)(int32_t)r0;
+        struct stat st;
+        if (fstat(fd, &st) != 0) {
+            arm_set_errno(ctx, errno); ret32(~0u); break;
+        }
+        if (!S_ISDIR(st.st_mode)) {
+            arm_set_errno(ctx, ENOTDIR); ret32(~0u); break;
+        }
+        char link[64], path[PATH_MAX];
+        snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+        const ptrdiff_t n = synth_proc_readlink(link, path, sizeof path - 1);
+        if (n < 0) { arm_set_errno(ctx, errno); ret32(~0u); break; }
+        path[n] = 0;
+        char *cwd = strdup(path);
+        if (!cwd) { arm_set_errno(ctx, ENOMEM); ret32(~0u); break; }
+        g_guest_cwd.store(cwd, std::memory_order_release);
+        ret32(0);
         break;
     }
     case SVC_CHDIR: {
@@ -41392,19 +41890,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_RET0: ret32(0); break;
 
     case SVC_EGL_BIND_API: ret32(1u); break; /* EGL_TRUE / MB_CUR_MAX stand-in */
-    case SVC_MALLOC_USABLE_SIZE: {
-        /* malloc_usable_size(p): how much of p the allocator will honour, and 0 for
-         * a pointer it does not own. arm_malloc lays a block out as {size at
-         * payload-8, ALLOC_MAGIC at payload-4}, so the size is read from payload-8;
-         * allocators layered on top size their copy from this (Unity's
-         * MemoryManager::Reallocate does), and a wrong length would corrupt a grown
-         * array. The range test has to be done on the canonical address: an A64
-         * payload is a 64-bit VA whose low half is the heap address. */
-        const uint32_t va = ctx.is_arm64 ? a64_canon_va(g_svc_args64[0])
-                                         : (uint32_t)r0;
-        ret32(arm_malloc_usable_size(ctx, va));
-        break;
-    }
+    /* malloc_usable_size and memalign: fast path at the top of dispatch_svc. */
     case SVC_ZLIB_VERSION: {
         static const char ver[] = "1.2.11";
         memcpy(ctx.mem.ptr(STR_SCRATCH), ver, sizeof ver);
@@ -41496,13 +41982,15 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 }
             }
         }
+        /* One record serves every module: the callback gets it by pointer for the
+         * duration of its call, and each pass rewrites every field. */
+        const uint32_t info_backing = arm_malloc(ctx, info_size);
+        if (!info_backing) { ret32((uint32_t)-1); break; }
+        const GuestVA info = ctx.is_arm64 ? a64_guest_va(info_backing)
+                                          : (GuestVA)info_backing;
         for (const auto &m : g_module_phdrs) {
             if (m.process_pid != guest_pid()) continue;
             if (m.is_64 != ctx.is_arm64) continue;
-            uint32_t info_backing = arm_malloc(ctx, info_size);
-            if (!info_backing) { callback_rc = -1; break; }
-            GuestVA info = ctx.is_arm64 ? a64_guest_va(info_backing)
-                                        : (GuestVA)info_backing;
             memset(ctx.mem.ptr(info), 0, info_size);
             if (ctx.is_arm64) {
                 ctx.mem.write64(info + 0u, m.load_bias);
@@ -41533,9 +42021,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                         ctx.mem.cstr(m.name_va) ?: "?",
                         (unsigned long long)m.load_bias,
                         (unsigned long long)m.phdr_va, m.phnum, callback_rc);
-            arm_free(ctx, info_backing);
             if (callback_rc != 0) break; /* POSIX/bionic early-stop contract */
         }
+        arm_free(ctx, info_backing);
         ret32((uint32_t)callback_rc);
         break;
     }
@@ -43771,11 +44259,15 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                                            : ctx.mem.read32(regs[13]);
         ++g_gl_draw_count;
         gl_restore_texture_units();
+        auto draw = (decltype(pfn_glDrawElementsBaseVertex))host_gl_promoted_proc(
+            "glDrawElementsBaseVertex", 3, 2,
+            {{"glDrawElementsBaseVertexEXT", "GL_EXT_draw_elements_base_vertex"},
+             {"glDrawElementsBaseVertexOES", "GL_OES_draw_elements_base_vertex"}});
         {
             const void *idx = gl_index_source(r3);
-            if (pfn_glDrawElementsBaseVertex && gl_index_valid) {
+            if (draw && gl_index_valid) {
                 ArmLockDropped gl_unlocked; /* same as glDrawElements */
-                pfn_glDrawElementsBaseVertex((GLenum)r0,(GLsizei)r1,(GLenum)r2,
+                draw((GLenum)r0,(GLsizei)r1,(GLenum)r2,
                                              idx, (GLint)basevertex);
             }
         }
@@ -43784,7 +44276,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             fprintf(stderr, "[gl] DrawElementsBaseVertex#%llu mode=0x%" PRIx64 " count=%d "
                     "type=0x%" PRIx64 " idx=0x%" PRIx64 " base=%d err=0x%x pfn=%d\n",
                     (unsigned long long)g_gl_draw_count, r0, (int)r1, r2, r3,
-                    (int)basevertex, e, pfn_glDrawElementsBaseVertex ? 1 : 0);
+                    (int)basevertex, e, draw ? 1 : 0);
             gldraw_dump_state();
         }
         break;
@@ -44809,9 +45301,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         typedef void (*pfn_t)(GLuint, GLenum, GLint, GLint, GLint, GLint,
                               GLuint, GLenum, GLint, GLint, GLint, GLint,
                               GLsizei, GLsizei, GLsizei);
-        static pfn_t f = (pfn_t)host_gl_proc({"glCopyImageSubData",
-                                              "glCopyImageSubDataEXT",
-                                              "glCopyImageSubDataOES"});
+        pfn_t f = (pfn_t)host_gl_promoted_proc("glCopyImageSubData", 3, 2,
+            {{"glCopyImageSubDataEXT", "GL_EXT_copy_image"},
+             {"glCopyImageSubDataOES", "GL_OES_copy_image"}});
         /* Arguments 5..15. Under AAPCS64 the first eight are in x0..x7, so reading
          * them all off the stack the way armeabi does would hand the driver whatever
          * the guest happened to leave there. */
@@ -45283,9 +45775,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
          * Share file I/O and kernel signal operations with raw svc#0, then
          * translate the kernel's -errno to libc -1/errno. In particular the
          * action/mask here use the kernel structure, not libc's sigaction. */
-        if ((ctx.is_arm64 && (nr==129u || nr==63u || nr==64u || nr==57u || nr==90u ||
+        if ((ctx.is_arm64 && (nr==50u || nr==55u || nr==129u || nr==63u || nr==64u || nr==57u || nr==90u ||
                               nr==131u || nr==134u || nr==135u)) ||
-            (!ctx.is_arm64 && (nr==3u || nr==4u || nr==6u || nr==184u ||
+            (!ctx.is_arm64 && (nr==95u || nr==133u || nr==207u || nr==3u || nr==4u || nr==6u || nr==184u ||
                                nr==90u || nr==91u || nr==125u || nr==192u ||
                                nr==37u || nr==174u || nr==175u || nr==268u))) {
             const auto saved_args=g_svc_args64;
@@ -45772,6 +46264,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         const GuestVA cookie = argp(2);
         const GuestSysProp *prop = sysprop_from_handle(handle);
         if (!prop || !cb) { ret32(0); break; }
+        const GuestSysProp snapshot = *prop;
+        prop = &snapshot;
         const uint32_t name_b = arm_malloc(ctx, (uint32_t)prop->name.size() + 1u);
         const uint32_t val_b = arm_malloc(ctx, (uint32_t)prop->value.size() + 1u);
         if (!name_b || !val_b) { ret32(0); break; }
@@ -45794,6 +46288,30 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
 
     // ---- pthread TLS ----
 
+    case SVC_PTHREAD_GETTID_NP: {
+        /* pthread_t is a runtime handle, not the Linux TID. Match the same
+         * registry and Linux namespace used by gettid, TLS and procfs. */
+        const GuestVA handle = argp(0);
+        if (handle == 1) { ret32(guest_tid_of(0)); break; }
+        if (handle && handle < 4096) {
+            const uint32_t tid = (uint32_t)handle;
+            if (const ArmThread *thread = thread_slot_by_tid(tid)) {
+                /* CLONE_CHILD_CLEARTID clears Bionic's tid on thread exit;
+                 * the joinable handle remains valid until pthread_join. */
+                ret32(thread->finished ? 0u : guest_tid_of(tid));
+                break;
+            }
+            if (g_dvm_native_stacks[tid].attached) { ret32(guest_tid_of(tid)); break; }
+        }
+        /* Bionic's invalid-handle contract changed with target API 26.
+         * Null retains the historical -1 result without overwriting errno. */
+        if (handle && lunaria_app_target_sdk() >= 26) {
+            fprintf(stderr, "[pthread_gettid_np] invalid pthread_t 0x%llx\n",
+                    (unsigned long long)handle);
+            dispatch_svc(ctx, SVC_ABORT, regs);
+        } else ret32(~0u);
+        break;
+    }
     case SVC_PTHREAD_SELF: ret32(g_current_tid ? g_current_tid : 1u); break;
     case SVC_PTHREAD_KEY_CREATE: {
         uint32_t key = GUEST_KEYS_MAX;
@@ -46216,13 +46734,6 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
 
     
 
-    case SVC_MEMALIGN: {
-        const uint64_t align = ctx.is_arm64 ? g_svc_args64[0] : (uint64_t)r0;
-        const uint64_t size  = ctx.is_arm64 ? g_svc_args64[1] : (uint64_t)r1;
-        /* bionic memalign rounds arbitrary alignments up to a power of two. */
-        retptr(arm_memalign(ctx, align, size));
-        break;
-    }
     case SVC_POSIX_MEMALIGN: {
         /* posix_memalign(void **memptr, align, size): the alignment must be a power
          * of two *and* a multiple of sizeof(void*), it answers an errno rather than
@@ -50721,6 +51232,24 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         else              ret32((uint32_t)(int32_t)v);
         break;
     }
+    case SVC_EXPM1: {
+        const uint64_t bits = (uint64_t)(uint32_t)r0 | ((uint64_t)(uint32_t)r1 << 32);
+        double input; memcpy(&input, &bits, sizeof input);
+        errno = 0;
+        const double result = std::expm1(input);
+        const int error = errno;
+        uint64_t out; memcpy(&out, &result, sizeof out);
+        ret64(out);
+        if (error) arm_set_errno(ctx, error);
+        break;
+    }
+    case SVC_NAN: {
+        const char *tag = ARM_STR(r0);
+        const double result = std::nan(tag ? tag : "");
+        uint64_t out; memcpy(&out, &result, sizeof out);
+        ret64(out);
+        break;
+    }
     case SVC_EXPM1F: {
         // expm1f(float x[r0]) -> float[r0]
         float f; uint32_t tmp = r0; memcpy(&f, &tmp, 4);
@@ -53939,7 +54468,7 @@ public:
         }
         // Poll GLFW events every ~16M ticks to keep window responsive
         if (g_glfw && (prev >> 24) != (ticks >> 24))
-            glfwPollEvents();
+            poll_glfw_events();
     }
     uint64_t GetTicksRemaining() override {
         if (g_process_stopping.load(std::memory_order_relaxed) || process_exit_pending()) return 0;
@@ -55132,11 +55661,11 @@ static bool g_audio_pump_active;
  * per completely consumed buffer. Mix sources onto one output timeline: two
  * players must overlap, rather than competing to fill or overwrite a ring. */
 static void drive_opensles_callbacks(ArmExecCtx &ctx) {
-    if (g_in_cb()) return;
+    const bool notifications=!g_in_cb();
     /* Every guest operation on this queue table holds the execution lock.
      * The frame pump must follow the same rule while scanning and mixing. */
     ArmLockGuard locked;
-    if (g_audio_pump_active || (g_sl_queues.empty() && !luna_at_active())) return;
+    if (g_audio_pump_active || (g_sl_queues.empty() && g_aaudio_streams.empty() && !luna_at_active())) return;
     g_audio_pump_active = true;
     const uint32_t rate = g_sl_sample_rate;
     const unsigned channels = 2u;
@@ -55151,7 +55680,7 @@ static void drive_opensles_callbacks(ArmExecCtx &ctx) {
     for (unsigned pass = 0; pass < 64u; ++pass) {
         /* Restart the scan after guest code: a callback can destroy a player,
          * clear its queue, or create another player. No iterator survives it. */
-        while (callbacks < 64u) {
+        while (notifications && callbacks < 64u) {
             uint32_t slot = 0;
             uint64_t cb = 0, arg = 0, itf = 0;
             for (auto &kv : g_sl_queues) {
@@ -55188,6 +55717,12 @@ static void drive_opensles_callbacks(ArmExecCtx &ctx) {
             unsigned n = luna_pcm_mix(&preview, mix, wanted, rate, channels);
             if (n > produced) produced = n;
         }
+        for(auto &kv:g_aaudio_streams){
+            auto &s=kv.second;s.update_state(now);if(!s.playing())continue;
+            unsigned n=s.mix(mix,wanted,rate,channels,false);
+            if(n>produced)produced=n;
+            if(s.state==luna_aaudio::started && !n && s.frames_written && now>s.presentation_end_ns && !s.underflow){++s.xruns;s.underflow=true;}
+        }
         if (!produced) break;
         for (unsigned i = 0; i < produced * channels; ++i) {
             int32_t v = mix[i];
@@ -55197,6 +55732,12 @@ static void drive_opensles_callbacks(ArmExecCtx &ctx) {
         if (accepted <= 0) break;
         if (!sink) silent_end += (unsigned)accepted;
         luna_at_advance((unsigned)accepted, rate, channels);
+        for(auto &kv:g_aaudio_streams){
+            auto &s=kv.second;if(!s.playing())continue;
+            unsigned n=s.mix(nullptr,(unsigned)accepted,rate,channels,true);
+            if(n){s.presentation_end_ns=now+(queued+n)*1000000000ull/rate;s.underflow=false;}
+        }
+
         for (auto &kv : g_sl_queues) {
             SlBufferQueue &q = kv.second;
             if (q.play_state == 3u)
@@ -57449,7 +57990,7 @@ extern "C" void arm_exec_glfw_poll(void) {
             glfwGetFramebufferSize(g_glfw, &fw, &fh);
             glfw_fb_size_cb(g_glfw, fw, fh);
         }
-        glfwPollEvents();
+        poll_glfw_events();
     }
     if (luna_ime_active() || luna_overlay_guest_keys_captured() || luna_overlay_menu_showing())
         keymap_release();
@@ -57798,7 +58339,7 @@ static bool guest_window_present_frame(void);
 
 extern "C" void arm_exec_egl_swap(void) {
     pinch_poll();
-    if (g_glfw) glfwPollEvents();
+    poll_glfw_events();
     /* SurfaceFlinger consumes submitted frames on its own context. The host
      * pump has nothing to render into the application's EGLSurface and must
      * not make it current: that would exclude the Java renderer's host thread
@@ -63702,6 +64243,11 @@ static bool cb_lock_wait_try_grant(ArmExecCtx &ctx) {
     ArmLockGuard wait_locked;
     if (g_cb_lock_wait.kind == CbLockWait::Idle) return true;
     /* A sleep owns no word: the only condition is its deadline. */
+    if(g_cb_lock_wait.kind==CbLockWait::RetrySleep){
+        if(host_mono_ns()<g_cb_lock_wait.deadline_ns)return false;
+        cb_lock_wait_reset();return true;
+    }
+
     if (g_cb_lock_wait.kind == CbLockWait::Sleep) {
         if (host_mono_ns() < g_cb_lock_wait.deadline_ns) return false;
         g_cb_resume_result = 0u;
@@ -63867,7 +64413,7 @@ static void cb_lock_wait_progress(ArmExecCtx &ctx, int depth) {
             schedule_threads(env_ticks("LUNARIA_CB_MUTEX_TICKS", 2'000'000ULL));
         return;
     }
-    if (g_cb_lock_wait.kind == CbLockWait::Sleep) {
+    if (g_cb_lock_wait.kind == CbLockWait::Sleep || g_cb_lock_wait.kind == CbLockWait::RetrySleep) {
         if (host_mono_ns() < g_cb_lock_wait.deadline_ns) a64_yield_to_engines();
     } else if (g_cb_lock_wait.kind == CbLockWait::Futex) {
         /* Whoever will wake this address is another guest thread; give the

@@ -4,7 +4,8 @@
 #define _FILE_OFFSET_BITS 64
 #endif
 #include "lunaria_os.h"
-#include "dvm/charset.h"
+#include "lunaria_file.h"
+#include "dvm/dvm_lib.h"
 #include "luna_boot.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -493,8 +494,9 @@ struct manifest {
    char package[256], split[256], activity[512], application[512], application_process[512], activity_process[512];
    char orientation[32], theme[32], min_sdk[32], target_sdk[32], config_changes[32];
    char cleartext[8], network_security[32];
-   char receivers[APK_META], services[APK_META];
+   char receivers[APK_META], services[APK_META], activities[APK_META], activity_filters[APK_META];
    char providers[APK_META], permissions[APK_META], query_actions[APK_META], query_packages[APK_META];
+   char libraries[APK_META];
 };
 struct axml {
    char **strings;
@@ -664,9 +666,11 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
    int result = -1, depth = 0, activity_depth = -1, provider_depth = -1, queries_depth = -1, intent_depth = -1;
    char activity[512] = "", target[512] = "", orient[32] = "", theme[32] = "", app_theme[32] = "", provider[APK_META] = "", changes[32] = "";
    bool main = false, launcher = false, activity_launch = false;
+   int activity_enabled = 1, filter_data = 0, filter_priority = 0;
+   char filter_actions[2048] = "", filter_categories[2048] = "";
    int receiver_depth = -1, enabled = 1, app_enabled = 1, exported = -1, boot = 0, app_boot = 0;
    bool receiver_filter = false;
-   int service_depth = -1, service_enabled = 1, service_exported = -1;
+   int service_depth = -1, service_enabled = 1, service_exported = -1, application_depth=-1;
    char service[512] = "", service_actions[2048] = "", service_process[512] = "";
    char receiver[512] = "", permission[512] = "", process[512] = "";
    char app_permission[512] = "", app_process[512] = "";
@@ -720,6 +724,7 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
             if (copy_text(m->package, sizeof m->package, attr_text(a, count, "package")) || copy_text(m->split, sizeof m->split, attr_text(a, count, "split")))
                goto done;
          } else if (!strcmp(tag, "application")) {
+            application_depth=depth;
             if (class_name(m->application, sizeof m->application, m->package, attr_text(a, count, "name")) || attr_number(app_theme, sizeof app_theme, a, count, "theme"))
                goto done;
             const struct attr *v = attribute(a, count, "enabled");
@@ -781,22 +786,33 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
             if (attr_number(changes, sizeof changes, a, count, "configChanges")) goto done;
             if (copy_text(activity, sizeof activity, attr_text(a, count, "name")) || copy_text(target, sizeof target, attr_text(a, count, "targetActivity")) || attr_number(orient, sizeof orient, a, count, "screenOrientation") || attr_number(theme, sizeof theme, a, count, "theme"))
                goto done;
+            const struct attr *av = attribute(a, count, "enabled");
+            activity_enabled = app_enabled && (!av || attr_boolean(av));
             activity_depth = depth;
             activity_launch = false;
          } else if (!strcmp(tag, "intent-filter") && activity_depth >= 0) {
             intent_depth = depth;
             main = launcher = false;
+            const struct attr *priority = attribute(a, count, "priority");
+            filter_priority = priority ? (int)strtol(priority->text, NULL, 0) : 0;
+            filter_data = 0;
+            filter_actions[0] = filter_categories[0] = 0;
          } else if (!strcmp(tag, "action")) {
             const char *v = attr_text(a, count, "name");
             if (queries_depth >= 0 && append(m->query_actions, sizeof m->query_actions, v, ","))
                goto done;
             if (service_depth >= 0 && append(service_actions, sizeof service_actions, v, ","))
                goto done;
+            if (intent_depth >= 0 && append(filter_actions, sizeof filter_actions, v, ",")) goto done;
             if (intent_depth >= 0 && !strcmp(v, "android.intent.action.MAIN"))
                main = true;
-         } else if (!strcmp(tag, "category") && intent_depth >= 0 && !strcmp(attr_text(a, count, "name"), "android.intent.category.LAUNCHER"))
-            launcher = true;
-         else if (!strcmp(tag, "queries"))
+         } else if (!strcmp(tag, "category") && intent_depth >= 0) {
+            const char *v = attr_text(a, count, "name");
+            if (append(filter_categories, sizeof filter_categories, v, ",")) goto done;
+            if (!strcmp(v, "android.intent.category.LAUNCHER")) launcher = true;
+         } else if (!strcmp(tag, "data") && intent_depth >= 0) {
+            filter_data = 1;
+         } else if (!strcmp(tag, "queries"))
             queries_depth = depth;
          else if (!strcmp(tag, "package") && queries_depth >= 0) {
             if (append(m->query_packages, sizeof m->query_packages, attr_text(a, count, "name"), ","))
@@ -838,19 +854,35 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
          } else if (!strcmp(tag, "uses-permission")) {
             if (append(m->permissions, sizeof m->permissions, attr_text(a, count, "name"), ","))
                goto done;
+         } else if (!strcmp(tag,"uses-library") && application_depth>=0 && depth==application_depth+1) {
+            const char *name=attr_text(a,count,"name");
+            if(!*name || strchr(name,'\n') || strchr(name,'\r') || append(m->libraries,sizeof m->libraries,name,"\n"))goto done;
          } else if (!strcmp(tag, "uses-sdk")) {
             if (attr_number(m->min_sdk, sizeof m->min_sdk, a, count, "minSdkVersion") || attr_number(m->target_sdk, sizeof m->target_sdk, a, count, "targetSdkVersion"))
                goto done;
          }
       } else if (kind == 0x103) {
+         if(depth==application_depth)application_depth=-1;
          if (len < 24 || depth <= 0)
             goto done;
          if (depth == intent_depth) {
-            activity_launch |= main && launcher;
+            char component[512], row[APK_META];
+            if (class_name(component, sizeof component, m->package, activity)) goto done;
+            int n = snprintf(row, sizeof row, "%s|%s|%s|%d|%d", component,
+                             filter_actions, filter_categories, filter_data, filter_priority);
+            if (n < 0 || (size_t)n >= sizeof row ||
+                append(m->activity_filters, sizeof m->activity_filters, row, "\n")) goto done;
+            activity_launch |= main && launcher && !filter_data;
             intent_depth = -1;
          }
          if (depth == activity_depth) {
-            if (activity_launch && !*m->activity) {
+            char component[512], target_class[512] = "", row[APK_META];
+            if (class_name(component, sizeof component, m->package, activity) ||
+                (*target && class_name(target_class, sizeof target_class, m->package, target))) goto done;
+            int n = snprintf(row, sizeof row, "%s|%s|%d", component, target_class, activity_enabled);
+            if (n < 0 || (size_t)n >= sizeof row ||
+                append(m->activities, sizeof m->activities, row, "\n")) goto done;
+            if (activity_launch && activity_enabled && !*m->activity) {
                if (copy_text(m->config_changes, sizeof m->config_changes, changes) ||
                    copy_text(m->activity_process,sizeof m->activity_process,activity_process)) goto done;
                if (class_name(m->activity, sizeof m->activity, m->package, *target ? target : activity) || copy_text(m->orientation, sizeof m->orientation, orient) || copy_text(m->theme, sizeof m->theme, *theme ? theme : app_theme))
@@ -1481,7 +1513,8 @@ static int profile_storage(const char *root, const char *package, const char *pr
    static const struct {
       const char *key, *subdir;
    } dirs[] = {
-      {"ANDROID_EXTERNAL_FILES_DIR", "external/files"}, {"ANDROID_FILES_DIR", "files"},
+      {"ANDROID_EXTERNAL_FILES_DIR", "external/files"}, {"ANDROID_EXTERNAL_CACHE_DIR", "external/cache"},
+      {"ANDROID_EXTERNAL_STORAGE_DIR", "external/storage"}, {"ANDROID_FILES_DIR", "files"},
       {"ANDROID_CACHE_DIR", "cache"}, {"ANDROID_CODE_CACHE_DIR", "code_cache"},
       {"ANDROID_DATABASES_DIR", "databases"}, {"ANDROID_NO_BACKUP_DIR", "no_backup"},
       {"ANDROID_PREFS_DIR", "shared_prefs"},
@@ -1491,7 +1524,7 @@ static int profile_storage(const char *root, const char *package, const char *pr
          return -1;
    if (path_join(path, sizeof path, common, "obb") || mkdirs(path) || env_set("ANDROID_EXTERNAL_OBB_DIR", path, true))
       return -1;
-   if (path_join(path, sizeof path, private_dir, "device-root") || env_default("LUNARIA_GUEST_ROOT", path) || mkdirs(getenv("LUNARIA_GUEST_ROOT")))
+   if (path_join(path, sizeof path, private_dir, "device-root") || env_default("LUNARIA_GUEST_ROOT", path) || mkdirs(getenv("LUNARIA_GUEST_ROOT")) || luna_android_fs_prepare(getenv("LUNARIA_GUEST_ROOT")))
       return -1;
    if (strcmp(profile, "default")) {
       const char *keys[] = {"LUNARIA_SHARED_ASSETS", "LUNARIA_PROFILE_SEED_FILES"};
@@ -1529,6 +1562,29 @@ static bool suffix(const char *s, const char *ext)
    size_t n = strlen(s), k = strlen(ext);
    return n >= k && !strcasecmp(s + n - k, ext);
 }
+/* Driver discovery is host runtime state, shared by APKs and direct modules.
+ * Keep explicit driver selection intact and resolve bundled Resources too. */
+static int host_driver_defaults(void)
+{
+#ifdef __APPLE__
+   char exedir[APK_PATH], path[APK_PATH], resources[APK_PATH];
+   if (luna_os_executable_path(exedir, sizeof exedir)) return 0;
+   char *slash = strrchr(exedir, '/');
+   if (!slash) return 0;
+   *slash = 0;
+   if (!path_join(resources, sizeof resources, exedir, "../Resources") &&
+       directory(resources))
+      (void)luna_file_realpath(resources, exedir, sizeof exedir);
+   static const char *driver_manifests[] = {
+      "lib/moltenvk_icd.json", ".deps/lib/moltenvk_icd.json"
+   };
+   for (size_t i = 0; i < sizeof driver_manifests / sizeof driver_manifests[0]; i++)
+      if (!path_join(path, sizeof path, exedir, driver_manifests[i]) && exists(path))
+         return env_default("VK_ICD_FILENAMES", path);
+#endif
+   return 0;
+}
+
 static int font_defaults(const char *exedir)
 {
    static const struct {
@@ -1551,18 +1607,7 @@ static int font_defaults(const char *exedir)
       }
    if (!path_join(path, sizeof path, exedir, "syslib-arm64") && directory(path))
       env_default("LUNARIA_SYSLIB_DIR", path);
-#ifdef __APPLE__
-   static const char *driver_manifests[] = {
-      "lib/moltenvk_icd.json", ".deps/lib/moltenvk_icd.json"
-   };
-   for (size_t i = 0; i < sizeof driver_manifests / sizeof driver_manifests[0]; i++) {
-      if (!path_join(path, sizeof path, exedir, driver_manifests[i]) && exists(path)) {
-         env_default("VK_ICD_FILENAMES", path);
-         break;
-      }
-   }
-#endif
-   return 0;
+   return host_driver_defaults();
 }
 static int keymap_resolve(const char *exedir)
 {
@@ -2071,6 +2116,14 @@ static int apk_prepare_inner(int *argc, const char ***argv)
    char input[APK_PATH], cwd[APK_PATH], exedir[APK_PATH], conf[APK_PATH], root[APK_PATH], cache_root[APK_PATH], cache[APK_PATH], pkgdir[APK_PATH], inst[APK_PATH], base[APK_PATH], ready[APK_PATH];
    if (!luna_file_realpath(argument, input, sizeof input) || !apk_getcwd(cwd, sizeof cwd) || luna_os_executable_path(exedir, sizeof exedir))
       return apk_error("cannot resolve APK or executable path");
+   /* APKPure's XAPK endpoint also serves ordinary APKs. The extension is a
+    * download label, not the archive structure: inspect the central directory
+    * before both launcher metadata and installation choose a parsing path. */
+   struct zip format = {0};
+   if (zip_open(&format, input)) return -1;
+   container = !zip_find(&format, "AndroidManifest.xml") &&
+               !zip_find(&format, "base/manifest/AndroidManifest.xml");
+   zip_close(&format);
    char *slash = strrchr(exedir, '/');
    if (!slash)
       return -1;
@@ -2082,7 +2135,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
 #endif
    if (conf_default_path(conf, sizeof conf) || env_set("LUNARIA_CONF", conf, true) || config_load(conf, NULL))
       return -1;
-   if ((!list && !prepare && !install) || choose) {
+   if ((!list && !prepare && !install && !rename_label) || choose) {
       if (launcher_display_metadata(input, container, conf) || font_defaults(exedir)) return -1;
       launch_ui_ready = luna_launcher_begin(input) != 0;
    }
@@ -2275,11 +2328,13 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       {"ANDROID_LAUNCH_CONFIG_CHANGES", m->config_changes},
       {"ANDROID_SCREEN_ORIENTATION", m->orientation}, {"ANDROID_THEME_RESOURCE", m->theme},
       {"ANDROID_RECEIVERS", m->receivers}, {"ANDROID_SERVICES", m->services},
+      {"ANDROID_ACTIVITIES", m->activities}, {"ANDROID_ACTIVITY_FILTERS", m->activity_filters},
       {"ANDROID_CONTENT_PROVIDERS", m->providers}, {"ANDROID_REQUESTED_PERMISSIONS", m->permissions},
       {"ANDROID_MIN_SDK", m->min_sdk}, {"ANDROID_TARGET_SDK", m->target_sdk},
       {"ANDROID_USES_CLEARTEXT_TRAFFIC", m->cleartext},
       {"ANDROID_NETWORK_SECURITY_CONFIG", m->network_security},
       {"ANDROID_QUERY_ACTIONS", m->query_actions}, {"ANDROID_QUERY_PACKAGES", m->query_packages},
+      {"ANDROID_USES_LIBRARIES", m->libraries},
    };
    for (size_t i = 0; i < sizeof metadata / sizeof metadata[0]; i++) {
       if (*metadata[i].value) {
@@ -2484,6 +2539,7 @@ int luna_apk_restart_launcher(void)
 int luna_apk_prepare(int *argc, const char ***argv)
 {
    int result = apk_prepare_inner(argc, argv);
+   if (result == 0 && host_driver_defaults()) result = apk_error("cannot configure host driver");
    if (result == 0 && luna_launcher_cancelled()) result = apk_error("installation cancelled");
    luna_launcher_end(result == 0);
    return result;

@@ -81,7 +81,7 @@ export MACOSX_DEPLOYMENT_TARGET = $(MAC_MIN_VERSION)
 DYNARMIC_CMAKE_FLAGS = -DBOOST_ROOT=$(abspath $(MAC_DEPS)/boost) \
 	-DBoost_NO_SYSTEM_PATHS=ON -DCMAKE_CXX_FLAGS=-DFMT_CONSTEVAL= \
 	-DCMAKE_OSX_DEPLOYMENT_TARGET=$(MAC_MIN_VERSION)
-HOST_CPPFLAGS     = -DEGL_NO_PLATFORM_SPECIFIC_TYPES \
+HOST_CPPFLAGS     = -DEGL_NO_PLATFORM_SPECIFIC_TYPES -I$(MAC_DEPS)/boost \
 	-I$(MAC_DEPS)/linux-abi -I$(MAC_DEPS)/khronos/include \
 	-I$(MAC_DEPS)/vulkan/include \
 	-I$(MAC_DEPS)/glfw/include \
@@ -244,7 +244,10 @@ else
 all: host-all
 endif
 
-host-all: $(bins) $(OPENH264_SO)
+# The guest's libm/libc must be the real AArch64 ones: with the emulator's trap
+# stubs every pow/sincosf leaves the JIT.  A file target, so it costs nothing
+# once fetched.
+host-all: $(bins) $(OPENH264_SO) syslib-core
 
 # Preserve the documented target when the Windows linker writes an .exe.
 ifeq ($(LUNARIA_BIN),lunaria.exe)
@@ -288,7 +291,7 @@ syslib: $(SYSLIB_LIBM) $(SYSLIB_LIBC) $(SYSLIB_LIBZ)
 
 # Downloadable without an NDK (build-tools zip). Used by Windows dist when the
 # optional NDK pieces are missing.
-syslib-core: $(SYSLIB_LIBM) $(SYSLIB_LIBC)
+syslib-core: $(SYSLIB_LIBM) $(SYSLIB_LIBC) $(SYSLIB_ART)
 
 # Extract one renderscript arm64-v8a DSO into $@.  $1 = archive member basename
 # (libm.so / libc.so).  Shared zip cache avoids a second download for libc.
@@ -389,6 +392,16 @@ $(SYSLIB_GUEST): src/lib/guest.c Makefile
 	    src/lib/guest.c -o $@
 	@echo "guestlib: $@ ready"
 
+# Placeholder ART runtime images: /proc/self/maps of a zygote child lists them.
+ART_IMAGES := libart.so libartbase.so libdexfile.so libnativeloader.so
+SYSLIB_ART := $(addprefix $(SYSLIB_DIR)/,$(ART_IMAGES))
+artlib: $(SYSLIB_ART)
+$(SYSLIB_ART): src/lib/art_image.c Makefile
+	@mkdir -p $(SYSLIB_DIR)
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 \
+	    -fuse-ld=lld -Wl,-soname,$(notdir $@) -Wall -Wextra \
+	    -DART_IMAGE_SYMBOL=lunaria_image_$(basename $(notdir $@)) $< -o $@
+
 syslib-clean:
 	rm -rf $(SYSLIB_DIR)
 
@@ -427,12 +440,12 @@ runtime/libpthread.so: $(PTHREAD_SRC)
 	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE $(LDFLAGS) \
 	    $(HOST_SO_LDFLAGS) -shared $(PTHREAD_CPPFLAGS) $(PTHREAD_SRC) -lpthread $(HOST_RT_LIBS) -o $@
 
-runtime/libdl.so: src/trace.h src/linker/dlfcn.c src/linker/linker.c src/linker/linker_environ.c src/linker/rt.c src/linker/strlcpy.c
+runtime/libdl.so: src/trace.h src/linker/dlfcn.c src/linker/linker.c src/linker/linker_environ.c
 	mkdir -p runtime
 	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -D_GNU_SOURCE -DLINKER_DEBUG=1 -DRUNTIMEPATH='"$(PREFIX)$(LIBDIR)$(RUNTIMEDIR)"' \
 	    -Wno-pedantic -Wno-variadic-macros -Wno-pointer-to-int-cast -Wno-int-to-pointer-cast -Wno-incompatible-pointer-types \
 	    $(LDFLAGS) $(HOST_SO_LDFLAGS) -shared \
-	    src/linker/dlfcn.c src/linker/linker.c src/linker/linker_environ.c src/linker/rt.c src/linker/strlcpy.c \
+	    src/linker/dlfcn.c src/linker/linker.c src/linker/linker_environ.c \
 	    $(HOST_SYSTEM_DL_LIBS) -lpthread -o $@
 
 runtime/libc.so: src/trace.h $(LIBC_SRC) $(LIBC_HEADERS)
@@ -497,16 +510,26 @@ DVM_SRC = src/apkpure.c src/dvm/calendar.c src/dvm/dvm_path.c src/luna_unicode.c
           src/dvm/dvm_net.c src/dvm/dvm_media.c src/dvm/regex.c src/dvm/charset.c src/dvm/apk_signers.c src/dvm/dvm_sqlite.c \
           src/webview_cdp.c $(WEBVIEW_CDP_HOST_SRC)
 DVM_SRC += src/luna_process_ipc.c
-DVM_HDR = src/jvm/jvm.h src/dvm/dvm_parcel.h src/dvm/dvm_html.h src/dvm/color_blend.h src/luna_overlay.h src/dvm/dvm_path.h src/lunaria_file.h src/simplewebp.h src/luna_unicode.h src/unicode/character_data.h src/dvm/dex.h src/dvm/dvm.h src/dvm/dvm_internal.h src/dvm/dvm_jni.h \
-          src/dvm/dvm_net.h src/lunaria_os.h src/dvm/dvm_media.h src/dvm/apk_signers.h src/dvm/dvm_sqlite.h \
-          src/dvm/regex.h src/dvm/charset.h src/dvm/locale_names.h src/dvm/date_symbols_data.h src/dvm/framework.h \
+DVM_HDR = src/jvm/jvm.h src/dvm/dvm_parcel.h src/dvm/dvm_lib.h src/luna_overlay.h src/dvm/dvm_lib.h src/lunaria_file.h src/simplewebp.h src/luna_unicode.h src/unicode/character_data.h src/dvm/dvm.h src/dvm/dvm.h src/dvm/dvm_internal.h \
+          src/dvm/dvm_net.h src/lunaria_os.h src/dvm/dvm_media.h src/dvm/dvm.h \
+          src/dvm/dvm_lib.h src/dvm/dvm_lib.h src/dvm/locale_names.h src/dvm/date_symbols_data.h src/dvm/framework.h \
           src/webview_cdp.h
 DVM_HDR += src/unicode/breaks.h src/unicode/break_data.h
-DVM_HDR += src/dvm/calendar.h src/dvm/calendar_data.h
-DVM_HDR += src/unicode/bidi_data.h src/dvm/dvm_reflect.h src/dvm/dvm_android_ui.h src/dvm/dvm_graphics.h src/dvm/dvm_text.h src/dvm/dvm_time.h src/dvm/dvm_crypto.h
-DVM_HDR += src/dvm/dvm_videoview.h src/apkpure.h
+DVM_HDR += src/dvm/dvm_extras_lang.h src/dvm/dvm_ec.h
+DVM_HDR += src/dvm/dvm_lib.h src/dvm/calendar_data.h
+DVM_HDR += src/dvm/date_time_patterns_data.h src/dvm/dvm_extras_android.h
+DVM_HDR += src/unicode/bidi_data.h src/dvm/dvm_reflect.h src/dvm/dvm_android_ui.h src/dvm/dvm_graphics.h src/dvm/dvm_text.h src/dvm/dvm_time.h src/dvm/dvm_crypto.h src/dvm/dvm_pbe.h
+DVM_HDR += src/dvm/dvm_videoview.h
+DVM_HDR += src/dvm/dvm_sax.h src/dvm/dvm_dom.h src/dvm/dvm_list_view.h src/dvm/dvm_vector.h
+DVM_HDR += src/dvm/dvm_time_formatter.h src/dvm/time_standalone_months.h src/dvm/date_symbols_data.h src/dvm/framework.h
+DVM_HDR += src/dvm/dvm_http_params.h
+DVM_HDR +=
+DVM_HDR += src/dvm/dvm_http_entity.h
+DVM_HDR += src/dvm/dvm_http_message.h src/dvm/dvm_http_client.h
+DVM_HDR +=
+DVM_HDR +=
 DVM_HDR += src/dvm/dvm_nio_file.h
-DVM_HDR += src/dvm/dvm_alarm.h
+DVM_HDR +=
 DVM_HDR += src/dvm/platform_classes.h
 # The Dalvik bytecode emulator lives in libjvm.so: it is reached from jvm.c
 # (a JNI call with no host stub) and it calls back out through the same JNI
@@ -516,7 +539,7 @@ DVM_HDR += src/dvm/platform_classes.h
 # presents it.  Both sides then resolve to the same single instance of the
 # engine — two copies would each hold half of the state.
 # Link a new inode before replacing a runtime that may still be mapped.
-runtime/libjvm.so: src/trace.h src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c src/jvm/jvm.h src/jvm/jni.h src/jvm/screen_orientation.h $(DVM_SRC) $(DVM_HDR) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o $(BUILD_DIR)/luna_input.o
+runtime/libjvm.so: src/trace.h src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c src/jvm/jvm.h src/jvm/jni.h $(DVM_SRC) $(DVM_HDR) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o $(BUILD_DIR)/luna_input.o
 	mkdir -p runtime
 	$(CC) $(CFLAGS) $(SANITIZE) -fPIC $(CPPFLAGS) -D_GNU_SOURCE -Wno-pedantic $(LDFLAGS) $(HOST_SO_LDFLAGS) -shared \
 	    src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c $(DVM_SRC) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o $(BUILD_DIR)/luna_input.o \
@@ -670,7 +693,7 @@ $(BUILD_DIR)/luna_compositor.o: src/luna_compositor.c src/luna_compositor.h src/
 	    -c src/luna_compositor.c -o $@
 
 $(BUILD_DIR)/luna_boot.o: | $(BUILD_DIR)
-$(BUILD_DIR)/luna_boot.o: src/luna_boot.c src/apkpure.h src/luna_boot.h src/luna_overlay.h src/luna_qfkey.h src/lunaria_os.h $(LUNA_UI_DIR)/luna-ui.h
+$(BUILD_DIR)/luna_boot.o: src/luna_boot.c src/luna_boot.h src/luna_overlay.h src/luna_qfkey.h src/lunaria_os.h $(LUNA_UI_DIR)/luna-ui.h
 	$(CC) -std=c11 $(OPTFLAGS) -fPIC $(CPPFLAGS) -I$(LUNA_UI_DIR) -D_GNU_SOURCE \
 	    -Wno-unused-function -Wno-unused-variable -Wno-sign-compare \
 	    -c src/luna_boot.c -o $@
@@ -690,7 +713,7 @@ temp-cleanup-test: test/temp_cleanup_test.c src/lunaria_file.c src/lunaria_file.
 	$(BUILD_DIR)/temp_cleanup_test
 
 .PHONY: path-geometry-test
-path-geometry-test: test/path_geometry_test.c src/dvm/dvm_path.c src/dvm/dvm_path.h | $(BUILD_DIR)
+path-geometry-test: test/path_geometry_test.c src/dvm/dvm_path.c src/dvm/dvm_lib.h | $(BUILD_DIR)
 	$(CC) -std=c11 -g -O1 -Wall -Wextra $(DVM_TEST_SAN) -Isrc test/path_geometry_test.c src/dvm/dvm_path.c -lm -o $(BUILD_DIR)/path_geometry_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/path_geometry_test
 
@@ -726,9 +749,9 @@ guest-dac-test: lunaria $(BUILD_DIR)/guest-dac64.so $(BUILD_DIR)/guest-dac32.so 
 	    python3 test/run_guest_results.py $(BUILD_DIR)/guest-dac64.so $(BUILD_DIR)/guest-dac32.so
 
 .PHONY: symlink-file-test
-symlink-file-test: test/symlink_file_test.c src/lunaria_file.c src/lunaria_file.h src/lunaria_os.h | $(BUILD_DIR)
-	$(CC) -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Isrc test/symlink_file_test.c src/lunaria_file.c -lpthread -o $(BUILD_DIR)/symlink_file_test
-	$(BUILD_DIR)/symlink_file_test
+symlink-file-test: test/symlink_file_test.c src/lunaria_file.c src/lunaria_file.h src/lunaria_os.h $(BUILD_DIR)/lunaria_os.o | $(BUILD_DIR)
+	$(CC) -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Isrc test/symlink_file_test.c src/lunaria_file.c $(BUILD_DIR)/lunaria_os.o $(CPPFLAGS) $(HOST_TEST_RPATH) -lm $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_SYSTEM_DL_LIBS) $(HOST_GL_LIBS) -lpthread -o test/symlink_file_test
+	test/symlink_file_test
 
 $(BUILD_DIR)/arm_exec.o: src/lunaria_file.h src/lib/inc/log_assert.h
 
@@ -745,7 +768,7 @@ $(BUILD_DIR)/stub_%.o: src/lib/stub.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc/lib -DLUNARIA_STUB_$* -c src/lib/stub.c -o $@
 # Per-file objects instead of `$(CC) -r`: GNU ld accepts COFF relocatable
 # output, but llvm-mingw links with lld, which errors on `-r`.
-WINDOWS_DL_SRC = src/linker/dlfcn.c src/linker/linker.c src/linker/linker_environ.c src/linker/rt.c src/linker/strlcpy.c
+WINDOWS_DL_SRC = src/linker/dlfcn.c src/linker/linker.c src/linker/linker_environ.c
 WINDOWS_DL_OBJS = $(patsubst src/linker/%.c,$(BUILD_DIR)/wdl_%.o,$(WINDOWS_DL_SRC))
 $(BUILD_DIR)/wdl_%.o: src/linker/%.c src/linker/linker.h src/lunaria_os.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -DLINKER_DEBUG=1 -DRUNTIMEPATH='"runtime"' \
@@ -759,7 +782,6 @@ $(BUILD_DIR)/wj_$(subst /,_,$(patsubst %.c,%.o,$(1))): $(1) $$(DVM_HDR) src/jvm/
 	$$(CC) $$(CFLAGS) $$(CPPFLAGS) -D_GNU_SOURCE -Wno-pedantic -c $(1) -o $$@
 endef
 $(foreach s,$(WINDOWS_JVM_SRC),$(eval $(call WINDOWS_JVM_COMPILE,$(s))))
-$(BUILD_DIR)/wj_src_jvm_jni_stubs.o: src/jvm/screen_orientation.h
 HOST_DL_LIBS = $(WINDOWS_DL_OBJS)
 HOST_JVM_LIB = $(WINDOWS_JVM_OBJS) $(WINDOWS_JVM_UI)
 $(HOST_EXPORT): scripts/windows-exports.py $(LUNARIA_OBJECTS) $(HOST_DL_LIBS) $(HOST_JVM_LIB) $(WINDOWS_STUB_OBJECTS)
@@ -816,6 +838,7 @@ test:
 HOST_ELF_REGRESSION = $(if $(filter Darwin,$(LUNA_OS_NAME)),,host-elf-test)
 test-host:
 	$(MAKE) message-pattern-test
+	$(MAKE) app-sdk-test
 	$(MAKE) apk-launcher-test unity-reflection-test host-memory-test host-file-test host-socket-test host-timer-test host-pattern-test $(HOST_ELF_REGRESSION) run-queue-test deadline-heap-test heap-core-test pixels-test charset-test unicode-test regex-test dex-reader-test dvm-test pcm-queue-test webview-cdp-test
 
 test-sync:
@@ -830,14 +853,20 @@ UNITY_TEST_GC = -Wl,-dead_strip
 else
 UNITY_TEST_GC = -Wl,--gc-sections
 endif
-test/test_unity: test/test_unity.c src/jvm/jni_stubs.c src/jvm/jvm.h src/jvm/jni.h src/jvm/screen_orientation.h
+test/test_unity: test/test_unity.c src/jvm/jni_stubs.c src/jvm/jvm.h src/jvm/jni.h
 	$(CC) -std=c11 -g -Isrc -D_GNU_SOURCE -ffunction-sections -fdata-sections \
 	    test/test_unity.c src/jvm/jni_stubs.c $(UNITY_TEST_GC) -o $@
 
 .PHONY: screen-orientation-test
-screen-orientation-test: test/screen_orientation_test.c src/jvm/screen_orientation.h | $(BUILD_DIR)
+screen-orientation-test: test/screen_orientation_test.c src/jvm/jvm.h | $(BUILD_DIR)
 	$(CC) -std=c11 -Wall -Wextra -Werror -Isrc test/screen_orientation_test.c -o $(BUILD_DIR)/screen_orientation_test
 	$(BUILD_DIR)/screen_orientation_test
+.PHONY: app-sdk-test
+app-sdk-test: test/app_sdk_test.c src/jvm/jni_stubs.c src/jvm/jvm.h | $(BUILD_DIR)
+	$(CC) -std=c11 -Isrc -D_GNU_SOURCE -ffunction-sections -fdata-sections \
+	    test/app_sdk_test.c src/jvm/jni_stubs.c $(UNITY_TEST_GC) -o $(BUILD_DIR)/app_sdk_test
+	$(BUILD_DIR)/app_sdk_test
+
 unity-reflection-test: test/test_unity
 	./test/test_unity
 
@@ -867,14 +896,14 @@ DVM_TEST_SAN ?= -fsanitize=address,undefined
 apk-signers-test: $(BUILD_DIR)/test_apk_signers
 	$(BUILD_DIR)/test_apk_signers
 
-$(BUILD_DIR)/test_apk_signers: test/apk_signers_test.c test/apk_signers_fixture.h src/dvm/apk_signers.c src/dvm/apk_signers.h src/lunaria_os.h | $(BUILD_DIR)
+$(BUILD_DIR)/test_apk_signers: test/apk_signers_test.c test/apk_signers_fixture.h src/dvm/apk_signers.c src/dvm/dvm.h src/lunaria_os.h | $(BUILD_DIR)
 	$(CC) -std=c11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Isrc $(DVM_TEST_SAN) \
 	    test/apk_signers_test.c src/dvm/apk_signers.c $(HOST_CRYPTO_LIBS) -o $@
 .PHONY: dex-reader-test
 dex-reader-test: $(BUILD_DIR)/test_dex_reader test/dvm_test.dex
 	$(BUILD_DIR)/test_dex_reader test/dvm_test.dex
 
-$(BUILD_DIR)/test_dex_reader: test/dex_reader_test.c src/dvm/dex.c src/dvm/dex.h | $(BUILD_DIR)
+$(BUILD_DIR)/test_dex_reader: test/dex_reader_test.c src/dvm/dex.c src/dvm/dvm.h | $(BUILD_DIR)
 	$(CC) -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Isrc $(DVM_TEST_SAN) \
 	    test/dex_reader_test.c src/dvm/dex.c -o $@
 
@@ -886,7 +915,7 @@ test/test_dvm: test/declared_click_tests.h test/locale_iso_tests.h test/sonic_ap
 	    -lm $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_CRYPTO_LIBS) $(HOST_CHARSET_LIBS) $(HOST_Z_LIBS) $(HOST_SYSTEM_DL_LIBS) $(HOST_GL_LIBS) -o $@
 
 .PHONY: runtime-shutdown-test
-test/test_dvm: test/pending_intent_tests.h test/choice_format_tests.h test/message_format_tests.h
+test/test_dvm: test/pending_intent_tests.h test/choice_format_tests.h test/message_format_tests.h test/xml_namespace_fixture.h
 test/test_dvm: test/player_event_tests.h test/player_fixture.h
 test/test_dvm: test/videoview_tests.h test/video_fixture.h
 test/test_dvm: test/touch_transform_tests.h
@@ -908,7 +937,7 @@ runtime-shutdown-test: test/test_dvm
 	done
 
 .PHONY: color-blend-test
-color-blend-test: test/color_blend_test.c src/dvm/color_blend.h
+color-blend-test: test/color_blend_test.c src/dvm/dvm_lib.h
 	@mkdir -p $(BUILD_DIR)
 	$(CC) -std=c11 -O1 -g $(DVM_TEST_SAN) -Isrc test/color_blend_test.c -lm -o $(BUILD_DIR)/color_blend_test
 	$(BUILD_DIR)/color_blend_test
@@ -940,7 +969,7 @@ profile-menu-test: test/test_boot_card
 surface-window-test: test/test_boot_card
 	./test/test_boot_card --surface-test
 
-test/test_regex: test/regex_test.c src/dvm/regex.c src/dvm/regex.h
+test/test_regex: test/regex_test.c src/dvm/regex.c src/dvm/dvm_lib.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc/dvm -o $@ test/regex_test.c src/dvm/regex.c -lpthread
 
 # The Vulkan bridge driven the way a guest drives it, through its host-call
@@ -952,7 +981,7 @@ vulkan-test: test/test_vulkan_bridge
 	./test/test_vulkan_bridge --disabled
 	./test/test_vulkan_bridge
 
-test/test_charset: test/charset_test.c src/dvm/charset.c src/dvm/charset.h
+test/test_charset: test/charset_test.c src/dvm/charset.c src/dvm/dvm_lib.h
 	$(CC) -std=c11 -g -Wall -Wextra -D_GNU_SOURCE -Isrc $(CPPFLAGS) -o $@ \
 	    test/charset_test.c src/dvm/charset.c $(HOST_CHARSET_LIBS)
 
@@ -966,8 +995,8 @@ charset-test: test/test_charset
 regex-test: test/test_regex
 	./test/test_regex
 
-dvm-test: test/test_dvm test/dvm_test.dex
-	./test/test_dvm test/dvm_test.dex $(DVM_DEX)
+dvm-test: test/test_dvm test/dvm_test.dex $(OPENH264_SO)
+	LUNARIA_OPENH264="$${LUNARIA_OPENH264:-$(abspath $(OPENH264_SO))}" ./test/test_dvm test/dvm_test.dex $(DVM_DEX)
 
 .PHONY: packed-position-test
 packed-position-test: test/test_dvm
@@ -1031,10 +1060,10 @@ http-chunked-test: test/test_http_chunked
 	./test/test_http_chunked
 
 .PHONY: tls-socket-test
-test/test_tls_socket: test/tls_socket_test.c src/dvm/dvm_net.c src/dvm/dvm_net.h src/lunaria_os.h
+test/test_tls_socket: test/tls_socket_test.c src/dvm/dvm_net.c src/dvm/dvm_net.h src/lunaria_os.h $(LUNA_OS_OBJ)
 	$(CC) -std=c11 -O1 -g -Wall -Wextra -D_GNU_SOURCE $(CPPFLAGS) -Isrc \
-	    -fsanitize=address,undefined test/tls_socket_test.c src/dvm/dvm_net.c \
-	    $(HOST_CRYPTO_LIBS) -lpthread -o $@
+	    -fsanitize=address,undefined test/tls_socket_test.c src/dvm/dvm_net.c $(LUNA_OS_OBJ) \
+	    $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_CRYPTO_LIBS) -lpthread -o $@
 
 tls-socket-test: test/test_tls_socket
 	./test/test_tls_socket
@@ -1077,6 +1106,15 @@ test/test_gl_host_identity: test/gl_host_identity.c
 	$(CC) -std=c11 -O2 -Wall -Wextra $< -lEGL -lGLESv2 -o $@
 
 .PHONY: gl-version-test
+.PHONY: gl-fragment-output-test
+$(BUILD_DIR)/gl_fragment_output_test: test/gl_fragment_output_test.c | $(BUILD_DIR)
+	$(CC) -std=c11 -Wall -Wextra -Werror $(CPPFLAGS) $(HOST_TEST_RPATH) $< $(HOST_GL_LIBS) -o $@
+gl-fragment-output-test: $(BUILD_DIR)/gl_fragment_output_test
+ifeq ($(LUNA_OS_NAME),Darwin)
+	DYLD_LIBRARY_PATH="$(abspath $(MAC_DEPS)/lib)" VK_ICD_FILENAMES="$(abspath $(MAC_DEPS)/lib/moltenvk_icd.json)" $(BUILD_DIR)/gl_fragment_output_test
+else
+	$(BUILD_DIR)/gl_fragment_output_test
+endif
 gl-version-test: lunaria test/libglversiontest.so test/test_gl_host_identity
 	@LUNARIA_GL_IDENTITY=host LD_LIBRARY_PATH="$(CURDIR):$(CURDIR)/runtime" ./test/test_gl_host_identity ./lunaria test/libglversiontest.so \
 	    > .glversiontest.out 2>&1; \
@@ -1528,15 +1566,10 @@ test/libpackagepath32.so: test/package_data_path_test.c
 package-data-path-test: lunaria test/libpackagepath64.so test/libpackagepath32.so
 	@mkdir -p "$(BUILD_DIR)/package-data/app/files" "$(BUILD_DIR)/package-data/root"
 	@printf 'private' > "$(BUILD_DIR)/package-data/app/files/marker"
-	@rc=0; for abi in 64 32; do \
-	    output="$(BUILD_DIR)/package-path$$abi.log"; \
-	    timeout -k 2s 20s env ANDROID_PACKAGE_NAME=test.paths \
-	        ANDROID_FILES_DIR="$(abspath $(BUILD_DIR))/package-data/app/files" \
-	        LUNARIA_GUEST_ROOT="$(abspath $(BUILD_DIR))/package-data/root" \
-	        ./lunaria test/libpackagepath$$abi.so > "$$output" 2>&1; \
-	    grep 'packagepath.*RESULT\|packagepath.*FAIL' "$$output"; \
-	    grep -q 'RESULT PASS' "$$output" && ! grep -q 'RESULT FAIL' "$$output" || rc=1; \
-	done; exit $$rc
+	@env ANDROID_PACKAGE_NAME=test.paths \
+	    ANDROID_FILES_DIR="$(abspath $(BUILD_DIR))/package-data/app/files" \
+	    LUNARIA_GUEST_ROOT="$(abspath $(BUILD_DIR))/package-data/root" \
+	    python3 test/run_guest_results.py test/libpackagepath64.so test/libpackagepath32.so
 
 .PHONY: jni-context-path-test
 jni-context-path-test: lunaria test/libjnicontextpath.so test/libjnicontextpath-arm32.so test/dvm_test.dex
@@ -2448,7 +2481,7 @@ dist-clean:
 	$(RM) -r "$(BUILD_DIR)/dist"
 	$(RM) lunaria-*.tar.gz lunaria-*.dmg lunaria-*.zip
 
-.PHONY: primary-mutex-test gl-map-test luna-browser luna-browser-test vulkan-test dist dist-stage dist-stage-build dist-mac dist-clean all pixels-test dl-test jit-speed syslib syslib-core syslib-for-dist guestlib syslib-clean host-all macos-deps x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
+.PHONY: primary-mutex-test gl-map-test luna-browser luna-browser-test vulkan-test dist dist-stage dist-stage-build dist-mac dist-clean all pixels-test dl-test jit-speed syslib syslib-core artlib syslib-for-dist guestlib syslib-clean host-all macos-deps x86 x86_64 armeabi armeabi-v7a armeabi-v7a-neon arm64-v8a \
 	        clean install install-bin install-lib test net-test dvm-test http-chunked-test regex-test charset-test abi-test \
 	        posix-test boot-card-test surface-window-test binary128-test fd-callback-test \
 	        thread-start-test mutex-test heap-test heap-core-test icache-sync-test guestmem-test lock-test \
@@ -2584,7 +2617,7 @@ host-timer-test: $(HOST_TIMER_TEST)
 .PHONY: host-timer-test
 
 HOST_ELF_TEST = $(BUILD_DIR)/test_host_elf_segments$(HOST_TEST_EXE_SUFFIX)
-HOST_ELF_TEST_SRC = src/linker/dlfcn.c src/linker/linker_environ.c src/linker/strlcpy.c
+HOST_ELF_TEST_SRC = src/linker/dlfcn.c src/linker/linker_environ.c
 $(HOST_ELF_TEST): test/host_elf_segments_test.c src/linker/linker.c src/linker/linker.h \
                  src/linker/linker_debug.h src/lunaria_os.h $(HOST_ELF_TEST_SRC) $(LUNA_OS_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -DLINKER_DEBUG=0 -DRUNTIMEPATH='"runtime"' \
@@ -2646,7 +2679,7 @@ host-pattern-test: $(HOST_PATTERN_TEST)
 	$(HOST_PATTERN_TEST)
 .PHONY: host-pattern-test
 
-$(BUILD_DIR)/apk.o: src/apk.c src/luna_boot.h src/lunaria_os.h src/dvm/charset.h | $(BUILD_DIR)
+$(BUILD_DIR)/apk.o: src/apk.c src/luna_boot.h src/lunaria_os.h src/dvm/dvm_lib.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -c $< -o $@
 
 .PHONY: unicode-test apk-launcher-test
@@ -2659,7 +2692,7 @@ $(BUILD_DIR)/test_unicode_breaks: test/unicode_break_test.c src/luna_unicode.c s
 unicode-break-test: $(BUILD_DIR)/test_unicode_breaks
 	$(BUILD_DIR)/test_unicode_breaks
 .PHONY: unicode-break-test
-$(BUILD_DIR)/test_calendar: test/calendar_test.c src/dvm/calendar.c src/dvm/calendar.h | $(BUILD_DIR)
+$(BUILD_DIR)/test_calendar: test/calendar_test.c src/dvm/calendar.c src/dvm/dvm_lib.h | $(BUILD_DIR)
 	$(CC) -std=c11 -g -O1 -Wall -Wextra -Werror -Isrc $(DVM_TEST_SAN) test/calendar_test.c src/dvm/calendar.c -o $@
 calendar-test: $(BUILD_DIR)/test_calendar
 	python3 test/calendar_oracle.py $(BUILD_DIR)/calendar-oracle.txt
@@ -2668,15 +2701,15 @@ calendar-test: $(BUILD_DIR)/test_calendar
 apk-launcher-test: $(LUNARIA_BIN)
 	python3 test/apk_launcher_test.py ./$(LUNARIA_BIN)
 
-$(BUILD_DIR)/test_apkpure: test/apkpure_test.c src/apkpure.c src/apkpure.h src/dvm/dvm_net.h $(LUNA_OS_OBJ)
+$(BUILD_DIR)/test_apkpure: test/apkpure_test.c src/apkpure.c src/luna_boot.h src/dvm/dvm_net.h $(LUNA_OS_OBJ)
 	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -Wall -Wextra $(CPPFLAGS) $(DVM_TEST_SAN) -Isrc \
-	    test/apkpure_test.c src/apkpure.c $(LUNA_OS_OBJ) $(HOST_SYSTEM_DL_LIBS) $(HOST_NATIVE_LIBS) $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_GL_LIBS) -lm -o $@
+	    test/apkpure_test.c src/apkpure.c $(LUNA_OS_OBJ) -Wl,-rpath,$(abspath .deps/lib) $(HOST_SYSTEM_DL_LIBS) $(HOST_NATIVE_LIBS) $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_GL_LIBS) -lm -o $@
 .PHONY: apkpure-test
 apkpure-test: $(BUILD_DIR)/test_apkpure
 	python3 test/apkpure_test.py $(BUILD_DIR)/test_apkpure
 
 # Optional UI fixture: run with --launcher <private cache directory> under Xvfb.
-test/test_apkpure_launcher: test/boot_card_test.c test/apkpure_launcher_transport.c src/apkpure.c src/apkpure.h $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_qfkey.o $(LUNA_OS_OBJ)
+test/test_apkpure_launcher: test/boot_card_test.c test/apkpure_launcher_transport.c src/apkpure.c $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_qfkey.o $(LUNA_OS_OBJ)
 	$(CC) -std=c11 -D_GNU_SOURCE -O1 -g $(CPPFLAGS) -Isrc test/boot_card_test.c test/apkpure_launcher_transport.c src/apkpure.c src/luna_unicode.c \
 	    $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_qfkey.o $(LUNA_OS_OBJ) \
 	    $(HOST_GL_LIBS) $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_SYSTEM_DL_LIBS) -lm -o $@
@@ -3190,7 +3223,7 @@ kill-process-test: lunaria $(KILL_PROCESS_FIXTURES)
 	@python3 test/run_kill_process_test.py $(KILL_PROCESS_FIXTURES)
 
 $(BUILD_DIR)/apk_service_manifest_probe: test/apk_service_manifest_probe.c src/apk.c src/dvm/charset.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_GNU_SOURCE -O1 -ffunction-sections -fdata-sections $(CPPFLAGS) -Isrc test/apk_service_manifest_probe.c src/dvm/charset.c -Wl,--gc-sections -o $@
+	$(CC) -std=c11 -D_GNU_SOURCE -O1 -ffunction-sections -fdata-sections $(CPPFLAGS) -Isrc test/apk_service_manifest_probe.c src/dvm/charset.c $(UNITY_TEST_GC) -o $@
 .PHONY: apk-service-manifest-test
 apk-service-manifest-test: $(BUILD_DIR)/apk_service_manifest_probe
 	python3 test/apk_service_manifest_test.py $<
@@ -3224,3 +3257,236 @@ provider-lifecycle-test: test/test_dvm
 .PHONY: service-wire-test
 service-wire-test: test/test_dvm
 	./test/test_dvm --service-wire-test
+
+# Issue API regressions: real guest callbacks and guest cwd on both ARM ABIs.
+$(BUILD_DIR)/issue-compat64.so: test/issue_compat_test.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -Isrc -o $@ $<
+$(BUILD_DIR)/issue-compat32.so: test/issue_compat_test.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabihf -mfloat-abi=softfp $(ABI_TEST_CFLAGS) -Isrc -o $@ $<
+.PHONY: issue-compat-test
+issue-compat-test: lunaria $(BUILD_DIR)/issue-compat64.so $(BUILD_DIR)/issue-compat32.so
+	@for abi in 64 32; do \
+	    log="$(BUILD_DIR)/issue-compat$$abi.log"; \
+	    root="$(BUILD_DIR)/issue-compat-root-$$abi"; \
+	    mkdir -p "$$root/app/files" "$$root/external" "$$root/data" "$$root/code" "$$root/storage"; \
+	    env LUNARIA_GUEST_ROOT="$$root" ANDROID_PACKAGE_NAME=com.lunaria.issuecompat \
+	      ANDROID_PACKAGE_CODE_PATH="$$root/code" \
+	      ANDROID_EXTERNAL_STORAGE_DIR="$$root/storage" \
+	      ANDROID_FILES_DIR="$$root/app/files" ANDROID_EXTERNAL_FILES_DIR="$$root/external" \
+	      ./lunaria "$(BUILD_DIR)/issue-compat$$abi.so" > "$$log" 2>&1; \
+	    grep 'issuecompat' "$$log"; \
+	    grep -q 'RESULT PASS' "$$log" && ! grep -q 'RESULT FAIL' "$$log" || exit 1; \
+	done
+
+.PHONY: application-binding-test
+application-binding-test: test/test_dvm
+	./test/test_dvm --application-binding-test
+
+test/test_dvm: test/class_loader_tests.h
+.PHONY: class-loader-test
+class-loader-test: test/test_dvm test/dvm_test.dex
+	./test/test_dvm --class-loader-test test/dvm_test.dex
+
+.PHONY: field-cache-test
+field-cache-test: test/test_dvm
+	./test/test_dvm --field-cache-test
+
+ifeq ($(LUNA_OS_NAME),Darwin)
+$(MAC_DEPS)/lib/libharfbuzz.0.dylib: scripts/fetch-macos-deps.sh
+	sh scripts/fetch-macos-deps.sh
+$(BUILD_DIR)/luna_overlay.o: $(MAC_DEPS)/lib/libharfbuzz.0.dylib
+endif
+
+test/test_dvm: test/provider_crud_tests.h
+
+
+test/test_dvm: test/query_builder_tests.h
+
+test/test_dvm: test/ec_tests.h
+.PHONY: ec-test
+ec-test: test/test_dvm
+	./test/test_dvm --ec-test
+
+test/test_dvm: test/storage_tests.h
+.PHONY: storage-test
+storage-test: test/test_dvm
+	./test/test_dvm --storage-test
+
+.PHONY: pbe-test
+test/test_dvm: test/pbe_tests.h test/pbe_vectors.h
+pbe-test: test/test_dvm
+	./test/test_dvm --pbe-test
+
+$(BUILD_DIR)/aaudio-contract64.so: test/aaudio_contract_test.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
+$(BUILD_DIR)/aaudio-contract32.so: test/aaudio_contract_test.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabi -mfloat-abi=softfp -mfpu=vfpv3 $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
+$(BUILD_DIR)/test_aaudio_stream: test/aaudio_stream_core_test.cpp src/aaudio_stream.h | $(BUILD_DIR)
+	$(CXX) -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -Isrc $< -o $@
+.PHONY: aaudio-contract-test aaudio-core-test
+aaudio-core-test: $(BUILD_DIR)/test_aaudio_stream
+	$(BUILD_DIR)/test_aaudio_stream
+aaudio-contract-test: lunaria $(BUILD_DIR)/aaudio-contract64.so $(BUILD_DIR)/aaudio-contract32.so
+	@python3 test/run_guest_results.py $(BUILD_DIR)/aaudio-contract64.so $(BUILD_DIR)/aaudio-contract32.so
+$(BUILD_DIR)/arm_exec.o: src/aaudio_stream.h
+
+.PHONY: system-properties-test
+test/test_dvm: test/system_properties_tests.h
+system-properties-test: test/test_dvm
+	./test/test_dvm --system-properties-test
+
+# The device's package database: stock image packages, the running app as row 0.
+.PHONY: package-inventory-test
+package-inventory-test:
+	$(CC) -std=c11 -D_GNU_SOURCE -ffunction-sections -fdata-sections -Isrc $(CPPFLAGS) `if test "$$(uname -s)" = Darwin; then echo -Wl,-dead_strip; else echo -Wl,--gc-sections; fi` test/package_inventory_test.c -o $(BUILD_DIR)/package-inventory-test
+	rm -rf $(BUILD_DIR)/package-inventory-root
+	$(BUILD_DIR)/package-inventory-test $(BUILD_DIR)/package-inventory-root
+
+.PHONY: activity-resolution-test
+test/test_dvm: test/activity_resolution_tests.h
+$(BUILD_DIR)/activity-launch.dex: test/make_activity_launch_dex.py test/make_dex.py | $(BUILD_DIR)
+	python3 test/make_activity_launch_dex.py $@
+activity-resolution-test: test/test_dvm $(BUILD_DIR)/activity-launch.dex
+	./test/test_dvm --activity-resolution-test
+	./test/test_dvm --activity-launch-test $(BUILD_DIR)/activity-launch.dex
+
+.PHONY: android-fs-layout-test
+$(BUILD_DIR)/android-fs-layout-test: test/android_fs_layout_test.c src/lunaria_file.c | $(BUILD_DIR)
+	$(CC) -std=c11 -D_GNU_SOURCE -Wall -Wextra $(CPPFLAGS) -Isrc -ffunction-sections -fdata-sections $< src/lunaria_file.c $(UNITY_TEST_GC) -o $@
+android-fs-layout-test: $(BUILD_DIR)/android-fs-layout-test
+	$<
+
+.PHONY: resolve-info-test
+test/test_dvm: test/resolve_info_tests.h
+resolve-info-test: test/test_dvm
+	./test/test_dvm --resolve-info-test
+
+.PHONY: activity-preferences-test
+test/test_dvm: test/activity_preferences_tests.h
+activity-preferences-test: test/test_dvm
+	./test/test_dvm --activity-preferences-test
+
+.PHONY: keyguard-test
+test/test_dvm: test/keyguard_tests.h
+keyguard-test: test/test_dvm
+	./test/test_dvm --keyguard-test
+
+.PHONY: multi-array-test
+test/test_dvm: test/multi_array_tests.h
+multi-array-test: test/test_dvm
+	./test/test_dvm --multi-array-test
+
+.PHONY: vector-test
+test/test_dvm: test/vector_tests.h
+vector-test: test/test_dvm
+	./test/test_dvm --vector-test
+
+.PHONY: adapter-view-test
+test/test_dvm: test/adapter_view_tests.h
+adapter-view-test: test/test_dvm
+	./test/test_dvm --adapter-view-test
+
+.PHONY: adapter-observer-test
+test/test_dvm: test/adapter_observer_tests.h
+adapter-observer-test: test/test_dvm
+	./test/test_dvm --adapter-observer-test
+
+
+.PHONY: list-view-test
+test/test_dvm: test/list_view_tests.h
+list-view-test: test/test_dvm
+	./test/test_dvm --list-view-test
+
+.PHONY: array-adapter-test
+test/test_dvm: test/array_adapter_tests.h test/array_adapter_fixture.h
+array-adapter-test: test/test_dvm
+	./test/test_dvm --array-adapter-test
+
+.PHONY: array-list-test
+test/test_dvm: test/array_list_tests.h
+array-list-test: test/test_dvm
+	./test/test_dvm --array-list-test
+
+.PHONY: item-click-test
+test/test_dvm: test/item_click_tests.h
+item-click-test: test/test_dvm
+	./test/test_dvm --item-click-test
+
+.PHONY: url-components-test
+test/test_dvm: test/url_components_tests.h
+url-components-test: test/test_dvm
+	./test/test_dvm --url-components-test
+
+.PHONY: dom-test
+test/test_dvm: test/dom_tests.h
+dom-test: test/test_dvm
+	./test/test_dvm --dom-test
+
+.PHONY: sax-test
+test/test_dvm: test/sax_tests.h
+sax-test: test/test_dvm
+	./test/test_dvm --sax-test
+
+.PHONY: http-transport-test
+$(BUILD_DIR)/test_http_transport: test/http_transport_test.c src/dvm/dvm_net.c src/dvm/dvm_net.h $(LUNA_OS_OBJ)
+	$(CC) -std=c11 -O1 -g -Wall -Wextra -D_GNU_SOURCE $(CPPFLAGS) -Isrc test/http_transport_test.c src/dvm/dvm_net.c $(LUNA_OS_OBJ) $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_CRYPTO_LIBS) -lpthread -o $@
+http-transport-test: $(BUILD_DIR)/test_http_transport
+	$(BUILD_DIR)/test_http_transport
+
+.PHONY: https-test
+test/test_dvm: test/https_tests.h
+https-test: test/test_dvm
+	./test/test_dvm --https-test
+
+.PHONY: json-accumulate-test
+test/test_dvm: test/json_accumulate_tests.h
+json-accumulate-test: test/test_dvm
+	./test/test_dvm --json-accumulate-test
+
+.PHONY: header-number-test
+test/test_dvm: test/header_number_tests.h
+header-number-test: test/test_dvm
+	./test/test_dvm --header-number-test
+
+.PHONY: date-parse-test
+test/test_dvm: test/android_time_tests.h test/orientation_tests.h test/math_round_tests.h test/intent_extras_tests.h
+
+.PHONY: intent-extras-test
+intent-extras-test: test/test_dvm
+	./test/test_dvm --intent-extras-test
+
+.PHONY: math-round-test
+math-round-test: test/test_dvm
+	./test/test_dvm --math-round-test
+
+.PHONY: orientation-test
+orientation-test: test/test_dvm
+	./test/test_dvm --orientation-test
+.PHONY: android-time-test
+test/test_dvm: test/time_formatter_tests.h
+.PHONY: time-formatter-test
+test/test_dvm: test/http_params_tests.h
+.PHONY: http-params-test
+test/test_dvm: test/url_form_tests.h test/http_entity_tests.h
+.PHONY: url-form-test http-entity-test
+test/test_dvm: test/http_client_tests.h test/http_client_shadow.h
+.PHONY: http-client-test
+test/test_dvm: test/uri_value_tests.h test/uri_value_fixture.h
+.PHONY: uri-value-test
+uri-value-test: test/test_dvm
+	./test/test_dvm --uri-value-test
+http-client-test: test/test_dvm
+	./test/test_dvm --http-client-test
+url-form-test: test/test_dvm
+	./test/test_dvm --url-form-test
+http-entity-test: test/test_dvm
+	./test/test_dvm --http-entity-test
+http-params-test: test/test_dvm
+	./test/test_dvm --http-params-test
+time-formatter-test: test/test_dvm
+	./test/test_dvm --time-formatter-test
+android-time-test: test/test_dvm
+	./test/test_dvm --android-time-test
+test/test_dvm: test/date_parse_tests.h
+date-parse-test: test/test_dvm
+	./test/test_dvm --date-parse-test

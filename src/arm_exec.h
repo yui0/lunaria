@@ -411,6 +411,10 @@ int arm_exec_fb_width(void);
  * that touch the host filesystem on the guest's behalf must go through this:
  * without it an Android path such as "/etc" aliases the host's. */
 const char *arm_exec_map_guest_path(const char *path, char *buf, size_t bufsz);
+/* Project a staged host path into the Android namespace before publishing it
+ * through framework APIs. Unknown paths are returned unchanged. */
+const char *arm_exec_unmap_host_path(const char *path,char *buf,size_t bufsz);
+const char *arm_exec_canonical_guest_path(const char *path,char *buf,size_t bufsz);
 /* Read the emulated process environment.  This deliberately does not expose
  * the launcher's host environment to Java or guest libc.  The returned
  * pointer remains owned by the emulator and is copied by callers. */

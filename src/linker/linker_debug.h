@@ -72,7 +72,18 @@
  * corruption when the linker uses printf().
  */
 #if LINKER_DEBUG
-#include "linker_format.h"
+#include <stdarg.h>
+#include <stddef.h>
+
+/* Formatting routines for the dynamic linker's debug traces */
+/* We want to avoid dragging the whole C library fprintf()   */
+/* implementation into the dynamic linker since this creates */
+/* issues (it uses malloc()/free()) and increases code size  */
+
+// apkenv: we can just use snprintf
+//int format_buffer(char *buffer, size_t bufsize, const char *format, ...);
+#define format_buffer snprintf
+
 extern int apkenv_debug_verbosity;
 #if LINKER_DEBUG_TO_LOG
 extern int apkenv_format_log(int, const char *, const char *, ...);

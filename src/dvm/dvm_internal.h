@@ -202,9 +202,13 @@ struct dvm_dex {
 struct dvm_attached_thread { uint64_t token; dvm_ref thread; };
 struct dvm_network_callback { dvm_ref callback, network; bool online; };
 struct dvm {
+   dvm_ref application_class_loader, bootstrap_class_loader;
+   dvm_ref legacy_http_class_loader;
+   uint64_t field_cache_generation;
    /* ui_is_a(): view class names already resolved to their classes, keyed by
     * the caller's string literal.  Per VM because classes belong to one. */
    struct { const char *key; struct dvm_class *cls; } is_a_cache[64];
+   _Atomic unsigned device_keyguard_state;
    _Atomic bool stopping;
    _Atomic int process_exit_phase; /* 0 live, 1 publishing, 2 terminal */
    _Atomic int process_exit_status;
@@ -338,6 +342,7 @@ struct dvm {
    /* Captured before runtime installation and any application code. */
    int64_t process_start_elapsed_ms;
    int64_t process_start_uptime_ms;
+   int32_t date_parse_century_start;
    uint64_t steps;       /* since dvm_create, for diagnostics */
    uint64_t call_steps;  /* since the outermost dvm_call, for the step limit */
    uint64_t step_limit;
@@ -610,6 +615,10 @@ void dvm_nsd_finish(struct dvm *vm);
 /* Called by dvm.c when a class has no dex definition, before falling back to
  * the host stubs.  Returns NULL when the runtime has no built-in for it. */
 struct dvm_class *dvm_runtime_define(struct dvm *vm, const char *desc);
+struct dvm_class *dvm_runtime_shared_define(struct dvm *vm,const char *desc);
+bool dvm_runtime_shared_class_exists(struct dvm *vm,const char *desc);
+bool dvm_runtime_http_core_class(const char *desc);
+bool dvm_runtime_http_optional_enabled(void);
 
 /* A fresh Bundle containing only the installed application metadata. */
 dvm_ref dvm_runtime_manifest_bundle(struct dvm *vm);
@@ -646,3 +655,40 @@ enum luna_message_error {
 enum luna_message_error luna_message_compile(const uint16_t *text, size_t length,
                                              struct luna_message_pattern *out);
 void luna_message_free(struct luna_message_pattern *pattern);
+
+/* ---- android.database.sqlite over the host's SQLite (dvm_sqlite.c) ----
+ * The tables have the layout of rt_method / rt_field rows and are NULL-terminated;
+ * dvm_runtime.c wires them to the framework classes. */
+struct dvm_sqlite_method {
+   const char *name, *sig;
+   dvm_builtin_fn fn;
+   uint32_t access;
+};
+
+struct dvm_sqlite_field {
+   const char *name, *type;
+};
+
+extern const struct dvm_sqlite_method dvm_sqlite_database_methods[];
+extern const struct dvm_sqlite_field  dvm_sqlite_database_fields[];
+extern const struct dvm_sqlite_method dvm_sqlite_cursor_methods[];
+extern const struct dvm_sqlite_field  dvm_sqlite_cursor_fields[];
+extern const struct dvm_sqlite_method dvm_sqlite_program_methods[];
+extern const struct dvm_sqlite_method dvm_sqlite_statement_methods[];
+extern const struct dvm_sqlite_field  dvm_sqlite_program_fields[];
+extern const struct dvm_sqlite_method dvm_sqlite_helper_methods[];
+extern const struct dvm_sqlite_field  dvm_sqlite_helper_fields[];
+
+/* Opens (creating when `flags` says so) a database and returns the
+ * SQLiteDatabase object, or 0 with an SQLiteException pending.  `flags` are
+ * SQLiteDatabase.OPEN_* / CREATE_IF_NECESSARY / ENABLE_WRITE_AHEAD_LOGGING. */
+dvm_ref dvm_sqlite_open(struct dvm *vm, const char *path, int flags);
+
+/* Removes a database file and its -journal/-wal/-shm companions. */
+bool dvm_sqlite_delete_files(const char *path);
+
+/* A Cursor with no columns and no rows. */
+dvm_ref dvm_sqlite_empty_cursor(struct dvm *vm);
+
+/* The file a database name refers to (Context.getDatabasePath). */
+void dvm_sqlite_database_path(const char *name, char *path, size_t cap);

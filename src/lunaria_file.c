@@ -12,6 +12,34 @@ static char temp_root[4096];
 static long temp_owner;
 static int temp_registered;
 
+char *luna_java_file_normalize(const char *path)
+{
+   if(!path){errno=EINVAL;return NULL;}
+   size_t n=strlen(path),used=0;
+   char *out=malloc(n+1);if(!out)return NULL;
+   for(size_t i=0;i<n;++i)
+      if(path[i]!='/' || !used || out[used-1]!='/')out[used++]=path[i];
+   if(used>1 && out[used-1]=='/')--used;
+   out[used]=0;return out;
+}
+
+char *luna_java_file_resolve(const char *parent,const char *child)
+{
+   if(!child){errno=EINVAL;return NULL;}
+   if(!parent)return luna_java_file_normalize(child);
+   char *p=luna_java_file_normalize(*parent ? parent : "/");
+   char *c=luna_java_file_normalize(child);
+   if(!p || !c){free(p);free(c);return NULL;}
+   size_t pn=strlen(p),cn=strlen(c);
+   if(pn>SIZE_MAX-cn-2){free(p);free(c);errno=ENOMEM;return NULL;}
+   char *out=malloc(pn+cn+2);
+   if(out){
+      const char *tail=c[0]=='/' ? c+1 : c;
+      snprintf(out,pn+cn+2,"%s%s%s",p,*tail && p[pn-1]!='/' ? "/" : "",tail);
+   }
+   free(p);free(c);return out;
+}
+
 /* Never follow a link out of our private namespace. Only this process's
  * mkdtemp directory is visited, never a glob of other Lunaria executions. */
 static void temp_remove(const char *path)
@@ -638,6 +666,37 @@ char *luna_symlink_realpath(const char *path,char *out,size_t cap)
    if (!sym_resolve(path,actual,sizeof actual,1)) r=luna_file_realpath(actual,out,cap);
    sym_leave();return r;
 }
+char *luna_file_canonical_namespace(const char *path,char *out,size_t capacity,
+   luna_symlink_mapper mapper,luna_symlink_mapper reverse)
+{
+   if(!path || path[0]!='/' || !out || !capacity || !mapper){errno=EINVAL;return NULL;}
+   char work[SYM_PATH]="/",mapped[SYM_PATH],resolved[SYM_PATH],projected[SYM_PATH];
+   size_t used=1;
+   for(size_t at=1;path[at];){
+      while(path[at]=='/')++at;if(!path[at])break;
+      size_t start=at;while(path[at] && path[at]!='/')++at;size_t n=at-start;
+      if(n==1 && path[start]=='.')continue;
+      if(n==2 && path[start]=='.' && path[start+1]=='.'){
+         while(used>1 && work[used-1]!='/')--used;
+         if(used>1)--used;work[used]=0;continue;
+      }
+      if(used+n+2>sizeof work){errno=ENAMETOOLONG;return NULL;}
+      if(used>1)work[used++]='/';memcpy(work+used,path+start,n);used+=n;work[used]=0;
+      const char *physical=mapper(work,mapped,sizeof mapped);
+      if(!physical){if(errno==ENOENT || errno==ENOTDIR)continue;return NULL;}
+      if(luna_symlink_realpath(physical,resolved,sizeof resolved)){
+         const char *logical=reverse ? reverse(resolved,projected,sizeof projected) : resolved;
+         if(!logical)return NULL;
+         /* Unprojected host mount details are not Android path components. */
+         if(logical!=resolved){
+            used=strlen(logical);if(used>=sizeof work){errno=ENAMETOOLONG;return NULL;}
+            memcpy(work,logical,used+1);
+         }
+      }else if(errno!=ENOENT && errno!=ENOTDIR)return NULL;
+   }
+   if(used>=capacity){errno=ENAMETOOLONG;return NULL;}
+   memcpy(out,work,used+1);return out;
+}
 int luna_symlink_rename(const char *from,const char *to)
 {
    sym_enter();char a[SYM_PATH],b[SYM_PATH],ma[SYM_PATH],mb[SYM_PATH],target[SYM_PATH];int r=-1;
@@ -710,4 +769,50 @@ int luna_symlink_directory_close(luna_directory *dir)
    while (*at && (*at)->native!=dir) at=&(*at)->next;
    if (*at) {struct sym_directory *old=*at;*at=old->next;free(old->path);free(old);}
    int r=luna_directory_close(dir);sym_leave();return r;
+}
+
+/* Android 12 init data directories. Keep creation and guest ownership in one
+ * table: the host process owns backing files, the Android system owns these
+ * mount points. /data/user/0 is a namespace binding to /data/data. */
+static const struct {const char *name;unsigned mode,uid,gid;} android_fs_dirs[]={
+   {"data",0771,1000,1000},{"data/data",0771,1000,1000},
+   {"data/user",0711,1000,1000},{"data/user_de",0711,1000,1000},
+   {"data/user_de/0",0771,1000,1000},{"data/app",0771,1000,1000},
+   {"data/local",0751,0,0},{"data/local/tmp",0771,2000,2000},
+   {"data/misc",01771,1000,9998},{"data/system",0775,1000,1000},
+};
+int luna_android_fs_inode(const char *path,luna_file_info *info)
+{
+   if (!path || *path!='/' || !info) return 0;
+   for (unsigned i=0;i<sizeof android_fs_dirs/sizeof android_fs_dirs[0];++i) {
+      if (strcmp(path+1,android_fs_dirs[i].name)) continue;
+      info->uid=android_fs_dirs[i].uid;info->gid=android_fs_dirs[i].gid;
+      info->mode=(info->mode&~07777u)|android_fs_dirs[i].mode;
+      return 1;
+   }
+   return 0;
+}
+/* Do not follow a replacement link or overwrite existing user data. The
+ * configured root may itself be a host mount; children belong to this layout. */
+static int luna_android_fs_directory(const char *path, unsigned mode)
+{
+   if (!luna_file_mkdir(path, mode)) return 0;
+   if (errno != EEXIST) return -1;
+   luna_file_info info;
+   if (luna_file_infoat(LUNA_AT_FDCWD,path,&info,LUNA_AT_NOFOLLOW)) return -1;
+   if ((info.mode & 0170000u) != 0040000u) {errno=ENOTDIR;return -1;}
+   return 0;
+}
+int luna_android_fs_prepare(const char *root)
+{
+   if (!root || !*root) {errno=EINVAL;return -1;}
+   for (unsigned i=0;i<sizeof android_fs_dirs/sizeof android_fs_dirs[0];++i) {
+      char path[4096];
+      int n=snprintf(path,sizeof path,"%s/%s",root,android_fs_dirs[i].name);
+      if (n<0 || (size_t)n>=sizeof path) {errno=ENAMETOOLONG;return -1;}
+      if (luna_android_fs_directory(path,android_fs_dirs[i].mode)) return -1;
+   }
+   /* /data/user/0 is a bind alias of /data/data. The path mapper implements
+    * that binding, including the parent directory and not only app children. */
+   return 0;
 }

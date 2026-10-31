@@ -358,9 +358,22 @@ dvm_ref dvm_new_string(struct dvm *vm, const char *utf8)
 
 dvm_ref dvm_new_array(struct dvm *vm, char elem, const char *elem_desc, uint32_t length)
 {
-   char desc[256];
-   snprintf(desc, sizeof desc, "[%s", elem_desc ? elem_desc : "I");
-   struct dvm_class *cls = dvm__class_by_desc(vm, desc);
+   char primitive[2]={elem,0};
+   const char *component=elem_desc ? elem_desc : elem=='L' ? "Ljava/lang/Object;" : primitive;
+   size_t count=0;while(component[count]=='[')++count;
+   if (count>=255 || !*component || !strcmp(component,"V")) {
+      dvm__throw(vm,"java/lang/IllegalArgumentException","invalid array component");return 0;
+   }
+   size_t length_desc=strlen(component);
+   char local[256], *desc=length_desc+2<=sizeof local ? local : malloc(length_desc+2);
+   if (!desc) {dvm__throw(vm,"java/lang/OutOfMemoryError","array descriptor");return 0;}
+   desc[0]='[';memcpy(desc+1,component,length_desc+1);
+   struct dvm_class *cls=dvm__class_by_desc(vm,desc);
+   if (desc!=local)free(desc);
+   size_t width=(size_t)dvm__elem_width(elem);
+   if (!width || length>SIZE_MAX/width) {
+      dvm__throw(vm,"java/lang/OutOfMemoryError","array allocation size");return 0;
+   }
 
    dvm_ref r = heap_alloc(vm);
    if (!r) return 0;
@@ -369,9 +382,9 @@ dvm_ref dvm_new_array(struct dvm *vm, char elem, const char *elem_desc, uint32_t
    o->kind = DVM_OBJ_ARRAY;
    o->length = length;
    o->elem_kind = elem;
-   size_t bytes = (size_t)length * (size_t)dvm__elem_width(elem);
+   size_t bytes = (size_t)length * width;
    o->data = calloc(bytes ? bytes : 1, 1);
-   if (!o->data) { heap_free(vm, r); return 0; }
+   if (!o->data) { heap_free(vm, r); dvm__throw(vm,"java/lang/OutOfMemoryError","array data");return 0; }
    return r;
 }
 
@@ -576,6 +589,7 @@ static void note_missing(struct dvm *vm, const char *what)
  * runtime's own dalvik/ and libcore/.  androidx/ is application code. */
 static bool desc_is_boot_class(const char *desc)
 {
+   if(dvm_runtime_http_core_class(desc))return true;
    static const char *const ns[] = {
       "Ljava/", "Ljavax/", "Landroid/", "Ldalvik/", "Llibcore/",
    };
@@ -615,6 +629,10 @@ struct dvm_class *dvm__class_by_desc(struct dvm *vm, const char *desc)
       c = dvm_runtime_define(vm, desc);
       if (c) return c;
    }
+   /* Enabled device shared libraries are a separate delegation step before
+    * the application's DEX, not an expansion of the boot namespace. */
+   c=dvm_runtime_shared_define(vm,desc);
+   if(c)return c;
    /* Otherwise a dex definition wins; then a built-in; then a host stub. */
    for (int i = 0; i < vm->ndexes; ++i) {
       int idx = dex_find_class(&vm->dexes[i]->file, desc);
@@ -658,6 +676,7 @@ static bool desc_is_platform(const char *desc)
       "Lorg/xml/", "Lorg/xmlpull/", "Ljunit/",
    };
    if (!desc) return true;
+   if(!strncmp(desc,"Lorg/apache/http/",17) && !dvm_runtime_http_core_class(desc) && !dvm_runtime_http_optional_enabled())return false;
    if (desc[0] == '[') return true;             /* arrays are synthesised */
    for (size_t i = 0; i < sizeof ns / sizeof ns[0]; ++i)
       if (!strncmp(desc, ns[i], strlen(ns[i]))) return true;
@@ -723,6 +742,7 @@ bool dvm_class_exists(struct dvm *vm, const char *name)
    size_t length = strlen(desc);
    if (length < 3 || desc[0] != 'L' || desc[length - 1] != ';') return false;
    if (dvm_class_is_known(vm, desc)) return true;
+   if(dvm_runtime_shared_class_exists(vm,desc))return true;
    return dvm_platform_class_exists(desc);
 }
 
@@ -1080,71 +1100,46 @@ static struct dvm_field *class_find_field_slow(struct dvm_class *cls, const char
    return NULL;
 }
 
-/* The runtime stubs look fields up by name on every call, and a view tree walk
- * does it hundreds of times per frame.  Remember where a hit was found, keyed
- * by the caller's name pointer (a literal at nearly every call site) and
- * validated against the field list itself, so a reused pointer or a field list
- * that grew since can only cost a slow search, never a wrong answer. */
-struct field_hit { struct dvm_class *cls, *owner; const char *name, *type, *field_name, *field_type; int index; bool statics; bool miss; unsigned shape, namehash; };
+/* Cache successful lookups, validating caller-owned name/type contents on
+ * every hit. Stack buffers may keep the same address while naming another
+ * field. A negative result has no immutable field metadata to validate against,
+ * so it is not retained. Each VM has a generation to prevent cache pointers
+ * from surviving class destruction and allocator address reuse. */
+struct field_hit {
+   struct dvm_class *cls, *owner;
+   const char *name, *type;
+   int index;
+   bool statics;
+};
+static _Atomic uint64_t field_cache_generation = 1;
 
-/* What a negative answer depends on: how many fields (and interfaces, for the
- * constants) every class in the chain declares.  A class gets its field lists
- * when it is defined, so the sum only moves if the chain does; integer reads,
- * no string compares. */
-static unsigned class_chain_shape(const struct dvm_class *cls)
-{
-   unsigned sum = 0;
-   for (const struct dvm_class *c = cls; c; c = c->super)
-      sum = sum * 31u + (unsigned)c->nifields + 7u * (unsigned)c->nsfields + 13u * (unsigned)c->nifaces;
-   return sum;
-}
-
-static unsigned name_hash(const char *s)
-{
-   unsigned h = 2166136261u;
-   for (; *s; ++s) h = (h ^ (unsigned char)*s) * 16777619u;
-   return h;
-}
-
-static struct dvm_field *class_find_field(struct dvm_class *cls, const char *name,
-                                          const char *type, bool statics)
+static struct dvm_field *class_find_field(struct dvm *vm, struct dvm_class *cls,
+                                          const char *name, const char *type, bool statics)
 {
    static _Thread_local struct field_hit cache[2048];
-   /* The type is part of the key: ui_int() asks for the same name as "I" and
-    * then "Z", and two entries fighting over one slot is a slow search each. */
+   static _Thread_local uint64_t generation;
+   if (generation != vm->field_cache_generation) {
+      memset(cache, 0, sizeof cache);
+      generation = vm->field_cache_generation;
+   }
    const uintptr_t key = (((uintptr_t)cls >> 4) * 2654435761u ^ ((uintptr_t)name >> 3) ^
                           ((uintptr_t)type >> 2) * 40503u ^ (statics ? 1u : 0u)) * 2246822519u >> 7;
-   struct field_hit *h = &cache[key & 2047u];
-   if (h->cls == cls && h->name == name && h->statics == statics) {
-      if (h->miss) {
-         /* Probing for a field the class does not have (a view helper asking
-          * every drawable for "shape") used to walk the whole chain with a
-          * strcmp per field, every time. */
-         if (h->type == type && h->shape == class_chain_shape(cls) &&
-             h->namehash == name_hash(name)) return NULL;
-      } else if (h->owner) {
-         struct dvm_field *list = statics ? h->owner->sfields : h->owner->ifields;
-         int n = statics ? h->owner->nsfields : h->owner->nifields;
-         if (h->index < n) {
-            struct dvm_field *f = &list[h->index];
-            /* The same field entry, asked for with the same literals, as when it was
-             * found: nothing to compare. */
-            if (h->type == type && f->name == h->field_name && f->type == h->field_type) return f;
-            if (f->name && !strcmp(f->name, name) &&
-                (!type || !f->type || !strcmp(f->type, type)))
-               return f;
-         }
+   struct field_hit *hit = &cache[key & 2047u];
+   if (hit->cls == cls && hit->name == name && hit->statics == statics && hit->owner) {
+      struct dvm_field *list = statics ? hit->owner->sfields : hit->owner->ifields;
+      int count = statics ? hit->owner->nsfields : hit->owner->nifields;
+      if (hit->index < count) {
+         struct dvm_field *field = &list[hit->index];
+         if (field->name && !strcmp(field->name, name) &&
+             (!type || !field->type || !strcmp(field->type, type))) return field;
       }
    }
-   struct dvm_class *owner = NULL; int index = 0;
-   struct dvm_field *f = class_find_field_slow(cls, name, type, statics, &owner, &index);
-   if (f) *h = (struct field_hit){ .cls = cls, .owner = owner, .name = name, .type = type,
-                                   .field_name = f->name, .field_type = f->type,
-                                   .index = index, .statics = statics };
-   else   *h = (struct field_hit){ .cls = cls, .name = name, .type = type, .statics = statics,
-                                   .miss = true, .shape = class_chain_shape(cls),
-                                   .namehash = name_hash(name) };
-   return f;
+   struct dvm_class *owner = NULL;
+   int index = 0;
+   struct dvm_field *field = class_find_field_slow(cls, name, type, statics, &owner, &index);
+   if (field) *hit = (struct field_hit){.cls=cls,.owner=owner,.name=name,.type=type,.index=index,.statics=statics};
+   else memset(hit, 0, sizeof *hit);
+   return field;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -1411,7 +1406,7 @@ bool dvm__get_field_from(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
 {
    struct dvm_object *o = dvm__obj(vm, obj);
    if (!o || !o->cls) return false;
-   struct dvm_field *f = class_find_field(owner ? owner : o->cls, name, type, false);
+   struct dvm_field *f = class_find_field(vm, owner ? owner : o->cls, name, type, false);
    if (!f || !o->slots || f->slot >= o->cls->islots) return false;
    *out = o->slots[f->slot];
    return true;
@@ -1423,7 +1418,7 @@ bool dvm__set_field_from(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
 {
    struct dvm_object *o = dvm__obj(vm, obj);
    if (!o || !o->cls) return false;
-   struct dvm_field *f = class_find_field(owner ? owner : o->cls, name, type, false);
+   struct dvm_field *f = class_find_field(vm, owner ? owner : o->cls, name, type, false);
    if (!f || !o->slots || f->slot >= o->cls->islots) return false;
    o->slots[f->slot] = val;
    return true;
@@ -1444,7 +1439,7 @@ bool dvm_set_field(struct dvm *vm, dvm_ref obj, const char *name,
 bool dvm_get_static(struct dvm *vm, struct dvm_class *cls, const char *name,
                     const char *type, union dvm_value *out)
 {
-   struct dvm_field *f = class_find_field(cls, name, type, true);
+   struct dvm_field *f = class_find_field(vm, cls, name, type, true);
    if (!f || !f->cls->sslots || f->slot >= f->cls->nsslots) return false;
    if (!dvm_init_class(vm, f->cls)) return false;
    *out = f->cls->sslots[f->slot];
@@ -1454,7 +1449,7 @@ bool dvm_get_static(struct dvm *vm, struct dvm_class *cls, const char *name,
 bool dvm_set_static(struct dvm *vm, struct dvm_class *cls, const char *name,
                     const char *type, union dvm_value val)
 {
-   struct dvm_field *f = class_find_field(cls, name, type, true);
+   struct dvm_field *f = class_find_field(vm, cls, name, type, true);
    if (!f || !f->cls->sslots || f->slot >= f->cls->nsslots) return false;
    f->cls->sslots[f->slot] = val;
    return true;
@@ -1979,7 +1974,7 @@ static struct dvm_field *resolve_field(struct dvm *vm, struct dvm_dex *dd,
    struct dvm_class *cls = dvm__class_by_desc(vm, cd);
    *out_cls = cls;
    if (!cls) return NULL;
-   struct dvm_field *f = class_find_field(cls, *out_name, *out_type, statics);
+   struct dvm_field *f = class_find_field(vm, cls, *out_name, *out_type, statics);
    if (f && dd->field_cache && idx < dd->file.field_ids_size)
       dd->field_cache[idx] = f;
    return f;
@@ -5143,9 +5138,11 @@ struct dvm *dvm_create(const struct dvm_hooks *hooks)
 {
    struct dvm *vm = calloc(1, sizeof *vm);
    if (!vm) return NULL;
+   vm->field_cache_generation = atomic_fetch_add_explicit(&field_cache_generation, 1, memory_order_relaxed);
    vm->process_start_elapsed_ms = (int64_t)(luna_os_boottime_ns() / 1000000ULL);
    vm->process_start_uptime_ms = (int64_t)(luna_os_uptime_ns() / 1000000ULL);
    vm->main_host_thread=luna_os_thread_token();
+   atomic_init(&vm->device_keyguard_state,0);
    atomic_init(&vm->stopping, false);
    atomic_init(&vm->process_exit_phase, 0);
    atomic_init(&vm->process_exit_status, 0);
@@ -5342,6 +5339,30 @@ bool dvm_add_dex_memory(struct dvm *vm, const void *data, size_t len,
            name ? name : "in-memory dex", len,
            dd->file.class_defs_size, dd->file.method_ids_size);
    return true;
+}
+
+/* Preserve the Android archive origin of every DEX. Flattening split DEXes
+ * into one directory loses both collision handling and ClassLoader metadata. */
+int dvm_add_apk_archive(struct dvm *vm, const char *host_path, const char *guest_path)
+{
+   int loaded = 0;
+   for (unsigned i = 1; i <= 64; ++i) {
+      char entry[48];
+      if (i == 1) snprintf(entry, sizeof entry, "classes.dex");
+      else snprintf(entry, sizeof entry, "classes%u.dex", i);
+      size_t size = 0;
+      unsigned char *data = arm_exec_zip_read(host_path, entry, &size);
+      if (!data) { if (i == 1) continue; break; }
+      size_t length = strlen(guest_path) + strlen(entry) + 2;
+      char *origin = malloc(length);
+      if (!origin) { free(data); return -1; }
+      snprintf(origin, length, "%s!%s", guest_path, entry);
+      bool ok = dvm_add_dex_memory(vm, data, size, origin);
+      free(origin); free(data);
+      if (!ok) return -1;
+      ++loaded;
+   }
+   return loaded;
 }
 
 int dvm_add_apk_dir(struct dvm *vm, const char *dir)

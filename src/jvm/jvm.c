@@ -18,9 +18,8 @@
 #include "lunaria_os.h"
 #include "jvm.h"
 #include "trace.h"
-#include "dvm/dvm_jni.h"
 #include "dvm/dvm.h"
-#include "dvm/charset.h"
+#include "dvm/dvm_lib.h"
 #include "arm.h"
 
 _Static_assert(sizeof(jclass) == sizeof(jobject), "We assume jclass and jobject are both same internally for the call methods");
@@ -1455,8 +1454,11 @@ jvm_class_is(struct jvm *jvm, jclass cls, const char *name)
    if (!jvm || !cls || !name)
       return false;
    struct jvm_object *ko = jvm_get_object(jvm, cls);
-   return ko && ko->type == JVM_OBJECT_CLASS && ko->klass.name.data &&
-          !strcmp(ko->klass.name.data, name);
+   if(!ko || ko->type!=JVM_OBJECT_CLASS || !ko->klass.name.data)return false;
+   const char *stored=ko->klass.name.data;
+   for(;*stored && *name;++stored,++name)
+      if((*stored=='/' ? '.' : *stored)!=(*name=='/' ? '.' : *name))return false;
+   return !*stored && !*name;
 }
 
 /* NewObject is AllocObject *plus the constructor*.  Skipping the second half
@@ -3653,10 +3655,11 @@ int luna_application_start(struct jvm *jvm,const char *manifest_class,
    for(size_t i=0;i<=n;++i)name[i]=source[i]=='.' ? '/' : source[i];
    bool custom=strcmp(name,"android/app/Application")!=0;
    if(custom && !in_dex(name))return -1;
-   jclass context=jvm->native.FindClass(&jvm->env,"android/content/Context");
+   jclass context=jvm->native.FindClass(&jvm->env,"android/app/ContextImpl");
    if(!context || jvm->native.ExceptionCheck(&jvm->env))return -1;
    jobject base=jvm->native.AllocObject(&jvm->env,context);
    if(!base || jvm->native.ExceptionCheck(&jvm->env))return -1;
+   if (!dvm_jni_bind_application(&jvm->env,base,NULL)) return -1;
    jclass cls=jvm->native.FindClass(&jvm->env,name);
    if(!cls || jvm->native.ExceptionCheck(&jvm->env))return -1;
    jmethodID ctor=jvm->native.GetMethodID(&jvm->env,cls,"<init>","()V");
@@ -3669,6 +3672,7 @@ int luna_application_start(struct jvm *jvm,const char *manifest_class,
    jvalue arg={.l=base};
    jvm->native.CallVoidMethodA(&jvm->env,application,attach,&arg);
    if(jvm->native.ExceptionCheck(&jvm->env))return -1;
+   if (!dvm_jni_bind_application(&jvm->env,base,application)) return -1;
    if(providers(jvm,application)<0 || jvm->native.ExceptionCheck(&jvm->env))return -1;
    jmethodID create=jvm->native.GetMethodID(&jvm->env,cls,"onCreate","()V");
    if(!create || jvm->native.ExceptionCheck(&jvm->env))return -1;

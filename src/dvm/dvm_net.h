@@ -28,12 +28,24 @@ int dvm_sock_close(int fd);
 void *dvm_http_connect(const char *url, int timeout_ms, char *error, size_t error_size);
 void dvm_http_transport_close(void *transport);
 
+/* A caller-owned, already connected stream. Ownership transfers only when
+ * transport_from_io succeeds. close runs exactly once after consumption. */
+struct dvm_http_io {
+   void *context;
+   long (*read)(void *context,void *buffer,size_t length);
+   long (*write)(void *context,const void *buffer,size_t length);
+   void (*close)(void *context);
+};
+void *dvm_http_transport_from_io(const struct dvm_http_io *io);
+typedef void *(*dvm_http_connector)(void *context,const char *url,int timeout_ms,char *error,size_t error_size);
+
 struct dvm_http_header {
    char *name;
    char *value;
 };
 
 struct dvm_http_response {
+   char *status_line;               /* exact wire protocol/status/reason */
    int status;                      /* -1 when the exchange never completed */
    struct dvm_http_header *headers;
    int nheaders;
@@ -78,6 +90,13 @@ bool dvm_http_perform(const char *method, const char *url,
                       const uint8_t *body, size_t body_len,
                       int timeout_ms, bool follow_redirects,
                       struct dvm_http_response *out);
+
+/* The connector is called for every new hop, including redirects. This lets
+ * Java socket factories and verification stay in the caller's transport path. */
+bool dvm_http_perform_with_connector(void **transport,const char *method,const char *url,
+   const struct dvm_http_header *headers,int nheaders,const uint8_t *body,size_t body_len,
+   int timeout_ms,bool follow_redirects,struct dvm_http_response *out,
+   dvm_http_connector connector,void *context);
 
 void dvm_http_response_free(struct dvm_http_response *r);
 

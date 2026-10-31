@@ -121,9 +121,13 @@ static int32_t time_offset(int64_t ms, const char *zone)
 
 /* --- java.util.Date ----------------------------------------------------- */
 
+static bool date_parse(struct dvm *,dvm_ref,const union dvm_value *,int,union dvm_value *);
 static bool date_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                       int nargs, union dvm_value *out)
 {
+   if(nargs && strstr(builtin_sig(),"Ljava/lang/String;")) {
+      union dvm_value parsed={0};if(!date_parse(vm,0,args,1,&parsed))return false;time_set_millis(vm,self,parsed.j);RETV();
+   }
    (void)out;
    time_set_millis(vm, self, nargs >= 1 ? ARG(0).j : now_millis());
    RETV();
@@ -293,7 +297,7 @@ static bool tz_getDisplayName(struct dvm *vm, dvm_ref self,
 /* --- java.util.Calendar ------------------------------------------------- */
 
 /* Java Calendar aliases share the C core's field numbers. */
-#include "calendar.h"
+#include "dvm_lib.h"
 enum {
    CAL_ERA = LC_ERA, CAL_YEAR = LC_YEAR, CAL_MONTH = LC_MONTH,
    CAL_WEEK_OF_YEAR = LC_WEEK_OF_YEAR, CAL_WEEK_OF_MONTH = LC_WEEK_OF_MONTH,
@@ -593,8 +597,87 @@ static const struct rt_method rt_icu_gregorian_calendar[]={
  M("<init>","()V",cal_init),M("<init>","(Ljava/util/Locale;)V",cal_init),M("<init>","(Landroid/icu/util/TimeZone;)V",cal_init),
  M("<init>","(Landroid/icu/util/TimeZone;Ljava/util/Locale;)V",cal_init),M("<init>","(III)V",cal_init),M("<init>","(IIIII)V",cal_init),M("<init>","(IIIIII)V",cal_init),M_END};
 
+/* ---- dvm_date_parse.h ---- */
+/* MPL-2.0. Legacy java.util.Date grammar, independent of host locale parsing. */
+struct date_parse_word {const char *word;int kind,value;};
+static const struct date_parse_word date_parse_words[]={
+   {"am",1,0},{"pm",1,1},
+   {"monday",0,0},{"tuesday",0,0},{"wednesday",0,0},{"thursday",0,0},{"friday",0,0},{"saturday",0,0},{"sunday",0,0},
+   {"january",2,0},{"february",2,1},{"march",2,2},{"april",2,3},{"may",2,4},{"june",2,5},{"july",2,6},{"august",2,7},{"september",2,8},{"october",2,9},{"november",2,10},{"december",2,11},
+   {"gmt",3,0},{"ut",3,0},{"utc",3,0},{"est",3,300},{"edt",3,240},{"cst",3,360},{"cdt",3,300},{"mst",3,420},{"mdt",3,360},{"pst",3,480},{"pdt",3,420}
+};
+static bool date_parse(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)nargs;const unsigned char *text=(const unsigned char*)dvm_string_utf8(vm,ARG(0).l);
+   size_t length=ARG(0).l ? dvm_string_utf8_length(vm,ARG(0).l) : 0,at=0;
+   int32_t year=INT32_MIN,month=-1,day=-1,hour=-1,minute=-1,second=-1,offset=-1;int separator=0;
+   if(!text)goto invalid;
+   while(at<length) {
+      unsigned char token=text[at++];
+      if(token<=32 || token==',')continue;
+      if(token=='('){size_t nesting=1;while(at<length && nesting){unsigned char c=text[at++];if(c=='(')++nesting;else if(c==')')--nesting;}continue;}
+      if(token>='0' && token<='9') {
+         uint32_t magnitude=token-'0';
+         while(at<length && text[at]>='0' && text[at]<='9')magnitude=magnitude*10u+(unsigned)(text[at++]-'0');
+         int32_t value=(int32_t)magnitude;int next=at<length ? text[at] : -1;
+         if(separator=='+' || (separator=='-' && year!=INT32_MIN)) {
+            if(offset!=0 && offset!=-1)goto invalid;
+            if(value<24){magnitude=(uint32_t)value*60u;
+               if(at<length && text[at]==':'){++at;uint32_t minutes=0;while(at<length && text[at]>='0' && text[at]<='9')minutes=minutes*10u+(unsigned)(text[at++]-'0');magnitude+=minutes;}
+            } else magnitude=(uint32_t)(value%100)+(uint32_t)(value/100)*60u;
+            offset=(int32_t)(separator=='+' ? 0u-magnitude : magnitude);
+         } else if(value>=70) {
+            if(year!=INT32_MIN || (next>32 && next!=',' && next!='/' && at<length))goto invalid;year=value;
+         } else if(next==':') {
+            if(hour<0)hour=(int8_t)value;else if(minute<0)minute=(int8_t)value;else goto invalid;
+         } else if(next=='/') {
+            if(month<0)month=(int8_t)((uint32_t)value-1u);else if(day<0)day=(int8_t)value;else goto invalid;
+         } else {
+            if(at<length && next!=',' && next>32 && next!='-')goto invalid;
+            if(hour>=0 && minute<0)minute=(int8_t)value;
+            else if(minute>=0 && second<0)second=(int8_t)value;
+            else if(day<0)day=(int8_t)value;
+            else if(year==INT32_MIN && month>=0 && day>=0)year=value;
+            else goto invalid;
+         }
+         separator=0;continue;
+      }
+      if(token=='/' || token==':' || token=='+' || token=='-'){separator=token;continue;}
+      size_t begin=at-1;
+      while(at<length && ((text[at]>='a' && text[at]<='z') || (text[at]>='A' && text[at]<='Z')))++at;
+      size_t count=at-begin;if(count<2)goto invalid;
+      const struct date_parse_word *match=NULL;
+      for(size_t i=sizeof date_parse_words/sizeof date_parse_words[0];i>0;--i){const struct date_parse_word *word=&date_parse_words[i-1];
+         if(count<=strlen(word->word) && !strncasecmp((const char*)text+begin,word->word,count)){match=word;break;}}
+      if(!match)goto invalid;
+      if(match->kind==1){if(hour<1 || hour>12)goto invalid;if(match->value && hour<12)hour+=12;else if(!match->value && hour==12)hour=0;}
+      else if(match->kind==2){if(month>=0)goto invalid;month=match->value;}
+      else if(match->kind==3)offset=match->value;
+      separator=0;
+   }
+   if(year==INT32_MIN || month<0 || day<0)goto invalid;
+   if(year<100) {
+      if(!vm->date_parse_century_start){struct tm current;time_break(now_millis(),NULL,&current);vm->date_parse_century_start=current.tm_year+1900-80;}
+      int32_t start=vm->date_parse_century_start;year+=(start/100)*100;if(year<start)year+=100;
+   }
+   if(hour<0)hour=0;if(minute<0)minute=0;if(second<0)second=0;
+   bool gregorian=year>=1582;int64_t normalized_year=(int64_t)year+lc_floor(month,12);unsigned normalized_month=(unsigned)(month-lc_floor(month,12)*12)+1;
+   int64_t days=lc_civil_day(normalized_year,normalized_month,1,gregorian)-LC_EPOCH_JD+(int64_t)day-1;
+   /* Unsigned arithmetic gives Java long/int wraparound without C overflow. */
+   uint64_t wall=(uint64_t)days*UINT64_C(86400000)+(uint64_t)hour*3600000u+(uint64_t)minute*60000u+(uint64_t)second*1000u;
+   if(offset!=-1){int32_t correction=(int32_t)((uint32_t)offset*60000u);RETJ((int64_t)(wall+(uint64_t)(int64_t)correction));}
+   union dvm_value zone={0};if(!tz_getDefault(vm,0,NULL,0,&zone))return false;
+   struct cal_zone_context context;if(!cal_zone_context(vm,zone.l,&context))return false;
+   if(context.fixed)RETJ((int64_t)(wall-(uint64_t)(int64_t)context.offset));
+   if((int64_t)wall<INT64_MIN+INT64_C(259200000) || (int64_t)wall>INT64_MAX-INT64_C(259200000))goto invalid;
+   int64_t instant;if(!cal_host_resolve(&context,(int64_t)wall,0,0,true,&instant))goto invalid;RETJ(instant);
+invalid:
+   dvm__throw(vm,"java/lang/IllegalArgumentException","Invalid date");return false;
+}
+
 /* java.text.DateFormatSymbols: immutable CLDR data, mutable per-object copies. */
 #include "dvm/date_symbols_data.h"
+#include "dvm/date_time_patterns_data.h"
 static const struct { const char *field, *get, *set; unsigned start, count; } dfs_arrays[] = {
    {"eras","getEras","setEras",0,2},
    {"months","getMonths","setMonths",2,13},
@@ -789,11 +872,29 @@ static bool date_locale_name(struct dvm *vm,dvm_ref locale,char *name,size_t siz
    snprintf(name,size,"%s",value && *value ? value : "root");return true;
 }
 
+static const char *date_time_pattern(char *locale,int date_style,int time_style)
+{
+   for (;;) {
+      size_t lo=0,hi=sizeof date_time_pattern_locales/sizeof *date_time_pattern_locales;
+      while (lo<hi) {
+         size_t mid=lo+(hi-lo)/2;
+         int cmp=strcmp(locale,date_time_pattern_locales[mid].locale);
+         if (!cmp) return date_time_pattern_rows[date_time_pattern_locales[mid].row]
+            [date_style<0 ? time_style : 4+date_style*4+time_style];
+         if (cmp<0) hi=mid;else lo=mid+1;
+      }
+      char *end=strrchr(locale,'_');
+      if (end) *end=0;
+      else if (strcmp(locale,"root")) strcpy(locale,"root");
+      else return NULL;
+   }
+}
+
 static bool sdf_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                      int nargs, union dvm_value *out)
 {
    (void)out;
-   if (!ARG(0).l) {dvm__throw(vm,"java/lang/NullPointerException","pattern");return false;}
+   if (nargs && !ARG(0).l) {dvm__throw(vm,"java/lang/NullPointerException","pattern");return false;}
    union dvm_value locale={0};
    if (nargs>1) locale=args[1];
    else if (!loc_getDefault(vm,0,NULL,0,&locale)) return false;
@@ -801,7 +902,13 @@ static bool sdf_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
    if (!calendar || !cal_initialize(vm,calendar,0,locale.l,false)) return false;
    dvm_set_field(vm,self,"calendar","Ljava/util/Calendar;",(union dvm_value){.l=calendar});
    dvm_set_field(vm,self,"locale","Ljava/util/Locale;",locale);
-   union dvm_value v = ARG(0);
+   union dvm_value v = {0};
+   if (nargs) v=ARG(0);
+   else {
+      char name[256];if (!date_locale_name(vm,locale.l,name,sizeof name)) return false;
+      const char *pattern=date_time_pattern(name,3,3);
+      if (!pattern || !(v.l=dvm_new_string(vm,pattern))) return false;
+   }
    (void)dvm_set_field(vm, self, "pattern", "Ljava/lang/String;", v);
    RETV();
 }
@@ -1109,6 +1216,51 @@ static bool date_instance(struct dvm *vm,dvm_ref self,const union dvm_value *arg
    if (!good) return false;
    RETL(format);
 }
+static bool date_time_instance_impl(struct dvm *vm,int date_style,int time_style,
+                                    dvm_ref locale,union dvm_value *out)
+{
+   if (date_style < -1 || date_style>3 || time_style<0 || time_style>3) {
+      dvm__throw(vm,"java/lang/IllegalArgumentException","Invalid date/time style");return false;
+   }
+   char name[256];if (!date_locale_name(vm,locale,name,sizeof name)) return false;
+   const char *pattern=date_time_pattern(name,date_style,time_style);
+   if (!pattern) return false;
+   dvm_ref format=dvm_new_object(vm,dvm_find_class(vm,"java/text/SimpleDateFormat"));
+   if (!format) return false;
+   dvm_pin(vm,format);
+   union dvm_value init[]={{.l=dvm_new_string(vm,pattern)},{.l=locale}};
+   bool good=init[0].l && sdf_init(vm,format,init,2,out);
+   dvm_unpin(vm,format);
+   if (!good) return false;
+   RETL(format);
+}
+static bool time_instance(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                           int nargs,union dvm_value *out)
+{
+   (void)self;union dvm_value locale={0};
+   if (nargs>1) locale=ARG(1);
+   else if (!loc_getDefault(vm,0,NULL,0,&locale)) return false;
+   return date_time_instance_impl(vm,-1,nargs ? ARG(0).i : 2,locale.l,out);
+}
+static bool date_time_instance(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                                int nargs,union dvm_value *out)
+{
+   (void)self;union dvm_value locale={0};
+   if (nargs>2) locale=ARG(2);
+   else if (!loc_getDefault(vm,0,NULL,0,&locale)) return false;
+   int date_style=nargs ? ARG(0).i : 2;
+   if (date_style<0) {
+      dvm__throw(vm,"java/lang/IllegalArgumentException","Invalid date style");return false;
+   }
+   return date_time_instance_impl(vm,date_style,nargs ? ARG(1).i : 2,locale.l,out);
+}
+static bool date_default_instance(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                                   int nargs,union dvm_value *out)
+{
+   (void)self;(void)args;(void)nargs;union dvm_value locale={0};
+   if (!loc_getDefault(vm,0,NULL,0,&locale)) return false;
+   return date_time_instance_impl(vm,3,3,locale.l,out);
+}
 static bool am_vcall(struct dvm *, dvm_ref, const char *, const char *,
                      const union dvm_value *, int, union dvm_value *);
 static bool android_date_instance(struct dvm *vm,dvm_ref self,const union dvm_value *args,
@@ -1146,6 +1298,8 @@ static const struct rt_field rt_sdf_fields[] = {
 };
 
 static const struct rt_method rt_date[] = {
+   SM("parse","(Ljava/lang/String;)J",date_parse),
+   M("<init>","(Ljava/lang/String;)V",date_init),
    M("<init>", "()V", date_init),
    M("<init>", "(J)V", date_init),
    M("getTime", "()J", date_getTime),
@@ -1173,10 +1327,18 @@ static const struct rt_method rt_timezone[] = {
 };
 
 static const struct rt_method rt_sdf[] = {
+   SM("getInstance","()Ljava/text/DateFormat;",date_default_instance),
+   SM("getTimeInstance","()Ljava/text/DateFormat;",time_instance),
+   SM("getTimeInstance","(I)Ljava/text/DateFormat;",time_instance),
+   SM("getTimeInstance","(ILjava/util/Locale;)Ljava/text/DateFormat;",time_instance),
+   SM("getDateTimeInstance","()Ljava/text/DateFormat;",date_time_instance),
+   SM("getDateTimeInstance","(II)Ljava/text/DateFormat;",date_time_instance),
+   SM("getDateTimeInstance","(IILjava/util/Locale;)Ljava/text/DateFormat;",date_time_instance),
    SM("getDateInstance","()Ljava/text/DateFormat;",date_instance),
    SM("getDateInstance","(I)Ljava/text/DateFormat;",date_instance),
    SM("getDateInstance","(ILjava/util/Locale;)Ljava/text/DateFormat;",date_instance),
    M("toPattern","()Ljava/lang/String;",sdf_toPattern),
+   M("<init>", "()V", sdf_init),
    M("<init>", "(Ljava/lang/String;)V", sdf_init),
    M("<init>", "(Ljava/lang/String;Ljava/util/Locale;)V", sdf_init),
    M("applyPattern", "(Ljava/lang/String;)V", sdf_applyPattern),

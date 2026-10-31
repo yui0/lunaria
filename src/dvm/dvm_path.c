@@ -1,6 +1,6 @@
 /* C path geometry. NanoSVG supplies cubic tessellation and scanline coverage;
  * no window, GL context, or platform font dependency is required. */
-#include "dvm_path.h"
+#include "dvm_lib.h"
 #include "../luna-ui/nanosvgrast.h"
 #include <stdlib.h>
 #include <string.h>

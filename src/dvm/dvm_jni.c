@@ -6,11 +6,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-#include "dvm/dvm_jni.h"
+#include "dvm/dvm.h"
 #include "dvm/dvm_internal.h"
 #include "jvm/jvm.h"
 #include "arm_exec.h"
 #include "arm.h"
+#include "lunaria_os.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -1868,9 +1869,35 @@ static struct dvm *vm_get(void)
    g_vm = dvm_create(&hooks);
    if (!g_vm) return NULL;
 
-   int n = dvm_add_apk_dir(g_vm, dir);
-   if (!n) {
-      fprintf(stderr, "[dvm] no classes*.dex under %s; bytecode emulation is off\n", dir);
+
+   int n = 0;
+   const char *base_apk = getenv("ANDROID_APK_FILE");
+   if (base_apk && *base_apk) {
+      n = dvm_add_apk_archive(g_vm, base_apk, lunaria_android_apk_path());
+      const char *splits = getenv("ANDROID_SPLIT_APKS");
+      for (const char *p = splits; n >= 0 && p && *p; ) {
+         const char *end = strchr(p, ';');
+         if (!end) end = p + strlen(p);
+         const char *bar = memchr(p, '|', (size_t)(end - p));
+         if (bar && bar != p) {
+            char *host = luna_strndup(bar + 1, (size_t)(end - bar - 1));
+            char guest[PATH_MAX];
+            int length = snprintf(guest, sizeof guest, "%s/split_%.*s.apk",
+                                  lunaria_android_apk_dir(), (int)(bar - p), p);
+            int count = host && length >= 0 && length < (int)sizeof guest
+                        ? dvm_add_apk_archive(g_vm, host, guest) : -1;
+            free(host);
+            if (count < 0) { n = -1; break; }
+            n += count;
+         }
+         p = *end ? end + 1 : end;
+      }
+   }
+   /* Standalone native fixtures and legacy staged packages have no APK. */
+   if (n == 0) n = dvm_add_apk_dir(g_vm, dir);
+
+   if (n < 0) {
+      fprintf(stderr, "[dvm] invalid application DEX under %s\n", dir);
       dvm_destroy(g_vm);
       g_vm = NULL;
       return NULL;
@@ -2521,6 +2548,28 @@ void dvm_jni_exit_process(int status)
 struct dvm *dvm_jni_vm(void)
 {
    return vm_get();
+}
+
+jobject dvm_jni_get_class_loader(JNIEnv *env, jobject object)
+{
+   struct dvm *vm = vm_get();
+   if (!vm || !env) return NULL;
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   dvm_ref ref = object ? from_jobject(vm, env, object) : 0;
+   jobject loader = to_jobject(vm, env, dvm_get_class_loader(vm, ref));
+   dvm_gil_leave_to_guest(vm, cookie);
+   return loader;
+}
+
+bool dvm_jni_bind_application(JNIEnv *env, jobject base, jobject application)
+{
+   struct dvm *vm = vm_get();
+   if (!vm || !env || !base) return false;
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   bool ok = dvm_bind_application(vm, from_jobject(vm, env, base),
+                                  application ? from_jobject(vm, env, application) : 0);
+   dvm_gil_leave_to_guest(vm, cookie);
+   return ok;
 }
 
 void dvm_jni_bind_unity_activity(JNIEnv *env, jobject activity)

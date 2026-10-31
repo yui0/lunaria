@@ -33,13 +33,17 @@
 #ifdef _WIN32
 #include <pthread.h>
 #endif
-#include "linker/dlfcn.h"
+/* The bionic-compatible dlfcn entry points (src/linker/dlfcn.c). */
+void dl_parse_library_path(const char *path, char *delim);
+void *bionic_dlopen(const char *filename, int flag);
+const char *bionic_dlerror(void);
+void *bionic_dlsym(void *handle, const char *symbol);
+int bionic_dlclose(void *handle);
 #include "linker/linker.h"
 #include "jvm/jvm.h"
 #include "arm_exec.h"
 #include "luna_compositor.h"
 #include "luna_overlay.h"
-#include "dvm/dvm_jni.h"
 #include "dvm/dvm.h"
 
 #ifdef _WIN32
@@ -254,6 +258,20 @@ static void a64_preload_platform_libs(void)
          printf("preloading arm64 guest libc: %s\n", libpath);
          if (arm64_exec_load_library(libpath, 0) < 0)
             warnx("failed to load guest libc %s", libpath);
+      }
+   }
+
+   /* The ART runtime images every zygote child has mapped (see art_image.c). */
+   {
+      static const char *const art_images[] = {
+         "libart.so", "libartbase.so", "libdexfile.so", "libnativeloader.so", NULL};
+      for (const char *const *img = art_images; *img; ++img) {
+         if ((size_t)snprintf(libpath, sizeof libpath, "%s/%s", sys, *img) < sizeof libpath &&
+             stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
+            printf("preloading arm64 ART image: %s\n", libpath);
+            if (arm64_exec_load_library(libpath, 0) < 0)
+               warnx("failed to load ART image %s", libpath);
+         }
       }
    }
 }

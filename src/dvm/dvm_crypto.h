@@ -691,6 +691,7 @@ static const char *kf_key_class(const char *alg, int32_t kind)
    if (alg && !strcasecmp(alg, "RSA"))
       return kind == 2 ? "Lcom/android/org/conscrypt/OpenSSLRSAPublicKey;"
                        : "Lcom/android/org/conscrypt/OpenSSLRSAPrivateCrtKey;";
+   if(alg && !strcasecmp(alg,"EC"))return kind==2 ? "Lcom/android/org/conscrypt/OpenSSLECPublicKey;" : "Lcom/android/org/conscrypt/OpenSSLECPrivateKey;";
    return "Ljava/security/Key;";
 }
 
@@ -791,7 +792,15 @@ static bool kf_generate(struct dvm *vm, dvm_ref self,
                  "no encoded key in the spec");
       return false;
    }
-   RETL(key_make(vm, kf_key_class(alg_name, kind), enc.l, alg_name, kind));
+   if(alg_name && !strcasecmp(alg_name,"EC")){
+      bool correct_spec=object_is_a(vm,ARG(0).l,kind==2 ? "Ljava/security/spec/X509EncodedKeySpec;" : "Ljava/security/spec/PKCS8EncodedKeySpec;");
+      uint32_t n=dvm_array_length(vm,enc.l);const unsigned char *bytes=dvm_array_data(vm,enc.l),*cursor=bytes;
+      EVP_PKEY *key=correct_spec && bytes ? (kind==2 ? d2i_PUBKEY(NULL,&cursor,n) : d2i_AutoPrivateKey(NULL,&cursor,n)) : NULL;
+      bool valid=key && EVP_PKEY_is_a(key,"EC") && cursor==bytes+n;EVP_PKEY_free(key);
+      if(!valid){dvm__throw(vm,"java/security/spec/InvalidKeySpecException","Invalid EC key encoding");return false;}
+   }
+   const char *key_algorithm=alg_name && !strcasecmp(alg_name,"EC") ? "EC" : alg_name;
+   RETL(key_make(vm, kf_key_class(key_algorithm, kind), enc.l, key_algorithm, kind));
 }
 
 /* The key's modulus / public exponent / private exponent as a BigInteger,
@@ -861,6 +870,8 @@ static bool kf_generatePublic(struct dvm *vm, dvm_ref self,
    return kf_generate(vm, self, args, nargs, out, 2);
 }
 
+#include "dvm_pbe.h"
+
 /* --- javax.crypto.Cipher ------------------------------------------------ */
 
 static void cipher_parse(const char *, char *, size_t, char *, size_t, char *, size_t);
@@ -915,6 +926,7 @@ static bool cipher_getInstance(struct dvm *vm, dvm_ref self,
    if (k) {
       union dvm_value v = { .l = dvm_new_string(vm, t ? t : "") };
       (void)dvm_set_field(vm, k, "transform", "Ljava/lang/String;", v);
+      (void)dvm_set_field(vm, k, "algorithm", "Ljava/lang/String;", v);
       v.l = security_builtin_provider(vm);
       (void)dvm_set_field(vm, k, "provider", "Ljava/security/Provider;", v);
    }
@@ -1001,13 +1013,16 @@ static bool cipher_init(struct dvm *vm, dvm_ref self,
    const struct dvm_method *method = dvm__builtin_method();
    const bool with_params = method && strstr(method->sig, "Ljava/security/spec/AlgorithmParameterSpec;");
    dvm_ref params = with_params && nargs >= 3 ? args[2].l : 0;
-   dvm_ref random = !with_params && nargs >= 3 ? args[2].l : 0;
+   dvm_ref random = with_params ? (nargs>=4 ? args[3].l : 0) : (nargs>=3 ? args[2].l : 0);
    union dvm_value iv = {0}, transform = {0};
    if (params) (void)dvm_get_field(vm, params, "iv", "[B", &iv);
    (void)dvm_get_field(vm, self, "transform", "Ljava/lang/String;", &transform);
    char alg[128], mode[128], pad[128];
    cipher_parse(dvm_string_utf8(vm, transform.l), alg, sizeof alg,
                 mode, sizeof mode, pad, sizeof pad);
+   dvm_ref operational_key=args[1].l;
+   bool pbe=pbe_algorithm(dvm_string_utf8(vm,transform.l),NULL);
+   if(pbe && !pbe_cipher_key(vm,dvm_string_utf8(vm,transform.l),args[1].l,params,&operational_key,&iv.l))return false;
    const bool rsa = !strcasecmp(alg, "RSA");
    const bool gcm = !strcasecmp(mode, "GCM");
    const bool encrypting = ARG(0).i == JCE_ENCRYPT || ARG(0).i == JCE_WRAP;
@@ -1047,7 +1062,7 @@ static bool cipher_init(struct dvm *vm, dvm_ref self,
    }
    union dvm_value value = {.i = ARG(0).i};
    (void)dvm_set_field(vm, self, "opmode", "I", value);
-   value.l = args[1].l;
+   value.l = operational_key;
    (void)dvm_set_field(vm, self, "key", "Ljava/lang/Object;", value);
    (void)dvm_set_field(vm, self, "iv", "[B", iv);
    (void)dvm_set_field(vm, self, "aad", "[B", empty);
@@ -1093,6 +1108,9 @@ static void cipher_parse(const char *t, char *alg, size_t na, char *mode,
 {
    snprintf(alg, na, "%s", t ? t : "");
    mode[0] = pad[0] = '\0';
+   if(pbe_algorithm(t,NULL)){
+      snprintf(alg,na,"AES");snprintf(mode,nm,"CBC");snprintf(pad,np,"PKCS7Padding");return;
+   }
    char *slash = strchr(alg, '/');
    if (!slash) return;
    *slash = '\0';
@@ -1823,6 +1841,17 @@ static bool sig_init(struct dvm *vm, dvm_ref self, dvm_ref key, int32_t state)
       dvm__throw(vm, "java/security/InvalidKeyException", "key is null");
       return false;
    }
+   union dvm_value algorithm={0},kind={0};
+   dvm_get_field(vm,self,"algorithm","Ljava/lang/String;",&algorithm);
+   dvm_get_field(vm,key,"kind","I",&kind);
+   struct sig_alg parsed;uint32_t size=0;
+   const unsigned char *encoded=key_bytes(vm,key,&size),*cursor=encoded;
+   EVP_PKEY *native=!encoded ? NULL : state==2 ? d2i_PUBKEY(NULL,&cursor,size) : d2i_AutoPrivateKey(NULL,&cursor,size);
+   bool valid=sig_parse(dvm_string_utf8(vm,algorithm.l),&parsed) && native &&
+      kind.i==(state==2 ? 2 : 1) && (parsed.ecdsa ? EVP_PKEY_is_a(native,"EC") :
+         EVP_PKEY_is_a(native,"RSA") || (parsed.pss && EVP_PKEY_is_a(native,"RSA-PSS")));
+   EVP_PKEY_free(native);
+   if(!valid){dvm__throw(vm,"java/security/InvalidKeyException","Key does not match signature algorithm");return false;}
    (void)dvm_set_field(vm, self, "key", "Ljava/lang/Object;", (union dvm_value){ .l = key });
    (void)dvm_set_field(vm, self, "state", "I", (union dvm_value){ .i = state });
    (void)dvm_set_field(vm, self, "data", "[B", (union dvm_value){ .l = 0 });
@@ -2147,6 +2176,8 @@ static const struct rt_field rt_key_fields[] = {
    { "kind", "I" }, F_END
 };
 
+#include "dvm_ec.h"
+
 /* Software RSA uses the crypto backend already linked by the runtime.
  * Never substitute fixed keys, suppress generation failures, or add another
  * crypto dependency. Prime generation runs outside the interpreter lock. */
@@ -2160,15 +2191,16 @@ static bool kpg_instance(struct dvm *vm, dvm_ref self,
       return false;
    }
    const char *name = dvm_string_utf8(vm, ARG(0).l);
-   if (!name || strcasecmp(name, "RSA")) {
+   if (!name || (strcasecmp(name,"RSA") && strcasecmp(name,"EC"))) {
       dvm__throw(vm, "java/security/NoSuchAlgorithmException", "%s", name ? name : "");
       return false;
    }
    dvm_ref generator = dvm_new_object(vm,
       dvm__class_by_desc(vm, "Ljava/security/KeyPairGenerator;"));
    (void)dvm_set_field(vm, generator, "algorithm", "Ljava/lang/String;",
-      (union dvm_value){.l = dvm_new_string(vm, "RSA")});
-   (void)dvm_set_field(vm, generator, "keySize", "I", (union dvm_value){.i = 2048});
+      (union dvm_value){.l = dvm_new_string(vm,!strcasecmp(name,"EC") ? "EC" : "RSA")});
+   (void)dvm_set_field(vm, generator, "keySize", "I", (union dvm_value){.i = !strcasecmp(name,"EC") ? 256 : 2048});
+   if(!strcasecmp(name,"EC")){EC_GROUP *group=EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);bool good=group && ec_store_group(vm,generator,group);EC_GROUP_free(group);if(!good)return false;}
    RETL(generator);
 }
 
@@ -2178,6 +2210,14 @@ static bool kpg_initialize(struct dvm *vm, dvm_ref self,
 {
    (void)nargs; (void)out;
    int bits = ARG(0).i;
+   union dvm_value algorithm={0};dvm_get_field(vm,self,"algorithm","Ljava/lang/String;",&algorithm);
+   const char *name=dvm_string_utf8(vm,algorithm.l);
+   if(name && !strcasecmp(name,"EC")){
+      int nid=ec_size_nid(bits);EC_GROUP *group=nid==NID_undef ? NULL : EC_GROUP_new_by_curve_name(nid);
+      if(!group){dvm__throw(vm,"java/security/InvalidParameterException","Unknown EC key size %d",bits);return false;}
+      bool good=ec_store_group(vm,self,group);EC_GROUP_free(group);if(!good)return false;
+      dvm_set_field(vm,self,"keySize","I",(union dvm_value){.i=bits});RETV();
+   }
    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
    int valid = bits > 0 && ctx && EVP_PKEY_keygen_init(ctx) > 0 &&
       EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, bits) > 0;
@@ -2188,6 +2228,15 @@ static bool kpg_initialize(struct dvm *vm, dvm_ref self,
    }
    (void)dvm_set_field(vm, self, "keySize", "I", (union dvm_value){.i = bits});
    RETV();
+}
+
+static bool kpg_initialize_spec(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;union dvm_value algorithm={0};dvm_get_field(vm,self,"algorithm","Ljava/lang/String;",&algorithm);
+   const char *name=dvm_string_utf8(vm,algorithm.l);
+   EC_GROUP *group=name && !strcasecmp(name,"EC") ? ec_group_from_spec(vm,ARG(0).l) : NULL;
+   if(!group){dvm__throw(vm,"java/security/InvalidAlgorithmParameterException","Unsupported key generation parameters");return false;}
+   bool good=ec_store_group(vm,self,group);EC_GROUP_free(group);if(!good)return false;RETV();
 }
 
 static bool kp_init(struct dvm *vm, dvm_ref self,
@@ -2219,13 +2268,19 @@ static bool kpg_generate(struct dvm *vm, dvm_ref self,
                          const union dvm_value *args, int nargs, union dvm_value *out)
 {
    (void)args; (void)nargs;
-   union dvm_value bits = {0};
+   union dvm_value bits = {0},algorithm={0},parameters={0};
    (void)dvm_get_field(vm, self, "keySize", "I", &bits);
+   dvm_get_field(vm,self,"algorithm","Ljava/lang/String;",&algorithm);
+   bool ec=!strcasecmp(dvm_string_utf8(vm,algorithm.l),"EC");
+   dvm_get_field(vm,self,"parameters","[B",&parameters);
+   uint32_t parameter_size=parameters.l ? dvm_array_length(vm,parameters.l) : 0;
+   const unsigned char *parameter_bytes=parameters.l ? dvm_array_data(vm,parameters.l) : NULL;
+   EVP_PKEY *domain=ec && parameter_bytes ? d2i_KeyParams(EVP_PKEY_EC,NULL,&parameter_bytes,parameter_size) : NULL;
    unsigned depth = dvm_gil_unlock_all(vm);
-   EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+   EVP_PKEY_CTX *ctx=ec ? (domain ? EVP_PKEY_CTX_new(domain,NULL) : NULL) : EVP_PKEY_CTX_new_id(EVP_PKEY_RSA,NULL);
    EVP_PKEY *key = NULL;
-   int ok = ctx && EVP_PKEY_keygen_init(ctx) > 0 &&
-      EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, bits.i) > 0 && EVP_PKEY_keygen(ctx, &key) > 0;
+   int ok=ctx && EVP_PKEY_keygen_init(ctx)>0 && (ec || EVP_PKEY_CTX_set_rsa_keygen_bits(ctx,bits.i)>0) && EVP_PKEY_keygen(ctx,&key)>0;
+   EVP_PKEY_free(domain);
    EVP_PKEY_CTX_free(ctx);
    unsigned char *pub = NULL, *priv = NULL;
    PKCS8_PRIV_KEY_INFO *p8 = ok ? EVP_PKEY2PKCS8(key) : NULL;
@@ -2236,22 +2291,24 @@ static bool kpg_generate(struct dvm *vm, dvm_ref self,
    dvm_gil_relock(vm, depth);
    if (!ok || pub_len <= 0 || priv_len <= 0) {
       OPENSSL_free(pub); OPENSSL_free(priv);
-      dvm__throw(vm, "java/security/ProviderException", "RSA key generation failed");
+      dvm__throw(vm, "java/security/ProviderException", "Key pair generation failed");
       return false;
    }
-   dvm_ref public_key = key_make(vm, kf_key_class("RSA", 2),
-      make_bytes(vm, pub, (uint32_t)pub_len), "RSA", 2);
-   dvm_ref private_key = key_make(vm, kf_key_class("RSA", 1),
-      make_bytes(vm, priv, (uint32_t)priv_len), "RSA", 1);
+   const char *key_algorithm=ec ? "EC" : "RSA";
+   dvm_ref public_key=key_make(vm,kf_key_class(key_algorithm,2),make_bytes(vm,pub,(uint32_t)pub_len),key_algorithm,2);
+   dvm_pin(vm,public_key);
+   dvm_ref private_key=key_make(vm,kf_key_class(key_algorithm,1),make_bytes(vm,priv,(uint32_t)priv_len),key_algorithm,1);
+   dvm_pin(vm,private_key);
    OPENSSL_free(pub); OPENSSL_clear_free(priv, (size_t)priv_len);
    dvm_ref pair = dvm_new_object(vm, dvm__class_by_desc(vm, "Ljava/security/KeyPair;"));
    union dvm_value keys[] = {{.l = public_key}, {.l = private_key}}, ignored;
-   if (!kp_init(vm, pair, keys, 2, &ignored)) return false;
+   bool good=pair && public_key && private_key && kp_init(vm,pair,keys,2,&ignored);
+   dvm_unpin(vm,public_key);dvm_unpin(vm,private_key);if(!good)return false;
    RETL(pair);
 }
 
 static const struct rt_field rt_kpg_fields[] = {
-   {"algorithm", "Ljava/lang/String;"}, {"keySize", "I"}, F_END
+   {"algorithm", "Ljava/lang/String;"}, {"keySize", "I"}, {"parameters","[B"}, F_END
 };
 static const struct rt_field rt_kp_fields[] = {
    {"publicKey", "Ljava/security/PublicKey;"},
@@ -2262,6 +2319,8 @@ static const struct rt_method rt_kpg[] = {
    M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
    M("initialize", "(I)V", kpg_initialize),
    M("initialize", "(ILjava/security/SecureRandom;)V", kpg_initialize),
+   M("initialize","(Ljava/security/spec/AlgorithmParameterSpec;)V",kpg_initialize_spec),
+   M("initialize","(Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",kpg_initialize_spec),
    M("generateKeyPair", "()Ljava/security/KeyPair;", kpg_generate),
    M("genKeyPair", "()Ljava/security/KeyPair;", kpg_generate), M_END
 };
@@ -2983,6 +3042,7 @@ static const struct rt_method rt_cipher[] = {
    M("init", "(ILjava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V",
      cipher_init),
    M("init", "(ILjava/security/Key;Ljava/security/SecureRandom;)V", cipher_init),
+   M("init", "(ILjava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V", cipher_init),
    M("doFinal", "([B)[B", cipher_doFinal),
    M("doFinal", "()[B", cipher_doFinal),
    M("update", "(Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;)I", cipher_update_buffers),
