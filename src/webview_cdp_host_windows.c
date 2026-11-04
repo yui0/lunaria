@@ -90,6 +90,7 @@ int lunaria_cdp_host_open(struct lunaria_cdp_host *host,
    int written = swprintf(command, command_chars,
       L"\"%ls\" --headless --no-first-run --no-default-browser-check "
       L"--remote-debugging-pipe "
+      L"--disable-blink-features=AutomationControlled "
       L"--remote-debugging-io-pipes=%lu,%lu "
       L"--user-data-dir=\"%ls\" about:blank",
       browser, (unsigned long)(uintptr_t)child_read,

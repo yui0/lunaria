@@ -477,12 +477,23 @@ By default, Lunaria looks for `lunaria.conf` in its startup working directory an
 ./lunaria --choose-profile game.xapk
 ./lunaria --profile account2 game.xapk
 ./lunaria --list-profiles game.xapk
-./lunaria --profile account2 --rename-profile "Main account" game.xapk
 ```
 
-Use **Profile → Rename Profile…** in the right-click menu to change the current profile’s display name, including Japanese names. Names persist across launches; account IDs and data directories stay fixed. `--list-profiles` shows the ID followed by the display name when renamed.
+Profile names are their data directory names under `profiles/<package>/`. The launcher, right-click menu, and `--list-profiles` use those same names. The `default` profile uses `data/<package>/`.
 
 Set `LUNARIA_PROFILE_PROMPT=1` to select a profile at every launch. `LUNARIA_SHARED_ASSETS` accepts colon-separated shared resource names; `LUNARIA_PROFILE_SEED_FILES` lists resource files to copy once into a new profile. The sample configuration includes the Genshin Impact resource layout. Each new profile starts with its own login state.
+
+**Optional Google services.** Open **Google services** in the right-click menu to install a local Google Play services APK/XAPK. The same installer also accepts Play Store and Google Services Framework packages when an app needs them. Original archives, including splits, are retained under the current data folder; running applications need a restart after installation.
+
+Use **Sign in to a new environment…** once to create a separate GMS environment. Its Google application data and AccountManager store remain under `system/gms/gms-N/` in the current data folder. Choose a saved environment in another app's right-click menu and restart that app to reuse it. Selecting an environment saves the app's choice without opening authentication. The menu shows the number of saved Google accounts and suppresses duplicate sign-in windows for the same environment.
+
+The `default` GMS environment retains the existing Google application data and `system/accounts.tsv`. Existing launches with `LUNARIA_LAUNCH_ACTIVITY=com.android.settings.accounts.AddAccountSettings` continue to use it. A named environment can also be selected with `LUNARIA_GMS_PROFILE=gms-2`; it is independent of the game's `--profile` setting.
+
+```bash
+./lunaria --google-services --data-root /path/to/data
+# Headless package installation, without starting authentication:
+./lunaria --data-root /path/to/data --install-system GooglePlayServices.xapk
+```
 
 If a package contains multiple ABIs, select one explicitly:
 

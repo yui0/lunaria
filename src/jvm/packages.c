@@ -115,11 +115,15 @@ static int current_package(struct lunaria_android_package *out)
  * without QUERY_ALL_PACKAGES is the force-queryable set plus whatever its own
  * <queries> names, and what the shell prints is only ever read by a grep for a
  * particular name.  So the table holds the packages an application has a
- * reason to look for -- the Play stack, the platform itself, the browser and
+ * reason to look for -- the Play Store, the platform itself, the browser and
  * the shell -- at the paths a Pixel-class device keeps them.
  *
- * The text is the same syntax a LUNARIA_PACKAGES file uses, so the default and
- * an installation's own ledger cannot drift apart in format.
+ * Google Play services (com.google.android.gms, com.google.android.gsf) is in
+ * it, as on a Pixel.  The emulator ships no Google-signed APK: the file at the
+ * ledger path is an empty archive until the installation puts a genuine one
+ * there, and PackageInfo carries signatures only from a real signed APK.  An
+ * installation that wants a device without it lists `-com.google.android.gms`
+ * in LUNARIA_PACKAGES.
  */
 static const char kDefaultLedger[] =
 "# <package>                        <uid>  <flags>            <sourceDir> [<versionName>/<versionCode>]\n"
@@ -130,9 +134,9 @@ static const char kDefaultLedger[] =
 "com.android.providers.settings     1000   system             /system/priv-app/SettingsProvider/SettingsProvider.apk\n"
 "com.android.providers.media.module 10062  system             /apex/com.android.mediaprovider/priv-app/MediaProvider/MediaProvider.apk\n"
 "com.android.vending                10108  system,queryable,updated /product/priv-app/Phonesky/Phonesky.apk 38.5.21-31/83852130\n"
+"com.google.android.webview         10088  system,queryable   /product/app/WebViewGoogle/WebViewGoogle.apk 120.0.6099.230/609923033\n"
 "com.google.android.gms             10109  system,queryable,updated /product/priv-app/PrebuiltGmsCore/PrebuiltGmsCore.apk 23.50.13/235013000\n"
 "com.google.android.gsf             10109  system,queryable   /product/priv-app/GoogleServicesFramework/GoogleServicesFramework.apk\n"
-"com.google.android.webview         10088  system,queryable   /product/app/WebViewGoogle/WebViewGoogle.apk 120.0.6099.230/609923033\n"
 "com.android.chrome                 10091  system,updated     /product/app/Chrome/Chrome.apk 120.0.6099.230/609923033\n"
 "com.google.android.googlequicksearchbox 10092 system         /product/priv-app/Velvet/Velvet.apk\n"
 "com.google.android.inputmethod.latin    10093 system         /product/app/LatinIMEGooglePrebuilt/LatinIMEGooglePrebuilt.apk\n"
@@ -170,6 +174,23 @@ static void mkdir_p(char *path)
    (void)luna_file_mkdir(path, 0755);
 }
 
+/* The device's system image is shared by every app of this data folder:
+ * <data root>/system/<guest path> is the real, signed APK of a system package
+ * (Play services, the Play Store).  Puts it where this app's guest root expects
+ * the package, replacing a stub.  False when no such file is installed. */
+static bool shared_system_apk(const char *guest_path, const char *host)
+{
+   const char *root = getenv("LUNARIA_DATA_ROOT");
+   char shared[PATH_MAX];
+   struct stat st;
+   if (!root || !*root ||
+       (size_t)snprintf(shared, sizeof shared, "%s/system%s", root, guest_path) >= sizeof shared ||
+       stat(shared, &st) != 0 || st.st_size <= 22)
+      return false;
+   (void)unlink(host);
+   return luna_file_symlink(shared, host) == 0;
+}
+
 /* A package's APK, as far as anything outside its own installer can tell, is a
  * zip archive at the path PackageManager reports.  The emulator has no copy of
  * a Pixel's system image, so what it can honestly provide is an archive that
@@ -195,7 +216,12 @@ static void ledger_materialise(const char *guest_path)
    if ((size_t)snprintf(host, sizeof host, "%s%s", guest_root(), guest_path)
        >= sizeof host)
       return;
-   if (stat(host, &st) == 0 && st.st_size > 0) return;
+   if (stat(host, &st) == 0 && st.st_size > 0) {
+      /* A stub left by an earlier run gives way to the real APK once it is
+       * installed in the shared system image. */
+      if (st.st_size > 22 || !shared_system_apk(guest_path, host)) return;
+      return;
+   }
 
    snprintf(dir, sizeof dir, "%s", host);
    slash = strrchr(dir, '/');
@@ -203,9 +229,62 @@ static void ledger_materialise(const char *guest_path)
    *slash = '\0';
    mkdir_p(dir);
 
+   if (shared_system_apk(guest_path, host)) return;
    f = fopen(host, "wb");
    if (!f) return;
    (void)fwrite(eocd, 1, sizeof eocd, f);
+   (void)fclose(f);
+}
+
+/* /system/build.prop: the device's build properties as a file, from the same
+ * table android.os.Build and __system_property_get answer from -- Android has
+ * one set of properties, and apps (and `getprop`-style readers) read this
+ * file as well. */
+static void build_prop_materialise(void)
+{
+   char host[PATH_MAX], dir[PATH_MAX], *slash;
+   FILE *f;
+   if ((size_t)snprintf(host, sizeof host, "%s/system/build.prop", guest_root())
+       >= sizeof host)
+      return;
+   snprintf(dir, sizeof dir, "%s", host);
+   slash = strrchr(dir, '/');
+   if (!slash || slash == dir) return;
+   *slash = '\0';
+   mkdir_p(dir);
+   f = fopen(host, "wb");
+   if (!f) return;
+   fputs("# begin build properties\n", f);
+   for (size_t i = 0; ; ++i) {
+      const char *name = lunaria_android_property_name(i);
+      if (!name) break;
+      fprintf(f, "%s=%s\n", name, lunaria_android_property(name));
+   }
+   (void)fclose(f);
+}
+
+/* /system/etc/security/otacerts.zip: the certificates an OTA package must be
+ * signed with.  This device installs no OTA from a vendor, so the archive holds
+ * none -- an empty zip, not a missing file: Play services reads the file at every
+ * check-in, and a device image always carries it. */
+static void ota_certs_materialise(void)
+{
+   static const unsigned char empty_zip[22] = {
+      'P', 'K', 5, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+   };
+   char host[PATH_MAX], dir[PATH_MAX], *slash;
+   FILE *f;
+   if ((size_t)snprintf(host, sizeof host, "%s/system/etc/security/otacerts.zip", guest_root())
+       >= sizeof host)
+      return;
+   snprintf(dir, sizeof dir, "%s", host);
+   slash = strrchr(dir, '/');
+   if (!slash || slash == dir) return;
+   *slash = '\0';
+   mkdir_p(dir);
+   f = fopen(host, "wb");
+   if (!f) return;
+   (void)fwrite(empty_zip, 1, sizeof empty_zip, f);
    (void)fclose(f);
 }
 
@@ -395,12 +474,69 @@ static char *read_file(const char *path)
    return buf;
 }
 
+/* Takes a package out of the table (never row 0, the running app). */
+static void ledger_remove(const char *name)
+{
+   for (size_t i = 1; i < g_nrows; ++i) {
+      if (strcmp(g_rows[i].name, name)) continue;
+      free(g_rows[i].name); free(g_rows[i].source_dir); free(g_rows[i].data_dir);
+      free(g_rows[i].lib_dir); free(g_rows[i].version_name);
+      memmove(&g_rows[i], &g_rows[i + 1], (g_nrows - i - 1) * sizeof *g_rows);
+      --g_nrows;
+      return;
+   }
+}
+
+/* One item of an inline list: `default` (the built-in image), `-name` (drop a
+ * package), or a ledger line / bare package name. */
+static void ledger_add_item(char *item)
+{
+   while (*item == ' ' || *item == '\t') ++item;
+   size_t n = strlen(item);
+   while (n && (item[n - 1] == ' ' || item[n - 1] == '\t')) item[--n] = '\0';
+   if (!n) return;
+   if (!strcmp(item, "default")) ledger_add_text(kDefaultLedger);
+   else if (item[0] == '-') ledger_remove(item + 1);
+   else ledger_add_line(item, n);
+}
+
+/* LUNARIA_PACKAGES: `default`, `none`, the path of a ledger file, or an inline
+ * list separated by ';' -- e.g.
+ *   default;-com.google.android.googlequicksearchbox;com.google.android.gms 10109 system,queryable /product/priv-app/PrebuiltGmsCore/PrebuiltGmsCore.apk
+ * A value with no ';' that is not a readable file is a one-item list. */
+static void ledger_add_spec(const char *spec)
+{
+   if (!strcmp(spec, "none")) return;   /* no device packages, only the app */
+   if (!strchr(spec, ';')) {
+      char *text = read_file(spec);
+      if (text) { ledger_add_text(text); free(text); return; }
+      if (strchr(spec, '/') || strchr(spec, '\\')) {
+         fprintf(stderr, "[pm] LUNARIA_PACKAGES=%s cannot be read (%s) -- "
+                 "using the built-in ledger\n", spec, strerror(errno));
+         ledger_add_text(kDefaultLedger);
+         return;
+      }
+   }
+   char *copy = dup_range(spec, strlen(spec));
+   if (!copy) return;
+   for (char *e = copy; *e; ) {
+      char *sep = strchr(e, ';');
+      if (sep) *sep = '\0';
+      ledger_add_item(e);
+      if (!sep) break;
+      e = sep + 1;
+   }
+   free(copy);
+}
+
 static void ledger_build(void)
 {
    struct lunaria_android_package self;
    const char *spec, *extra;
 
    g_built = 1;
+   build_prop_materialise();
+   ota_certs_materialise();
 
    /* The caller is row 0.  Every other reader of this table expects to find
     * the running package in it, and a lookup that misses it would answer
@@ -416,24 +552,7 @@ static void ledger_build(void)
 
    spec = getenv("LUNARIA_PACKAGES");
    if (!spec || !*spec) spec = "default";
-
-   if (!strcmp(spec, "none")) {
-      /* An installation that wants the old behaviour back.  It does not
-       * describe a device, but it is the only way to bisect against it. */
-   } else if (!strcmp(spec, "default")) {
-      ledger_add_text(kDefaultLedger);
-   } else {
-      char *text = read_file(spec);
-      if (text) {
-         ledger_add_text(text);
-         free(text);
-      } else {
-         fprintf(stderr,
-                 "[pm] LUNARIA_PACKAGES=%s cannot be read (%s) — "
-                 "using the built-in ledger\n", spec, strerror(errno));
-         ledger_add_text(kDefaultLedger);
-      }
-   }
+   ledger_add_spec(spec);
 
    /* Packages this installation adds on top, as bare names or as full ledger
     * lines separated by ';'. */
@@ -498,6 +617,49 @@ int lunaria_android_package_find(const char *name,
       }
    }
    return 0;
+}
+
+/* The device's own filesystem is laid out by the system, not by the app that
+ * happens to be running, so this does not go through the guest's credentials. */
+static void host_mkdir_p(char *path)
+{
+   for (char *p = path + 1; *p; ++p) {
+      if (*p != '/') continue;
+      *p = '\0';
+      (void)luna_file_mkdir(path, 0755);
+      *p = '/';
+   }
+   (void)luna_file_mkdir(path, 0755);
+}
+
+/* A package learned at run time (the caller of a Binder transaction is an
+ * installed package, and the Play Store looks it up by uid and reads its
+ * signing certificate from its APK).  `host_apk` is where that package's APK
+ * really is; it is made visible at the package's sourceDir.  A package the
+ * ledger already has is left as it is. */
+int lunaria_android_package_install(const char *name, uint32_t uid, const char *host_apk)
+{
+   char line[1024], guest[512], host[PATH_MAX], dir[PATH_MAX], *slash;
+   ledger_ready();
+   if (!name || !*name || strlen(name) > 200 || row_exists(name)) return 0;
+   snprintf(guest, sizeof guest, "/data/app/%s/base.apk", name);
+   snprintf(line, sizeof line, "%s %u - %s", name, uid, guest);
+   ledger_add_line(line, strlen(line));
+   if (!host_apk || host_apk[0] != '/') return 1;
+   /* ledger_add_line materialised an empty archive there: put the real one in
+    * its place. */
+   if ((size_t)snprintf(host, sizeof host, "%s%s", guest_root(), guest) >= sizeof host) return 1;
+   snprintf(dir, sizeof dir, "%s", host);
+   slash = strrchr(dir, '/');
+   if (!slash || slash == dir) return 1;
+   *slash = '\0';
+   host_mkdir_p(dir);
+   (void)unlink(host);
+   if (luna_file_symlink(host_apk, host) != 0)
+      fprintf(stderr, "[pm] cannot show %s at %s: %s\n", host_apk, host, strerror(errno));
+   else
+      fprintf(stderr, "[pm] installed %s (uid %u): %s -> %s\n", name, uid, host, host_apk);
+   return 1;
 }
 
 static int holds_permission(const char *want)
@@ -636,14 +798,15 @@ int luna_providers_open(struct luna_providers *p,const char *text,
    for(const char *s=text;*s;++s)if(*s==separator)++capacity;
    p->storage=strdup(text);p->items=calloc(capacity,sizeof *p->items);
    if(!p->storage || !p->items){luna_providers_close(p);return -ENOMEM;}
-   char *entry=p->storage;
+   char *entry=p->storage;size_t count_dbg=0;char *fields_dbg[8]={0};
    while(entry && *entry){
       char *next=strchr(entry,separator);if(next)*next++=0;
-      char *fields[8]={0};fields[0]=entry;size_t count=1;
+      char *fields[8]={0};fields[0]=entry;size_t count=1;count_dbg=0;
       for(char *s=entry;*s;++s)if(*s=='|'){
          if(count==8)goto invalid;
          *s=0;fields[count++]=s+1;
       }
+      count_dbg=count;for(size_t i=0;i<8;++i)fields_dbg[i]=fields[i];
       if(count!=(version2 ? 8u : 3u) || !*fields[0] || !*fields[1])goto invalid;
       struct luna_provider *r=&p->items[p->count];
       r->name=fields[0];r->authority=fields[1];r->metadata=fields[2];
@@ -659,6 +822,11 @@ int luna_providers_open(struct luna_providers *p,const char *text,
    }
    qsort(p->items,p->count,sizeof *p->items,luna_provider_compare);return 0;
 invalid:
+   fprintf(stderr,"[providers] malformed manifest provider entry (%zu fields): name=%.120s authority=%.120s process=%.80s enabled=%.8s init=%.8s grant=%.8s multi=%.8s\n",
+           count_dbg,entry,count_dbg>1&&fields_dbg[1]?fields_dbg[1]:"",
+           count_dbg>3&&fields_dbg[3]?fields_dbg[3]:"",count_dbg>4&&fields_dbg[4]?fields_dbg[4]:"",
+           count_dbg>5&&fields_dbg[5]?fields_dbg[5]:"",count_dbg>6&&fields_dbg[6]?fields_dbg[6]:"",
+           count_dbg>7&&fields_dbg[7]?fields_dbg[7]:"");
    luna_providers_close(p);return -EINVAL;
 }
 int luna_provider_local(const struct luna_provider *p,const char *process)

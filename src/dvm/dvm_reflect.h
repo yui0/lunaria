@@ -2884,6 +2884,33 @@ static bool cl_getDeclaredClasses(struct dvm *vm, dvm_ref self,
    RETL(array);
 }
 
+/* Class.getClasses(): the public member classes of the class and of its superclasses. */
+static bool cl_getClasses(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                          int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   dvm_ref found[256];
+   uint32_t n = 0;
+   struct dvm_object *o = dvm__obj(vm, self);
+   for (struct dvm_class *c = o ? o->klass : NULL; c && n < 256; c = c->super) {
+      union dvm_value declared = { 0 };
+      dvm_ref cref = class_object_for(vm, c);
+      if (!cref || !cl_getDeclaredClasses(vm, cref, NULL, 0, &declared) || !declared.l) return false;
+      dvm_pin(vm, declared.l);
+      const uint32_t m = dvm_array_length(vm, declared.l);
+      for (uint32_t i = 0; i < m && n < 256; ++i) {
+         dvm_ref member = ((const dvm_ref *)dvm_array_data(vm, declared.l))[i];
+         struct dvm_object *mo = dvm__obj(vm, member);
+         if (mo && mo->klass && (mo->klass->access & DEX_ACC_PUBLIC)) found[n++] = member;
+      }
+      dvm_unpin(vm, declared.l);
+   }
+   dvm_ref array = dvm_new_array(vm, 'L', "Ljava/lang/Class;", n);
+   if (!array) return false;
+   for (uint32_t i = 0; i < n; ++i) ((dvm_ref *)dvm_array_data(vm, array))[i] = found[i];
+   RETL(array);
+}
+
 static bool cl_getDeclaringClass(struct dvm *vm, dvm_ref self,
                                   const union dvm_value *args, int nargs,
                                   union dvm_value *out)
@@ -4085,6 +4112,7 @@ static const struct rt_method rt_class[] = {
    M("getSuperclass", "()Ljava/lang/Class;", cl_getSuperclass),
    M("getModifiers", "()I", cl_getModifiers),
    M("getDeclaredClasses", "()[Ljava/lang/Class;", cl_getDeclaredClasses),
+   M("getClasses", "()[Ljava/lang/Class;", cl_getClasses),
    M("getDeclaringClass", "()Ljava/lang/Class;", cl_getDeclaringClass),
    M("getEnclosingClass", "()Ljava/lang/Class;", cl_getEnclosingClass),
    M("getEnclosingMethod", "()Ljava/lang/reflect/Method;", cl_getEnclosingExecutable),
@@ -4141,6 +4169,81 @@ static bool clsl_findLoadedClass(struct dvm *vm, dvm_ref self,
    RETL(class_object_for(vm, dvm__class_by_desc(vm, desc)));
 }
 
+/* ClassLoader.getPackage(name) / getDefinedPackage(name): the Package of a package
+ * that has a class defined, null when none does. */
+static bool clsl_get_package(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                             int nargs, union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   const char *dotted = args[0].l ? dvm_string_utf8(vm, args[0].l) : NULL;
+   if (!dotted) { dvm__throw(vm, "java/lang/NullPointerException", "name"); return false; }
+   char slashed[512];
+   size_t n = strlen(dotted);
+   if (n >= sizeof slashed) RETL(0);
+   for (size_t i = 0; i <= n; ++i) slashed[i] = dotted[i] == '.' ? '/' : dotted[i];
+   bool defined = false;
+   for (int i = 0; i < vm->nclasses && !defined; ++i) {
+      const struct dvm_class *c = vm->classes[i];
+      defined = c && c->name && !strncmp(c->name, slashed, n) && c->name[n] == '/' && !strchr(c->name + n + 1, '/');
+   }
+   if (!defined) RETL(0);
+   struct dvm_class *pc = dvm__class_by_desc(vm, "Ljava/lang/Package;");
+   dvm_ref r = pc ? dvm_new_object(vm, pc) : 0;
+   if (r) (void)dvm_set_field(vm, r, "name", "Ljava/lang/String;", (union dvm_value){ .l = args[0].l });
+   RETL(r);
+}
+
+/* ClassLoader.getPackages(): one Package for each package that has a class defined. */
+static bool clsl_get_packages(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                              int nargs, union dvm_value *out)
+{
+   (void)self; (void)args; (void)nargs;
+   struct dvm_class *pc = dvm__class_by_desc(vm, "Ljava/lang/Package;");
+   char (*seen)[256] = NULL;
+   uint32_t count = 0, cap = 0;
+   dvm_ref array = 0;
+   for (int pass = 0; pass < 2; ++pass) {
+      if (pass == 1) {
+         array = dvm_new_array(vm, 'L', "Ljava/lang/Package;", count);
+         if (!array) { free(seen); return false; }
+         dvm_pin(vm, array);
+      }
+      uint32_t k = 0;
+      for (int i = 0; i < vm->nclasses; ++i) {
+         const struct dvm_class *c = vm->classes[i];
+         const char *slash = c && c->name ? strrchr(c->name, '/') : NULL;
+         if (!slash || slash == c->name || (size_t)(slash - c->name) >= 256) continue;
+         char pkg[256];
+         size_t n = (size_t)(slash - c->name);
+         for (size_t j = 0; j < n; ++j) pkg[j] = c->name[j] == '/' ? '.' : c->name[j];
+         pkg[n] = 0;
+         bool dup = false;
+         for (uint32_t j = 0; j < (pass ? k : count) && !dup; ++j) dup = !strcmp(seen[j], pkg);
+         if (dup) continue;
+         if (pass == 0) {
+            if (count == cap) {
+               cap = cap ? cap * 2 : 256;
+               char (*grown)[256] = realloc(seen, (size_t)cap * sizeof *seen);
+               if (!grown) { free(seen); dvm__throw(vm, "java/lang/OutOfMemoryError", "packages"); return false; }
+               seen = grown;
+            }
+            memcpy(seen[count++], pkg, n + 1);
+         } else {
+            dvm_ref r = pc ? dvm_new_object(vm, pc) : 0;
+            if (r) {
+               (void)dvm_set_field(vm, r, "name", "Ljava/lang/String;", (union dvm_value){ .l = dvm_new_string(vm, pkg) });
+               ((dvm_ref *)dvm_array_data(vm, array))[k] = r;
+            }
+            ++k;
+         }
+      }
+      if (pass == 1) { /* seen[] was only grown in pass 0; duplicates were checked against it */ }
+   }
+   free(seen);
+   dvm_unpin(vm, array);
+   RETL(array);
+}
+
 static const struct rt_field rt_class_loader_fields[] = {
    { "parent", "Ljava/lang/ClassLoader;" }, F_END
 };
@@ -4149,6 +4252,9 @@ static const struct rt_method rt_class_loader[] = {
    M("<init>", "()V", nop_void),
    M("<init>", "(Ljava/lang/ClassLoader;)V", clsl_init_parent),
    M("getParent", "()Ljava/lang/ClassLoader;", clsl_get_parent),
+   M("getPackage", "(Ljava/lang/String;)Ljava/lang/Package;", clsl_get_package),
+   M("getPackages", "()[Ljava/lang/Package;", clsl_get_packages),
+   M("getDefinedPackage", "(Ljava/lang/String;)Ljava/lang/Package;", clsl_get_package),
    M("loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", cl_forName),
    M("findLoadedClass", "(Ljava/lang/String;)Ljava/lang/Class;",
      clsl_findLoadedClass),
@@ -4233,6 +4339,17 @@ static bool dexcl_init(struct dvm *vm, dvm_ref self, const union dvm_value *args
    RETV();
 }
 
+/* DelegateLastClassLoader(dexPath, librarySearchPath, parent, delegateResourceLoading):
+ * the BaseDexClassLoader constructor without the trailing flag, which only
+ * chooses how resources are looked up. */
+static bool delegate_last_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                               int nargs, union dvm_value *out)
+{
+   union dvm_value three[3] = { args[0], args[1], args[2] };
+   (void)nargs;
+   return dexcl_init(vm, self, three, 3, out);
+}
+
 static const struct rt_method rt_dex_class_loader[] = {
    M("<init>", "(Ljava/lang/String;Ljava/io/File;Ljava/lang/String;"
                "Ljava/lang/ClassLoader;)V", dexcl_init),
@@ -4245,6 +4362,13 @@ static const struct rt_method rt_dex_class_loader[] = {
    M("getParent", "()Ljava/lang/ClassLoader;", clsl_get_parent),
    M("findLibrary", "(Ljava/lang/String;)Ljava/lang/String;", dexcl_find_library),
    M("getLdLibraryPath", "()Ljava/lang/String;", dexcl_library_path),
+   M_END,
+};
+
+static const struct rt_method rt_delegate_last_class_loader[] = {
+   M("<init>", "(Ljava/lang/String;Ljava/lang/ClassLoader;)V", dexcl_init),
+   M("<init>", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/ClassLoader;)V", dexcl_init),
+   M("<init>", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/ClassLoader;Z)V", delegate_last_init),
    M_END,
 };
 

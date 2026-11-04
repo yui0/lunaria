@@ -1357,7 +1357,7 @@ static const char pick_css_extra[] =
 
 static int launcher_form(char *path, size_t capacity,
                          luna_launcher_setting *settings, size_t count,
-                         const char *package)
+                         const char *package, const char *title, const char *note)
 {
     if (!launcher_window_open(960, 680)) return -1;
     if (count > PICK_FIELDS) count = PICK_FIELDS;
@@ -1393,7 +1393,10 @@ static int launcher_form(char *path, size_t capacity,
         "<p class=\"sub\" id=\"launcher-sub\"></p>");
     if (!package) {
         at += (size_t)snprintf(html + at, html_size - at,
-            "<button class=\"drop\" id=\"drop\">Drop a package file here or click to browse…</button>"
+            "<button class=\"drop\" id=\"drop\">Drop a package file here or click to browse…</button>");
+    }
+    if (!package && !title) {
+        at += (size_t)snprintf(html + at, html_size - at,
             "<div class=\"lbl\">Find an app on APKPure</div>"
             "<div class=\"row\"><input id=\"store-query\" placeholder=\"Application name, e.g. ni no kuni\" aria-label=\"Application name\">"
             "<button id=\"store-search\">Search</button></div>"
@@ -1403,7 +1406,8 @@ static int launcher_form(char *path, size_t capacity,
             at += (size_t)snprintf(html + at, html_size - at,
                 "<button class=\"store-result hidden\" id=\"store-result%d\"></button>",i);
     }
-    at += (size_t)snprintf(html + at, html_size - at, "<h2>%s</h2>", package ? "PROFILE" : "SETTINGS");
+    if (package || count)
+        at += (size_t)snprintf(html + at, html_size - at, "<h2>%s</h2>", package ? "PROFILE" : "SETTINGS");
     for (size_t i = 0; i < count; ++i) {
         if (settings[i].compact) {
             /* a run of compact settings is one row of equal columns */
@@ -1445,7 +1449,7 @@ static int launcher_form(char *path, size_t capacity,
     }
     snprintf(html + at, html_size - at,
         "<div id=\"error\"></div></div>"
-        "<div class=\"bar\"><div class=\"note\">%s %s</div>"
+        "<div class=\"bar\"><div id=\"launcher-note\" class=\"note\">%s %s</div>"
         "<button id=\"continue\">Open</button></div></div>%s</body>",
         package ? "Each profile keeps its own app data." : "Changes are saved to lunaria.conf.", pick_version, dialog_html);
     snprintf(css, sizeof boot_css_base + sizeof pick_css_extra + strlen(dialog_css) + 1,
@@ -1455,11 +1459,15 @@ static int launcher_form(char *path, size_t capacity,
     luna_parse_css(css);
     luna_parse_html(html);
     free(html); free(css);
-    luna_set_text(luna_get_element_by_id("launcher-title"), package ? "Open a profile" : "Open an application");
+    luna_set_text(luna_get_element_by_id("launcher-title"), title ? title : package ? "Open a profile" : "Open an application");
+    if (note) luna_set_text(luna_get_element_by_id("launcher-note"), note);
+    if (title) luna_set_text(luna_get_element_by_id("continue"), "Install");
     luna_set_text(luna_get_element_by_id("launcher-sub"), package ? package : "Choose an APK, XAPK, APKS or AAB package.");
     if (!package) {
-        pick_store.count=0;
         luna_set_on_click(luna_get_element_by_id("drop"), pick_browse);
+    }
+    if (!package && !title) {
+        pick_store.count=0;
         luna_set_on_click(luna_get_element_by_id("store-search"),pick_store_search);
         luna_set_on_click(luna_get_element_by_id("store-cancel"),pick_store_cancel);
         for (int i=0;i<APKPURE_RESULTS;++i) {
@@ -1492,7 +1500,7 @@ static int launcher_form(char *path, size_t capacity,
     char selected_path[4096] = "";
     while (!cancelled) {
         frame(1);
-        if (!package) pick_store_tick();
+        if (!package && !title) pick_store_tick();
         if (pick_folder[0] && pick_folder_for >= 0) {
             pick_set_field((size_t)pick_folder_for, pick_folder);
             pick_folder[0] = 0; pick_folder_for = -1;
@@ -1557,7 +1565,13 @@ static int launcher_form(char *path, size_t capacity,
 int luna_launcher_pick(char *path, size_t capacity,
                        luna_launcher_setting *settings, size_t count)
 {
-    return launcher_form(path, capacity, settings, count, NULL);
+    return launcher_form(path, capacity, settings, count, NULL, NULL, NULL);
+}
+
+int luna_launcher_pick_named(char *path, size_t capacity, const char *title,
+                             const char *note)
+{
+    return launcher_form(path, capacity, NULL, 0, NULL, title, note);
 }
 
 int luna_launcher_choose(const char *package, const char *const *profiles, const char *const *labels,
@@ -1573,7 +1587,7 @@ int luna_launcher_choose(const char *package, const char *const *profiles, const
     };
     const char *selected = getenv("LUNARIA_PROFILE");
     snprintf(settings[0].value, sizeof settings[0].value, "%s", selected && *selected ? selected : profiles[0]);
-    int result = launcher_form(choice, capacity, settings, 2, package);
+    int result = launcher_form(choice, capacity, settings, 2, package, NULL, NULL);
     free(values);
     progress_document(); frame(1);
     return result;

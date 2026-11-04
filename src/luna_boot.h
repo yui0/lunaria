@@ -84,6 +84,8 @@ typedef struct luna_launcher_setting {
  * cancelled or there is no display to ask on. */
 int luna_launcher_pick(char *path, size_t capacity,
                        luna_launcher_setting *settings, size_t count);
+int luna_launcher_pick_named(char *path, size_t capacity, const char *title,
+                             const char *note);
 void luna_launcher_end(int keep_window);
 void *luna_launcher_take_window(void);
 
@@ -108,9 +110,17 @@ int apkpure_download(const char *package, const char *directory, char *path, siz
  * starting over under another (returns only when it could not). */
 const char *luna_apk_profile_current(void);
 int luna_apk_profile_list(char (*names)[65], int max);
-int luna_apk_profile_label(const char *id, char *out, size_t cap);
-int luna_apk_profile_set_label(const char *id, const char *label);
 int luna_apk_profile_new_name(char *out, size_t cap);
 int luna_apk_restart(const char *profile);
 /* Starts over with no APK, showing the launcher screen. */
 int luna_apk_restart_launcher(void);
+/* Optional Google packages and their account settings share the current
+ * installation's data root. Windows are opened in a separate process. */
+int luna_apk_google_services_installed(void);
+int luna_apk_google_services_busy(void);
+int luna_apk_google_services_open(int setup, const char *profile);
+int luna_apk_google_profile_list(char (*names)[65], int max);
+int luna_apk_google_profile_accounts(const char *profile);
+int luna_apk_google_profile_create(char *out, size_t cap);
+/* Retains the original archive, including splits, for component hosts. */
+int luna_apk_system_archive(const char *package, char *out, size_t cap);

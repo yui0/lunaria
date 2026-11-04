@@ -1177,7 +1177,24 @@ static const struct rt_method rt_x_view_more[] = {
    M_END,
 };
 
+/* ImageView.get/setMaxWidth/MaxHeight: unbounded (Integer.MAX_VALUE) until set. */
+static bool x_image_max_size(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                             int nargs, union dvm_value *out)
+{
+   const char *name = builtin_name();
+   const char *field = strstr(name, "Width") ? "maxWidth" : "maxHeight";
+   (void)nargs;
+   if (name[0] == 's') {
+      rt_set_int(vm, self, field, args[0].i);
+      (void)x_flag_set(vm, self, "maxSizeSet", 1);
+      ui_invalidate();
+      RETV();
+   }
+   RETI(rt_get_int(vm, self, "maxSizeSet") ? rt_get_int(vm, self, field) : INT32_MAX);
+}
 static const struct rt_method rt_x_image_view[] = {
+   M("getMaxHeight", "()I", x_image_max_size), M("setMaxHeight", "(I)V", x_image_max_size),
+   M("getMaxWidth", "()I", x_image_max_size), M("setMaxWidth", "(I)V", x_image_max_size),
    M("setImageAlpha", "(I)V", x_image_tint_alpha), M("getImageAlpha", "()I", x_image_tint_alpha),
    M("setImageTintList", "(Landroid/content/res/ColorStateList;)V", x_image_tint_alpha),
    M("getImageTintList", "()Landroid/content/res/ColorStateList;", x_image_tint_alpha),
@@ -1186,7 +1203,15 @@ static const struct rt_method rt_x_image_view[] = {
    M_END,
 };
 
+/* TextView.getLineHeight(): the height of one line of the view's text. */
+static bool x_text_line_height(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                               int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   RETI((int32_t)lroundf(layout_line_height(vm, self)));
+}
 static const struct rt_method rt_x_text_view[] = {
+   M("getLineHeight", "()I", x_text_line_height),
    M("setAllCaps", "(Z)V", x_text_setAllCaps),
    M("setEllipsize", "(Landroid/text/TextUtils$TruncateAt;)V", x_text_ellipsize),
    M("getEllipsize", "()Landroid/text/TextUtils$TruncateAt;", x_text_ellipsize),

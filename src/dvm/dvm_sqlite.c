@@ -976,6 +976,215 @@ const struct dvm_sqlite_field dvm_sqlite_cursor_fields[] = {
    { "position", "I" }, { "closed", "Z" }, { NULL, NULL }
 };
 
+/* --- cursor snapshots, MatrixCursor -------------------------------------- */
+
+/* The wire form of a whole cursor, little-endian:
+ *   u32 columns | u32 rows | (u32 length, name bytes) per column |
+ *   per cell: u8 type, then i64 / f64 bits / (u32 length, bytes) / nothing for NULL.
+ * It is how a ContentProvider's result crosses a process boundary. */
+struct snap { uint8_t *p; size_t n, cap; bool failed; };
+
+static void snap_put(struct snap *w, const void *src, size_t n)
+{
+   if (w->failed) return;
+   if (w->n + n > w->cap) {
+      size_t cap = w->cap ? w->cap : 512;
+      while (cap < w->n + n) cap *= 2;
+      uint8_t *grown = realloc(w->p, cap);
+      if (!grown) { w->failed = true; return; }
+      w->p = grown; w->cap = cap;
+   }
+   memcpy(w->p + w->n, src, n);
+   w->n += n;
+}
+static void snap_u32(struct snap *w, uint32_t v)
+{ uint8_t b[4]; for (unsigned i = 0; i < 4; ++i) b[i] = (uint8_t)(v >> (i * 8)); snap_put(w, b, 4); }
+static void snap_u64(struct snap *w, uint64_t v)
+{ uint8_t b[8]; for (unsigned i = 0; i < 8; ++i) b[i] = (uint8_t)(v >> (i * 8)); snap_put(w, b, 8); }
+static uint32_t snap_get32(const uint8_t *p)
+{ return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+static uint64_t snap_get64(const uint8_t *p)
+{ return (uint64_t)snap_get32(p) | (uint64_t)snap_get32(p + 4) << 32; }
+
+/* Calls an instance method of any Cursor object, whatever class implements it. */
+static bool cursor_call(struct dvm *vm, dvm_ref obj, const char *name, const char *sig,
+                        const union dvm_value *args, int nargs, union dvm_value *out)
+{
+   struct dvm_class *c = dvm_object_class(vm, obj);
+   struct dvm_method *m = c ? dvm_find_method(vm, c, name, sig) : NULL;
+   union dvm_value ignored = {0};
+   if (!m) { dvm__throw(vm, "java/lang/AbstractMethodError", "Cursor.%s", name); return false; }
+   return dvm_call(vm, m, obj, args, nargs, out ? out : &ignored);
+}
+
+int dvm_sqlite_cursor_snapshot(struct dvm *vm, dvm_ref cursor, void **bytes, size_t *size)
+{
+   struct snap w = {0};
+   union dvm_value cols = {0}, rows = {0}, pos = {0}, ok = {0};
+   *bytes = NULL; *size = 0;
+   if (!cursor) return -EINVAL;
+   if (!cursor_call(vm, cursor, "getColumnCount", "()I", NULL, 0, &cols) ||
+       !cursor_call(vm, cursor, "getCount", "()I", NULL, 0, &rows)) return -EIO;
+   snap_u32(&w, (uint32_t)cols.i);
+   snap_u32(&w, (uint32_t)rows.i);
+   for (int32_t c = 0; c < cols.i; ++c) {
+      union dvm_value index = { .i = c }, name = {0};
+      if (!cursor_call(vm, cursor, "getColumnName", "(I)Ljava/lang/String;", &index, 1, &name)) { free(w.p); return -EIO; }
+      const char *text = name.l ? dvm_string_utf8(vm, name.l) : "";
+      snap_u32(&w, (uint32_t)strlen(text));
+      snap_put(&w, text, strlen(text));
+   }
+   for (int32_t r = 0; r < rows.i; ++r) {
+      pos.i = r;
+      if (!cursor_call(vm, cursor, "moveToPosition", "(I)Z", &pos, 1, &ok) || !ok.i) { free(w.p); return -EIO; }
+      for (int32_t c = 0; c < cols.i; ++c) {
+         union dvm_value index = { .i = c }, type = {0}, v = {0};
+         if (!cursor_call(vm, cursor, "getType", "(I)I", &index, 1, &type)) { free(w.p); return -EIO; }
+         /* Cursor.FIELD_TYPE_*: 0 null, 1 integer, 2 float, 3 string, 4 blob. */
+         switch (type.i) {
+         case 1:
+            if (!cursor_call(vm, cursor, "getLong", "(I)J", &index, 1, &v)) { free(w.p); return -EIO; }
+            { uint8_t t = SQ_INTEGER; snap_put(&w, &t, 1); snap_u64(&w, (uint64_t)v.j); }
+            break;
+         case 2:
+            if (!cursor_call(vm, cursor, "getDouble", "(I)D", &index, 1, &v)) { free(w.p); return -EIO; }
+            { uint8_t t = SQ_FLOAT; uint64_t bits; memcpy(&bits, &v.d, 8); snap_put(&w, &t, 1); snap_u64(&w, bits); }
+            break;
+         case 3: {
+            if (!cursor_call(vm, cursor, "getString", "(I)Ljava/lang/String;", &index, 1, &v)) { free(w.p); return -EIO; }
+            const char *text = v.l ? dvm_string_utf8(vm, v.l) : "";
+            uint8_t t = SQ_TEXT; snap_put(&w, &t, 1);
+            snap_u32(&w, (uint32_t)strlen(text)); snap_put(&w, text, strlen(text));
+            break;
+         }
+         case 4: {
+            if (!cursor_call(vm, cursor, "getBlob", "(I)[B", &index, 1, &v)) { free(w.p); return -EIO; }
+            struct dvm_object *o = v.l ? dvm__obj(vm, v.l) : NULL;
+            uint8_t t = SQ_BLOB; snap_put(&w, &t, 1);
+            snap_u32(&w, o ? o->length : 0); if (o && o->length) snap_put(&w, o->data, o->length);
+            break;
+         }
+         default:
+            { uint8_t t = SQ_NULL; snap_put(&w, &t, 1); }
+         }
+      }
+   }
+   if (w.failed) { free(w.p); return -ENOMEM; }
+   *bytes = w.p; *size = w.n;
+   return 0;
+}
+
+/* A Cursor over a snapshot; 0 when the bytes are not one. */
+dvm_ref dvm_sqlite_cursor_from_snapshot(struct dvm *vm, const void *bytes, size_t size)
+{
+   const uint8_t *p = bytes, *end = p + size;
+   if (size < 8) return 0;
+   struct sq_cursor *c = calloc(1, sizeof *c);
+   if (!c) return 0;
+   const uint32_t cols = snap_get32(p), rows = snap_get32(p + 4);
+   p += 8;
+   if (cols > 4096 || rows > (1u << 24)) goto bad;
+   c->ncols = (int)cols; c->nrows = (int)rows;
+   c->names = calloc(cols ? cols : 1, sizeof *c->names);
+   c->cells = calloc((size_t)rows * (cols ? cols : 1), sizeof *c->cells);
+   if (!c->names || !c->cells) goto bad;
+   for (uint32_t i = 0; i < cols; ++i) {
+      if (end - p < 4) goto bad;
+      const uint32_t n = snap_get32(p); p += 4;
+      if ((size_t)(end - p) < n) goto bad;
+      c->names[i] = malloc(n + 1);
+      if (!c->names[i]) goto bad;
+      memcpy(c->names[i], p, n); c->names[i][n] = 0; p += n;
+   }
+   for (size_t i = 0; i < (size_t)rows * cols; ++i) {
+      struct sq_cell *cell = &c->cells[i];
+      if (end - p < 1) goto bad;
+      cell->type = *p++;
+      switch (cell->type) {
+      case SQ_INTEGER: if (end - p < 8) goto bad; cell->i = (int64_t)snap_get64(p); p += 8; break;
+      case SQ_FLOAT:   if (end - p < 8) goto bad; { uint64_t bits = snap_get64(p); memcpy(&cell->d, &bits, 8); } p += 8; break;
+      case SQ_TEXT: case SQ_BLOB: {
+         if (end - p < 4) goto bad;
+         const uint32_t n = snap_get32(p); p += 4;
+         if ((size_t)(end - p) < n || n > INT32_MAX - 1) goto bad;
+         cell->p = malloc((size_t)n + 1);
+         if (!cell->p) goto bad;
+         memcpy(cell->p, p, n); cell->p[n] = 0; cell->n = (int)n; p += n;
+         break;
+      }
+      case SQ_NULL: break;
+      default: goto bad;
+      }
+   }
+   return cursor_wrap(vm, c);
+bad:
+   cursor_data_free(c);
+   return 0;
+}
+
+/* android.database.MatrixCursor: a Cursor a caller fills row by row.  It is a
+ * Cursor (every read, move and column method is inherited) over the same
+ * storage; only construction and addRow are its own. */
+static bool matrix_init(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs, union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   struct dvm_object *names = args[0].l ? dvm__obj(vm, args[0].l) : NULL;
+   if (!names || names->kind != DVM_OBJ_ARRAY || names->elem_kind != 'L') {
+      dvm__throw(vm, "java/lang/NullPointerException", "columnNames");
+      return false;
+   }
+   struct sq_cursor *c = calloc(1, sizeof *c);
+   if (!c) { dvm__throw(vm, "java/lang/OutOfMemoryError", "MatrixCursor"); return false; }
+   c->ncols = (int)names->length;
+   c->names = calloc(names->length ? names->length : 1, sizeof *c->names);
+   for (uint32_t i = 0; c->names && i < names->length; ++i) {
+      const char *n = ((dvm_ref *)names->data)[i] ? dvm_string_utf8(vm, ((dvm_ref *)names->data)[i]) : "";
+      c->names[i] = strdup(n ? n : "");
+   }
+   if (!c->names) { cursor_data_free(c); dvm__throw(vm, "java/lang/OutOfMemoryError", "MatrixCursor"); return false; }
+   host_data_set(vm, self, c, cursor_destroy);
+   (void)dvm_set_field(vm, self, "position", "I", (union dvm_value){ .i = -1 });
+   RETV();
+}
+
+static bool matrix_add_row(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs, union dvm_value *out)
+{
+   (void)nargs; (void)out;
+   struct sq_cursor *c = cursor_of(vm, self);
+   struct dvm_object *row = args[0].l ? dvm__obj(vm, args[0].l) : NULL;
+   if (!c) { dvm__throw(vm, "java/lang/IllegalStateException", "MatrixCursor"); return false; }
+   if (!row || row->kind != DVM_OBJ_ARRAY || row->elem_kind != 'L') {
+      dvm__throw(vm, "java/lang/NullPointerException", "columnValues");
+      return false;
+   }
+   if (row->length != (uint32_t)c->ncols) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException", "columnNames.length = %d, columnValues.length = %u",
+                 c->ncols, row->length);
+      return false;
+   }
+   struct sq_cell *grown = realloc(c->cells, (size_t)(c->nrows + 1) * (size_t)(c->ncols ? c->ncols : 1) * sizeof *c->cells);
+   if (!grown) { dvm__throw(vm, "java/lang/OutOfMemoryError", "MatrixCursor"); return false; }
+   c->cells = grown;
+   struct sq_cell *dest = c->cells + (size_t)c->nrows * (size_t)c->ncols;
+   memset(dest, 0, (size_t)c->ncols * sizeof *dest);
+   for (int i = 0; i < c->ncols; ++i) {
+      dest[i].type = SQ_NULL;
+      if (!cell_from_object(vm, ((dvm_ref *)row->data)[i], &dest[i])) {
+         for (int j = 0; j <= i; ++j) cell_clear(&dest[j]);
+         return false;
+      }
+   }
+   ++c->nrows;
+   RETV();
+}
+
+const struct dvm_sqlite_method dvm_sqlite_matrix_cursor_methods[] = {
+   { "<init>", "([Ljava/lang/String;)V", matrix_init, 0 },
+   { "<init>", "([Ljava/lang/String;I)V", matrix_init, 0 },
+   { "addRow", "([Ljava/lang/Object;)V", matrix_add_row, 0 },
+   { NULL, NULL, NULL, 0 }
+};
+
 /* --- SQL building -------------------------------------------------------- */
 
 struct sq_text { char *p; size_t n, cap; bool failed; };
@@ -1663,6 +1872,125 @@ static bool db_delete_database(struct dvm *vm, dvm_ref self, const union dvm_val
    RETI(dvm_sqlite_delete_files(p.l ? dvm_string_utf8(vm, p.l) : NULL));
 }
 
+/* --- SQLiteDatabase.OpenParams and its Builder ----------------------------
+ * The parameters an API 27 caller hands to openDatabase(File, OpenParams).  The
+ * open flags decide whether the file is created; the remaining settings (journal
+ * and synchronous mode, lookaside, idle timeout, handlers) tune how a connection
+ * pool behaves and have no counterpart in the single connection used here, so
+ * the builder accepts and returns itself for them. */
+#define OPEN_CREATE_IF_NECESSARY 0x10000000
+
+static dvm_ref open_params_make(struct dvm *vm, const char *desc, int flags)
+{
+   struct dvm_class *c = dvm__class_by_desc(vm, desc);
+   dvm_ref o = c ? dvm_new_object(vm, c) : 0;
+   if (o) (void)dvm_set_field(vm, o, "flags", "I", (union dvm_value){ .i = flags });
+   return o;
+}
+
+static int open_params_flags(struct dvm *vm, dvm_ref o)
+{
+   union dvm_value v = { .i = OPEN_CREATE_IF_NECESSARY };
+   if (o) (void)dvm_get_field(vm, o, "flags", "I", &v);
+   return v.i;
+}
+
+static bool opb_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                     int nargs, union dvm_value *out)
+{
+   (void)out;
+   const int flags = nargs > 0 && ARG(0).l ? open_params_flags(vm, ARG(0).l)
+                                           : OPEN_CREATE_IF_NECESSARY;
+   (void)dvm_set_field(vm, self, "flags", "I", (union dvm_value){ .i = flags });
+   RETV();
+}
+
+static bool opb_self(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                     int nargs, union dvm_value *out)
+{ (void)vm; (void)args; (void)nargs; RETL(self); }
+
+static bool opb_set_flags(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                          int nargs, union dvm_value *out)
+{
+   (void)nargs;
+   (void)dvm_set_field(vm, self, "flags", "I", (union dvm_value){ .i = ARG(0).i });
+   RETL(self);
+}
+
+static bool opb_add_flags(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                          int nargs, union dvm_value *out)
+{
+   (void)nargs;
+   (void)dvm_set_field(vm, self, "flags", "I",
+                       (union dvm_value){ .i = open_params_flags(vm, self) | ARG(0).i });
+   RETL(self);
+}
+
+static bool opb_remove_flags(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                             int nargs, union dvm_value *out)
+{
+   (void)nargs;
+   (void)dvm_set_field(vm, self, "flags", "I",
+                       (union dvm_value){ .i = open_params_flags(vm, self) & ~ARG(0).i });
+   RETL(self);
+}
+
+static bool opb_build(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                      int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   RETL(open_params_make(vm, "Landroid/database/sqlite/SQLiteDatabase$OpenParams;",
+                         open_params_flags(vm, self)));
+}
+
+static bool op_get_flags(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                         int nargs, union dvm_value *out)
+{ (void)args; (void)nargs; RETI(open_params_flags(vm, self)); }
+
+/* static SQLiteDatabase.openDatabase(File, OpenParams) */
+static bool db_open_with_params(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                                int nargs, union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   union dvm_value p = { 0 };
+   if (ARG(0).l) (void)dvm_get_field(vm, ARG(0).l, "path", "Ljava/lang/String;", &p);
+   const char *path;
+   if (!sq_str(vm, p.l, &path)) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException", "path must not be null");
+      return false;
+   }
+   dvm_ref db = dvm_sqlite_open(vm, path, open_params_flags(vm, ARG(1).l));
+   if (!db) return false;
+   RETL(db);
+}
+
+#define OPB "Landroid/database/sqlite/SQLiteDatabase$OpenParams$Builder;"
+const struct dvm_sqlite_method dvm_sqlite_open_params_builder_methods[] = {
+   { "<init>", "()V", opb_init, 0 },
+   { "<init>", "(Landroid/database/sqlite/SQLiteDatabase$OpenParams;)V", opb_init, 0 },
+   { "setOpenFlags", "(I)" OPB, opb_set_flags, 0 },
+   { "addOpenFlags", "(I)" OPB, opb_add_flags, 0 },
+   { "removeOpenFlags", "(I)" OPB, opb_remove_flags, 0 },
+   { "setCursorFactory", "(Landroid/database/sqlite/SQLiteDatabase$CursorFactory;)" OPB, opb_self, 0 },
+   { "setErrorHandler", "(Landroid/database/DatabaseErrorHandler;)" OPB, opb_self, 0 },
+   { "setLookasideConfig", "(II)" OPB, opb_self, 0 },
+   { "setIdleConnectionTimeout", "(J)" OPB, opb_self, 0 },
+   { "setJournalMode", "(Ljava/lang/String;)" OPB, opb_self, 0 },
+   { "setSynchronousMode", "(Ljava/lang/String;)" OPB, opb_self, 0 },
+   { "build", "()Landroid/database/sqlite/SQLiteDatabase$OpenParams;", opb_build, 0 },
+   { NULL, NULL, NULL, 0 }
+};
+#undef OPB
+
+const struct dvm_sqlite_method dvm_sqlite_open_params_methods[] = {
+   { "getOpenFlags", "()I", op_get_flags, 0 },
+   { NULL, NULL, NULL, 0 }
+};
+
+const struct dvm_sqlite_field dvm_sqlite_open_params_fields[] = {
+   { "flags", "I" }, { NULL, NULL }
+};
+
 #define SM DEX_ACC_STATIC
 const struct dvm_sqlite_method dvm_sqlite_database_methods[] = {
    { "beginTransaction", "()V", db_begin_exclusive, 0 },
@@ -1699,6 +2027,12 @@ const struct dvm_sqlite_method dvm_sqlite_database_methods[] = {
    { "rawQueryWithFactory",
      "(Landroid/database/sqlite/SQLiteDatabase$CursorFactory;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;)Landroid/database/Cursor;",
      db_raw_query, 0 },
+   { "rawQueryWithFactory",
+     "(Landroid/database/sqlite/SQLiteDatabase$CursorFactory;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;Landroid/os/CancellationSignal;)Landroid/database/Cursor;",
+     db_raw_query, 0 },
+   { "rawQuery",
+     "(Ljava/lang/String;[Ljava/lang/String;Landroid/os/CancellationSignal;)Landroid/database/Cursor;",
+     db_raw_query, 0 },
    { "query",
      "(Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Landroid/database/Cursor;",
      db_query, 0 },
@@ -1732,6 +2066,9 @@ const struct dvm_sqlite_method dvm_sqlite_database_methods[] = {
    { "openDatabase",
      "(Ljava/lang/String;Landroid/database/sqlite/SQLiteDatabase$CursorFactory;ILandroid/database/DatabaseErrorHandler;)Landroid/database/sqlite/SQLiteDatabase;",
      db_open_database, SM },
+   { "openDatabase",
+     "(Ljava/io/File;Landroid/database/sqlite/SQLiteDatabase$OpenParams;)Landroid/database/sqlite/SQLiteDatabase;",
+     db_open_with_params, SM },
    { "openOrCreateDatabase",
      "(Ljava/lang/String;Landroid/database/sqlite/SQLiteDatabase$CursorFactory;)Landroid/database/sqlite/SQLiteDatabase;",
      db_open_or_create, SM },

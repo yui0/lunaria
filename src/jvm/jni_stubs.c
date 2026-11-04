@@ -314,7 +314,7 @@ java_io_File_getParent(JNIEnv *env, jobject object, va_list args)
    const char *p=jni_file_get_path(object);
    const char *slash=p ? strrchr(p,'/') : NULL;
    if(!slash || !strcmp(p,"/"))return NULL;
-   char *parent=strndup(p,slash==p ? 1 : (size_t)(slash-p));
+   char *parent=luna_strndup(p,slash==p ? 1 : (size_t)(slash-p));
    jstring result=parent ? (*env)->NewStringUTF(env,parent) : NULL;
    free(parent);return result;
 }
@@ -892,7 +892,16 @@ static void android_install_token(const char *label, const char *pkg,
    static const char alphabet[] =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
    uint64_t h = UINT64_C(1469598103934665603);
-   const char *parts[3] = { label, pkg, getenv("ANDROID_APK_FILE") };
+   /* The install is named by its package and version, not by where this process
+    * happens to keep a copy of the APK: every process of the package -- the
+    * launched one and each component host -- sees one install directory, and
+    * it stays the same from run to run, as PackageManager's does. */
+   int32_t version_code = 0;
+   const char *version_name = NULL;
+   arm_exec_apk_version(&version_code, &version_name);
+   char version[32];
+   snprintf(version, sizeof version, "%d", (int)version_code);
+   const char *parts[3] = { label, pkg, version };
    for (unsigned p = 0; p < 3; ++p)
       for (const unsigned char *s =
               (const unsigned char *)(parts[p] ? parts[p] : ""); *s; ++s) {
@@ -1046,6 +1055,8 @@ android_property_entry(const char *name, size_t index)
       { "ro.product.board",         dev->board },
       { "ro.board.platform",        dev->platform },
       { "ro.hardware",              dev->hardware },
+      /* OpenGL ES 3.2, encoded as the framework reads it: major<<16 | minor. */
+      { "ro.opengles.version",      "196610" },
       /* ABI — one 64-bit image; abilist32 empty the way a 64-only device is. */
       { "ro.product.cpu.abi",       "arm64-v8a" },
       { "ro.product.cpu.abi2",      "" },

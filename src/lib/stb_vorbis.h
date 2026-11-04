@@ -36,6 +36,10 @@ typedef struct {
    int alloc_buffer_length_in_bytes;
 } stb_vorbis_alloc;
 
+/* Decode a whole stream; returns the frames per channel (<= 0 on failure) and a
+ * malloc'd interleaved 16-bit buffer. */
+int stb_vorbis_decode_memory(const unsigned char *mem, int len, int *channels,
+                             int *sample_rate, short **output);
 stb_vorbis *stb_vorbis_open_memory(const unsigned char *data, int len,
                                    int *error, const stb_vorbis_alloc *alloc_buffer);
 stb_vorbis_info stb_vorbis_get_info(stb_vorbis *f);

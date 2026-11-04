@@ -515,22 +515,19 @@ DVM_HDR = src/jvm/jvm.h src/dvm/dvm_parcel.h src/dvm/dvm_lib.h src/luna_overlay.
           src/dvm/dvm_lib.h src/dvm/dvm_lib.h src/dvm/locale_names.h src/dvm/date_symbols_data.h src/dvm/framework.h \
           src/webview_cdp.h
 DVM_HDR += src/unicode/breaks.h src/unicode/break_data.h
-DVM_HDR += src/dvm/dvm_extras_lang.h src/dvm/dvm_ec.h
 DVM_HDR += src/dvm/dvm_lib.h src/dvm/calendar_data.h
 DVM_HDR += src/dvm/date_time_patterns_data.h src/dvm/dvm_extras_android.h
-DVM_HDR += src/unicode/bidi_data.h src/dvm/dvm_reflect.h src/dvm/dvm_android_ui.h src/dvm/dvm_graphics.h src/dvm/dvm_text.h src/dvm/dvm_time.h src/dvm/dvm_crypto.h src/dvm/dvm_pbe.h
+DVM_HDR += src/unicode/bidi_data.h src/dvm/dvm_reflect.h src/dvm/dvm_android_ui.h src/dvm/dvm_graphics.h src/dvm/dvm_text.h src/dvm/dvm_time.h src/dvm/dvm_crypto.h
 DVM_HDR += src/dvm/dvm_videoview.h
-DVM_HDR += src/dvm/dvm_sax.h src/dvm/dvm_dom.h src/dvm/dvm_list_view.h src/dvm/dvm_vector.h
-DVM_HDR += src/dvm/dvm_time_formatter.h src/dvm/time_standalone_months.h src/dvm/date_symbols_data.h src/dvm/framework.h
-DVM_HDR += src/dvm/dvm_http_params.h
-DVM_HDR +=
-DVM_HDR += src/dvm/dvm_http_entity.h
+DVM_HDR += src/dvm/dvm_sax.h src/dvm/dvm_dom.h src/dvm/dvm_vector.h
+DVM_HDR += src/dvm/time_standalone_months.h src/dvm/date_symbols_data.h src/dvm/framework.h
 DVM_HDR += src/dvm/dvm_http_message.h src/dvm/dvm_http_client.h
-DVM_HDR +=
-DVM_HDR +=
 DVM_HDR += src/dvm/dvm_nio_file.h
-DVM_HDR +=
 DVM_HDR += src/dvm/platform_classes.h
+# Every header under src/ is an input of the emulator: dvm_runtime.c is a unity
+# build that #includes the dvm_*.h family, so a hand-kept list silently misses new
+# ones (an edited header then did not rebuild libjvm.so).  Track them all.
+DVM_HDR += $(wildcard src/*.h src/dvm/*.h src/jvm/*.h src/unicode/*.h)
 # The Dalvik bytecode emulator lives in libjvm.so: it is reached from jvm.c
 # (a JNI call with no host stub) and it calls back out through the same JNI
 # table, so the two have to be in one object.
@@ -919,6 +916,8 @@ test/test_dvm: test/pending_intent_tests.h test/choice_format_tests.h test/messa
 test/test_dvm: test/player_event_tests.h test/player_fixture.h
 test/test_dvm: test/videoview_tests.h test/video_fixture.h
 test/test_dvm: test/touch_transform_tests.h
+test/test_dvm: test/secure_random_provider_tests.h
+test/test_dvm: test/charset_encoder_tests.h
 test/test_dvm: test/jobinfo_tests.h
 test/test_dvm: test/scheduled_executor_tests.h test/alarm_tests.h test/location_tests.h test/network_policy_tests.h test/network_policy_fixture.h
 test/test_dvm: test/progress_bar_tests.h
@@ -965,6 +964,27 @@ boot-card-test: test/test_boot_card
 .PHONY: profile-menu-test
 profile-menu-test: test/test_boot_card
 	./test/test_boot_card --profile-menu-test
+
+.PHONY: google-services-menu-test google-services-test
+google-services-menu-test: test/test_boot_card
+	./test/test_boot_card --google-menu-test
+
+$(BUILD_DIR)/test_google_services: test/google_services_test.c src/apk.c src/lunaria_file.c src/lunaria_file.h src/lunaria_os.h src/luna_boot.h src/luna_google.h | $(BUILD_DIR)
+	$(CC) -std=c11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Wno-unused-function \
+	    -ffunction-sections -fdata-sections $(CPPFLAGS) \
+	    test/google_services_test.c src/lunaria_file.c $(UNITY_TEST_GC) -lpthread -o $@
+
+google-services-test: $(BUILD_DIR)/test_google_services
+	$(BUILD_DIR)/test_google_services
+
+test/test_dvm: test/google_environment_tests.h
+.PHONY: google-environment-test
+google-environment-test: test/test_dvm
+	./test/test_dvm --google-environment-test
+
+.PHONY: file-transfer-test
+file-transfer-test: test/test_dvm
+	./test/test_dvm --file-transfer-test
 
 surface-window-test: test/test_boot_card
 	./test/test_boot_card --surface-test
@@ -2533,6 +2553,48 @@ $(BUILD_DIR)/random-family64.so: test/random_family_test.c src/jvm/jni.h | $(BUI
 $(BUILD_DIR)/random-family32.so: test/random_family_test.c src/jvm/jni.h | $(BUILD_DIR)
 	clang -target armv7-linux-gnueabi $(ABI_TEST_CFLAGS) $< -o $@
 .PHONY: random-family-test
+$(BUILD_DIR)/policy-fixture/code/classes.dex: test/make_policy_fixture_dex.py test/make_dex.py
+	python3 test/make_policy_fixture_dex.py $@
+$(BUILD_DIR)/policy-fixture64.so: test/strictmode_policy_test.c src/jvm/jni.h | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) $< -o $@
+$(BUILD_DIR)/policy-fixture32.so: test/strictmode_policy_test.c src/jvm/jni.h | $(BUILD_DIR)
+	clang -target armv7-linux-gnueabi $(ABI_TEST_CFLAGS) $< -o $@
+.PHONY: strictmode-policy-test
+$(BUILD_DIR)/receiver-fixture/code/classes.dex: test/make_result_receiver_dex.py test/make_dex.py
+	python3 test/make_result_receiver_dex.py $@
+$(BUILD_DIR)/receiver-fixture64.so: test/result_receiver_test.c src/jvm/jni.h | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) $< -o $@
+$(BUILD_DIR)/receiver-fixture32.so: test/result_receiver_test.c src/jvm/jni.h | $(BUILD_DIR)
+	clang -target armv7-linux-gnueabi $(ABI_TEST_CFLAGS) $< -o $@
+.PHONY: result-receiver-test
+$(BUILD_DIR)/account-parcel64.so: test/account_parcel_test.c src/jvm/jni.h | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) $< -o $@
+$(BUILD_DIR)/account-parcel32.so: test/account_parcel_test.c src/jvm/jni.h | $(BUILD_DIR)
+	clang -target armv7-linux-gnueabi $(ABI_TEST_CFLAGS) $< -o $@
+GMS_TEST_CODE_PATH ?=
+$(BUILD_DIR)/account-future64.so: test/account_future_test.c src/jvm/jni.h | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) $< -o $@
+$(BUILD_DIR)/account-future32.so: test/account_future_test.c src/jvm/jni.h | $(BUILD_DIR)
+	clang -target armv7-linux-gnueabi $(ABI_TEST_CFLAGS) $< -o $@
+.PHONY: account-future-test
+account-future-test: lunaria $(BUILD_DIR)/account-future64.so $(BUILD_DIR)/account-future32.so
+	@test -n "$(GMS_TEST_CODE_PATH)" || { echo 'Set GMS_TEST_CODE_PATH to the extracted GMS APK directory'; exit 2; }
+	@ANDROID_PACKAGE_CODE_PATH="$(GMS_TEST_CODE_PATH)" DISPLAY= python3 test/run_guest_results.py $(BUILD_DIR)/account-future64.so $(BUILD_DIR)/account-future32.so
+.PHONY: account-parcel-test
+account-parcel-test: lunaria $(BUILD_DIR)/account-parcel64.so $(BUILD_DIR)/account-parcel32.so
+	@test -n "$(GMS_TEST_CODE_PATH)" || { echo 'Set GMS_TEST_CODE_PATH to the extracted GMS APK directory'; exit 2; }
+	@ANDROID_PACKAGE_CODE_PATH="$(GMS_TEST_CODE_PATH)" DISPLAY= python3 test/run_guest_results.py $(BUILD_DIR)/account-parcel64.so $(BUILD_DIR)/account-parcel32.so
+$(BUILD_DIR)/provider-registry64.so: test/security_provider_registry_test.c src/jvm/jni.h | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu $(ABI_TEST_CFLAGS) $< -o $@
+$(BUILD_DIR)/provider-registry32.so: test/security_provider_registry_test.c src/jvm/jni.h | $(BUILD_DIR)
+	clang -target armv7-linux-gnueabi $(ABI_TEST_CFLAGS) $< -o $@
+.PHONY: security-provider-registry-test
+security-provider-registry-test: lunaria $(BUILD_DIR)/receiver-fixture/code/classes.dex $(BUILD_DIR)/provider-registry64.so $(BUILD_DIR)/provider-registry32.so
+	@ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/receiver-fixture/code" DISPLAY= python3 test/run_guest_results.py $(BUILD_DIR)/provider-registry64.so $(BUILD_DIR)/provider-registry32.so
+result-receiver-test: lunaria $(BUILD_DIR)/receiver-fixture/code/classes.dex $(BUILD_DIR)/receiver-fixture64.so $(BUILD_DIR)/receiver-fixture32.so
+	@ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/receiver-fixture/code" DISPLAY= python3 test/run_guest_results.py $(BUILD_DIR)/receiver-fixture64.so $(BUILD_DIR)/receiver-fixture32.so
+strictmode-policy-test: lunaria $(BUILD_DIR)/policy-fixture/code/classes.dex $(BUILD_DIR)/policy-fixture64.so $(BUILD_DIR)/policy-fixture32.so
+	@ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/policy-fixture/code" DISPLAY= python3 test/run_guest_results.py $(BUILD_DIR)/policy-fixture64.so $(BUILD_DIR)/policy-fixture32.so
 $(BUILD_DIR)/random-family/code/classes.dex: test/dvm_test.dex
 	mkdir -p $(@D)
 	cp $< $@
@@ -3232,7 +3294,7 @@ apk-service-manifest-test: $(BUILD_DIR)/apk_service_manifest_probe
 service-context-test: test/test_dvm
 	./test/test_dvm --service-context-test
 
-$(BUILD_DIR)/process_ipc_test: test/process_ipc_test.c src/luna_process_ipc.c src/lunaria_os.h | $(BUILD_DIR)
+$(BUILD_DIR)/process_ipc_test: test/process_ipc_test.c src/luna_process_ipc.c src/lunaria_os.h src/luna_google.h | $(BUILD_DIR)
 	$(CC) -std=c11 -g -O1 -Wall -Wextra $(DVM_TEST_SAN) -Isrc test/process_ipc_test.c src/luna_process_ipc.c -lpthread -o $@
 .PHONY: process-ipc-test
 process-ipc-test: $(BUILD_DIR)/process_ipc_test
@@ -3323,12 +3385,12 @@ $(BUILD_DIR)/aaudio-contract32.so: test/aaudio_contract_test.c | $(BUILD_DIR)
 	clang -target armv7a-linux-gnueabi -mfloat-abi=softfp -mfpu=vfpv3 $(ABI_TEST_CFLAGS) -std=c11 -o $@ $<
 $(BUILD_DIR)/test_aaudio_stream: test/aaudio_stream_core_test.cpp src/aaudio_stream.h | $(BUILD_DIR)
 	$(CXX) -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -Isrc $< -o $@
+$(BUILD_DIR)/arm_exec.o: src/aaudio_stream.h
 .PHONY: aaudio-contract-test aaudio-core-test
 aaudio-core-test: $(BUILD_DIR)/test_aaudio_stream
 	$(BUILD_DIR)/test_aaudio_stream
 aaudio-contract-test: lunaria $(BUILD_DIR)/aaudio-contract64.so $(BUILD_DIR)/aaudio-contract32.so
 	@python3 test/run_guest_results.py $(BUILD_DIR)/aaudio-contract64.so $(BUILD_DIR)/aaudio-contract32.so
-$(BUILD_DIR)/arm_exec.o: src/aaudio_stream.h
 
 .PHONY: system-properties-test
 test/test_dvm: test/system_properties_tests.h

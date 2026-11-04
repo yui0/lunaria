@@ -389,6 +389,11 @@ void     arm_exec_upload_texture_rgba(int tex, const uint8_t *rgba, int w, int h
  * asset.  This is the same lookup the native AAsset path uses — APK, split
  * APKs, OBB and the staged files tree. */
 unsigned char *arm_exec_asset_read(const char *name, size_t *len);
+/* Decode a whole Ogg Vorbis stream to interleaved 16-bit PCM.  On success
+ * returns 1 and a malloc'd buffer of `*frames` frames (free() it); 0 when the
+ * bytes are not decodable Vorbis. */
+int arm_exec_vorbis_decode(const unsigned char *data, size_t len, int *channels,
+                           int *rate, short **pcm, size_t *frames);
 /* Immediate asset children (files and directories), sorted and deduplicated.
  * Both the array and its names are allocated with malloc; caller frees them. */
 char **arm_exec_asset_list(const char *name, size_t *count);
@@ -396,6 +401,9 @@ char **arm_exec_asset_list(const char *name, size_t *count);
  * helper this honours the archive argument and does not add assets/ prefixes. */
 unsigned char *arm_exec_zip_read(const char *archive, const char *name,
                                  size_t *len);
+
+/* The member names of a zip/jar/apk, malloc'd array of malloc'd strings. */
+char **arm_exec_zip_list(const char *archive, size_t *count);
 
 /* Dump current framebuffer to PPM.  path may be NULL → /tmp/lunaria_NNNN.ppm.
  * Returns 1 on success.  Also: F12 in the window, or `touch /tmp/lunaria-shot`. */
@@ -458,6 +466,7 @@ void arm_exec_note_destructive(const char *what, const char *host_path,
  * Bundle.  Returns 0 when absent, else the value kind ('Z','I','F' in *iv or
  * 'L' in *sv).  'F' supplies the IEEE-754 float bits in *iv. */
 int arm_exec_apk_meta(const char *key, int32_t *iv, const char **sv);
+int arm_exec_apk_component_meta(const char *component, const char *key, int32_t *iv, const char **sv);
 const char *arm_exec_apk_meta_keys(void);
 /* meta-data nested under one <service>/<activity>/<receiver>/<provider>,
  * keyed by the component's dotted class name.  Same ';' encoding as

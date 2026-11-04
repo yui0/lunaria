@@ -31,6 +31,7 @@
 
 #include "luna_overlay.h"
 #include "luna_boot.h"
+#include "luna_google.h"
 #include <sys/stat.h>
 #include <dirent.h>
 #include "luna_input.h"
@@ -1236,6 +1237,32 @@ bool luna_overlay_present_checked(int w,int h,bool boot)
    return overlay_present_screen(w,h,boot ? OV_BOOT : OV_APP);
 }
 
+/* LUNARIA_OVERLAY_TAP="x,y@seconds[;x,y@seconds...]": taps the overlay at those
+ * points, that long after start-up (press, then release a frame later).  A way
+ * to drive a screen without a hand on the mouse: for tests and diagnosis. */
+static void overlay_scripted_tap(double now)
+{
+   static double start = -1, release_at = -1, rx, ry;
+   static const char *cursor;
+   static bool init;
+   if (!init) { init = true; cursor = getenv("LUNARIA_OVERLAY_TAP"); }
+   if (!cursor || !*cursor) return;
+   if (start < 0) start = now;
+   if (release_at >= 0) {
+      if (now >= release_at) { release_at = -1; (void)luna_overlay_pointer(rx, ry, 0); }
+      return;
+   }
+   double x, y, at;
+   int used = 0;
+   if (sscanf(cursor, "%lf,%lf@%lf%n", &x, &y, &at, &used) < 3) { cursor = NULL; return; }
+   if (now - start < at) return;
+   fprintf(stderr, "[overlay] scripted tap %.0f,%.0f\n", x, y);
+   cursor += used;
+   if (*cursor == ';') ++cursor;
+   rx = x; ry = y; release_at = now + 0.05;
+   (void)luna_overlay_pointer(x, y, 1);
+}
+
 static void overlay_present_locked(int w, int h)
 {
    const bool prof = overlay_prof_on();
@@ -1441,6 +1468,7 @@ bound:
       double now = overlay_now();
       double dt = now - g_last_time;
       g_last_time = now;
+      overlay_scripted_tap(now);
       luna_update(now, dt);
       overlay_render_windows(w, h);
       overlay_maybe_dump_boot(w, h, status_only);
@@ -1932,7 +1960,7 @@ bool luna_overlay_get_font_metrics(float px,bool bold,struct luna_overlay_font_m
  * ======================================================================== */
 
 /* The right-click menu is a short main list; each group opens one panel beside it. */
-enum { SUB_NONE, SUB_INPUT, SUB_DISPLAY, SUB_GRAPHICS, SUB_SOUND, SUB_LOCALE, SUB_WEBVIEW, SUB_PROFILE, SUB_COUNT };
+enum { SUB_NONE, SUB_INPUT, SUB_DISPLAY, SUB_GRAPHICS, SUB_SOUND, SUB_LOCALE, SUB_WEBVIEW, SUB_PROFILE, SUB_GOOGLE, SUB_COUNT };
 
 #define MENU_W 248
 #define ROW_H 24
@@ -1956,11 +1984,9 @@ static double g_menu_x, g_menu_y;
 static int    g_menu_w, g_menu_h;
 static int    g_menu_sub;
 static bool g_settings_open;
-static bool g_profile_rename, g_profile_select_all;
-static char g_profile_name[256], g_profile_error[128];
-static size_t g_profile_cursor;
 /* Pending API preference; driver state changes only on the next launch. */
 static int g_graphics_choice = -1;
+static char g_google_choice[65];
 static int g_gl_identity_choice = -1;
 static int g_locale_choice = -1;
 static const struct { const char *tag, *label; } g_locales[] = {
@@ -2208,9 +2234,11 @@ static int menu_main_rows(struct menu_buf *b, int parent_y[SUB_COUNT])
    y += menu_item(b, "settings", "Settings...", false, NULL);
    y += menu_sep(b);
    if (getenv("ANDROID_PACKAGE_NAME")) {
+      parent_y[SUB_GOOGLE] = y;
+      y += menu_item(b, "sub-google", "Google services", false, arrow);
       parent_y[SUB_PROFILE] = y;
       char label[256];
-      luna_apk_profile_label(luna_apk_profile_current(), label, sizeof label);
+      snprintf(label, sizeof label, "%s", luna_apk_profile_current());
       y += menu_item(b, "sub-profile", "Profile", false, label);
       y += menu_item(b, "restart", "Restart", false, NULL);
       y += menu_item(b, "launcher", "Back to launcher", false, NULL);
@@ -2229,7 +2257,7 @@ static int menu_keymap_page(void)
 static int menu_sub_rows(struct menu_buf *b)
 {
    int y = PAD;
-   char id[32];
+   char id[80];
    const int page = menu_keymap_page();
    if (g_menu_sub == SUB_INPUT) {
       y += menu_item(b, "paste", "Paste Clipboard as Typing", false, NULL);
@@ -2343,18 +2371,41 @@ static int menu_sub_rows(struct menu_buf *b)
          y += menu_item(b, id, labels[i], cur && !strcmp(cur, names[i]), NULL);
       }
       }
+   } else if (g_menu_sub == SUB_GOOGLE) {
+      const bool installed = luna_apk_google_services_installed() != 0;
+      const bool busy = luna_apk_google_services_busy() != 0;
+      if (!g_google_choice[0]) snprintf(g_google_choice, sizeof g_google_choice, "%s", luna_google_profile_current());
+      y += menu_header(b, "GOOGLE SERVICES");
+      y += menu_item(b, NULL, installed ? "Play services installed" : "Play services not installed", false, NULL);
+      y += menu_item(b, busy ? NULL : "google-install", "Install Google APK / XAPK...", false, NULL);
+      y += menu_item(b, installed && !busy ? "google-new" : NULL, "Sign in to a new environment...", false, NULL);
+      const int selected_accounts = luna_apk_google_profile_accounts(g_google_choice);
+      if (!selected_accounts)
+         y += menu_item(b, installed && !busy ? "google-signin" : NULL, "Sign in to selected environment...", false, NULL);
+      y += menu_sep(b);
+      y += menu_header(b, "SAVED ENVIRONMENTS");
+      char profiles[PROFILE_MAX][65];
+      const int count = luna_apk_google_profile_list(profiles, PROFILE_MAX);
+      for (int i = 0; i < count; ++i) {
+         char label[128];
+         int accounts = luna_apk_google_profile_accounts(profiles[i]);
+         snprintf(id, sizeof id, "google-use-%s", profiles[i]);
+         snprintf(label, sizeof label, "%s (%d saved account%s)", profiles[i], accounts, accounts == 1 ? "" : "s");
+         y += menu_item(b, id, label, !strcmp(profiles[i], g_google_choice), NULL);
+      }
+      y += menu_sep(b);
+      y += menu_item(b, NULL, busy ? "Google services window is open" : "Uses this app's data folder", false, NULL);
+      y += menu_item(b, NULL, "Restart app to apply changes", false, NULL);
    } else if (g_menu_sub == SUB_PROFILE) {
       char names[PROFILE_MAX][65];
       const int n = luna_apk_profile_list(names, PROFILE_MAX);
       const char *cur = luna_apk_profile_current();
       y += menu_header(b, "PROFILE");
       y += menu_item(b, "profile-new", "New Profile", false, NULL);
-      y += menu_item(b, "profile-rename", "Rename Profile…", false, NULL);
       y += menu_sep(b);
       for (int i = 0; i < n; ++i) {
-         snprintf(id, sizeof id, "profile-%d", i);
-         char label[256]; luna_apk_profile_label(names[i], label, sizeof label);
-         y += menu_item(b, id, label, !strcmp(names[i], cur), NULL);
+         snprintf(id, sizeof id, "profile-id-%s", names[i]);
+         y += menu_item(b, id, names[i], !strcmp(names[i], cur), NULL);
       }
       y += menu_item(b, NULL, "Switching restarts the app", false, NULL);
    }
@@ -2374,27 +2425,6 @@ static void menu_publish_locked(void)
          free(b.p);
       } else luna_overlay_set_menu(NULL, NULL, false);
       return;
-   }
-   if (g_profile_rename) {
-      struct menu_buf doc = {0};
-      int width = g_menu_w < 488 ? g_menu_w - 16 : 472;
-      menu_put(&doc, "<div id=\"luna-menu-backdrop\"></div>");
-      menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;width:%dpx;\">",
-                (g_menu_w-width)/2, menu_clampi((g_menu_h-210)/2, 8, g_menu_h), width);
-      menu_header(&doc, "RENAME PROFILE");
-      menu_item(&doc, NULL, "Display name (account data stays in place)", false, NULL);
-      menu_put(&doc, "<div id=\"luna-menu-profile-name\" style=\"margin:8px;padding:8px;border:1px solid #6fa8ff;white-space:pre;overflow:hidden;color:#fff;\">");
-      if (g_profile_select_all) menu_put(&doc, "<span style=\"background:#315d91;\">");
-      char left[256]; memcpy(left, g_profile_name, g_profile_cursor); left[g_profile_cursor] = 0;
-      menu_put_text(&doc, left); menu_put(&doc, "<span style=\"color:#8bbcff;\">|</span>");
-      menu_put_text(&doc, g_profile_name + g_profile_cursor);
-      if (g_profile_select_all) menu_put(&doc, "</span>");
-      menu_put(&doc, "</div>");
-      if (g_profile_error[0]) menu_item(&doc, NULL, g_profile_error, false, NULL);
-      menu_item(&doc, "profile-name-save", "Save", false, NULL);
-      menu_item(&doc, "profile-name-cancel", "Cancel", false, NULL);
-      menu_put(&doc, "</div>");
-      luna_overlay_set_menu(doc.p, g_menu_style, true); free(doc.p); return;
    }
    if (g_settings_open) {
       struct menu_buf doc = {0};
@@ -2748,21 +2778,28 @@ static void menu_clicked(const char *id)
    if (*id == '-') ++id;
    pthread_mutex_lock(&g_menu_lock);
    bool keep_open = false;
-   if (!strcmp(id, "profile-rename")) {
-      luna_apk_profile_label(luna_apk_profile_current(), g_profile_name, sizeof g_profile_name);
-      g_profile_cursor = strlen(g_profile_name); g_profile_select_all = true;
-      g_profile_error[0] = 0; g_profile_rename = true; keep_open = true;
-   } else if (!strcmp(id, "profile-name-save")) {
-      if (!luna_apk_profile_set_label(luna_apk_profile_current(), g_profile_name)) {
-         g_profile_rename = false; menu_notice_locked("Profile renamed");
-      } else {
-         snprintf(g_profile_error, sizeof g_profile_error, "Cannot save. Check name and storage access.");
-         keep_open = true;
-      }
-   } else if (!strcmp(id, "profile-name-cancel")) {
-      g_profile_rename = false;
-   } else if (!strcmp(id, "profile-name")) {
+   if (!strncmp(id, "google-use-", 11)) {
+      const char *profile = id + 11;
+      char names[PROFILE_MAX][65];
+      int count = luna_apk_google_profile_list(names, PROFILE_MAX);
+      bool found = false;
+      for (int i = 0; i < count; ++i) if (!strcmp(profile, names[i])) found = true;
+      if (found && menu_conf_write("LUNARIA_GMS_PROFILE", profile, false)) {
+         snprintf(g_google_choice, sizeof g_google_choice, "%s", profile);
+         menu_notice_locked("GMS environment selected; restart the app to apply");
+      } else menu_notice_locked("Cannot save GMS environment");
       keep_open = true;
+   } else if (!strcmp(id, "google-install") || !strcmp(id, "google-signin") || !strcmp(id, "google-new")) {
+      char fresh[65];
+      const char *profile = g_google_choice[0] ? g_google_choice : luna_google_profile_current();
+      int result = 0;
+      if (!strcmp(id, "google-new")) {
+         result = luna_apk_google_profile_create(fresh, sizeof fresh);
+         profile = fresh;
+      }
+      if (!result && !luna_apk_google_services_open(!strcmp(id, "google-install"), profile))
+         menu_notice_locked("Opening Google services...");
+      else { menu_notice_locked("Cannot open Google services"); keep_open = true; }
    } else if (!strcmp(id, "pause")) {
       const bool paused = !luna_guest_paused();
       luna_guest_set_paused(paused);
@@ -2871,6 +2908,7 @@ static void menu_clicked(const char *id)
          { "input", SUB_INPUT }, { "display", SUB_DISPLAY }, { "graphics", SUB_GRAPHICS },
          { "sound", SUB_SOUND }, { "locale", SUB_LOCALE }, { "webview", SUB_WEBVIEW },
          { "profile", SUB_PROFILE },
+         { "google", SUB_GOOGLE },
       };
       int sub = SUB_NONE;
       for (size_t i = 0; i < sizeof groups / sizeof groups[0]; ++i)
@@ -2963,7 +3001,7 @@ static void menu_clicked(const char *id)
       menu_conf_set("LUNARIA_FULLSCREEN", arm_exec_is_fullscreen() ? "0" : "1");
       arm_exec_toggle_fullscreen();
    } else if (!strcmp(id, "restart") || !strcmp(id, "profile-new") ||
-              (!strncmp(id, "profile-", 8) && id[8] >= '0' && id[8] <= '9')) {
+              !strncmp(id, "profile-id-", 11)) {
       /* Starting over is this command line again under the chosen profile.
        * A new profile is only a name until the app starts under it. */
       char names[PROFILE_MAX][65], fresh[65];
@@ -2971,8 +3009,9 @@ static void menu_clicked(const char *id)
       if (!strcmp(id, "profile-new")) {
          if (luna_apk_profile_new_name(fresh, sizeof fresh) == 0) profile = fresh;
       } else if (id[0] == 'p') {
-         const int i = atoi(id + 8);
-         if (i >= 0 && i < luna_apk_profile_list(names, PROFILE_MAX)) profile = names[i];
+         const int n = luna_apk_profile_list(names, PROFILE_MAX);
+         for (int i = 0; i < n; ++i)
+            if (!strcmp(id + 11, names[i])) { profile = names[i]; break; }
       } else profile = luna_apk_profile_current();
       if (profile) {
          pthread_mutex_unlock(&g_menu_lock);
@@ -2995,7 +3034,7 @@ static void menu_clicked(const char *id)
       arm_exec_request_quit();
    } else keep_open = true;
    g_menu_open = keep_open;
-   if (!g_menu_open) { g_menu_sub = SUB_NONE; g_profile_rename = false; }
+   if (!g_menu_open) { g_menu_sub = SUB_NONE; }
    menu_publish_locked();
    pthread_mutex_unlock(&g_menu_lock);
 }
@@ -3005,7 +3044,6 @@ void luna_menu_open(double x, double y, int w, int h)
    luna_overlay_set_menu_handler(menu_clicked);
    pthread_mutex_lock(&g_menu_lock);
    g_menu_open = true;
-   g_profile_rename = false;
    g_settings_open = false;
    g_menu_sub = SUB_NONE;
    g_menu_x = x;
@@ -3020,7 +3058,6 @@ void luna_menu_close(void)
 {
    pthread_mutex_lock(&g_menu_lock);
    g_menu_open = false;
-   g_profile_rename = false;
    g_settings_open = false;
    g_menu_sub = SUB_NONE;
    menu_publish_locked();
@@ -3037,68 +3074,14 @@ void luna_menu_tick(void)
    pthread_mutex_unlock(&g_menu_lock);
 }
 
-/* Host menu editing is serialized with menu publication. It never enters the
- * Android IME or the WebView, and clipboard access stays on the window thread. */
-static void profile_name_insert(const char *text)
-{
-   size_t n = strlen(text), len = strlen(g_profile_name);
-   if (n + (g_profile_select_all ? 0 : len) >= sizeof g_profile_name) {
-      snprintf(g_profile_error, sizeof g_profile_error, "Name is limited to 255 UTF-8 bytes."); return;
-   }
-   if (g_profile_select_all) { len = 0; g_profile_name[0] = 0; g_profile_cursor = 0; }
-   memmove(g_profile_name + g_profile_cursor + n, g_profile_name + g_profile_cursor, len - g_profile_cursor + 1);
-   memcpy(g_profile_name + g_profile_cursor, text, n);
-   g_profile_cursor += n; g_profile_select_all = false; g_profile_error[0] = 0;
-}
+/* No editable host menu fields currently consume keyboard input. */
 bool luna_overlay_host_char(uint32_t cp)
 {
-   pthread_mutex_lock(&g_menu_lock);
-   bool active = g_menu_open && g_profile_rename;
-   if (active && cp >= 32 && cp != 127 && cp <= 0x10ffff && !(cp >= 0xd800 && cp <= 0xdfff)) {
-      char text[5] = {0};
-      if (cp < 0x80) text[0] = cp;
-      else if (cp < 0x800) { text[0] = 0xc0 | (cp >> 6); text[1] = 0x80 | (cp & 63); }
-      else if (cp < 0x10000) { text[0] = 0xe0 | (cp >> 12); text[1] = 0x80 | ((cp >> 6) & 63); text[2] = 0x80 | (cp & 63); }
-      else { text[0] = 0xf0 | (cp >> 18); text[1] = 0x80 | ((cp >> 12) & 63); text[2] = 0x80 | ((cp >> 6) & 63); text[3] = 0x80 | (cp & 63); }
-      profile_name_insert(text); menu_publish_locked();
-   }
-   pthread_mutex_unlock(&g_menu_lock); return active;
+   (void)cp;
+   return false;
 }
 bool luna_overlay_host_key(int key, int action, int mods)
 {
-   pthread_mutex_lock(&g_menu_lock);
-   bool active = g_menu_open && g_profile_rename;
-   const char *command = NULL;
-   if (active && action) {
-#ifdef __APPLE__
-      bool shortcut = (mods & LUNA_MOD_SUPER) != 0;
-#else
-      bool shortcut = (mods & LUNA_MOD_CONTROL) != 0;
-#endif
-      size_t len = strlen(g_profile_name), before = g_profile_cursor, after = g_profile_cursor;
-      if (before) { --before; while (before && ((unsigned char)g_profile_name[before] & 0xc0) == 0x80) --before; }
-      if (after < len) { ++after; while (after < len && ((unsigned char)g_profile_name[after] & 0xc0) == 0x80) ++after; }
-      if (key == LUNA_KEY_ENTER) command = "luna-menu-profile-name-save"; /* Enter */
-      else if (key == LUNA_KEY_ESCAPE) command = "luna-menu-profile-name-cancel";
-      else if (shortcut && key == LUNA_KEY_A) g_profile_select_all = true;
-      else if (shortcut && (key == LUNA_KEY_C || key == LUNA_KEY_X) && g_profile_select_all) {
-         arm_exec_clipboard_set(g_profile_name);
-         if (key == LUNA_KEY_X) { g_profile_name[0] = 0; g_profile_cursor = 0; g_profile_select_all = false; }
-      } else if (shortcut && key == LUNA_KEY_V) {
-         char *text = arm_exec_clipboard_get();
-         if (text) { profile_name_insert(text); free(text); }
-      } else if (key == LUNA_KEY_BACKSPACE || key == LUNA_KEY_DELETE) { /* Backspace / Delete */
-         if (g_profile_select_all) { g_profile_name[0] = 0; g_profile_cursor = 0; }
-         else if (key == LUNA_KEY_BACKSPACE) { memmove(g_profile_name+before, g_profile_name+g_profile_cursor, len-g_profile_cursor+1); g_profile_cursor = before; }
-         else memmove(g_profile_name+g_profile_cursor, g_profile_name+after, len-after+1);
-         g_profile_select_all = false;
-      } else if (key == LUNA_KEY_LEFT || key == LUNA_KEY_RIGHT || key == LUNA_KEY_HOME || key == LUNA_KEY_END) {
-         g_profile_cursor = key == LUNA_KEY_HOME ? 0 : key == LUNA_KEY_END ? len : key == LUNA_KEY_LEFT ? before : after;
-         g_profile_select_all = false;
-      }
-      if (!command) menu_publish_locked();
-   }
-   pthread_mutex_unlock(&g_menu_lock);
-   if (command) menu_clicked(command);
-   return active;
+   (void)key; (void)action; (void)mods;
+   return false;
 }

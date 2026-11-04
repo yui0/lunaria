@@ -400,10 +400,12 @@ void dvm_gil_notify_one_for(uintptr_t channel);
 struct dvm *dvm_current(void);
 
 /* Populate PackageInfo.signatures/signingInfo from the certificate carried by
- * the installed APK.  This is shared by the bytecode PackageManager paths in
+ * the installed APK.  `source_dir` is the package's guest APK path (NULL for the
+ * running app, whose APK is ANDROID_APK_FILE); a package whose APK is not a
+ * signed archive carries no signatures, as on a device.  This is shared by the bytecode PackageManager paths in
  * dvm_runtime.c and dvm_jni.c. */
 bool dvm_package_info_add_signatures(struct dvm *vm, dvm_ref package_info,
-                                     uint32_t flags);
+                                     uint32_t flags, const char *source_dir);
 
 /* True on a host thread started for bytecode, false on the one that drives the
  * frame pump and the guest CPU.  A wait on the latter has to stay short. */
@@ -412,6 +414,7 @@ bool dvm_on_bytecode_thread(void);
 /* True in Android's main-thread context. Guest native threads sharing the
  * frame-pump host thread retain their own Android thread identity. */
 bool dvm_on_main_thread(void);
+void dvm_deliver_boot_completed(struct dvm *vm);
 
 struct dvm;
 
@@ -425,6 +428,24 @@ int dvm_service_dispatch(struct dvm *,const void *bytes,size_t size);
 /* The ActivityManager-side transport accepts a serialized start request.
  * Returning 0 means accepted; negative errno means no request was accepted. */
 void dvm_service_set_submit(struct dvm *,int (*submit)(void *,const char *,const void *,size_t),void *user);
+/* Cross-process Binder (dvm_parcel.h).  The transport sends one message to a
+ * peer: the package/process name when the sender is a parent, NULL for a child
+ * talking to its parent.  dvm_binder_receive returns 1 when a message was Binder
+ * traffic; dvm_binder_remote_bind asks `package`'s process to bind a Service. */
+/* Provided by the launcher (apk.c): the ';'-separated content authorities an APK's
+ * manifest declares, malloc'd; 0 on success, -1 when it cannot be read. */
+int luna_apk_content_authorities(const char *apk_path, char **out);
+/* A whole Cursor as bytes and back (dvm_sqlite.c): how a ContentProvider's result
+ * crosses a process boundary.  The snapshot is malloc'd; 0 / NULL on failure. */
+int dvm_sqlite_cursor_snapshot(struct dvm *,uint32_t cursor,void **bytes,size_t *size);
+uint32_t dvm_sqlite_cursor_from_snapshot(struct dvm *,const void *bytes,size_t size);
+void dvm_binder_set_transport(int (*send)(void *,const char *,const void *,size_t),void *user);
+void dvm_binder_set_pump(void (*pump)(void));
+void dvm_binder_set_provider_server(int (*serve)(struct dvm *,uint32_t,uint32_t,const uint8_t *,size_t));
+int dvm_binder_request(struct dvm *,const char *package,const char *magic,const void *body,size_t body_size,
+                       int32_t *status,uint8_t **payload,size_t *payload_size);
+int dvm_binder_receive(struct dvm *,const char *name,const void *bytes,size_t size);
+int dvm_binder_remote_bind(struct dvm *,const char *package,uint32_t intent,uint32_t connection);
 
 /* ---- DEX / APK container readers (dex.c, apk_signers.c) ---- */
 /* Access flags (dex, class/field/method share the space). */
@@ -826,6 +847,8 @@ struct lm_sink;
 jobject dvm_jni_surface_from_sink(JNIEnv *env, struct lm_sink *sink);
 struct lm_sink *dvm_jni_surface_acquire_sink(JNIEnv *env, jobject surface);
 void dvm_jni_main_transaction(JNIEnv *env, bool begin);
+/* Enter the launcher Activity into the activity stack before its onCreate. */
+void dvm_jni_attach_activity(JNIEnv *env, jobject activity);
 void dvm_jni_activity_dispatch(JNIEnv *env, jobject activity, const char *step,
                                int post);
 bool dvm_jni_activity_finishing(JNIEnv *env, jobject activity);

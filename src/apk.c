@@ -7,6 +7,7 @@
 #include "lunaria_file.h"
 #include "dvm/dvm_lib.h"
 #include "luna_boot.h"
+#include "luna_google.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,11 +18,15 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <zlib.h>
-#ifndef _WIN32
-#include <unistd.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #ifdef _WIN32
 #include <process.h>
-#endif
+#else
+#include <unistd.h>
+#include <spawn.h>
+#include <sys/wait.h>
+extern char **environ;
 #endif
 #define APK_PATH 4096
 #define APK_META 65536
@@ -490,14 +495,66 @@ static int zip_extract(struct zip *z, const char *root, bool overwrite)
    extraction_report(&progress, true);
    return 0;
 }
+/* A growable NUL-terminated string.  Manifest metadata has no useful fixed
+ * bound: Google Play services alone declares hundreds of components, and one
+ * service carries dozens of actions.  A string never appended to reads as "". */
+struct text { char *s; size_t n, cap; };
+static const char *text_get(const struct text *t) { return t->s ? t->s : ""; }
+static void text_free(struct text *t) { free(t->s); *t = (struct text){0}; }
+static void text_reset(struct text *t) { t->n = 0; if (t->s) t->s[0] = 0; }
+static int text_append(struct text *t, const char *value, const char *separator)
+{
+   const size_t s = t->n ? strlen(separator) : 0, b = strlen(value);
+   if (t->n + s + b + 1 > t->cap) {
+      size_t cap = t->cap ? t->cap : 256;
+      while (cap < t->n + s + b + 1) cap *= 2;
+      char *grown = realloc(t->s, cap);
+      if (!grown) return apk_error("manifest metadata: out of memory");
+      t->s = grown;
+      t->cap = cap;
+   }
+   if (s) memcpy(t->s + t->n, separator, s);
+   memcpy(t->s + t->n + s, value, b + 1);
+   t->n += s + b;
+   return 0;
+}
+/* Formats one record and appends it, separated from the previous one. */
+static int text_add_row(struct text *t, const char *separator, const char *format, ...)
+{
+   va_list ap, copy;
+   va_start(ap, format);
+   va_copy(copy, ap);
+   const int need = vsnprintf(NULL, 0, format, copy);
+   va_end(copy);
+   char *row = need >= 0 ? malloc((size_t)need + 1) : NULL;
+   if (!row) { va_end(ap); return apk_error("manifest metadata: out of memory"); }
+   vsnprintf(row, (size_t)need + 1, format, ap);
+   va_end(ap);
+   const int result = text_append(t, row, separator);
+   free(row);
+   return result;
+}
+
 struct manifest {
    char package[256], split[256], activity[512], application[512], application_process[512], activity_process[512];
    char orientation[32], theme[32], min_sdk[32], target_sdk[32], config_changes[32];
    char cleartext[8], network_security[32];
-   char receivers[APK_META], services[APK_META], activities[APK_META], activity_filters[APK_META];
-   char providers[APK_META], permissions[APK_META], query_actions[APK_META], query_packages[APK_META];
-   char libraries[APK_META];
+   struct text receivers, services, activities, activity_filters;
+   struct text providers, permissions, query_actions, query_packages;
+   struct text libraries;
 };
+static void manifest_clear(struct manifest *m)
+{
+   text_free(&m->receivers); text_free(&m->services); text_free(&m->activities);
+   text_free(&m->activity_filters); text_free(&m->providers); text_free(&m->permissions);
+   text_free(&m->query_actions); text_free(&m->query_packages); text_free(&m->libraries);
+   memset(m, 0, sizeof *m);
+}
+static void manifest_free(struct manifest *m)
+{
+   if (m) manifest_clear(m);
+   free(m);
+}
 struct axml {
    char **strings;
    size_t count;
@@ -589,16 +646,6 @@ static int axml_pool(struct axml *x, const unsigned char *p, size_t n)
    }
    return 0;
 }
-static int append(char *out, size_t capacity, const char *value, const char *separator)
-{
-   size_t a = strlen(out), b = strlen(value), s = a ? strlen(separator) : 0;
-   if (a + s + b >= capacity)
-      return apk_error("manifest metadata too large");
-   if (s)
-      memcpy(out + a, separator, s);
-   memcpy(out + a + s, value, b + 1);
-   return 0;
-}
 static int copy_text(char *out, size_t cap, const char *value)
 {
    if (strlen(value) >= cap)
@@ -662,16 +709,16 @@ static int attr_boolean(const struct attr *v)
 }
 static int parse_manifest_events(const unsigned char *data, size_t size, struct manifest *m, struct axml x)
 {
-   memset(m, 0, sizeof *m);
+   manifest_clear(m);
    int result = -1, depth = 0, activity_depth = -1, provider_depth = -1, queries_depth = -1, intent_depth = -1;
-   char activity[512] = "", target[512] = "", orient[32] = "", theme[32] = "", app_theme[32] = "", provider[APK_META] = "", changes[32] = "";
+   struct text provider = {0}, filter_actions = {0}, filter_categories = {0}, filter_specs = {0}, service_actions = {0}, receiver_actions = {0};
+   char activity[512] = "", target[512] = "", orient[32] = "", theme[32] = "", app_theme[32] = "", changes[32] = "";
    bool main = false, launcher = false, activity_launch = false;
    int activity_enabled = 1, filter_data = 0, filter_priority = 0;
-   char filter_actions[2048] = "", filter_categories[2048] = "";
    int receiver_depth = -1, enabled = 1, app_enabled = 1, exported = -1, boot = 0, app_boot = 0;
    bool receiver_filter = false;
    int service_depth = -1, service_enabled = 1, service_exported = -1, application_depth=-1;
-   char service[512] = "", service_actions[2048] = "", service_process[512] = "";
+   char service[512] = "", service_process[512] = "";
    char receiver[512] = "", permission[512] = "", process[512] = "";
    char app_permission[512] = "", app_process[512] = "";
    char provider_process[512] = "", activity_process[512] = "";
@@ -759,6 +806,7 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
             } else if (copy_text(process, sizeof process, proc)) goto done;
             receiver_depth = depth;
             receiver_filter = false;
+            text_reset(&receiver_actions);
          } else if (!strcmp(tag, "service")) {
             if (class_name(service, sizeof service, m->package, attr_text(a, count, "name"))) goto done;
             const struct attr *v = attribute(a, count, "enabled");
@@ -772,7 +820,7 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
                int n = snprintf(service_process, sizeof service_process, "%s%s", m->package, proc);
                if (n < 0 || (size_t)n >= sizeof service_process) goto done;
             } else if (copy_text(service_process, sizeof service_process, proc)) goto done;
-            service_actions[0] = 0;
+            text_reset(&service_actions);
             service_depth = depth;
          } else if (!strcmp(tag, "intent-filter") && receiver_depth >= 0) {
             receiver_filter = true;
@@ -796,28 +844,53 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
             const struct attr *priority = attribute(a, count, "priority");
             filter_priority = priority ? (int)strtol(priority->text, NULL, 0) : 0;
             filter_data = 0;
-            filter_actions[0] = filter_categories[0] = 0;
+            text_reset(&filter_actions); text_reset(&filter_categories); text_reset(&filter_specs);
          } else if (!strcmp(tag, "action")) {
             const char *v = attr_text(a, count, "name");
-            if (queries_depth >= 0 && append(m->query_actions, sizeof m->query_actions, v, ","))
+            if (queries_depth >= 0 && text_append(&m->query_actions, v, ","))
                goto done;
-            if (service_depth >= 0 && append(service_actions, sizeof service_actions, v, ","))
+            if (service_depth >= 0 && text_append(&service_actions, v, ","))
                goto done;
-            if (intent_depth >= 0 && append(filter_actions, sizeof filter_actions, v, ",")) goto done;
+            if (receiver_depth >= 0 && text_append(&receiver_actions, v, ","))
+               goto done;
+            if (intent_depth >= 0 && text_append(&filter_actions, v, ",")) goto done;
             if (intent_depth >= 0 && !strcmp(v, "android.intent.action.MAIN"))
                main = true;
          } else if (!strcmp(tag, "category") && intent_depth >= 0) {
             const char *v = attr_text(a, count, "name");
-            if (append(filter_categories, sizeof filter_categories, v, ",")) goto done;
+            if (text_append(&filter_categories, v, ",")) goto done;
             if (!strcmp(v, "android.intent.category.LAUNCHER")) launcher = true;
          } else if (!strcmp(tag, "data") && intent_depth >= 0) {
             filter_data = 1;
+            /* One <data> element: its attributes as "key=value,..." with the
+             * separators percent-escaped; elements are joined by ';'. */
+            static const char *const keys[] = { "scheme", "host", "port", "path", "pathPrefix", "pathSuffix",
+                                                "pathPattern", "pathAdvancedPattern", "mimeType" };
+            struct text spec = {0};
+            for (size_t k = 0; k < sizeof keys / sizeof keys[0]; k++) {
+               const struct attr *v = attribute(a, count, keys[k]);
+               if (!v || !*v->text) continue;
+               char item[1024], *w = item;
+               w += snprintf(w, sizeof item, "%s=", keys[k]);
+               for (const char *c = v->text; *c && (size_t)(w - item) + 4 < sizeof item; c++) {
+                  if (*c == '%' || *c == ',' || *c == ';' || *c == '|' || *c == '\n' || *c == '=')
+                     w += snprintf(w, 4, "%%%02X", (unsigned char)*c);
+                  else
+                     *w++ = *c;
+               }
+               *w = 0;
+               if (text_append(&spec, item, ",")) { text_free(&spec); goto done; }
+            }
+            if (*text_get(&spec) && text_append(&filter_specs, text_get(&spec), ";")) { text_free(&spec); goto done; }
+            text_free(&spec);
          } else if (!strcmp(tag, "queries"))
             queries_depth = depth;
          else if (!strcmp(tag, "package") && queries_depth >= 0) {
-            if (append(m->query_packages, sizeof m->query_packages, attr_text(a, count, "name"), ","))
+            if (text_append(&m->query_packages, attr_text(a, count, "name"), ","))
                goto done;
-         } else if (!strcmp(tag, "provider")) {
+         } else if (!strcmp(tag, "provider") && queries_depth < 0) {
+            /* A <provider> inside <queries> only declares visibility of another
+             * app's provider (by authority); it is not a component of this one. */
             const struct attr *pv=attribute(a,count,"process");
             const char *proc=pv ? pv->text : m->application_process;
             if(*proc==':'){
@@ -832,8 +905,8 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
             char qualified[512];
             if (class_name(qualified, sizeof qualified, m->package, attr_text(a, count, "name")))
                goto done;
-            int n = snprintf(provider, sizeof provider, "%s|%s|", qualified, attr_text(a, count, "authorities"));
-            if (n < 0 || (size_t)n >= sizeof provider)
+            text_reset(&provider);
+            if (text_add_row(&provider, "", "%s|%s|", qualified, attr_text(a, count, "authorities")))
                goto done;
             provider_depth = depth;
          } else if (!strcmp(tag, "meta-data") && provider_depth >= 0) {
@@ -841,22 +914,18 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
             if (!v)
                v = attribute(a, count, "value");
             if (v) {
-               char pair[APK_META];
-               int n = snprintf(pair, sizeof pair, "%s~%s", attr_text(a, count, "name"), v->text);
-               if (n < 0 || (size_t)n >= sizeof pair)
+               const size_t l = provider.n;
+               if (l && provider.s[l - 1] != '|' && text_append(&provider, ",", ""))
                   goto done;
-               size_t l = strlen(provider);
-               if (l && provider[l - 1] != '|' && append(provider, sizeof provider, ",", ""))
-                  goto done;
-               if (append(provider, sizeof provider, pair, ""))
+               if (text_add_row(&provider, "", "%s~%s", attr_text(a, count, "name"), v->text))
                   goto done;
             }
          } else if (!strcmp(tag, "uses-permission")) {
-            if (append(m->permissions, sizeof m->permissions, attr_text(a, count, "name"), ","))
+            if (text_append(&m->permissions, attr_text(a, count, "name"), ","))
                goto done;
          } else if (!strcmp(tag,"uses-library") && application_depth>=0 && depth==application_depth+1) {
             const char *name=attr_text(a,count,"name");
-            if(!*name || strchr(name,'\n') || strchr(name,'\r') || append(m->libraries,sizeof m->libraries,name,"\n"))goto done;
+            if(!*name || strchr(name,'\n') || strchr(name,'\r') || text_append(&m->libraries,name,"\n"))goto done;
          } else if (!strcmp(tag, "uses-sdk")) {
             if (attr_number(m->min_sdk, sizeof m->min_sdk, a, count, "minSdkVersion") || attr_number(m->target_sdk, sizeof m->target_sdk, a, count, "targetSdkVersion"))
                goto done;
@@ -866,22 +935,21 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
          if (len < 24 || depth <= 0)
             goto done;
          if (depth == intent_depth) {
-            char component[512], row[APK_META];
+            char component[512];
             if (class_name(component, sizeof component, m->package, activity)) goto done;
-            int n = snprintf(row, sizeof row, "%s|%s|%s|%d|%d", component,
-                             filter_actions, filter_categories, filter_data, filter_priority);
-            if (n < 0 || (size_t)n >= sizeof row ||
-                append(m->activity_filters, sizeof m->activity_filters, row, "\n")) goto done;
+            if (text_add_row(&m->activity_filters, "\n", "%s|%s|%s|%d|%d|%s", component,
+                             text_get(&filter_actions), text_get(&filter_categories), filter_data, filter_priority,
+                             text_get(&filter_specs)))
+               goto done;
             activity_launch |= main && launcher && !filter_data;
             intent_depth = -1;
          }
          if (depth == activity_depth) {
-            char component[512], target_class[512] = "", row[APK_META];
+            char component[512], target_class[512] = "";
             if (class_name(component, sizeof component, m->package, activity) ||
                 (*target && class_name(target_class, sizeof target_class, m->package, target))) goto done;
-            int n = snprintf(row, sizeof row, "%s|%s|%d", component, target_class, activity_enabled);
-            if (n < 0 || (size_t)n >= sizeof row ||
-                append(m->activities, sizeof m->activities, row, "\n")) goto done;
+            if (text_add_row(&m->activities, "\n", "%s|%s|%d", component, target_class, activity_enabled))
+               goto done;
             if (activity_launch && activity_enabled && !*m->activity) {
                if (copy_text(m->config_changes, sizeof m->config_changes, changes) ||
                    copy_text(m->activity_process,sizeof m->activity_process,activity_process)) goto done;
@@ -891,28 +959,24 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
             activity_depth = -1;
          }
          if (depth == receiver_depth) {
-            char row[APK_META];
-            int n = snprintf(row, sizeof row, "%s|%d|%d|%d|%d|%s|%s", receiver,
+            if (text_add_row(&m->receivers, ";", "%s|%d|%d|%d|%d|%s|%s|%s", receiver,
                              enabled, app_enabled, exported < 0 ? receiver_filter : exported,
-                             boot, permission, process);
-            if (n < 0 || (size_t)n >= sizeof row || append(m->receivers, sizeof m->receivers, row, ";")) goto done;
+                             boot, permission, process, text_get(&receiver_actions)))
+               goto done;
             receiver_depth = -1;
          }
          if (depth == service_depth) {
-            char row[APK_META];
-            int n = snprintf(row, sizeof row, "%s|%d|%d|%s|%s", service, service_enabled && app_enabled,
-                             service_exported, service_actions, service_process);
-            if (n < 0 || (size_t)n >= sizeof row || append(m->services, sizeof m->services, row, ";")) goto done;
+            if (text_add_row(&m->services, ";", "%s|%d|%d|%s|%s", service, service_enabled && app_enabled,
+                             service_exported, text_get(&service_actions), service_process))
+               goto done;
             service_depth = -1;
          }
          if (depth == provider_depth) {
-            char suffix[640];
-            int n=snprintf(suffix,sizeof suffix,"|%s|%d|%d|%d|%d",provider_process,
-                           provider_enabled,provider_order,provider_grant,provider_multi);
-            if(n<0 || (size_t)n>=sizeof suffix || append(provider,sizeof provider,suffix,""))goto done;
-            if(!*m->providers && copy_text(m->providers,sizeof m->providers,"!2\n"))goto done;
-            if (append(m->providers, sizeof m->providers, provider,
-                       !strcmp(m->providers,"!2\n") ? "" : "\n"))goto done;
+            if(text_add_row(&provider,"","|%s|%d|%d|%d|%d",provider_process,
+                            provider_enabled,provider_order,provider_grant,provider_multi))goto done;
+            if(!m->providers.n && text_append(&m->providers,"!2\n",""))goto done;
+            if (text_append(&m->providers, text_get(&provider),
+                            !strcmp(text_get(&m->providers),"!2\n") ? "" : "\n"))goto done;
             provider_depth = -1;
          }
          if (depth == queries_depth)
@@ -924,6 +988,7 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
    if (!depth && package_valid(m->package))
       result = 0;
 done:
+   text_free(&provider); text_free(&filter_actions); text_free(&filter_categories); text_free(&filter_specs); text_free(&service_actions); text_free(&receiver_actions);
    axml_free(&x);
    return result ? apk_error("invalid Android manifest") : 0;
 }
@@ -1256,7 +1321,7 @@ static int launcher_display_metadata(const char *path, bool container,
             candidate.size = e->size;
             if (zip_index(&candidate, e->name)) goto done;
          }
-         memset(m, 0, sizeof *m);
+         manifest_clear(m);
          int parsed = manifest_zip(&candidate, m);
          zip_close(&candidate);
          if (parsed) goto done;
@@ -1270,7 +1335,7 @@ static int launcher_display_metadata(const char *path, bool container,
 done:
    zip_close(&candidate);
    zip_close(&outer);
-   free(m);
+   manifest_free(m);
    return result;
 }
 
@@ -1329,6 +1394,144 @@ static int materialize(const char *source, const char *target)
       return 0;
    return copy_file(source, target);
 }
+/* The optional Google system packages use Android's ordinary source paths.
+ * Keep the original archive too: a component host needs all of its splits. */
+static const struct { const char *package, *path; } google_packages[] = {
+   {"com.google.android.gms", "system/product/priv-app/PrebuiltGmsCore/PrebuiltGmsCore.apk"},
+   {"com.android.vending", "system/product/priv-app/Phonesky/Phonesky.apk"},
+   {"com.google.android.gsf", "system/product/priv-app/GoogleServicesFramework/GoogleServicesFramework.apk"},
+};
+static const char *google_package_path(const char *package)
+{
+   for (size_t i = 0; i < sizeof google_packages / sizeof google_packages[0]; ++i)
+      if (!strcmp(package, google_packages[i].package)) return google_packages[i].path;
+   return NULL;
+}
+static int system_archive_path(const char *root, const char *package, char *out, size_t cap)
+{
+   char rel[512];
+   if (!root || !*root || !package || !package_valid(package)) return -1;
+   if (snprintf(rel, sizeof rel, "system/packages/%s.apk", package) >= (int)sizeof rel) return -1;
+   return path_join(out, cap, root, rel);
+}
+int luna_apk_system_archive(const char *package, char *out, size_t cap)
+{
+   const char *root = getenv("LUNARIA_DATA_ROOT");
+   if (!system_archive_path(root, package, out, cap) && exists(out)) return 0;
+   const char *rel = package ? google_package_path(package) : NULL;
+   return rel && root && !path_join(out, cap, root, rel) && exists(out) ? 0 : -1;
+}
+static int system_publish_file(const char *source, const char *target, bool link)
+{
+   char dir[APK_PATH], temp[APK_PATH], actual[APK_PATH];
+   if (luna_file_realpath(target, actual, sizeof actual) && !strcmp(source, actual)) return 0;
+   if (copy_text(dir, sizeof dir, target)) return -1;
+   char *slash = strrchr(dir, '/');
+   if (!slash) return -1;
+   *slash = 0;
+   if (mkdirs(dir) || snprintf(temp, sizeof temp, "%s/.install-XXXXXX", dir) >= (int)sizeof temp) return -1;
+   int fd = luna_file_mkstemp(temp);
+   if (fd < 0) return -1;
+   luna_fd_close(fd);
+   int result;
+   if (link && !luna_file_unlink(temp) && !luna_file_link(source, temp)) result = 0;
+   else result = copy_file(source, temp);
+   if (!result) result = luna_file_rename(temp, target);
+   if (result) luna_file_unlink(temp);
+   return result;
+}
+static int google_package_install(const char *root, const char *package,
+                                   const char *archive, const char *base, bool container)
+{
+   const char *rel = google_package_path(package);
+   char original[APK_PATH], installed[APK_PATH];
+   if (!rel) return apk_error("select a Google Play services, Play Store, or Google Services Framework APK/XAPK");
+   if (system_archive_path(root, package, original, sizeof original) ||
+       path_join(installed, sizeof installed, root, rel) ||
+       system_publish_file(archive, original, false) ||
+       system_publish_file(container ? base : original, installed, !container))
+      return apk_error("cannot install system package %s: %s", package, strerror(errno));
+   fprintf(stderr, "[apk] system package installed: %s in %s\n", package, root);
+   printf("system_package=%s\nsystem_archive=%s\n", package, original);
+   return 0;
+}
+
+int luna_apk_google_profile_list(char (*names)[65], int max)
+{
+   if (max < 1) return 0;
+   snprintf(names[0], 65, "default");
+   int n = 1;
+   const char *root = getenv("LUNARIA_DATA_ROOT");
+   char dir[APK_PATH], path[APK_PATH];
+   if (!root || path_join(dir, sizeof dir, root, "system/gms")) return n;
+   luna_directory *d = luna_directory_open(dir);
+   if (!d) return n;
+   luna_directory_entry *entry;
+   while (n < max && (entry = luna_directory_read(d))) {
+      if (!luna_google_profile_valid(entry->d_name) || !strcmp(entry->d_name, "default")) continue;
+      if (!path_join(path, sizeof path, dir, entry->d_name) && directory(path))
+         copy_text(names[n++], 65, entry->d_name);
+   }
+   luna_directory_close(d);
+   return n;
+}
+int luna_apk_google_profile_accounts(const char *profile)
+{
+   char dir[APK_PATH], path[APK_PATH], line[8192];
+   if (luna_google_accounts_directory(getenv("LUNARIA_DATA_ROOT"), profile, dir, sizeof dir) ||
+       path_join(path, sizeof path, dir, "accounts.tsv")) return 0;
+   FILE *f = fopen(path, "rb");
+   if (!f) return 0;
+   int n = 0;
+   while (fgets(line, sizeof line, f)) {
+      if (strncmp(line, "A\t", 2)) continue;
+      const char *type = strchr(line + 2, '\t');
+      if (type && !strncmp(type + 1, "com.google\t", 11)) ++n;
+   }
+   fclose(f);
+   return n;
+}
+int luna_apk_google_profile_create(char *out, size_t cap)
+{
+   const char *root = getenv("LUNARIA_DATA_ROOT");
+   char parent[APK_PATH], dir[APK_PATH], id[65];
+   if (!root || cap < 6 || path_join(parent, sizeof parent, root, "system/gms") || mkdirs(parent)) return -1;
+   for (int k = 2; k < 10000; ++k) {
+      snprintf(id, sizeof id, "gms-%d", k);
+      if (strlen(id) >= cap) return -1;
+      bool occupied = false;
+      for (size_t i = 0; i < sizeof google_packages / sizeof google_packages[0]; ++i) {
+         char rel[512];
+         snprintf(rel, sizeof rel, "profiles/%s/%s", google_packages[i].package, id);
+         if (path_join(dir, sizeof dir, root, rel)) return -1;
+         if (exists(dir)) occupied = true;
+      }
+      if (occupied) continue;
+      if (path_join(dir, sizeof dir, parent, id)) return -1;
+      if (!luna_file_mkdir(dir, 0700)) return copy_text(out, cap, id);
+      if (errno != EEXIST) return -1;
+   }
+   return -1;
+}
+/* Separate processes must not open the same environment's sign-in flow twice.
+ * Component hosts keep running normally: only the explicit account UI locks. */
+static int google_sign_in_lock = -1;
+static int google_sign_in_enter(const char *root, const char *profile)
+{
+   char dir[APK_PATH], path[APK_PATH];
+   if (google_sign_in_lock >= 0) return 0;
+   if (luna_google_accounts_directory(root, profile, dir, sizeof dir) || mkdirs(dir) ||
+       path_join(path, sizeof path, dir, "signin.lock")) return -1;
+   int fd = luna_file_open(path, O_RDWR | O_CREAT | LUNA_FILE_CLOEXEC, 0600);
+   if (fd < 0) return -1;
+   if (luna_file_lock(fd, 0, 1, 0, 1, 0)) {
+      luna_fd_close(fd);
+      return apk_error("Google sign-in is already open for environment %s", profile);
+   }
+   google_sign_in_lock = fd;
+   return 0;
+}
+
 static int link_asset(const char *source, const char *target)
 {
    if (exists(target)) {
@@ -1349,88 +1552,9 @@ static bool profile_valid(const char *s)
          return false;
    return true;
 }
-/* Labels live outside guest data; immutable IDs continue to select accounts. */
-static int profile_label_path(const char *root, const char *package, const char *id,
-                              char *out, size_t cap)
-{
-   char rel[768];
-   if (!root || !package || !profile_valid(id) || !package_valid(package)) return -1;
-   snprintf(rel, sizeof rel, "profiles/%s/.labels/%s", package, id);
-   return path_join(out, cap, root, rel);
-}
-static bool profile_label_valid(const char *text)
-{
-   size_t n = strlen(text);
-   if (!n || n > 255) return false;
-   bool visible = false;
-   for (size_t i = 0; i < n;) {
-      unsigned c = (unsigned char)text[i++], cp = c, more = 0, min = 0;
-      if (c >= 0xc2 && c <= 0xdf) { cp = c & 31; more = 1; min = 0x80; }
-      else if (c >= 0xe0 && c <= 0xef) { cp = c & 15; more = 2; min = 0x800; }
-      else if (c >= 0xf0 && c <= 0xf4) { cp = c & 7; more = 3; min = 0x10000; }
-      else if (c >= 0x80) return false;
-      if (i + more > n) return false;
-      for (unsigned k = 0; k < more; ++k) {
-         unsigned b = (unsigned char)text[i++];
-         if ((b & 0xc0) != 0x80) return false;
-         cp = (cp << 6) | (b & 63);
-      }
-      if (cp < min || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff) ||
-          cp < 32 || (cp >= 127 && cp <= 159)) return false;
-      if (cp != ' ' && cp != 0x3000) visible = true;
-   }
-   return visible;
-}
-static int profile_label_read(const char *root, const char *package, const char *id,
-                              char *out, size_t cap)
-{
-   char path[APK_PATH], text[257];
-   if (!profile_label_path(root, package, id, path, sizeof path)) {
-      FILE *f = fopen(path, "rb");
-      if (f) {
-         size_t n = fread(text, 1, sizeof text - 1, f);
-         bool ok = !ferror(f); fclose(f); text[n] = 0;
-         if (ok && n == strlen(text) && profile_label_valid(text)) return copy_text(out, cap, text);
-      }
-   }
-   return copy_text(out, cap, id);
-}
-static int profile_label_write(const char *root, const char *package, const char *id,
-                               const char *label)
-{
-   char path[APK_PATH], temp[APK_PATH], dir[APK_PATH], rel[768];
-   if (!profile_label_valid(label) || profile_label_path(root, package, id, path, sizeof path))
-      return apk_error("profile name must contain 1–255 bytes of UTF-8 text without control characters");
-   if (strcmp(id, "default")) {
-      snprintf(rel, sizeof rel, "profiles/%s/%s", package, id);
-      if (path_join(dir, sizeof dir, root, rel) || !directory(dir))
-         return apk_error("profile does not exist: %s", id);
-   }
-   copy_text(dir, sizeof dir, path); *strrchr(dir, '/') = 0;
-   if (mkdirs(dir) || snprintf(temp, sizeof temp, "%s/.rename-XXXXXX", dir) >= (int)sizeof temp) return -1;
-   int fd = luna_file_mkstemp(temp);
-   if (fd < 0) return -1;
-   size_t n = strlen(label), off = 0;
-   while (off < n) {
-      ptrdiff_t written = luna_fd_write(fd, label + off, n - off);
-      if (written < 0 && errno == EINTR) continue;
-      if (written <= 0) break;
-      off += (size_t)written;
-   }
-   int closed = luna_fd_close(fd);
-   if (off == n && !closed && !luna_file_rename(temp, path)) return 0;
-   luna_file_unlink(temp);
-   return apk_error("cannot save profile name");
-}
-static void profile_label_print(const char *root, const char *package, const char *id)
-{
-   char label[256]; profile_label_read(root, package, id, label, sizeof label);
-   if (strcmp(id, label)) printf("%s\t%s\n", id, label);
-   else puts(id);
-}
 static int profiles_list(const char *root, const char *package)
 {
-   profile_label_print(root, package, "default");
+   puts("default");
    char dir[APK_PATH], relative[512];
    snprintf(relative, sizeof relative, "profiles/%s", package);
    if (path_join(dir, sizeof dir, root, relative))
@@ -1442,7 +1566,7 @@ static int profiles_list(const char *root, const char *package)
    while ((e = luna_directory_read(d))) {
       char path[APK_PATH];
       if (profile_valid(e->d_name) && !path_join(path, sizeof path, dir, e->d_name) && directory(path))
-         profile_label_print(root, package, e->d_name);
+         puts(e->d_name);
    }
    return luna_directory_close(d);
 }
@@ -1479,15 +1603,8 @@ static int profiles_choose(const char *root, const char *package, char *choice, 
       result = copy_text(choice, capacity, names[0]);
       goto done;
    }
-   char (*labels)[256] = calloc(count, sizeof *labels);
-   const char **display = calloc(count, sizeof *display);
-   if (!labels || !display) { free(labels); free(display); goto done; }
-   for (size_t i = 0; i < count; ++i) {
-      profile_label_read(root, package, names[i], labels[i], sizeof labels[i]);
-      display[i] = labels[i];
-   }
-   result = luna_launcher_choose(package, (const char *const *)names, display, count, choice, capacity);
-   free(display); free(labels);
+   result = luna_launcher_choose(package, (const char *const *)names,
+                                 (const char *const *)names, count, choice, capacity);
    if (result) apk_error("profile selection requires the launch window; use --profile NAME for a headless run");
 done:
    for (size_t i=0; i<count; ++i) free(names[i]);
@@ -1499,10 +1616,17 @@ static int profile_storage(const char *root, const char *package, const char *pr
    if (!profile_valid(profile) || !package_valid(package))
       return apk_error("invalid profile or package name");
    char relative[512], common[APK_PATH], private_dir[APK_PATH], path[APK_PATH];
+   char google_root[APK_PATH];
+   const char *storage_root = root, *storage_profile = profile;
+   if (google_package_path(package) && strcmp(profile, "default")) {
+      if (luna_google_environment_root(root, profile, google_root, sizeof google_root)) return -1;
+      storage_root = google_root;
+      storage_profile = "default";
+   }
    snprintf(relative, sizeof relative, "data/%s", package);
-   if (path_join(common, sizeof common, root, relative))
+   if (path_join(common, sizeof common, storage_root, relative))
       return -1;
-   if (!strcmp(profile, "default")) {
+   if (!strcmp(storage_profile, "default")) {
       if (copy_text(private_dir, sizeof private_dir, common))
          return -1;
    } else {
@@ -1524,9 +1648,11 @@ static int profile_storage(const char *root, const char *package, const char *pr
          return -1;
    if (path_join(path, sizeof path, common, "obb") || mkdirs(path) || env_set("ANDROID_EXTERNAL_OBB_DIR", path, true))
       return -1;
-   if (path_join(path, sizeof path, private_dir, "device-root") || env_default("LUNARIA_GUEST_ROOT", path) || mkdirs(getenv("LUNARIA_GUEST_ROOT")) || luna_android_fs_prepare(getenv("LUNARIA_GUEST_ROOT")))
+   /* Like the app directories above, the device filesystem belongs to the
+    * selected profile. exec retains the previous launch's environment. */
+   if (path_join(path, sizeof path, private_dir, "device-root") || env_set("LUNARIA_GUEST_ROOT", path, true) || mkdirs(path) || luna_android_fs_prepare(path))
       return -1;
-   if (strcmp(profile, "default")) {
+   if (strcmp(storage_profile, "default")) {
       const char *keys[] = {"LUNARIA_SHARED_ASSETS", "LUNARIA_PROFILE_SEED_FILES"};
       for (unsigned kind = 0; kind < 2; kind++) {
          char *list = strdup(env_value(keys[kind], ""));
@@ -1793,7 +1919,8 @@ static void apk_help(void)
 {
    puts("Usage: lunaria [--config FILE] [--data-root DIR] [--profile NAME] APP.apk|APP.aab|APP.xapk|APP.apks\n"
         "       lunaria [--list-profiles | --choose-profile | --prepare-profile | --install-only] APP.apk\n"
-        "       lunaria --profile ID --rename-profile NAME APP.apk\n"
+        "       lunaria --install-system APP.apk\n"
+        "       lunaria --google-services [--data-root DIR]\n"
         "       lunaria MODULE.so\n\n"
         "APK archives are installed once in cache/packages; application data persists in data/.\n"
         "Environment settings override lunaria.conf; command-line options override both.");
@@ -2016,11 +2143,14 @@ static int launcher_ask(int *argc, const char ***argv)
 
 /* 0: enter the loader, 1: command completed, -1: failure. */
 static void restart_remember(int argc, const char **argv);
+static int restart_environment_remember(void);
+static int restart_environment_option(const char *key, const char *value);
 static int apk_prepare_inner(int *argc, const char ***argv)
 {
    if (*argc >= 2 && (!strcmp((*argv)[1], "--apk-process-arm64") || !strcmp((*argv)[1], "--apk-process-arm32") ||
                       !strcmp((*argv)[1], "--service-process-arm64") || !strcmp((*argv)[1], "--service-process-arm32")))
       return 0;
+   if (restart_environment_remember()) return apk_error("cannot retain the launch environment");
    if (*argc < 2) {
       /* Started with nothing to run (a double-clicked app, a launcher icon).
        * Without a display there is nobody to ask. */
@@ -2034,7 +2164,10 @@ static int apk_prepare_inner(int *argc, const char ***argv)
    }
    restart_remember(*argc, *argv);
    bool list = false, prepare = false, install = false, choose = false, profile_requested = false;
-   const char *rename_label = NULL;
+   bool system_install = false, google_setup = false;
+   /* --service-host: prepare this package exactly as for a launch, then run it as a
+    * headless component host (control socket on fd 3) instead of its launcher. */
+   bool service_host = false;
    bool launch_ui_ready = false;
    int at = 1;
    for (; at < *argc; at++) {
@@ -2057,21 +2190,22 @@ static int apk_prepare_inner(int *argc, const char ***argv)
          prepare = true;
          continue;
       }
+      if (!strcmp(arg, "--service-host")) {
+         service_host = true;
+         continue;
+      }
       if (!strcmp(arg, "--install-only")) {
          install = true;
+         continue;
+      }
+      if (!strcmp(arg, "--install-system") || !strcmp(arg, "--google-services")) {
+         install = system_install = true;
+         google_setup = !strcmp(arg, "--google-services");
          continue;
       }
       if (!strcmp(arg, "--choose-profile")) {
          choose = true;
          profile_requested = false;
-         continue;
-      }
-      if (!strcmp(arg, "--rename-profile") || !strncmp(arg, "--rename-profile=", 17)) {
-         if (arg[16] == '=') rename_label = arg + 17;
-         else {
-            if (++at >= *argc) return apk_error("--rename-profile requires a name");
-            rename_label = (*argv)[at];
-         }
          continue;
       }
       const char *key = NULL, *value = NULL;
@@ -2099,14 +2233,25 @@ static int apk_prepare_inner(int *argc, const char ***argv)
          return apk_error("unknown or incomplete option: %s", arg);
       if (env_set(key, value, true))
          return -1;
+      if ((!strcmp(key, "LUNARIA_CONF") || !strcmp(key, "LUNARIA_DATA_ROOT")) &&
+          restart_environment_option(key, value)) return -1;
       if (!strcmp(key, "LUNARIA_PROFILE")) {
          choose = false;
          profile_requested = true;
       }
    }
-   if (at >= *argc || *argc - at != 1)
-      return apk_error("specify one APK or module");
-   const char *argument = (*argv)[at];
+   char selected[APK_PATH];
+   const char *argument;
+   if (at == *argc && google_setup) {
+      char note[APK_PATH + 128];
+      snprintf(note, sizeof note, "Shared data folder: %s",
+               env_value("LUNARIA_DATA_ROOT", "."));
+      if (luna_launcher_pick_named(selected, sizeof selected, "Install Google services", note)) return 1;
+      argument = selected;
+   } else {
+      if (at >= *argc || *argc - at != 1) return apk_error("specify one APK or module");
+      argument = (*argv)[at];
+   }
    bool container = suffix(argument, ".xapk") || suffix(argument, ".apks");
    if (!container && !suffix(argument, ".apk") && !suffix(argument, ".aab")) {
       if (at != 1)
@@ -2135,7 +2280,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
 #endif
    if (conf_default_path(conf, sizeof conf) || env_set("LUNARIA_CONF", conf, true) || config_load(conf, NULL))
       return -1;
-   if ((!list && !prepare && !install && !rename_label) || choose) {
+   if (((!list && !prepare && !install) || choose || google_setup) && !service_host) {
       if (launcher_display_metadata(input, container, conf) || font_defaults(exedir)) return -1;
       launch_ui_ready = luna_launcher_begin(input) != 0;
    }
@@ -2162,6 +2307,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
    fflush(stderr);
    struct zip outer = {0}, apk = {0};
    struct manifest *m = calloc(1, sizeof *m), *split = calloc(1, sizeof *split);
+   struct text split_list = {0};
    char **apks = NULL;
    size_t apk_count = 0;
    int result = -1;
@@ -2236,6 +2382,10 @@ static int apk_prepare_inner(int *argc, const char ***argv)
    }
    if (config_load(conf, m->package) || keymap_resolve(exedir))
       goto done;
+   if (!luna_google_profile_valid(luna_google_profile_current())) {
+      apk_error("invalid Google services environment name");
+      goto done;
+   }
    /* Package configuration can relocate data independently of the APK cache. */
    if (absolute_path(env_value("LUNARIA_DATA_ROOT", cwd), root, sizeof root) || mkdirs(root) || env_set("LUNARIA_DATA_ROOT", root, true))
       goto done;
@@ -2244,12 +2394,12 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       goto done;
    if (directory(olddata) && !exists(newdata) && luna_file_rename(olddata, newdata))
       goto done;
-   if (rename_label) {
-      result = profile_label_write(root, m->package, env_value("LUNARIA_PROFILE", "default"), rename_label) ? -1 : 1;
-      goto done;
-   }
    if (list) {
       result = profiles_list(root, m->package) ? -1 : 1;
+      goto done;
+   }
+   if (system_install && !google_package_path(m->package)) {
+      apk_error("select a Google Play services, Play Store, or Google Services Framework APK/XAPK");
       goto done;
    }
    char chosen[65];
@@ -2259,7 +2409,17 @@ static int apk_prepare_inner(int *argc, const char ***argv)
           env_set("LUNARIA_PROFILE", chosen, true)) goto done;
    }
    char profile[65];
-   if (copy_text(profile, sizeof profile, env_value("LUNARIA_PROFILE", "default")) || profile_storage(root, m->package, profile))
+   if (copy_text(profile, sizeof profile, env_value("LUNARIA_PROFILE", "default"))) goto done;
+   if (google_package_path(m->package)) {
+      const char *selected = getenv("LUNARIA_GMS_PROFILE");
+      if (selected && *selected) {
+         if (profile_requested && strcmp(profile, selected)) {
+            apk_error("Google services environment and app profile must match"); goto done;
+         }
+         if (copy_text(profile, sizeof profile, selected)) goto done;
+      } else if (env_set("LUNARIA_GMS_PROFILE", profile, true)) goto done;
+   }
+   if (profile_storage(root, m->package, profile))
       goto done;
    if (prepare) {
       char private_dir[APK_PATH];
@@ -2268,7 +2428,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       char *last = strrchr(private_dir, '/');
       if (last)
          * last = 0;
-      printf("profile=%s\nprivate=%s\nexternal=%s\nobb=%s\n", profile, private_dir, getenv("ANDROID_EXTERNAL_FILES_DIR"), getenv("ANDROID_EXTERNAL_OBB_DIR"));
+      printf("profile=%s\nprivate=%s\nexternal=%s\nobb=%s\nguest_root=%s\n", profile, private_dir, getenv("ANDROID_EXTERNAL_FILES_DIR"), getenv("ANDROID_EXTERNAL_OBB_DIR"), getenv("LUNARIA_GUEST_ROOT"));
       result = 1;
       goto done;
    }
@@ -2283,7 +2443,6 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       arm32 |= !strncmp(n, "lib/armeabi-v7a/", 16);
       armeabi |= !strncmp(n, "lib/armeabi/", 12);
    }
-   char split_list[APK_META] = "";
    for (size_t i = 0; i < apk_count; i++)
       if (strcmp(apks[i], base)) {
          struct zip z = {0};
@@ -2303,9 +2462,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
          zip_close(&z);
          if (r)
             goto done;
-         char record[APK_PATH + 512];
-         int n = snprintf(record, sizeof record, "%s|%s", split->split, apks[i]);
-         if (n < 0 || (size_t)n >= sizeof record || append(split_list, sizeof split_list, record, ";"))
+         if (text_add_row(&split_list, ";", "%s|%s", split->split, apks[i]))
             goto done;
       }
    const char *arch = env_value("LUNARIA_ARCH", arm64 ? "arm64-v8a" : arm32 ? "armeabi-v7a" : armeabi ? "armeabi" : "arm64-v8a");
@@ -2317,8 +2474,15 @@ static int apk_prepare_inner(int *argc, const char ***argv)
    snprintf(relative, sizeof relative, "lib/%s", arch);
    if (path_join(libdir, sizeof libdir, inst, relative) || mkdirs(libdir) || path_join(staged_apk, sizeof staged_apk, inst, "base.apk") || materialize(base, staged_apk))
       goto done;
-   if (env_set("ANDROID_PACKAGE_NAME", m->package, true) || env_set("ANDROID_PACKAGE_CODE_PATH", inst, true) || env_set("ANDROID_APK_FILE", staged_apk, true) || env_set("ANDROID_NATIVE_LIB_DIR", libdir, true) || env_set("ANDROID_SPLIT_APKS", split_list, true))
+   if (env_set("ANDROID_PACKAGE_NAME", m->package, true) || env_set("ANDROID_PACKAGE_CODE_PATH", inst, true) || env_set("ANDROID_APK_FILE", staged_apk, true) || env_set("ANDROID_NATIVE_LIB_DIR", libdir, true) || env_set("ANDROID_SPLIT_APKS", text_get(&split_list), true))
       goto done;
+   /* `am start -n`: the component named here is launched instead of the manifest's launcher. */
+   const char *forced_activity = getenv("LUNARIA_LAUNCH_ACTIVITY");
+   if (forced_activity && *forced_activity && class_name(m->activity, sizeof m->activity, m->package, forced_activity))
+      goto done;
+   if (!install && !service_host && !strcmp(m->package, "com.google.android.gms") &&
+       forced_activity && !strcmp(forced_activity, "com.android.settings.accounts.AddAccountSettings") &&
+       google_sign_in_enter(root, profile)) goto done;
    const struct {
       const char *key, *value;
    } metadata[] = {
@@ -2327,14 +2491,14 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       {"ANDROID_PROCESS_NAME", *m->activity_process ? m->activity_process : m->application_process},
       {"ANDROID_LAUNCH_CONFIG_CHANGES", m->config_changes},
       {"ANDROID_SCREEN_ORIENTATION", m->orientation}, {"ANDROID_THEME_RESOURCE", m->theme},
-      {"ANDROID_RECEIVERS", m->receivers}, {"ANDROID_SERVICES", m->services},
-      {"ANDROID_ACTIVITIES", m->activities}, {"ANDROID_ACTIVITY_FILTERS", m->activity_filters},
-      {"ANDROID_CONTENT_PROVIDERS", m->providers}, {"ANDROID_REQUESTED_PERMISSIONS", m->permissions},
+      {"ANDROID_RECEIVERS", text_get(&m->receivers)}, {"ANDROID_SERVICES", text_get(&m->services)},
+      {"ANDROID_ACTIVITIES", text_get(&m->activities)}, {"ANDROID_ACTIVITY_FILTERS", text_get(&m->activity_filters)},
+      {"ANDROID_CONTENT_PROVIDERS", text_get(&m->providers)}, {"ANDROID_REQUESTED_PERMISSIONS", text_get(&m->permissions)},
       {"ANDROID_MIN_SDK", m->min_sdk}, {"ANDROID_TARGET_SDK", m->target_sdk},
       {"ANDROID_USES_CLEARTEXT_TRAFFIC", m->cleartext},
       {"ANDROID_NETWORK_SECURITY_CONFIG", m->network_security},
-      {"ANDROID_QUERY_ACTIONS", m->query_actions}, {"ANDROID_QUERY_PACKAGES", m->query_packages},
-      {"ANDROID_USES_LIBRARIES", m->libraries},
+      {"ANDROID_QUERY_ACTIONS", text_get(&m->query_actions)}, {"ANDROID_QUERY_PACKAGES", text_get(&m->query_packages)},
+      {"ANDROID_USES_LIBRARIES", text_get(&m->libraries)},
    };
    for (size_t i = 0; i < sizeof metadata / sizeof metadata[0]; i++) {
       if (*metadata[i].value) {
@@ -2343,6 +2507,9 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       } else
          luna_os_unsetenv(metadata[i].key);
    }
+   /* A service host answers for every process the package declares. */
+   if (service_host ? env_set("ANDROID_SERVICE_HOST", "1", true) : (luna_os_unsetenv("ANDROID_SERVICE_HOST"), 0))
+      goto done;
    luna_os_unsetenv("ANDROID_APK_SIGNER_PKCS7");
    for (size_t i = 0; i < apk.count; i++) {
       struct zip_entry *e = apk.entries + i;
@@ -2371,8 +2538,9 @@ static int apk_prepare_inner(int *argc, const char ***argv)
    /* An Android process starts at the launcher Activity in the dex; the app
     * loads its own engine library from there. */
    static const char *main_module;
-   main_module = !strcmp(arch, "arm64-v8a") ? "--apk-process-arm64" : "--apk-process-arm32";
-   static const char *newargs[3];
+   main_module = service_host ? (!strcmp(arch, "arm64-v8a") ? "--service-process-arm64" : "--service-process-arm32")
+                              : (!strcmp(arch, "arm64-v8a") ? "--apk-process-arm64" : "--apk-process-arm32");
+   static const char *newargs[4];
    FILE *stamp = open_file(ready, "wb");
    if (!stamp)
       goto done;
@@ -2384,20 +2552,23 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       goto done;
    }
    fprintf(stderr, "[apk] %s: %s, %s, profile=%s\n[apk] installed view: %s\n", m->package, arch, hit ? "cache hit" : "installed", profile, inst);
+   if (system_install && google_package_install(root, m->package, input, base, container)) goto done;
    if (install) {
       printf("package=%s\nactivity=%s\narch=%s\ninstalled=%s\nmodule=%s\nconfigChanges=%s\n", m->package, m->activity, arch, inst, main_module, *m->config_changes ? m->config_changes : "0");
       result = 1;
       goto done;
    }
-   if (!*m->activity && env_true("LUNARIA_DEX_START")) {
+   /* A component host (e.g. Play services) has no launcher Activity by design. */
+   if (!service_host && !*m->activity && env_true("LUNARIA_DEX_START")) {
       apk_error("manifest has no launcher Activity");
       goto done;
    }
    newargs[0] = (*argv)[0];
    newargs[1] = main_module;
-   newargs[2] = NULL;
+   newargs[2] = service_host ? "3" : NULL;
+   newargs[3] = NULL;
    *argv = newargs;
-   *argc = 2;
+   *argc = service_host ? 3 : 2;
    result = 0;
 done:
    zip_close(&outer);
@@ -2405,8 +2576,9 @@ done:
    for (size_t i = 0; i < apk_count; i++)
       free(apks[i]);
    free(apks);
-   free(m);
-   free(split);
+   text_free(&split_list);
+   manifest_free(m);
+   manifest_free(split);
    return result;
 }
 
@@ -2416,6 +2588,53 @@ done:
  * launcher's own choices (the APK it asked for) are part of that line. */
 static char **g_restart_argv;
 static int g_restart_argc;
+static char **g_restart_environment;
+
+static int restart_environment_remember(void)
+{
+   if (g_restart_environment) return 0;
+#ifdef _WIN32
+   char **source = _environ;
+#else
+   char **source = environ;
+#endif
+   size_t n = 0;
+   while (source && source[n]) ++n;
+   char **saved = calloc(n + 1, sizeof *saved);
+   if (!saved) return -1;
+   for (size_t i = 0; i < n; ++i) {
+      saved[i] = strdup(source[i]);
+      if (!saved[i]) {
+         for (size_t k = 0; k < i; ++k) free(saved[k]);
+         free(saved); return -1;
+      }
+   }
+   g_restart_environment = saved;
+   return 0;
+}
+
+/* Retain explicit common CLI options when returning to the launcher too.
+ * Values derived from an APK's configuration are deliberately not retained. */
+static int restart_environment_option(const char *key, const char *value)
+{
+   if (!g_restart_environment) return -1;
+   size_t n = 0, key_length = strlen(key);
+   while (g_restart_environment[n]) {
+      if (!strncmp(g_restart_environment[n], key, key_length) && g_restart_environment[n][key_length] == '=') break;
+      ++n;
+   }
+   char *entry = malloc(key_length + strlen(value) + 2);
+   if (!entry) return -1;
+   sprintf(entry, "%s=%s", key, value);
+   if (!g_restart_environment[n]) {
+      char **grown = realloc(g_restart_environment, (n + 2) * sizeof *grown);
+      if (!grown) { free(entry); return -1; }
+      g_restart_environment = grown;
+      g_restart_environment[n + 1] = NULL;
+   } else free(g_restart_environment[n]);
+   g_restart_environment[n] = entry;
+   return 0;
+}
 
 static void restart_remember(int argc, const char **argv)
 {
@@ -2427,6 +2646,44 @@ static void restart_remember(int argc, const char **argv)
       if (!g_restart_argv[i]) { g_restart_argv = NULL; return; }
    }
    g_restart_argc = argc;
+}
+
+/* The content authorities an APK's manifest declares, separated by ';', as a
+ * malloc'd string (empty when none).  The device uses it to know which package
+ * owns a provider without starting that package.  -1 when the APK has no
+ * readable manifest. */
+int luna_apk_content_authorities(const char *apk_path, char **out)
+{
+   struct zip z = {0};
+   struct manifest *m = calloc(1, sizeof *m);
+   struct text found = {0};
+   int result = -1;
+   *out = NULL;
+   if (!m || zip_open(&z, apk_path) || manifest_zip(&z, m)) goto done;
+   /* Records are "name|authorities|metadata|process|..." after a "!2\n" header. */
+   const char *record = text_get(&m->providers);
+   if (!strncmp(record, "!2\n", 3)) record += 3;
+   while (*record) {
+      const char *end = strchr(record, '\n');
+      const size_t length = end ? (size_t)(end - record) : strlen(record);
+      const char *bar = memchr(record, '|', length);
+      if (bar) {
+         const char *authorities = bar + 1;
+         const char *stop = memchr(authorities, '|', (size_t)(record + length - authorities));
+         char *copy = luna_strndup(authorities, stop ? (size_t)(stop - authorities) : (size_t)(record + length - authorities));
+         if (!copy || (*copy && text_append(&found, copy, ";"))) { free(copy); goto done; }
+         free(copy);
+      }
+      record += length + (end ? 1 : 0);
+   }
+   *out = found.s ? found.s : strdup("");
+   found.s = NULL;
+   result = *out ? 0 : -1;
+done:
+   text_free(&found);
+   zip_close(&z);
+   manifest_free(m);
+   return result;
 }
 
 const char *luna_apk_profile_current(void)
@@ -2459,15 +2716,6 @@ int luna_apk_profile_list(char (*names)[65], int max)
    return n;
 }
 
-int luna_apk_profile_label(const char *id, char *out, size_t cap)
-{
-   return profile_label_read(getenv("LUNARIA_DATA_ROOT"), getenv("ANDROID_PACKAGE_NAME"), id, out, cap);
-}
-int luna_apk_profile_set_label(const char *id, const char *label)
-{
-   return profile_label_write(getenv("LUNARIA_DATA_ROOT"), getenv("ANDROID_PACKAGE_NAME"), id, label);
-}
-
 /* The next unused "profile-N". */
 int luna_apk_profile_new_name(char *out, size_t cap)
 {
@@ -2488,7 +2736,7 @@ int luna_apk_profile_new_name(char *out, size_t cap)
 int luna_apk_restart(const char *profile)
 {
    char exe[APK_PATH];
-   if (!g_restart_argv || luna_os_executable_path(exe, sizeof exe)) return -1;
+   if (!g_restart_argv || !g_restart_environment || luna_os_executable_path(exe, sizeof exe)) return -1;
    if (!profile) profile = luna_apk_profile_current();
    if (!profile_valid(profile)) return -1;
    const char **args = calloc((size_t)g_restart_argc + 3, sizeof *args);
@@ -2511,12 +2759,147 @@ int luna_apk_restart(const char *profile)
    fprintf(stderr, "[apk] restarting under profile %s\n", profile);
    fflush(NULL);
 #ifdef _WIN32
-   _execv(exe, args);   /* the CRT takes const char *const * */
+   _execve(exe, args, (const char *const *)g_restart_environment);
 #else
-   execv(exe, (char *const *)args);
+   execve(exe, (char *const *)args, g_restart_environment);
 #endif
    free(args);
    return -1;
+}
+
+/* Launch a setup/account window without replacing the running application or
+ * leaking its Android paths, profile, Binder sockets, or activity overrides. */
+static atomic_bool google_window_open;
+struct google_window_job {
+   char executable[APK_PATH], root[APK_PATH], conf[APK_PATH], archive[APK_PATH];
+   char profile[65];
+   char **environment;
+   int setup;
+};
+static void google_environment_free(char **env)
+{
+   if (!env) return;
+   for (size_t i = 0; env[i]; ++i) free(env[i]);
+   free(env);
+}
+static char **google_environment(int setup, const char *profile)
+{
+#ifdef _WIN32
+   char **source = _environ;
+#else
+   char **source = environ;
+#endif
+   size_t count = 0;
+   while (source && source[count]) ++count;
+   char **env = calloc(count + 3, sizeof *env);
+   if (!env) return NULL;
+   size_t n = 0;
+   for (size_t i = 0; i < count; ++i) {
+      const char *s = source[i];
+      if (!strncmp(s, "ANDROID_", 8)) continue;
+      if (!strncmp(s, "LUNARIA_", 8) && strncmp(s, "LUNARIA_CACHE_DIR=", 18) &&
+          strncmp(s, "LUNARIA_NET=", 12) && strncmp(s, "LUNARIA_PBUFFER=", 16)) continue;
+      env[n] = strdup(s);
+      if (!env[n++]) { google_environment_free(env); return NULL; }
+   }
+   if (!setup) {
+      env[n] = strdup("LUNARIA_LAUNCH_ACTIVITY=com.android.settings.accounts.AddAccountSettings");
+      if (!env[n]) { google_environment_free(env); return NULL; }
+      ++n;
+      char selected[96];
+      snprintf(selected, sizeof selected, "LUNARIA_GMS_PROFILE=%s", profile);
+      env[n] = strdup(selected);
+      if (!env[n]) { google_environment_free(env); return NULL; }
+   }
+   return env;
+}
+static void *google_window_run(void *opaque)
+{
+   struct google_window_job *job = opaque;
+   char *setup_args[] = {job->executable, "--google-services", "--data-root", job->root,
+                         "--config", job->conf, NULL};
+   char *account_args[] = {job->executable, "--data-root", job->root, "--config", job->conf,
+                           "--profile", job->profile, job->archive, NULL};
+   char **args = job->setup ? setup_args : account_args;
+   int result = 0;
+#ifdef _WIN32
+   if (_spawnve(_P_WAIT, job->executable, (const char *const *)args,
+                (const char *const *)job->environment) < 0) result = errno;
+#else
+   posix_spawn_file_actions_t actions;
+   posix_spawnattr_t attributes;
+   result = posix_spawn_file_actions_init(&actions);
+   bool have_actions = !result, have_attributes = false;
+   if (!result) { result = posix_spawnattr_init(&attributes); have_attributes = !result; }
+#if defined(__APPLE__) && defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
+   if (!result) result = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_CLOEXEC_DEFAULT);
+#elif defined(__GLIBC__)
+#if __GLIBC_PREREQ(2,34)
+   if (!result) result = posix_spawn_file_actions_addclosefrom_np(&actions, 3);
+#else
+   if (!result) result = ENOTSUP;
+#endif
+#else
+   if (!result) result = ENOTSUP;
+#endif
+   pid_t child;
+   if (!result) result = posix_spawn(&child, job->executable, &actions, &attributes, args, job->environment);
+   if (have_attributes) posix_spawnattr_destroy(&attributes);
+   if (have_actions) posix_spawn_file_actions_destroy(&actions);
+   if (!result) {
+      int status;
+      while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+   }
+#endif
+   if (result) fprintf(stderr, "[google-services] cannot open window: %s\n", strerror(result));
+   google_environment_free(job->environment);
+   free(job);
+   atomic_store(&google_window_open, false);
+   return NULL;
+}
+int luna_apk_google_services_installed(void)
+{
+   char path[APK_PATH];
+   luna_file_info info;
+   return !luna_apk_system_archive("com.google.android.gms", path, sizeof path) &&
+          !luna_file_infoat(LUNA_AT_FDCWD, path, &info, 0) && info.size > 22;
+}
+int luna_apk_google_services_busy(void)
+{
+   return atomic_load(&google_window_open);
+}
+int luna_apk_google_services_open(int setup, const char *profile)
+{
+   bool expected = false;
+   if (!atomic_compare_exchange_strong(&google_window_open, &expected, true)) { errno = EBUSY; return -1; }
+   struct google_window_job *job = calloc(1, sizeof *job);
+   const char *root = getenv("LUNARIA_DATA_ROOT");
+   if (!profile) profile = luna_google_profile_current();
+   if (!job || !root || !*root || !luna_google_profile_valid(profile) ||
+       copy_text(job->profile, sizeof job->profile, profile) || copy_text(job->root, sizeof job->root, root) ||
+       luna_os_executable_path(job->executable, sizeof job->executable) ||
+       conf_default_path(job->conf, sizeof job->conf) ||
+       (!setup && luna_apk_system_archive("com.google.android.gms", job->archive, sizeof job->archive)) ||
+       !(job->environment = google_environment(setup, profile))) {
+      if (job) { google_environment_free(job->environment); free(job); }
+      atomic_store(&google_window_open, false);
+      return -1;
+   }
+   job->setup = setup;
+   pthread_attr_t attributes;
+   int rc = pthread_attr_init(&attributes);
+   bool initialized = !rc;
+   if (!rc) rc = pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+   pthread_t thread;
+   if (!rc) rc = pthread_create(&thread, &attributes, google_window_run, job);
+   if (initialized) pthread_attr_destroy(&attributes);
+   if (rc) {
+      google_environment_free(job->environment); free(job);
+      atomic_store(&google_window_open, false);
+      errno = rc;
+      return -1;
+   }
+   return 0;
 }
 
 /* Starts over with no arguments: the screen a launch without an APK shows,
@@ -2524,14 +2907,14 @@ int luna_apk_restart(const char *profile)
 int luna_apk_restart_launcher(void)
 {
    char exe[APK_PATH];
-   if (luna_os_executable_path(exe, sizeof exe)) return -1;
+   if (!g_restart_environment || luna_os_executable_path(exe, sizeof exe)) return -1;
    const char *args[2] = { exe, NULL };
    fprintf(stderr, "[apk] returning to the launcher\n");
    fflush(NULL);
 #ifdef _WIN32
-   _execv(exe, args);
+   _execve(exe, args, (const char *const *)g_restart_environment);
 #else
-   execv(exe, (char *const *)args);
+   execve(exe, (char *const *)args, g_restart_environment);
 #endif
    return -1;
 }

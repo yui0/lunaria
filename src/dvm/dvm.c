@@ -1400,6 +1400,15 @@ static void log_forwarded_uncaught(struct dvm *vm, dvm_ref exc,
  * Fields
  * ------------------------------------------------------------------------ */
 
+/* The instance slot of the field `name` of `cls` (inherited fields included), or
+ * -1.  Code that reads the same fields of an object on every call resolves them
+ * once per class and indexes the object's slots afterwards. */
+int dvm__field_slot(struct dvm *vm, struct dvm_class *cls, const char *name, const char *type)
+{
+   struct dvm_field *f = cls ? class_find_field(vm, cls, name, type, false) : NULL;
+   return f && f->slot < cls->islots ? (int)f->slot : -1;
+}
+
 bool dvm__get_field_from(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
                          const char *name, const char *type,
                          union dvm_value *out)
@@ -3439,6 +3448,13 @@ bool dvm__monitor_enter(struct dvm *vm, dvm_ref ref)
    }
 }
 
+/* Thread.holdsLock: the calling thread owns this object's monitor. */
+bool dvm__monitor_held(struct dvm *vm, dvm_ref ref)
+{
+   struct dvm_object *o = dvm__obj(vm, ref);
+   return o && o->monitor_depth && o->monitor_owner == monitor_thread_token(vm);
+}
+
 bool dvm__monitor_exit(struct dvm *vm, dvm_ref ref)
 {
    struct dvm_object *o = dvm__obj(vm, ref);
@@ -4162,6 +4178,15 @@ void dvm_main_looper_tick(struct dvm *vm)
    /* Same contract as dvm_media_pump_active(): called from the frame pump,
     * which does not carry the interpreter lock. */
    unsigned cookie = dvm_gil_enter_from_guest(vm);
+   if (dvm__sched_trace()) {
+      static uint64_t last;
+      const uint64_t t = dvm__now_ms();
+      if (t - last > 5000) {
+         last = t;
+         fprintf(stderr, "[sched] main tick pid=%d: transaction=%u drain_depth=%d on_main=%d pending=%d\n", (int)getpid(),
+                 vm->main_transaction_depth, vm->drain_depth, (int)dvm_on_main_thread(), vm->npending);
+      }
+   }
    if (vm->main_transaction_depth) {
       dvm_gil_leave_to_guest(vm, cookie);
       return;

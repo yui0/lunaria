@@ -87,7 +87,12 @@ char *lunaria_cdp_json_string_dup(const char *json, const char *key);
 /* The same for a JSON string literal starting at p. */
 char *lunaria_cdp_json_string_at(const char *p);
 /* Enables Fetch domain with Document-type navigation interception. */
+/* Requests to this host are the page's synchronous JavaScript-interface calls. */
+#define LUNARIA_CDP_BRIDGE_HOST "lunaria-bridge.invalid"
 int lunaria_cdp_page_enable_fetch(struct lunaria_cdp_page *page);
+/* Answers a paused request with a 200 JSON body (CORS-open: the page is cross-origin). */
+int lunaria_cdp_page_fetch_fulfill(struct lunaria_cdp_page *page, const char *request_id,
+                                   const char *body);
 /* Respond to a paused Fetch.requestPaused: let it proceed or abort it. */
 int lunaria_cdp_page_fetch_continue(struct lunaria_cdp_page *page,
                                     const char *request_id);

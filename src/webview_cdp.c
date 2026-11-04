@@ -467,13 +467,52 @@ int lunaria_cdp_page_navigate(struct lunaria_cdp_page *page, const char *url)
 int lunaria_cdp_page_enable_fetch(struct lunaria_cdp_page *page)
 {
    if (!page || !page->transport || !page->session_id[0]) return -1;
-   char command[320];
+   char command[480];
+   /* Documents (navigation offered to the WebViewClient) and the JavaScript
+    * bridge's synchronous calls, which are answered here, never the network. */
    snprintf(command, sizeof command,
       "{\"id\":%u,\"sessionId\":\"%s\","
       "\"method\":\"Fetch.enable\","
-      "\"params\":{\"patterns\":[{\"resourceType\":\"Document\"}]}}",
+      "\"params\":{\"patterns\":[{\"resourceType\":\"Document\"},"
+      "{\"urlPattern\":\"https://" LUNARIA_CDP_BRIDGE_HOST "/*\"}]}}",
       page->next_id++, page->session_id);
    return lunaria_cdp_send(page->transport, command);
+}
+
+static char *cdp_base64(const unsigned char *in, size_t n)
+{
+   static const char t[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+   char *out = malloc((n + 2) / 3 * 4 + 1), *w = out;
+   if (!out) return NULL;
+   for (size_t i = 0; i < n; i += 3) {
+      unsigned v = (unsigned)in[i] << 16 | (i + 1 < n ? (unsigned)in[i + 1] << 8 : 0u) | (i + 2 < n ? in[i + 2] : 0u);
+      *w++ = t[v >> 18 & 63]; *w++ = t[v >> 12 & 63];
+      *w++ = i + 1 < n ? t[v >> 6 & 63] : '=';
+      *w++ = i + 2 < n ? t[v & 63] : '=';
+   }
+   *w = 0;
+   return out;
+}
+
+int lunaria_cdp_page_fetch_fulfill(struct lunaria_cdp_page *page, const char *request_id,
+                                   const char *body)
+{
+   if (!page || !page->transport || !page->session_id[0] || !request_id || !body) return -1;
+   char *quoted = lunaria_cdp_json_quote(request_id), *encoded = cdp_base64((const unsigned char *)body, strlen(body));
+   if (!quoted || !encoded) { free(quoted); free(encoded); return -1; }
+   size_t n = strlen(quoted) + strlen(encoded) + strlen(page->session_id) + 320;
+   char *command = malloc(n);
+   if (!command) { free(quoted); free(encoded); return -1; }
+   snprintf(command, n,
+      "{\"id\":%u,\"sessionId\":\"%s\",\"method\":\"Fetch.fulfillRequest\","
+      "\"params\":{\"requestId\":%s,\"responseCode\":200,\"responseHeaders\":["
+      "{\"name\":\"Content-Type\",\"value\":\"application/json\"},"
+      "{\"name\":\"Access-Control-Allow-Origin\",\"value\":\"*\"},"
+      "{\"name\":\"Cache-Control\",\"value\":\"no-store\"}],\"body\":\"%s\"}}",
+      page->next_id++, page->session_id, quoted, encoded);
+   int status = lunaria_cdp_send(page->transport, command);
+   free(command); free(quoted); free(encoded);
+   return status;
 }
 
 int lunaria_cdp_page_fetch_continue(struct lunaria_cdp_page *page,

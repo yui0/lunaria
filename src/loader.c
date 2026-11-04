@@ -44,6 +44,7 @@ int bionic_dlclose(void *handle);
 #include "arm_exec.h"
 #include "luna_compositor.h"
 #include "luna_overlay.h"
+#include "luna_boot.h"
 #include "dvm/dvm.h"
 
 #ifdef _WIN32
@@ -1080,10 +1081,98 @@ static int component_submit(void *user,const char *process,const void *bytes,siz
    if(!rc)fprintf(stderr,"[service-broker] accepted start for %s pid=%u\n",process,pid);
    return rc;
 }
+/* Other installed packages that run as component hosts (Play Store, Play
+ * services): one lazily-created pool per package, each exec'ing the launcher
+ * with --service-host on that package's installed APK. */
+#define NAME_MAX_WRAPPED 200
+static struct luna_process_channel *g_service_channel;   /* a host's link to its parent */
+#define PACKAGE_POOL_MAX 8
+static struct { char *package; struct luna_process_pool *pool; } g_package_pools[PACKAGE_POOL_MAX];
+static struct luna_process_pool *package_pool(const char *package)
+{
+   if(g_service_channel)return NULL;   /* only the owner of the pools starts hosts */
+   for(int i=0;i<PACKAGE_POOL_MAX;++i)
+      if(g_package_pools[i].package && !strcmp(g_package_pools[i].package,package))return g_package_pools[i].pool;
+   int slot=-1;
+   for(int i=0;i<PACKAGE_POOL_MAX;++i)if(!g_package_pools[i].package){slot=i;break;}
+   if(slot<0)return NULL;
+   struct lunaria_android_package record;
+   char host[4096],executable[4096];
+   if(!lunaria_android_package_find(package,&record) || !record.source_dir)return NULL;
+   if(luna_apk_system_archive(package,host,sizeof host) &&
+      !arm_exec_map_guest_path(record.source_dir,host,sizeof host))return NULL;
+   if(luna_os_executable_path(executable,sizeof executable)<0)return NULL;
+   /* Guest pid ranges of each host start above the application's own pool. */
+   struct luna_process_pool *pool=luna_process_pool_open_host(executable,host,(uint32_t)record.uid,811,600000u+(uint32_t)slot*65536u);
+   if(!pool){fprintf(stderr,"[binder] cannot host %s: %s\n",package,strerror(errno));return NULL;}
+   g_package_pools[slot].package=strdup(package);g_package_pools[slot].pool=pool;
+   return pool;
+}
+/* The Binder transport.  A parent addresses a child by package name; a child
+ * has only its parent, reached through its control channel (peer == NULL). */
+/* A host never starts another host: every message for a package goes up to the
+ * process that owns the pools, wrapped with the destination ("LBF1", length,
+ * name), and that process delivers it.  One host per package, whoever asks. */
+static int binder_transport_send(void *user,const char *peer,const void *bytes,size_t size)
+{
+   (void)user;
+   if(g_service_channel){
+      if(!peer)return luna_process_channel_send(g_service_channel,bytes,size);
+      const size_t n=strlen(peer);
+      unsigned char *wrapped=n<=NAME_MAX_WRAPPED ? malloc(8+n+size) : NULL;
+      if(!wrapped)return -ENOMEM;
+      memcpy(wrapped,"LBF1",4);
+      for(unsigned i=0;i<4;++i)wrapped[4+i]=(unsigned char)((uint32_t)n>>(i*8));
+      memcpy(wrapped+8,peer,n);memcpy(wrapped+8+n,bytes,size);
+      int rc=luna_process_channel_send(g_service_channel,wrapped,8+n+size);
+      free(wrapped);return rc;
+   }
+   const unsigned char *direct=bytes;
+   if(size>=8 && !memcmp(direct,"LBD1",4)){
+      uint32_t target=0;
+      for(unsigned i=0;i<4;++i)target|=(uint32_t)direct[4+i]<<(8*i);
+      if(target==(uint32_t)getpid())
+         return dvm_binder_receive(dvm_jni_vm(),peer,direct+8,size-8) ? 0 : -EPROTO;
+      for(int i=0;i<PACKAGE_POOL_MAX;++i){
+         if(!g_package_pools[i].pool)continue;
+         int rc=luna_process_pool_send_to_host(g_package_pools[i].pool,target,direct+8,size-8);
+         if(rc!=-ESRCH)return rc;
+      }
+      return g_component_pool ? luna_process_pool_send_to_host(g_component_pool,target,direct+8,size-8) : -ESRCH;
+   }
+   if(!peer)return -ENOTCONN;
+   struct luna_process_pool *pool=package_pool(peer);
+   if(!pool)return -ENOENT;
+   /* An answer for a host that has gone away is dropped, not a reason to start it. */
+   const unsigned char *magic=bytes;
+   if(size>=4 && !memcmp(magic,"LBR1",4) && !luna_process_pool_running(pool,peer))return -ECONNREFUSED;
+   uint32_t pid=0;
+   return luna_process_pool_send(pool,peer,bytes,size,&pid);
+}
 static void component_reply(void *user,const char *name,uint32_t pid,const void *bytes,size_t size)
 {
    (void)user;
    const unsigned char *p=bytes;
+   if(size>=8 && !memcmp(p,"LBF1",4)){
+      uint32_t n=0;for(unsigned i=0;i<4;++i)n|=(uint32_t)p[4+i]<<(i*8);
+      if(n==0 || n>NAME_MAX_WRAPPED || size<8+(size_t)n){fprintf(stderr,"[service-broker] malformed forward from %s\n",name);return;}
+      char dest[NAME_MAX_WRAPPED+1];memcpy(dest,p+8,n);dest[n]=0;
+      const char *self=getenv("ANDROID_PACKAGE_NAME");
+      if(size>=12+(size_t)n && !memcmp(p+8+n,"LBD1",4)){
+         (void)binder_transport_send(NULL,dest,p+8+n,size-8-n);return;
+      }
+      if(self && !strcmp(dest,self)){(void)dvm_binder_receive(dvm_jni_vm(),NULL,p+8+n,size-8-n);return;}
+      (void)binder_transport_send(NULL,dest,p+8+n,size-8-n);
+      return;
+   }
+   if(size>=8 && !memcmp(p,"LBD1",4)){
+      (void)binder_transport_send(NULL,name,bytes,size);return;
+   }
+   if(size>=12 && p[0]=='L' && p[1]=='B'){
+      if(!dvm_binder_receive(dvm_jni_vm(),name,bytes,size))
+         fprintf(stderr,"[service-broker] unknown Binder message from %s pid=%u\n",name,pid);
+      return;
+   }
    if(size!=8 || memcmp(p,"LSR1",4)){
       fprintf(stderr,"[service-broker] invalid reply from %s pid=%u\n",name,pid);return;
    }
@@ -1093,6 +1182,14 @@ static void component_reply(void *user,const char *name,uint32_t pid,const void 
 }
 static void component_pool_tick(void)
 {
+   for(int i=0;i<PACKAGE_POOL_MAX;++i){
+      if(!g_package_pools[i].pool)continue;
+      int rc=luna_process_pool_tick(g_package_pools[i].pool,component_reply,NULL);
+      if(rc<0 && rc!=-EPIPE)fprintf(stderr,"[binder] IPC error from %s: %s\n",g_package_pools[i].package,strerror(-rc));
+      char name[512];uint32_t pid;int status;
+      while(luna_process_pool_next_exit(g_package_pools[i].pool,name,sizeof name,&pid,&status)>0)
+         fprintf(stderr,"[binder] %s pid=%u exited status=%d\n",name,pid,status);
+   }
    if(!g_component_pool)return;
    int rc=luna_process_pool_tick(g_component_pool,component_reply,NULL);
    if(rc<0 && rc!=-EPIPE)fprintf(stderr,"[service-broker] IPC error: %s\n",strerror(-rc));
@@ -1110,6 +1207,8 @@ static void component_pool_install(struct dvm *vm,int is_a64)
    g_component_pool=luna_process_pool_open(executable,is_a64 ? "--service-process-arm64" : "--service-process-arm32",811,5096);
    if(!g_component_pool){fprintf(stderr,"[service-broker] unavailable: %s\n",strerror(errno));return;}
    dvm_service_set_submit(vm,component_submit,g_component_pool);
+   dvm_binder_set_transport(binder_transport_send,NULL);
+   dvm_binder_set_pump(component_pool_tick);
 }
 
 static bool process_exit_status(int *status)
@@ -1253,15 +1352,17 @@ start_manifest_providers(struct jvm *jvm, jobject context)
    struct luna_providers providers;
    if(luna_providers_open(&providers,encoded,package)<0)return -1;
    int started=0;
+   char failed[256]="";
    for(size_t index=0;index<providers.count;++index){
       struct luna_provider *row=&providers.items[index];
-      if(!luna_provider_local(row,process))continue;
+      if(!(getenv("ANDROID_SERVICE_HOST") ? row->enabled : luna_provider_local(row,process)))continue;
       char *entry=row->name,*authority=row->authority,*metadata=row->metadata;
       char cls[256];
       size_t n = 0;
       for (const char *p = entry; *p && n + 1 < sizeof cls; ++p)
          cls[n++] = (*p == '.') ? '/' : *p;
       cls[n] = '\0';
+      snprintf(failed, sizeof failed, "%s", cls);
       if (!*cls || !dvm_jni_class_in_dex(cls)) goto provider_failed;
 
       jclass provider_class = jvm->native.FindClass(&jvm->env, cls);
@@ -1362,6 +1463,8 @@ start_manifest_providers(struct jvm *jvm, jobject context)
    luna_providers_close(&providers);
    return started;
 provider_failed:
+   fprintf(stderr, "[loader] content provider failed: %s\n", failed);
+   if (jvm->native.ExceptionCheck(&jvm->env)) jvm->native.ExceptionDescribe(&jvm->env);
    luna_providers_close(&providers);
    return -1;
 }
@@ -1421,7 +1524,8 @@ run_dex_activity(struct jvm *jvm, int is_a64)
       cls[n++] = (*p == '.') ? '/' : *p;
    cls[n] = '\0';
 
-   if (!dvm_jni_class_in_dex(cls)) {
+   /* A component of the platform itself (Settings screens) is launched like one of the app's. */
+   if (!dvm_jni_class_in_dex(cls) && !jvm->native.FindClass(&jvm->env, cls)) {
       fprintf(stderr, "[loader] dex startup: %s is not in any dex\n", cls);
       return EXIT_FAILURE;
    }
@@ -1491,6 +1595,7 @@ run_dex_activity(struct jvm *jvm, int is_a64)
    }
 
    dvm_jni_main_transaction(&jvm->env, true);
+   dvm_jni_attach_activity(&jvm->env, activity);
    dvm_jni_activity_dispatch(&jvm->env, activity, "Created", 0);
    if (!dex_call_lifecycle(jvm, activity, cls, "onCreate",
                            "(Landroid/os/Bundle;)V", 1)) {
@@ -1585,11 +1690,28 @@ struct service_process {
    struct dvm *vm;
    struct luna_process_channel *channel;
    int fatal;
+   int ready;                 /* Application.onCreate has returned */
+   struct { void *bytes; size_t size; } held[16];  /* component commands that arrived before it */
+   unsigned nheld;
 };
+static struct service_process *g_service_process;
 static void service_process_command(void *user,const void *bytes,size_t size)
 {
    struct service_process *process=user;
    if(process->fatal)return;
+   /* ActivityManager creates a component only once the process has bound its
+    * Application.  Content-provider requests and calls on a Binder already handed
+    * out are not components being created, so they are answered at once. */
+   const unsigned char *tag=bytes;
+   const int starts_component=!(size>=4 && tag[0]=='L' && tag[1]=='B') || (size>=4 && !memcmp(tag,"LBB1",4));
+   if(!process->ready && starts_component){
+      if(process->nheld>=sizeof process->held/sizeof *process->held || !(process->held[process->nheld].bytes=malloc(size))){
+         fprintf(stderr,"[service-process] too many commands before the Application is ready\n");return;
+      }
+      memcpy(process->held[process->nheld].bytes,bytes,size);process->held[process->nheld++].size=size;
+      return;
+   }
+   if(dvm_binder_receive(process->vm,NULL,bytes,size))return;
    int status=dvm_service_dispatch(process->vm,bytes,size);
    unsigned char reply[8]={'L','S','R','1',0,0,0,0};
    for(unsigned i=0;i<4;++i)reply[4+i]=(unsigned char)((uint32_t)status>>(i*8));
@@ -1597,12 +1719,23 @@ static void service_process_command(void *user,const void *bytes,size_t size)
    if(rc<0 || status==-EIO)process->fatal=1;
    fprintf(stderr,"[service-process] command result=%d\n",status);
 }
+/* What the component process's main thread runs while it waits for a reply from
+ * another process: its own control channel and the pools it owns. */
+static void service_process_pump(void)
+{
+   if(g_service_process)(void)luna_process_channel_tick(g_service_process->channel,service_process_command,g_service_process);
+   component_pool_tick();
+}
 static int run_service_process(struct jvm *jvm,int is_a64,int control_fd)
 {
    struct service_process process={0};
    process.channel=luna_process_channel_open(control_fd);
    if(!process.channel){fprintf(stderr,"[service-process] control channel: %s\n",strerror(errno));return EXIT_FAILURE;}
    process.vm=dvm_jni_vm();
+   g_service_channel=process.channel;
+   g_service_process=&process;
+   dvm_binder_set_transport(binder_transport_send,NULL);
+   dvm_binder_set_pump(service_process_pump);
    jobject base=NULL,application=NULL;
    int result=EXIT_FAILURE;
    if(!process.vm || luna_application_start(jvm,getenv("ANDROID_APPLICATION_CLASS"),
@@ -1612,6 +1745,13 @@ static int run_service_process(struct jvm *jvm,int is_a64,int control_fd)
    }
    fprintf(stderr,"[service-process] ready: %s pid=%d\n",
            getenv("ANDROID_PROCESS_NAME") ? getenv("ANDROID_PROCESS_NAME") : "?",arm_exec_guest_pid());
+   process.ready=1;
+   for(unsigned i=0;i<process.nheld;++i){
+      service_process_command(&process,process.held[i].bytes,process.held[i].size);
+      free(process.held[i].bytes);
+   }
+   process.nheld=0;
+   dvm_deliver_boot_completed(process.vm);
    void (*run_threads)(void)=is_a64 ? arm64_exec_run_pending_threads : arm_exec_run_pending_threads;
    result=EXIT_SUCCESS;
    while(!process.fatal){
@@ -1619,12 +1759,15 @@ static int run_service_process(struct jvm *jvm,int is_a64,int control_fd)
       if(process_exit_status(&status)){result=status;break;}
       int rc=luna_process_channel_tick(process.channel,service_process_command,&process);
       if(rc==-EPIPE)break;
+      /* A host may itself bind another host's Service (the Play Store uses Play services). */
+      component_pool_tick();
       if(rc<0){fprintf(stderr,"[service-process] IPC error: %s\n",strerror(-rc));result=EXIT_FAILURE;break;}
       run_threads();dvm_main_looper_tick(process.vm);dvm_prefs_flush(process.vm);
       usleep(1000);
    }
    if(process.fatal)result=EXIT_FAILURE;
 done:
+   g_service_process=NULL;
    luna_process_channel_close(process.channel);return result;
 }
 

@@ -288,6 +288,116 @@ static bool nio_files_test(struct dvm *vm,dvm_ref self,const union dvm_value *ar
    if(error) RETI(0);
    const char *name=builtin_name();RETI(!strcmp(name,"exists") || (info.mode&0170000)==(!strcmp(name,"isDirectory") ? 0040000 : 0100000));
 }
+/* The default file system and its provider.  Both are stateless: a path is the
+ * string it was made from and every operation goes to the guest filesystem, so
+ * one object of each serves the process.  Desugared java.nio.file code (the j$
+ * adapters) asks for them first, before it touches a Path. */
+static dvm_ref g_nio_file_system, g_nio_file_provider;
+static bool nio_fs_default(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)args;(void)nargs;
+   RETL(runtime_singleton(vm,"Lsun/nio/fs/UnixFileSystem;",&g_nio_file_system));
+}
+static bool nio_fs_provider(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)args;(void)nargs;
+   RETL(runtime_singleton(vm,"Lsun/nio/fs/UnixFileSystemProvider;",&g_nio_file_provider));
+}
+static bool nio_fs_separator(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)args;(void)nargs;
+   RETL(dvm_new_string(vm,"/"));
+}
+static bool nio_fs_get_path(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;
+   return nio_paths_get(vm,0,args,nargs,out);
+}
+static bool nio_fs_true(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)vm;(void)self;(void)args;(void)nargs;RETI(1);
+}
+static bool nio_fs_false(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)vm;(void)self;(void)args;(void)nargs;RETI(0);
+}
+static bool nio_fs_scheme(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)args;(void)nargs;
+   RETL(dvm_new_string(vm,"file"));
+}
+static const struct rt_method rt_nio_filesystems[]={
+   SM("getDefault","()Ljava/nio/file/FileSystem;",nio_fs_default),M_END};
+static const struct rt_method rt_nio_filesystem[]={
+   M("provider","()Ljava/nio/file/spi/FileSystemProvider;",nio_fs_provider),
+   M("getSeparator","()Ljava/lang/String;",nio_fs_separator),
+   M("getPath","(Ljava/lang/String;[Ljava/lang/String;)Ljava/nio/file/Path;",nio_fs_get_path),
+   M("isOpen","()Z",nio_fs_true),M("isReadOnly","()Z",nio_fs_false),M_END};
+/* FileSystemProvider.getFileSystem(URI): the default provider serves one file
+ * system, named by the "file" scheme. */
+static bool nio_fs_for_uri(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)nargs;
+   union dvm_value scheme={0};
+   if(!ARG(0).l){dvm__throw(vm,"java/lang/NullPointerException","uri");return false;}
+   if(!am_vcall(vm,ARG(0).l,"getScheme","()Ljava/lang/String;",NULL,0,&scheme))return false;
+   const char *text=scheme.l ? dvm_string_utf8(vm,scheme.l) : NULL;
+   if(!text || strcasecmp(text,"file")){
+      dvm__throw(vm,"java/nio/file/FileSystemNotFoundException","Provider \"%s\" not installed",text ? text : "");return false;
+   }
+   RETL(runtime_singleton(vm,"Lsun/nio/fs/UnixFileSystem;",&g_nio_file_system));
+}
+
+/* Path.getFileSystem / getFileName / getParent / resolve / getNameCount: a Path is
+ * its normalised string, so each is string surgery on the text. */
+static bool nio_path_file_system(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)args;(void)nargs;
+   RETL(runtime_singleton(vm,"Lsun/nio/fs/UnixFileSystem;",&g_nio_file_system));
+}
+static bool nio_path_part(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   dvm_ref string=nio_path_text(vm,self);if(!string) return false;
+   const char *text=sref(vm,string);size_t n=strlen(text);
+   const char *slash=n ? strrchr(text,'/') : NULL;
+   if(!strcmp(builtin_name(),"getFileName")){
+      if(!n || (n==1 && *text=='/')) RETL(0);
+      RETL(path_make(vm,slash ? slash+1 : text));
+   }
+   /* getParent: nothing above a root or a single relative name. */
+   if(!slash) RETL(0);
+   if(slash==text) RETL(n>1 ? path_make(vm,"/") : 0);
+   char *parent=luna_strndup(text,(size_t)(slash-text));
+   if(!parent){dvm__throw(vm,"java/lang/OutOfMemoryError","path parent");return false;}
+   dvm_ref result=path_make(vm,parent);free(parent);RETL(result);
+}
+static bool nio_path_count(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   dvm_ref string=nio_path_text(vm,self);if(!string) return false;
+   const char *text=sref(vm,string);int count=0;
+   for(const char *p=text;*p;){while(*p=='/')++p;if(!*p)break;++count;while(*p && *p!='/')++p;}
+   RETI(count);
+}
+static bool nio_path_resolve(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   if(!ARG(0).l){dvm__throw(vm,"java/lang/NullPointerException","other");return false;}
+   dvm_ref base=nio_path_text(vm,self);if(!base) return false;
+   dvm_ref other=object_is_a(vm,ARG(0).l,"Lsun/nio/fs/UnixPath;") ? nio_path_text(vm,ARG(0).l) : ARG(0).l;
+   if(!other) return false;
+   const char *a=sref(vm,base),*b=sref(vm,other);
+   if(*b=='/') RETL(path_make(vm,b));
+   if(!*b) RETL(self);
+   if(!*a) RETL(path_make(vm,b));
+   const size_t na=strlen(a),nb=strlen(b);char *joined=malloc(na+nb+2);
+   if(!joined){dvm__throw(vm,"java/lang/OutOfMemoryError","resolved path");return false;}
+   memcpy(joined,a,na);size_t used=na;
+   if(joined[used-1]!='/')joined[used++]='/';
+   memcpy(joined+used,b,nb+1);
+   dvm_ref result=path_make(vm,joined);free(joined);RETL(result);
+}
 static const struct rt_field rt_nio_path_fields[]={{"path","Ljava/lang/String;"},F_END};
 static const char *const rt_nio_path_ifaces[]={"Ljava/nio/file/Path;",NULL};
 static const char *const rt_nio_path_superifaces[]={"Ljava/lang/Comparable;","Ljava/lang/Iterable;","Ljava/nio/file/Watchable;",NULL};
@@ -295,7 +405,11 @@ static const struct rt_method rt_nio_path[]={
    M("toString","()Ljava/lang/String;",nio_path_string),M("toFile","()Ljava/io/File;",nio_path_to_file),
    M("equals","(Ljava/lang/Object;)Z",nio_path_equals),M("hashCode","()I",nio_path_hash),
    M("compareTo","(Ljava/nio/file/Path;)I",nio_path_compare),M("compareTo","(Ljava/lang/Object;)I",nio_path_compare),
-   M("isAbsolute","()Z",nio_path_absolute),M("toAbsolutePath","()Ljava/nio/file/Path;",nio_path_absolute),M_END};
+   M("isAbsolute","()Z",nio_path_absolute),M("toAbsolutePath","()Ljava/nio/file/Path;",nio_path_absolute),
+   M("getFileSystem","()Ljava/nio/file/FileSystem;",nio_path_file_system),
+   M("getFileName","()Ljava/nio/file/Path;",nio_path_part),M("getParent","()Ljava/nio/file/Path;",nio_path_part),
+   M("getNameCount","()I",nio_path_count),
+   M("resolve","(Ljava/lang/String;)Ljava/nio/file/Path;",nio_path_resolve),M("resolve","(Ljava/nio/file/Path;)Ljava/nio/file/Path;",nio_path_resolve),M_END};
 static const struct rt_method rt_nio_paths[]={SM("get","(Ljava/lang/String;[Ljava/lang/String;)Ljava/nio/file/Path;",nio_paths_get),M_END};
 static const struct rt_field rt_nio_invalid_fields[]={{"input","Ljava/lang/String;"},{"reason","Ljava/lang/String;"},{"index","I"},F_END};
 static const struct rt_method rt_nio_invalid[]={M("<init>","(Ljava/lang/String;Ljava/lang/String;)V",nio_invalid_init),M("<init>","(Ljava/lang/String;Ljava/lang/String;I)V",nio_invalid_init),M("getInput","()Ljava/lang/String;",nio_exception_field),M("getReason","()Ljava/lang/String;",nio_exception_field),M("getIndex","()I",nio_exception_field),M_END};
@@ -321,8 +435,13 @@ static const struct rt_method rt_nio_attrs_interface[]={NIO_ATTR_METHODS(NIO_ATT
 static const struct rt_method rt_nio_path_interface[]={
    NIO_ATTR_ABSTRACT("toString","()Ljava/lang/String;",NULL),NIO_ATTR_ABSTRACT("toFile","()Ljava/io/File;",NULL),
    NIO_ATTR_ABSTRACT("isAbsolute","()Z",NULL),NIO_ATTR_ABSTRACT("toAbsolutePath","()Ljava/nio/file/Path;",NULL),
-   NIO_ATTR_ABSTRACT("compareTo","(Ljava/nio/file/Path;)I",NULL),M_END};
+   NIO_ATTR_ABSTRACT("compareTo","(Ljava/nio/file/Path;)I",NULL),
+   NIO_ATTR_ABSTRACT("getFileSystem","()Ljava/nio/file/FileSystem;",NULL),
+   NIO_ATTR_ABSTRACT("getFileName","()Ljava/nio/file/Path;",NULL),NIO_ATTR_ABSTRACT("getParent","()Ljava/nio/file/Path;",NULL),
+   NIO_ATTR_ABSTRACT("getNameCount","()I",NULL),
+   NIO_ATTR_ABSTRACT("resolve","(Ljava/lang/String;)Ljava/nio/file/Path;",NULL),NIO_ATTR_ABSTRACT("resolve","(Ljava/nio/file/Path;)Ljava/nio/file/Path;",NULL),M_END};
 #undef NIO_ATTR_ABSTRACT
 #undef NIO_ATTR_METHODS
 static const struct rt_field rt_nio_key_fields[]={{"device","J"},{"inode","J"},F_END};
 static const struct rt_method rt_nio_key[]={M("equals","(Ljava/lang/Object;)Z",nio_key_value),M("hashCode","()I",nio_key_value),M("toString","()Ljava/lang/String;",nio_key_value),M_END};
+

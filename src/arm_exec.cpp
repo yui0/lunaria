@@ -921,6 +921,51 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"glDeleteTextures",        SVC_GL_DeleteTextures},
     {"glTexParameteri",         SVC_GL_TexParameteri},
     {"glGetTexParameteriv",     SVC_GL_GetTexParameteriv},
+    {"strtoq", SVC_STRTOLL},
+    {"strtouq", SVC_STRTOULL},
+    {"mkstemp64", SVC_MKSTEMP},
+    {"readdir64", SVC_READDIR},
+    {"scandir64", SVC_SCANDIR},
+    {"openat64", SVC_OPENAT},
+    {"alphasort64", SVC_ALPHASORT},
+    {"wcstoimax", SVC_WCSTOLL},
+    {"wcstoumax", SVC_WCSTOULL},
+    {"mkstemps64", SVC_MKSTEMPS},
+    {"strtol_l", SVC_STRTOL},
+    {"strtoul_l", SVC_STRTOUL},
+    {"strtod_l", SVC_STRTOD},
+    {"strtof_l", SVC_STRTOF},
+    {"strerror_l", SVC_STRERROR},
+    {"strcasecmp_l", SVC_STRCASECMP},
+    {"strncasecmp_l", SVC_STRNCASECMP},
+    {"glGetTexParameterfv",     SVC_GL_GetTexParameterfv},
+    {"glDrawRangeElements", SVC_GL_DrawRangeElements},
+    {"glGetBufferParameteri64v", SVC_GL3_GetBufferParameteri64v},
+    {"glGetBufferPointerv", SVC_GL3_GetBufferPointerv},
+    {"glGetFragDataLocation", SVC_GL3_GetFragDataLocation},
+    {"glGetInteger64i_v", SVC_GL3_GetInteger64i_v},
+    {"glGetUniformuiv", SVC_GL3_GetUniformuiv},
+    {"glGetVertexAttribIiv", SVC_GL3_GetVertexAttribIiv},
+    {"glGetVertexAttribIuiv", SVC_GL3_GetVertexAttribIuiv},
+    {"glGetVertexAttribfv", SVC_GL_GetVertexAttribfv},
+    {"glInvalidateSubFramebuffer", SVC_GL3_InvalidateSubFramebuffer},
+    {"glIsTransformFeedback", SVC_GL3_IsTransformFeedback},
+    {"glPauseTransformFeedback", SVC_GL3_PauseTransformFeedback},
+    {"glResumeTransformFeedback", SVC_GL3_ResumeTransformFeedback},
+    {"glUniform1ui", SVC_GL3_Uniform1ui},
+    {"glUniform2ui", SVC_GL3_Uniform2ui},
+    {"glUniform3ui", SVC_GL3_Uniform3ui},
+    {"glUniform4ui", SVC_GL3_Uniform4ui},
+    {"glVertexAttribI4iv", SVC_GL3_VertexAttribI4iv},
+    {"glVertexAttribI4uiv", SVC_GL3_VertexAttribI4uiv},
+    {"glWaitSync", SVC_GL3_WaitSync},
+    {"glGetAttachedShaders",    SVC_GL_GetAttachedShaders},
+    {"glGetBufferParameteriv",  SVC_GL_GetBufferParameteriv},
+    {"glStencilMaskSeparate",   SVC_GL_StencilMaskSeparate},
+    {"glVertexAttribI4i",       SVC_GL3_VertexAttribI4i},
+    {"glVertexAttribI4ui",      SVC_GL3_VertexAttribI4ui},
+    {"glGetSynciv",             SVC_GL3_GetSynciv},
+    {"glGetTransformFeedbackVarying", SVC_GL3_GetTransformFeedbackVarying},
     {"glTexImage2D",            SVC_GL_TexImage2D},
     {"glTexSubImage2D",         SVC_GL_TexSubImage2D},
     {"glCopyTexSubImage2D",     SVC_GL_CopyTexSubImage2D},
@@ -1203,6 +1248,7 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"__read_chk",               SVC_READ_CHK},
     {"__write_chk",              SVC_WRITE_CHK},
     {"__fwrite_chk",             SVC_FWRITE_CHK},
+    {"__fread_chk",              SVC_FREAD_CHK},
     {"__pread_chk",              SVC_PREAD_CHK},
     /* Must use the 64-bit offset path.  Binding this to SVC_PREAD was fine on
      * A64 only because that case already reads x3 as a full register; keep
@@ -1617,6 +1663,8 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"strlcpy",                 SVC_STRLCPY},
     {"strncasecmp",             SVC_STRNCASECMP},
     {"strerror",                SVC_STRERROR},
+    {"strsignal",               SVC_STRSIGNAL},
+    {"asctime",                 SVC_ASCTIME},
     {"strerror_r",              SVC_STRERROR_R},
     {"__xpg_strerror_r",        SVC_STRERROR_R},
     {"setlocale",               SVC_SETLOCALE},
@@ -2357,6 +2405,10 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"wprintf",                   SVC_WPRINTF},
     {"swscanf",                   SVC_SWSCANF},
     {"lrint",                     SVC_LRINT},
+    {"lround",                    SVC_LROUND},
+    {"lroundf",                   SVC_LROUNDF},
+    {"llround",                   SVC_LLROUND},
+    {"llroundf",                  SVC_LLROUNDF},
 
     {"localeconv",                SVC_LOCALECONV},
     
@@ -2497,6 +2549,8 @@ static const A64SoftFpAbi kA64SoftFpAbi[] = {
     { SVC_ISFINITE, 1, 8, 0 }, { SVC_SIGNBIT, 1, 8, 0 },
     { SVC_ISNANF,   1, 4, 0 }, { SVC_ISINFF,  1, 4, 0 },
     { SVC_LRINT,    1, 8, 0 }, { SVC_LRINTF,  1, 4, 0 },
+    { SVC_LROUND,   1, 8, 0 }, { SVC_LROUNDF, 1, 4, 0 },
+    { SVC_LLROUND,  1, 8, 0 }, { SVC_LLROUNDF,1, 4, 0 },
     { SVC_ISFINITEF,1, 4, 0 }, { SVC_SIGNBITF,1, 4, 0 },
     { SVC_ILOGB,    1, 8, 0 }, { SVC_SINCOS,  1, 8, 0 },
     { SVC_FMA,      3, 8, 8 },
@@ -7458,33 +7512,55 @@ static void synth_guest_task_write_entry(const char *root, uint32_t target_pid,
 }
 
 static void synth_guest_task_refresh(const char *root, uint32_t target_pid) {
-    /* Drop entries for threads that have gone: a stale directory would list
-     * threads that no longer exist, which is the same kind of lie in the
-     * other direction. */
+    /* Only the NAMES in this directory matter to a lister.  File contents are
+     * generated when a file is opened (fopen/open serve them from memory; a
+     * named <tid> entry is written on demand by synth_guest_task_dir()).  So a
+     * listing makes the set of <tid> directories equal to the live threads and
+     * touches nothing else: no rewrite of comm/stat/status, no unlink of
+     * entries that are still right.  That is O(threads that came or went), not
+     * O(threads), and it never removes an entry a concurrent walker is on. */
+    static std::mutex refresh_mu;
+    std::lock_guard<std::mutex> guard(refresh_mu);
+    std::set<uint32_t> want;
+    auto add = [&](uint32_t sched_tid) {
+        if (!guest_task_visible(target_pid, sched_tid)) return;
+        want.insert(sched_tid ? guest_tid_of(sched_tid) : target_pid);
+    };
+    add(0);
+    for (const auto &thread : g_threads)
+        if (thread.id) add(thread.id);
+    if (target_pid == GUEST_TID_BASE)
+        for (uint32_t tid = 1; tid < 256; ++tid)
+            if (g_dvm_native_stacks[tid].attached) add(tid);
+
+    std::set<uint32_t> have;
+    std::vector<std::string> stale;
     if (luna_directory *d = luna_directory_open(root)) {
         while (luna_directory_entry *e = luna_directory_read(d)) {
             if (e->d_name[0] == '.') continue;
-            char victim[PATH_MAX];
-            snprintf(victim, sizeof victim, "%s/%s", root, e->d_name);
-            char f[PATH_MAX + 16];
-            snprintf(f, sizeof f, "%s/stat", victim);   luna_file_unlink(f);
-            snprintf(f, sizeof f, "%s/comm", victim);   luna_file_unlink(f);
-            snprintf(f, sizeof f, "%s/status", victim); luna_file_unlink(f);
-            rmdir(victim);
+            char *end = nullptr;
+            const unsigned long id = strtoul(e->d_name, &end, 10);
+            if (*end == '\0' && id <= UINT32_MAX && want.count((uint32_t)id))
+                have.insert((uint32_t)id);
+            else
+                stale.emplace_back(e->d_name);
         }
         luna_directory_close(d);
     }
-    /* Scheduler thread 0 is the process's main thread; g_threads holds the rest.
-     * Count only the live ones (see synth_guest_task_live()): the count has to
-     * match the entries a reader can enumerate. */
-    const unsigned live = synth_guest_task_live(target_pid);
-    synth_guest_task_write_entry(root, target_pid, 0, live);
-    for (const auto &thread : g_threads)
-        if (thread.id) synth_guest_task_write_entry(root, target_pid, thread.id, live);
-    if (target_pid == GUEST_TID_BASE)
-        for (uint32_t tid = 1; tid < 256; ++tid)
-            if (g_dvm_native_stacks[tid].attached)
-                synth_guest_task_write_entry(root, target_pid, tid, live);
+    for (const std::string &name : stale) {      /* threads that have gone */
+        char victim[PATH_MAX], f[PATH_MAX + 16];
+        snprintf(victim, sizeof victim, "%s/%s", root, name.c_str());
+        snprintf(f, sizeof f, "%s/stat", victim);   luna_file_unlink(f);
+        snprintf(f, sizeof f, "%s/comm", victim);   luna_file_unlink(f);
+        snprintf(f, sizeof f, "%s/status", victim); luna_file_unlink(f);
+        rmdir(victim);
+    }
+    for (uint32_t tid : want) {                   /* threads that are new */
+        if (have.count(tid)) continue;
+        char dir[PATH_MAX];
+        snprintf(dir, sizeof dir, "%s/%u", root, tid);
+        if (luna_file_mkdir(dir, 0755) != 0 && errno != EEXIST) continue;
+    }
 }
 
 static const char *synth_guest_task_dir(uint32_t pid, const char *tail) {
@@ -7583,6 +7659,7 @@ static unsigned guest_live_threads(void) {
  * the task list, openat(2) naming a file) still get the on-disk copy.
  * Returns NULL when `path` is not one of these files, and the caller falls
  * through to its existing handling. */
+/* Takes the GUEST path ("/proc/..."), never a mapped /tmp path: call it before map_guest_path(). */
 static bool synth_guest_task_bytes(const char *path, char **out_buf,
                                    size_t *out_len) {
     if (!path || !out_buf || !out_len || strncmp(path, "/proc/", 6) != 0)
@@ -7717,10 +7794,36 @@ static unsigned long long guest_starttime_ticks(void) {
  * committed mappings; host process RSS must never appear in guest procfs. */
 static void guest_vm_pages(unsigned long long *vsize_pages,
                            unsigned long long *rss_pages) {
+    /* PERF: this parses the whole maps file with sscanf.  /proc/<pid>/task/<tid>/status
+     * and stat call it on every read and NMSS reads them for every thread
+     * hundreds of times a second, so cache the result while the mappings are
+     * unchanged (same key and one-second bound synth_guest_maps() uses). */
+    static std::mutex cache_mu;
+    static uint64_t cache_key = 0, cache_ms = 0;
+    static unsigned long long cache_v = 0, cache_r = 0;
+    static bool cache_ok = false;
+    const uint64_t key = guest_maps_key();
+    const uint64_t now_ms = host_mono_ns() / 1000000ull;
+    {
+        std::lock_guard<std::mutex> lk(cache_mu);
+        if (cache_ok && key == cache_key && now_ms - cache_ms < 1000ull) {
+            *vsize_pages = cache_v;
+            *rss_pages = cache_r;
+            return;
+        }
+    }
     *vsize_pages = 0;
     *rss_pages = 0;
     const char *path = synth_guest_maps();
     if (!path) return;
+    struct CacheStore {
+        std::mutex &mu; unsigned long long *v, *r;
+        ~CacheStore() {
+            std::lock_guard<std::mutex> lk(mu);
+            cache_key = key_; cache_ms = ms_; cache_v = *v; cache_r = *r; cache_ok = true;
+        }
+        uint64_t key_, ms_;
+    } store{cache_mu, vsize_pages, rss_pages, key, now_ms};
     if (FILE *f = luna_file_fopen(path, "r")) {
         char line[PATH_MAX + 128], perms[5];
         unsigned long long lo, hi;
@@ -19289,6 +19392,11 @@ static void apk_meta_ensure_loaded() {
                         dval < strings.size()) {
                         key = strings[dval];
                         have_key = true;
+                    } else if (!strcmp(an, "resource")) {
+                        /* android:resource is the resource id itself (a Bundle holds it as an int). */
+                        have_val = true;
+                        ent.kind = ApkMetaEntry::KindInt;
+                        ent.i = (int32_t)dval;
                     } else if (!strcmp(an, "value")) {
                         have_val = true;
                         if (typ == 0x03 && dval < strings.size()) {
@@ -19440,6 +19548,27 @@ static const ApkMetaEntry *apk_meta_get(const char *key) {
     apk_meta_ensure_loaded();
     auto it = g_apk_meta.find(key);
     return it == g_apk_meta.end() ? nullptr : &it->second;
+}
+
+static int apk_meta_result(const ApkMetaEntry *e, int32_t *iv, const char **sv) {
+    if (!e) return 0;
+    switch (e->kind) {
+    case ApkMetaEntry::KindBool:  if (iv) *iv = e->b ? 1 : 0; return 'Z';
+    case ApkMetaEntry::KindInt:   if (iv) *iv = e->i;         return 'I';
+    case ApkMetaEntry::KindFloat: if (iv) memcpy(iv, &e->f, sizeof *iv); return 'F';
+    default:                      if (sv) *sv = e->str.c_str(); return 'L';
+    }
+}
+
+/* One component's own meta-data: two services may use the same key for
+ * different values (each account authenticator names its own xml). */
+extern "C" int arm_exec_apk_component_meta(const char *component, const char *key, int32_t *iv, const char **sv) {
+    apk_meta_ensure_loaded();
+    if (!component || !key) return 0;
+    auto owned = g_apk_component_meta.find(component);
+    if (owned == g_apk_component_meta.end()) return 0;
+    auto it = owned->second.find(key);
+    return it == owned->second.end() ? 0 : apk_meta_result(&it->second, iv, sv);
 }
 
 /* The same table, for the bytecode VM.  Play services and other SDKs read
@@ -19752,7 +19881,9 @@ static std::map<std::string, ZipEntry> g_obb_dir;
 static FILE *g_obb_fp = nullptr;
 static bool  g_obb_tried = false;
 
-static bool zip_index_file(FILE *fp, std::map<std::string, ZipEntry> &dir) {
+/* Reads the central directory.  `*valid` says the archive is a zip at all; the
+ * directory may well be empty (an empty zip is a legal archive). */
+static bool zip_read_directory(FILE *fp, std::map<std::string, ZipEntry> &dir) {
     if (!fp) return false;
     fseek(fp, 0, SEEK_END);
     long fsz = ftell(fp);
@@ -19783,7 +19914,11 @@ static bool zip_index_file(FILE *fp, std::map<std::string, ZipEntry> &dir) {
         if (elen + clen) fseek(fp, elen + clen, SEEK_CUR);
         dir.emplace(std::move(name), ze);
     }
-    return !dir.empty();
+    return true;
+}
+
+static bool zip_index_file(FILE *fp, std::map<std::string, ZipEntry> &dir) {
+    return zip_read_directory(fp, dir) && !dir.empty();
 }
 
 static bool zip_read_entry(FILE *fp, const ZipEntry &e, const std::string &name,
@@ -20936,6 +21071,8 @@ static const char *map_guest_path_raw(const char *path, char *buf, size_t bufsz)
 
     /* procfs has no host fallback, including Java and metadata operations. */
     if (path_under(path, "/proc", 5)) {
+        /* SLOW: this writes host files for /proc/<pid>/task/<tid>/*.  Hot readers
+         * (fopen) must serve those from memory BEFORE calling map_guest_path(). */
         if (const char *synth = synthetic_proc_path(path)) return synth;
         /* Since Android 10 an app is denied /proc/net: the file exists, and
          * reading it is refused (SELinux proc_net), which is not ENOENT. */
@@ -22280,6 +22417,35 @@ extern "C" unsigned char *arm_exec_zip_read(const char *archive,
     if (!data.empty()) memcpy(buf, data.data(), data.size());
     if (len) *len = data.size();
     return buf;
+}
+
+/* The member names of a zip/jar/apk (or of a directory standing in for one), in
+ * archive order.  Both the array and its names are malloc'd; the caller frees. */
+extern "C" char **arm_exec_zip_list(const char *archive, size_t *count) {
+    if (count) *count = 0;
+    if (!archive || !*archive) return nullptr;
+    char mapped[PATH_MAX];
+    const char *host = map_guest_path(archive, mapped, sizeof mapped);
+    FILE *fp = luna_file_fopen(host, "rb");
+    if (!fp) return nullptr;
+    std::map<std::string, asset_bridge::ZipEntry> dir;
+    const bool ok = asset_bridge::zip_read_directory(fp, dir);
+    fclose(fp);
+    if (!ok) return nullptr;
+    char **names = (char **)calloc(dir.size() + 1, sizeof *names);
+    if (!names) return nullptr;
+    size_t n = 0;
+    for (const auto &entry : dir) {
+        names[n] = strdup(entry.first.c_str());
+        if (!names[n]) {
+            while (n) free(names[--n]);
+            free(names);
+            return nullptr;
+        }
+        ++n;
+    }
+    if (count) *count = n;
+    return names;
 }
 
 // AAPCS64 va_list (Android/bionic): x3 points at.
@@ -28206,6 +28372,19 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
              * FORTIFY buffer violation (bionic fortify.cpp). */
             if (!count || size <= maximum / count) {
                 fname = "fwrite";
+                want = size * count;
+                have = ctx.is_arm64 ? argp(4) : ctx.mem.read32(regs[13]);
+            }
+            break;
+        }
+        case SVC_FREAD_CHK: {
+            /* __fread_chk(buf, size, count, stream, buf_size): same shape as
+             * __fwrite_chk, with the buffer size as the fifth argument. */
+            const uint64_t size = argp(1), count = argp(2);
+            const uint64_t maximum = ctx.is_arm64 ? UINT64_MAX : UINT32_MAX;
+            plain = SVC_LIBC_FREAD;
+            if (!count || size <= maximum / count) {
+                fname = "fread";
                 want = size * count;
                 have = ctx.is_arm64 ? argp(4) : ctx.mem.read32(regs[13]);
             }
@@ -36698,6 +36877,197 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             pfn_glGetTexParameteriv(gl_host_tex_target((GLenum)r0), (GLenum)r1,
                                     (GLint*)ctx.mem.ptr(r2));
         break;
+    case SVC_GL3_GetBufferParameteri64v: {
+        static auto f = (void (*)(GLenum, GLenum, int64_t *))host_gl_proc({ "glGetBufferParameteri64v" });
+        const GuestVA p = argp_n(2);
+        int64_t v = 0;
+        if (f) f((GLenum)r0, (GLenum)r1, &v);
+        if (p) ctx.mem.write64(p, (uint64_t)v);
+        break;
+    }
+    case SVC_GL3_GetBufferPointerv: {
+        /* The guest sees the shadow buffer MapBufferRange handed out, never a host pointer. */
+        const GuestVA p = argp_n(2);
+        auto it = g_gl_mapped.find(gl_mapping_buffer((GLenum)r0));
+        const uint32_t gva = (r1 == 0x88BDu /* GL_BUFFER_MAP_POINTER */ && it != g_gl_mapped.end())
+                             ? it->second.gva : 0u;
+        if (p) { if (ctx.is_arm64) ctx.mem.write64(p, gva); else ctx.mem.write32(p, gva); }
+        break;
+    }
+    case SVC_GL3_GetFragDataLocation: {
+        static auto f = (GLint (*)(GLuint, const GLchar *))host_gl_proc({ "glGetFragDataLocation" });
+        ret32((uint32_t)((f && r1) ? f((GLuint)r0, (const GLchar *)ctx.mem.cstr(argp_n(1))) : -1));
+        break;
+    }
+    case SVC_GL3_GetInteger64i_v: {
+        static auto f = (void (*)(GLenum, GLuint, int64_t *))host_gl_proc({ "glGetInteger64i_v" });
+        const GuestVA p = argp_n(2);
+        int64_t v = 0;
+        if (f) f((GLenum)r0, (GLuint)r1, &v);
+        if (p) ctx.mem.write64(p, (uint64_t)v);
+        break;
+    }
+    case SVC_GL3_GetUniformuiv: {
+        static auto f = (void (*)(GLuint, GLint, GLuint *))host_gl_proc({ "glGetUniformuiv" });
+        const GuestVA p = argp_n(2);
+        if (f && p) f((GLuint)r0, (GLint)r1, (GLuint *)ctx.mem.ptr(p));
+        break;
+    }
+    case SVC_GL3_GetVertexAttribIiv:
+    case SVC_GL3_GetVertexAttribIuiv: {
+        static auto fi = (void (*)(GLuint, GLenum, GLint *))host_gl_proc({ "glGetVertexAttribIiv" });
+        static auto fu = (void (*)(GLuint, GLenum, GLuint *))host_gl_proc({ "glGetVertexAttribIuiv" });
+        const GuestVA p = argp_n(2);
+        if (!p) break;
+        if (svc_no == SVC_GL3_GetVertexAttribIiv) { if (fi) fi((GLuint)r0, (GLenum)r1, (GLint *)ctx.mem.ptr(p)); }
+        else                                      { if (fu) fu((GLuint)r0, (GLenum)r1, (GLuint *)ctx.mem.ptr(p)); }
+        break;
+    }
+    case SVC_GL_GetVertexAttribfv: {
+        static auto f = (void (*)(GLuint, GLenum, GLfloat *))host_gl_proc({ "glGetVertexAttribfv" });
+        const GuestVA p = argp_n(2);
+        if (f && p) f((GLuint)r0, (GLenum)r1, (GLfloat *)ctx.mem.ptr(p));
+        break;
+    }
+    case SVC_GL3_InvalidateSubFramebuffer: {
+        /* (target, numAttachments, attachments, x, y, width, height).  Mirrors the
+         * whole-framebuffer invalidate: a colour attachment of the default
+         * framebuffer is left alone. */
+        static auto f = (void (*)(GLenum, GLsizei, const GLenum *, GLint, GLint, GLsizei, GLsizei))
+            host_gl_proc({ "glInvalidateSubFramebuffer" });
+        const GLsizei n = (GLsizei)r1;
+        const GuestVA ap = argp_n(2);
+        if (!f || n <= 0 || n > 16 || !ap) break;
+        GLint bound = 0;
+        if (pfn_glGetIntegerv) pfn_glGetIntegerv((r0 == 0x8CA8u) ? 0x8CAAu : 0x8CA6u, &bound);
+        GLenum kept[16]; GLsizei nk = 0;
+        for (GLsizei i = 0; i < n; ++i) {
+            const GLenum a = ctx.mem.read32(ap + 4u * (uint32_t)i);
+            if (bound == 0 && (a == 0x1800u || (a >= 0x8CE0u && a <= 0x8CEFu))) continue;
+            kept[nk++] = a;
+        }
+        if (nk) f((GLenum)r0, nk, kept, (GLint)arg32(3), (GLint)arg32(4), (GLsizei)arg32(5), (GLsizei)arg32(6));
+        break;
+    }
+    case SVC_GL3_IsTransformFeedback: {
+        static auto f = (GLboolean (*)(GLuint))host_gl_proc({ "glIsTransformFeedback" });
+        ret32(f ? (uint32_t)f((GLuint)r0) : 0u);
+        break;
+    }
+    case SVC_GL3_PauseTransformFeedback:
+    case SVC_GL3_ResumeTransformFeedback: {
+        static auto fp = (void (*)(void))host_gl_proc({ "glPauseTransformFeedback" });
+        static auto fr = (void (*)(void))host_gl_proc({ "glResumeTransformFeedback" });
+        auto f = svc_no == SVC_GL3_PauseTransformFeedback ? fp : fr;
+        if (f) f();
+        break;
+    }
+    case SVC_GL3_Uniform1ui: case SVC_GL3_Uniform2ui:
+    case SVC_GL3_Uniform3ui: case SVC_GL3_Uniform4ui: {
+        static auto f1 = (void (*)(GLint, GLuint))host_gl_proc({ "glUniform1ui" });
+        static auto f2 = (void (*)(GLint, GLuint, GLuint))host_gl_proc({ "glUniform2ui" });
+        static auto f3 = (void (*)(GLint, GLuint, GLuint, GLuint))host_gl_proc({ "glUniform3ui" });
+        static auto f4 = (void (*)(GLint, GLuint, GLuint, GLuint, GLuint))host_gl_proc({ "glUniform4ui" });
+        switch (svc_no) {
+        case SVC_GL3_Uniform1ui: if (f1) f1((GLint)r0, (GLuint)r1); break;
+        case SVC_GL3_Uniform2ui: if (f2) f2((GLint)r0, (GLuint)r1, (GLuint)r2); break;
+        case SVC_GL3_Uniform3ui: if (f3) f3((GLint)r0, (GLuint)r1, (GLuint)r2, (GLuint)r3); break;
+        default:                 if (f4) f4((GLint)r0, (GLuint)r1, (GLuint)r2, (GLuint)r3, (GLuint)arg32(4)); break;
+        }
+        break;
+    }
+    case SVC_GL3_VertexAttribI4iv:
+    case SVC_GL3_VertexAttribI4uiv: {
+        static auto fi = (void (*)(GLuint, const GLint *))host_gl_proc({ "glVertexAttribI4iv" });
+        static auto fu = (void (*)(GLuint, const GLuint *))host_gl_proc({ "glVertexAttribI4uiv" });
+        const GuestVA p = argp_n(1);
+        if (!p) break;
+        if (svc_no == SVC_GL3_VertexAttribI4iv) { if (fi) fi((GLuint)r0, (const GLint *)ctx.mem.ptr(p)); }
+        else                                    { if (fu) fu((GLuint)r0, (const GLuint *)ctx.mem.ptr(p)); }
+        break;
+    }
+    case SVC_GL3_WaitSync: {
+        /* glWaitSync(sync, flags, GLuint64 timeout): server-side wait on the host context. */
+        static auto f = (void (*)(void *, GLbitfield, uint64_t))host_gl_proc({ "glWaitSync" });
+        const uint64_t timeout = ctx.is_arm64 ? (uint64_t)argp(2)
+                                              : ((uint64_t)r2 | ((uint64_t)r3 << 32));
+        void *sync = gl_sync_lookup((uint32_t)r0);
+        if (f && sync) f(sync, (GLbitfield)r1, timeout);
+        break;
+    }
+    case SVC_GL_GetTexParameterfv: {
+        static auto f = (void (*)(GLenum, GLenum, GLfloat *))host_gl_proc({ "glGetTexParameterfv" });
+        const GuestVA p = argp_n(2);
+        if (!p) break;
+        GLfloat v = 0.0f;
+        if (f) f(gl_host_tex_target((GLenum)r0), (GLenum)r1, &v);
+        uint32_t bits; memcpy(&bits, &v, 4);
+        ctx.mem.write32(p, bits);
+        break;
+    }
+    case SVC_GL_StencilMaskSeparate: {
+        static auto f = (void (*)(GLenum, GLuint))host_gl_proc({ "glStencilMaskSeparate" });
+        if (f) f((GLenum)r0, (GLuint)r1);
+        break;
+    }
+    case SVC_GL3_VertexAttribI4i: {
+        static auto f = (void (*)(GLuint, GLint, GLint, GLint, GLint))host_gl_proc({ "glVertexAttribI4i" });
+        if (f) f((GLuint)r0, (GLint)r1, (GLint)r2, (GLint)r3, (GLint)arg32(4));
+        break;
+    }
+    case SVC_GL3_VertexAttribI4ui: {
+        static auto f = (void (*)(GLuint, GLuint, GLuint, GLuint, GLuint))host_gl_proc({ "glVertexAttribI4ui" });
+        if (f) f((GLuint)r0, (GLuint)r1, (GLuint)r2, (GLuint)r3, (GLuint)arg32(4));
+        break;
+    }
+    case SVC_GL3_GetSynciv: {
+        /* glGetSynciv(sync, pname, bufSize, GLsizei *length, GLint *values) */
+        static auto f = (void (*)(void *, GLenum, GLsizei, GLsizei *, GLint *))host_gl_proc({ "glGetSynciv" });
+        const GLsizei cap = (GLsizei)r2;
+        const GuestVA lenp = argp_n(3), valp = argp_n(4);
+        void *sync = gl_sync_lookup((uint32_t)r0);
+        GLint vals[8] = {0};
+        GLsizei got = 0;
+        if (f && sync && cap > 0) f(sync, (GLenum)r1, cap < 8 ? cap : 8, &got, vals);
+        if (valp) for (GLsizei i = 0; i < got; ++i) ctx.mem.write32(valp + 4u * (uint32_t)i, (uint32_t)vals[i]);
+        if (lenp) ctx.mem.write32(lenp, (uint32_t)got);
+        break;
+    }
+    case SVC_GL3_GetTransformFeedbackVarying: {
+        /* (program, index, bufSize, GLsizei *length, GLsizei *size, GLenum *type, GLchar *name) */
+        static auto f = (void (*)(GLuint, GLuint, GLsizei, GLsizei *, GLsizei *, GLenum *, GLchar *))
+            host_gl_proc({ "glGetTransformFeedbackVarying" });
+        const GLsizei cap = (GLsizei)r2;
+        const GuestVA lenp = argp_n(3), sizep = argp_n(4), typep = argp_n(5), namep = argp_n(6);
+        GLsizei len = 0, size = 0; GLenum type = 0;
+        std::vector<GLchar> name((size_t)(cap > 0 ? cap : 1), 0);
+        if (f) f((GLuint)r0, (GLuint)r1, cap, &len, &size, &type, name.data());
+        if (lenp)  ctx.mem.write32(lenp,  (uint32_t)len);
+        if (sizep) ctx.mem.write32(sizep, (uint32_t)size);
+        if (typep) ctx.mem.write32(typep, (uint32_t)type);
+        if (namep && cap > 0) memcpy(ctx.mem.ptr(namep), name.data(), (size_t)cap);
+        break;
+    }
+    case SVC_GL_GetAttachedShaders: {
+        /* glGetAttachedShaders(program, maxCount, GLsizei *count, GLuint *shaders) */
+        static auto f = (void (*)(GLuint, GLsizei, GLsizei *, GLuint *))host_gl_proc({ "glGetAttachedShaders" });
+        const GLsizei cap = (GLsizei)r1;
+        const GuestVA countp = argp_n(2), shp = argp_n(3);
+        std::vector<GLuint> ids((size_t)(cap > 0 ? cap : 1), 0);
+        GLsizei n = 0;
+        if (f && cap > 0) f((GLuint)r0, cap, &n, ids.data());
+        if (shp) for (GLsizei i = 0; i < n; ++i) ctx.mem.write32(shp + 4u * (uint32_t)i, ids[(size_t)i]);
+        if (countp) ctx.mem.write32(countp, (uint32_t)n);
+        break;
+    }
+    case SVC_GL_GetBufferParameteriv: {
+        static auto f = (void (*)(GLenum, GLenum, GLint *))host_gl_proc({ "glGetBufferParameteriv" });
+        const GuestVA p = argp_n(2);
+        GLint v = 0;
+        if (f) f((GLenum)r0, (GLenum)r1, &v);
+        if (p) ctx.mem.write32(p, (uint32_t)v);
+        break;
+    }
     case SVC_GL_TexImage2D: {
         // (target,level,internalfmt,width, height,border,format,type,pixels).
         if (pfn_glTexImage2D) {
@@ -37399,6 +37769,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             gldraw_dump_state();
         }
         break;
+    case SVC_GL_DrawRangeElements:
+        /* glDrawRangeElements(mode, start, end, count, type, indices): the range is a
+         * hint to the driver; drawing is glDrawElements(mode, count, type, indices). */
+        { const uint64_t type = argp_n(4), idx = argp_n(5);
+          r1 = r3; r2 = type; r3 = idx; }
+        [[fallthrough]];
     case SVC_GL_DrawElements:
         // r0=mode r1=count r2=type r3=indices_va (IBO bound -> byte offset)
         ++g_gl_draw_count;
@@ -39983,6 +40359,33 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                                         : ctx.mem.cstr(r0);
         const char *mode = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[1])
                                         : ctx.mem.cstr(r1);
+        /* A thread's own /proc/<pid>/task/<tid>/{status,stat,comm} is formatted
+         * straight into memory from the guest's spelling of the path.  This has
+         * to run BEFORE map_guest_path(): that call routes /proc through
+         * synthetic_proc_path(), which writes a directory and three host files
+         * per thread and returns a /tmp path that synth_guest_task_bytes()
+         * (it only accepts "/proc/...") can no longer recognise.  NMSS polls
+         * every thread this way hundreds of times a second, so the disk
+         * round trip was ~0.85 ms per fopen and grew with the thread count. */
+        if (path && mode && mode[0] == 'r' && !strncmp(path, "/proc/", 6)) {
+            const uint64_t fo_ts = host_mono_ns();
+            if (ctx.is_arm64) {
+                char *bytes = nullptr;
+                size_t blen = 0;
+                if (synth_guest_task_bytes(path, &bytes, &blen) && bytes) {
+                    const uint32_t shim =
+                        register_synth_gfile(ctx, bytes, (uint32_t)blen);
+                    free(bytes);
+                    fopen_prof_note(path, lr, 0, host_mono_ns() - fo_ts);
+                    retptr(guest_file_va(ctx, shim));
+                    break;
+                }
+            } else if (FILE *mem = synth_guest_task_stream(path)) {
+                fopen_prof_note(path, lr, 0, host_mono_ns() - fo_ts);
+                retptr(guest_file_va(ctx, register_file(ctx, mem, true)));
+                break;
+            }
+        }
         char fo_mapped[PATH_MAX];
         const uint64_t fo_t0 = host_mono_ns();
         path = map_guest_path(path, fo_mapped, sizeof fo_mapped);
@@ -39998,36 +40401,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         if (lunaria_env("LUNARIA_TRACE_OPEN"))
             fprintf(stderr, "[fopen] %s mode=%s\n", path ? path : "(null)", mode ? mode : "(null)");
-        /* A thread's own /proc files come straight out of memory: procfs is
-         * generated at open time and never written anywhere, and going
-         * through the synthetic task directory instead made this the hottest
-         * filesystem path in the emulator.  See synth_guest_task_bytes(). */
-        /* Every exit from here is an fopen the guest made, so every one of them is
-         * counted, including the synthetic /proc paths: a poll of a thread's own
-         * status is the single hottest fopen this emulator serves, and the
-         * diagnostic that exists to find it must see it. */
-        if (mode && mode[0] == 'r') {
-            if (ctx.is_arm64) {
-                char *bytes = nullptr;
-                size_t blen = 0;
-                const uint64_t fo_ts = host_mono_ns();
-                if (synth_guest_task_bytes(path, &bytes, &blen) && bytes) {
-                    const uint32_t shim =
-                        register_synth_gfile(ctx, bytes, (uint32_t)blen);
-                    free(bytes);
-                    fopen_prof_note(path, lr, fo_map_ns, host_mono_ns() - fo_ts);
-                    retptr(guest_file_va(ctx, shim));
-                    break;
-                }
-            } else {
-                const uint64_t fo_ts = host_mono_ns();
-                if (FILE *mem = synth_guest_task_stream(path)) {
-                    fopen_prof_note(path, lr, fo_map_ns, host_mono_ns() - fo_ts);
-                    retptr(guest_file_va(ctx, register_file(ctx, mem, true)));
-                    break;
-                }
-            }
-        }
+        /* (/proc task files were already served from memory above, before mapping.) */
         if (const char *subst = synthetic_proc_path(path)) path = subst;
         if (path && (!strncmp(path, "/proc/", 6) || !strcmp(path, "/proc"))) {
             static int blocked = 0;
@@ -51224,6 +51598,22 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         else              ret32((uint32_t)(int32_t)v);
         break;
     }
+    /* lround/llround: round half away from zero; lround's result is a `long`. */
+    case SVC_LROUNDF: case SVC_LLROUNDF: {
+        float f; uint32_t tmp = r0; memcpy(&f, &tmp, 4);
+        const long long v = llroundf(f);
+        if (ctx.is_arm64 || svc_no == SVC_LLROUNDF) ret64((uint64_t)v);
+        else                                         ret32((uint32_t)(int32_t)v);
+        break;
+    }
+    case SVC_LROUND: case SVC_LLROUND: {
+        uint64_t bits = (uint64_t)r1 << 32 | r0;
+        double d; memcpy(&d, &bits, 8);
+        const long long v = llround(d);
+        if (ctx.is_arm64 || svc_no == SVC_LLROUND) ret64((uint64_t)v);
+        else                                        ret32((uint32_t)(int32_t)v);
+        break;
+    }
     case SVC_LRINT: {
         uint64_t bits = (uint64_t)r1 << 32 | r0;
         double d; memcpy(&d, &bits, 8);
@@ -53094,6 +53484,49 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         a32_guest_mmap_commit(ctx, to, new_len, prot, 0x20u, -1);
         a32_guest_munmap(ctx, (uint32_t)r0, old_len);
         ret32(to);
+        break;
+    }
+    case SVC_STRSIGNAL: {
+        /* bionic's strsignal: the sys_siglist names, "Unknown signal N" otherwise;
+         * the buffer is per-process, as the C library's is. */
+        static const char *const names[] = {
+            nullptr, "Hangup", "Interrupt", "Quit", "Illegal instruction",
+            "Trap", "Aborted", "Bus error", "Floating point exception", "Killed",
+            "User signal 1", "Segmentation fault", "User signal 2", "Broken pipe",
+            "Alarm clock", "Terminated", "Stack fault", "Child exited",
+            "Continued", "Stopped (signal)", "Stopped", "Stopped (tty input)",
+            "Stopped (tty output)", "Urgent I/O condition", "CPU time limit exceeded",
+            "File size limit exceeded", "Virtual timer expired", "Profiling timer expired",
+            "Window size changed", "I/O possible", "Power failure", "Bad system call" };
+        static uint32_t sig_static = 0;
+        if (!sig_static) sig_static = arm_malloc(ctx, 64);
+        const int sig = (int)r0;
+        if (sig_static) {
+            if (sig > 0 && sig < (int)(sizeof names / sizeof *names))
+                snprintf((char*)ctx.mem.ptr(sig_static), 64, "%s", names[sig]);
+            else if (sig >= 32 && sig <= 64)
+                snprintf((char*)ctx.mem.ptr(sig_static), 64, "Real-time signal %d", sig - 32);
+            else
+                snprintf((char*)ctx.mem.ptr(sig_static), 64, "Unknown signal %d", sig);
+        }
+        ret32(sig_static);
+        break;
+    }
+    case SVC_ASCTIME: {
+        static uint32_t asc_static = 0;
+        if (!asc_static) asc_static = arm_malloc(ctx, 32);
+        struct tm tmv{};
+        if (!r0 || !asc_static) { ret32(0); break; }
+        read_guest_tm(ctx, argp(0), tmv);
+        static const char dn[7][4] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+        static const char mn[12][4] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+        if (tmv.tm_wday < 0 || tmv.tm_wday > 6 || tmv.tm_mon < 0 || tmv.tm_mon > 11) {
+            arm_set_errno(ctx, EOVERFLOW); ret32(0); break;
+        }
+        snprintf((char*)ctx.mem.ptr(asc_static), 32, "%.3s %.3s%3d %.2d:%.2d:%.2d %d\n",
+                 dn[tmv.tm_wday], mn[tmv.tm_mon], tmv.tm_mday, tmv.tm_hour,
+                 tmv.tm_min, tmv.tm_sec, 1900 + tmv.tm_year);
+        ret32(asc_static);
         break;
     }
     case SVC_STRERROR: {
@@ -58712,6 +59145,18 @@ static constexpr uint32_t TRAMP64_RET = 0xD65F03C0u;
 /* SVC cost inside a slice (LUNARIA_SVC_TIME=1); see Arm64Callbacks::CallSVC. */
 static const bool g_svc_time = lunaria_env("LUNARIA_SVC_TIME") != nullptr;
 static std::atomic<uint64_t> g_svc_ns{0}, g_svc_lock_ns{0}, g_svc_count{0};
+
+extern "C" int arm_exec_vorbis_decode(const unsigned char *data, size_t len,
+                                      int *channels, int *rate, short **pcm,
+                                      size_t *frames) {
+    if (!data || len < 4 || len > INT32_MAX || memcmp(data, "OggS", 4)) return 0;
+    const int n = stb_vorbis_decode_memory(data, (int)len, channels, rate, pcm);
+    if (n <= 0 || !*pcm || *channels < 1 || *channels > 8) {
+        free(*pcm); *pcm = nullptr; return 0;
+    }
+    *frames = (size_t)n;
+    return 1;
+}
 
 /* Host Ogg Vorbis decode (stb_vorbis.c) for FVorbisAudioInfo — see
  * SVC_STB_VORBIS_INFO / SVC_STB_VORBIS_READ in arm.h for the design (an
@@ -67678,7 +68123,16 @@ static int guest_program_spawn(const std::vector<std::string> &words,
  * RunningAppProcessInfo and ApplicationInfo.uid from here, so that one
  * process cannot disagree with itself about who it is. */
 extern "C" int arm_exec_guest_pid(void) { return (int)guest_pid(); }
-extern "C" int arm_exec_guest_uid(void) { return 10000; /* FIRST_APPLICATION_UID */ }
+/* FIRST_APPLICATION_UID unless the process was started as another package
+ * (a hosted component process runs as that package's ledger uid). */
+extern "C" int arm_exec_guest_uid(void) {
+    static const int uid = []() {
+        const char *e = lunaria_env("LUNARIA_GUEST_UID");
+        const long v = e ? strtol(e, nullptr, 10) : 0;
+        return v >= 10000 && v < 20000 ? (int)v : 10000;
+    }();
+    return uid;
+}
 
 extern "C" int arm64_exec_load_library(const char *path, uint64_t base_addr) {
     if (!g_ctx) return -1;

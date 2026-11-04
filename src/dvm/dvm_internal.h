@@ -398,12 +398,14 @@ bool dvm__runtime_exit(struct dvm *, dvm_ref, const union dvm_value *, int, unio
 struct dvm_class *dvm__register_builtin(struct dvm *vm, const char *desc);
 struct dvm_class *dvm__define_primitive(struct dvm *vm, const char *desc);
 struct dvm_class *dvm__class_by_desc(struct dvm *vm, const char *desc);
+void dvm__activity_attach(struct dvm *vm, dvm_ref activity);
 void dvm__activity_visible(struct dvm *vm, dvm_ref activity);
 /* Activity.dispatchActivity{Pre,Post}<step>(): see dvm_runtime.c. */
 void dvm__activity_dispatch(struct dvm *vm, dvm_ref activity, const char *step,
                             bool post, dvm_ref bundle);
 void dvm__main_queue_idle(struct dvm *vm, bool dispatched);
 
+int dvm__field_slot(struct dvm *vm, struct dvm_class *cls, const char *name, const char *type);
 bool dvm__class_assignable(struct dvm *vm, struct dvm_class *from,
                            struct dvm_class *to);
 struct dvm_object *dvm__obj(struct dvm *vm, dvm_ref ref);
@@ -448,6 +450,7 @@ void dvm__thread_set_state(struct dvm *vm, dvm_ref thread,
                            enum dvm_thread_state state);
 
 bool dvm__monitor_notify(struct dvm *vm, dvm_ref ref, bool all);
+bool dvm__monitor_held(struct dvm *vm, dvm_ref ref);
 bool dvm__monitor_state(struct dvm *vm, dvm_ref ref, bool current,
                         uint32_t *depth);
 dvm_ref dvm__intern(struct dvm *vm, const char *utf8);
@@ -673,6 +676,10 @@ extern const struct dvm_sqlite_method dvm_sqlite_database_methods[];
 extern const struct dvm_sqlite_field  dvm_sqlite_database_fields[];
 extern const struct dvm_sqlite_method dvm_sqlite_cursor_methods[];
 extern const struct dvm_sqlite_field  dvm_sqlite_cursor_fields[];
+extern const struct dvm_sqlite_method dvm_sqlite_matrix_cursor_methods[];
+extern const struct dvm_sqlite_method dvm_sqlite_open_params_methods[];
+extern const struct dvm_sqlite_method dvm_sqlite_open_params_builder_methods[];
+extern const struct dvm_sqlite_field  dvm_sqlite_open_params_fields[];
 extern const struct dvm_sqlite_method dvm_sqlite_program_methods[];
 extern const struct dvm_sqlite_method dvm_sqlite_statement_methods[];
 extern const struct dvm_sqlite_field  dvm_sqlite_program_fields[];

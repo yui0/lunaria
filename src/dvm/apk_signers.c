@@ -101,7 +101,9 @@ static int scheme(struct bytes b, int v3, unsigned sdk,
          goto bad;
       if (v3 && (!number(&data, &signed_min) || !number(&data, &signed_max) ||
                  signed_min != min || signed_max != max)) goto bad;
-      if (!slice(&data, &attrs) || data.n || !slice(&certs, &der)) goto bad;
+      /* Trailing bytes after the attributes are ignored, as AOSP's verifier does:
+       * signers in the wild (Google Play services) append an empty field. */
+      if (!slice(&data, &attrs) || !slice(&certs, &der)) goto bad;
       X509 *cert = certificate(der);
       if (!cert) goto bad;
       if (!sk_X509_push(list, cert)) { X509_free(cert); goto bad; }

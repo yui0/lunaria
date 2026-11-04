@@ -3651,32 +3651,32 @@ int luna_application_start(struct jvm *jvm,const char *manifest_class,
    *base_out=NULL;*application_out=NULL;
    char name[512];
    const char *source=manifest_class && *manifest_class ? manifest_class : "android/app/Application";
-   size_t n=strlen(source);if(n>=sizeof name)return -1;
+   size_t n=strlen(source);if(n>=sizeof name){fprintf(stderr,"[application] %s: start failed at step 1\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
    for(size_t i=0;i<=n;++i)name[i]=source[i]=='.' ? '/' : source[i];
    bool custom=strcmp(name,"android/app/Application")!=0;
-   if(custom && !in_dex(name))return -1;
+   if(custom && !in_dex(name)){fprintf(stderr,"[application] %s: start failed at step 2\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
    jclass context=jvm->native.FindClass(&jvm->env,"android/app/ContextImpl");
-   if(!context || jvm->native.ExceptionCheck(&jvm->env))return -1;
+   if(!context || jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 3\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
    jobject base=jvm->native.AllocObject(&jvm->env,context);
-   if(!base || jvm->native.ExceptionCheck(&jvm->env))return -1;
-   if (!dvm_jni_bind_application(&jvm->env,base,NULL)) return -1;
+   if(!base || jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 4\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
+   if (!dvm_jni_bind_application(&jvm->env,base,NULL)) {fprintf(stderr,"[application] %s: start failed at step 5\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
    jclass cls=jvm->native.FindClass(&jvm->env,name);
-   if(!cls || jvm->native.ExceptionCheck(&jvm->env))return -1;
+   if(!cls || jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 6\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
    jmethodID ctor=jvm->native.GetMethodID(&jvm->env,cls,"<init>","()V");
-   if(!ctor || jvm->native.ExceptionCheck(&jvm->env))return -1;
+   if(!ctor || jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 7\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
    jobject application=jvm->native.NewObjectA(&jvm->env,cls,ctor,NULL);
-   if(!application || jvm->native.ExceptionCheck(&jvm->env))return -1;
+   if(!application || jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 8\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
    jmethodID attach=jvm->native.GetMethodID(&jvm->env,cls,"attachBaseContext",
                                            "(Landroid/content/Context;)V");
-   if(!attach || jvm->native.ExceptionCheck(&jvm->env))return -1;
+   if(!attach || jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 9\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
    jvalue arg={.l=base};
    jvm->native.CallVoidMethodA(&jvm->env,application,attach,&arg);
-   if(jvm->native.ExceptionCheck(&jvm->env))return -1;
-   if (!dvm_jni_bind_application(&jvm->env,base,application)) return -1;
-   if(providers(jvm,application)<0 || jvm->native.ExceptionCheck(&jvm->env))return -1;
+   if(jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 10\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
+   if (!dvm_jni_bind_application(&jvm->env,base,application)) {fprintf(stderr,"[application] %s: start failed at step 11\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
+   if(providers(jvm,application)<0 || jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 12\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
    jmethodID create=jvm->native.GetMethodID(&jvm->env,cls,"onCreate","()V");
-   if(!create || jvm->native.ExceptionCheck(&jvm->env))return -1;
+   if(!create || jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 13\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
    jvm->native.CallVoidMethodA(&jvm->env,application,create,NULL);
-   if(jvm->native.ExceptionCheck(&jvm->env))return -1;
+   if(jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 14\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
    *base_out=base;*application_out=application;return 0;
 }

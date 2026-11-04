@@ -1995,6 +1995,17 @@ void luna_process_channel_close(struct luna_process_channel *);
  * Guest PID ranges are disjoint, each reserving 4096 thread IDs. */
 struct luna_process_pool *luna_process_pool_open(const char *executable,const char *mode,
                                                 uint32_t parent_pid,uint32_t first_pid);
+/* A pool whose children are another installed package's component host:
+ * each is exec'd as `executable --service-host host_apk` (the launcher prepares
+ * the package, then runs it with control fd 3).  The process name is the
+ * package name and the process runs as `guest_uid` (LUNARIA_GUEST_UID).
+ * `first_pid` must not overlap another pool's range. */
+struct luna_process_pool *luna_process_pool_open_host(const char *executable,const char *host_apk,
+                                                     uint32_t guest_uid,uint32_t parent_pid,uint32_t first_pid);
+/* Whether a host named `name` is alive in the pool (sending to it would not start one). */
+int luna_process_pool_running(struct luna_process_pool *,const char *name);
+/* Send to an existing host PID; never start a replacement process. */
+int luna_process_pool_send_to_host(struct luna_process_pool *,uint32_t host_pid,const void *data,size_t size);
 int luna_process_pool_send(struct luna_process_pool *,const char *process,
                             const void *,size_t,uint32_t *guest_pid);
 /* A reply callback may enqueue another message, including to another VM.

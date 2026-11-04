@@ -3394,10 +3394,16 @@ static bool view_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
    return am_vcall(vm,self,"onDrawForeground","(Landroid/graphics/Canvas;)V",(union dvm_value *)args,1,out);
 }
 
+/* While a ViewGroup's own picture is captured for the overlay, its children are
+ * left out of it: each child is its own element of the document, and drawing it
+ * here as well would show it twice. */
+static bool g_ui_capture_without_children;
+
 static bool vg_draw_child(struct dvm *vm,dvm_ref self,const union dvm_value *args,
                            int nargs,union dvm_value *out)
 {
    (void)nargs;
+   if (g_ui_capture_without_children) { if (out) out->i=0; return true; }
    dvm_ref canvas=ARG(0).l,child=ARG(1).l;
    if (!canvas || !child) {dvm__throw(vm,"java/lang/NullPointerException","drawChild"); return false;}
    /* View.draw(canvas,parent,time) returns continued Animation work, not
@@ -3967,7 +3973,11 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
       union dvm_value clip[4]={{.i=area[0]},{.i=area[1]},{.i=area[2]},{.i=area[3]}};
       if (!am_vcall(vm,canvas,"clipRect","(IIII)Z",clip,4,&ignored)) return NULL;
    }
-   if (!am_vcall(vm,view,"draw","(Landroid/graphics/Canvas;)V",&argument,1,&ignored)) return NULL;
+   const bool own_picture_only=ui_is_a(vm,view,"android/view/ViewGroup");
+   if (own_picture_only) g_ui_capture_without_children=true;
+   const bool drawn=am_vcall(vm,view,"draw","(Landroid/graphics/Canvas;)V",&argument,1,&ignored);
+   if (own_picture_only) g_ui_capture_without_children=false;
+   if (!drawn) return NULL;
    (void)dvm_set_field(vm,view,"drawingSeq","I",(union dvm_value){.i=(int32_t)g_ui_build_seq});
    uint64_t publish_started=ui_render_ns();
    if(!bm->overlay_key[0]) {

@@ -120,10 +120,30 @@
 
 # ---------------------------------------------------------------------------
 # PackageManager and `pm list packages` report the device's package database:
-# the packages preinstalled on the emulated Pixel image (Play Store, Play
-# services, Chrome, system apps), with the running APK as its own row.
+# the packages preinstalled on the emulated Pixel image (Play Store, Chrome,
+# system apps), with the running APK as its own row.
 # A title's anti-tamper layer asks for those packages; a device without them
 # is not a retail device.
+#
+# LUNARIA_PACKAGES chooses the device's package list:
+#   default                the built-in Pixel image (the default)
+#   none                   only the running app
+#   /path/to/ledger.txt    a ledger file, one package per line
+#   a;b;c                  an inline list; each item is one of
+#                            default            the built-in image
+#                            -com.android.chrome  drop a package
+#                            <package> [uid] [flags] [sourceDir] [version/code]
+# Google Play services is in the built-in image, as on a Pixel, but Lunaria
+# ships no Google-signed APK: the package is an empty archive until you put a
+# genuine one at <device-root>/product/priv-app/PrebuiltGmsCore/PrebuiltGmsCore.apk
+# (apps verify its Google signature).  For a device without it:
+#LUNARIA_PACKAGES=default;-com.google.android.gms;-com.google.android.gsf
+# LUNARIA_PACKAGES_EXTRA=a.b.c;d.e.f   more packages on top (names or ledger lines)
+#
+# A Service of another installed package is bound in that package's own process
+# (its genuine APK must be at its ledger path; the process is started on first
+# use).  Packages that may be hosted this way, separated by ',' or ';':
+#LUNARIA_SERVICE_HOSTS=com.android.vending,com.google.android.gms
 # LUNARIA_TRACE_PM=1 prints the installed-package ledger.
 
 # -- WebView ------------------------------------------------------------------

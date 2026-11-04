@@ -228,6 +228,10 @@ int lunaria_android_package_at(size_t index,
                                struct lunaria_android_package *out);
 int lunaria_android_package_find(const char *name,
                                  struct lunaria_android_package *out);
+/* Adds an installed package to the ledger (a peer's package, learned over
+ * Binder), with its APK at `host_apk` shown at its sourceDir.  A name already
+ * present is kept unchanged. */
+int lunaria_android_package_install(const char *name, uint32_t uid, const char *host_apk);
 
 /* Package visibility, as Android 11 defines it for PackageManager queries.
  *

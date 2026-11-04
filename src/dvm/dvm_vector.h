@@ -516,6 +516,134 @@ static bool activity_csv_has(const char *csv, const char *word)
    return false;
 }
 
+/* IntentFilter data matching.  A filter's <data> elements, in the row's
+ * escaped form ("key=value,key=value;..."), are merged into lists of schemes,
+ * authorities (host and optional port), paths and MIME types; an intent
+ * matches when each list the filter has holds a match for it, the way
+ * IntentFilter.matchData does. */
+static char *filter_spec_unescape(const char *s, size_t n)
+{
+   char *o = malloc(n + 1), *w = o;
+   if (!o) return NULL;
+   for (size_t i = 0; i < n; ) {
+      unsigned v;
+      if (s[i] == '%' && i + 2 < n && sscanf(s + i + 1, "%2x", &v) == 1) { *w++ = (char)v; i += 3; }
+      else *w++ = s[i++];
+   }
+   *w = 0;
+   return o;
+}
+/* Glob pattern as PatternMatcher.PATTERN_SIMPLE_GLOB: '*' repeats the previous
+ * character, '.*' matches anything, '\' quotes. */
+static bool filter_glob(const char *pat, const char *s)
+{
+   while (*pat) {
+      int c = (unsigned char)*pat;
+      if (c == '\\' && pat[1]) { ++pat; c = (unsigned char)*pat; }
+      if (pat[1] == '*' && !(c == '.')) {
+         ++pat;
+         for (;;) {   /* zero or more of c */
+            if (filter_glob(pat + 1, s)) return true;
+            if ((unsigned char)*s != c) return false;
+            ++s;
+         }
+      }
+      if (c == '.' && pat[1] == '*') {
+         pat += 2;
+         if (!*pat) return true;
+         for (; *s; ++s) if (filter_glob(pat, s)) return true;
+         return filter_glob(pat, s);
+      }
+      if (c != '.' && (unsigned char)*s != c) return false;
+      if (c == '.' && !*s) return false;
+      if (!*s) return false;
+      ++pat; ++s;
+   }
+   return !*s;
+}
+static bool filter_mime_match(const char *want, const char *have)
+{
+   if (!want || !have) return false;
+   if (!strcmp(want, "*/*") || !strcmp(want, have)) return true;
+   const char *ws = strchr(want, '/'), *hs = strchr(have, '/');
+   return ws && hs && !strcmp(ws, "/*") && (size_t)(ws - want) == (size_t)(hs - have) && !strncmp(want, have, (size_t)(ws - want));
+}
+static bool filter_data_matches(struct dvm *vm, const char *specs, dvm_ref data, const char *type)
+{
+   bool any_scheme = false, any_auth = false, any_path = false, any_type = false;
+   bool scheme_ok = false, auth_ok = false, path_ok = false, type_ok = false;
+   char *scheme = NULL, *host = NULL, *path = NULL;
+   int port = -1;
+   if (data) {
+      union dvm_value v = { 0 };
+      if (am_vcall(vm, data, "getScheme", "()Ljava/lang/String;", NULL, 0, &v) && v.l) scheme = strdup(dvm_string_utf8(vm, v.l));
+      v.l = 0;
+      if (am_vcall(vm, data, "getHost", "()Ljava/lang/String;", NULL, 0, &v) && v.l) host = strdup(dvm_string_utf8(vm, v.l));
+      v.l = 0;
+      if (am_vcall(vm, data, "getPath", "()Ljava/lang/String;", NULL, 0, &v) && v.l) path = strdup(dvm_string_utf8(vm, v.l));
+      v.i = -1;
+      if (am_vcall(vm, data, "getPort", "()I", NULL, 0, &v)) port = v.i;
+      if (dvm_exception(vm)) dvm_clear_exception(vm);
+   }
+   for (const char *e = specs; e && *e; ) {
+      const char *end = strchr(e, ';');
+      size_t len = end ? (size_t)(end - e) : strlen(e);
+      char *fh = NULL, *fp = NULL;
+      for (const char *kv = e; kv < e + len; ) {
+         const char *comma = memchr(kv, ',', (size_t)(e + len - kv));
+         size_t klen = comma ? (size_t)(comma - kv) : (size_t)(e + len - kv);
+         const char *eq = memchr(kv, '=', klen);
+         if (eq) {
+            char *key = luna_strndup(kv, (size_t)(eq - kv)), *val = filter_spec_unescape(eq + 1, klen - (size_t)(eq - kv) - 1);
+            if (key && val) {
+               if (!strcmp(key, "scheme")) { any_scheme = true; scheme_ok |= scheme && !strcasecmp(scheme, val); }
+               else if (!strcmp(key, "mimeType")) { any_type = true; type_ok |= type && filter_mime_match(val, type); }
+               else if (!strcmp(key, "host")) { free(fh); fh = val; val = NULL; }
+               else if (!strcmp(key, "port")) { free(fp); fp = val; val = NULL; }
+               else if (!strcmp(key, "path")) { any_path = true; path_ok |= path && !strcmp(path, val); }
+               else if (!strcmp(key, "pathPrefix")) { any_path = true; path_ok |= path && !strncmp(path, val, strlen(val)); }
+               else if (!strcmp(key, "pathSuffix")) {
+                  any_path = true;
+                  size_t pl = path ? strlen(path) : 0, vl = strlen(val);
+                  path_ok |= path && pl >= vl && !strcmp(path + pl - vl, val);
+               }
+               else if (!strcmp(key, "pathPattern") || !strcmp(key, "pathAdvancedPattern")) { any_path = true; path_ok |= path && filter_glob(val, path); }
+            }
+            free(key); free(val);
+         }
+         kv = comma ? comma + 1 : e + len;
+      }
+      if (fh) {
+         any_auth = true;
+         bool host_ok = host && (!strcmp(fh, "*") || (fh[0] == '*' && fh[1] == '.' ? strlen(host) > strlen(fh) - 1 &&
+                                 !strcasecmp(host + strlen(host) - (strlen(fh) - 1), fh + 1) : !strcasecmp(fh, host)));
+         bool port_ok = !fp || (port >= 0 && port == atoi(fp));
+         auth_ok |= host_ok && port_ok;
+      }
+      free(fh); free(fp);
+      e = end ? end + 1 : NULL;
+   }
+   free(scheme); free(host); free(path);
+   if (!any_scheme && !any_type) return !data && !type;
+   if (any_scheme) {
+      if (!scheme_ok) return false;
+      if (any_auth && !auth_ok) return false;
+      /* Paths are looked at only under an authority (IntentFilter.matchData). */
+      if (any_auth && any_path && !path_ok) return false;
+   } else if (data) {
+      /* Only types: the data must be absent or a content:/file: uri. */
+      union dvm_value v = { 0 };
+      bool local = false;
+      if (am_vcall(vm, data, "getScheme", "()Ljava/lang/String;", NULL, 0, &v) && v.l) {
+         const char *sc = dvm_string_utf8(vm, v.l);
+         local = sc && (!strcmp(sc, "content") || !strcmp(sc, "file"));
+      }
+      if (!local) return false;
+   }
+   if (any_type) return type_ok;
+   return !type;
+}
+
 static bool activity_filter_matches(struct dvm *vm, dvm_ref intent,
                                     const char *component, int flags, int *priority)
 {
@@ -524,16 +652,19 @@ static bool activity_filter_matches(struct dvm *vm, dvm_ref intent,
    dvm_get_field(vm,intent,"categories","Ljava/util/Set;",&categories);
    dvm_get_field(vm,intent,"data","Landroid/net/Uri;",&data);
    dvm_get_field(vm,intent,"type","Ljava/lang/String;",&type);
-   /* URI/MIME matching needs the full data specification, not a match-all. */
-   if (data.l || type.l) return false;
    const char *text=getenv("ANDROID_ACTIVITY_FILTERS");
    char *copy=text ? strdup(text) : NULL;
    bool matched=false;
    for (char *p=copy, *row; p && (row=luna_strsep(&p,"\n"));) {
       char *name=luna_strsep(&row,"|"), *actions=luna_strsep(&row,"|"), *cats=luna_strsep(&row,"|");
-      char *data = luna_strsep(&row,"|");
-      int candidate_priority = row ? atoi(row) : 0;
-      if (!data || !actions || !cats || strcmp(name,component) || atoi(data)) continue;
+      char *data_flag = luna_strsep(&row,"|");
+      char *priority_text = luna_strsep(&row,"|");
+      const char *specs = row ? row : "";
+      int candidate_priority = priority_text ? atoi(priority_text) : 0;
+      if (!data_flag || !actions || !cats || strcmp(name,component)) continue;
+      /* A filter that declares <data> without a spec we can read cannot match an Intent that has none. */
+      if (atoi(data_flag) && !*specs && !data.l && !type.l) continue;
+      if (!filter_data_matches(vm, atoi(data_flag) ? specs : "", data.l, type.l ? dvm_string_utf8(vm, type.l) : NULL)) continue;
       if (action.l && !activity_csv_has(actions,dvm_string_utf8(vm,action.l))) continue;
       if ((flags & 0x10000) && !activity_csv_has(cats,"android.intent.category.DEFAULT")) continue;
       struct rt_list *requested=categories.l ? list_of(vm,categories.l) : NULL;
@@ -589,7 +720,7 @@ static bool pm_queryIntentActivities(struct dvm *vm, dvm_ref self,
       if (flags & PM_GET_META_DATA) {
          union dvm_value bundle={0};
          dvm_get_field(vm,info,"metaData","Landroid/os/Bundle;",&bundle);
-         manifest_bundle_fill(vm,bundle.l,arm_exec_apk_component_meta_keys(name));
+         manifest_bundle_fill(vm,bundle.l,arm_exec_apk_component_meta_keys(name), name);
       }
       dvm_set_field(vm,resolve,"priority","I",(union dvm_value){.i=priority});
       dvm_set_field(vm,resolve,"activityInfo","Landroid/content/pm/ActivityInfo;",(union dvm_value){.l=info});

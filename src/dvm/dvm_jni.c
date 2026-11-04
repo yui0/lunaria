@@ -563,6 +563,27 @@ static uint8_t *dvm_buffer_bytes(struct dvm *vm, dvm_ref r, uint32_t *len)
    return dvm_array_data(vm, bufv.l);
 }
 
+/* The buffer's backing byte[] object. */
+static struct dvm_object *dvm_buffer_array(struct dvm *vm, dvm_ref r)
+{
+   union dvm_value bufv = { 0 };
+   if (!dvm_get_field(vm, r, "buf", "[B", &bufv) || !bufv.l) return NULL;
+   return dvm__obj(vm, bufv.l);
+}
+
+/* The array's storage is borrowed (caller-owned native memory): nothing to free. */
+static void native_buffer_data_release(void *data) { (void)data; }
+
+/* A direct buffer whose bytes live in its guest region.  The region is held by a
+ * global reference to the buffer's handle for as long as the byte[] lives, and
+ * given back when the byte[] is collected. */
+static void direct_region_release(void *handle)
+{
+   JNIEnv *env = current_env();
+   if (env) (*env)->DeleteGlobalRef(env, (jobject)(uintptr_t)handle);
+   arm_exec_release_guest_direct_buffer((uint32_t)(uintptr_t)handle);
+}
+
 /* The guest-backed handle for this buffer, allocated once and remembered on
  * the object, with the VM's bytes copied into it. */
 static uint32_t dvm_direct_buffer_to_host(struct dvm *vm, dvm_ref r)
@@ -585,6 +606,20 @@ static uint32_t dvm_direct_buffer_to_host(struct dvm *vm, dvm_ref r)
    uint64_t cap = 0;
    void *dst = arm_exec_direct_buffer_host(handle, &cap);
    if (dst && dst!=src && cap) memcpy(dst, src, cap < len ? (size_t)cap : (size_t)len);
+   /* From here the buffer *is* the guest region: a direct buffer's bytes are one
+    * piece of memory that Java and native code both see, as on a device.  A
+    * native that was handed only the buffer's address (Conscrypt reads and writes
+    * through `long` pointers) never crosses the bridge again, so copying around
+    * calls would leave each side looking at stale bytes. */
+   struct dvm_object *array = dst && cap >= len ? dvm_buffer_array(vm, r) : NULL;
+   JNIEnv *env = current_env();
+   if (array && array->data == src && array->data_destroy != direct_region_release && env &&
+       (*env)->NewGlobalRef(env, (jobject)(uintptr_t)handle)) {
+      free(array->data);
+      array->data = dst;
+      array->data_owner = (void *)(uintptr_t)handle;
+      array->data_destroy = direct_region_release;
+   }
    return handle;
 }
 
@@ -606,7 +641,6 @@ static void dvm_direct_buffer_from_host(struct dvm *vm, dvm_ref r)
 /* NewDirectByteBuffer wraps caller-owned native storage. Its Java view must
  * alias those bytes, rather than becoming an opaque object or a copy whose
  * writes cannot be observed by native code. */
-static void native_buffer_data_release(void *data) { (void)data; }
 static dvm_ref native_buffer_import(struct dvm *vm,JNIEnv *env,jobject host,
                                      void *address,uint64_t capacity)
 {
@@ -1198,11 +1232,23 @@ static void dvm_fill_registered_application_info(
    (void)dvm_set_field(vm, ai, "uid", "I", v);
    v.i = record->flags;
    (void)dvm_set_field(vm, ai, "flags", "I", v);
+   /* Installed and not disabled; the field default (false) reads as
+    * SERVICE_DISABLED to Google Play services' availability check. */
+   v.i = 1;
+   (void)dvm_set_field(vm, ai, "enabled", "Z", v);
    v.l = dvm_new_string(vm, record->source_dir);
    (void)dvm_set_field(vm, ai, "sourceDir", "Ljava/lang/String;", v);
    (void)dvm_set_field(vm, ai, "publicSourceDir", "Ljava/lang/String;", v);
    v.l = dvm_new_string(vm, record->data_dir);
    (void)dvm_set_field(vm, ai, "dataDir", "Ljava/lang/String;", v);
+   (void)dvm_set_field(vm, ai, "credentialProtectedDataDir", "Ljava/lang/String;", v);
+   {
+      /* Every package has a device-protected (direct boot) data directory too. */
+      char de[512];
+      snprintf(de, sizeof de, "/data/user_de/0/%s", record->name);
+      v.l = dvm_new_string(vm, de);
+      (void)dvm_set_field(vm, ai, "deviceProtectedDataDir", "Ljava/lang/String;", v);
+   }
    v.l = dvm_new_string(vm, record->lib_dir ? record->lib_dir : "");
    (void)dvm_set_field(vm, ai, "nativeLibraryDir", "Ljava/lang/String;", v);
 }
@@ -1355,9 +1401,9 @@ static bool hook_call_external_inner(void *user, struct dvm *vm, const char *cla
       (void)dvm_set_field(vm, pi, "versionCode", "I", v);
       v.l = vname ? dvm_new_string(vm, vname) : 0;
       (void)dvm_set_field(vm, pi, "versionName", "Ljava/lang/String;", v);
-      if (self_pkg && !strcmp(self_pkg, record.name))
-         (void)dvm_package_info_add_signatures(vm, pi,
-                                               nargs > 1 ? (uint32_t)args[1].i : 0);
+      (void)dvm_package_info_add_signatures(
+         vm, pi, nargs > 1 ? (uint32_t)args[1].i : 0,
+         self_pkg && !strcmp(self_pkg, record.name) ? NULL : record.source_dir);
       dvm_pin(vm, pi);
       out->l = pi;
       return true;
@@ -2102,6 +2148,16 @@ static bool dvm_jni_invoke_locked(JNIEnv *env, const char *class_name, const cha
    return true;
 }
 
+void dvm_jni_attach_activity(JNIEnv *env, jobject activity)
+{
+   struct dvm *vm = dvm_jni_vm();
+   if (!vm || !env || !activity) return;
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   dvm_ref ref = from_jobject(vm, env, activity);
+   if (ref) dvm__activity_attach(vm, ref);
+   dvm_gil_leave_to_guest(vm, cookie);
+}
+
 void dvm_jni_show_activity(JNIEnv *env, jobject activity)
 {
    struct dvm *vm = dvm_jni_vm();
@@ -2375,11 +2431,13 @@ bool dvm_jni_class_assignable_locked(const char *sub, const char *sup)
     * VM synthesises an external class whose super is java/lang/Object and
     * whose interface list is empty, and class_assignable() would then report
     * "not assignable" for a relationship the framework really has. */
-   if (!dvm_class_is_known(vm, sub) || !dvm_class_is_known(vm, sup))
-      return false;
+   /* A platform class the VM provides itself (java.nio.DirectByteBuffer, say) has
+    * its place in the hierarchy too, but it is only materialised the first time
+    * something asks for it.  Ask, and trust the answer if the class has a real
+    * definition -- not the external placeholder made for a name nothing defines. */
    struct dvm_class *a = dvm_find_class(vm, sub);
    struct dvm_class *b = dvm_find_class(vm, sup);
-   if (!a || !b)
+   if (!a || !b || a->external || b->external)
       return false;
    return dvm__class_assignable(vm, a, b);
 }

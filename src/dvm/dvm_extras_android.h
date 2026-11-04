@@ -821,6 +821,353 @@ static dvm_ref x_find_provider(struct dvm *vm, const char *wanted)
    return 0;
 }
 
+/* ---- Providers in other processes ---------------------------------------
+ *
+ * An authority this process does not serve belongs to another installed package.
+ * The device finds its owner from the manifests of the packages run as component
+ * hosts (without starting them), asks that package's process to run the
+ * operation against its own provider, and brings the answer back: a Cursor as a
+ * snapshot, a Bundle as a parcel.  Request body (little-endian):
+ *   u32 operation | uri string | operation arguments
+ *     query:   projection[] | selection | selectionArgs[] | sortOrder
+ *     call:    method | arg | u32 length + extras Bundle parcel (0 = null)
+ *     getType: (none)
+ * with a string written as u32 length + bytes (0xFFFFFFFF is null) and a string
+ * array as i32 count (-1 is null) + strings.  The reply's status is 0 with a
+ * payload, 1 for a null result, or a negative errno. */
+enum { PQ_QUERY = 1, PQ_CALL = 2, PQ_GET_TYPE = 3, PQ_INSERT = 4, PQ_UPDATE = 5, PQ_DELETE = 6 };
+
+struct pq_writer { uint8_t *p; size_t n, cap; bool failed; };
+static void pq_put(struct pq_writer *w, const void *src, size_t n)
+{
+   if (w->failed) return;
+   if (w->n + n > w->cap) {
+      size_t cap = w->cap ? w->cap : 256;
+      while (cap < w->n + n) cap *= 2;
+      uint8_t *grown = realloc(w->p, cap);
+      if (!grown) { w->failed = true; return; }
+      w->p = grown; w->cap = cap;
+   }
+   memcpy(w->p + w->n, src, n);
+   w->n += n;
+}
+static void pq_u32(struct pq_writer *w, uint32_t v) { uint8_t b[4]; bput(b, v); pq_put(w, b, 4); }
+static void pq_string(struct dvm *vm, struct pq_writer *w, dvm_ref s)
+{
+   if (!s) { pq_u32(w, 0xFFFFFFFFu); return; }
+   const char *text = dvm_string_utf8(vm, s);
+   const size_t n = text ? strlen(text) : 0;
+   pq_u32(w, (uint32_t)n);
+   pq_put(w, text, n);
+}
+static void pq_strings(struct dvm *vm, struct pq_writer *w, dvm_ref array)
+{
+   struct dvm_object *o = array ? dvm__obj(vm, array) : NULL;
+   if (!o || o->kind != DVM_OBJ_ARRAY) { pq_u32(w, 0xFFFFFFFFu); return; }
+   pq_u32(w, o->length);
+   for (uint32_t i = 0; i < o->length; ++i) pq_string(vm, w, ((dvm_ref *)o->data)[i]);
+}
+
+struct pq_reader { const uint8_t *p, *end; bool failed; };
+static uint32_t pq_get32(struct pq_reader *r)
+{
+   if (r->end - r->p < 4) { r->failed = true; return 0; }
+   const uint32_t v = bget(r->p);
+   r->p += 4;
+   return v;
+}
+static dvm_ref pq_get_string(struct dvm *vm, struct pq_reader *r)
+{
+   const uint32_t n = pq_get32(r);
+   if (r->failed || n == 0xFFFFFFFFu) return 0;
+   if ((size_t)(r->end - r->p) < n) { r->failed = true; return 0; }
+   dvm_ref s = dvm_new_string_n(vm, (const char *)r->p, n);
+   r->p += n;
+   return s;
+}
+static dvm_ref pq_get_strings(struct dvm *vm, struct pq_reader *r)
+{
+   const uint32_t n = pq_get32(r);
+   if (r->failed || n == 0xFFFFFFFFu) return 0;
+   if (n > (size_t)(r->end - r->p) / 4) { r->failed = true; return 0; }
+   dvm_ref array = dvm_new_array(vm, 'L', "Ljava/lang/String;", n);
+   if (!array) { r->failed = true; return 0; }
+   dvm_pin(vm, array);
+   for (uint32_t i = 0; i < n && !r->failed; ++i) {
+      dvm_ref item = pq_get_string(vm, r);
+      ((dvm_ref *)dvm_array_data(vm, array))[i] = item;
+   }
+   dvm_unpin(vm, array);
+   return array;
+}
+
+/* A Bundle <-> a parcel's bytes (0 length is null). */
+static bool pq_bundle_out(struct dvm *vm, struct pq_writer *w, dvm_ref bundle)
+{
+   if (!bundle) { pq_u32(w, 0); return true; }
+   union dvm_value parcel = {0};
+   if (!parcel_obtain(vm, 0, NULL, 0, &parcel) || !parcel.l) return false;
+   dvm_pin(vm, parcel.l);
+   struct rt_parcel *p = parcel_of(vm, parcel.l);
+   bool ok = p && parcel_write_bundle(vm, parcel.l, p, bundle) && !p->failed && !dvm_exception(vm);
+   if (ok) { pq_u32(w, p->size); pq_put(w, p->buf, p->size); }
+   union dvm_value ignored = {0};
+   (void)parcel_recycle(vm, parcel.l, NULL, 0, &ignored);
+   dvm_unpin(vm, parcel.l);
+   return ok;
+}
+static dvm_ref pq_bundle_in_as(struct dvm *vm, const uint8_t *bytes, size_t size, const char *desc)
+{
+   if (!size) return 0;
+   dvm_ref parcel = binder_parcel_from(vm, bytes, size);
+   struct rt_parcel *p = parcel ? parcel_of(vm, parcel) : NULL;
+   dvm_ref bundle = 0;
+   if (p) {
+      dvm_pin(vm, parcel);
+      if (!parcel_read_bundle_as(vm, parcel, p, &bundle, desc)) bundle = 0;
+      dvm_unpin(vm, parcel);
+   }
+   return bundle;
+}
+static dvm_ref pq_bundle_in(struct dvm *vm, const uint8_t *bytes, size_t size)
+{
+   return pq_bundle_in_as(vm, bytes, size, "Landroid/os/Bundle;");
+}
+
+/* The authorities each component host's manifest declares, read once. */
+struct pq_authorities { char package[256]; char *list; };
+static struct pq_authorities g_pq_authorities[8];
+static int g_npq_authorities;
+
+static const char *pq_package_authorities(const char *package)
+{
+   for (int i = 0; i < g_npq_authorities; ++i)
+      if (!strcmp(g_pq_authorities[i].package, package)) return g_pq_authorities[i].list;
+   if (g_npq_authorities >= 8) return NULL;
+   struct lunaria_android_package record;
+   char host[4096];
+   char *list = NULL;
+   if (!lunaria_android_package_find(package, &record) || !record.source_dir ||
+       !arm_exec_map_guest_path(record.source_dir, host, sizeof host) ||
+       luna_apk_content_authorities(host, &list) < 0)
+      list = strdup("");        /* no readable APK: it owns nothing, and is not asked again */
+   if (!list) return NULL;
+   snprintf(g_pq_authorities[g_npq_authorities].package, sizeof g_pq_authorities[0].package, "%s", package);
+   g_pq_authorities[g_npq_authorities].list = list;
+   ++g_npq_authorities;
+   return list;
+}
+
+/* The component host that owns `authority`, as a malloc'd package name, or NULL. */
+static char *pq_owner(const char *authority)
+{
+   const char *self = getenv("ANDROID_PACKAGE_NAME");
+   const char *cursor = NULL;
+   char host[256];
+   const size_t n = strlen(authority);
+   while (svc_next_host(&cursor, host, sizeof host)) {
+      if (self && !strcmp(host, self)) continue;
+      const char *list = pq_package_authorities(host);
+      for (const char *e = list; e && *e; ) {
+         const char *end = strchr(e, ';');
+         const size_t len = end ? (size_t)(end - e) : strlen(e);
+         if (len == n && !memcmp(e, authority, n)) return strdup(host);
+         e = end ? end + 1 : NULL;
+      }
+   }
+   return NULL;
+}
+
+/* Runs one operation against the owner process.  *handled is false when no
+ * component host owns the authority (the caller reports "no such provider"). */
+static bool x_provider_remote(struct dvm *vm, uint32_t operation, const union dvm_value *args,
+                              union dvm_value *out, bool *handled)
+{
+   *handled = false;
+   union dvm_value authority = {0}, uri_text = {0};
+   if (!am_vcall(vm, args[0].l, "getAuthority", "()Ljava/lang/String;", NULL, 0, &authority) || !authority.l) return true;
+   const char *name = dvm_string_utf8(vm, authority.l);
+   char *owner = name ? pq_owner(name) : NULL;
+   if (!owner) return true;
+   *handled = true;
+   if (!am_vcall(vm, args[0].l, "toString", "()Ljava/lang/String;", NULL, 0, &uri_text)) { free(owner); return false; }
+   struct pq_writer w = {0};
+   pq_u32(&w, operation);
+   pq_string(vm, &w, uri_text.l);
+   bool ok = true;
+   if (operation == PQ_QUERY) {
+      pq_strings(vm, &w, args[1].l); pq_string(vm, &w, args[2].l);
+      pq_strings(vm, &w, args[3].l); pq_string(vm, &w, args[4].l);
+   } else if (operation == PQ_CALL) {
+      pq_string(vm, &w, args[1].l); pq_string(vm, &w, args[2].l);
+      ok = pq_bundle_out(vm, &w, args[3].l);
+   } else if (operation == PQ_INSERT) {
+      ok = pq_bundle_out(vm, &w, args[1].l);
+   } else if (operation == PQ_UPDATE) {
+      ok = pq_bundle_out(vm, &w, args[1].l);
+      pq_string(vm, &w, args[2].l); pq_strings(vm, &w, args[3].l);
+   } else if (operation == PQ_DELETE) {
+      pq_string(vm, &w, args[1].l); pq_strings(vm, &w, args[2].l);
+   }
+   if (!ok || w.failed) { free(w.p); free(owner); return false; }
+   int32_t status = 0; uint8_t *payload = NULL; size_t psize = 0;
+   const int rc = dvm_binder_request(vm, owner, "LBQ1", w.p, w.n, &status, &payload, &psize);
+   free(w.p);
+   if (rc < 0) {
+      dvm__throw(vm, "android/os/DeadObjectException", "content provider process %s: %s", owner, strerror(-rc));
+      free(owner);
+      return false;
+   }
+   free(owner);
+   out->l = 0;
+   if (status < 0) {
+      free(payload);
+      dvm__throw(vm, "java/lang/IllegalArgumentException", "Unknown content provider %s", name);
+      return false;
+   }
+   if (status == 0 && operation == PQ_QUERY) out->l = dvm_sqlite_cursor_from_snapshot(vm, payload, psize);
+   else if (status == 0 && operation == PQ_CALL) out->l = pq_bundle_in(vm, payload, psize);
+   else if (status == 0 && operation == PQ_GET_TYPE) out->l = dvm_new_string_n(vm, (const char *)payload, psize);
+   else if (status == 0 && operation == PQ_INSERT && psize) {
+      union dvm_value text = { .l = dvm_new_string_n(vm, (const char *)payload, psize) }, uri = {0};
+      struct dvm_class *uc = dvm__class_by_desc(vm, "Landroid/net/Uri;");
+      struct dvm_method *parse = uc ? dvm_find_method(vm, uc, "parse", "(Ljava/lang/String;)Landroid/net/Uri;") : NULL;
+      if (text.l && parse && dvm_call(vm, parse, 0, &text, 1, &uri)) out->l = uri.l;
+   } else if (status == 0 && (operation == PQ_UPDATE || operation == PQ_DELETE) && psize >= 4)
+      out->i = (int32_t)bget(payload);
+   free(payload);
+   return !dvm_exception(vm);
+}
+
+/* The owner side: run the operation against this process's own provider. */
+static int x_provider_serve(struct dvm *vm, uint32_t sender, uint32_t seq, const uint8_t *body, size_t size)
+{
+   struct pq_reader r = { body, body + size, false };
+   const uint32_t operation = pq_get32(&r);
+   dvm_ref uri_text = pq_get_string(vm, &r);
+   if (r.failed || !uri_text) return -EINVAL;
+   dvm_pin(vm, uri_text);
+   union dvm_value text = { .l = uri_text }, uri = {0};
+   struct dvm_class *uc = dvm__class_by_desc(vm, "Landroid/net/Uri;");
+   struct dvm_method *parse = uc ? dvm_find_method(vm, uc, "parse", "(Ljava/lang/String;)Landroid/net/Uri;") : NULL;
+   int rc = -EIO;
+   if (parse && dvm_call(vm, parse, 0, &text, 1, &uri) && uri.l) {
+      dvm_pin(vm, uri.l);
+      union dvm_value authority = {0};
+      const char *name = NULL;
+      if (am_vcall(vm, uri.l, "getAuthority", "()Ljava/lang/String;", NULL, 0, &authority) && authority.l)
+         name = dvm_string_utf8(vm, authority.l);
+      dvm_ref provider = name ? x_find_provider(vm, name) : 0;
+      if (!provider) rc = -ENOENT;
+      else {
+         union dvm_value result = {0};
+         bool ok = false;
+         int32_t status = 0;
+         uint8_t *payload = NULL; size_t psize = 0;
+         if (operation == PQ_QUERY) {
+            union dvm_value a[5] = { uri, { .l = pq_get_strings(vm, &r) }, {0}, {0}, {0} };
+            dvm_ref hold[3] = { a[1].l, 0, 0 };
+            a[2].l = pq_get_string(vm, &r); hold[1] = a[2].l;
+            a[3].l = pq_get_strings(vm, &r); hold[2] = a[3].l;
+            a[4].l = pq_get_string(vm, &r);
+            if (a[1].l) dvm_pin(vm, a[1].l);
+            if (a[3].l) dvm_pin(vm, a[3].l);
+            ok = !r.failed && am_vcall(vm, provider, "query",
+               "(Landroid/net/Uri;[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;)Landroid/database/Cursor;",
+               a, 5, &result);
+            if (a[1].l) dvm_unpin(vm, a[1].l);
+            if (a[3].l) dvm_unpin(vm, a[3].l);
+            if (ok && !result.l) status = 1;
+            else if (ok) {
+               void *bytes = NULL; size_t n = 0;
+               if (dvm_sqlite_cursor_snapshot(vm, result.l, (void **)&bytes, &n) == 0) { payload = bytes; psize = n; }
+               else ok = false;
+               union dvm_value ignored = {0};
+               (void)am_vcall(vm, result.l, "close", "()V", NULL, 0, &ignored);
+            }
+         } else if (operation == PQ_CALL) {
+            union dvm_value a[3] = {0};
+            a[0].l = pq_get_string(vm, &r);
+            a[1].l = pq_get_string(vm, &r);
+            const uint32_t blen = pq_get32(&r);
+            if (!r.failed && (size_t)(r.end - r.p) >= blen) a[2].l = pq_bundle_in(vm, r.p, blen);
+            if (a[2].l) dvm_pin(vm, a[2].l);
+            ok = !r.failed && am_vcall(vm, provider, "call",
+               "(Ljava/lang/String;Ljava/lang/String;Landroid/os/Bundle;)Landroid/os/Bundle;", a, 3, &result);
+            if (a[2].l) dvm_unpin(vm, a[2].l);
+            if (ok && !result.l) status = 1;
+            else if (ok) {
+               struct pq_writer w = {0};
+               if (pq_bundle_out(vm, &w, result.l) && !w.failed && w.n >= 4) {
+                  psize = w.n - 4;
+                  payload = malloc(psize ? psize : 1);
+                  if (payload) memcpy(payload, w.p + 4, psize); else ok = false;
+               } else ok = false;
+               free(w.p);
+            }
+         } else if (operation == PQ_INSERT || operation == PQ_UPDATE || operation == PQ_DELETE) {
+            uint32_t blen = 0;
+            union dvm_value a[4] = { uri, {0}, {0}, {0} };
+            if (operation != PQ_DELETE) {
+               blen = pq_get32(&r);
+               if (!r.failed && (size_t)(r.end - r.p) >= blen) {
+                  a[1].l = pq_bundle_in_as(vm, r.p, blen, "Landroid/content/ContentValues;");
+                  r.p += blen;
+               } else r.failed = true;
+               if (a[1].l) dvm_pin(vm, a[1].l);
+            }
+            if (operation == PQ_INSERT) {
+               ok = !r.failed && am_vcall(vm, provider, "insert",
+                  "(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;", a, 2, &result);
+            } else {
+               const int shift = operation == PQ_UPDATE ? 2 : 1;
+               a[shift].l = pq_get_string(vm, &r);
+               dvm_ref hold = a[shift].l;
+               a[shift + 1].l = pq_get_strings(vm, &r);
+               (void)hold;
+               if (a[shift + 1].l) dvm_pin(vm, a[shift + 1].l);
+               ok = !r.failed && (operation == PQ_UPDATE
+                  ? am_vcall(vm, provider, "update",
+                     "(Landroid/net/Uri;Landroid/content/ContentValues;Ljava/lang/String;[Ljava/lang/String;)I", a, 4, &result)
+                  : am_vcall(vm, provider, "delete",
+                     "(Landroid/net/Uri;Ljava/lang/String;[Ljava/lang/String;)I", a, 3, &result));
+               if (a[shift + 1].l) dvm_unpin(vm, a[shift + 1].l);
+               if (ok) { payload = malloc(4); if (payload) { bput(payload, (uint32_t)result.i); psize = 4; } else ok = false; }
+            }
+            if (a[1].l && operation != PQ_DELETE) dvm_unpin(vm, a[1].l);
+            if (ok && operation == PQ_INSERT) {
+               if (!result.l) status = 1;
+               else {
+                  union dvm_value t = {0};
+                  const char *text = am_vcall(vm, result.l, "toString", "()Ljava/lang/String;", NULL, 0, &t) && t.l
+                     ? dvm_string_utf8(vm, t.l) : NULL;
+                  psize = text ? strlen(text) : 0;
+                  payload = malloc(psize ? psize : 1);
+                  if (payload && text) memcpy(payload, text, psize); else ok = false;
+               }
+            }
+         } else if (operation == PQ_GET_TYPE) {
+            ok = am_vcall(vm, provider, "getType", "(Landroid/net/Uri;)Ljava/lang/String;", &uri, 1, &result);
+            if (ok && !result.l) status = 1;
+            else if (ok) {
+               const char *t = dvm_string_utf8(vm, result.l);
+               psize = t ? strlen(t) : 0;
+               payload = malloc(psize ? psize : 1);
+               if (payload) memcpy(payload, t, psize); else ok = false;
+            }
+         }
+         if (dvm_exception(vm)) { dvm_clear_exception(vm); ok = false; }
+         binder_reply(sender, seq, ok ? status : -EIO, 0, payload, psize);
+         free(payload);
+         rc = 0;
+      }
+      dvm_unpin(vm, uri.l);
+   }
+   dvm_unpin(vm, uri_text);
+   if (dvm_exception(vm)) dvm_clear_exception(vm);
+   return rc;
+}
+
 /* call(uri, method, arg, extras): the provider's own call(), the way the
  * framework reaches one for an authority the uri names. */
 static bool x_resolver_call(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -833,6 +1180,13 @@ static bool x_resolver_call(struct dvm *vm, dvm_ref self, const union dvm_value 
    if (!am_vcall(vm, ARG(0).l, "getAuthority", "()Ljava/lang/String;", NULL, 0, &authority)) return false;
    const char *a = authority.l ? dvm_string_utf8(vm, authority.l) : NULL;
    dvm_ref provider = a ? x_find_provider(vm, a) : 0;
+   if (!provider && a) {
+      /* An authority a component host in another process owns. */
+      bool handled = false;
+      union dvm_value request[4] = { ARG(0), ARG(1), ARG(2), ARG(3) };
+      if (!x_provider_remote(vm, PQ_CALL, request, out, &handled)) return false;
+      if (handled) return true;
+   }
    if (!provider) {
       /* No such provider: acquireProvider() comes back empty. */
       char text[256];
@@ -861,6 +1215,22 @@ static bool x_resolver_operation(struct dvm *vm,dvm_ref self,const union dvm_val
    const char *protocol=dvm_string_utf8(vm,scheme.l);
    const char *name=dvm_string_utf8(vm,authority.l);
    dvm_ref provider=protocol && !strcmp(protocol,"content") && name ? x_find_provider(vm,name) : 0;
+   if (!provider && protocol && !strcmp(protocol,"content") && name && !strcmp(operation->name,"query") && nargs>=5) {
+      /* An authority a component host in another process owns. */
+      bool handled=false;
+      if (!x_provider_remote(vm,PQ_QUERY,args,out,&handled)) return false;
+      if (handled) return true;
+   }
+   if (!provider && protocol && !strcmp(protocol,"content") && name) {
+      const uint32_t remote = !strcmp(operation->name,"insert") ? PQ_INSERT :
+                              !strcmp(operation->name,"update") ? PQ_UPDATE :
+                              !strcmp(operation->name,"delete") ? PQ_DELETE : 0;
+      bool handled=false;
+      if (remote) {
+         if (!x_provider_remote(vm,remote,args,out,&handled)) return false;
+         if (handled) return true;
+      }
+   }
    if (!provider) {
       if (!strcmp(operation->name,"query")) RETL(0);
       dvm__throw(vm,"java/lang/IllegalArgumentException","Unknown content provider %s",name ? name : "");
@@ -869,11 +1239,91 @@ static bool x_resolver_operation(struct dvm *vm,dvm_ref self,const union dvm_val
    return am_vcall(vm,provider,operation->name,operation->sig,args,nargs,out);
 }
 
+/* ---- ContentProviderClient ------------------------------------------------
+ *
+ * acquireContentProviderClient()/acquireUnstableContentProviderClient() answer a
+ * client bound to one authority, or null when no installed provider owns it (this
+ * process's own, or a component host's).  The client's operations are the
+ * resolver's, aimed at that authority. */
+static bool x_authority_exists(struct dvm *vm, const char *authority)
+{
+   if (x_find_provider(vm, authority)) return true;
+   char *owner = pq_owner(authority);
+   free(owner);
+   return owner != NULL;
+}
+
+static bool x_resolver_acquire(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                               int nargs, union dvm_value *out)
+{
+   (void)self; (void)nargs;
+   if (!ARG(0).l) { dvm__throw(vm, "java/lang/NullPointerException", "uri"); return false; }
+   dvm_ref authority = ARG(0).l;
+   union dvm_value got = {0};
+   if (!strcmp(builtin_sig(), "(Landroid/net/Uri;)Landroid/content/ContentProviderClient;")) {
+      if (!am_vcall(vm, ARG(0).l, "getAuthority", "()Ljava/lang/String;", NULL, 0, &got)) return false;
+      authority = got.l;
+   }
+   const char *name = authority ? dvm_string_utf8(vm, authority) : NULL;
+   if (!name || !x_authority_exists(vm, name)) RETL(0);
+   struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/content/ContentProviderClient;");
+   dvm_ref client = c ? dvm_new_object(vm, c) : 0;
+   if (!client) return false;
+   (void)dvm_set_field(vm, client, "authority", "Ljava/lang/String;", (union dvm_value){ .l = authority });
+   RETL(client);
+}
+
+/* client.call(method, arg, extras) (and, from API 29, call(authority, method, ...)):
+ * the resolver's call() on this client's authority. */
+static bool x_client_call(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                          int nargs, union dvm_value *out)
+{
+   union dvm_value authority = {0}, uri = {0};
+   const bool with_authority = nargs == 4;
+   (void)dvm_get_field(vm, self, "authority", "Ljava/lang/String;", &authority);
+   struct dvm_class *uc = dvm__class_by_desc(vm, "Landroid/net/Uri;");
+   struct dvm_method *parse = uc ? dvm_find_method(vm, uc, "parse", "(Ljava/lang/String;)Landroid/net/Uri;") : NULL;
+   char text[512];
+   snprintf(text, sizeof text, "content://%s", with_authority && ARG(0).l ? dvm_string_utf8(vm, ARG(0).l)
+                                              : authority.l ? dvm_string_utf8(vm, authority.l) : "");
+   union dvm_value s = { .l = dvm_new_string(vm, text) };
+   if (!parse || !dvm_call(vm, parse, 0, &s, 1, &uri) || !uri.l) return false;
+   const int base = with_authority ? 1 : 0;
+   union dvm_value request[4] = { uri, ARG(base), ARG(base + 1), ARG(base + 2) };
+   return x_resolver_call(vm, 0, request, 4, out);
+}
+
+static bool x_client_true(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                          union dvm_value *out)
+{ (void)vm; (void)self; (void)args; (void)nargs; RETI(1); }
+static bool x_client_void(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                          union dvm_value *out)
+{ (void)vm; (void)self; (void)args; (void)nargs; (void)out; return true; }
+
+static const struct rt_field rt_content_provider_client_fields[] = {
+   { "authority", "Ljava/lang/String;" }, F_END
+};
+static const struct rt_method rt_content_provider_client[] = {
+   M("query", "(Landroid/net/Uri;[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;)Landroid/database/Cursor;", x_resolver_operation),
+   M("insert", "(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;", x_resolver_operation),
+   M("update", "(Landroid/net/Uri;Landroid/content/ContentValues;Ljava/lang/String;[Ljava/lang/String;)I", x_resolver_operation),
+   M("delete", "(Landroid/net/Uri;Ljava/lang/String;[Ljava/lang/String;)I", x_resolver_operation),
+   M("call", "(Ljava/lang/String;Ljava/lang/String;Landroid/os/Bundle;)Landroid/os/Bundle;", x_client_call),
+   M("call", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Landroid/os/Bundle;)Landroid/os/Bundle;", x_client_call),
+   M("close", "()V", x_client_void),
+   M("release", "()Z", x_client_true),
+   M_END,
+};
+
 static const struct rt_method rt_x_content_resolver[] = {
    M("call", "(Landroid/net/Uri;Ljava/lang/String;Ljava/lang/String;Landroid/os/Bundle;)Landroid/os/Bundle;", x_resolver_call),
    M("insert","(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;",x_resolver_operation),
    M("update","(Landroid/net/Uri;Landroid/content/ContentValues;Ljava/lang/String;[Ljava/lang/String;)I",x_resolver_operation),
    M("delete","(Landroid/net/Uri;Ljava/lang/String;[Ljava/lang/String;)I",x_resolver_operation),
+   M("acquireContentProviderClient","(Landroid/net/Uri;)Landroid/content/ContentProviderClient;",x_resolver_acquire),
+   M("acquireContentProviderClient","(Ljava/lang/String;)Landroid/content/ContentProviderClient;",x_resolver_acquire),
+   M("acquireUnstableContentProviderClient","(Landroid/net/Uri;)Landroid/content/ContentProviderClient;",x_resolver_acquire),
+   M("acquireUnstableContentProviderClient","(Ljava/lang/String;)Landroid/content/ContentProviderClient;",x_resolver_acquire),
    M_END,
 };
 
@@ -1535,7 +1985,17 @@ static bool pending_send_token(struct dvm *vm,dvm_ref token,int alarm_count)
    if(flags&UINT32_C(0x40000000))pending_cancel_token(vm,token);
    dvm_ref context=pending_field(vm,token,"context","Landroid/content/Context;");
    union dvm_value a={.l=intent},ignored={0};
-   bool handled=dvm_runtime_context_broadcast(vm,"sendBroadcast","(Landroid/content/Intent;)V",context,&a,1,&ignored);
+   bool handled;
+   switch(rt_get_int(vm,token,"type")) {
+   case PI_SERVICE:
+      handled=am_vcall(vm,context,"startService","(Landroid/content/Intent;)Landroid/content/ComponentName;",&a,1,&ignored);break;
+   case PI_FOREGROUND_SERVICE:
+      handled=am_vcall(vm,context,"startForegroundService","(Landroid/content/Intent;)Landroid/content/ComponentName;",&a,1,&ignored);break;
+   case PI_ACTIVITY:
+      handled=am_vcall(vm,context,"startActivity","(Landroid/content/Intent;)V",&a,1,&ignored);break;
+   default:
+      handled=dvm_runtime_context_broadcast(vm,"sendBroadcast","(Landroid/content/Intent;)V",context,&a,1,&ignored);
+   }
    dvm_unpin(vm,intent);return handled && !dvm_exception(vm);
 }
 static bool alarm_listener_run(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
@@ -1826,4 +2286,327 @@ static const struct rt_method rt_query_builder[]={
    SM("buildQueryString","(ZLjava/lang/String;[Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",qb_build_static),
    M("query","(Landroid/database/sqlite/SQLiteDatabase;[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Landroid/database/Cursor;",qb_query),
    M("query","(Landroid/database/sqlite/SQLiteDatabase;[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Landroid/database/Cursor;",qb_query),M_END
+};
+
+/* ======== merged from dvm_extras_notification.h ======== */
+/* android.app.Notification and Notification.Builder.
+ *
+ * A Notification is plain data (title, text, flags, group, extras); posting it
+ * is NotificationManager's business.  The Builder collects settings and
+ * build() returns a Notification carrying them, with the title/text/etc. in
+ * `extras` under the same keys AOSP uses, since apps read them back from there.
+ * Included from dvm_runtime.c after the Bundle and NotificationManager code. */
+
+static const struct { const char *name, *value; } notification_extras_keys[] = {
+   { "EXTRA_TITLE", "android.title" },
+   { "EXTRA_TEXT", "android.text" },
+   { "EXTRA_BIG_TEXT", "android.bigText" },
+   { "EXTRA_SUB_TEXT", "android.subText" },
+   { "EXTRA_SUMMARY_TEXT", "android.summaryText" },
+   { "EXTRA_TITLE_BIG", "android.title.big" },
+   { "EXTRA_SHOW_WHEN", "android.showWhen" },
+   { "EXTRA_SHOW_CHRONOMETER", "android.showChronometer" },
+   { "EXTRA_PROGRESS", "android.progress" },
+   { "EXTRA_PROGRESS_MAX", "android.progressMax" },
+   { "EXTRA_PROGRESS_INDETERMINATE", "android.progressIndeterminate" },
+   { "EXTRA_SMALL_ICON", "android.icon" },
+   { "EXTRA_LARGE_ICON", "android.largeIcon" },
+   { "CATEGORY_MESSAGE", "msg" },
+   { "CATEGORY_REMINDER", "reminder" },
+   { "CATEGORY_EVENT", "event" },
+   { "CATEGORY_ALARM", "alarm" },
+   { "CATEGORY_PROMO", "promo" },
+   { "CATEGORY_SERVICE", "service" },
+   { "CATEGORY_STATUS", "status" },
+   { NULL, NULL }
+};
+static const struct rt_field rt_notification_sfields[] = {
+   { "EXTRA_TITLE", "Ljava/lang/String;" }, { "EXTRA_TEXT", "Ljava/lang/String;" },
+   { "EXTRA_BIG_TEXT", "Ljava/lang/String;" }, { "EXTRA_SUB_TEXT", "Ljava/lang/String;" },
+   { "EXTRA_SUMMARY_TEXT", "Ljava/lang/String;" }, { "EXTRA_TITLE_BIG", "Ljava/lang/String;" },
+   { "EXTRA_SHOW_WHEN", "Ljava/lang/String;" }, { "EXTRA_SHOW_CHRONOMETER", "Ljava/lang/String;" },
+   { "EXTRA_PROGRESS", "Ljava/lang/String;" }, { "EXTRA_PROGRESS_MAX", "Ljava/lang/String;" },
+   { "EXTRA_PROGRESS_INDETERMINATE", "Ljava/lang/String;" }, { "EXTRA_SMALL_ICON", "Ljava/lang/String;" },
+   { "EXTRA_LARGE_ICON", "Ljava/lang/String;" },
+   { "CATEGORY_MESSAGE", "Ljava/lang/String;" }, { "CATEGORY_REMINDER", "Ljava/lang/String;" },
+   { "CATEGORY_EVENT", "Ljava/lang/String;" }, { "CATEGORY_ALARM", "Ljava/lang/String;" },
+   { "CATEGORY_PROMO", "Ljava/lang/String;" }, { "CATEGORY_SERVICE", "Ljava/lang/String;" },
+   { "CATEGORY_STATUS", "Ljava/lang/String;" }, F_END
+};
+
+static const struct rt_field rt_notification_fields[] = {
+   { "when", "J" }, { "number", "I" }, { "flags", "I" }, { "defaults", "I" },
+   { "priority", "I" }, { "extras", "Landroid/os/Bundle;" },
+   { "group", "Ljava/lang/String;" }, { "sortKey", "Ljava/lang/String;" },
+   { "channelId", "Ljava/lang/String;" }, { "category", "Ljava/lang/String;" },
+   { "tickerText", "Ljava/lang/CharSequence;" }, { "contentIntent", "Landroid/app/PendingIntent;" },
+   { "deleteIntent", "Landroid/app/PendingIntent;" }, F_END
+};
+
+/* The Builder keeps exactly the fields a Notification has, so build() copies
+ * them across by name. */
+#define NOTIFICATION_COPY_FIELDS(X) \
+   X("when", "J") X("number", "I") X("flags", "I") X("defaults", "I") X("priority", "I") \
+   X("group", "Ljava/lang/String;") X("sortKey", "Ljava/lang/String;") \
+   X("channelId", "Ljava/lang/String;") X("category", "Ljava/lang/String;") \
+   X("tickerText", "Ljava/lang/CharSequence;") X("contentIntent", "Landroid/app/PendingIntent;") \
+   X("deleteIntent", "Landroid/app/PendingIntent;")
+
+static dvm_ref notification_extras(struct dvm *vm, dvm_ref obj)
+{
+   union dvm_value ex = { 0 }, ignored = { 0 };
+   (void)dvm_get_field(vm, obj, "extras", "Landroid/os/Bundle;", &ex);
+   if (ex.l) return ex.l;
+   struct dvm_class *bc = dvm__class_by_desc(vm, "Landroid/os/Bundle;");
+   ex.l = bc ? dvm_new_object(vm, bc) : 0;
+   if (!ex.l) return 0;
+   (void)map_init(vm, ex.l, NULL, 0, &ignored);
+   (void)dvm_set_field(vm, obj, "extras", "Landroid/os/Bundle;", ex);
+   return ex.l;
+}
+
+static bool notification_put_extra(struct dvm *vm, dvm_ref obj, const char *key,
+                                   const char *name, const char *sig, union dvm_value v)
+{
+   dvm_ref ex = notification_extras(vm, obj);
+   if (!ex) return false;
+   union dvm_value a[2] = { { .l = dvm_new_string(vm, key) }, v }, ignored = { 0 };
+   return am_vcall(vm, ex, name, sig, a, 2, &ignored);
+}
+
+static bool notification_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                              int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs; (void)out;
+   (void)notification_extras(vm, self);
+   RETV();
+}
+
+static bool notification_get_extras(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                                    int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   RETL(notification_extras(vm, self));
+}
+
+#define NOTIFICATION_GETTER(fn, field, desc, ret) \
+static bool fn(struct dvm *vm, dvm_ref self, const union dvm_value *args, \
+               int nargs, union dvm_value *out) \
+{ \
+   union dvm_value v = { 0 }; \
+   (void)args; (void)nargs; \
+   (void)dvm_get_field(vm, self, field, desc, &v); \
+   ret(v.l); \
+}
+NOTIFICATION_GETTER(notification_get_group, "group", "Ljava/lang/String;", RETL)
+NOTIFICATION_GETTER(notification_get_sort_key, "sortKey", "Ljava/lang/String;", RETL)
+NOTIFICATION_GETTER(notification_get_channel_id, "channelId", "Ljava/lang/String;", RETL)
+NOTIFICATION_GETTER(notification_get_category, "category", "Ljava/lang/String;", RETL)
+
+static bool notification_get_when(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                                  int nargs, union dvm_value *out)
+{
+   union dvm_value v = { 0 };
+   (void)args; (void)nargs;
+   (void)dvm_get_field(vm, self, "when", "J", &v);
+   RETJ(v.j);
+}
+
+static const struct rt_method rt_notification[] = {
+   M("<init>", "()V", notification_init),
+   M("getGroup", "()Ljava/lang/String;", notification_get_group),
+   M("getSortKey", "()Ljava/lang/String;", notification_get_sort_key),
+   M("getChannelId", "()Ljava/lang/String;", notification_get_channel_id),
+   M("getExtras", "()Landroid/os/Bundle;", notification_get_extras),
+   M("getWhen", "()J", notification_get_when),
+   M_END,
+};
+
+/* ---------------------------------------------------------------- Builder */
+
+static bool nb_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                    int nargs, union dvm_value *out)
+{
+   (void)out;
+   (void)notification_extras(vm, self);
+   /* Builder(Context, String channelId) */
+   if (nargs > 1 && args[1].l)
+      (void)dvm_set_field(vm, self, "channelId", "Ljava/lang/String;", args[1]);
+   union dvm_value now = { .j = (int64_t)time(NULL) * 1000 };
+   (void)dvm_set_field(vm, self, "when", "J", now);
+   RETV();
+}
+
+/* One setter per (method, field): store the argument and return the builder so
+ * calls chain. */
+#define NB_SET(fn, field, desc) \
+static bool fn(struct dvm *vm, dvm_ref self, const union dvm_value *args, \
+               int nargs, union dvm_value *out) \
+{ \
+   (void)dvm_set_field(vm, self, field, desc, ARG(0)); \
+   RETL(self); \
+}
+#define NB_EXTRA(fn, key, call, sig) \
+static bool fn(struct dvm *vm, dvm_ref self, const union dvm_value *args, \
+               int nargs, union dvm_value *out) \
+{ \
+   if (!notification_put_extra(vm, self, key, call, sig, ARG(0))) return false; \
+   RETL(self); \
+}
+NB_SET(nb_set_when, "when", "J")
+NB_SET(nb_set_number, "number", "I")
+NB_SET(nb_set_group, "group", "Ljava/lang/String;")
+NB_SET(nb_set_sort_key, "sortKey", "Ljava/lang/String;")
+NB_SET(nb_set_channel, "channelId", "Ljava/lang/String;")
+NB_SET(nb_set_category, "category", "Ljava/lang/String;")
+NB_SET(nb_set_ticker, "tickerText", "Ljava/lang/CharSequence;")
+NB_SET(nb_set_content_intent, "contentIntent", "Landroid/app/PendingIntent;")
+NB_SET(nb_set_delete_intent, "deleteIntent", "Landroid/app/PendingIntent;")
+NB_SET(nb_set_defaults, "defaults", "I")
+NB_SET(nb_set_priority, "priority", "I")
+NB_EXTRA(nb_set_title, "android.title", "putCharSequence", "(Ljava/lang/String;Ljava/lang/CharSequence;)V")
+NB_EXTRA(nb_set_text, "android.text", "putCharSequence", "(Ljava/lang/String;Ljava/lang/CharSequence;)V")
+NB_EXTRA(nb_set_sub_text, "android.subText", "putCharSequence", "(Ljava/lang/String;Ljava/lang/CharSequence;)V")
+NB_EXTRA(nb_set_show_when, "android.showWhen", "putBoolean", "(Ljava/lang/String;Z)V")
+
+/* Flags are single bits of Notification.flags. */
+static bool nb_flag(struct dvm *vm, dvm_ref self, int32_t bit, bool on)
+{
+   union dvm_value f = { 0 };
+   (void)dvm_get_field(vm, self, "flags", "I", &f);
+   f.i = on ? (f.i | bit) : (f.i & ~bit);
+   return dvm_set_field(vm, self, "flags", "I", f);
+}
+#define NB_FLAG(fn, bit) \
+static bool fn(struct dvm *vm, dvm_ref self, const union dvm_value *args, \
+               int nargs, union dvm_value *out) \
+{ \
+   (void)nb_flag(vm, self, bit, ARG(0).i != 0); \
+   RETL(self); \
+}
+NB_FLAG(nb_set_auto_cancel, 0x10)
+NB_FLAG(nb_set_ongoing, 0x2)
+NB_FLAG(nb_set_only_alert_once, 0x8)
+NB_FLAG(nb_set_group_summary, 0x200)
+
+/* Settings with no visible effect on this device are accepted and chained. */
+static bool nb_ignore(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                      int nargs, union dvm_value *out)
+{
+   (void)vm; (void)args; (void)nargs;
+   RETL(self);
+}
+
+static bool nb_set_style(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                         int nargs, union dvm_value *out)
+{
+   /* BigTextStyle.bigText() supplies the expanded text. */
+   union dvm_value text = { 0 };
+   if (ARG(0).l) {
+      (void)dvm_get_field(vm, ARG(0).l, "bigText", "Ljava/lang/CharSequence;", &text);
+      if (text.l && !notification_put_extra(vm, self, "android.bigText", "putCharSequence",
+                         "(Ljava/lang/String;Ljava/lang/CharSequence;)V", text))
+         return false;
+   }
+   RETL(self);
+}
+
+static bool nb_get_extras(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                          int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   RETL(notification_extras(vm, self));
+}
+
+static bool nb_set_extras(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                          int nargs, union dvm_value *out)
+{
+   if (ARG(0).l) {
+      union dvm_value ignored = { 0 };
+      dvm_ref mine = notification_extras(vm, self);
+      if (mine && !am_vcall(vm, mine, "putAll", "(Landroid/os/Bundle;)V", args, 1, &ignored))
+         return false;
+   }
+   RETL(self);
+}
+
+static bool nb_build(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                     int nargs, union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   struct dvm_class *nc = dvm__class_by_desc(vm, "Landroid/app/Notification;");
+   dvm_ref n = nc ? dvm_new_object(vm, nc) : 0;
+   if (!n) { dvm__throw(vm, "java/lang/OutOfMemoryError", "Notification"); return false; }
+   union dvm_value v = { 0 };
+#define X(name, desc) \
+   (void)dvm_get_field(vm, self, name, desc, &v); (void)dvm_set_field(vm, n, name, desc, v);
+   NOTIFICATION_COPY_FIELDS(X)
+#undef X
+   /* The notification owns a copy of the extras, not the builder's Bundle. */
+   union dvm_value ignored = { 0 };
+   dvm_ref extras = notification_extras(vm, n);
+   dvm_ref mine = notification_extras(vm, self);
+   if (extras && mine &&
+       !am_vcall(vm, extras, "putAll", "(Landroid/os/Bundle;)V",
+                 &(union dvm_value){ .l = mine }, 1, &ignored))
+      return false;
+   RETL(n);
+}
+
+static const struct rt_method rt_notification_builder[] = {
+   M("<init>", "(Landroid/content/Context;)V", nb_init),
+   M("<init>", "(Landroid/content/Context;Ljava/lang/String;)V", nb_init),
+   M("setContentTitle", "(Ljava/lang/CharSequence;)Landroid/app/Notification$Builder;", nb_set_title),
+   M("setContentText", "(Ljava/lang/CharSequence;)Landroid/app/Notification$Builder;", nb_set_text),
+   M("setSubText", "(Ljava/lang/CharSequence;)Landroid/app/Notification$Builder;", nb_set_sub_text),
+   M("setTicker", "(Ljava/lang/CharSequence;)Landroid/app/Notification$Builder;", nb_set_ticker),
+   M("setWhen", "(J)Landroid/app/Notification$Builder;", nb_set_when),
+   M("setShowWhen", "(Z)Landroid/app/Notification$Builder;", nb_set_show_when),
+   M("setNumber", "(I)Landroid/app/Notification$Builder;", nb_set_number),
+   M("setAutoCancel", "(Z)Landroid/app/Notification$Builder;", nb_set_auto_cancel),
+   M("setOngoing", "(Z)Landroid/app/Notification$Builder;", nb_set_ongoing),
+   M("setOnlyAlertOnce", "(Z)Landroid/app/Notification$Builder;", nb_set_only_alert_once),
+   M("setGroup", "(Ljava/lang/String;)Landroid/app/Notification$Builder;", nb_set_group),
+   M("setGroupSummary", "(Z)Landroid/app/Notification$Builder;", nb_set_group_summary),
+   M("setSortKey", "(Ljava/lang/String;)Landroid/app/Notification$Builder;", nb_set_sort_key),
+   M("setChannelId", "(Ljava/lang/String;)Landroid/app/Notification$Builder;", nb_set_channel),
+   M("setCategory", "(Ljava/lang/String;)Landroid/app/Notification$Builder;", nb_set_category),
+   M("setDefaults", "(I)Landroid/app/Notification$Builder;", nb_set_defaults),
+   M("setPriority", "(I)Landroid/app/Notification$Builder;", nb_set_priority),
+   M("setContentIntent", "(Landroid/app/PendingIntent;)Landroid/app/Notification$Builder;", nb_set_content_intent),
+   M("setDeleteIntent", "(Landroid/app/PendingIntent;)Landroid/app/Notification$Builder;", nb_set_delete_intent),
+   M("setStyle", "(Landroid/app/Notification$Style;)Landroid/app/Notification$Builder;", nb_set_style),
+   M("setExtras", "(Landroid/os/Bundle;)Landroid/app/Notification$Builder;", nb_set_extras),
+   M("addExtras", "(Landroid/os/Bundle;)Landroid/app/Notification$Builder;", nb_set_extras),
+   M("getExtras", "()Landroid/os/Bundle;", nb_get_extras),
+   /* Presentation-only settings: nothing on this device draws a status bar. */
+   M("setSmallIcon", "(I)Landroid/app/Notification$Builder;", nb_ignore),
+   M("setLargeIcon", "(Landroid/graphics/Bitmap;)Landroid/app/Notification$Builder;", nb_ignore),
+   M("setColor", "(I)Landroid/app/Notification$Builder;", nb_ignore),
+   M("setVisibility", "(I)Landroid/app/Notification$Builder;", nb_ignore),
+   M("setSound", "(Landroid/net/Uri;)Landroid/app/Notification$Builder;", nb_ignore),
+   M("setVibrate", "([J)Landroid/app/Notification$Builder;", nb_ignore),
+   M("setLights", "(III)Landroid/app/Notification$Builder;", nb_ignore),
+   M("setTimeoutAfter", "(J)Landroid/app/Notification$Builder;", nb_ignore),
+   M("setProgress", "(IIZ)Landroid/app/Notification$Builder;", nb_ignore),
+   M("build", "()Landroid/app/Notification;", nb_build),
+   M_END,
+};
+
+/* BigTextStyle: only the expanded text is read back, by setStyle(). */
+static bool bts_big_text(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                         int nargs, union dvm_value *out)
+{
+   (void)dvm_set_field(vm, self, "bigText", "Ljava/lang/CharSequence;", ARG(0));
+   RETL(self);
+}
+static const struct rt_field rt_big_text_style_fields[] = {
+   { "bigText", "Ljava/lang/CharSequence;" }, F_END
+};
+static const struct rt_method rt_big_text_style[] = {
+   M("<init>", "()V", empty_void),
+   M("bigText", "(Ljava/lang/CharSequence;)Landroid/app/Notification$BigTextStyle;", bts_big_text),
+   M("setBigContentTitle", "(Ljava/lang/CharSequence;)Landroid/app/Notification$BigTextStyle;", nb_ignore),
+   M("setSummaryText", "(Ljava/lang/CharSequence;)Landroid/app/Notification$BigTextStyle;", nb_ignore),
+   M_END,
 };

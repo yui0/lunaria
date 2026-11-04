@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #endif
 #include "lunaria_os.h"
+#include "luna_google.h"
 #if defined(__linux__)
 #include <errno.h>
 #include <fcntl.h>
@@ -32,6 +33,7 @@ struct luna_process_channel {
    unsigned char header[8];
    size_t header_size,received;
    struct packet *incoming;
+   struct packet *ready_head,*ready_tail;
 };
 struct child {
    struct child *next;
@@ -45,10 +47,11 @@ struct child {
 struct exit_notice { struct exit_notice *next; char *name; uint32_t pid; int status; };
 struct luna_process_pool {
    pthread_mutex_t lock;
-   char *executable,*mode;
-   uint32_t parent_pid,next_pid;
+   char *executable,*mode,*host_apk;
+   uint32_t parent_pid,next_pid,guest_uid;
    struct child *children;
    struct exit_notice *exits,*exits_tail;
+   struct reply *ready_head,*ready_tail;
    int error;
 };
 static void put32(unsigned char *p,uint32_t v)
@@ -130,26 +133,42 @@ int luna_process_channel_tick(struct luna_process_channel *c,luna_process_messag
       if(c->header_size<8)c->header_size+=(size_t)n;else c->received+=(size_t)n;
    }
    if(rc)c->error=-rc;
+   /* Keep unread callbacks on the channel, not on this stack. A callback
+    * may pump this channel again while waiting for a synchronous Binder reply. */
+   if(head){
+      if(c->ready_tail)c->ready_tail->next=head;else c->ready_head=head;
+      c->ready_tail=tail;
+   }
    pthread_mutex_unlock(&c->lock);
-   for(struct packet *p=head;p;p=p->next)if(callback)callback(user,p->bytes,p->size);
-   packets_free(head);return rc ? rc : count;
+   for(unsigned delivered=0;delivered<32;++delivered){
+      pthread_mutex_lock(&c->lock);
+      struct packet *p=c->ready_head;
+      if(p){c->ready_head=p->next;if(!c->ready_head)c->ready_tail=NULL;}
+      pthread_mutex_unlock(&c->lock);
+      if(!p)break;
+      if(callback)callback(user,p->bytes,p->size);
+      free(p);
+   }
+   return rc ? rc : count;
 }
 void luna_process_channel_close(struct luna_process_channel *c)
 {
    if(!c)return;
-   close(c->fd);packets_free(c->head);free(c->incoming);
+   close(c->fd);packets_free(c->head);packets_free(c->ready_head);free(c->incoming);
    pthread_mutex_destroy(&c->lock);free(c);
 }
 static bool env_key(const char *entry,const char *name)
 { size_t n=strlen(name);return !strncmp(entry,name,n) && entry[n]=='='; }
-static char **child_environment(const char *name,uint32_t pid,uint32_t parent)
+static char **child_environment(const char *name,uint32_t pid,uint32_t parent,uint32_t uid,bool host)
 {
    size_t n=0;while(environ[n])++n;
-   char **result=calloc(n+4,sizeof *result);if(!result)return NULL;
+   char **result=calloc(n+5,sizeof *result);if(!result)return NULL;
    size_t at=0;
    for(size_t i=0;i<n;++i){
+      if(host && (env_key(environ[i],"LUNARIA_LAUNCH_ACTIVITY") || env_key(environ[i],"LUNARIA_TOUCH_TEST") ||
+                  env_key(environ[i],"LUNARIA_TOUCH_FIFO") || env_key(environ[i],"LUNARIA_PLAY")))continue;
       if(env_key(environ[i],"ANDROID_PROCESS_NAME") || env_key(environ[i],"LUNARIA_GUEST_TID_BASE") ||
-         env_key(environ[i],"LUNARIA_GUEST_PPID"))continue;
+         env_key(environ[i],"LUNARIA_GUEST_PPID") || env_key(environ[i],"LUNARIA_GUEST_UID"))continue;
       result[at]=strdup(environ[i]);if(!result[at++])goto fail;
    }
    size_t len=strlen(name)+sizeof "ANDROID_PROCESS_NAME=";
@@ -159,6 +178,10 @@ static char **child_environment(const char *name,uint32_t pid,uint32_t parent)
    result[at]=strdup(text);if(!result[at++])goto fail;
    snprintf(text,sizeof text,"LUNARIA_GUEST_PPID=%u",parent);
    result[at]=strdup(text);if(!result[at++])goto fail;
+   if(uid){
+      snprintf(text,sizeof text,"LUNARIA_GUEST_UID=%u",uid);
+      result[at]=strdup(text);if(!result[at++])goto fail;
+   }
    return result;
 fail:
    for(size_t i=0;i<at;++i)free(result[i]);
@@ -190,9 +213,19 @@ static int spawn_child(struct luna_process_pool *pool,const char *name,struct ch
    /* This path must not leak the live VM's files/sockets into another VM. */
    if(!rc)rc=ENOTSUP;
 #endif
-   char **env=child_environment(name,pool->next_pid,pool->parent_pid);
+   char **env=child_environment(name,pool->next_pid,pool->parent_pid,pool->guest_uid,pool->host_apk!=NULL);
    if(!env && !rc)rc=ENOMEM;
-   char *args[]={pool->executable,pool->mode,"3",NULL};
+   const char *owner=getenv("ANDROID_PACKAGE_NAME"),*profile="default";
+   /* A peer system package owns its own app data, rather than another game's
+    * account profile. This package's own secondary processes still share it. */
+   size_t owner_length=owner ? strlen(owner) : 0;
+   if(owner_length && !strncmp(name,owner,owner_length) && (!name[owner_length] || name[owner_length]==':')){
+      const char *current=getenv("LUNARIA_PROFILE");if(current && *current)profile=current;
+   } else if(!strcmp(name,"com.google.android.gms") || !strcmp(name,"com.android.vending") || !strcmp(name,"com.google.android.gsf"))
+      profile=luna_google_profile_current();
+   char *module_args[]={pool->executable,pool->mode,"3",NULL};
+   char *host_args[]={pool->executable,"--service-host","--profile",(char *)profile,pool->host_apk,NULL};
+   char **args=pool->host_apk ? host_args : module_args;
    if(!rc)rc=posix_spawn(&child->host_pid,pool->executable,&actions,NULL,args,env);
    if(initialized)posix_spawn_file_actions_destroy(&actions);
    environment_free(env);close(source);close(fds[1]);
@@ -212,6 +245,16 @@ struct luna_process_pool *luna_process_pool_open(const char *exe,const char *mod
    pool->executable=strdup(exe);pool->mode=strdup(mode);pool->parent_pid=parent;pool->next_pid=first;
    int rc=pthread_mutex_init(&pool->lock,NULL);
    if(!pool->executable || !pool->mode || rc){if(!rc)pthread_mutex_destroy(&pool->lock);free(pool->executable);free(pool->mode);free(pool);errno=rc ? rc : ENOMEM;return NULL;}
+   return pool;
+}
+struct luna_process_pool *luna_process_pool_open_host(const char *exe,const char *apk,uint32_t uid,uint32_t parent,uint32_t first)
+{
+   if(!apk || !*apk){errno=EINVAL;return NULL;}
+   struct luna_process_pool *pool=luna_process_pool_open(exe,"--service-host",parent,first);
+   if(!pool)return NULL;
+   pool->guest_uid=uid;
+   pool->host_apk=strdup(apk);
+   if(!pool->host_apk){int e=errno;luna_process_pool_close(pool);errno=e;return NULL;}
    return pool;
 }
 static void child_poll(struct child *child)
@@ -254,6 +297,31 @@ int luna_process_pool_send(struct luna_process_pool *pool,const char *name,const
    if(!rc){rc=luna_process_channel_send(child->channel,data,size);if(!rc && pid)*pid=child->guest_pid;}
    pthread_mutex_unlock(&pool->lock);return rc;
 }
+int luna_process_pool_send_to_host(struct luna_process_pool *pool,uint32_t host_pid,const void *data,size_t size)
+{
+   if(!pool || (!data && size))return -EINVAL;
+   if(size>LUNA_PROCESS_MESSAGE_MAX)return -EMSGSIZE;
+   pthread_mutex_lock(&pool->lock);
+   int rc=-ESRCH;
+   for(struct child *child=pool->children;child;child=child->next){
+      if((uint32_t)child->host_pid!=host_pid)continue;
+      child_poll(child);
+      if(!child->dead)rc=luna_process_channel_send(child->channel,data,size);
+      break;
+   }
+   pthread_mutex_unlock(&pool->lock);
+   return rc;
+}
+int luna_process_pool_running(struct luna_process_pool *pool,const char *name)
+{
+   if(!pool || !name)return 0;
+   pthread_mutex_lock(&pool->lock);
+   int running=0;
+   for(struct child *child=pool->children;child && !running;child=child->next){
+      child_poll(child);running=!child->dead && !strcmp(child->name,name);
+   }
+   pthread_mutex_unlock(&pool->lock);return running;
+}
 struct reply { struct reply *next; char *name; uint32_t pid; size_t size; unsigned char data[]; };
 struct replies { struct reply *head,*tail; struct child *child; int error; };
 static void collect_reply(void *user,const void *data,size_t size)
@@ -275,9 +343,22 @@ int luna_process_pool_tick(struct luna_process_pool *pool,luna_process_reply_fn 
       if(n<0){child->drained=true;if(!error)error=-n;}
    }
    reap(pool);if(pool->error && !error)error=pool->error;pool->error=0;
+   /* The pool also batches channel callbacks; expose its pending replies to
+    * a nested pool tick before invoking any potentially blocking callback. */
+   if(replies.head){
+      if(pool->ready_tail)pool->ready_tail->next=replies.head;else pool->ready_head=replies.head;
+      pool->ready_tail=replies.tail;
+   }
    pthread_mutex_unlock(&pool->lock);
-   struct reply *p=replies.head;
-   while(p){struct reply *next=p->next;if(callback)callback(user,p->name,p->pid,p->data,p->size);free(p->name);free(p);p=next;}
+   for(;;){
+      pthread_mutex_lock(&pool->lock);
+      struct reply *p=pool->ready_head;
+      if(p){pool->ready_head=p->next;if(!pool->ready_head)pool->ready_tail=NULL;}
+      pthread_mutex_unlock(&pool->lock);
+      if(!p)break;
+      if(callback)callback(user,p->name,p->pid,p->data,p->size);
+      free(p->name);free(p);
+   }
    return replies.error ? -replies.error : error ? -error : count;
 }
 int luna_process_pool_next_exit(struct luna_process_pool *pool,char *name,size_t capacity,uint32_t *pid,int *status)
@@ -296,6 +377,9 @@ int luna_process_pool_next_exit(struct luna_process_pool *pool,char *name,size_t
 void luna_process_pool_close(struct luna_process_pool *pool)
 {
    if(!pool)return;
+   while(pool->ready_head){
+      struct reply *p=pool->ready_head;pool->ready_head=p->next;free(p->name);free(p);
+   }
    for(struct child *c=pool->children;c;c=c->next){luna_process_channel_close(c->channel);c->channel=NULL;c->drained=true;}
    struct timespec delay={0,10000000};
    for(unsigned i=0;i<20 && pool->children;++i){reap(pool);if(pool->children)nanosleep(&delay,NULL);}
@@ -307,7 +391,7 @@ void luna_process_pool_close(struct luna_process_pool *pool)
       free(c->name);free(c);
    }
    while(pool->exits){struct exit_notice *n=pool->exits;pool->exits=n->next;free(n->name);free(n);}
-   pthread_mutex_destroy(&pool->lock);free(pool->mode);free(pool->executable);free(pool);
+   pthread_mutex_destroy(&pool->lock);free(pool->host_apk);free(pool->mode);free(pool->executable);free(pool);
 }
 
 #else
@@ -327,8 +411,14 @@ int luna_process_channel_send(struct luna_process_channel *c,const void *p,size_
 int luna_process_channel_tick(struct luna_process_channel *c,luna_process_message_fn f,void *u)
 { (void)c;(void)f;(void)u;return -ENOSYS; }
 void luna_process_channel_close(struct luna_process_channel *c){(void)c;}
+struct luna_process_pool *luna_process_pool_open_host(const char *e,const char *a,uint32_t u,uint32_t p,uint32_t f)
+{ (void)e;(void)a;(void)u;(void)p;(void)f;errno=ENOSYS;return NULL; }
 struct luna_process_pool *luna_process_pool_open(const char *e,const char *m,uint32_t p,uint32_t f)
 { (void)e;(void)m;(void)p;(void)f;errno=ENOSYS;return NULL; }
+int luna_process_pool_running(struct luna_process_pool *p,const char *n)
+{ (void)p;(void)n;return 0; }
+int luna_process_pool_send_to_host(struct luna_process_pool *p,uint32_t h,const void *d,size_t s)
+{ (void)p;(void)h;(void)d;(void)s;return -ENOSYS; }
 int luna_process_pool_send(struct luna_process_pool *p,const char *n,const void *d,size_t s,uint32_t *g)
 { (void)p;(void)n;(void)d;(void)s;(void)g;return -ENOSYS; }
 int luna_process_pool_tick(struct luna_process_pool *p,luna_process_reply_fn f,void *u)

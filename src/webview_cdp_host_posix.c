@@ -88,10 +88,13 @@ int lunaria_cdp_host_open(struct lunaria_cdp_host *host,
    char *argv[] = {
       (char *)browser_binary, "--headless", "--no-first-run",
       "--no-default-browser-check", "--remote-debugging-pipe",
+      /* The pipe is how the emulator draws and feeds the page, not a script
+       * driving it: like an app's WebView, the page is not "automation controlled". */
+      "--disable-blink-features=AutomationControlled",
       profile_arg, "about:blank", NULL, NULL,
    };
    /* Chrome itself requires this when the emulator is run as root. */
-   if (geteuid() == 0) argv[7] = "--no-sandbox";
+   if (geteuid() == 0) argv[8] = "--no-sandbox";
    pid_t pid = -1;
    if (!ok) ok = posix_spawn(&pid, browser_binary, &actions, NULL,
                               argv, environ);
