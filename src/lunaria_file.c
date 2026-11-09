@@ -152,14 +152,55 @@ static void sym_init(void)
    pthread_mutex_init(&sym_lock,&attr);
    pthread_mutexattr_destroy(&attr);
 }
-static void sym_enter(void) {pthread_once(&sym_once,sym_init);pthread_mutex_lock(&sym_lock);}
-static void sym_leave(void) {int e=errno;pthread_mutex_unlock(&sym_lock);errno=e;}
+static unsigned sym_depth;
+static uint64_t verdict_generation=1;
+static int verdict_dirty;
+static void sym_enter(void) {pthread_once(&sym_once,sym_init);pthread_mutex_lock(&sym_lock);++sym_depth;}
+static void sym_leave(void)
+{
+   int e=errno;
+   /* An operation that changes what links and directories exist says so when it
+    * starts and again when it is done: a verdict recorded in between described
+    * the state before the change. */
+   if (--sym_depth==0 && verdict_dirty) {verdict_dirty=0;++verdict_generation;}
+   pthread_mutex_unlock(&sym_lock);errno=e;
+}
 void luna_symlink_set_mapper(luna_symlink_mapper mapper,luna_symlink_mapper reverse)
 {sym_enter();path_mapper=mapper;reverse_mapper=reverse;sym_leave();}
+static void verdicts_changed(void);
 static luna_file_inode_mapper inode_mapper;
 static unsigned file_uid,file_gid;
 void luna_file_set_credentials(unsigned uid,unsigned gid,luna_file_inode_mapper mapper)
-{sym_enter();file_uid=uid;file_gid=gid;inode_mapper=mapper;sym_leave();}
+{sym_enter();verdicts_changed();file_uid=uid;file_gid=gid;inode_mapper=mapper;sym_leave();}
+/* Verdicts about directories and links that do not change from one call to the
+ * next.  Resolving a guest path asked the host about every component of it
+ * (stat for the permission, lstat and a ".sym." file for a possible link), several
+ * system calls a component and dozens a path, and the same few directories are
+ * asked about thousands of times a second.  An answer is kept for a short time
+ * and thrown away at once by anything in this file that can change one (a link
+ * created or removed, a rename, a mode change); a change made behind its back
+ * is seen within the time limit.  Callers hold sym_lock. */
+#define VERDICT_SLOTS 512
+#define VERDICT_TTL_NS 1000000000ull
+struct verdict { uint64_t hash, expires, generation; char path[SYM_PATH]; };
+static struct verdict verdicts[2][VERDICT_SLOTS];
+static void verdicts_changed(void) {++verdict_generation;verdict_dirty=1;}
+static uint64_t verdict_now(void)
+{struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000000000ull+(uint64_t)t.tv_nsec;}
+static uint64_t verdict_hash(const char *path)
+{uint64_t h=1469598103934665603ull;for (;*path;++path) h=(h^(unsigned char)*path)*1099511628211ull;return h|1;}
+static int verdict_known(int kind,const char *path)
+{
+   struct verdict *v=&verdicts[kind][verdict_hash(path)%VERDICT_SLOTS];
+   return v->hash==verdict_hash(path) && v->generation==verdict_generation &&
+          verdict_now()<v->expires && !strcmp(v->path,path);
+}
+static void verdict_remember(int kind,const char *path)
+{
+   if (strlen(path)>=SYM_PATH) return;
+   uint64_t h=verdict_hash(path);struct verdict *v=&verdicts[kind][h%VERDICT_SLOTS];
+   v->hash=h;v->generation=verdict_generation;v->expires=verdict_now()+VERDICT_TTL_NS;strcpy(v->path,path);
+}
 /* Ownership follows the inode, including paths containing parent components.
  * Search checks still run on the original components before normalization. */
 static int sym_inode(const char *path,luna_file_info *info)
@@ -174,9 +215,18 @@ static int sym_inode(const char *path,luna_file_info *info)
    return inode_mapper(path,info);
 }
 /* Evaluate DAC using guest credentials even when the host process is root. */
+static int sym_permission_uncached(const char *path,int mode,int directory);
 static int sym_permission(const char *path,int mode,int directory)
 {
    if (!inode_mapper) return 0;
+   const int searchable=directory && mode==1;   /* the check made for every path component */
+   if (searchable && verdict_known(0,path)) return 0;
+   int r=sym_permission_uncached(path,mode,directory);
+   if (searchable && !r) verdict_remember(0,path);
+   return r;
+}
+static int sym_permission_uncached(const char *path,int mode,int directory)
+{
    luna_file_info info;
    if (luna_file_infoat(LUNA_AT_FDCWD,path,&info,0)) return -1;
    if (directory && (info.mode&0170000)!=0040000) {errno=ENOTDIR;return -1;}
@@ -264,10 +314,13 @@ static int sym_text(const char *metadata,char *target,size_t cap)
 static int sym_probe(const char *path,char *metadata,char *target)
 {
    luna_file_info info;
-   if (!luna_file_infoat(LUNA_AT_FDCWD,path,&info,LUNA_AT_NOFOLLOW)) return 0;
+   if (verdict_known(1,path)) {(void)sym_name(path,metadata,SYM_PATH);return 0;}   /* known not to be a link */
+   if (!luna_file_infoat(LUNA_AT_FDCWD,path,&info,LUNA_AT_NOFOLLOW)) {verdict_remember(1,path);return 0;}
    if (errno!=ENOENT && errno!=ENOTDIR) return -1;
    if (sym_name(path,metadata,SYM_PATH)) return 0;
-   return sym_text(metadata,target,SYM_PATH);
+   int link=sym_text(metadata,target,SYM_PATH);
+   if (link==0) verdict_remember(1,path);
+   return link;
 }
 static int sym_hidden(const char *path)
 {
@@ -449,7 +502,7 @@ int luna_symlink_create(const char *target,const char *path)
    if (!target || !path) {errno=EFAULT;return -1;}
    if (!*target) {errno=ENOENT;return -1;}
    if (strlen(target)>=SYM_PATH) {errno=ENAMETOOLONG;return -1;}
-   sym_enter();char actual[SYM_PATH],metadata[SYM_PATH],stage[SYM_PATH];int r=-1;
+   sym_enter();verdicts_changed();char actual[SYM_PATH],metadata[SYM_PATH],stage[SYM_PATH];int r=-1;
    if (sym_resolve(path,actual,sizeof actual,0) || sym_name(actual,metadata,sizeof metadata)) goto done;
    if (sym_parent_permission(actual,3)) goto done;
    luna_file_info info;
@@ -526,7 +579,7 @@ int luna_symlink_fd_info(int fd,luna_file_info *info)
 }
 int luna_symlink_fd_chmod(int fd,unsigned mode)
 {
-   sym_enter();luna_file_info info;int r=luna_symlink_fd_info(fd,&info);
+   sym_enter();verdicts_changed();luna_file_info info;int r=luna_symlink_fd_info(fd,&info);
    if (!r) {
       char path[SYM_PATH];
       if (inode_mapper && !sym_fd_path(fd,path,sizeof path) && sym_inode(path,&info) && info.uid!=file_uid) {
@@ -553,7 +606,7 @@ int luna_symlink_infoat(int fd,const char *path,luna_file_info *info,int flags)
 int luna_symlink_unlinkat(int fd,const char *path,int flags)
 {
    if (flags&~LUNA_AT_REMOVEDIR) {errno=EINVAL;return -1;}
-   sym_enter();char absolute[SYM_PATH],actual[SYM_PATH],metadata[SYM_PATH],target[SYM_PATH];int r=-1;
+   sym_enter();verdicts_changed();char absolute[SYM_PATH],actual[SYM_PATH],metadata[SYM_PATH],target[SYM_PATH];int r=-1;
    if (!sym_at(fd,path,absolute) && !sym_resolve(absolute,actual,sizeof actual,0)) {
       int link=sym_probe(actual,metadata,target);
       if (sym_parent_permission(actual,3)) link=-1;
@@ -578,7 +631,7 @@ int luna_symlink_access(const char *p,int mode) {return luna_symlink_accessat(LU
 
 int luna_symlink_mkdir(const char *path,unsigned mode)
 {
-   sym_enter();char actual[SYM_PATH],metadata[SYM_PATH],target[SYM_PATH];int r=-1;
+   sym_enter();verdicts_changed();char actual[SYM_PATH],metadata[SYM_PATH],target[SYM_PATH];int r=-1;
    char name[SYM_PATH];
    if (!path) {errno=EFAULT;goto done;}
    if (sym_copy(name,sizeof name,path)) goto done;
@@ -595,7 +648,7 @@ done:
 }
 int luna_symlink_chmodat(int fd,const char *path,unsigned mode,int flags)
 {
-   sym_enter();char absolute[SYM_PATH],actual[SYM_PATH],metadata[SYM_PATH],target[SYM_PATH];int r=-1;
+   sym_enter();verdicts_changed();char absolute[SYM_PATH],actual[SYM_PATH],metadata[SYM_PATH],target[SYM_PATH];int r=-1;
    if (!sym_at(fd,path,absolute) && !sym_resolve(absolute,actual,sizeof actual,!(flags&LUNA_AT_NOFOLLOW))) {
       int link=flags&LUNA_AT_NOFOLLOW ? sym_probe(actual,metadata,target) : 0;
       if (link==1) errno=EOPNOTSUPP;else if (!link && !sym_owner_permission(actual)) r=luna_file_chmodat(LUNA_AT_FDCWD,actual,mode,flags);
@@ -620,7 +673,7 @@ int luna_symlink_set_modified(const char *path,int64_t ms)
 }
 int luna_symlink_link(const char *from,const char *to)
 {
-   sym_enter();char a[SYM_PATH],b[SYM_PATH],ma[SYM_PATH],mb[SYM_PATH],target[SYM_PATH];int r=-1;
+   sym_enter();verdicts_changed();char a[SYM_PATH],b[SYM_PATH],ma[SYM_PATH],mb[SYM_PATH],target[SYM_PATH];int r=-1;
    if (!sym_resolve(from,a,sizeof a,0) && !sym_resolve(to,b,sizeof b,0) && !sym_parent_permission(b,3)) {
       int sa=sym_probe(a,ma,target),sb=sym_probe(b,mb,target);
       if (sb==1) errno=EEXIST;
@@ -673,15 +726,18 @@ char *luna_file_canonical_namespace(const char *path,char *out,size_t capacity,
    char work[SYM_PATH]="/",mapped[SYM_PATH],resolved[SYM_PATH],projected[SYM_PATH];
    size_t used=1;
    for(size_t at=1;path[at];){
-      while(path[at]=='/')++at;if(!path[at])break;
+      while(path[at]=='/')++at;
+      if(!path[at])break;
       size_t start=at;while(path[at] && path[at]!='/')++at;size_t n=at-start;
       if(n==1 && path[start]=='.')continue;
       if(n==2 && path[start]=='.' && path[start+1]=='.'){
          while(used>1 && work[used-1]!='/')--used;
-         if(used>1)--used;work[used]=0;continue;
+         if(used>1)--used;
+         work[used]=0;continue;
       }
       if(used+n+2>sizeof work){errno=ENAMETOOLONG;return NULL;}
-      if(used>1)work[used++]='/';memcpy(work+used,path+start,n);used+=n;work[used]=0;
+      if(used>1)work[used++]='/';
+      memcpy(work+used,path+start,n);used+=n;work[used]=0;
       const char *physical=mapper(work,mapped,sizeof mapped);
       if(!physical){if(errno==ENOENT || errno==ENOTDIR)continue;return NULL;}
       if(luna_symlink_realpath(physical,resolved,sizeof resolved)){
@@ -699,7 +755,7 @@ char *luna_file_canonical_namespace(const char *path,char *out,size_t capacity,
 }
 int luna_symlink_rename(const char *from,const char *to)
 {
-   sym_enter();char a[SYM_PATH],b[SYM_PATH],ma[SYM_PATH],mb[SYM_PATH],target[SYM_PATH];int r=-1;
+   sym_enter();verdicts_changed();char a[SYM_PATH],b[SYM_PATH],ma[SYM_PATH],mb[SYM_PATH],target[SYM_PATH];int r=-1;
    if (sym_resolve(from,a,sizeof a,0) || sym_resolve(to,b,sizeof b,0)) goto done;
    if (sym_parent_permission(a,3) || sym_parent_permission(b,3)) goto done;
    int sa=sym_probe(a,ma,target),sb=sym_probe(b,mb,target);

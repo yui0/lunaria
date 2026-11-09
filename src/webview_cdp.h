@@ -54,7 +54,7 @@ int lunaria_cdp_page_capture(struct lunaria_cdp_page *page,
 int lunaria_cdp_page_mouse(struct lunaria_cdp_page *page,
                            int x, int y, int pressed,
                            unsigned *request_id);
-/* action: 1 down, -1 move, 0 up. */
+/* action: 1 down, -1 move, 0 up, 2 cancel. */
 int lunaria_cdp_page_touch(struct lunaria_cdp_page *page,
                            int x, int y, int action);
 int lunaria_cdp_page_insert_text(struct lunaria_cdp_page *page,

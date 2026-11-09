@@ -33,6 +33,9 @@ struct rt_bitmap {
    char png[DVM_PATH_MAX];
    char overlay_key[64];
    unsigned overlay_gen;
+   struct lm_sink *native_sink;
+   uint64_t native_serial;
+   bool surface_frame;      /* the picture lives in the renderer; px[] is not kept current */
 };
 
 static void bitmap_destroy(void *data)
@@ -40,6 +43,7 @@ static void bitmap_destroy(void *data)
    struct rt_bitmap *bitmap = data;
    if (!bitmap) return;
    luna_overlay_image_forget(bitmap->overlay_key);
+   lm_sink_free(bitmap->native_sink);
    free(bitmap->px);
    free(bitmap);
 }
@@ -47,7 +51,11 @@ static void bitmap_destroy(void *data)
 static struct rt_bitmap *bitmap_of(struct dvm *vm, dvm_ref b)
 {
    struct dvm_object *o = b ? dvm__obj(vm, b) : NULL;
-   return o ? o->data : NULL;
+   struct rt_bitmap *bm=o ? o->data : NULL;
+   if(bm && bm->native_sink && lm_sink_snapshot_argb(bm->native_sink,&bm->native_serial,&bm->px,&bm->w,&bm->h)) {
+      ++bm->gen;bm->overlay_gen=bm->gen;
+   }
+   return bm;
 }
 
 /* The density of the screen the emulator presents: the same number
@@ -92,12 +100,28 @@ static dvm_ref bitmap_new(struct dvm *vm, int32_t w, int32_t h)
 /* The UI thread is the window BufferQueue consumer. lm_sink_take owns its
  * front buffer until this consumer takes another one, even with an async
  * decoder producer. Keep pixels in memory and reuse the Bitmap for each size. */
+static void bitmap_assign_key(struct rt_bitmap *bm);
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+static void surface_image_release(void *sink) {lm_sink_free(sink);}
+static void surface_image_pull(void *sink,const char *key,int64_t present_ns)
+{
+ const uint8_t *rgba=NULL;int w=0,h=0;
+ if(lm_sink_take_at(sink,present_ns,&rgba,&w,&h)) (void)luna_overlay_image_rgba(key,w,h,rgba);
+}
 static bool surface_refresh_bitmap(struct dvm *vm, dvm_ref surface)
 {
    struct lm_sink *sink = surface_sink(vm, surface);
+   dvm_ref existing=ui_obj(vm,surface,"bufferBitmap","Landroid/graphics/Bitmap;");
+   struct dvm_object *existing_object=existing ? dvm__obj(vm,existing) : NULL;
+   struct rt_bitmap *existing_bitmap=existing_object ? existing_object->data : NULL;
+   if(sink && existing_bitmap && existing_bitmap->native_sink==sink) return false;
    const uint8_t *rgba = NULL;
    int w = 0, h = 0;
-   if (!sink || !lm_sink_take(sink, &rgba, &w, &h)) return false;
+   struct timespec now;clock_gettime(CLOCK_MONOTONIC,&now);
+   int64_t present=(int64_t)now.tv_sec*1000000000+now.tv_nsec;
+   if (!sink || !lm_sink_take_at(sink,present,&rgba,&w,&h)) return false;
    dvm_ref bitmap = ui_obj(vm, surface, "bufferBitmap", "Landroid/graphics/Bitmap;");
    struct rt_bitmap *bm = bitmap_of(vm, bitmap);
    if (!bm || bm->w != w || bm->h != h) {
@@ -107,11 +131,45 @@ static bool surface_refresh_bitmap(struct dvm *vm, dvm_ref surface)
       (void)dvm_set_field(vm, surface, "bufferBitmap", "Landroid/graphics/Bitmap;",
                           (union dvm_value){.l=bitmap});
    }
-   for (size_t i = 0, count = (size_t)w * h; i < count; ++i)
+   /* The picture goes to the renderer as it came out of the decoder.  Turning a
+    * 1080p frame into a Bitmap, drawing that scaled into the view's raster and
+    * converting the raster again cost three passes over the frame, thirty times
+    * a second, on the thread that runs the UI; the view's box scales it on the
+    * GPU.  The Bitmap keeps its size (so the surface is still a drawing surface)
+    * and its picture lives in the renderer under its own name. */
+   if (!bm->overlay_key[0]) bitmap_assign_key(bm);
+   const bool published = luna_overlay_image_rgba(bm->overlay_key, w, h, rgba);
+   /* The Bitmap still holds the pixels, for anything that reads or draws it. */
+   size_t i = 0;
+   const size_t count = (size_t)w * h;
+#if defined(__SSE2__)
+   {
+      const __m128i green_alpha = _mm_set1_epi32((int)0xff00ff00u), low = _mm_set1_epi32(0xff);
+      for (; i + 4 <= count; i += 4) {
+         const __m128i x = _mm_loadu_si128((const __m128i *)(rgba + 4 * i));
+         const __m128i r = _mm_slli_epi32(_mm_and_si128(x, low), 16);          /* R to bits 16..23 */
+         const __m128i b = _mm_and_si128(_mm_srli_epi32(x, 16), low);          /* B to bits 0..7 */
+         _mm_storeu_si128((__m128i *)(bm->px + i),
+                          _mm_or_si128(_mm_or_si128(_mm_and_si128(x, green_alpha), r), b));
+      }
+   }
+#endif
+   for (; i < count; ++i)
       bm->px[i] = ((uint32_t)rgba[4*i+3] << 24) |
                   ((uint32_t)rgba[4*i] << 16) |
                   ((uint32_t)rgba[4*i+1] << 8) | rgba[4*i+2];
    ++bm->gen;
+   if (published) {
+      bm->overlay_gen = bm->gen; bm->surface_frame = true;
+      /* Ownership of subsequent acquisitions moves to the compositor. CPU
+       * readers mirror its front lazily; a new video frame needs no traversal. */
+      lm_sink_ref(sink);
+      if(luna_overlay_image_source(bm->overlay_key,sink,surface_image_pull,surface_image_release)) {
+         lm_sink_free(bm->native_sink);
+         lm_sink_ref(sink);bm->native_sink=sink;
+         (void)lm_sink_snapshot_argb(sink,&bm->native_serial,&bm->px,&bm->w,&bm->h);
+      } else lm_sink_free(sink);
+   }
    return true;
 }
 
@@ -125,43 +183,28 @@ static bool bitmap_live(struct dvm *vm, struct rt_bitmap *bm)
 
 /* The bitmap as a PNG file the overlay can load; rewritten when the pixels
  * changed since last time. */
+/* The renderer's name for a bitmap's picture.  One counter for every bitmap, so
+ * two bitmaps never share a key and show each other's pixels. */
+static void bitmap_assign_key(struct rt_bitmap *bm)
+{
+   static atomic_ullong sequence;
+   snprintf(bm->overlay_key, sizeof bm->overlay_key, "lunaria-bitmap-%llu",
+            atomic_fetch_add(&sequence, 1) + 1);
+}
+
 static const char *bitmap_png_path(struct dvm *vm, dvm_ref b)
 {
    struct rt_bitmap *bm = bitmap_of(vm, b);
    if (!bm || bm->recycled || !bm->px) return NULL;
-   if (bm->png[0] && bm->png_gen == bm->gen) return bm->png;
-   static unsigned seq;
-   char dir[DVM_PATH_MAX];
-   if (luna_temp_path(dir, sizeof dir, "bitmaps")) return NULL;
-   (void)luna_file_mkdir(dir, 0700);
-   if (!bm->png[0])
-      snprintf(bm->png, sizeof bm->png, "%s/b%u.png", dir, ++seq);
-   uint8_t *rgba = malloc((size_t)bm->w * (size_t)bm->h * 4);
-   if (!rgba) return NULL;
-   for (size_t i = 0; i < (size_t)bm->w * (size_t)bm->h; ++i) {
-      const uint32_t p = bm->px[i];
-      rgba[i * 4 + 0] = (uint8_t)(p >> 16);
-      rgba[i * 4 + 1] = (uint8_t)(p >> 8);
-      rgba[i * 4 + 2] = (uint8_t)p;
-      rgba[i * 4 + 3] = (uint8_t)(p >> 24);
+   bool fresh = !bm->overlay_key[0];
+   if (fresh) bitmap_assign_key(bm);
+   /* The pixels go to the renderer as they are: encoding them to a PNG file for
+    * the renderer to decode again cost more than drawing the picture did. */
+   if (fresh || bm->overlay_gen != bm->gen) {
+      if (!luna_overlay_image_argb(bm->overlay_key, bm->w, bm->h, bm->px)) return NULL;
+      bm->overlay_gen = bm->gen;
    }
-   char temporary[DVM_PATH_MAX+8];
-   snprintf(temporary,sizeof temporary,"%s.tmp",bm->png);
-   /* A scratch file the overlay reads straight back, rewritten whenever the app
-    * redraws the bitmap: speed over size (stb's default tries all five row
-    * filters and a deep match search, most of a frame's cost for a big bitmap). */
-   const int level = stbi_write_png_compression_level, filter = stbi_write_force_png_filter;
-   stbi_write_png_compression_level = 1;
-   stbi_write_force_png_filter = 1;
-   const int ok = stbi_write_png(temporary, bm->w, bm->h, 4, rgba, bm->w * 4);
-   stbi_write_png_compression_level = level;
-   stbi_write_force_png_filter = filter;
-   free(rgba);
-   if (!ok || luna_file_rename(temporary,bm->png)) {
-      (void)luna_file_unlink(temporary); return NULL;
-   }
-   bm->png_gen = bm->gen;
-   return bm->png;
+   return bm->overlay_key;
 }
 
 /* Bilinear resample into a new bitmap (createScaledBitmap, density scaling). */
@@ -291,11 +334,16 @@ static dvm_ref bitmap_decode(struct dvm *vm, const uint8_t *data, size_t len,
    stbi_set_flip_vertically_on_load_thread(0);
    uint8_t *rgba = NULL;
    bool decoded;
+   /* Decompressing touches only host memory, and a poster takes tens of
+    * milliseconds: do it without the interpreter lock so the main thread, which
+    * is usually the one waiting for it, keeps running other work. */
+   const unsigned gil_depth = dvm_gil_unlock_all(vm);
    if (webp) decoded = bitmap_decode_webp(data, len, bounds_only, &w, &h, &comp, &rgba);
    else {
       rgba = len <= INT_MAX ? stbi_load_from_memory(data, (int)len, &w, &h, &comp, 4) : NULL;
       decoded = rgba != NULL;
    }
+   dvm_gil_relock(vm, gil_depth);
    if (!decoded) {
       static int told;
       if (told++ < 8)
@@ -1022,8 +1070,15 @@ static bool view_transform_coordinates(struct dvm *vm, dvm_ref self,
    RETV();
 }
 
-static void mat_map(const float m[9], float x, float y, float *ox, float *oy)
+static inline void mat_map(const float m[9], float x, float y, float *ox, float *oy)
 {
+   /* The matrices that reach pixel loops are affine; skip the perspective
+    * divide (exactly the same result when the last row is 0 0 1). */
+   if (m[6] == 0.0f && m[7] == 0.0f && m[8] == 1.0f) {
+      *ox = m[0] * x + m[1] * y + m[2];
+      *oy = m[3] * x + m[4] * y + m[5];
+      return;
+   }
    const float w = m[6] * x + m[7] * y + m[8];
    *ox = (m[0] * x + m[1] * y + m[2]) / (w ? w : 1.0f);
    *oy = (m[3] * x + m[4] * y + m[5]) / (w ? w : 1.0f);
@@ -1933,6 +1988,33 @@ static unsigned char *canvas_mask_cached(const luna_path *path,int w,int h,const
    }
 }
 
+static uint32_t gd_sample(const uint32_t *,uint32_t,const float *,float,uint32_t);
+
+/* A linear gradient's colour is a function of one number, so a fill samples a
+ * table of the finished colours (stops, paint alpha and colour filter already
+ * applied) instead of walking the stops and blending them for every pixel. */
+#define GRADIENT_LUT 512
+static void gradient_lut_build(const struct canvas_shader *s,uint32_t *lut)
+{
+   const struct vector_gradient *g=s->gradient;
+   for(int i=0;i<GRADIENT_LUT;++i) {
+      uint32_t c=gd_sample(g->colors,(uint32_t)g->count,g->positions,(float)i/(GRADIENT_LUT-1),0);
+      c=(c&0xffffffu)|((((c>>24)*s->alpha+127)/255)<<24);
+      lut[i]=color_filter_pixel(&s->filter,c);
+   }
+}
+static inline uint32_t gradient_lut_sample(const struct canvas_shader *s,const uint32_t *lut,float x,float y)
+{
+   float u,v;mat_map(s->inverse,x,y,&u,&v);if(!isfinite(u) || !isfinite(v)) return 0;
+   const struct vector_gradient *g=s->gradient;
+   const float dx=g->x1-g->x0,dy=g->y1-g->y0,length=dx*dx+dy*dy;
+   float t=length>0 ? ((u-g->x0)*dx+(v-g->y0)*dy)/length : 1;
+   if(g->tile==1) t-=floorf(t);
+   else if(g->tile==2) {t=fmodf(t,2);if(t<0) t+=2;if(t>1) t=2-t;}
+   t=fmaxf(0,fminf(1,t));
+   return lut[(int)(t*(GRADIENT_LUT-1)+.5f)];
+}
+
 static bool canvas_path_color(struct dvm *vm,dvm_ref self,const luna_path *path,uint32_t color,
                                  int style,float stroke,int cap,int join,float miter,bool aa,
                                  dvm_ref paint,union dvm_value *out)
@@ -1995,6 +2077,11 @@ static bool canvas_path_color(struct dvm *vm,dvm_ref self,const luna_path *path,
    const float *cb=state->clip_bounds;
    const bool solid=!shader.gradient && !shader.bitmap;
    const bool opaque_dst=!dst->has_alpha;
+   uint32_t lut[GRADIENT_LUT];
+   const bool use_lut=!solid && shader.gradient && !shader.bitmap && shader.gradient->type==0 &&
+      shader.gradient->count>=2 && shader.gradient->colors &&
+      (long)(limits[2]-limits[0])*(limits[3]-limits[1])>=2048;
+   if(use_lut) gradient_lut_build(&shader,lut);
    const unsigned solid_alpha=color>>24;
    for(int y=limits[1];y<limits[3];++y) {
       if(simple_clip && !(y+.5f>=cb[1] && y+.5f<cb[3])) continue;
@@ -2012,7 +2099,8 @@ static bool canvas_path_color(struct dvm *vm,dvm_ref self,const luna_path *path,
             if(mode==3) {dst->px[index]=color;continue;}
             if(mode==6 && !opaque_dst) continue;
          }
-         uint32_t sample=solid ? color : canvas_shader_sample(&shader,lx,ly,color);
+         uint32_t sample=solid ? color : use_lut ? gradient_lut_sample(&shader,lut,lx,ly)
+                                                  : canvas_shader_sample(&shader,lx,ly,color);
          dst->px[index]=canvas_blend(sample,dst->px[index],mode,coverage,opaque_dst);
       }
    }
@@ -3905,7 +3993,10 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
 {
    struct dvm_class *cls=dvm_object_class(vm,view);
    const char *hooks[]={"draw","onDraw","dispatchDraw"};
-   bool custom=false;
+   /* TextView measures shaped Layout runs. Publish that same Canvas picture:
+    * emitting an HTML label would shape and wrap the text a second time. */
+   const bool text_view=ui_is_a(vm,view,"android/widget/TextView");
+   bool custom=text_view;
    for(size_t i=0;i<sizeof hooks/sizeof *hooks;++i) {
       struct dvm_method *m=cls ? dvm_find_method(vm,cls,hooks[i],"(Landroid/graphics/Canvas;)V") : NULL;
       if (m && m->has_code) custom=true;
@@ -3917,15 +4008,54 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
       dvm_ref surface=ui_obj(vm,holder,"surface","Landroid/view/Surface;");
       if (ui_obj(vm,surface,"bufferBitmap","Landroid/graphics/Bitmap;")) custom=true;
    }
+   /* A view that draws itself in app code owns the Android contract: its picture
+    * changes only after invalidate(). Built-in widgets drawn through the same
+    * path (ProgressBar, a video surface) change by their setters, which do not
+    * all say so on the view, so they are always redrawn. */
+   bool app_draw=text_view;
+   for(size_t i=0;i<sizeof hooks/sizeof *hooks && !app_draw;++i) {
+      struct dvm_method *m=cls ? dvm_find_method(vm,cls,hooks[i],"(Landroid/graphics/Canvas;)V") : NULL;
+      app_draw=m && m->has_code;
+   }
+   if(ui_is_a(vm,view,"android/widget/ProgressBar") || ui_is_a(vm,view,"android/view/SurfaceView")) app_draw=false;
    const struct ui_node *node=ui_node(vm,view);
    if (!custom || !node || node->w<=0 || node->h<=0 || ui_int(vm,view,"visibility")) return NULL;
+   if (ui_is_a(vm,view,"android/view/SurfaceView")) {
+      /* A video surface whose frame is already in the renderer needs no raster
+       * of its own: the view's box shows that picture. */
+      dvm_ref holder=ui_obj(vm,view,"holder","Landroid/view/SurfaceHolder;");
+      dvm_ref surface=ui_obj(vm,holder,"surface","Landroid/view/Surface;");
+      struct rt_bitmap *sb=bitmap_of(vm,ui_obj(vm,surface,"bufferBitmap","Landroid/graphics/Bitmap;"));
+      if (sb && sb->surface_frame && sb->overlay_key[0] && sb->overlay_gen==sb->gen) {
+         (void)dvm_set_field(vm,view,"drawingSeq","I",(union dvm_value){.i=(int32_t)g_ui_build_seq});
+         return sb->overlay_key;
+      }
+   }
    dvm_ref bitmap=ui_obj(vm,view,"drawingBitmap","Landroid/graphics/Bitmap;");
    struct rt_bitmap *bm=bitmap_of(vm,bitmap);
+   /* Nothing invalidated it and it kept its size: the picture it left in the
+    * last build is still its picture, whatever else made the document stale. */
+   union dvm_value recorded_epoch={0};
+   (void)dvm_get_field(vm,view,"drawingEpoch","J",&recorded_epoch);
+   const uint64_t capture_epoch=g_ui_draw_epoch;
+   const bool epoch_matches=(uint64_t)recorded_epoch.j==capture_epoch;
+   if (app_draw && epoch_matches && bm && bm->w==node->w && bm->h==node->h && bm->overlay_key[0] && bm->overlay_gen==bm->gen &&
+       (uint32_t)ui_int(vm,view,"drawingSeq")+1==g_ui_build_seq && !ui_int(vm,view,"drawDirty")) {
+      (void)dvm_set_field(vm,view,"drawingSeq","I",(union dvm_value){.i=(int32_t)g_ui_build_seq});
+      ++g_ui_render_prof.reused;
+      return bm->overlay_key;
+   }
+   if(dvm__env("LUNARIA_UI_RENDER_PROF")) {
+      unsigned reason=!app_draw ? 0 : !bm ? 1 : bm->w!=node->w || bm->h!=node->h ? 2 :
+         !epoch_matches ? 3 : !bm->overlay_key[0] || bm->overlay_gen!=bm->gen ? 4 :
+         (uint32_t)ui_int(vm,view,"drawingSeq")+1!=g_ui_build_seq ? 5 : 6;
+      ++g_ui_render_prof.capture_miss[reason];
+   }
    /* The pixels already in the bitmap stand for everything this rebuild's
     * damage does not touch, but only if they were left by the rebuild just
     * before it — a view that sat out a rebuild (hidden, detached) missed that
     * rebuild's damage. */
-   bool partial=bm && bm->w==node->w && bm->h==node->h && !g_ui_frame_damage.full &&
+   bool partial=epoch_matches && bm && bm->w==node->w && bm->h==node->h && !g_ui_frame_damage.full &&
       (uint32_t)ui_int(vm,view,"drawingSeq")+1==g_ui_build_seq && bm->overlay_key[0] && bm->overlay_gen==bm->gen;
    int32_t area[4]={0,0,node->w,node->h};
    if (partial) {
@@ -3961,6 +4091,7 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
    }
    /* Until this draw completes the bitmap is not a picture of anything. */
    (void)dvm_set_field(vm,view,"drawingSeq","I",(union dvm_value){.i=0});
+   (void)dvm_set_field(vm,view,"drawDirty","Z",(union dvm_value){.i=0});
    if (partial) {
       for(int32_t y=area[1];y<area[3];++y)
          memset(bm->px+(size_t)y*bm->w+area[0],0,(size_t)(area[2]-area[0])*sizeof *bm->px);
@@ -3978,14 +4109,14 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
    const bool drawn=am_vcall(vm,view,"draw","(Landroid/graphics/Canvas;)V",&argument,1,&ignored);
    if (own_picture_only) g_ui_capture_without_children=false;
    if (!drawn) return NULL;
+   (void)dvm_set_field(vm,view,"drawingEpoch","J",(union dvm_value){.j=(int64_t)capture_epoch});
    (void)dvm_set_field(vm,view,"drawingSeq","I",(union dvm_value){.i=(int32_t)g_ui_build_seq});
    uint64_t publish_started=ui_render_ns();
-   if(!bm->overlay_key[0]) {
-      static uint64_t sequence;
-      snprintf(bm->overlay_key,sizeof bm->overlay_key,"lunaria-bitmap-%llu",(unsigned long long)++sequence);
-   }
+   if(!bm->overlay_key[0]) bitmap_assign_key(bm);
    if(bm->overlay_gen!=bm->gen) {
-      if(!luna_overlay_image_argb(bm->overlay_key,bm->w,bm->h,bm->px)) {
+      const bool sent=partial ? luna_overlay_image_argb_rect(bm->overlay_key,bm->w,bm->h,bm->px,area[0],area[1],area[2],area[3])
+                              : luna_overlay_image_argb(bm->overlay_key,bm->w,bm->h,bm->px);
+      if(!sent) {
          dvm__throw(vm,"java/lang/OutOfMemoryError","Bitmap upload");return NULL;
       }
       bm->overlay_gen=bm->gen;

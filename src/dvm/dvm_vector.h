@@ -644,15 +644,15 @@ static bool filter_data_matches(struct dvm *vm, const char *specs, dvm_ref data,
    return !type;
 }
 
-static bool activity_filter_matches(struct dvm *vm, dvm_ref intent,
-                                    const char *component, int flags, int *priority)
+static bool manifest_filter_matches(struct dvm *vm, dvm_ref intent,
+                                    const char *component, int flags, int *priority,const char *table)
 {
    union dvm_value action={0}, categories={0}, data={0}, type={0};
    dvm_get_field(vm,intent,"action","Ljava/lang/String;",&action);
    dvm_get_field(vm,intent,"categories","Ljava/util/Set;",&categories);
    dvm_get_field(vm,intent,"data","Landroid/net/Uri;",&data);
    dvm_get_field(vm,intent,"type","Ljava/lang/String;",&type);
-   const char *text=getenv("ANDROID_ACTIVITY_FILTERS");
+   const char *text=getenv(table);
    char *copy=text ? strdup(text) : NULL;
    bool matched=false;
    for (char *p=copy, *row; p && (row=luna_strsep(&p,"\n"));) {
@@ -676,6 +676,9 @@ static bool activity_filter_matches(struct dvm *vm, dvm_ref intent,
    free(copy);
    return matched;
 }
+
+static bool activity_filter_matches(struct dvm *vm,dvm_ref intent,const char *component,int flags,int *priority)
+{ return manifest_filter_matches(vm,intent,component,flags,priority,"ANDROID_ACTIVITY_FILTERS"); }
 
 static bool pm_queryIntentActivities(struct dvm *vm, dvm_ref self,
                                      const union dvm_value *args, int nargs,

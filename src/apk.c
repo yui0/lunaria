@@ -8,6 +8,7 @@
 #include "dvm/dvm_lib.h"
 #include "luna_boot.h"
 #include "luna_google.h"
+#include "jvm/jvm.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -418,10 +419,10 @@ static int zip_read(struct zip *z, const struct zip_entry *e, FILE *out, unsigne
       status = -1;
    return status ? apk_error("corrupt ZIP entry: %s", e->name) : 0;
 }
-static unsigned char *zip_memory(struct zip *z, const char *name, size_t *size)
+static unsigned char *zip_memory_limit(struct zip *z, const char *name, size_t *size, size_t limit)
 {
    struct zip_entry *e = zip_find(z, name);
-   if (!e || e->size > APK_MAX_MANIFEST)
+   if (!e || e->size > limit || e->size >= SIZE_MAX)
       return NULL;
    unsigned char *data = malloc((size_t)e->size + 1);
    if (!data)
@@ -433,6 +434,10 @@ static unsigned char *zip_memory(struct zip *z, const char *name, size_t *size)
    data[e->size] = 0;
    *size = (size_t)e->size;
    return data;
+}
+static unsigned char *zip_memory(struct zip *z, const char *name, size_t *size)
+{
+   return zip_memory_limit(z, name, size, APK_MAX_MANIFEST);
 }
 static int zip_extract(struct zip *z, const char *root, bool overwrite)
 {
@@ -536,18 +541,20 @@ static int text_add_row(struct text *t, const char *separator, const char *forma
 }
 
 struct manifest {
+   char version_name[256], version_code[32];
    char package[256], split[256], activity[512], application[512], application_process[512], activity_process[512];
    char orientation[32], theme[32], min_sdk[32], target_sdk[32], config_changes[32];
    char cleartext[8], network_security[32];
-   struct text receivers, services, activities, activity_filters;
+   struct text receivers, receiver_filters, services, activities, activity_filters;
    struct text providers, permissions, query_actions, query_packages;
-   struct text libraries;
+   struct text libraries, service_metadata;
 };
 static void manifest_clear(struct manifest *m)
 {
    text_free(&m->receivers); text_free(&m->services); text_free(&m->activities);
-   text_free(&m->activity_filters); text_free(&m->providers); text_free(&m->permissions);
+   text_free(&m->receiver_filters); text_free(&m->activity_filters); text_free(&m->providers); text_free(&m->permissions);
    text_free(&m->query_actions); text_free(&m->query_packages); text_free(&m->libraries);
+   text_free(&m->service_metadata);
    memset(m, 0, sizeof *m);
 }
 static void manifest_free(struct manifest *m)
@@ -595,54 +602,46 @@ static int pool_len(const unsigned char *p, size_t n, size_t *at, bool utf8, uin
    }
    return 0;
 }
+/* Decode one string without materializing the pool. Large resource tables
+ * can have hundreds of thousands of strings; registry lookup needs only a few. */
+static char *axml_pool_string(const unsigned char *p, size_t n, uint32_t index)
+{
+   if (n < 28) return NULL;
+   size_t header = le16(p + 2), count = le32(p + 8), base = le32(p + 20);
+   bool utf8 = (le32(p + 16) & 256) != 0;
+   if (header < 28 || header > n || count > (n - header) / 4 || index >= count || base > n) return NULL;
+   size_t off = le32(p + header + (size_t)index * 4);
+   if (off > n - base) return NULL;
+   size_t at = base + off;
+   uint32_t len, unused;
+   if ((utf8 && pool_len(p,n,&at,true,&unused)) || pool_len(p,n,&at,utf8,&len)) return NULL;
+   if (utf8) {
+      if (len > n - at || n - at - len < 1 || p[at + len]) return NULL;
+      char *value = malloc((size_t)len + 1);
+      if (value) { memcpy(value,p + at,len); value[len] = 0; }
+      return value;
+   }
+   if (len > (n - at) / 2 || n - at - (size_t)len * 2 < 2 || le16(p + at + len*2)) return NULL;
+   uint16_t *units = malloc(((size_t)len + 1) * 2);
+   char *value = malloc((size_t)len * 3 + 1);
+   if (!units || !value) { free(units);free(value);return NULL; }
+   for (uint32_t i = 0; i < len; ++i) units[i] = le16(p + at + (size_t)i * 2);
+   value[jcs_utf16_to_wtf8(units,len,value)] = 0;
+   free(units);
+   return value;
+}
 static int axml_pool(struct axml *x, const unsigned char *p, size_t n)
 {
-   if (n < 28)
-      return -1;
-   size_t header = le16(p + 2), count = le32(p + 8), base = le32(p + 20);
-   bool utf8 = !!(le32(p + 16) & 256);
-   if (count > 1000000 || header > n || count > (n - header) / 4 || base > n)
-      return -1;
+   if (n < 28) return -1;
+   size_t header = le16(p + 2), count = le32(p + 8);
+   if (count > 1000000 || header < 28 || header > n || count > (n - header) / 4) return -1;
    axml_free(x);
-   x->strings = calloc(count ? count : 1, sizeof(*x->strings));
-   if (!x->strings)
-      return -1;
+   x->strings = calloc(count ? count : 1,sizeof *x->strings);
+   if (!x->strings) return -1;
    x->count = count;
-   for (size_t i = 0; i < count; i++) {
-      size_t off = le32(p + header + i * 4);
-      if (off > n - base)
-         return -1;
-      size_t at = base + off;
-      uint32_t len, unused;
-      if (utf8 && pool_len(p, n, &at, true, &unused))
-         return -1;
-      if (pool_len(p, n, &at, utf8, &len))
-         return -1;
-      if (utf8) {
-         if (len > n - at || n - at - len < 1 || p[at + len])
-            return -1;
-         x->strings[i] = malloc((size_t)len + 1);
-         if (!x->strings[i])
-            return -1;
-         memcpy(x->strings[i], p + at, len);
-         x->strings[i][len] = 0;
-      } else {
-         if (len > (n - at) / 2 || n - at - (size_t)len * 2 < 2 || le16(p + at + len * 2))
-            return -1;
-         uint16_t *u = malloc(((size_t)len + 1) * 2);
-         char *s = malloc((size_t)len * 3 + 1);
-         if (!u || !s) {
-            free(u);
-            free(s);
-            return -1;
-         }
-         for (uint32_t k = 0; k < len; k++)
-            u[k] = le16(p + at + k * 2);
-         size_t bytes = jcs_utf16_to_wtf8(u, len, s);
-         s[bytes] = 0;
-         free(u);
-         x->strings[i] = s;
-      }
+   for (uint32_t i = 0; i < count; ++i) {
+      x->strings[i] = axml_pool_string(p,n,i);
+      if (!x->strings[i]) return -1;
    }
    return 0;
 }
@@ -707,8 +706,33 @@ static int attr_boolean(const struct attr *v)
       return !strcmp(v->text, "true") || !strcmp(v->text, "1");
    return v->value != 0;
 }
-static int parse_manifest_events(const unsigned char *data, size_t size, struct manifest *m, struct axml x)
+struct registered_value { uint8_t type; uint32_t data; };
+struct manifest_resources {
+   struct zip *zip;
+   unsigned char *table;
+   size_t size, pool_size;
+   const unsigned char *pool;
+   struct axml values;
+};
+static const char *manifest_resource_string(struct manifest_resources *,uint32_t);
+static bool manifest_resource_value(struct manifest_resources *,uint32_t,struct registered_value *);
+static bool manifest_string_attribute(const char *key)
 {
+   static const char *const names[]={"name","process","permission","authorities",
+      "targetActivity","parentActivityName","targetPackage","versionName"};
+   for(size_t i=0;i<sizeof names/sizeof *names;++i)if(!strcmp(key,names[i]))return true;
+   return false;
+}
+static bool manifest_boolean_attribute(const char *key)
+{
+   static const char *const names[]={"enabled","exported","directBootAware","grantUriPermissions",
+      "multiprocess","debuggable","allowBackup","supportsRtl","usesCleartextTraffic"};
+   for(size_t i=0;i<sizeof names/sizeof *names;++i)if(!strcmp(key,names[i]))return true;
+   return false;
+}
+static int parse_manifest_events(const unsigned char *data, size_t size, struct manifest *m, struct axml x, struct zip *zip)
+{
+   struct manifest_resources resources={.zip=zip};
    manifest_clear(m);
    int result = -1, depth = 0, activity_depth = -1, provider_depth = -1, queries_depth = -1, intent_depth = -1;
    struct text provider = {0}, filter_actions = {0}, filter_categories = {0}, filter_specs = {0}, service_actions = {0}, receiver_actions = {0};
@@ -767,9 +791,24 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
                a[i].text = numbers[i];
             }
          }
+         for(size_t i=0;zip && i<count;++i) {
+            if(a[i].type!=1)continue;
+            if(manifest_string_attribute(a[i].key)) {
+               a[i].text=manifest_resource_string(&resources,a[i].value);
+               if(!a[i].text)goto done;
+            } else if(manifest_boolean_attribute(a[i].key)) {
+               struct registered_value value;
+               if(!manifest_resource_value(&resources,a[i].value,&value) || value.type<16 || value.type>31)goto done;
+               a[i].type=value.type;a[i].value=value.data;
+               snprintf(numbers[i],sizeof numbers[i],"%" PRIu32,value.data);
+               a[i].text=numbers[i];
+            }
+         }
          if (!strcmp(tag, "manifest")) {
             if (copy_text(m->package, sizeof m->package, attr_text(a, count, "package")) || copy_text(m->split, sizeof m->split, attr_text(a, count, "split")))
                goto done;
+            if (copy_text(m->version_name, sizeof m->version_name, attr_text(a,count,"versionName")) ||
+                attr_number(m->version_code, sizeof m->version_code, a,count,"versionCode")) goto done;
          } else if (!strcmp(tag, "application")) {
             application_depth=depth;
             if (class_name(m->application, sizeof m->application, m->package, attr_text(a, count, "name")) || attr_number(app_theme, sizeof app_theme, a, count, "theme"))
@@ -798,7 +837,7 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
             v = attribute(a, count, "permission");
             if (copy_text(permission, sizeof permission, v ? v->text : app_permission)) goto done;
             v = attribute(a, count, "process");
-            const char *proc = v ? v->text : app_process;
+            const char *proc = v && *v->text ? v->text : app_process;
             if (!*proc) proc = m->package;
             if (*proc == ':') {
                int n = snprintf(process, sizeof process, "%s%s", m->package, proc);
@@ -814,7 +853,7 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
             v = attribute(a, count, "exported");
             service_exported = v ? attr_boolean(v) : -1;
             v = attribute(a, count, "process");
-            const char *proc = v ? v->text : app_process;
+            const char *proc = v && *v->text ? v->text : app_process;
             if (!*proc) proc = m->package;
             if (*proc == ':') {
                int n = snprintf(service_process, sizeof service_process, "%s%s", m->package, proc);
@@ -824,9 +863,14 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
             service_depth = depth;
          } else if (!strcmp(tag, "intent-filter") && receiver_depth >= 0) {
             receiver_filter = true;
+            intent_depth = depth;
+            const struct attr *priority = attribute(a,count,"priority");
+            filter_priority=priority ? (int)strtol(priority->text,NULL,0) : 0;
+            filter_data=0;
+            text_reset(&filter_actions);text_reset(&filter_categories);text_reset(&filter_specs);
          } else if (!strcmp(tag, "activity") || !strcmp(tag, "activity-alias")) {
             const struct attr *pv=attribute(a,count,"process");
-            const char *proc=pv ? pv->text : m->application_process;
+            const char *proc=pv && *pv->text ? pv->text : m->application_process;
             if(*proc==':'){
                int n=snprintf(activity_process,sizeof activity_process,"%s%s",m->package,proc);
                if(n<0 || (size_t)n>=sizeof activity_process)goto done;
@@ -892,7 +936,7 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
             /* A <provider> inside <queries> only declares visibility of another
              * app's provider (by authority); it is not a component of this one. */
             const struct attr *pv=attribute(a,count,"process");
-            const char *proc=pv ? pv->text : m->application_process;
+            const char *proc=pv && *pv->text ? pv->text : m->application_process;
             if(*proc==':'){
                int n=snprintf(provider_process,sizeof provider_process,"%s%s",m->package,proc);
                if(n<0 || (size_t)n>=sizeof provider_process)goto done;
@@ -909,6 +953,10 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
             if (text_add_row(&provider, "", "%s|%s|", qualified, attr_text(a, count, "authorities")))
                goto done;
             provider_depth = depth;
+         } else if (!strcmp(tag, "meta-data") && service_depth >= 0) {
+            const struct attr *v = attribute(a, count, "resource");
+            if (v && text_add_row(&m->service_metadata, "\n", "%s|%s|%" PRIu32,
+                                  service, attr_text(a, count, "name"), v->value)) goto done;
          } else if (!strcmp(tag, "meta-data") && provider_depth >= 0) {
             const struct attr *v = attribute(a, count, "resource");
             if (!v)
@@ -936,12 +984,12 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
             goto done;
          if (depth == intent_depth) {
             char component[512];
-            if (class_name(component, sizeof component, m->package, activity)) goto done;
-            if (text_add_row(&m->activity_filters, "\n", "%s|%s|%s|%d|%d|%s", component,
+            if (class_name(component, sizeof component, m->package, receiver_depth>=0 ? receiver : activity)) goto done;
+            if (text_add_row(receiver_depth>=0 ? &m->receiver_filters : &m->activity_filters, "\n", "%s|%s|%s|%d|%d|%s", component,
                              text_get(&filter_actions), text_get(&filter_categories), filter_data, filter_priority,
                              text_get(&filter_specs)))
                goto done;
-            activity_launch |= main && launcher && !filter_data;
+            if(receiver_depth<0)activity_launch |= main && launcher && !filter_data;
             intent_depth = -1;
          }
          if (depth == activity_depth) {
@@ -989,6 +1037,7 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
       result = 0;
 done:
    text_free(&provider); text_free(&filter_actions); text_free(&filter_categories); text_free(&filter_specs); text_free(&service_actions); text_free(&receiver_actions);
+   axml_free(&resources.values);free(resources.table);
    axml_free(&x);
    return result ? apk_error("invalid Android manifest") : 0;
 }
@@ -1122,17 +1171,19 @@ static int bundle_node(struct bundle_xml *b, struct pb node, unsigned depth)
    put32(end + 20, name);
    return bundle_event(b, end, sizeof end);
 }
-static int parse_manifest(const unsigned char *data, size_t size, struct manifest *m)
+static int parse_manifest_with_zip(const unsigned char *data, size_t size, struct manifest *m, struct zip *zip)
 {
    if (size < 8 || le32(data) != 0x00080003 || le32(data + 4) < 8 || le32(data + 4) > size)
       return apk_error("APK needs a binary AndroidManifest.xml");
-   return parse_manifest_events(data + 8, le32(data + 4) - 8, m, (struct axml){0});
+   return parse_manifest_events(data + 8, le32(data + 4) - 8, m, (struct axml){0}, zip);
 }
+static int parse_manifest(const unsigned char *data,size_t size,struct manifest *m)
+{ return parse_manifest_with_zip(data,size,m,NULL); }
 static int parse_bundle_manifest(const unsigned char *data, size_t size, struct manifest *m)
 {
    struct bundle_xml b = {0};
    int r = bundle_node(&b, (struct pb){data, size}, 0);
-   if (!r) r = parse_manifest_events(b.events, b.size, m, b.strings);
+   if (!r) r = parse_manifest_events(b.events, b.size, m, b.strings, NULL);
    else { axml_free(&b.strings); apk_error("invalid Bundle manifest"); }
    free(b.events);
    return r;
@@ -1145,10 +1196,314 @@ static int manifest_zip(struct zip *z, struct manifest *m)
    if (bundle) data = zip_memory(z, "base/manifest/AndroidManifest.xml", &n);
    if (!data)
       return apk_error("missing APK manifest");
-   int r = bundle ? parse_bundle_manifest(data, n, m) : parse_manifest(data, n, m);
+   int r = bundle ? parse_bundle_manifest(data, n, m) : parse_manifest_with_zip(data, n, m, z);
    free(data);
    return r;
 }
+
+int luna_apk_package_version(const char *apk, const char *package, int *code,
+                              char *name, size_t cap, int *target_sdk)
+{
+   struct zip zip = {0};
+   struct manifest *m = calloc(1, sizeof *m);
+   int result = -1;
+   if (!apk || !package || !code || !name || !cap || !target_sdk || !m ||
+       zip_open(&zip, apk) || manifest_zip(&zip,m) || strcmp(package,m->package)) goto done;
+   char *end = NULL;
+   errno = 0;
+   unsigned long long value = *m->version_code ? strtoull(m->version_code,&end,10) : 0;
+   if (errno || value > UINT32_MAX || (end && *end) || copy_text(name,cap,m->version_name)) goto done;
+   *code = (int32_t)(uint32_t)value;
+   *target_sdk = *m->target_sdk ? atoi(m->target_sdk) : *m->min_sdk ? atoi(m->min_sdk) : 1;
+   result = 1;
+done:
+   manifest_free(m); zip_close(&zip);
+   return result;
+}
+/* MPL-2.0. RegisteredServicesCache metadata from installed, unmodified APKs.
+ * Included by apk.c so ZIP, binary XML and string-pool readers are shared. */
+
+/* Registered service identities are nonlocalized configuration. Use the
+ * default resource, with the best supported SDK qualifier. Resource aliases,
+ * sparse/16-bit offsets and compact entries use the Android table formats. */
+static bool registered_resource(const unsigned char *table, size_t size, uint32_t id,
+                                  unsigned sdk, struct registered_value *out)
+{
+   int best = -1;
+   if (size < 12 || le16(table) != 2 || le32(table + 4) > size) return false;
+   size = le32(table + 4);
+   for (size_t at = le16(table + 2); at + 8 <= size;) {
+      const unsigned char *pkg = table + at;
+      size_t length = le32(pkg + 4), header = le16(pkg + 2);
+      if (length < header || header < 8 || length > size - at) return false;
+      if (le16(pkg) == 0x200 && header >= 284 && le32(pkg + 8) == (id >> 24)) {
+         unsigned type_offset = header >= 288 ? le32(pkg + 284) : 0;
+         for (size_t pos = header; pos + 8 <= length;) {
+            const unsigned char *type = pkg + pos;
+            size_t n = le32(type + 4), h = le16(type + 2);
+            if (h < 8 || n < h || n > length - pos) return false;
+            if (le16(type) == 0x201 && h >= 48 && type[8] + type_offset == ((id >> 16) & 255)) {
+               uint32_t count = le32(type + 12), start = le32(type + 16), config = le32(type + 20);
+               if (config < 28 || config > h - 20 || start < h || start > n) return false;
+               bool match = true;
+               for (unsigned k = 4; k < config; ++k)
+                  if ((k < 24 || k >= 28) && type[20 + k]) match = false;
+               unsigned version = le16(type + 44);
+               if (le16(type + 46) || version > sdk) match = false;
+               uint32_t index = id & 65535, offset = UINT32_MAX;
+               if (match && (int)version >= best) {
+                  if (type[9] & 1) {
+                     if (count > (start - h) / 4) return false;
+                     for (uint32_t k = 0; k < count; ++k)
+                        if (le16(type + h + 4*k) == index) { offset = (uint32_t)le16(type + h + 4*k + 2) * 4; break; }
+                  } else if (index < count) {
+                     unsigned width = (type[9] & 2) ? 2 : 4;
+                     if (count > (start - h) / width) return false;
+                     offset = width == 2 ? le16(type + h + index*2) : le32(type + h + index*4);
+                     if (width == 2) offset = offset == 65535 ? UINT32_MAX : offset * 4;
+                  }
+                  if (offset != UINT32_MAX) {
+                     if (offset > n - start || n - start - offset < 8) return false;
+                     const unsigned char *entry = type + start + offset;
+                     size_t remaining = n - start - offset;
+                     uint16_t flags = le16(entry + 2), entry_size = le16(entry);
+                     if (!(flags & 1)) {
+                        if (flags & 8) { out->type = flags >> 8; out->data = le32(entry + 4); }
+                        else {
+                           if (entry_size < 8 || entry_size > remaining || remaining - entry_size < 8) return false;
+                           out->type = entry[entry_size + 3]; out->data = le32(entry + entry_size + 4);
+                        }
+                        best = (int)version;
+                     }
+                  }
+               }
+            }
+            pos += n;
+         }
+      }
+      at += length;
+   }
+   return best >= 0;
+}
+static char *registered_string(const unsigned char *table, size_t size,
+                                const unsigned char *pool, size_t pool_size, uint32_t id, unsigned sdk)
+{
+   for (unsigned depth = 0; depth < 32; ++depth) {
+      struct registered_value value;
+      if (!registered_resource(table, size, id, sdk, &value)) return NULL;
+      if (value.type == 3) return axml_pool_string(pool, pool_size, value.data);
+      if (value.type != 1 || value.data == id) return NULL;
+      id = value.data;
+   }
+   return NULL;
+}
+/* Android resolves string references in component identities before resolving
+ * classes or normalizing private process names. Load the table only on demand. */
+static bool manifest_resource_value(struct manifest_resources *r,uint32_t id,struct registered_value *out)
+{
+   if(!r->table) {
+      r->table=zip_memory_limit(r->zip,"resources.arsc",&r->size,512u*1024u*1024u);
+      if(!r->table || r->size<12 || le16(r->table)!=2 || le32(r->table+4)>r->size)return false;
+      r->size=le32(r->table+4);
+      for(size_t at=le16(r->table+2);at+8<=r->size;) {
+         size_t n=le32(r->table+at+4),h=le16(r->table+at+2);
+         if(n<h || h<8 || n>r->size-at)return false;
+         if(le16(r->table+at)==1){r->pool=r->table+at;r->pool_size=n;break;}
+         at+=n;
+      }
+   }
+   if(!r->pool)return false;
+   for(unsigned depth=0;depth<32;++depth) {
+      if(!registered_resource(r->table,r->size,id,(unsigned)lunaria_sdk_int(),out))return false;
+      if(out->type!=1)return true;
+      if(out->data==id)return false;
+      id=out->data;
+   }
+   return false;
+}
+static const char *manifest_resource_string(struct manifest_resources *r,uint32_t id)
+{
+   struct registered_value v;
+   if(!manifest_resource_value(r,id,&v) || v.type!=3)return NULL;
+   char *value=axml_pool_string(r->pool,r->pool_size,v.data);
+   if(!value)return NULL;
+   char **values=realloc(r->values.strings,(r->values.count+1)*sizeof *values);
+   if(!values){free(value);return NULL;}
+   r->values.strings=values;r->values.strings[r->values.count++]=value;
+   return value;
+}
+
+static char *registered_xml_attribute(const unsigned char *xml, size_t size, const char *attribute,
+                                      const unsigned char *table, size_t table_size,
+                                      const unsigned char *global, size_t pool_size, unsigned sdk)
+{
+   struct axml pool = {0};
+   char *result = NULL;
+   if (size < 8 || le16(xml) != 3 || le32(xml + 4) > size) return NULL;
+   size = le32(xml + 4);
+   for (size_t at = le16(xml + 2); at + 8 <= size;) {
+      const unsigned char *p = xml + at;
+      size_t n = le32(p + 4), h = le16(p + 2);
+      if (n < h || h < 8 || n > size - at) break;
+      if (le16(p) == 1 && axml_pool(&pool, p, n)) break;
+      if (le16(p) == 0x102) {
+         if (n < 36 || h < 16) break;
+         size_t start = 16 + le16(p + 24), stride = le16(p + 26), count = le16(p + 28);
+         if (start > n || stride < 20 || count > (n - start) / stride) break;
+         for (size_t i = 0; i < count; ++i) {
+            const unsigned char *a = p + start + i*stride;
+            if (strcmp(axml_string(&pool, le32(a + 4)), attribute)) continue;
+            uint32_t value = le32(a + 16);
+            if (a[15] == 3 && value < pool.count) result = strdup(axml_string(&pool, value));
+            else if (a[15] == 1) result = registered_string(table, table_size, global, pool_size, value, sdk);
+            break;
+         }
+         break; /* Registered service attributes belong to the document root. */
+      }
+      at += n;
+   }
+   axml_free(&pool);
+   return result;
+}
+static bool registered_service_enabled(const struct manifest *m, const char *component, const char *action)
+{
+   char *copy = strdup(text_get(&m->services)), *scan = copy, *row;
+   bool found = false;
+   while (copy && (row = luna_strsep(&scan, ";"))) {
+      char *name = luna_strsep(&row, "|"), *enabled = luna_strsep(&row, "|");
+      (void)luna_strsep(&row, "|");
+      char *actions = luna_strsep(&row, "|"), *item;
+      if (!name || !enabled || !atoi(enabled) || strcmp(name, component)) continue;
+      while (actions && (item = luna_strsep(&actions, ","))) if (!strcmp(item, action)) found = true;
+   }
+   free(copy);
+   return found;
+}
+struct registered_entry { struct registered_entry *next; char *name, *value; };
+struct registered_cache {
+   struct registered_cache *next;
+   char *path, *action, *metadata, *attribute;
+   int64_t size;
+   luna_file_time modified;
+   bool loaded;
+   unsigned sdk;
+   struct registered_entry *entries;
+};
+static pthread_mutex_t registered_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct registered_cache *registered_caches;
+static void registered_entries_free(struct registered_entry *e)
+{ while (e) { struct registered_entry *next = e->next; free(e->name); free(e->value); free(e); e = next; } }
+static int registered_load(struct registered_cache *cache)
+{
+   struct zip zip = {0};
+   struct manifest *manifest = calloc(1, sizeof *manifest);
+   unsigned char *table = NULL;
+   size_t size = 0;
+   const unsigned char *pool = NULL;
+   size_t pool_size = 0;
+   char *rows = NULL;
+   int status = -1;
+   const char *stage = "manifest";
+   if (!manifest || zip_open(&zip, cache->path) || manifest_zip(&zip, manifest)) goto done;
+   stage = "resource table";
+   if (!manifest->service_metadata.n) { status = 0; goto done; }
+   table = zip_memory_limit(&zip, "resources.arsc", &size, 512u*1024u*1024u);
+   if (!table || size < 12 || le16(table) != 2 || le32(table + 4) > size) goto done;
+   for (size_t at = le16(table + 2); at + 8 <= size;) {
+      size_t n = le32(table + at + 4), h = le16(table + at + 2);
+      if (n < h || h < 8 || n > size - at) goto done;
+      if (le16(table + at) == 1) { pool = table + at; pool_size = n; break; }
+      at += n;
+   }
+   rows = strdup(text_get(&manifest->service_metadata));
+   if (!rows) goto done;
+   char *scan = rows, *row;
+   while ((row = luna_strsep(&scan, "\n"))) {
+      char *name = luna_strsep(&row, "|"), *key = luna_strsep(&row, "|");
+      if (!name || !key || !row || strcmp(key, cache->metadata) ||
+          !registered_service_enabled(manifest, name, cache->action)) continue;
+      uint32_t id = (uint32_t)strtoul(row, NULL, 10);
+      char *path = registered_string(table, size, pool, pool_size, id, cache->sdk);
+      if (getenv("LUNARIA_TRACE_REGISTERED")) fprintf(stderr,"[registered] %s resource %08x -> %s\n",name,id,path ? path : "(absent)");
+      size_t xml_size = 0;
+      unsigned char *xml = path ? zip_memory(&zip, path, &xml_size) : NULL;
+      free(path);
+      char *value = xml ? registered_xml_attribute(xml, xml_size, cache->attribute, table, size, pool, pool_size, cache->sdk) : NULL;
+      free(xml);
+      if (!value) continue;
+      struct registered_entry *entry = calloc(1, sizeof *entry);
+      if (!entry) { free(value); goto done; }
+      entry->name = strdup(name); entry->value = value;
+      if (!entry->name) { free(value); free(entry); goto done; }
+      entry->next = cache->entries; cache->entries = entry;
+   }
+   status = 0;
+done:
+   if (status && getenv("LUNARIA_TRACE_REGISTERED")) fprintf(stderr,"[registered] %s: cannot read %s\n",cache->path,stage);
+   if (status) { registered_entries_free(cache->entries); cache->entries = NULL; }
+   free(rows); free(table); manifest_free(manifest); zip_close(&zip);
+   return status;
+}
+int luna_apk_service_manifest(const char *apk, char **services, char **providers, char *process, size_t cap)
+{
+   struct zip zip = {0};
+   struct manifest *manifest = calloc(1, sizeof *manifest);
+   int result = -1;
+   if (services) *services = NULL;
+   if (providers) *providers = NULL;
+   if (!apk || !services || !process || !cap || !manifest) goto done;
+   if (zip_open(&zip, apk) || manifest_zip(&zip, manifest)) goto done;
+   if (copy_text(process, cap, manifest->application_process)) goto done;
+   *services = strdup(text_get(&manifest->services));
+   if (providers) *providers = strdup(text_get(&manifest->providers));
+   if (*services && (!providers || *providers)) result = 0;
+   else { free(*services); *services = NULL; if(providers){free(*providers);*providers=NULL;} }
+done:
+   manifest_free(manifest);
+   zip_close(&zip);
+   return result;
+}
+
+/* System registered-service lookup, independent of the calling application's
+ * package visibility. Non-exported authenticators can be bound by system UID. */
+int luna_apk_find_registered_service(const char *apk, const char *action, const char *metadata,
+                                    const char *attribute, const char *value, unsigned sdk,
+                                    char *component, size_t cap)
+{
+   luna_file_info info;
+   if (!apk || !action || !metadata || !attribute || !value || !component || !cap ||
+       luna_file_infoat(LUNA_AT_FDCWD, apk, &info, 0)) return -1;
+   pthread_mutex_lock(&registered_lock);
+   struct registered_cache *cache = registered_caches;
+   while (cache && (strcmp(cache->path, apk) || strcmp(cache->action, action) ||
+          strcmp(cache->metadata, metadata) || strcmp(cache->attribute, attribute))) cache = cache->next;
+   int result = -1;
+   if (!cache) {
+      cache = calloc(1, sizeof *cache);
+      if (!cache) goto done;
+      cache->path = strdup(apk); cache->action = strdup(action);
+      cache->metadata = strdup(metadata); cache->attribute = strdup(attribute);
+      if (!cache->path || !cache->action || !cache->metadata || !cache->attribute) {
+         free(cache->path); free(cache->action); free(cache->metadata); free(cache->attribute); free(cache); goto done;
+      }
+      cache->next = registered_caches; registered_caches = cache;
+
+   }
+   if (!cache->loaded || cache->size != info.size ||
+       cache->modified.seconds != info.modified.seconds || cache->modified.nanoseconds != info.modified.nanoseconds || cache->sdk != sdk) {
+      registered_entries_free(cache->entries); cache->entries = NULL;
+      cache->sdk = sdk; cache->loaded = false;
+      if (registered_load(cache)) goto done;
+      cache->size = info.size; cache->modified = info.modified; cache->loaded = true;
+   }
+   result = 0;
+   for (struct registered_entry *entry = cache->entries; entry; entry = entry->next)
+      if (!strcmp(entry->value, value)) { result = copy_text(component, cap, entry->name) ? -1 : 1; break; }
+done:
+   pthread_mutex_unlock(&registered_lock);
+   return result;
+}
+
 static int env_set(const char *key, const char *value, bool overwrite)
 {
    return luna_os_setenv(key, value, overwrite);
@@ -1356,7 +1711,8 @@ static int copy_file(const char *source, const char *target)
    int r = 0;
    luna_file_info info;
    struct extraction_progress progress = {.count = 1, .name = target};
-   bool report = !luna_file_infoat(LUNA_AT_FDCWD, source, &info, 0) && info.size >= 32 * 1048576;
+   bool have_info = !luna_file_infoat(LUNA_AT_FDCWD, source, &info, 0);
+   bool report = have_info && info.size >= 32 * 1048576;
    if (report) {
       progress.total = info.size;
       fprintf(stderr, "[apk] Copying: %s -> %s\n", source, target);
@@ -1378,6 +1734,12 @@ static int copy_file(const char *source, const char *target)
    fclose(in);
    if (fclose(out))
       r = -1;
+   /* A package cache is another view of the installed archive. Recreating it
+    * must not turn an unchanged APK into an apparent package update. */
+   if (!r && have_info) {
+      const luna_file_time times[2] = {info.accessed, info.modified};
+      if (luna_file_timesat(LUNA_AT_FDCWD, target, times, 0)) r = -1;
+   }
    if (r)
       luna_file_unlinkat(LUNA_AT_FDCWD, target, 0);
    else if (report) {
@@ -1388,8 +1750,18 @@ static int copy_file(const char *source, const char *target)
 }
 static int materialize(const char *source, const char *target)
 {
-   if (exists(target))
+   if (exists(target)) {
+      luna_file_info original, cached;
+      if (luna_file_infoat(LUNA_AT_FDCWD, source, &original, 0) ||
+          luna_file_infoat(LUNA_AT_FDCWD, target, &cached, 0)) return -1;
+      if (original.size != cached.size) return apk_error("cached file size differs from source: %s", target);
+      if (original.modified.seconds != cached.modified.seconds ||
+          original.modified.nanoseconds != cached.modified.nanoseconds) {
+         const luna_file_time times[2] = {original.accessed, original.modified};
+         return luna_file_timesat(LUNA_AT_FDCWD, target, times, 0);
+      }
       return 0;
+   }
    if (!luna_file_link(source, target))
       return 0;
    return copy_file(source, target);
@@ -1532,16 +1904,6 @@ static int google_sign_in_enter(const char *root, const char *profile)
    return 0;
 }
 
-static int link_asset(const char *source, const char *target)
-{
-   if (exists(target)) {
-      char actual[APK_PATH], expected[APK_PATH];
-      if (luna_file_realpath(target, actual, sizeof actual) && luna_file_realpath(source, expected, sizeof expected) && !strcmp(actual, expected))
-         return 0;
-      return apk_error("profile resource already exists: %s", target);
-   }
-   return luna_file_symlink(source, target) ? apk_error("cannot share resource: %s", target) : 0;
-}
 static bool profile_valid(const char *s)
 {
    size_t n = strlen(s);
@@ -1643,8 +2005,12 @@ static int profile_storage(const char *root, const char *package, const char *pr
       {"ANDROID_DATABASES_DIR", "databases"}, {"ANDROID_NO_BACKUP_DIR", "no_backup"},
       {"ANDROID_PREFS_DIR", "shared_prefs"},
    };
+   /* Profiles separate private app state. External storage belongs to the
+    * installed app across profiles, without game-specific resource lists. */
    for (size_t i = 0; i < sizeof dirs / sizeof dirs[0]; i++)
-      if (path_join(path, sizeof path, private_dir, dirs[i].subdir) || mkdirs(path) || env_set(dirs[i].key, path, true))
+      if (path_join(path, sizeof path,
+                    !strncmp(dirs[i].subdir, "external/", 9) ? common : private_dir,
+                    dirs[i].subdir) || mkdirs(path) || env_set(dirs[i].key, path, true))
          return -1;
    if (path_join(path, sizeof path, common, "obb") || mkdirs(path) || env_set("ANDROID_EXTERNAL_OBB_DIR", path, true))
       return -1;
@@ -1652,35 +2018,6 @@ static int profile_storage(const char *root, const char *package, const char *pr
     * selected profile. exec retains the previous launch's environment. */
    if (path_join(path, sizeof path, private_dir, "device-root") || env_set("LUNARIA_GUEST_ROOT", path, true) || mkdirs(path) || luna_android_fs_prepare(path))
       return -1;
-   if (strcmp(storage_profile, "default")) {
-      const char *keys[] = {"LUNARIA_SHARED_ASSETS", "LUNARIA_PROFILE_SEED_FILES"};
-      for (unsigned kind = 0; kind < 2; kind++) {
-         char *list = strdup(env_value(keys[kind], ""));
-         if (!list)
-            return -1;
-         char *save = NULL;
-         for (char *item = strtok_r(list, ":", &save); item; item = strtok_r(NULL, ":", &save)) {
-            if (!profile_valid(item)) {
-               free(list);
-               return apk_error("invalid profile resource name");
-            }
-            char resource[APK_PATH], source[APK_PATH], target[APK_PATH];
-            if (path_join(resource, sizeof resource, common, "external/files") || path_join(source, sizeof source, resource, item) ||
-                path_join(target, sizeof target, getenv("ANDROID_EXTERNAL_FILES_DIR"), item)) {
-               free(list);
-               return -1;
-            }
-            if (!exists(source))
-               continue;
-            int r = kind ? (!exists(target) ? copy_file(source, target) : 0) : link_asset(source, target);
-            if (r) {
-               free(list);
-               return -1;
-            }
-         }
-         free(list);
-      }
-   }
    return env_set("LUNARIA_PROFILE", profile, true);
 }
 static bool suffix(const char *s, const char *ext)
@@ -2483,15 +2820,17 @@ static int apk_prepare_inner(int *argc, const char ***argv)
    if (!install && !service_host && !strcmp(m->package, "com.google.android.gms") &&
        forced_activity && !strcmp(forced_activity, "com.android.settings.accounts.AddAccountSettings") &&
        google_sign_in_enter(root, profile)) goto done;
+   const char *component_process = service_host ? getenv("ANDROID_PROCESS_NAME") : NULL;
    const struct {
       const char *key, *value;
    } metadata[] = {
       {"ANDROID_LAUNCH_ACTIVITY", m->activity}, {"ANDROID_APPLICATION_CLASS", m->application},
       {"ANDROID_APPLICATION_PROCESS", m->application_process},
-      {"ANDROID_PROCESS_NAME", *m->activity_process ? m->activity_process : m->application_process},
+      {"ANDROID_PROCESS_NAME", component_process && *component_process ? component_process :
+         service_host ? m->application_process : *m->activity_process ? m->activity_process : m->application_process},
       {"ANDROID_LAUNCH_CONFIG_CHANGES", m->config_changes},
       {"ANDROID_SCREEN_ORIENTATION", m->orientation}, {"ANDROID_THEME_RESOURCE", m->theme},
-      {"ANDROID_RECEIVERS", text_get(&m->receivers)}, {"ANDROID_SERVICES", text_get(&m->services)},
+      {"ANDROID_RECEIVERS", text_get(&m->receivers)}, {"ANDROID_RECEIVER_FILTERS", text_get(&m->receiver_filters)}, {"ANDROID_SERVICES", text_get(&m->services)},
       {"ANDROID_ACTIVITIES", text_get(&m->activities)}, {"ANDROID_ACTIVITY_FILTERS", text_get(&m->activity_filters)},
       {"ANDROID_CONTENT_PROVIDERS", text_get(&m->providers)}, {"ANDROID_REQUESTED_PERMISSIONS", text_get(&m->permissions)},
       {"ANDROID_MIN_SDK", m->min_sdk}, {"ANDROID_TARGET_SDK", m->target_sdk},
@@ -2507,7 +2846,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       } else
          luna_os_unsetenv(metadata[i].key);
    }
-   /* A service host answers for every process the package declares. */
+   /* A component host has no launcher Activity. Its process was chosen by AMS. */
    if (service_host ? env_set("ANDROID_SERVICE_HOST", "1", true) : (luna_os_unsetenv("ANDROID_SERVICE_HOST"), 0))
       goto done;
    luna_os_unsetenv("ANDROID_APK_SIGNER_PKCS7");
@@ -2857,12 +3196,16 @@ static void *google_window_run(void *opaque)
    atomic_store(&google_window_open, false);
    return NULL;
 }
-int luna_apk_google_services_installed(void)
+int luna_apk_google_package_installed(const char *package)
 {
    char path[APK_PATH];
    luna_file_info info;
-   return !luna_apk_system_archive("com.google.android.gms", path, sizeof path) &&
+   return package && google_package_path(package) && !luna_apk_system_archive(package, path, sizeof path) &&
           !luna_file_infoat(LUNA_AT_FDCWD, path, &info, 0) && info.size > 22;
+}
+int luna_apk_google_services_installed(void)
+{
+   return luna_apk_google_package_installed("com.google.android.gms");
 }
 int luna_apk_google_services_busy(void)
 {

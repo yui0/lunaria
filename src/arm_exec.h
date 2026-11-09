@@ -355,6 +355,9 @@ const char *arm_exec_gl_string(unsigned name);
  * that thread.  Handles: 0 is EGL_NO_*, everything else is opaque. */
 uint32_t arm_exec_egl_get_display(void);
 int      arm_exec_egl_initialize(int32_t *major, int32_t *minor);
+int      arm_exec_egl_terminate(void);
+int      arm_exec_egl_get_configs(uint32_t *out, int max, int32_t *num);
+uint32_t arm_exec_egl_create_pbuffer_config(uint32_t config, const int32_t *attribs);
 int      arm_exec_egl_choose_config(const int32_t *attribs, uint32_t *out,
                                     int max, int32_t *num);
 uint32_t arm_exec_egl_create_context(uint32_t share, const int32_t *attribs);
@@ -388,6 +391,7 @@ void     arm_exec_upload_texture_rgba(int tex, const uint8_t *rgba, int w, int h
  * Returns a malloc'd buffer the caller frees, or NULL when there is no such
  * asset.  This is the same lookup the native AAsset path uses — APK, split
  * APKs, OBB and the staged files tree. */
+void arm_exec_audio_service(void);
 unsigned char *arm_exec_asset_read(const char *name, size_t *len);
 /* Decode a whole Ogg Vorbis stream to interleaved 16-bit PCM.  On success
  * returns 1 and a malloc'd buffer of `*frames` frames (free() it); 0 when the
@@ -489,6 +493,7 @@ void arm_exec_apk_version(int32_t *code, const char **name);
  * was handing out the *host* process's pid and uid, so the app appeared to be
  * running as root under a pid the guest's own getpid() had never heard of. */
 int arm_exec_guest_pid(void);
+int arm_exec_guest_is_64bit(void);
 int arm_exec_guest_uid(void);
 /* Bounded C11 reader for ResTable_map_entry. No allocation or aligned reads. */
 static inline uint16_t arsc_u16(const uint8_t *p)
@@ -717,6 +722,8 @@ float     arm_exec_touch_y(void);
 long long arm_exec_touch_time(void);
 long long arm_exec_touch_down_time(void);
 void      arm_exec_touch_push(int action, float x, float y);
+/* Host pointer buttons: 0=left, 1=middle, 2=right; surface coordinates. */
+void      arm_exec_pointer_button(int button, int down, float x, float y);
 
 /* NDK input queue for NativeActivity titles (UE).  Creates the queue's pipe on
  * first call and returns the opaque AInputQueue* the guest will hand back to

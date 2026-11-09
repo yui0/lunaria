@@ -12,7 +12,6 @@
 #include "dvm/dvm_internal.h"
 #include "dvm/platform_classes.h"
 #include "luna_boot.h"
-#include "luna_overlay.h"
 #include "arm_exec.h"
 #include "arm.h"
 #include "lunaria_os.h"
@@ -238,6 +237,15 @@ struct dvm_object *dvm__obj(struct dvm *vm, dvm_ref ref)
 {
    if (!ref || ref > vm->heap_size) return NULL;
    struct dvm_object *o = heap_slot(vm, ref);
+   return o->live ? o : NULL;
+}
+
+/* The same lookup for the interpreter's own use, where it is worth inlining. */
+static inline __attribute__((always_inline))
+struct dvm_object *obj_fast(struct dvm *vm, dvm_ref ref)
+{
+   if (__builtin_expect(!ref || ref > vm->heap_size, 0)) return NULL;
+   struct dvm_object *o = &vm->heap_blocks[(ref - 1u) / DVM_HEAP_BLOCK][(ref - 1u) % DVM_HEAP_BLOCK];
    return o->live ? o : NULL;
 }
 
@@ -598,12 +606,33 @@ static bool desc_is_boot_class(const char *desc)
    return false;
 }
 
-struct dvm_class *dvm__class_by_desc(struct dvm *vm, const char *desc)
+struct dvm_class *(dvm__class_by_desc)(struct dvm *vm, const char *desc)
 {
    if (!desc || !*desc) return NULL;
 
    struct dvm_class *c = class_lookup(vm, desc);
-   if (c) return c;
+   if (c) {
+      /* A failed lookup is not a class definition. A dynamically loaded DEX
+       * may now define a formerly unresolved application type. Preserve the
+       * descriptor's identity for existing type references, but load its real
+       * fields, methods and class initializer before answering the lookup. */
+      if (c->synthesized && !desc_is_boot_class(desc) && c->unresolved_dexes < vm->ndexes) {
+         int first = c->unresolved_dexes;
+         c->unresolved_dexes = vm->ndexes;
+         for (int i = first; i < vm->ndexes; ++i) {
+            int index = dex_find_class(&vm->dexes[i]->file, desc);
+            if (index < 0) continue;
+            free(c->mcache); c->mcache = NULL; c->mcache_cap = c->mcache_len = 0;
+            c->external = c->synthesized = false;
+            c->init_state = 0;
+            if (!class_load_from_dex(vm, c, vm->dexes[i], (uint32_t)index)) {
+               c->external = true; c->init_state = 2;
+            }
+            break;
+         }
+      }
+      return c;
+   }
 
    if (desc[0] == '[') {
       c = class_register(vm, desc);
@@ -653,6 +682,7 @@ struct dvm_class *dvm__class_by_desc(struct dvm *vm, const char *desc)
    if (!c) return NULL;
    c->external = true;
    c->synthesized = true;
+   c->unresolved_dexes = vm->ndexes;
    c->init_state = 2;
    c->super = strcmp(desc, "Ljava/lang/Object;")
                 ? dvm__class_by_desc(vm, "Ljava/lang/Object;") : NULL;
@@ -697,7 +727,7 @@ static bool class_absent(struct dvm *vm, struct dvm_class *c)
    return true;
 }
 
-struct dvm_class *dvm_find_class(struct dvm *vm, const char *name)
+struct dvm_class *(dvm_find_class)(struct dvm *vm, const char *name)
 {
    char desc[512];
    name_to_desc(name, desc, sizeof desc);
@@ -1018,7 +1048,7 @@ struct dvm_method *dvm_find_method_by_params(struct dvm *vm, struct dvm_class *c
    return NULL;
 }
 
-struct dvm_method *dvm_find_method(struct dvm *vm, struct dvm_class *cls,
+struct dvm_method *(dvm_find_method)(struct dvm *vm, struct dvm_class *cls,
                                    const char *name, const char *sig)
 {
    if (!cls) return NULL;
@@ -1110,6 +1140,12 @@ struct field_hit {
    const char *name, *type;
    int index;
    bool statics;
+   /* A lookup that found nothing is remembered too, with its own copy of the
+    * strings (the caller's may live on a stack that is reused).  Callers probe
+    * "I" and then "Z" for the same name, so every boolean read paid for a full
+    * walk of the class chain that could only fail. */
+   bool missing;
+   char miss_name[48], miss_type[16];
 };
 static _Atomic uint64_t field_cache_generation = 1;
 
@@ -1125,6 +1161,9 @@ static struct dvm_field *class_find_field(struct dvm *vm, struct dvm_class *cls,
    const uintptr_t key = (((uintptr_t)cls >> 4) * 2654435761u ^ ((uintptr_t)name >> 3) ^
                           ((uintptr_t)type >> 2) * 40503u ^ (statics ? 1u : 0u)) * 2246822519u >> 7;
    struct field_hit *hit = &cache[key & 2047u];
+   if (hit->missing && hit->cls == cls && hit->statics == statics &&
+       !strcmp(hit->miss_name, name) && !strcmp(hit->miss_type, type ? type : ""))
+      return NULL;
    if (hit->cls == cls && hit->name == name && hit->statics == statics && hit->owner) {
       struct dvm_field *list = statics ? hit->owner->sfields : hit->owner->ifields;
       int count = statics ? hit->owner->nsfields : hit->owner->nifields;
@@ -1138,7 +1177,13 @@ static struct dvm_field *class_find_field(struct dvm *vm, struct dvm_class *cls,
    int index = 0;
    struct dvm_field *field = class_find_field_slow(cls, name, type, statics, &owner, &index);
    if (field) *hit = (struct field_hit){.cls=cls,.owner=owner,.name=name,.type=type,.index=index,.statics=statics};
-   else memset(hit, 0, sizeof *hit);
+   else {
+      memset(hit, 0, sizeof *hit);
+      if (strlen(name) < sizeof hit->miss_name && (!type || strlen(type) < sizeof hit->miss_type)) {
+         hit->cls = cls; hit->statics = statics; hit->missing = true;
+         strcpy(hit->miss_name, name); strcpy(hit->miss_type, type ? type : "");
+      }
+   }
    return field;
 }
 
@@ -1309,6 +1354,7 @@ void dvm__throw(struct dvm *vm, const char *class_name, const char *fmt, ...)
       struct dvm_object *o = dvm__obj(vm, e);
       if (o && !o->utf8 && msg[0]) o->utf8 = strdup(msg);   /* always readable */
    }
+   if (e) dvm__throwable_capture(vm,e);
    vm->exception = e;
    vm->exc_ref = e;
    vm->nexc_trace = 0;   /* a fresh throw starts a fresh unwind path */
@@ -1409,7 +1455,7 @@ int dvm__field_slot(struct dvm *vm, struct dvm_class *cls, const char *name, con
    return f && f->slot < cls->islots ? (int)f->slot : -1;
 }
 
-bool dvm__get_field_from(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
+bool (dvm__get_field_from)(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
                          const char *name, const char *type,
                          union dvm_value *out)
 {
@@ -1421,7 +1467,7 @@ bool dvm__get_field_from(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
    return true;
 }
 
-bool dvm__set_field_from(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
+bool (dvm__set_field_from)(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
                          const char *name, const char *type,
                          union dvm_value val)
 {
@@ -1433,13 +1479,13 @@ bool dvm__set_field_from(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
    return true;
 }
 
-bool dvm_get_field(struct dvm *vm, dvm_ref obj, const char *name,
+bool (dvm_get_field)(struct dvm *vm, dvm_ref obj, const char *name,
                    const char *type, union dvm_value *out)
 {
    return dvm__get_field_from(vm, obj, NULL, name, type, out);
 }
 
-bool dvm_set_field(struct dvm *vm, dvm_ref obj, const char *name,
+bool (dvm_set_field)(struct dvm *vm, dvm_ref obj, const char *name,
                    const char *type, union dvm_value val)
 {
    return dvm__set_field_from(vm, obj, NULL, name, type, val);
@@ -1462,6 +1508,124 @@ bool dvm_set_static(struct dvm *vm, struct dvm_class *cls, const char *name,
    if (!f || !f->cls->sslots || f->slot >= f->cls->nsslots) return false;
    f->cls->sslots[f->slot] = val;
    return true;
+}
+
+/* ---- call-site caches (see dvm_internal.h) -------------------------------- */
+#define IC_GEN(vm) ((uint64_t)(((vm)->field_cache_generation & 0x7fu) | 0x80u))
+#define IC_CLS(c) ((uint64_t)(((uintptr_t)(c) >> 4) & 0xfffffffffffull))
+#define IC_PACK(c, slot, vm) (IC_CLS(c) | ((uint64_t)(slot) << 44) | (IC_GEN(vm) << 56))
+#define IC_MATCH(w, c, vm) ((w) && ((w) & 0xfffffffffffull) == IC_CLS(c) && ((w) >> 56) == IC_GEN(vm))
+
+/* Looks `lookup` up in the call site's table; returns the packed slot or -1. */
+static inline int ic_find(const struct dvm_field_ic *ic, const struct dvm_class *lookup,
+                          struct dvm *vm)
+{
+   for (unsigned i = 0; i < 8; ++i) {
+      const uint64_t w = atomic_load_explicit(&ic->w[i], memory_order_relaxed);
+      if (IC_MATCH(w, lookup, vm)) return (int)((w >> 44) & 0xfffu);
+   }
+   return -1;
+}
+
+static void ic_remember(struct dvm_field_ic *ic, const struct dvm_class *lookup,
+                        uint32_t slot, struct dvm *vm)
+{
+   if (slot >= 0x1000u) return;
+   const unsigned at = atomic_fetch_add_explicit(&ic->next, 1, memory_order_relaxed) & 7u;
+   atomic_store_explicit(&ic->w[at], IC_PACK(lookup, slot, vm), memory_order_relaxed);
+}
+
+/* Only call sites whose name and type are string literals reach here, so the
+ * addresses are stable and a cached lookup needs no string comparison. */
+static struct dvm_field *class_find_field_literal(struct dvm *vm, struct dvm_class *cls,
+                                                  const char *name, const char *type)
+{
+   static _Thread_local struct { const struct dvm_class *cls; const char *name, *type;
+                                 struct dvm_field *field; } cache[1024];
+   static _Thread_local uint64_t generation;
+   if (generation != vm->field_cache_generation) {
+      memset(cache, 0, sizeof cache);
+      generation = vm->field_cache_generation;
+   }
+   const size_t at = (((uintptr_t)cls >> 4) * 2654435761u ^ ((uintptr_t)name >> 3) * 40503u ^ ((uintptr_t)type >> 2)) & 1023u;
+   if (cache[at].cls == cls && cache[at].name == name && cache[at].type == type)
+      return cache[at].field;
+   struct dvm_field *f = class_find_field(vm, cls, name, type, false);
+   cache[at].cls = cls; cache[at].name = name; cache[at].type = type; cache[at].field = f;
+   return f;
+}
+
+bool dvm__get_field_ic(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
+                       const char *name, const char *type, union dvm_value *out,
+                       struct dvm_field_ic *ic)
+{
+   struct dvm_object *o = dvm__obj(vm, obj);
+   if (!o || !o->cls) return false;
+   struct dvm_class *lookup = owner ? owner : o->cls;
+   const int slot = ic_find(ic, lookup, vm);
+   if (slot >= 0) {
+      if (o->slots && (uint32_t)slot < o->cls->islots) { *out = o->slots[slot]; return true; }
+      return false;
+   }
+   struct dvm_field *f = class_find_field_literal(vm, lookup, name, type);
+   if (!f || !o->slots || f->slot >= o->cls->islots) return false;
+   ic_remember(ic, lookup, f->slot, vm);
+   *out = o->slots[f->slot];
+   return true;
+}
+
+bool dvm__set_field_ic(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
+                       const char *name, const char *type, union dvm_value val,
+                       struct dvm_field_ic *ic)
+{
+   struct dvm_object *o = dvm__obj(vm, obj);
+   if (!o || !o->cls) return false;
+   struct dvm_class *lookup = owner ? owner : o->cls;
+   const int slot = ic_find(ic, lookup, vm);
+   if (slot >= 0) {
+      if (o->slots && (uint32_t)slot < o->cls->islots) { o->slots[slot] = val; return true; }
+      return false;
+   }
+   struct dvm_field *f = class_find_field_literal(vm, lookup, name, type);
+   if (!f || !o->slots || f->slot >= o->cls->islots) return false;
+   ic_remember(ic, lookup, f->slot, vm);
+   o->slots[f->slot] = val;
+   return true;
+}
+
+struct dvm_class *dvm__find_class_ic(struct dvm *vm, const char *name,
+                                     _Atomic uint64_t *ic)
+{
+   const uint64_t w = atomic_load_explicit(ic, memory_order_relaxed);
+   if (w && (w >> 56) == IC_GEN(vm))
+      return (struct dvm_class *)(uintptr_t)((w & 0xfffffffffffull) << 4);
+   struct dvm_class *c = (dvm_find_class)(vm, name);
+   if (c && ((uintptr_t)c & 0xf) == 0 && ((uintptr_t)c >> 48) == 0)
+      atomic_store_explicit(ic, IC_PACK(c, 0, vm), memory_order_relaxed);
+   return c;
+}
+
+struct dvm_class *dvm__class_by_desc_ic(struct dvm *vm, const char *desc,
+                                        _Atomic uint64_t *ic)
+{
+   const uint64_t w = atomic_load_explicit(ic, memory_order_relaxed);
+   if (w && (w >> 56) == IC_GEN(vm))
+      return (struct dvm_class *)(uintptr_t)((w & 0xfffffffffffull) << 4);
+   struct dvm_class *c = (dvm__class_by_desc)(vm, desc);
+   if (c && ((uintptr_t)c & 0xf) == 0 && ((uintptr_t)c >> 48) == 0)
+      atomic_store_explicit(ic, IC_PACK(c, 0, vm), memory_order_relaxed);
+   return c;
+}
+
+struct dvm_method *dvm__find_method_ic(struct dvm *vm, struct dvm_class *cls,
+                                       const char *name, const char *sig,
+                                       struct dvm_method_ic *ic)
+{
+   if (ic->cls == cls && ic->generation == vm->field_cache_generation && cls)
+      return ic->m;
+   struct dvm_method *m = (dvm_find_method)(vm, cls, name, sig);
+   if (m && cls) { ic->generation = vm->field_cache_generation; ic->cls = cls; ic->m = m; }
+   return m;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -1672,10 +1836,37 @@ bool dvm__class_assignable(struct dvm *vm, struct dvm_class *from,
    return class_assignable(vm, from, to);
 }
 
+static bool class_assignable_slow(struct dvm *vm, struct dvm_class *from,
+                                  struct dvm_class *to);
+
+/* instanceof / check-cast / the host's ui_is_a() ask the same (class, class)
+ * question over and over, and answering it walks the superclass chain and every
+ * interface comparing descriptors with strcmp.  Remember the "yes" answers, per
+ * thread and per VM generation: a class's hierarchy does not change once it is
+ * built, and a "no" is not kept because a class can still gain its superclass
+ * link after registration. */
 static bool class_assignable(struct dvm *vm, struct dvm_class *from,
                              struct dvm_class *to)
 {
    if (!from || !to) return true;   /* unknown: do not block the app */
+   if (from == to) return true;
+   static _Thread_local struct { const struct dvm_class *from, *to; } cache[1024];
+   static _Thread_local uint64_t generation;
+   if (generation != vm->field_cache_generation) {
+      memset(cache, 0, sizeof cache);
+      generation = vm->field_cache_generation;
+   }
+   const size_t slot = ((((uintptr_t)from >> 4) * 2654435761u) ^ ((uintptr_t)to >> 4)) & 1023u;
+   if (cache[slot].from == from && cache[slot].to == to) return true;
+   if (!class_assignable_slow(vm, from, to)) return false;
+   cache[slot].from = from; cache[slot].to = to;
+   return true;
+}
+
+static bool class_assignable_slow(struct dvm *vm, struct dvm_class *from,
+                                  struct dvm_class *to)
+{
+   if (!from || !to) return true;
    if (from == to || !strcmp(from->desc, to->desc)) return true;
    /* Primitive values have no reference widening conversion.  This check
     * must precede Object: array covariance recurses on the component type,
@@ -1908,9 +2099,32 @@ static struct dvm_dex *dex_of(struct dvm *vm, struct dex_file *f)
    return NULL;
 }
 
-static struct dvm_method *resolve_method(struct dvm *vm, struct dvm_dex *dd,
-                                         uint32_t idx, struct dvm_class **out_cls,
-                                         const char **out_name, const char **out_sig)
+static struct dvm_method *resolve_method_slow(struct dvm *vm, struct dvm_dex *dd,
+                                              uint32_t idx, struct dvm_class **out_cls,
+                                              const char **out_name, const char **out_sig);
+
+/* The constant-pool entry is almost always already resolved: answer from the
+ * per-dex table without a call, and leave the descriptor work to the slow path. */
+static inline __attribute__((always_inline))
+struct dvm_method *resolve_method(struct dvm *vm, struct dvm_dex *dd,
+                                  uint32_t idx, struct dvm_class **out_cls,
+                                  const char **out_name, const char **out_sig)
+{
+   if (__builtin_expect(dd->method_cache && idx < dd->file.method_ids_size, 1)) {
+      struct dvm_method *m = dd->method_cache[idx];
+      if (__builtin_expect(m != NULL, 1)) {
+         *out_cls  = m->cls;
+         *out_name = m->name;
+         *out_sig = m->sig ? m->sig : "";
+         return m;
+      }
+   }
+   return resolve_method_slow(vm, dd, idx, out_cls, out_name, out_sig);
+}
+
+static struct dvm_method *resolve_method_slow(struct dvm *vm, struct dvm_dex *dd,
+                                              uint32_t idx, struct dvm_class **out_cls,
+                                              const char **out_name, const char **out_sig)
 {
    /* The cache is consulted first, because everything below it is the
     * expensive half: dex_proto_signature() builds the descriptor string out of
@@ -1962,10 +2176,31 @@ static struct dvm_method *resolve_method(struct dvm *vm, struct dvm_dex *dd,
    return m;
 }
 
-static struct dvm_field *resolve_field(struct dvm *vm, struct dvm_dex *dd,
-                                       uint32_t idx, bool statics,
-                                       struct dvm_class **out_cls,
-                                       const char **out_name, const char **out_type)
+static struct dvm_field *resolve_field_slow(struct dvm *vm, struct dvm_dex *dd,
+                                            uint32_t idx, bool statics,
+                                            struct dvm_class **out_cls,
+                                            const char **out_name, const char **out_type);
+
+static inline __attribute__((always_inline))
+struct dvm_field *resolve_field(struct dvm *vm, struct dvm_dex *dd,
+                                uint32_t idx, bool statics,
+                                struct dvm_class **out_cls,
+                                const char **out_name, const char **out_type)
+{
+   if (__builtin_expect(dd->field_cache && idx < dd->file.field_ids_size, 1)) {
+      struct dvm_field *f = dd->field_cache[idx];
+      if (__builtin_expect(f != NULL, 1)) {
+         *out_cls = f->cls; *out_name = f->name; *out_type = f->type;
+         return f;
+      }
+   }
+   return resolve_field_slow(vm, dd, idx, statics, out_cls, out_name, out_type);
+}
+
+static struct dvm_field *resolve_field_slow(struct dvm *vm, struct dvm_dex *dd,
+                                            uint32_t idx, bool statics,
+                                            struct dvm_class **out_cls,
+                                            const char **out_name, const char **out_type)
 {
    if (dd->field_cache && idx < dd->file.field_ids_size && dd->field_cache[idx]) {
       struct dvm_field *f = dd->field_cache[idx];
@@ -2062,7 +2297,8 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
    uint32_t nins = m->code.insns_size;
    uint32_t nregs = fr->nregs;
    uint32_t *r = fr->regs;
-   struct dvm_dex *dd = dex_of(vm, m->dex);
+   struct dvm_dex *dd = m->dd_cache;
+   if (!dd) { dd = dex_of(vm, m->dex); m->dd_cache = dd; }
    if (m->dex && !dd) {
       /* Every constant-pool index in this method is meaningless without its
        * own dex; resolving against another one silently returns the wrong
@@ -2086,8 +2322,264 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
                  m->cls->name, m->name, (unsigned)(reg), nregs); \
       goto exception; } } while (0)
 
+   uint32_t pc;
+   uint16_t u0;
+   uint8_t op;
+   /* Threaded dispatch.  Every handler that finishes normally ends in
+    * DISPATCH(), which fetches the next instruction and jumps straight to its
+    * handler through this table: one indirect jump per handler instead of one
+    * shared jump at the top of the loop, so the CPU predicts each opcode's
+    * successor separately.  The rare work (lock hand-over, step budget,
+    * tracing, the end of the method) stays at the top of the loop, and
+    * DISPATCH() falls back to it whenever any of that is due. */
+   static const void *const dtab[256] = {
+      [0 ... 255] = &&L_switch,
+      [0x00] = &&L_00,
+      [0x01] = &&L_01,
+      [0x02] = &&L_02,
+      [0x03] = &&L_03,
+      [0x04] = &&L_04,
+      [0x05] = &&L_05,
+      [0x06] = &&L_06,
+      [0x07] = &&L_07,
+      [0x08] = &&L_08,
+      [0x09] = &&L_09,
+      [0x0a] = &&L_0a,
+      [0x0b] = &&L_0b,
+      [0x0c] = &&L_0c,
+      [0x0d] = &&L_0d,
+      [0x0e] = &&L_0e,
+      [0x0f] = &&L_0f,
+      [0x10] = &&L_10,
+      [0x11] = &&L_11,
+      [0x12] = &&L_12,
+      [0x13] = &&L_13,
+      [0x14] = &&L_14,
+      [0x15] = &&L_15,
+      [0x16] = &&L_16,
+      [0x17] = &&L_17,
+      [0x18] = &&L_18,
+      [0x19] = &&L_19,
+      [0x1a] = &&L_1a,
+      [0x1b] = &&L_1b,
+      [0x1c] = &&L_1c,
+      [0x1d] = &&L_1d,
+      [0x1e] = &&L_1e,
+      [0x1f] = &&L_1f,
+      [0x20] = &&L_20,
+      [0x21] = &&L_21,
+      [0x22] = &&L_22,
+      [0x23] = &&L_23,
+      [0x24] = &&L_24,
+      [0x25] = &&L_25,
+      [0x26] = &&L_26,
+      [0x27] = &&L_27,
+      [0x28] = &&L_28,
+      [0x29] = &&L_29,
+      [0x2a] = &&L_2a,
+      [0x2b] = &&L_2b,
+      [0x2c] = &&L_2c,
+      [0x2d] = &&L_2d,
+      [0x2e] = &&L_2e,
+      [0x2f] = &&L_2f,
+      [0x30] = &&L_30,
+      [0x31] = &&L_31,
+      [0x32] = &&L_32,
+      [0x33] = &&L_33,
+      [0x34] = &&L_34,
+      [0x35] = &&L_35,
+      [0x36] = &&L_36,
+      [0x37] = &&L_37,
+      [0x38] = &&L_38,
+      [0x39] = &&L_39,
+      [0x3a] = &&L_3a,
+      [0x3b] = &&L_3b,
+      [0x3c] = &&L_3c,
+      [0x3d] = &&L_3d,
+      [0x44] = &&L_44,
+      [0x45] = &&L_45,
+      [0x46] = &&L_46,
+      [0x47] = &&L_47,
+      [0x48] = &&L_48,
+      [0x49] = &&L_49,
+      [0x4a] = &&L_4a,
+      [0x4b] = &&L_4b,
+      [0x4c] = &&L_4c,
+      [0x4d] = &&L_4d,
+      [0x4e] = &&L_4e,
+      [0x4f] = &&L_4f,
+      [0x50] = &&L_50,
+      [0x51] = &&L_51,
+      [0x52] = &&L_52,
+      [0x53] = &&L_53,
+      [0x54] = &&L_54,
+      [0x55] = &&L_55,
+      [0x56] = &&L_56,
+      [0x57] = &&L_57,
+      [0x58] = &&L_58,
+      [0x59] = &&L_59,
+      [0x5a] = &&L_5a,
+      [0x5b] = &&L_5b,
+      [0x5c] = &&L_5c,
+      [0x5d] = &&L_5d,
+      [0x5e] = &&L_5e,
+      [0x5f] = &&L_5f,
+      [0x60] = &&L_60,
+      [0x61] = &&L_61,
+      [0x62] = &&L_62,
+      [0x63] = &&L_63,
+      [0x64] = &&L_64,
+      [0x65] = &&L_65,
+      [0x66] = &&L_66,
+      [0x67] = &&L_67,
+      [0x68] = &&L_68,
+      [0x69] = &&L_69,
+      [0x6a] = &&L_6a,
+      [0x6b] = &&L_6b,
+      [0x6c] = &&L_6c,
+      [0x6d] = &&L_6d,
+      [0x6e] = &&L_6e,
+      [0x6f] = &&L_6f,
+      [0x70] = &&L_70,
+      [0x71] = &&L_71,
+      [0x72] = &&L_72,
+      [0x74] = &&L_74,
+      [0x75] = &&L_75,
+      [0x76] = &&L_76,
+      [0x77] = &&L_77,
+      [0x78] = &&L_78,
+      [0x7b] = &&L_7b,
+      [0x7c] = &&L_7c,
+      [0x7d] = &&L_7d,
+      [0x7e] = &&L_7e,
+      [0x7f] = &&L_7f,
+      [0x80] = &&L_80,
+      [0x81] = &&L_81,
+      [0x82] = &&L_82,
+      [0x83] = &&L_83,
+      [0x84] = &&L_84,
+      [0x85] = &&L_85,
+      [0x86] = &&L_86,
+      [0x87] = &&L_87,
+      [0x88] = &&L_88,
+      [0x89] = &&L_89,
+      [0x8a] = &&L_8a,
+      [0x8b] = &&L_8b,
+      [0x8c] = &&L_8c,
+      [0x8d] = &&L_8d,
+      [0x8e] = &&L_8e,
+      [0x8f] = &&L_8f,
+      [0x90] = &&L_90,
+      [0x91] = &&L_91,
+      [0x92] = &&L_92,
+      [0x93] = &&L_93,
+      [0x94] = &&L_94,
+      [0x95] = &&L_95,
+      [0x96] = &&L_96,
+      [0x97] = &&L_97,
+      [0x98] = &&L_98,
+      [0x99] = &&L_99,
+      [0x9a] = &&L_9a,
+      [0x9b] = &&L_9b,
+      [0x9c] = &&L_9c,
+      [0x9d] = &&L_9d,
+      [0x9e] = &&L_9e,
+      [0x9f] = &&L_9f,
+      [0xa0] = &&L_a0,
+      [0xa1] = &&L_a1,
+      [0xa2] = &&L_a2,
+      [0xa3] = &&L_a3,
+      [0xa4] = &&L_a4,
+      [0xa5] = &&L_a5,
+      [0xa6] = &&L_a6,
+      [0xa7] = &&L_a7,
+      [0xa8] = &&L_a8,
+      [0xa9] = &&L_a9,
+      [0xaa] = &&L_aa,
+      [0xab] = &&L_ab,
+      [0xac] = &&L_ac,
+      [0xad] = &&L_ad,
+      [0xae] = &&L_ae,
+      [0xaf] = &&L_af,
+      [0xb0] = &&L_b0,
+      [0xb1] = &&L_b1,
+      [0xb2] = &&L_b2,
+      [0xb3] = &&L_b3,
+      [0xb4] = &&L_b4,
+      [0xb5] = &&L_b5,
+      [0xb6] = &&L_b6,
+      [0xb7] = &&L_b7,
+      [0xb8] = &&L_b8,
+      [0xb9] = &&L_b9,
+      [0xba] = &&L_ba,
+      [0xbb] = &&L_bb,
+      [0xbc] = &&L_bc,
+      [0xbd] = &&L_bd,
+      [0xbe] = &&L_be,
+      [0xbf] = &&L_bf,
+      [0xc0] = &&L_c0,
+      [0xc1] = &&L_c1,
+      [0xc2] = &&L_c2,
+      [0xc3] = &&L_c3,
+      [0xc4] = &&L_c4,
+      [0xc5] = &&L_c5,
+      [0xc6] = &&L_c6,
+      [0xc7] = &&L_c7,
+      [0xc8] = &&L_c8,
+      [0xc9] = &&L_c9,
+      [0xca] = &&L_ca,
+      [0xcb] = &&L_cb,
+      [0xcc] = &&L_cc,
+      [0xcd] = &&L_cd,
+      [0xce] = &&L_ce,
+      [0xcf] = &&L_cf,
+      [0xd0] = &&L_d0,
+      [0xd1] = &&L_d1,
+      [0xd2] = &&L_d2,
+      [0xd3] = &&L_d3,
+      [0xd4] = &&L_d4,
+      [0xd5] = &&L_d5,
+      [0xd6] = &&L_d6,
+      [0xd7] = &&L_d7,
+      [0xd8] = &&L_d8,
+      [0xd9] = &&L_d9,
+      [0xda] = &&L_da,
+      [0xdb] = &&L_db,
+      [0xdc] = &&L_dc,
+      [0xdd] = &&L_dd,
+      [0xde] = &&L_de,
+      [0xdf] = &&L_df,
+      [0xe0] = &&L_e0,
+      [0xe1] = &&L_e1,
+      [0xe2] = &&L_e2,
+      [0xfa] = &&L_fa,
+      [0xfb] = &&L_fb,
+      [0xfc] = &&L_fc,
+      [0xfd] = &&L_fd,
+      [0xfe] = &&L_fe,
+      [0xff] = &&L_ff
+   };
+#define DISPATCH() { \
+      pc = fr->pc; \
+      if (__builtin_expect(pc >= nins || vm->trace || \
+            ((vm->steps + 1u) & (DVM_AEL_YIELD_STEPS - 1u)) == 0, 0)) continue; \
+      if (vm->step_limit) { \
+         if (vm->call_steps >= vm->step_limit) continue; \
+         ++vm->call_steps; \
+      } \
+      ++vm->steps; \
+      u0 = insns[pc]; \
+      op = OPCODE(u0); \
+      vm->cur_pc = pc; \
+      goto *dtab[op]; \
+   }
+   /* Set once: every call out restores it on the way back (invoke() saves the
+    * caller), and a lock hand-over reloads this thread's saved state, which
+    * names this method. */
+   vm->cur_method = m;
    for (;;) {
-      if (fr->pc >= nins) {
+      pc = fr->pc;
+      if (__builtin_expect(pc >= nins, 0)) {
          dvm__throw(vm, "java/lang/VerifyError", "%s.%s ran past the end",
                     m->cls->name, m->name);
          goto exception;
@@ -2146,10 +2638,8 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          goto exception;
       }
 
-      uint32_t pc = fr->pc;
-      uint16_t u0 = insns[pc];
-      uint8_t op = OPCODE(u0);
-      vm->cur_method = m;
+      u0 = insns[pc];
+      op = OPCODE(u0);
       vm->cur_pc = pc;
 
       if (vm->trace >= 2 && trace_this)
@@ -2162,131 +2652,132 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          fputc('\n', stderr);
       }
 
+   L_switch:
       switch (op) {
-      case 0x00: /* nop, and the payload pseudo-ops when reached by accident */
-         fr->pc += 1;
-         break;
+      case 0x00: L_00: /* nop, and the payload pseudo-ops when reached by accident */
+         fr->pc = pc + 1;
+         DISPATCH();
 
       /* --- moves --- */
-      case 0x01: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = r[B4(u0)]; fr->pc += 1; break;
-      case 0x07: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = r[B4(u0)]; fr->pc += 1; break;
-      case 0x02: case 0x08:
+      case 0x01: L_01: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = r[B4(u0)]; fr->pc = pc + 1; DISPATCH();
+      case 0x07: L_07: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = r[B4(u0)]; fr->pc = pc + 1; DISPATCH();
+      case 0x02: L_02: case 0x08: L_08:
          REQ(AA(u0)); REQ(IU(1));
          r[AA(u0)] = r[IU(1)];
-         fr->pc += 2;
+         fr->pc = pc + 2;
          break;
-      case 0x03: case 0x09:
+      case 0x03: L_03: case 0x09: L_09:
          REQ(IU(1)); REQ(IU(2));
          r[IU(1)] = r[IU(2)];
-         fr->pc += 3;
+         fr->pc = pc + 3;
          break;
-      case 0x04:
+      case 0x04: L_04:
          REQ(A4(u0) + 1); REQ(B4(u0) + 1);
          sw(r, A4(u0), rw(r, B4(u0)));
-         fr->pc += 1;
+         fr->pc = pc + 1;
          break;
-      case 0x05:
+      case 0x05: L_05:
          REQ(AA(u0) + 1); REQ(IU(1) + 1);
          sw(r, AA(u0), rw(r, IU(1)));
-         fr->pc += 2;
+         fr->pc = pc + 2;
          break;
-      case 0x06:
+      case 0x06: L_06:
          REQ(IU(1) + 1); REQ(IU(2) + 1);
          sw(r, IU(1), rw(r, IU(2)));
-         fr->pc += 3;
+         fr->pc = pc + 3;
          break;
 
-      case 0x0a: /* move-result */
-      case 0x0c: /* move-result-object */
+      case 0x0a: L_0a: /* move-result */
+      case 0x0c: L_0c: /* move-result-object */
          REQ(AA(u0));
          r[AA(u0)] = (uint32_t)fr->result;
-         fr->pc += 1;
-         break;
-      case 0x0b: /* move-result-wide */
+         fr->pc = pc + 1;
+         DISPATCH();
+      case 0x0b: L_0b: /* move-result-wide */
          REQ(AA(u0) + 1);
          sw(r, AA(u0), fr->result);
-         fr->pc += 1;
-         break;
-      case 0x0d: /* move-exception */
+         fr->pc = pc + 1;
+         DISPATCH();
+      case 0x0d: L_0d: /* move-exception */
          REQ(AA(u0));
          /* The handler entry already cleared the pending exception; the
           * object itself is kept in exc_ref for exactly this instruction. */
          r[AA(u0)] = vm->exception ? vm->exception : vm->exc_ref;
          vm->exception = 0;
-         fr->pc += 1;
-         break;
+         fr->pc = pc + 1;
+         DISPATCH();
 
       /* --- returns --- */
-      case 0x0e:
+      case 0x0e: L_0e:
          return true;
-      case 0x0f: case 0x11:
+      case 0x0f: L_0f: case 0x11: L_11:
          REQ(AA(u0));
          out->u = r[AA(u0)];
          return true;
-      case 0x10:
+      case 0x10: L_10:
          REQ(AA(u0) + 1);
          out->ju = rw(r, AA(u0));
          return true;
 
       /* --- constants --- */
-      case 0x12: { /* const/4 */
+      case 0x12: L_12: { /* const/4 */
          REQ(A4(u0));
          int32_t v = (int32_t)(int8_t)(uint8_t)(B4(u0) << 4) >> 4;
          r[A4(u0)] = (uint32_t)v;
-         fr->pc += 1;
-         break;
+         fr->pc = pc + 1;
+         DISPATCH();
       }
-      case 0x13: /* const/16 */
+      case 0x13: L_13: /* const/16 */
          REQ(AA(u0));
          r[AA(u0)] = (uint32_t)(int32_t)(int16_t)IU(1);
-         fr->pc += 2;
-         break;
-      case 0x14: /* const */
+         fr->pc = pc + 2;
+         DISPATCH();
+      case 0x14: L_14: /* const */
          REQ(AA(u0));
          r[AA(u0)] = (uint32_t)IU(1) | ((uint32_t)IU(2) << 16);
-         fr->pc += 3;
-         break;
-      case 0x15: /* const/high16 */
+         fr->pc = pc + 3;
+         DISPATCH();
+      case 0x15: L_15: /* const/high16 */
          REQ(AA(u0));
          r[AA(u0)] = (uint32_t)IU(1) << 16;
-         fr->pc += 2;
-         break;
-      case 0x16: /* const-wide/16 */
+         fr->pc = pc + 2;
+         DISPATCH();
+      case 0x16: L_16: /* const-wide/16 */
          REQ(AA(u0) + 1);
          sw(r, AA(u0), (uint64_t)(int64_t)(int16_t)IU(1));
-         fr->pc += 2;
-         break;
-      case 0x17: /* const-wide/32 */
+         fr->pc = pc + 2;
+         DISPATCH();
+      case 0x17: L_17: /* const-wide/32 */
          REQ(AA(u0) + 1);
          sw(r, AA(u0), (uint64_t)(int64_t)(int32_t)
             ((uint32_t)IU(1) | ((uint32_t)IU(2) << 16)));
-         fr->pc += 3;
-         break;
-      case 0x18: { /* const-wide */
+         fr->pc = pc + 3;
+         DISPATCH();
+      case 0x18: L_18: { /* const-wide */
          REQ(AA(u0) + 1);
          uint64_t v = 0;
          for (int i = 0; i < 4; ++i) v |= (uint64_t)IU(1 + i) << (16 * i);
          sw(r, AA(u0), v);
-         fr->pc += 5;
-         break;
+         fr->pc = pc + 5;
+         DISPATCH();
       }
-      case 0x19: /* const-wide/high16 */
+      case 0x19: L_19: /* const-wide/high16 */
          REQ(AA(u0) + 1);
          sw(r, AA(u0), (uint64_t)IU(1) << 48);
-         fr->pc += 2;
-         break;
-      case 0x1a: /* const-string */
+         fr->pc = pc + 2;
+         DISPATCH();
+      case 0x1a: L_1a: /* const-string */
          REQ(AA(u0));
          r[AA(u0)] = dd ? const_string(vm, dd, IU(1)) : 0;
-         fr->pc += 2;
-         break;
-      case 0x1b: /* const-string/jumbo */
+         fr->pc = pc + 2;
+         DISPATCH();
+      case 0x1b: L_1b: /* const-string/jumbo */
          REQ(AA(u0));
          r[AA(u0)] = dd ? const_string(vm, dd,
                         (uint32_t)IU(1) | ((uint32_t)IU(2) << 16)) : 0;
-         fr->pc += 3;
-         break;
-      case 0x1c: { /* const-class */
+         fr->pc = pc + 3;
+         DISPATCH();
+      case 0x1c: L_1c: { /* const-class */
          REQ(AA(u0));
          /* A type the loader cannot produce is NoClassDefFoundError, not a
           * null Class.  Handing back null turned "this optional component is
@@ -2303,25 +2794,25 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             goto exception;
          }
          r[AA(u0)] = class_object(vm, t);
-         fr->pc += 2;
-         break;
+         fr->pc = pc + 2;
+         DISPATCH();
       }
 
-      case 0x1d: /* monitor-enter */
+      case 0x1d: L_1d: /* monitor-enter */
          REQ(AA(u0));
          if (!dvm__monitor_enter(vm, r[AA(u0)])) goto exception;
-         fr->pc += 1;
-         break;
-      case 0x1e: /* monitor-exit */
+         fr->pc = pc + 1;
+         DISPATCH();
+      case 0x1e: L_1e: /* monitor-exit */
          REQ(AA(u0));
          if (!dvm__monitor_exit(vm, r[AA(u0)])) goto exception;
-         fr->pc += 1;
-         break;
+         fr->pc = pc + 1;
+         DISPATCH();
 
-      case 0x1f: { /* check-cast */
+      case 0x1f: L_1f: { /* check-cast */
          REQ(AA(u0));
          struct dvm_class *t = dd ? resolve_type(vm, dd, IU(1)) : NULL;
-         struct dvm_object *o = dvm__obj(vm, r[AA(u0)]);
+         struct dvm_object *o = obj_fast(vm, r[AA(u0)]);
          if (o && t && !class_assignable(vm, o->cls, t)) {
             fprintf(stderr, "[dvm] check-cast at %s.%s%s pc=%u: %s to %s\n",
                     m->cls->name, m->name, m->sig ? m->sig : "",
@@ -2334,29 +2825,29 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
                        o->cls ? o->cls->name : "?", t->name);
             goto exception;
          }
-         fr->pc += 2;
-         break;
+         fr->pc = pc + 2;
+         DISPATCH();
       }
-      case 0x20: { /* instance-of */
+      case 0x20: L_20: { /* instance-of */
          REQ(A4(u0)); REQ(B4(u0));
          struct dvm_class *t = dd ? resolve_type(vm, dd, IU(1)) : NULL;
-         struct dvm_object *o = dvm__obj(vm, r[B4(u0)]);
+         struct dvm_object *o = obj_fast(vm, r[B4(u0)]);
          r[A4(u0)] = (o && t && class_assignable(vm, o->cls, t)) ? 1u : 0u;
-         fr->pc += 2;
-         break;
+         fr->pc = pc + 2;
+         DISPATCH();
       }
-      case 0x21: { /* array-length */
+      case 0x21: L_21: { /* array-length */
          REQ(A4(u0)); REQ(B4(u0));
-         struct dvm_object *o = dvm__obj(vm, r[B4(u0)]);
+         struct dvm_object *o = obj_fast(vm, r[B4(u0)]);
          if (!o || o->kind != DVM_OBJ_ARRAY) {
             dvm__throw(vm, "java/lang/NullPointerException", "array-length");
             goto exception;
          }
          r[A4(u0)] = o->length;
-         fr->pc += 1;
-         break;
+         fr->pc = pc + 1;
+         DISPATCH();
       }
-      case 0x22: { /* new-instance */
+      case 0x22: L_22: { /* new-instance */
          REQ(AA(u0));
          struct dvm_class *t = dd ? resolve_type(vm, dd, IU(1)) : NULL;
          if (!t || class_absent(vm, t)) {
@@ -2371,10 +2862,10 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          } else {
             r[AA(u0)] = dvm_new_object(vm, t);
          }
-         fr->pc += 2;
-         break;
+         fr->pc = pc + 2;
+         DISPATCH();
       }
-      case 0x23: { /* new-array */
+      case 0x23: L_23: { /* new-array */
          REQ(A4(u0)); REQ(B4(u0));
          struct dvm_class *t = dd ? resolve_type(vm, dd, IU(1)) : NULL;
          int32_t len = (int32_t)r[B4(u0)];
@@ -2384,10 +2875,10 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          }
          const char *ed = (t && t->desc[0] == '[') ? t->desc + 1 : "I";
          r[A4(u0)] = dvm_new_array(vm, dvm__kind_of(ed), ed, (uint32_t)len);
-         fr->pc += 2;
-         break;
+         fr->pc = pc + 2;
+         DISPATCH();
       }
-      case 0x24: case 0x25: { /* filled-new-array[/range] */
+      case 0x24: L_24: case 0x25: L_25: { /* filled-new-array[/range] */
          bool range = (op == 0x25);
          struct dvm_class *t = dd ? resolve_type(vm, dd, IU(1)) : NULL;
          uint32_t slots[256];
@@ -2406,14 +2897,14 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             }
          }
          fr->result = arr;
-         fr->pc += 3;
-         break;
+         fr->pc = pc + 3;
+         DISPATCH();
       }
-      case 0x26: { /* fill-array-data */
+      case 0x26: L_26: { /* fill-array-data */
          REQ(AA(u0));
          int32_t off = (int32_t)((uint32_t)IU(1) | ((uint32_t)IU(2) << 16));
          uint32_t poff = pc + (uint32_t)off;
-         struct dvm_object *ao = dvm__obj(vm, r[AA(u0)]);
+         struct dvm_object *ao = obj_fast(vm, r[AA(u0)]);
          if (!ao || ao->kind != DVM_OBJ_ARRAY) {
             dvm__throw(vm, "java/lang/NullPointerException", "fill-array-data");
             goto exception;
@@ -2428,10 +2919,10 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             if (poff + 4u + units <= nins && width == (uint16_t)dvm__elem_width(ao->elem_kind))
                memcpy(ao->data, (const uint8_t *)&insns[poff + 4], (size_t)n * width);
          }
-         fr->pc += 3;
-         break;
+         fr->pc = pc + 3;
+         DISPATCH();
       }
-      case 0x27: /* throw */
+      case 0x27: L_27: /* throw */
          REQ(AA(u0));
          if (!r[AA(u0)]) {
             dvm__throw(vm, "java/lang/NullPointerException", "throw null");
@@ -2489,21 +2980,21 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          goto exception;
 
       /* --- branches --- */
-      case 0x28: { /* goto */
+      case 0x28: L_28: { /* goto */
          int32_t off = (int8_t)AA(u0);
          if (!off) { dvm__throw(vm, "java/lang/VerifyError", "goto 0"); goto exception; }
          fr->pc = (uint32_t)((int32_t)pc + off);
-         break;
+         DISPATCH();
       }
-      case 0x29:
+      case 0x29: L_29:
          fr->pc = (uint32_t)((int32_t)pc + (int16_t)IU(1));
          break;
-      case 0x2a:
+      case 0x2a: L_2a:
          fr->pc = (uint32_t)((int32_t)pc + (int32_t)
                   ((uint32_t)IU(1) | ((uint32_t)IU(2) << 16)));
          break;
 
-      case 0x2b: case 0x2c: { /* packed-switch / sparse-switch */
+      case 0x2b: L_2b: case 0x2c: L_2c: { /* packed-switch / sparse-switch */
          REQ(AA(u0));
          int32_t off = (int32_t)((uint32_t)IU(1) | ((uint32_t)IU(2) << 16));
          uint32_t poff = pc + (uint32_t)off;
@@ -2537,11 +3028,11 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             }
          }
          fr->pc = target;
-         break;
+         DISPATCH();
       }
 
       /* --- comparisons --- */
-      case 0x2d: case 0x2e: { /* cmpl-float / cmpg-float */
+      case 0x2d: L_2d: case 0x2e: L_2e: { /* cmpl-float / cmpg-float */
          REQ(AA(u0));
          uint16_t bc = IU(1);
          REQ(bc & 0xff); REQ(bc >> 8);
@@ -2552,10 +3043,10 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          else if (isless(a, b)) v = -1;
          else v = 0;
          r[AA(u0)] = (uint32_t)v;
-         fr->pc += 2;
-         break;
+         fr->pc = pc + 2;
+         DISPATCH();
       }
-      case 0x2f: case 0x30: { /* cmpl-double / cmpg-double */
+      case 0x2f: L_2f: case 0x30: L_30: { /* cmpl-double / cmpg-double */
          REQ(AA(u0));
          uint16_t bc = IU(1);
          REQ((bc & 0xff) + 1); REQ((bc >> 8) + 1);
@@ -2566,20 +3057,20 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          else if (isless(a, b)) v = -1;
          else v = 0;
          r[AA(u0)] = (uint32_t)v;
-         fr->pc += 2;
-         break;
+         fr->pc = pc + 2;
+         DISPATCH();
       }
-      case 0x31: { /* cmp-long */
+      case 0x31: L_31: { /* cmp-long */
          REQ(AA(u0));
          uint16_t bc = IU(1);
          REQ((bc & 0xff) + 1); REQ((bc >> 8) + 1);
          int64_t a = (int64_t)rw(r, bc & 0xff), b = (int64_t)rw(r, bc >> 8);
          r[AA(u0)] = (uint32_t)(a > b ? 1 : (a == b ? 0 : -1));
-         fr->pc += 2;
-         break;
+         fr->pc = pc + 2;
+         DISPATCH();
       }
 
-      case 0x32: case 0x33: case 0x34: case 0x35: case 0x36: case 0x37: {
+      case 0x32: L_32: case 0x33: L_33: case 0x34: L_34: case 0x35: L_35: case 0x36: L_36: case 0x37: L_37: {
          REQ(A4(u0)); REQ(B4(u0));
          int32_t a = (int32_t)r[A4(u0)], b = (int32_t)r[B4(u0)];
          bool t;
@@ -2592,9 +3083,9 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             default:   t = (a <= b); break;
          }
          fr->pc = t ? (uint32_t)((int32_t)pc + (int16_t)IU(1)) : pc + 2;
-         break;
+         DISPATCH();
       }
-      case 0x38: case 0x39: case 0x3a: case 0x3b: case 0x3c: case 0x3d: {
+      case 0x38: L_38: case 0x39: L_39: case 0x3a: L_3a: case 0x3b: L_3b: case 0x3c: L_3c: case 0x3d: L_3d: {
          REQ(AA(u0));
          int32_t a = (int32_t)r[AA(u0)];
          bool t;
@@ -2607,15 +3098,15 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             default:   t = (a <= 0); break;
          }
          fr->pc = t ? (uint32_t)((int32_t)pc + (int16_t)IU(1)) : pc + 2;
-         break;
+         DISPATCH();
       }
 
       /* --- arrays --- */
-      case 0x44: case 0x45: case 0x46: case 0x47: case 0x48: case 0x49: case 0x4a: {
+      case 0x44: L_44: case 0x45: L_45: case 0x46: L_46: case 0x47: L_47: case 0x48: L_48: case 0x49: L_49: case 0x4a: L_4a: {
          REQ(AA(u0));
          uint16_t bc = IU(1);
          REQ(bc & 0xff); REQ(bc >> 8);
-         struct dvm_object *a = dvm__obj(vm, r[bc & 0xff]);
+         struct dvm_object *a = obj_fast(vm, r[bc & 0xff]);
          uint32_t idx = r[bc >> 8];
          if (!array_check(vm, a, idx)) goto exception;
          switch (op) {
@@ -2627,14 +3118,14 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             case 0x49: r[AA(u0)] = ((uint16_t *)a->data)[idx]; break;
             default:   r[AA(u0)] = (uint32_t)(int32_t)(int16_t)((uint16_t *)a->data)[idx]; break;
          }
-         fr->pc += 2;
-         break;
+         fr->pc = pc + 2;
+         DISPATCH();
       }
-      case 0x4b: case 0x4c: case 0x4d: case 0x4e: case 0x4f: case 0x50: case 0x51: {
+      case 0x4b: L_4b: case 0x4c: L_4c: case 0x4d: L_4d: case 0x4e: L_4e: case 0x4f: L_4f: case 0x50: L_50: case 0x51: L_51: {
          REQ(AA(u0));
          uint16_t bc = IU(1);
          REQ(bc & 0xff); REQ(bc >> 8);
-         struct dvm_object *a = dvm__obj(vm, r[bc & 0xff]);
+         struct dvm_object *a = obj_fast(vm, r[bc & 0xff]);
          uint32_t idx = r[bc >> 8];
          if (!array_check(vm, a, idx)) goto exception;
          switch (op) {
@@ -2646,17 +3137,17 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             case 0x50: ((uint16_t *)a->data)[idx] = (uint16_t)r[AA(u0)]; break;
             default:   ((uint16_t *)a->data)[idx] = (uint16_t)r[AA(u0)]; break;
          }
-         fr->pc += 2;
-         break;
+         fr->pc = pc + 2;
+         DISPATCH();
       }
 
       /* --- instance fields --- */
-      case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57: case 0x58: {
+      case 0x52: L_52: case 0x53: L_53: case 0x54: L_54: case 0x55: L_55: case 0x56: L_56: case 0x57: L_57: case 0x58: L_58: {
          REQ(A4(u0)); REQ(B4(u0));
          struct dvm_class *fc; const char *fn, *ft;
          struct dvm_field *f = dd ? resolve_field(vm, dd, IU(1), false, &fc, &fn, &ft)
                                   : NULL;
-         struct dvm_object *o = dvm__obj(vm, r[B4(u0)]);
+         struct dvm_object *o = obj_fast(vm, r[B4(u0)]);
          if (!o) {
             /* Name the field's declaring class as well.  Obfuscated code
              * reuses one identifier for dozens of unrelated fields, so
@@ -2683,15 +3174,15 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
                     ft ? ft : "?", v.l);
          if (op == 0x53) { REQ(A4(u0) + 1); sw(r, A4(u0), v.ju); }
          else r[A4(u0)] = v.u;
-         fr->pc += 2;
-         break;
+         fr->pc = pc + 2;
+         DISPATCH();
       }
-      case 0x59: case 0x5a: case 0x5b: case 0x5c: case 0x5d: case 0x5e: case 0x5f: {
+      case 0x59: L_59: case 0x5a: L_5a: case 0x5b: L_5b: case 0x5c: L_5c: case 0x5d: L_5d: case 0x5e: L_5e: case 0x5f: L_5f: {
          REQ(A4(u0)); REQ(B4(u0));
          struct dvm_class *fc; const char *fn, *ft;
          struct dvm_field *f = dd ? resolve_field(vm, dd, IU(1), false, &fc, &fn, &ft)
                                   : NULL;
-         struct dvm_object *o = dvm__obj(vm, r[B4(u0)]);
+         struct dvm_object *o = obj_fast(vm, r[B4(u0)]);
          if (!o) {
             dvm__throw(vm, "java/lang/NullPointerException",
                        "iput %s.%s:%s at %s.%s@%04x",
@@ -2708,12 +3199,12 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             fprintf(stderr, "[dvm] %*siput-object @%x.%s:%s <- @%x\n",
                     vm->depth * 2, "", r[B4(u0)], fn ? fn : "?",
                     ft ? ft : "?", v.l);
-         fr->pc += 2;
-         break;
+         fr->pc = pc + 2;
+         DISPATCH();
       }
 
       /* --- static fields --- */
-      case 0x60: case 0x61: case 0x62: case 0x63: case 0x64: case 0x65: case 0x66: {
+      case 0x60: L_60: case 0x61: L_61: case 0x62: L_62: case 0x63: L_63: case 0x64: L_64: case 0x65: L_65: case 0x66: L_66: {
          REQ(AA(u0));
          struct dvm_class *fc = NULL; const char *fn = NULL, *ft = NULL;
          struct dvm_field *f = dd ? resolve_field(vm, dd, IU(1), true, &fc, &fn, &ft)
@@ -2740,7 +3231,16 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
                      f->cls->sslots[f->slot] = v;
                }
             }
-         } else if (fc && fn && vm->hooks.get_external_static) {
+         } else if (fc && fn && !fc->external && fc->dex) {
+            /* The class is the app's own (or a library's, from a dex) and it has no
+             * such field: a device raises NoSuchFieldError, and the code that
+             * reads it expects to catch that -- the compiler's enum switch maps
+             * wrap each constant in exactly such a try.  Answering null made the
+             * next ordinal() call fail with an NPE the app never handles, and an
+             * ad that failed to load took the whole player with it. */
+            dvm__throw(vm, "java/lang/NoSuchFieldError", "%s.%s", fc->name, fn);
+            goto exception;
+        } else if (fc && fn && vm->hooks.get_external_static) {
             /* Nothing defines this class — not a dex, not a builtin, not the
              * host stubs.  A device raises NoClassDefFoundError here, and app
              * code guards for it: AppsFlyer probes for Xiaomi's install
@@ -2759,10 +3259,10 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
                     ft ? ft : "?", v.l);
          if (op == 0x61) { REQ(AA(u0) + 1); sw(r, AA(u0), v.ju); }
          else r[AA(u0)] = v.u;
-         fr->pc += 2;
-         break;
+         fr->pc = pc + 2;
+         DISPATCH();
       }
-      case 0x67: case 0x68: case 0x69: case 0x6a: case 0x6b: case 0x6c: case 0x6d: {
+      case 0x67: L_67: case 0x68: L_68: case 0x69: L_69: case 0x6a: L_6a: case 0x6b: L_6b: case 0x6c: L_6c: case 0x6d: L_6d: {
          REQ(AA(u0));
          struct dvm_class *fc; const char *fn, *ft;
          struct dvm_field *f = dd ? resolve_field(vm, dd, IU(1), true, &fc, &fn, &ft)
@@ -2779,13 +3279,13 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             fprintf(stderr, "[dvm] %*ssput-object %s.%s:%s <- @%x\n",
                     vm->depth * 2, "", fc ? fc->name : "?", fn ? fn : "?",
                     ft ? ft : "?", v.l);
-         fr->pc += 2;
-         break;
+         fr->pc = pc + 2;
+         DISPATCH();
       }
 
       /* --- invokes --- */
-      case 0x6e: case 0x6f: case 0x70: case 0x71: case 0x72:
-      case 0x74: case 0x75: case 0x76: case 0x77: case 0x78: {
+      case 0x6e: L_6e: case 0x6f: L_6f: case 0x70: L_70: case 0x71: L_71: case 0x72: L_72:
+      case 0x74: L_74: case 0x75: L_75: case 0x76: L_76: case 0x77: L_77: case 0x78: L_78: {
          bool range = (op >= 0x74);
          uint8_t kind = range ? (uint8_t)(op - 0x74 + 0x6e) : op;
          uint32_t midx = IU(1);
@@ -2876,25 +3376,25 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          if (!ok || vm->exception) goto exception;
 
          fr->result = ret.ju;
-         fr->pc += 3;   /* 35c and 3rc are both three code units */
-         break;
+         fr->pc = pc + 3;   /* 35c and 3rc are both three code units */
+         DISPATCH();
       }
 
       /* --- unary --- */
-      case 0x7b: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = (uint32_t)(-(int32_t)r[B4(u0)]); fr->pc += 1; break;
-      case 0x7c: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = ~r[B4(u0)]; fr->pc += 1; break;
-      case 0x7d: REQ(A4(u0) + 1); REQ(B4(u0) + 1); sw(r, A4(u0), (uint64_t)(-(int64_t)rw(r, B4(u0)))); fr->pc += 1; break;
-      case 0x7e: REQ(A4(u0) + 1); REQ(B4(u0) + 1); sw(r, A4(u0), ~rw(r, B4(u0))); fr->pc += 1; break;
-      case 0x7f: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = f_to_bits(-bits_to_f(r[B4(u0)])); fr->pc += 1; break;
-      case 0x80: REQ(A4(u0) + 1); REQ(B4(u0) + 1); sw(r, A4(u0), d_to_bits(-bits_to_d(rw(r, B4(u0))))); fr->pc += 1; break;
+      case 0x7b: L_7b: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = (uint32_t)(-(int32_t)r[B4(u0)]); fr->pc = pc + 1; DISPATCH();
+      case 0x7c: L_7c: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = ~r[B4(u0)]; fr->pc = pc + 1; DISPATCH();
+      case 0x7d: L_7d: REQ(A4(u0) + 1); REQ(B4(u0) + 1); sw(r, A4(u0), (uint64_t)(-(int64_t)rw(r, B4(u0)))); fr->pc = pc + 1; DISPATCH();
+      case 0x7e: L_7e: REQ(A4(u0) + 1); REQ(B4(u0) + 1); sw(r, A4(u0), ~rw(r, B4(u0))); fr->pc = pc + 1; DISPATCH();
+      case 0x7f: L_7f: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = f_to_bits(-bits_to_f(r[B4(u0)])); fr->pc = pc + 1; DISPATCH();
+      case 0x80: L_80: REQ(A4(u0) + 1); REQ(B4(u0) + 1); sw(r, A4(u0), d_to_bits(-bits_to_d(rw(r, B4(u0))))); fr->pc = pc + 1; break;
 
-      case 0x81: REQ(A4(u0) + 1); REQ(B4(u0)); sw(r, A4(u0), (uint64_t)(int64_t)(int32_t)r[B4(u0)]); fr->pc += 1; break;
-      case 0x82: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = f_to_bits((float)(int32_t)r[B4(u0)]); fr->pc += 1; break;
-      case 0x83: REQ(A4(u0) + 1); REQ(B4(u0)); sw(r, A4(u0), d_to_bits((double)(int32_t)r[B4(u0)])); fr->pc += 1; break;
-      case 0x84: REQ(A4(u0)); REQ(B4(u0) + 1); r[A4(u0)] = (uint32_t)rw(r, B4(u0)); fr->pc += 1; break;
-      case 0x85: REQ(A4(u0)); REQ(B4(u0) + 1); r[A4(u0)] = f_to_bits((float)(int64_t)rw(r, B4(u0))); fr->pc += 1; break;
-      case 0x86: REQ(A4(u0) + 1); REQ(B4(u0) + 1); sw(r, A4(u0), d_to_bits((double)(int64_t)rw(r, B4(u0)))); fr->pc += 1; break;
-      case 0x87: { /* float-to-int, with Java's saturating semantics */
+      case 0x81: L_81: REQ(A4(u0) + 1); REQ(B4(u0)); sw(r, A4(u0), (uint64_t)(int64_t)(int32_t)r[B4(u0)]); fr->pc = pc + 1; DISPATCH();
+      case 0x82: L_82: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = f_to_bits((float)(int32_t)r[B4(u0)]); fr->pc = pc + 1; DISPATCH();
+      case 0x83: L_83: REQ(A4(u0) + 1); REQ(B4(u0)); sw(r, A4(u0), d_to_bits((double)(int32_t)r[B4(u0)])); fr->pc = pc + 1; DISPATCH();
+      case 0x84: L_84: REQ(A4(u0)); REQ(B4(u0) + 1); r[A4(u0)] = (uint32_t)rw(r, B4(u0)); fr->pc = pc + 1; DISPATCH();
+      case 0x85: L_85: REQ(A4(u0)); REQ(B4(u0) + 1); r[A4(u0)] = f_to_bits((float)(int64_t)rw(r, B4(u0))); fr->pc = pc + 1; DISPATCH();
+      case 0x86: L_86: REQ(A4(u0) + 1); REQ(B4(u0) + 1); sw(r, A4(u0), d_to_bits((double)(int64_t)rw(r, B4(u0)))); fr->pc = pc + 1; DISPATCH();
+      case 0x87: L_87: { /* float-to-int, with Java's saturating semantics */
          REQ(A4(u0)); REQ(B4(u0));
          float f = bits_to_f(r[B4(u0)]);
          int32_t v;
@@ -2903,10 +3403,10 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          else if (f <= -2147483648.0f) v = INT32_MIN;
          else v = (int32_t)f;
          r[A4(u0)] = (uint32_t)v;
-         fr->pc += 1;
-         break;
+         fr->pc = pc + 1;
+         DISPATCH();
       }
-      case 0x88: {
+      case 0x88: L_88: {
          REQ(A4(u0) + 1); REQ(B4(u0));
          float f = bits_to_f(r[B4(u0)]);
          int64_t v;
@@ -2915,11 +3415,11 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          else if (f <= -9223372036854775808.0f) v = INT64_MIN;
          else v = (int64_t)f;
          sw(r, A4(u0), (uint64_t)v);
-         fr->pc += 1;
-         break;
+         fr->pc = pc + 1;
+         DISPATCH();
       }
-      case 0x89: REQ(A4(u0) + 1); REQ(B4(u0)); sw(r, A4(u0), d_to_bits((double)bits_to_f(r[B4(u0)]))); fr->pc += 1; break;
-      case 0x8a: {
+      case 0x89: L_89: REQ(A4(u0) + 1); REQ(B4(u0)); sw(r, A4(u0), d_to_bits((double)bits_to_f(r[B4(u0)]))); fr->pc = pc + 1; DISPATCH();
+      case 0x8a: L_8a: {
          REQ(A4(u0)); REQ(B4(u0) + 1);
          double f = bits_to_d(rw(r, B4(u0)));
          int32_t v;
@@ -2928,10 +3428,10 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          else if (f <= -2147483648.0) v = INT32_MIN;
          else v = (int32_t)f;
          r[A4(u0)] = (uint32_t)v;
-         fr->pc += 1;
-         break;
+         fr->pc = pc + 1;
+         DISPATCH();
       }
-      case 0x8b: {
+      case 0x8b: L_8b: {
          REQ(A4(u0) + 1); REQ(B4(u0) + 1);
          double f = bits_to_d(rw(r, B4(u0)));
          int64_t v;
@@ -2940,17 +3440,17 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
          else if (f <= -9223372036854775808.0) v = INT64_MIN;
          else v = (int64_t)f;
          sw(r, A4(u0), (uint64_t)v);
-         fr->pc += 1;
-         break;
+         fr->pc = pc + 1;
+         DISPATCH();
       }
-      case 0x8c: REQ(A4(u0)); REQ(B4(u0) + 1); r[A4(u0)] = f_to_bits((float)bits_to_d(rw(r, B4(u0)))); fr->pc += 1; break;
-      case 0x8d: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = (uint32_t)(int32_t)(int8_t)r[B4(u0)]; fr->pc += 1; break;
-      case 0x8e: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = (uint16_t)r[B4(u0)]; fr->pc += 1; break;
-      case 0x8f: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = (uint32_t)(int32_t)(int16_t)r[B4(u0)]; fr->pc += 1; break;
+      case 0x8c: L_8c: REQ(A4(u0)); REQ(B4(u0) + 1); r[A4(u0)] = f_to_bits((float)bits_to_d(rw(r, B4(u0)))); fr->pc = pc + 1; DISPATCH();
+      case 0x8d: L_8d: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = (uint32_t)(int32_t)(int8_t)r[B4(u0)]; fr->pc = pc + 1; DISPATCH();
+      case 0x8e: L_8e: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = (uint16_t)r[B4(u0)]; fr->pc = pc + 1; DISPATCH();
+      case 0x8f: L_8f: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = (uint32_t)(int32_t)(int16_t)r[B4(u0)]; fr->pc = pc + 1; break;
 
       /* --- binary op vAA, vBB, vCC --- */
-      case 0x90: case 0x91: case 0x92: case 0x93: case 0x94: case 0x95:
-      case 0x96: case 0x97: case 0x98: case 0x99: case 0x9a: {
+      case 0x90: L_90: case 0x91: L_91: case 0x92: L_92: case 0x93: L_93: case 0x94: L_94: case 0x95: L_95:
+      case 0x96: L_96: case 0x97: L_97: case 0x98: L_98: case 0x99: L_99: case 0x9a: L_9a: {
          REQ(AA(u0));
          uint16_t bc = IU(1);
          REQ(bc & 0xff); REQ(bc >> 8);
@@ -2976,11 +3476,11 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             default:   v = (int32_t)((uint32_t)a >> (b & 31)); break;
          }
          r[AA(u0)] = (uint32_t)v;
-         fr->pc += 2;
-         break;
+         fr->pc = pc + 2;
+         DISPATCH();
       }
-      case 0x9b: case 0x9c: case 0x9d: case 0x9e: case 0x9f: case 0xa0:
-      case 0xa1: case 0xa2: case 0xa3: case 0xa4: case 0xa5: {
+      case 0x9b: L_9b: case 0x9c: L_9c: case 0x9d: L_9d: case 0x9e: L_9e: case 0x9f: L_9f: case 0xa0: L_a0:
+      case 0xa1: L_a1: case 0xa2: L_a2: case 0xa3: L_a3: case 0xa4: L_a4: case 0xa5: L_a5: {
          REQ(AA(u0) + 1);
          uint16_t bc = IU(1);
          bool shift = (op >= 0xa3);
@@ -3009,10 +3509,10 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             default:   v = (int64_t)((uint64_t)a >> (b & 63)); break;
          }
          sw(r, AA(u0), (uint64_t)v);
-         fr->pc += 2;
-         break;
+         fr->pc = pc + 2;
+         DISPATCH();
       }
-      case 0xa6: case 0xa7: case 0xa8: case 0xa9: case 0xaa: {
+      case 0xa6: L_a6: case 0xa7: L_a7: case 0xa8: L_a8: case 0xa9: L_a9: case 0xaa: L_aa: {
          REQ(AA(u0));
          uint16_t bc = IU(1);
          REQ(bc & 0xff); REQ(bc >> 8);
@@ -3025,10 +3525,10 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             default:   v = fmodf(a, b); break;
          }
          r[AA(u0)] = f_to_bits(v);
-         fr->pc += 2;
-         break;
+         fr->pc = pc + 2;
+         DISPATCH();
       }
-      case 0xab: case 0xac: case 0xad: case 0xae: case 0xaf: {
+      case 0xab: L_ab: case 0xac: L_ac: case 0xad: L_ad: case 0xae: L_ae: case 0xaf: L_af: {
          REQ(AA(u0) + 1);
          uint16_t bc = IU(1);
          REQ((bc & 0xff) + 1); REQ((bc >> 8) + 1);
@@ -3041,13 +3541,13 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             default:   v = fmod(a, b); break;
          }
          sw(r, AA(u0), d_to_bits(v));
-         fr->pc += 2;
-         break;
+         fr->pc = pc + 2;
+         DISPATCH();
       }
 
       /* --- binary op/2addr --- */
-      case 0xb0: case 0xb1: case 0xb2: case 0xb3: case 0xb4: case 0xb5:
-      case 0xb6: case 0xb7: case 0xb8: case 0xb9: case 0xba: {
+      case 0xb0: L_b0: case 0xb1: L_b1: case 0xb2: L_b2: case 0xb3: L_b3: case 0xb4: L_b4: case 0xb5: L_b5:
+      case 0xb6: L_b6: case 0xb7: L_b7: case 0xb8: L_b8: case 0xb9: L_b9: case 0xba: L_ba: {
          REQ(A4(u0)); REQ(B4(u0));
          int32_t a = (int32_t)r[A4(u0)], b = (int32_t)r[B4(u0)];
          int32_t v = 0;
@@ -3071,11 +3571,11 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             default:   v = (int32_t)((uint32_t)a >> (b & 31)); break;
          }
          r[A4(u0)] = (uint32_t)v;
-         fr->pc += 1;
-         break;
+         fr->pc = pc + 1;
+         DISPATCH();
       }
-      case 0xbb: case 0xbc: case 0xbd: case 0xbe: case 0xbf: case 0xc0:
-      case 0xc1: case 0xc2: case 0xc3: case 0xc4: case 0xc5: {
+      case 0xbb: L_bb: case 0xbc: L_bc: case 0xbd: L_bd: case 0xbe: L_be: case 0xbf: L_bf: case 0xc0: L_c0:
+      case 0xc1: L_c1: case 0xc2: L_c2: case 0xc3: L_c3: case 0xc4: L_c4: case 0xc5: L_c5: {
          bool shift = (op >= 0xc3);
          REQ(A4(u0) + 1);
          REQ(shift ? (uint32_t)B4(u0) : (uint32_t)(B4(u0) + 1));
@@ -3102,10 +3602,10 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             default:   v = (int64_t)((uint64_t)a >> (b & 63)); break;
          }
          sw(r, A4(u0), (uint64_t)v);
-         fr->pc += 1;
-         break;
+         fr->pc = pc + 1;
+         DISPATCH();
       }
-      case 0xc6: case 0xc7: case 0xc8: case 0xc9: case 0xca: {
+      case 0xc6: L_c6: case 0xc7: L_c7: case 0xc8: L_c8: case 0xc9: L_c9: case 0xca: L_ca: {
          REQ(A4(u0)); REQ(B4(u0));
          float a = bits_to_f(r[A4(u0)]), b = bits_to_f(r[B4(u0)]), v;
          switch (op) {
@@ -3116,10 +3616,10 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             default:   v = fmodf(a, b); break;
          }
          r[A4(u0)] = f_to_bits(v);
-         fr->pc += 1;
-         break;
+         fr->pc = pc + 1;
+         DISPATCH();
       }
-      case 0xcb: case 0xcc: case 0xcd: case 0xce: case 0xcf: {
+      case 0xcb: L_cb: case 0xcc: L_cc: case 0xcd: L_cd: case 0xce: L_ce: case 0xcf: L_cf: {
          REQ(A4(u0) + 1); REQ(B4(u0) + 1);
          double a = bits_to_d(rw(r, A4(u0))), b = bits_to_d(rw(r, B4(u0))), v;
          switch (op) {
@@ -3130,13 +3630,13 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             default:   v = fmod(a, b); break;
          }
          sw(r, A4(u0), d_to_bits(v));
-         fr->pc += 1;
-         break;
+         fr->pc = pc + 1;
+         DISPATCH();
       }
 
       /* --- literal ops --- */
-      case 0xd0: case 0xd1: case 0xd2: case 0xd3: case 0xd4:
-      case 0xd5: case 0xd6: case 0xd7: {
+      case 0xd0: L_d0: case 0xd1: L_d1: case 0xd2: L_d2: case 0xd3: L_d3: case 0xd4: L_d4:
+      case 0xd5: L_d5: case 0xd6: L_d6: case 0xd7: L_d7: {
          REQ(A4(u0)); REQ(B4(u0));
          int32_t a = (int32_t)r[B4(u0)];
          int32_t b = (int16_t)IU(1);
@@ -3158,11 +3658,11 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             default:   v = a ^ b; break;
          }
          r[A4(u0)] = (uint32_t)v;
-         fr->pc += 2;
-         break;
+         fr->pc = pc + 2;
+         DISPATCH();
       }
-      case 0xd8: case 0xd9: case 0xda: case 0xdb: case 0xdc: case 0xdd:
-      case 0xde: case 0xdf: case 0xe0: case 0xe1: case 0xe2: {
+      case 0xd8: L_d8: case 0xd9: L_d9: case 0xda: L_da: case 0xdb: L_db: case 0xdc: L_dc: case 0xdd: L_dd:
+      case 0xde: L_de: case 0xdf: L_df: case 0xe0: L_e0: case 0xe1: L_e1: case 0xe2: L_e2: {
          REQ(AA(u0));
          uint16_t bc = IU(1);
          REQ(bc & 0xff);
@@ -3189,8 +3689,8 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
             default:   v = (int32_t)((uint32_t)a >> (b & 31)); break;
          }
          r[AA(u0)] = (uint32_t)v;
-         fr->pc += 2;
-         break;
+         fr->pc = pc + 2;
+         DISPATCH();
       }
 
       /* --- invoke-polymorphic / -custom, const-method-*: these need a
@@ -3198,9 +3698,9 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
        * into ordinary classes, so this only shows up in code that reflects on
        * method handles.  Skip the call and yield zero rather than derail the
        * whole method. */
-      case 0xfa: case 0xfb: fr->pc += 4; fr->result = 0; break;
-      case 0xfc: case 0xfd: fr->pc += 3; fr->result = 0; break;
-      case 0xfe: case 0xff: REQ(AA(u0)); r[AA(u0)] = 0; fr->pc += 2; break;
+      case 0xfa: L_fa: case 0xfb: L_fb: fr->pc = pc + 4; fr->result = 0; DISPATCH();
+      case 0xfc: L_fc: case 0xfd: L_fd: fr->pc = pc + 3; fr->result = 0; DISPATCH();
+      case 0xfe: L_fe: case 0xff: L_ff: REQ(AA(u0)); r[AA(u0)] = 0; fr->pc = pc + 2; break;
 
       default:
          dvm__throw(vm, "java/lang/VerifyError", "%s.%s: opcode %02x at %04x",
@@ -3674,7 +4174,10 @@ static bool invoke_body(struct dvm *vm, struct dvm_method *m, dvm_ref self,
 
    /* Java and native calls share this host thread's stack. Leave room to
     * construct the exception and unwind rather than limiting Java depth. */
-   size_t stack_remaining = luna_os_stack_remaining();
+   /* Reading the stack bounds costs a thread-local lookup, and one call level
+    * uses a few kilobytes against the 64 KB kept in reserve, so every fourth
+    * level is looked at -- the margin still covers the ones in between. */
+   size_t stack_remaining = (vm->depth & 3) == 0 ? luna_os_stack_remaining() : SIZE_MAX - 1;
    if (stack_remaining < 64u * 1024u ||
        (stack_remaining == SIZE_MAX && vm->depth >= DVM_MAX_FRAMES)) {
       if (getenv("LUNARIA_DVM_STACK")) {
@@ -3768,7 +4271,11 @@ static bool invoke_body(struct dvm *vm, struct dvm_method *m, dvm_ref self,
 
    if (m->builtin) {
       union dvm_value args[64];
-      int nargs = slots_to_values(m->sig, slots, nslots, args, 64);
+      int nargs;
+      if (m->sig && m->sig[0] == '(' && m->sig[1] == ')')
+         nargs = 0;          /* nothing to unpack */
+      else
+         nargs = slots_to_values(m->sig, slots, nslots, args, 64);
       ++vm->depth;
       struct dvm_method *previous_builtin = g_builtin_method;
       g_builtin_method = m;
@@ -3981,6 +4488,18 @@ static int drain_pending(struct dvm *vm, bool nested)
           * accepts and one it does not. */
          if (entry_due && now > entry_due + DVM_LOOPER_LATE_MS) {
             static int late_warned;
+            /* The line below is capped to keep a log readable; the count is
+             * not, and a summary says how many ran late and by how much. */
+            static uint64_t late_total, late_ms_total, late_worst, late_last_report;
+            ++late_total; late_ms_total += now - entry_due;
+            if (now - entry_due > late_worst) late_worst = now - entry_due;
+            if (now - late_last_report >= 10000) {
+               if (late_last_report)
+                  fprintf(stderr, "[sched-late] %llu callbacks ran late so far, %.0f ms on average, worst %llu ms\n",
+                          (unsigned long long)late_total, (double)late_ms_total / (double)late_total,
+                          (unsigned long long)late_worst);
+               late_last_report = now;
+            }
             if (late_warned++ < 64 || dvm__sched_trace())
                fprintf(stderr, "[sched] %s.run() ran %llu ms after its due "
                        "time (main-looper callback)\n",
@@ -4153,6 +4672,57 @@ void dvm__run_pending_threads(struct dvm *vm)
    if (vm->drain_depth == 0) dvm__ui_tick(vm);
 }
 int dvm__drain_for_wait(struct dvm *vm) { return drain_pending(vm, true); }
+
+/* Whether the main Looper has a message whose time has come.  The frame pump
+ * asks it while the guest is parked: waiting out the rest of the frame then
+ * only delays work the Java side could be doing. */
+/* The frame pump sleeps between frames; user input wakes it so a tap is handled
+ * when it arrives, not at the end of the sleep. */
+static pthread_mutex_t g_pump_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pump_cv;
+static pthread_once_t g_pump_once = PTHREAD_ONCE_INIT;
+static bool g_pump_woken;
+static void pump_cv_init(void)
+{
+   pthread_condattr_t at;
+   pthread_condattr_init(&at);
+   pthread_condattr_setclock(&at, CLOCK_MONOTONIC);
+   pthread_cond_init(&g_pump_cv, &at);
+   pthread_condattr_destroy(&at);
+}
+void dvm_pump_wake(void)
+{
+   pthread_once(&g_pump_once, pump_cv_init);
+   pthread_mutex_lock(&g_pump_mu);
+   g_pump_woken = true;
+   pthread_cond_signal(&g_pump_cv);
+   pthread_mutex_unlock(&g_pump_mu);
+}
+/* Sleeps up to `us`; true when input woke it early. */
+bool dvm_pump_wait_us(unsigned us)
+{
+   pthread_once(&g_pump_once, pump_cv_init);
+   struct timespec t;
+   clock_gettime(CLOCK_MONOTONIC, &t);
+   t.tv_nsec += (long)us * 1000L;
+   t.tv_sec += t.tv_nsec / 1000000000L; t.tv_nsec %= 1000000000L;
+   pthread_mutex_lock(&g_pump_mu);
+   while (!g_pump_woken && pthread_cond_timedwait(&g_pump_cv, &g_pump_mu, &t) == 0) {}
+   const bool woken = g_pump_woken;
+   g_pump_woken = false;
+   pthread_mutex_unlock(&g_pump_mu);
+   return woken;
+}
+
+bool dvm_main_work_due(struct dvm *vm)
+{
+   if (!vm || vm->main_transaction_depth) return false;
+   const uint64_t now = dvm__now_ms();
+   for (int i = 0; i < vm->npending; ++i)
+      if (!vm->pending_is_thread[i] && !vm->pending_looper[i] &&
+          (!vm->pending_due_ms[i] || vm->pending_due_ms[i] <= now)) return true;
+   return false;
+}
 
 /* One turn of the main thread's Looper, for the frame pump to call.
  *
@@ -4877,6 +5447,39 @@ void dvm_gil_acquire(struct dvm *vm)
    arm_lock_relock(ael_depth);
 }
 
+/* LUNARIA_PROF_GIL=1: who holds the interpreter lock, per thread, every 5 s. */
+struct gil_prof { unsigned id; const char *what; const char *root; unsigned long long ns; };
+static struct gil_prof g_gil_prof[48];
+static int g_gil_prof_n;
+static unsigned long long g_gil_prof_last;
+static void gil_prof_account(struct dvm *vm, unsigned long long held_ns)
+{
+   static int on = -1;
+   if (on < 0) on = getenv("LUNARIA_PROF_GIL") != NULL;
+   if (!on) return;
+   const unsigned id = g_gil_owner_id;
+   struct gil_prof *e = NULL;
+   for (int i = 0; i < g_gil_prof_n; ++i) if (g_gil_prof[i].id == id) { e = &g_gil_prof[i]; break; }
+   if (!e && g_gil_prof_n < 48) { e = &g_gil_prof[g_gil_prof_n++]; e->id = id; e->root = "?"; }
+   if (e) {
+      e->ns += held_ns; e->what = g_gil_owner_what;
+      if (vm->ncallstack > 0 && vm->ncallstack <= 128 && vm->callstack[0] && vm->callstack[0]->cls)
+         e->root = vm->callstack[0]->cls->name;
+   }
+   struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+   const unsigned long long now = (unsigned long long)t.tv_sec * 1000000000ull + t.tv_nsec;
+   if (!g_gil_prof_last) g_gil_prof_last = now;
+   if (now - g_gil_prof_last >= 5000000000ull) {
+      for (int i = 0; i < g_gil_prof_n; ++i) {
+         if (g_gil_prof[i].ns > 20000000ull)
+            fprintf(stderr, "[gil-prof] thread %u (%s) %s: %.0f ms of 5000\n", g_gil_prof[i].id,
+                    g_gil_prof[i].what ? g_gil_prof[i].what : "?", g_gil_prof[i].root, (double)g_gil_prof[i].ns / 1e6);
+         g_gil_prof[i].ns = 0;
+      }
+      g_gil_prof_last = now;
+   }
+}
+
 void dvm_gil_release(struct dvm *vm)
 {
    if (!t_gil_depth) return;      /* not ours to release */
@@ -4889,9 +5492,9 @@ void dvm_gil_release(struct dvm *vm)
    {
       struct timespec now;
       clock_gettime(CLOCK_MONOTONIC, &now);
-      atomic_fetch_add_explicit(&g_gil_held_ns,
-                                gil_ns_since(&g_gil_held_since, &now),
-                                memory_order_relaxed);
+      const unsigned long long held = gil_ns_since(&g_gil_held_since, &now);
+      atomic_fetch_add_explicit(&g_gil_held_ns, held, memory_order_relaxed);
+      gil_prof_account(vm, held);
    }
    struct dvm_gil_waiter *w = g_gil_head;
    if (w) {

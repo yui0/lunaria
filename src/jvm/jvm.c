@@ -3644,7 +3644,7 @@ jvm_init(struct jvm *jvm)
 /* No Activity, window, native engine, or host event loop is created here.
  * Constructors and attachBaseContext precede providers; Application.onCreate
  * follows them. Failure leaves the original Java exception pending. */
-int luna_application_start(struct jvm *jvm,const char *manifest_class,
+static int application_start_transaction(struct jvm *jvm,const char *manifest_class,
       bool (*in_dex)(const char *),int (*providers)(struct jvm *,jobject),
       jobject *base_out,jobject *application_out)
 {
@@ -3679,4 +3679,18 @@ int luna_application_start(struct jvm *jvm,const char *manifest_class,
    jvm->native.CallVoidMethodA(&jvm->env,application,create,NULL);
    if(jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 14\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
    *base_out=base;*application_out=application;return 0;
+}
+
+/* ActivityThread handles BIND_APPLICATION as one main-Looper message:
+ * attach, providers, and Application.onCreate finish before the next message.
+ * A JNI boundary between these steps is not a Looper dispatch boundary. */
+int luna_application_start(struct jvm *jvm,const char *manifest_class,
+      bool (*in_dex)(const char *),int (*providers)(struct jvm *,jobject),
+      jobject *base_out,jobject *application_out)
+{
+   dvm_jni_main_transaction(&jvm->env,true);
+   int result=application_start_transaction(jvm,manifest_class,in_dex,providers,
+                                           base_out,application_out);
+   dvm_jni_main_transaction(&jvm->env,false);
+   return result;
 }

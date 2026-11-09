@@ -1021,6 +1021,15 @@ uint64_t luna_os_monotonic_ns(void)
    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+bool luna_os_boot_id(char *out, size_t cap)
+{
+   if (!out || cap < 37) return false;
+   size_t size = cap;
+   if (sysctlbyname("kern.bootsessionuuid", out, &size, NULL, 0)) return false;
+   out[cap-1] = 0;
+   return strlen(out) == 36;
+}
+
 uint64_t luna_os_boottime_ns(void)
 {
    struct timespec ts;
@@ -1277,6 +1286,8 @@ static void luna_aq_callback(void *user, AudioQueueRef q, AudioQueueBufferRef b)
 }
 
 static void audio_saved_prefs(void);
+
+void luna_os_audio_set_pull(void (*pull)(void)) { (void)pull; }
 
 int luna_os_audio_open(unsigned rate, unsigned channels)
 {

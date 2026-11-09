@@ -593,12 +593,12 @@ int lunaria_cdp_page_touch(struct lunaria_cdp_page *page,
                            int x, int y, int action)
 {
    if (!page || !page->transport || !page->session_id[0] ||
-       (action != 1 && action != -1 && action != 0)) return -1;
+       (action != 1 && action != -1 && action != 0 && action != 2)) return -1;
    char command[448];
    const unsigned id = page->next_id++;
    const char *type = action == 1 ? "touchStart" :
-                      action == -1 ? "touchMove" : "touchEnd";
-   if (action == 0)
+                      action == -1 ? "touchMove" : action==2 ? "touchCancel" : "touchEnd";
+   if (action == 0 || action==2)
       snprintf(command, sizeof command,
          "{\"id\":%u,\"sessionId\":\"%s\","
          "\"method\":\"Input.dispatchTouchEvent\","

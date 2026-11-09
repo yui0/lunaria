@@ -10,8 +10,8 @@
  *
  * An AccountManagerFuture here is a lunaria/AccountFuture: fields only, polled
  * with the interpreter lock released, since the answer may arrive from any
- * thread.  The authenticator is bound in this process; the Transport is called
- * directly, as no Binder boundary lies between them.
+ * thread. The authenticator can live in another installed package; requests
+ * and responses use the ordinary Binder transport in that case.
  *
  * Included once, after the helpers it uses, by dvm_runtime.c. */
 
@@ -60,6 +60,7 @@ static const struct rt_field rt_account_future_fields[] = {
    { "callback", "Landroid/accounts/AccountManagerCallback;" },
    { "handler", "Landroid/os/Handler;" }, { "activity", "Landroid/app/Activity;" },
    { "account", "Landroid/accounts/Account;" }, { "tokenType", "Ljava/lang/String;" },
+   { "options", "Landroid/os/Bundle;" },
    F_END,
 };
 static const struct rt_field rt_account_callback_run_fields[] = {
@@ -677,6 +678,30 @@ static dvm_ref aa_authenticator_intent(struct dvm *vm, const char *account_type)
             found = intent;
       }
    }
+   /* AccountManagerService's registry belongs to the system, not to the
+    * calling app. Discover authenticators from every installed package's own
+    * manifest and XML resources, including non-exported system services. */
+   for (size_t i = 0; !found && i < lunaria_android_package_count(); ++i) {
+      struct lunaria_android_package package;
+      const char *current = getenv("ANDROID_PACKAGE_NAME");
+      if (!lunaria_android_package_at(i, &package) || !package.source_dir ||
+          (current && !strcmp(current, package.name))) continue;
+      char mapped[DVM_PATH_MAX], component[512];
+      const char *apk = arm_exec_map_guest_path(package.source_dir, mapped, sizeof mapped);
+      luna_file_info info;
+      if (!apk || luna_file_infoat(LUNA_AT_FDCWD, apk, &info, 0) || info.size <= 22) continue;
+      int matched = luna_apk_find_registered_service(apk, "android.accounts.AccountAuthenticator",
+                         "android.accounts.AccountAuthenticator", "accountType", account_type,
+                         (unsigned)lunaria_sdk_int(), component, sizeof component);
+      if (matched != 1) continue;
+      dvm_ref intent = new_intent(vm, "android.accounts.AccountAuthenticator");
+      union dvm_value names[2] = {{.l = dvm_new_string(vm, package.name)},
+                                  {.l = dvm_new_string(vm, component)}}, ignored = {0};
+      if (intent && am_vcall(vm, intent, "setClassName", "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;", names, 2, &ignored))
+         found = intent;
+      if (getenv("LUNARIA_TRACE_ACCOUNTS"))
+         fprintf(stderr, "[accounts] registered authenticator %s/%s for %s\n", package.name, component, account_type);
+   }
    dvm_unpin(vm, query);
    return found;
 }
@@ -751,9 +776,33 @@ static const struct rt_method rt_account_binding[] = {
    M_END,
 };
 
+/* AccountManager copies the client's Bundle; AccountManagerService adds the
+ * authenticated caller identity before invoking an authenticator. These keys
+ * must be present even for overloads with no options parameter. */
+static dvm_ref aa_login_options(struct dvm *vm, dvm_ref source, bool notify)
+{
+   dvm_ref result = aa_bundle_new(vm);
+   if (!result) return 0;
+   dvm_pin(vm, result);
+   union dvm_value a[2] = {{.l = source}}, ignored = {0};
+   bool good = !source || map_putAll(vm, result, a, 1, &ignored);
+   const char *package = getenv("ANDROID_PACKAGE_NAME");
+   good = good && aa_bundle_string(vm, result, "androidPackageName", package ? package : "");
+   a[0].l = dvm_new_string(vm, "callerUid"); a[1].i = arm_exec_guest_uid();
+   good = good && bundle_putInt(vm, result, a, 2, &ignored);
+   a[0].l = dvm_new_string(vm, "callerPid"); a[1].i = arm_exec_guest_pid();
+   good = good && bundle_putInt(vm, result, a, 2, &ignored);
+   if (notify) {
+      a[0].l = dvm_new_string(vm, "notifyOnAuthFailure"); a[1].i = 1;
+      good = good && bundle_putBoolean(vm, result, a, 2, &ignored);
+   }
+   dvm_unpin(vm, result);
+   return good && !dvm_exception(vm) ? result : 0;
+}
+
 /* Starts one request and returns its future (never null; failures complete it). */
 static dvm_ref aa_start(struct dvm *vm, int request, const char *type, dvm_ref account, dvm_ref token_type,
-                        dvm_ref features, dvm_ref options, dvm_ref activity, dvm_ref callback, dvm_ref handler)
+                        dvm_ref features, dvm_ref options, dvm_ref activity, dvm_ref callback, dvm_ref handler, bool notify)
 {
    struct dvm_class *fc = dvm__class_by_desc(vm, "Llunaria/AccountFuture;");
    struct dvm_class *rc = dvm__class_by_desc(vm, "Llunaria/AccountResponseBinder;");
@@ -761,6 +810,11 @@ static dvm_ref aa_start(struct dvm *vm, int request, const char *type, dvm_ref a
    dvm_ref future = fc ? dvm_new_object(vm, fc) : 0;
    if (!future) return 0;
    dvm_pin(vm, future);
+   if (request == AA_ADD || request == AA_TOKEN) {
+      options = aa_login_options(vm, options, notify);
+      if (!options) { dvm_unpin(vm, future); return 0; }
+      (void)dvm_set_field(vm, future, "options", "Landroid/os/Bundle;", (union dvm_value){.l = options});
+   }
    union dvm_value v = { .i = request };
    (void)dvm_set_field(vm, future, "request", "I", v);
    v.l = callback; (void)dvm_set_field(vm, future, "callback", "Landroid/accounts/AccountManagerCallback;", v);
@@ -809,7 +863,7 @@ static bool accman_addAccount(struct dvm *vm, dvm_ref self, const union dvm_valu
 {
    (void)self; (void)nargs;
    if (!args[0].l) { dvm__throw(vm, "java/lang/IllegalArgumentException", "accountType is null"); return false; }
-   RETL(aa_start(vm, AA_ADD, dvm_string_utf8(vm, args[0].l), 0, args[1].l, args[2].l, args[3].l, args[4].l, args[5].l, args[6].l));
+   RETL(aa_start(vm, AA_ADD, dvm_string_utf8(vm, args[0].l), 0, args[1].l, args[2].l, args[3].l, args[4].l, args[5].l, args[6].l, false));
 }
 
 /* A token already held for the account is answered without the authenticator. */
@@ -835,9 +889,9 @@ static bool accman_getAuthToken(struct dvm *vm, dvm_ref self, const union dvm_va
    /* (Account, String, Bundle, Activity|boolean, callback, handler) */
    const char *name, *type;
    if (!acct_of(vm, args[0].l, &name, &type)) return false;
-   dvm_ref activity = !strcmp(dvm__builtin_method()->sig,
-      "(Landroid/accounts/Account;Ljava/lang/String;Landroid/os/Bundle;Landroid/app/Activity;Landroid/accounts/AccountManagerCallback;Landroid/os/Handler;)Landroid/accounts/AccountManagerFuture;")
-      ? args[3].l : 0;
+   bool with_activity = !strcmp(dvm__builtin_method()->sig,
+      "(Landroid/accounts/Account;Ljava/lang/String;Landroid/os/Bundle;Landroid/app/Activity;Landroid/accounts/AccountManagerCallback;Landroid/os/Handler;)Landroid/accounts/AccountManagerFuture;");
+   dvm_ref activity = with_activity ? args[3].l : 0;
    dvm_ref cached = aa_cached_token_result(vm, args[0].l, args[1].l);
    if (cached) {
       struct dvm_class *fc = dvm__class_by_desc(vm, "Llunaria/AccountFuture;");
@@ -849,7 +903,7 @@ static bool accman_getAuthToken(struct dvm *vm, dvm_ref self, const union dvm_va
       aa_future_finish(vm, future, cached, AA_OK, NULL);
       RETL(future);
    }
-   RETL(aa_start(vm, AA_TOKEN, type, args[0].l, args[1].l, 0, args[2].l, activity, args[4].l, args[5].l));
+   RETL(aa_start(vm, AA_TOKEN, type, args[0].l, args[1].l, 0, args[2].l, activity, args[4].l, args[5].l, !with_activity && args[3].i));
 }
 
 /* blockingGetAuthToken(account, type, notifyAuthFailure): the token, or null. */
@@ -861,18 +915,13 @@ static bool accman_blockingGetAuthToken(struct dvm *vm, dvm_ref self, const unio
    if (!acct_of(vm, args[0].l, &name, &type)) return false;
    dvm_ref cached = aa_cached_token_result(vm, args[0].l, args[1].l);
    if (cached) RETL(dvm_new_string(vm, aa_bundle_get_string(vm, cached, "authtoken")));
-   dvm_ref future = aa_start(vm, AA_TOKEN, type, args[0].l, args[1].l, 0, 0, 0, 0, 0);
+   dvm_ref future = aa_start(vm, AA_TOKEN, type, args[0].l, args[1].l, 0, 0, 0, 0, 0, args[2].i != 0);
    union dvm_value result = { 0 };
    if (!future) RETL(0);
    dvm_pin(vm, future);
    const bool ok = aa_future_get(vm, future, NULL, 0, &result);
    dvm_unpin(vm, future);
-   if (!ok) {
-      /* IOException / AuthenticatorException / OperationCanceledException: the
-       * blocking form reports failure as no token. */
-      if (dvm_exception(vm)) dvm_clear_exception(vm);
-      RETL(0);
-   }
+   if (!ok) return false; /* The blocking API propagates the declared exceptions. */
    const char *token = aa_bundle_get_string(vm, result.l, "authtoken");
    RETL(token ? dvm_new_string(vm, token) : 0);
 }
@@ -889,7 +938,7 @@ static bool accman_removeAccount(struct dvm *vm, dvm_ref self, const union dvm_v
    dvm_ref callback = with_activity ? args[2].l : args[1].l;
    dvm_ref handler = with_activity ? args[3].l : args[2].l;
    /* The authenticator may veto; the account goes only if it does not. */
-   RETL(aa_start(vm, AA_REMOVE, type, args[0].l, 0, 0, 0, activity, callback, handler));
+   RETL(aa_start(vm, AA_REMOVE, type, args[0].l, 0, 0, 0, activity, callback, handler, false));
 }
 
 /* setPassword(account, password): the stored password; null clears it. */
@@ -963,7 +1012,7 @@ static bool x_accman_getAuthToken_legacy(struct dvm *vm, dvm_ref self, const uni
       RETL(future);
    }
    (void)self;
-   RETL(aa_start(vm, AA_TOKEN, type, args[0].l, args[1].l, 0, 0, 0, args[3].l, args[4].l));
+   RETL(aa_start(vm, AA_TOKEN, type, args[0].l, args[1].l, 0, 0, 0, args[3].l, args[4].l, args[2].i != 0));
 }
 
 static const struct rt_method rt_account_manager[] = {
@@ -1171,4 +1220,55 @@ static const struct rt_method rt_x_content_resolver_sync[] = {
    SM("getCurrentSyncs", "()Ljava/util/List;", x_sync_empty_list),
    SM("getPeriodicSyncs", "(Landroid/accounts/Account;Ljava/lang/String;)Ljava/util/List;", x_sync_empty_list),
    M_END,
+};
+
+/* MPL-2.0. Account's Parcelable reader, used inside GMS TokenResponse. */
+static bool account_init_parcel(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   struct rt_parcel *p=args[0].l?parcel_of(vm,args[0].l):NULL;
+   if(!p){dvm__throw(vm,"java/lang/NullPointerException","Parcel");return false;}
+   dvm_pin(vm,self);
+   union dvm_value values[3]={{0},{0},{0}},ignored={0};
+   bool ok=parcel_take_string(vm,p,&values[0].l);
+   if(ok)dvm_set_field(vm,self,"name","Ljava/lang/String;",values[0]);
+   if(ok)ok=parcel_take_string(vm,p,&values[1].l);
+   if(ok)dvm_set_field(vm,self,"type","Ljava/lang/String;",values[1]);
+   if(ok)ok=parcel_take_string(vm,p,&values[2].l);
+   if(ok){
+      dvm_set_field(vm,self,"accessId","Ljava/lang/String;",values[2]);
+      ok=account_init(vm,self,values,2,&ignored);
+   }
+   dvm_unpin(vm,self);
+   if(!ok)return false;
+   RETV();
+}
+static bool account_creator_create(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;
+   struct dvm_class *c=dvm__class_by_desc(vm,"Landroid/accounts/Account;");
+   dvm_ref account=c?dvm_new_object(vm,c):0;
+   if(!account)return false;
+   union dvm_value ignored={0};
+   if(!account_init_parcel(vm,account,args,nargs,&ignored))return false;
+   RETL(account);
+}
+static bool account_creator_array(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)nargs;
+   if(args[0].i<0){dvm__throw(vm,"java/lang/NegativeArraySizeException","Account[]");return false;}
+   RETL(dvm_new_array(vm,'L',"Landroid/accounts/Account;",args[0].i));
+}
+static bool account_get_access_id(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   union dvm_value id={0};dvm_get_field(vm,self,"accessId","Ljava/lang/String;",&id);RETL(id.l);
+}
+static const struct rt_method rt_account_parcel_more[]={
+   M("<init>","(Landroid/os/Parcel;)V",account_init_parcel),
+   M("getAccessId","()Ljava/lang/String;",account_get_access_id),M_END
+};
+static const struct rt_method rt_account_creator[]={
+   M("createFromParcel","(Landroid/os/Parcel;)Ljava/lang/Object;",account_creator_create),
+   M("newArray","(I)[Ljava/lang/Object;",account_creator_array),M_END
 };

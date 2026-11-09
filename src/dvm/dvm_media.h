@@ -72,9 +72,8 @@ int liq_wait_space(struct liq_queue *queue, unsigned timeout_ms);
 /* --- the frame sink behind android.view.Surface -------------------------- *
  *
  * A MediaCodec renders into a Surface; a SurfaceTexture takes the frames back
- * out.  On a device that is a BufferQueue.  Here one frame is enough: the
- * consumer (updateTexImage) always wants the newest, and a dropped frame is
- * exactly what a device does when the consumer falls behind. */
+ * out. Timed submissions retain FIFO order and apply producer back-pressure;
+ * immediate asynchronous submissions may replace another immediate frame. */
 struct lm_sink;
 
 struct lm_sink *lm_sink_new(void);
@@ -100,13 +99,24 @@ void lm_sink_push(struct lm_sink *s, const uint8_t *rgba, int w, int h,
  * sink's own buffer to convert into, commit() publishes it. */
 uint8_t *lm_sink_begin(struct lm_sink *s, int w, int h);
 bool lm_sink_commit(struct lm_sink *s, int w, int h, int64_t timestamp_ns);
+/* Explicit monotonic desired presentation time, as releaseOutputBuffer(J).
+ * A full queue rejects the commit without transferring the producer buffer. */
+bool lm_sink_commit_at(struct lm_sink *s, int w, int h, int64_t timestamp_ns);
 void lm_sink_abandon(struct lm_sink *s);
 uint64_t lm_sink_commit_id(struct lm_sink *s);
 int64_t lm_sink_acquired_timestamp(struct lm_sink *s);
 
 /* Consumer side.  False when no frame has arrived since the last take; the
- * pointer stays valid until the next push. */
+ * pointer stays valid until the next successful take, including during pushes.
+ * take() acquires without a display deadline (SurfaceTexture); take_at() uses
+ * BufferQueue's desired/expected presentation-time rules (window consumer). */
 bool lm_sink_take(struct lm_sink *s, const uint8_t **rgba, int *w, int *h);
+bool lm_sink_take_at(struct lm_sink *s, int64_t expected_present_ns,
+                      const uint8_t **rgba, int *w, int *h);
+
+/* Lazily mirror the acquired front into a caller-owned ARGB Bitmap. The copy
+ * is serialized with acquisition; serial avoids copying an unchanged front. */
+bool lm_sink_snapshot_argb(struct lm_sink *s,uint64_t *serial,uint32_t **pixels,int *w,int *h);
 
 /* Last frame still in the sink (even after take() cleared pending). */
 bool lm_sink_peek(const struct lm_sink *s, const uint8_t **rgba, int *w, int *h);
@@ -181,6 +191,8 @@ bool lm_codec_dequeue_rendered(struct lm_codec *c, int64_t *pts_us, int64_t *nan
 /* LUNARIA_TRACE_MEDIA: whether to log the codec state machine.  Shared so the
  * Java side of MediaCodec can log on the same switch. */
 bool lm_media_trace(void);
+void lm_media_wake(void);
+bool lm_media_take_wake(void);
 
 struct dvm;
 /* Advance every MediaPlayer that is currently playing.  Called from the host

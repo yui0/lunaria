@@ -733,11 +733,16 @@ inline std::vector<MmapSlab> g_mmap_slabs;
 // PROT_NONE anon bytes reserved.
 inline uint64_t g_mmap_prot_none_bytes = 0;
 
+/* True once the process is running a 64-bit guest.  Set before
+ * guest_layout_init(), which sizes the heap differently for the two. */
+inline bool g_guest_proc_arm64 = false;
+
 inline bool mmap_prot_none_budget_ok(uint32_t len) {
     // PROT_NONE consumes guest VA, not committed RAM.
     uint64_t mmap2_end = g_mmap2_end ? (uint64_t)g_mmap2_end : 0x100000000ull;
     uint64_t budget = (uint64_t)(MMAP_END - MMAP_BASE) +
                       (mmap2_end - (uint64_t)g_mmap2_base);
+    if (!g_guest_proc_arm64) budget += g_heap_size;
     if (g_mmap_prot_none_bytes + (uint64_t)len <= budget)
         return true;
     static int n = 0;
@@ -756,10 +761,6 @@ inline uint64_t mmap2_end_excl(void) {
     return g_mmap2_end ? (uint64_t)g_mmap2_end : 0x100000000ull;
 }
 
-/* True once the process is running a 64-bit guest.  Set before
- * guest_layout_init(), which sizes the heap differently for the two. */
-inline bool g_guest_proc_arm64 = false;
-
 inline void guest_layout_init(void) {
     static bool once = false;
     if (once) return;
@@ -767,23 +768,14 @@ inline void guest_layout_init(void) {
     uint32_t m2b = lunaria_env_u32("LUNARIA_MMAP2_BASE", 0);
     uint32_t m2e = lunaria_env_u32("LUNARIA_MMAP2_END", 0);
 
-    /* How much of the window malloc and the small-mmap fallback share.
-     *
-     * A 32-bit guest has one 4 GiB window holding images, thread stacks, mmap
-     * and heap, so 256 MiB of malloc arena there is a deliberate share of it.
-     * A 64-bit guest puts its mmaps in the real 64-bit address space
-     * (guest_va_layout_arm64), which leaves everything from HEAP_BASE up to
-     * MMAP2_BASE with nothing in it but this arena — and 256 MiB of that is
-     * not a budget, it is a leftover.  Genshin's Unity allocator reported
-     * "System out of memory! Trying to allocate 262160B" with 142 MiB in use,
-     * on a device this emulator tells the guest has 6 GiB of RAM.  Default to
-     * the whole window instead; LUNARIA_HEAP_MB still overrides it. */
+    /* malloc grows upward and overflow mmap grows downward in one arena.
+     * Reserve the available guest VA for both; touching pages, rather than
+     * this reservation, consumes host RAM. A separate fixed malloc quota
+     * would return ENOMEM while most of the process's VA remained unused. */
     const uint32_t heap_window_top = m2b ? (uint32_t)m2b : 0xF0000000u;
     const long window_mb = (long)((heap_window_top - HEAP_BASE) >> 20);
-    long max_mb = g_guest_proc_arm64 ? window_mb
-                                     : (window_mb < 1024 ? window_mb : 1024);
-    long heap_mb = lunaria_env_long("LUNARIA_HEAP_MB",
-                                    g_guest_proc_arm64 ? window_mb : 256);
+    const long max_mb = window_mb;
+    long heap_mb = lunaria_env_long("LUNARIA_HEAP_MB", window_mb);
     if (heap_mb < 64) heap_mb = 64;
     if (heap_mb > max_mb) heap_mb = max_mb;
     g_heap_size = (uint32_t)heap_mb * 1024u * 1024u;
@@ -971,15 +963,14 @@ inline uint32_t mmap_bump(uint32_t raw_len) {
         return ~0u;
     }
     addr = bump_in(g_mmap2_next, mmap2_end_excl());
-    if (addr == ~0u && len <= 0x01000000u && g_small_mmap_top) {
-        // PROT_NONE slabs consume the normal mmap arenas on A64.  The floor is
-        // wherever malloc has bumped to: the two share the window, and the
-        // heap's own lock decides between them (src/lib/guest.c).
+    if (addr == ~0u && (!g_guest_proc_arm64 || len <= 0x01000000u) && g_small_mmap_top) {
+        // Overflow mappings share the unused malloc arena. The heap lock
+        // moves its limit downward without crossing live allocations.
         uint32_t next = arm_heap_take_top(len, MMAP_ALIGN - 1u);
         if (next) {
             static int fb = 0;
             if (fb++ < 16)
-                fprintf(stderr, "[mmap] small A64 fallback len=%u -> %08x\n", len, next);
+                fprintf(stderr, "[mmap] shared heap arena len=%u -> %08x\n", len, next);
             return next;
         }
     }

@@ -90,7 +90,10 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, in
 	}
 
 	// 44100 bits/second sampling rate (CD quality)
-	int dir;
+	/* ALSA reads dir as well as writing it: 0 requests the nearest rate,
+	 * including an exact match. An uninitialized direction can exclude the
+	 * requested rate even when the device supports it. */
+	int dir = 0;
 	rc = snd_pcm_hw_params_set_rate_near(thiz->handle, params, &freq, &dir);
 	if (rc < 0) {
 		fprintf(stderr, "cannot set sample rate (%s)\n", snd_strerror(rc));
@@ -105,6 +108,7 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, in
 
 	// Set period size to 32 frames.
 	thiz->frames = frames;
+	dir = 0;
 	snd_pcm_hw_params_set_period_size_near(thiz->handle, params, &thiz->frames, &dir);
 
 	// And say how many periods the card should hold.  Left unset, ALSA picks

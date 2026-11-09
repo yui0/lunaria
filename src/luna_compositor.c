@@ -5,13 +5,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  *
- * See luna_compositor.h for what this is and why it exists.
+ * See luna_boot.h for what this is and why it exists.
  */
 
-#include "luna_compositor.h"
 #include "luna_boot.h"
-#include "luna_ime.h"
-#include "luna_overlay.h"
+#include "luna_qfkey.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -455,7 +453,13 @@ static void *comp_main(void *arg)
       luna_overlay_set_hosted(false);
       return NULL;
    }
-   eglSwapInterval(g_dpy, 1);
+   /* Blocking in eglSwapBuffers until the display's next refresh held the whole
+    * compositor to about 41 frames a second while the UI was producing 74: each
+    * wait began after the previous frame's work, and the compositor thread
+    * holds the lock the frame pump publishes through.  The window system still
+    * shows one finished frame per refresh; LUNARIA_COMP_SWAP_INTERVAL=1 waits
+    * for the display again. */
+   {const char *si=getenv("LUNARIA_COMP_SWAP_INTERVAL");eglSwapInterval(g_dpy, si ? atoi(si) : 0);}
    if (!gl_setup()) {
       fprintf(stderr, "[compositor] shader setup failed\n");
       atomic_store(&g_active, false);
@@ -473,7 +477,7 @@ static void *comp_main(void *arg)
        * or the UI changes it. */
       const bool boot = luna_boot_active() && !have_frame && !luna_overlay_guest_window_up();
       const bool ime = luna_ime_active();
-      const uint64_t period = boot ? 16000000ull : ime ? 33000000ull
+      const uint64_t period = (boot || luna_overlay_has_image_sources()) ? 16000000ull : ime ? 33000000ull
                              : luna_overlay_active() ? 100000000ull
                              : 1000000000ull;
 
@@ -593,6 +597,7 @@ static void *comp_main(void *arg)
       }
 
       comp_maybe_dump(w, h);
+      luna_qfkey_capture_gl(w, h);
       eglSwapBuffers(g_dpy, g_win);
       atomic_fetch_add_explicit(&g_frames, 1, memory_order_relaxed);
       last_draw = now_ns();

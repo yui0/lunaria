@@ -5,14 +5,13 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  *
- * See luna_ime.h for what this is and why it exists.
+ * See luna_boot.h for what this is and why it exists.
  */
 
 #define LUNA_UI_NO_PLATFORM
 #include "luna-ui.h"
 
-#include "luna_ime.h"
-#include "luna_overlay.h"
+#include "luna_boot.h"
 
 #include <pthread.h>
 #include <stdio.h>

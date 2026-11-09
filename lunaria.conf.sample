@@ -183,8 +183,6 @@
 # [com.miHoYo.GenshinImpact]
 # LUNARIA_KEYMAP=keymaps/genshin.conf
 # LUNARIA_PROFILE_PROMPT=1
-# LUNARIA_SHARED_ASSETS=AssetBundles:AudioAssets:VideoAssets:UnityShaderBin:il2cpp:ctable.dat:hardware_model_config.json:vulkan_gpu_list_config.txt
-# LUNARIA_PROFILE_SEED_FILES=data_revision:data_versions_persist:res_revision:res_revision_eternal:res_versions_persist:silence_data_versions_persist:silence_revision:base_res_version_hash:audio_revision:ScriptVersion:PatchDone:ChannelName:vulkan_gpu_list_config_engine.txt
 
 # Guest graphics API: Vulkan is enabled by default when the host bridge is available.
 # Set 0 to expose OpenGL ES only. The right-click Graphics API menu saves

@@ -1486,6 +1486,9 @@ uint64_t luna_os_monotonic_ns(void);
 uint64_t luna_os_realtime_ns(void);
 /* Android elapsedRealtime includes suspend; uptime excludes it. Both are
  * boot-relative, independent of wall-clock adjustments. */
+/* Stable within a host boot (including suspend and wall-clock changes),
+ * different after reboot. UTF-8 identity; false if unavailable or too small. */
+bool luna_os_boot_id(char *out, size_t cap);
 uint64_t luna_os_boottime_ns(void);
 uint64_t luna_os_uptime_ns(void);
 
@@ -1664,6 +1667,9 @@ void luna_os_offscreen_resize(void *native_window, int w, int h);
  * Returns: open 0 on success (the stream is silent but harmless otherwise),
  * write the number of frames accepted, queued_frames what is still to play. */
 int      luna_os_audio_open(unsigned rate, unsigned channels);
+/* The output asks for its next period of sound: the mixer runs on the output's
+ * own clock (as AudioFlinger's does) rather than on the display's. */
+void     luna_os_audio_set_pull(void (*pull)(void));
 int      luna_os_audio_write(const void *pcm16, unsigned frames);
 unsigned luna_os_audio_queued_frames(void);
 uint64_t luna_os_audio_played_frames(void);
@@ -1977,8 +1983,19 @@ static inline char *luna_host_realpath(const char *path, char *result, size_t ca
 extern "C" {
 #endif
 #define LUNA_PROCESS_MESSAGE_MAX (1024u * 1024u)
+#define LUNA_PROCESS_FD_MAX 64u
 struct luna_process_channel;
 struct luna_process_pool;
+/* Device process inventory, published by the framework rather than inferred
+ * from installed packages. The registry is private to the emulated image. */
+struct luna_process_info {
+   uint32_t pid, uid;
+   int32_t importance;
+   char name[512], package[256];
+};
+int luna_process_state_open(const char *directory);
+int luna_process_state_publish(const struct luna_process_info *);
+int luna_process_state_list(struct luna_process_info **out, size_t *count);
 /* Payloads are owned by the channel until this callback returns. Callbacks
  * run outside its lock and may enqueue a reply. Object references must be
  * serialized by the VM before entering this transport. */
@@ -1987,6 +2004,10 @@ typedef void (*luna_process_reply_fn)(void *,const char *,uint32_t,const void *,
 /* Takes ownership of fd. The endpoint is nonblocking and close-on-exec. */
 struct luna_process_channel *luna_process_channel_open(int fd);
 int luna_process_channel_send(struct luna_process_channel *,const void *,size_t);
+/* Queued sends own CLOEXEC duplicates. Received FDs are borrowed until the
+ * channel/pool callback returns; duplicate any FD that must outlive it. */
+int luna_process_channel_send_fds(struct luna_process_channel *,const void *,size_t,const int *,size_t);
+const int *luna_process_message_fds(size_t *count);
 /* Returns a message count or negative errno; -EPIPE means peer shutdown. */
 int luna_process_channel_tick(struct luna_process_channel *,luna_process_message_fn,void *);
 void luna_process_channel_close(struct luna_process_channel *);
@@ -2002,12 +2023,18 @@ struct luna_process_pool *luna_process_pool_open(const char *executable,const ch
  * `first_pid` must not overlap another pool's range. */
 struct luna_process_pool *luna_process_pool_open_host(const char *executable,const char *host_apk,
                                                      uint32_t guest_uid,uint32_t parent_pid,uint32_t first_pid);
+int luna_process_pool_set_profile(struct luna_process_pool *,const char *profile);
 /* Whether a host named `name` is alive in the pool (sending to it would not start one). */
 int luna_process_pool_running(struct luna_process_pool *,const char *name);
 /* Send to an existing host PID; never start a replacement process. */
 int luna_process_pool_send_to_host(struct luna_process_pool *,uint32_t host_pid,const void *data,size_t size);
+int luna_process_pool_send_to_host_fds(struct luna_process_pool *,uint32_t,const void *,size_t,const int *,size_t);
+/* Send to live hosts only, excluding the originating host. Never spawn. */
+int luna_process_pool_publish(struct luna_process_pool *,uint32_t exclude_host,const void *,size_t);
+int luna_process_pool_publish_fds(struct luna_process_pool *,uint32_t,const void *,size_t,const int *,size_t);
 int luna_process_pool_send(struct luna_process_pool *,const char *process,
                             const void *,size_t,uint32_t *guest_pid);
+int luna_process_pool_send_fds(struct luna_process_pool *,const char *,const void *,size_t,uint32_t *,const int *,size_t);
 /* A reply callback may enqueue another message, including to another VM.
  * -EPIPE reports a closed channel; the corresponding death notice becomes
  * available once the child is reaped. Other VMs' replies are still delivered. */

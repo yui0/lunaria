@@ -50,6 +50,7 @@ struct dvm_method {
    bool has_code;
    dvm_builtin_fn builtin;
    bool placeholder_warned; /* a no-op scaffold has reported itself once */
+   struct dvm_dex *dd_cache; /* the dex that owns `dex`, found once */
    int arg_slots;      /* parameter registers, excluding `this` */
    int arg_count;      /* declared parameters */
    char ret_kind;
@@ -108,6 +109,7 @@ struct dvm_class {
     * application's own namespace it is a class that does not exist, and
     * bytecode that names it must be told so.  See new-instance in dvm.c. */
    bool synthesized;
+   int unresolved_dexes;       /* DEX count at the last unsuccessful lookup */
    char elem_kind;             /* arrays */
    struct dvm_class *elem;     /* arrays */
 
@@ -190,6 +192,7 @@ struct dvm_object {
 
 struct dvm_dex {
    struct dex_file file;
+   dvm_ref defining_loader; /* null for the application class path */
    /* Per-index resolution caches.  A dex index is only meaningful inside its
     * own file, so the caches live here rather than in the VM. */
    struct dvm_class **type_cache;
@@ -205,9 +208,13 @@ struct dvm {
    dvm_ref application_class_loader, bootstrap_class_loader;
    dvm_ref legacy_http_class_loader;
    uint64_t field_cache_generation;
+   /* Android's default-network InetAddress cache, MRU last, under the GIL.
+    * Both references are pinned; the result is InetAddress[] or an error String. */
+   struct {dvm_ref host,result;uint64_t expires;} inet_address_cache[16];
+   unsigned inet_address_cache_count;
    /* ui_is_a(): view class names already resolved to their classes, keyed by
     * the caller's string literal.  Per VM because classes belong to one. */
-   struct { const char *key; struct dvm_class *cls; } is_a_cache[64];
+   struct { const char *key; struct dvm_class *cls; int missing_at; } is_a_cache[1024];
    _Atomic unsigned device_keyguard_state;
    _Atomic bool stopping;
    _Atomic int process_exit_phase; /* 0 live, 1 publishing, 2 terminal */
@@ -227,6 +234,7 @@ struct dvm {
    struct rt_codec *active_codecs; /* asynchronous MediaCodec, under GIL */
    struct rt_surface_texture *surface_textures; /* frame listeners, under GIL */
    dvm_ref content_providers; /* attached local providers, under GIL */
+   bool providers_starting; /* external acquisition waits for batch publication */
    struct dvm_network_callback *network_callbacks;
    size_t nnetwork_callbacks;
    dvm_ref *layout_observers;
@@ -302,6 +310,7 @@ struct dvm {
    bool keystore_hydrated;
    dvm_ref accepted_issuers; /* host CA snapshot belongs to this VM */
    dvm_ref main_thread;
+   dvm_ref main_looper; /* Process-owned Looper; never a reference into another VM. */
    unsigned main_transaction_depth; /* lifecycle work holds the main Looper until completion */
    uint64_t main_host_thread;
    dvm_ref main_thread_group, system_thread_group;
@@ -409,6 +418,7 @@ int dvm__field_slot(struct dvm *vm, struct dvm_class *cls, const char *name, con
 bool dvm__class_assignable(struct dvm *vm, struct dvm_class *from,
                            struct dvm_class *to);
 struct dvm_object *dvm__obj(struct dvm *vm, dvm_ref ref);
+void dvm__throwable_capture(struct dvm *vm, dvm_ref throwable);
 /* A non-escaping builtin may discard its newly imported JNI copies. */
 bool dvm__builtin_borrows_jni_payloads(const struct dvm_method *method);
 void dvm__discard_temporary(struct dvm *vm,dvm_ref ref);
@@ -429,6 +439,68 @@ bool dvm__get_field_from(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
 bool dvm__set_field_from(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
                          const char *name, const char *type,
                          union dvm_value val);
+
+/* Call-site caches for the host's by-name accessors.
+ *
+ * The host reads Java fields and finds methods by name thousands of times a
+ * frame (ui_int(view, "paddingLeft"), String.equals reading "value").  Each
+ * call hashed the name and compared it with strcmp.  When the name and type are
+ * string literals their addresses never change, so the call site can remember
+ * the answer for the receiver class it last saw and skip all of that: a field
+ * read becomes one tagged-word compare and an array load.  A word packs the
+ * class (address >> 4, 44 bits), the field slot (12 bits) and a VM generation
+ * (8 bits, so an address reused by a later VM never matches), and is read and
+ * written whole, so no lock is needed.  Non-literal names take the ordinary
+ * path. */
+/* Eight receiver classes per call site: a loop that walks every kind of view
+ * reads the same field from all of them. */
+struct dvm_field_ic { _Atomic uint64_t w[8]; _Atomic unsigned next; };
+bool dvm__get_field_ic(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
+                       const char *name, const char *type, union dvm_value *out,
+                       struct dvm_field_ic *ic);
+bool dvm__set_field_ic(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
+                       const char *name, const char *type, union dvm_value val,
+                       struct dvm_field_ic *ic);
+struct dvm_class *dvm__find_class_ic(struct dvm *vm, const char *name,
+                                     _Atomic uint64_t *ic);
+struct dvm_class *dvm__class_by_desc_ic(struct dvm *vm, const char *desc,
+                                        _Atomic uint64_t *ic);
+struct dvm_method_ic { uint64_t generation; struct dvm_class *cls; struct dvm_method *m; };
+struct dvm_method *dvm__find_method_ic(struct dvm *vm, struct dvm_class *cls,
+                                       const char *name, const char *sig,
+                                       struct dvm_method_ic *ic);
+#if defined(__GNUC__) && !defined(__cplusplus) && !defined(DVM_NO_CALLSITE_CACHE)
+#define DVM_LITERAL2(a, b) (__builtin_constant_p(a) && __builtin_constant_p(b))
+#define dvm_get_field(vm, obj, name, type, out) \
+   (DVM_LITERAL2(name, type) \
+    ? ({ static struct dvm_field_ic ic_; dvm__get_field_ic((vm), (obj), NULL, (name), (type), (out), &ic_); }) \
+    : (dvm_get_field)((vm), (obj), (name), (type), (out)))
+#define dvm_set_field(vm, obj, name, type, val) \
+   (DVM_LITERAL2(name, type) \
+    ? ({ static struct dvm_field_ic ic_; dvm__set_field_ic((vm), (obj), NULL, (name), (type), (val), &ic_); }) \
+    : (dvm_set_field)((vm), (obj), (name), (type), (val)))
+#define dvm__get_field_from(vm, obj, owner, name, type, out) \
+   (DVM_LITERAL2(name, type) \
+    ? ({ static struct dvm_field_ic ic_; dvm__get_field_ic((vm), (obj), (owner), (name), (type), (out), &ic_); }) \
+    : (dvm__get_field_from)((vm), (obj), (owner), (name), (type), (out)))
+#define dvm__set_field_from(vm, obj, owner, name, type, val) \
+   (DVM_LITERAL2(name, type) \
+    ? ({ static struct dvm_field_ic ic_; dvm__set_field_ic((vm), (obj), (owner), (name), (type), (val), &ic_); }) \
+    : (dvm__set_field_from)((vm), (obj), (owner), (name), (type), (val)))
+#define dvm_find_class(vm, name) \
+   (__builtin_constant_p(name) \
+    ? ({ static _Atomic uint64_t ic_; dvm__find_class_ic((vm), (name), &ic_); }) \
+    : (dvm_find_class)((vm), (name)))
+#define dvm__class_by_desc(vm, desc) \
+   (__builtin_constant_p(desc) \
+    ? ({ static _Atomic uint64_t ic_; dvm__class_by_desc_ic((vm), (desc), &ic_); }) \
+    : (dvm__class_by_desc)((vm), (desc)))
+#define dvm_find_method(vm, cls, name, sig) \
+   (DVM_LITERAL2(name, sig) \
+    ? ({ static _Thread_local struct dvm_method_ic ic_; dvm__find_method_ic((vm), (cls), (name), (sig), &ic_); }) \
+    : (dvm_find_method)((vm), (cls), (name), (sig)))
+#endif
+
 bool dvm__monitor_enter(struct dvm *vm, dvm_ref ref);
 bool dvm__monitor_try_enter(struct dvm *vm, dvm_ref ref);
 bool dvm__monitor_exit(struct dvm *vm, dvm_ref ref);
@@ -607,6 +679,9 @@ bool dvm_runtime_context_broadcast(struct dvm *vm, const char *method,
                                    const char *sig, dvm_ref context,
                                    const union dvm_value *args, int nargs,
                                    union dvm_value *out);
+bool dvm_runtime_deliver_broadcast(struct dvm *,dvm_ref,uint32_t,const char *,dvm_ref);
+bool dvm_runtime_broadcast_wanted(struct dvm *,dvm_ref,uint32_t,const char *,dvm_ref);
+int dvm_binder_broadcast(struct dvm *,dvm_ref,dvm_ref);
 
 /* dvm_runtime.c: installs the built-in classes into a fresh VM. */
 void dvm_runtime_install(struct dvm *vm);
@@ -689,6 +764,12 @@ extern const struct dvm_sqlite_field  dvm_sqlite_helper_fields[];
 /* Opens (creating when `flags` says so) a database and returns the
  * SQLiteDatabase object, or 0 with an SQLiteException pending.  `flags` are
  * SQLiteDatabase.OPEN_* / CREATE_IF_NECESSARY / ENABLE_WRITE_AHEAD_LOGGING. */
+/* Shared platform settings; read() returns a malloc'd value, including null
+ * for a present SQL NULL. Query returns the requested framework columns. */
+bool dvm_settings_read(struct dvm *,const char *,const char *,char **,bool *);
+bool dvm_settings_write(struct dvm *,const char *,const char *,const char *,bool,int *);
+dvm_ref dvm_settings_query(struct dvm *,const char *,const char *,dvm_ref,const char *);
+
 dvm_ref dvm_sqlite_open(struct dvm *vm, const char *path, int flags);
 
 /* Removes a database file and its -journal/-wal/-shm companions. */

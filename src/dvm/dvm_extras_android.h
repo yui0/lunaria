@@ -205,6 +205,9 @@ static bool x_if_add(struct dvm *vm, dvm_ref self, const union dvm_value *args,
 {
    (void)nargs; (void)out;
    const char *name = builtin_name();
+   /* IntentFilter(String action) has the same action semantics as addAction,
+    * including null rejection. A constructor name is not a data-path API. */
+   if (!strcmp(name, "<init>")) name = "addAction";
    if (!ARG(0).l) { dvm__throw(vm, "java/lang/NullPointerException", "%s", name); return false; }
    const char *s = dvm_string_utf8(vm, ARG(0).l);
    const char *field = x_if_field_for(name);
@@ -910,6 +913,7 @@ static bool pq_bundle_out(struct dvm *vm, struct pq_writer *w, dvm_ref bundle)
    dvm_pin(vm, parcel.l);
    struct rt_parcel *p = parcel_of(vm, parcel.l);
    bool ok = p && parcel_write_bundle(vm, parcel.l, p, bundle) && !p->failed && !dvm_exception(vm);
+   if(ok && p->descriptors.count){w->failed=true;ok=false;}
    if (ok) { pq_u32(w, p->size); pq_put(w, p->buf, p->size); }
    union dvm_value ignored = {0};
    (void)parcel_recycle(vm, parcel.l, NULL, 0, &ignored);
@@ -962,6 +966,20 @@ static const char *pq_package_authorities(const char *package)
 static char *pq_owner(const char *authority)
 {
    const char *self = getenv("ANDROID_PACKAGE_NAME");
+   if(self){
+      struct luna_providers providers;
+      if(!luna_providers_open(&providers,getenv("ANDROID_CONTENT_PROVIDERS"),self)){
+         const char *process=getenv("ANDROID_PROCESS_NAME");
+         if(!process || !*process)process=self;
+         bool remote=false;
+         for(size_t i=0;i<providers.count;++i){
+            const struct luna_provider *p=&providers.items[i];
+            if(p->enabled && luna_provider_authority(p,authority) && !luna_provider_local(p,process))remote=true;
+         }
+         luna_providers_close(&providers);
+         if(remote)return strdup(self);
+      }
+   }
    const char *cursor = NULL;
    char host[256];
    const size_t n = strlen(authority);
@@ -1042,6 +1060,7 @@ static bool x_provider_remote(struct dvm *vm, uint32_t operation, const union dv
 /* The owner side: run the operation against this process's own provider. */
 static int x_provider_serve(struct dvm *vm, uint32_t sender, uint32_t seq, const uint8_t *body, size_t size)
 {
+   if (!dvm_content_providers_wait(vm)) return -ETIMEDOUT;
    struct pq_reader r = { body, body + size, false };
    const uint32_t operation = pq_get32(&r);
    dvm_ref uri_text = pq_get_string(vm, &r);
@@ -1179,6 +1198,7 @@ static bool x_resolver_call(struct dvm *vm, dvm_ref self, const union dvm_value 
    union dvm_value authority = { 0 };
    if (!am_vcall(vm, ARG(0).l, "getAuthority", "()Ljava/lang/String;", NULL, 0, &authority)) return false;
    const char *a = authority.l ? dvm_string_utf8(vm, authority.l) : NULL;
+   if (a && !strcmp(a, "settings")) return settings_provider_call(vm, args, out);
    dvm_ref provider = a ? x_find_provider(vm, a) : 0;
    if (!provider && a) {
       /* An authority a component host in another process owns. */
@@ -1214,6 +1234,8 @@ static bool x_resolver_operation(struct dvm *vm,dvm_ref self,const union dvm_val
        !am_vcall(vm,ARG(0).l,"getAuthority","()Ljava/lang/String;",NULL,0,&authority)) return false;
    const char *protocol=dvm_string_utf8(vm,scheme.l);
    const char *name=dvm_string_utf8(vm,authority.l);
+   if (protocol && !strcmp(protocol, "content") && name && !strcmp(name, "settings"))
+      return settings_provider_operation(vm, operation->name, args, nargs, out);
    dvm_ref provider=protocol && !strcmp(protocol,"content") && name ? x_find_provider(vm,name) : 0;
    if (!provider && protocol && !strcmp(protocol,"content") && name && !strcmp(operation->name,"query") && nargs>=5) {
       /* An authority a component host in another process owns. */
@@ -1247,7 +1269,7 @@ static bool x_resolver_operation(struct dvm *vm,dvm_ref self,const union dvm_val
  * resolver's, aimed at that authority. */
 static bool x_authority_exists(struct dvm *vm, const char *authority)
 {
-   if (x_find_provider(vm, authority)) return true;
+   if (!strcmp(authority, "settings") || x_find_provider(vm, authority)) return true;
    char *owner = pq_owner(authority);
    free(owner);
    return owner != NULL;
@@ -1928,7 +1950,44 @@ static const struct rt_method rt_x_file_observer[] = {
 /* Activity: no touch-outside dismissal on a full-screen window; Unity reports
  * first-frame completion for a system that has no startup trace; a plain launch
  * has no calling package; onContentChanged() is empty in the base class. */
+/* Activity.setRequestedOrientation: the device is the host window, and turning
+ * the device is swapping its width and height (the same operation as the menu's
+ * rotate-device).  Landscape/portrait requests rotate when the window is the
+ * other way round; unspecified and sensor-driven requests return to the
+ * orientation the window had when the app started, which is what a device
+ * held in its natural position reports.  The layout, Configuration and
+ * onConfigurationChanged follow from the display-size change in the UI tick,
+ * exactly as for any other display change. */
+static int g_requested_orientation = -1;
+static int g_natural_landscape = -1;
+static bool act_set_requested_orientation(struct dvm *vm, dvm_ref self,
+                                          const union dvm_value *args, int nargs,
+                                          union dvm_value *out)
+{
+   (void)vm; (void)self; (void)nargs; (void)out;
+   const int o = ARG(0).i;
+   const int w = rt_surface_w(), h = rt_surface_h();
+   fprintf(stderr, "[orientation] setRequestedOrientation(%d) on a %dx%d window\n", o, w, h);
+   if (w <= 0 || h <= 0) { g_requested_orientation = o; RETV(); }
+   if (g_natural_landscape < 0) g_natural_landscape = w >= h;
+   g_requested_orientation = o;
+   bool landscape;
+   switch (o) {
+   case 0: case 6: case 8: case 11: landscape = true; break;   /* LANDSCAPE, SENSOR/REVERSE/USER */
+   case 1: case 7: case 9: case 12: landscape = false; break;  /* PORTRAIT, SENSOR/REVERSE/USER */
+   default: landscape = g_natural_landscape != 0; break;
+   }
+   if (landscape != (w >= h)) arm_exec_request_view_resize(h, w);
+   RETV();
+}
+static bool act_get_requested_orientation(struct dvm *vm, dvm_ref self,
+                                          const union dvm_value *args, int nargs,
+                                          union dvm_value *out)
+{ (void)vm; (void)self; (void)args; (void)nargs; RETI(g_requested_orientation); }
+
 static const struct rt_method rt_x_activity[] = {
+   M("setRequestedOrientation", "(I)V", act_set_requested_orientation),
+   M("getRequestedOrientation", "()I", act_get_requested_orientation),
    M("setFinishOnTouchOutside", "(Z)V", empty_void),
    M("reportFullyDrawn", "()V", empty_void),
    M("getCallingPackage", "()Ljava/lang/String;", ret_null),

@@ -503,6 +503,18 @@ uint64_t luna_os_monotonic_ns(void)
    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+bool luna_os_boot_id(char *out, size_t cap)
+{
+   if (!out || cap < 37) return false;
+   FILE *f = fopen("/proc/sys/kernel/random/boot_id", "r");
+   if (!f) return false;
+   bool ok = fgets(out, (int)(cap > INT_MAX ? INT_MAX : cap), f) != NULL;
+   fclose(f);
+   if (!ok) return false;
+   out[strcspn(out, "\r\n")] = 0;
+   return strlen(out) == 36;
+}
+
 uint64_t luna_os_boottime_ns(void)
 {
    struct timespec ts;
@@ -809,6 +821,15 @@ static void audio_wait_frames(struct timespec *deadline, unsigned frames, unsign
    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, deadline, NULL) == EINTR) {}
 }
 
+/* Published after the output thread starts; volatile does not synchronize
+ * this store with the consumer's load. */
+static _Atomic(void (*)(void)) g_audio_pull;
+void luna_os_audio_set_pull(void (*pull)(void))
+{
+   atomic_store_explicit(&g_audio_pull, pull, memory_order_release);
+}
+static atomic_int g_audio_fallback;          /* playing into the null sink because no card opened */
+
 static void *luna_audio_thread(void *arg)
 {
    (void)arg;
@@ -823,6 +844,7 @@ static void *luna_audio_thread(void *arg)
    clock_gettime(CLOCK_MONOTONIC, &deadline);
    uint64_t submitted = 0;
    unsigned long starved_periods = 0, starved_frames = 0;
+   uint64_t off_start_ns = 0, off_retired = 0;
    while (!atomic_load_explicit(&g_audio_stop, memory_order_acquire)) {
       /* Hand the card a whole period every period, always.  A mixer does not
        * stop when the application is late; it plays what it has and silence
@@ -832,6 +854,12 @@ static void *luna_audio_thread(void *arg)
        * — which is what a producer that cannot keep up sounds like here.
        * Hardware writes normally pace the loop; the monotonic deadline
        * below also paces sinks that accept frames without waiting. */
+      /* This thread is the output's clock: ask the mixer for what the next period
+       * needs before looking at what is in the ring. */
+      {
+         void (*pull)(void) = atomic_load_explicit(&g_audio_pull, memory_order_acquire);
+         if (pull) pull();
+      }
       unsigned t = atomic_load_explicit(&g_audio_tail, memory_order_relaxed);
       unsigned have = luna_audio_used();
       if (have > period) have = period;
@@ -927,14 +955,53 @@ static void *luna_audio_thread(void *arg)
           * for one period and leave the card free. */
          unsigned freq = g_audio.freq ? g_audio.freq : 48000u;
          audio_wait_frames(&deadline, period, freq);
-         if (have)
+         /* The clock is the wall clock, not a count of wake-ups: a thread that
+          * wakes late (the host is busy) has to retire what the time since its
+          * last wake-up is worth, or the stream falls behind a little every
+          * period and plays at two thirds speed under load. */
+         struct timespec wall;
+         clock_gettime(CLOCK_MONOTONIC, &wall);
+         const uint64_t wall_ns = (uint64_t)wall.tv_sec * 1000000000ull + (uint64_t)wall.tv_nsec;
+         if (!off_start_ns) { off_start_ns = wall_ns; off_retired = 0; }
+         /* The card that was busy may be free now: ask for it again every few
+          * seconds (the switch above does the opening and keeps the null sink
+          * if it still will not). */
+         if (atomic_load(&g_audio_fallback)) {
+            static uint64_t next_try;
+            if (wall_ns >= next_try) {
+               next_try = wall_ns + 3000000000ull;
+               if (next_try > 3000000000ull && off_retired) {
+                  pthread_mutex_lock(&g_audio_dev_lock);
+                  snprintf(g_audio_dev_want, sizeof g_audio_dev_want, "default");
+                  pthread_mutex_unlock(&g_audio_dev_lock);
+                  atomic_store_explicit(&g_audio_dev_switch, 1, memory_order_release);
+               }
+            }
+         }
+         const uint64_t due = (wall_ns - off_start_ns) * freq / 1000000000ull;
+         unsigned retire = due > off_retired ? (unsigned)(due - off_retired) : 0u;
+         if (!retire) continue;
+         const unsigned used = luna_audio_used();
+         const unsigned drop = used < retire ? used : retire;
+         if (drop)
             atomic_store_explicit(&g_audio_tail,
-                                  (t + have) % LUNA_AUDIO_RING_FRAMES,
+                                  (t + drop) % LUNA_AUDIO_RING_FRAMES,
                                   memory_order_release);
-         atomic_fetch_add_explicit(&g_audio_played, period, memory_order_release);
-         submitted += period;
+         atomic_fetch_add_explicit(&g_audio_played, retire, memory_order_release);
+         submitted += retire;
+         off_retired += retire;
+         if (getenv("LUNARIA_TRACE_AUDIO_CLOCK")) {
+            static uint64_t ticks, dropped, retired_sum, last;
+            ++ticks; dropped += drop; retired_sum += retire;
+            if (wall_ns - last >= 1000000000ull) {
+               if (last) fprintf(stderr, "[audio-thread] %llu ticks, retired %llu, dropped from ring %llu frames/s (ring used %u)\n",
+                  (unsigned long long)ticks, (unsigned long long)retired_sum, (unsigned long long)dropped, used);
+               last = wall_ns; ticks = dropped = retired_sum = 0;
+            }
+         }
          continue;
       }
+      off_start_ns = 0;   /* a card is open again: its own clock counts */
       const int wrote = AUDIO_play(&g_audio, (char *)chunk, (int)period);
       /* Count silence as well as source PCM: the mixer clock continues when
        * the guest producer is late.  Device delay is subtracted below so
@@ -1017,7 +1084,7 @@ int luna_os_audio_open(unsigned rate, unsigned channels)
     * silently substitute one for the other. */
    char devbuf[128];
    snprintf(devbuf, sizeof devbuf, "%s", (dev && *dev) ? dev : "default");
-   const int start_off = !strcmp(devbuf, "off") || !strcmp(devbuf, "none");
+   int start_off = !strcmp(devbuf, "off") || !strcmp(devbuf, "none");
    /* A period of about 10 ms: small enough that the guest's own buffer queue
     * keeps its timing, large enough not to wake the thread constantly. */
    unsigned period = rate / 100u;
@@ -1064,7 +1131,21 @@ int luna_os_audio_open(unsigned rate, unsigned channels)
          fprintf(stderr, "[audio] cannot open ALSA '%s' — is another program "
                  "using the card?  LUNARIA_ALSA_DEVICE names a different one, "
                  "LUNARIA_AUDIO=0 turns playback off\n", devbuf);
-      return -1;
+      /* Play on into a sink that is not there instead of failing the stream.  The
+       * player's clock is the audio clock: with no sink consuming samples at the
+       * rate they are played, a video ran at two thirds speed and dropped frames
+       * for as long as the card was held by another program.  The menu's audio
+       * output choice moves the stream to a card when one is free. */
+      start_off = 1;
+      atomic_store(&g_audio_fallback, 1);
+      memset(&g_audio, 0, sizeof g_audio);
+      g_audio.freq = rate;
+      g_audio.ch = (int)channels;
+      g_audio.frames = period;
+      g_audio.req_frames = (int)period;
+      g_audio.flag = 1;
+      g_audio.format = SND_PCM_FORMAT_S16_LE;
+      snprintf(devbuf, sizeof devbuf, "off");
       }
    }
    g_audio_ring = (int16_t *)calloc((size_t)LUNA_AUDIO_RING_FRAMES * channels,

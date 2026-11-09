@@ -8,6 +8,8 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <stdatomic.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -42,9 +44,8 @@ int bionic_dlclose(void *handle);
 #include "linker/linker.h"
 #include "jvm/jvm.h"
 #include "arm_exec.h"
-#include "luna_compositor.h"
-#include "luna_overlay.h"
 #include "luna_boot.h"
+#include "luna_google.h"
 #include "dvm/dvm.h"
 
 #ifdef _WIN32
@@ -779,6 +780,16 @@ static void stall_watch_tick(void)
  * the process down instead of printing. */
 int arm_exec_il2cpp_symbols(const char *path);
 
+#ifndef _WIN32
+_Static_assert(ATOMIC_BOOL_LOCK_FREE == 2,"diagnostic signal flag must be lock-free");
+static atomic_bool thread_dump_pending;
+static void thread_dump_signal(int sig)
+{
+   (void)sig;
+   atomic_store_explicit(&thread_dump_pending,true,memory_order_relaxed);
+}
+#endif
+
 static void thread_dump_request_tick(void)
 {
    static int every;
@@ -794,9 +805,15 @@ static void thread_dump_request_tick(void)
       if (rc) fprintf(stderr, "[il2cpp-syms] failed (%d)\n", rc);
       return;
    }
-   if (access(own, F_OK) == 0) unlink(own);
-   else if (access("/tmp/lunaria-threads", F_OK) == 0) unlink("/tmp/lunaria-threads");
-   else return;
+   bool requested=false;
+#ifndef _WIN32
+   requested=atomic_exchange_explicit(&thread_dump_pending,false,memory_order_relaxed);
+#endif
+   if (!requested) {
+      if (access(own, F_OK) == 0) unlink(own);
+      else if (access("/tmp/lunaria-threads", F_OK) == 0) unlink("/tmp/lunaria-threads");
+      else return;
+   }
    fprintf(stderr, "[threads] dump requested\n");
    arm64_exec_svc_ring_dump();
 }
@@ -1087,7 +1104,11 @@ static int component_submit(void *user,const char *process,const void *bytes,siz
 #define NAME_MAX_WRAPPED 200
 static struct luna_process_channel *g_service_channel;   /* a host's link to its parent */
 #define PACKAGE_POOL_MAX 8
-static struct { char *package; struct luna_process_pool *pool; } g_package_pools[PACKAGE_POOL_MAX];
+static struct {
+   char *package, *services, *providers;
+   char process[512];
+   struct luna_process_pool *pool;
+} g_package_pools[PACKAGE_POOL_MAX];
 static struct luna_process_pool *package_pool(const char *package)
 {
    if(g_service_channel)return NULL;   /* only the owner of the pools starts hosts */
@@ -1102,29 +1123,127 @@ static struct luna_process_pool *package_pool(const char *package)
    if(luna_apk_system_archive(package,host,sizeof host) &&
       !arm_exec_map_guest_path(record.source_dir,host,sizeof host))return NULL;
    if(luna_os_executable_path(executable,sizeof executable)<0)return NULL;
+   char *services=NULL,*providers=NULL,process[512];
+   if(luna_apk_service_manifest(host,&services,&providers,process,sizeof process))return NULL;
    /* Guest pid ranges of each host start above the application's own pool. */
    struct luna_process_pool *pool=luna_process_pool_open_host(executable,host,(uint32_t)record.uid,811,600000u+(uint32_t)slot*65536u);
-   if(!pool){fprintf(stderr,"[binder] cannot host %s: %s\n",package,strerror(errno));return NULL;}
+   if(!pool){free(services);free(providers);fprintf(stderr,"[binder] cannot host %s: %s\n",package,strerror(errno));return NULL;}
+   const char *owner=getenv("ANDROID_PACKAGE_NAME");
+   const char *profile=owner && !strcmp(owner,package) ? getenv("LUNARIA_PROFILE") :
+      (!strcmp(package,"com.google.android.gms") || !strcmp(package,"com.android.vending") ||
+       !strcmp(package,"com.google.android.gsf")) ? luna_google_profile_current() : "default";
+   if(luna_process_pool_set_profile(pool,profile && *profile ? profile : "default")){
+      free(services);free(providers);luna_process_pool_close(pool);return NULL;
+   }
+   g_package_pools[slot].services=services;
+   g_package_pools[slot].providers=providers;
+   snprintf(g_package_pools[slot].process,sizeof g_package_pools[slot].process,"%s",process);
    g_package_pools[slot].package=strdup(package);g_package_pools[slot].pool=pool;
    return pool;
+}
+static uint32_t binder_route_u32(const unsigned char *p)
+{ return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24; }
+static int binder_route_body(const unsigned char *m,size_t size,const unsigned char **body,size_t *length)
+{
+   if(size<24)return -EPROTO;
+   size_t pn=binder_route_u32(m+16);
+   if(pn>size-24)return -EPROTO;
+   size_t an=binder_route_u32(m+20+pn);
+   if(an>size-24-pn)return -EPROTO;
+   *body=m+24+pn+an;*length=size-24-pn-an;
+   return 0;
+}
+
+/* Resolve an incoming bind against the destination APK, before starting a VM.
+ * The service table is parsed once per package; its process names are already
+ * expanded from the manifest's application defaults and :private names. */
+static int binder_service_process(const char *package,const char *table,
+                                 const void *bytes,size_t size,char *out,size_t cap)
+{
+   const unsigned char *body=NULL;size_t length=0;
+   int decoded=binder_route_body(bytes,size,&body,&length);
+   if(decoded)return decoded;
+   struct dvm *vm=dvm_jni_vm();
+   unsigned cookie=dvm_gil_enter_from_guest(vm);
+   int operation=0;uint32_t intent=0;
+   int result=dvm_service_unpack(vm,body,length,&operation,&intent);
+   if(!result && operation!=3)result=-EPROTO;
+   union dvm_value component={0},cls={0},action={0};
+   if(!result){
+      dvm_get_field(vm,intent,"component","Landroid/content/ComponentName;",&component);
+      if(component.l)dvm_get_field(vm,component.l,"cls","Ljava/lang/String;",&cls);
+      dvm_get_field(vm,intent,"action","Ljava/lang/String;",&action);
+      const char *name=cls.l ? dvm_string_utf8(vm,cls.l) : NULL;
+      const char *act=action.l ? dvm_string_utf8(vm,action.l) : NULL;
+      char full[512];
+      int n=name ? snprintf(full,sizeof full,"%s%s",*name=='.' ? package : "",name) : 0;
+      result=n<0 || (size_t)n>=sizeof full ? -ENAMETOOLONG : -ENOENT;
+      if(name)for(char *p=full;*p;++p)if(*p=='/')*p='.';
+      char *rows=strdup(table ? table : ""),*scan=rows,*row;
+      if(!rows)result=-ENOMEM;
+      while(rows && (row=luna_strsep(&scan,";"))){
+         char *service=luna_strsep(&row,"|"),*enabled=luna_strsep(&row,"|");
+         (void)luna_strsep(&row,"|");
+         char *actions=luna_strsep(&row,"|"),*item;
+         if(!service || !enabled || !atoi(enabled) || !actions || !row || !*row)continue;
+         bool match=name && n>=0 && (size_t)n<sizeof full && !strcmp(service,full);
+         while(!name && act && (item=luna_strsep(&actions,",")))if(!strcmp(item,act))match=true;
+         if(!match)continue;
+         n=snprintf(out,cap,"%s",row);
+         result=n<0 || (size_t)n>=cap ? -ENAMETOOLONG : 0;
+         break;
+      }
+      free(rows);
+   }
+   dvm_gil_leave_to_guest(vm,cookie);
+   return result;
+}
+static int binder_provider_process(const char *package,const char *table,
+                                  const void *bytes,size_t size,char *out,size_t cap)
+{
+   const unsigned char *body=NULL;size_t length=0;
+   int rc=binder_route_body(bytes,size,&body,&length);
+   if(rc)return rc;
+   if(length<8)return -EPROTO;
+   size_t n=binder_route_u32(body+4);
+   if(n>length-8 || n<10 || memcmp(body+8,"content://",10))return -EPROTO;
+   const char *authority=(const char *)body+18;
+   size_t count=0;
+   while(count<n-10 && authority[count]!='/' && authority[count]!='?' && authority[count]!='#')++count;
+   char name[256];
+   if(!count || count>=sizeof name || memchr(authority,0,count))return -EPROTO;
+   memcpy(name,authority,count);name[count]=0;
+   struct luna_providers providers;
+   rc=luna_providers_open(&providers,table,package);
+   if(rc)return rc;
+   rc=-ENOENT;
+   for(size_t i=0;i<providers.count;++i){
+      const struct luna_provider *p=&providers.items[i];
+      if(!p->enabled || !luna_provider_authority(p,name))continue;
+      int written=snprintf(out,cap,"%s",p->process);
+      rc=written<0 || (size_t)written>=cap ? -ENAMETOOLONG : 0;
+      break;
+   }
+   luna_providers_close(&providers);
+   return rc;
 }
 /* The Binder transport.  A parent addresses a child by package name; a child
  * has only its parent, reached through its control channel (peer == NULL). */
 /* A host never starts another host: every message for a package goes up to the
  * process that owns the pools, wrapped with the destination ("LBF1", length,
  * name), and that process delivers it.  One host per package, whoever asks. */
-static int binder_transport_send(void *user,const char *peer,const void *bytes,size_t size)
+static int binder_transport_send_fds(void *user,const char *peer,const void *bytes,size_t size,const int *fds,size_t nfds)
 {
    (void)user;
    if(g_service_channel){
-      if(!peer)return luna_process_channel_send(g_service_channel,bytes,size);
+      if(!peer)return luna_process_channel_send_fds(g_service_channel,bytes,size,fds,nfds);
       const size_t n=strlen(peer);
       unsigned char *wrapped=n<=NAME_MAX_WRAPPED ? malloc(8+n+size) : NULL;
       if(!wrapped)return -ENOMEM;
       memcpy(wrapped,"LBF1",4);
       for(unsigned i=0;i<4;++i)wrapped[4+i]=(unsigned char)((uint32_t)n>>(i*8));
       memcpy(wrapped+8,peer,n);memcpy(wrapped+8+n,bytes,size);
-      int rc=luna_process_channel_send(g_service_channel,wrapped,8+n+size);
+      int rc=luna_process_channel_send_fds(g_service_channel,wrapped,8+n+size,fds,nfds);
       free(wrapped);return rc;
    }
    const unsigned char *direct=bytes;
@@ -1132,26 +1251,74 @@ static int binder_transport_send(void *user,const char *peer,const void *bytes,s
       uint32_t target=0;
       for(unsigned i=0;i<4;++i)target|=(uint32_t)direct[4+i]<<(8*i);
       if(target==(uint32_t)getpid())
-         return dvm_binder_receive(dvm_jni_vm(),peer,direct+8,size-8) ? 0 : -EPROTO;
+         return dvm_binder_receive_fds(dvm_jni_vm(),peer,direct+8,size-8,fds,nfds) ? 0 : -EPROTO;
       for(int i=0;i<PACKAGE_POOL_MAX;++i){
          if(!g_package_pools[i].pool)continue;
-         int rc=luna_process_pool_send_to_host(g_package_pools[i].pool,target,direct+8,size-8);
+         int rc=luna_process_pool_send_to_host_fds(g_package_pools[i].pool,target,direct+8,size-8,fds,nfds);
          if(rc!=-ESRCH)return rc;
       }
-      return g_component_pool ? luna_process_pool_send_to_host(g_component_pool,target,direct+8,size-8) : -ESRCH;
+      return g_component_pool ? luna_process_pool_send_to_host_fds(g_component_pool,target,direct+8,size-8,fds,nfds) : -ESRCH;
    }
    if(!peer)return -ENOTCONN;
+   /* Dynamic receivers live in already-running VMs. The broker fans out the
+    * immutable Intent snapshot; each VM resolves its registered filters. */
+   if(size>=24 && !memcmp(bytes,"LBC1",4)){
+      uint32_t sender=binder_route_u32((const unsigned char *)bytes+4);
+      int error=0;
+      if(sender!=(uint32_t)getpid())
+         (void)dvm_binder_receive_fds(dvm_jni_vm(),peer,bytes,size,fds,nfds);
+      for(int i=0;i<PACKAGE_POOL_MAX;++i){
+         if(!g_package_pools[i].pool)continue;
+         int rc=luna_process_pool_publish_fds(g_package_pools[i].pool,sender,bytes,size,fds,nfds);
+         if(rc<0 && !error)error=rc;
+      }
+      if(g_component_pool){
+         int rc=luna_process_pool_publish_fds(g_component_pool,sender,bytes,size,fds,nfds);
+         if(rc<0 && !error)error=rc;
+      }
+      return error;
+   }
+   const char *self=getenv("ANDROID_PACKAGE_NAME");
+   const bool own=self && !strcmp(self,peer);
+   const bool bind=size>=4 && !memcmp(bytes,"LBB1",4);
+   const bool provider=size>=4 && !memcmp(bytes,"LBQ1",4);
+   if(own && (bind || provider)){
+      char process[512];
+      int rc=bind ? binder_service_process(peer,getenv("ANDROID_SERVICES"),bytes,size,process,sizeof process) :
+         binder_provider_process(peer,getenv("ANDROID_CONTENT_PROVIDERS"),bytes,size,process,sizeof process);
+      if(rc)return rc;
+      const char *current=getenv("ANDROID_PROCESS_NAME");
+      if(current && !strcmp(current,process))
+         return dvm_binder_receive_fds(dvm_jni_vm(),peer,bytes,size,fds,nfds) ? 0 : -EPROTO;
+      uint32_t pid=0;
+      return g_component_pool ? luna_process_pool_send_fds(g_component_pool,process,bytes,size,&pid,fds,nfds) : -ENOTCONN;
+   }
    struct luna_process_pool *pool=package_pool(peer);
    if(!pool)return -ENOENT;
+   const char *process=peer,*services=NULL,*providers=NULL;
+   for(int i=0;i<PACKAGE_POOL_MAX;++i)if(g_package_pools[i].pool==pool){
+      process=g_package_pools[i].process;services=g_package_pools[i].services;providers=g_package_pools[i].providers;break;
+   }
+   char target[512];
+   if(bind || provider){
+      int rc=bind ? binder_service_process(peer,services,bytes,size,target,sizeof target) :
+         binder_provider_process(peer,providers,bytes,size,target,sizeof target);
+      if(rc)return rc;
+      process=target;
+      fprintf(stderr,"[binder] %s process: %s -> %s\n",bind ? "service" : "provider",peer,process);
+   }
    /* An answer for a host that has gone away is dropped, not a reason to start it. */
    const unsigned char *magic=bytes;
-   if(size>=4 && !memcmp(magic,"LBR1",4) && !luna_process_pool_running(pool,peer))return -ECONNREFUSED;
+   if(size>=4 && !memcmp(magic,"LBR1",4) && !luna_process_pool_running(pool,process))return -ECONNREFUSED;
    uint32_t pid=0;
-   return luna_process_pool_send(pool,peer,bytes,size,&pid);
+   return luna_process_pool_send_fds(pool,process,bytes,size,&pid,fds,nfds);
 }
+static int binder_transport_send(void *user,const char *peer,const void *bytes,size_t size)
+{ return binder_transport_send_fds(user,peer,bytes,size,NULL,0); }
 static void component_reply(void *user,const char *name,uint32_t pid,const void *bytes,size_t size)
 {
    (void)user;
+   size_t nfds=0;const int *fds=luna_process_message_fds(&nfds);
    const unsigned char *p=bytes;
    if(size>=8 && !memcmp(p,"LBF1",4)){
       uint32_t n=0;for(unsigned i=0;i<4;++i)n|=(uint32_t)p[4+i]<<(i*8);
@@ -1159,14 +1326,16 @@ static void component_reply(void *user,const char *name,uint32_t pid,const void 
       char dest[NAME_MAX_WRAPPED+1];memcpy(dest,p+8,n);dest[n]=0;
       const char *self=getenv("ANDROID_PACKAGE_NAME");
       if(size>=12+(size_t)n && !memcmp(p+8+n,"LBD1",4)){
-         (void)binder_transport_send(NULL,dest,p+8+n,size-8-n);return;
+         (void)binder_transport_send_fds(NULL,dest,p+8+n,size-8-n,fds,nfds);return;
       }
-      if(self && !strcmp(dest,self)){(void)dvm_binder_receive(dvm_jni_vm(),NULL,p+8+n,size-8-n);return;}
-      (void)binder_transport_send(NULL,dest,p+8+n,size-8-n);
+      if(self && !strcmp(dest,self) && memcmp(p+8+n,"LBB1",4) && memcmp(p+8+n,"LBQ1",4) && memcmp(p+8+n,"LBC1",4)){
+         (void)dvm_binder_receive(dvm_jni_vm(),NULL,p+8+n,size-8-n);return;
+      }
+      (void)binder_transport_send_fds(NULL,dest,p+8+n,size-8-n,fds,nfds);
       return;
    }
    if(size>=8 && !memcmp(p,"LBD1",4)){
-      (void)binder_transport_send(NULL,name,bytes,size);return;
+      (void)binder_transport_send_fds(NULL,name,bytes,size,fds,nfds);return;
    }
    if(size>=12 && p[0]=='L' && p[1]=='B'){
       if(!dvm_binder_receive(dvm_jni_vm(),name,bytes,size))
@@ -1208,6 +1377,7 @@ static void component_pool_install(struct dvm *vm,int is_a64)
    if(!g_component_pool){fprintf(stderr,"[service-broker] unavailable: %s\n",strerror(errno));return;}
    dvm_service_set_submit(vm,component_submit,g_component_pool);
    dvm_binder_set_transport(binder_transport_send,NULL);
+   dvm_binder_set_fd_transport(binder_transport_send_fds,NULL);
    dvm_binder_set_pump(component_pool_tick);
 }
 
@@ -1296,15 +1466,29 @@ pump_run_frame(void (*run_threads)(void))
          break;
       if (arm_exec_sched_ticks() != before)
          continue;   /* the guest is working — let it have the whole frame */
+      /* Everything is parked and the Java half has a message due: the rest of
+       * the guest's share would only delay it.  (A Java-only app such as a
+       * Compose UI has no guest work at all, and used to idle here for most
+       * of every frame while its main Looper waited.) */
+      if (dvm_main_work_due(dvm_jni_vm()))
+         break;
       /* Everything is parked.  Wait in small steps so that a wakeup which
        * becomes visible mid-frame is not held back until the next one. */
       const uint64_t t_idle = frame_now_ns();
-      usleep((deadline - now > 1000ull) ? 1000u : (useconds_t)(deadline - now));
+      (void)dvm_pump_wait_us((deadline - now > 1000ull) ? 1000u : (unsigned)(deadline - now));
       frame_stage_add(FRAME_STAGE_IDLE, t_idle);
    }
    const uint64_t java_start = pump_now_us();
    pump_java_frame();
    java_us = pump_now_us() - java_start;
+   /* The window shows 60 pictures a second.  A Java half that finishes early and
+    * starts the next turn at once (it has work due) runs the main Looper a
+    * hundred times a second, and every turn holds the interpreter lock the
+    * media player's own threads need: a video then falls behind its clock and
+    * drops frames.  Leave the lock alone for the rest of the period. */
+   static const uint64_t period_us = 16000;
+   const uint64_t used = pump_now_us() - (deadline - guest_us);
+   if (used < period_us) (void)dvm_pump_wait_us((unsigned)(period_us - used));
 }
 
 /* Calls one no-argument (or single-null-argument) lifecycle method through the
@@ -1345,7 +1529,7 @@ static int
 start_manifest_providers(struct jvm *jvm, jobject context)
 {
    const char *encoded = getenv("ANDROID_CONTENT_PROVIDERS");
-   if (!encoded || !*encoded) return 0;
+   if (!encoded || !*encoded) { dvm_content_providers_startup(dvm_jni_vm(),false); return 0; }
    const char *package=getenv("ANDROID_PACKAGE_NAME");
    const char *process=getenv("ANDROID_PROCESS_NAME");
    if(!process || !*process)process=package;
@@ -1355,7 +1539,7 @@ start_manifest_providers(struct jvm *jvm, jobject context)
    char failed[256]="";
    for(size_t index=0;index<providers.count;++index){
       struct luna_provider *row=&providers.items[index];
-      if(!(getenv("ANDROID_SERVICE_HOST") ? row->enabled : luna_provider_local(row,process)))continue;
+      if(!luna_provider_local(row,process))continue;
       char *entry=row->name,*authority=row->authority,*metadata=row->metadata;
       char cls[256];
       size_t n = 0;
@@ -1461,6 +1645,7 @@ start_manifest_providers(struct jvm *jvm, jobject context)
       ++started;
    }
    luna_providers_close(&providers);
+   dvm_content_providers_startup(dvm_jni_vm(),false);
    return started;
 provider_failed:
    fprintf(stderr, "[loader] content provider failed: %s\n", failed);
@@ -1649,6 +1834,7 @@ run_dex_activity(struct jvm *jvm, int is_a64)
    { const char *mf = getenv("LUNARIA_MAX_FRAMES"); if (mf && *mf) max_frames = atoi(mf); }
    fprintf(stderr, "[loader] dex startup: entering pump loop (max_frames=%d)\n",
            max_frames);
+   dvm_media_start_event_thread(dvm_jni_vm());
    int frame = 0, exit_status = 0;
    for (; max_frames <= 0 || frame < max_frames; ++frame) {
       if (arm_exec_guest_abort_count() > 0) {
@@ -1686,32 +1872,21 @@ run_dex_activity(struct jvm *jvm, int is_a64)
 }
 
 /* Independent component VM entry: no launcher Activity or EGL/window setup. */
+struct service_inbox { struct service_inbox *next; size_t size,nfds; int fds[LUNA_PROCESS_FD_MAX]; unsigned char bytes[]; };
 struct service_process {
    struct dvm *vm;
    struct luna_process_channel *channel;
-   int fatal;
-   int ready;                 /* Application.onCreate has returned */
-   struct { void *bytes; size_t size; } held[16];  /* component commands that arrived before it */
-   unsigned nheld;
+   atomic_int fatal, io_stop;
+   pthread_t io_thread;
+   pthread_mutex_t inbox_lock;
+   struct service_inbox *inbox_head, *inbox_tail;
+   int control_fd;
 };
-static struct service_process *g_service_process;
-static void service_process_command(void *user,const void *bytes,size_t size)
+static void service_process_command(void *user,const void *bytes,size_t size,const int *fds,size_t nfds)
 {
    struct service_process *process=user;
    if(process->fatal)return;
-   /* ActivityManager creates a component only once the process has bound its
-    * Application.  Content-provider requests and calls on a Binder already handed
-    * out are not components being created, so they are answered at once. */
-   const unsigned char *tag=bytes;
-   const int starts_component=!(size>=4 && tag[0]=='L' && tag[1]=='B') || (size>=4 && !memcmp(tag,"LBB1",4));
-   if(!process->ready && starts_component){
-      if(process->nheld>=sizeof process->held/sizeof *process->held || !(process->held[process->nheld].bytes=malloc(size))){
-         fprintf(stderr,"[service-process] too many commands before the Application is ready\n");return;
-      }
-      memcpy(process->held[process->nheld].bytes,bytes,size);process->held[process->nheld++].size=size;
-      return;
-   }
-   if(dvm_binder_receive(process->vm,NULL,bytes,size))return;
+   if(dvm_binder_receive_fds(process->vm,NULL,bytes,size,fds,nfds))return;
    int status=dvm_service_dispatch(process->vm,bytes,size);
    unsigned char reply[8]={'L','S','R','1',0,0,0,0};
    for(unsigned i=0;i<4;++i)reply[4+i]=(unsigned char)((uint32_t)status>>(i*8));
@@ -1719,12 +1894,59 @@ static void service_process_command(void *user,const void *bytes,size_t size)
    if(rc<0 || status==-EIO)process->fatal=1;
    fprintf(stderr,"[service-process] command result=%d\n",status);
 }
-/* What the component process's main thread runs while it waits for a reply from
- * another process: its own control channel and the pools it owns. */
-static void service_process_pump(void)
+/* Binder's transport must not depend on the application's main Looper. A
+ * service onBind/onCreate may hold a Java monitor while Binder threads keep
+ * serving transactions. Only component lifecycle and connection callbacks
+ * belong to the main thread. The socket blocks in poll when there is no work. */
+static void service_process_receive(void *user, const void *bytes, size_t size)
 {
-   if(g_service_process)(void)luna_process_channel_tick(g_service_process->channel,service_process_command,g_service_process);
-   component_pool_tick();
+   struct service_process *process = user;
+   if (dvm_binder_receive_io(process->vm, bytes, size)) return;
+   struct service_inbox *message = malloc(sizeof *message + size);
+   if (!message) { atomic_store(&process->fatal, 1); return; }
+   message->nfds=0;
+   size_t nfds=0;const int *fds=luna_process_message_fds(&nfds);
+   for(size_t i=0;i<nfds;++i){
+      int fd=luna_fd_dup(fds[i],0,1);
+      if(fd<0){for(size_t j=0;j<message->nfds;++j)luna_fd_close(message->fds[j]);free(message);atomic_store(&process->fatal,1);return;}
+      message->fds[message->nfds++]=fd;
+   }
+   message->next = NULL;
+   message->size = size;
+   memcpy(message->bytes, bytes, size);
+   pthread_mutex_lock(&process->inbox_lock);
+   if (process->inbox_tail) process->inbox_tail->next = message;
+   else process->inbox_head = message;
+   process->inbox_tail = message;
+   pthread_mutex_unlock(&process->inbox_lock);
+}
+static void *service_process_io(void *user)
+{
+   struct service_process *process = user;
+   while (!atomic_load(&process->io_stop)) {
+      struct pollfd fd = luna_pollfd_make(process->control_fd, POLLIN);
+      int rc = luna_socket_poll(&fd, 1, 100);
+      if (rc < 0 && errno == EINTR) continue;
+      if (rc > 0) rc = luna_process_channel_tick(process->channel, service_process_receive, process);
+      if (rc < 0) { atomic_store(&process->fatal, 1); break; }
+   }
+   return NULL;
+}
+static void service_process_drain(struct service_process *process)
+{
+   for (unsigned n = 0; n < 32; ++n) {
+      pthread_mutex_lock(&process->inbox_lock);
+      struct service_inbox *message = process->inbox_head;
+      if (message) {
+         process->inbox_head = message->next;
+         if (!process->inbox_head) process->inbox_tail = NULL;
+      }
+      pthread_mutex_unlock(&process->inbox_lock);
+      if (!message) break;
+      service_process_command(process, message->bytes, message->size,message->fds,message->nfds);
+      for(size_t i=0;i<message->nfds;++i)luna_fd_close(message->fds[i]);
+      free(message);
+   }
 }
 static int run_service_process(struct jvm *jvm,int is_a64,int control_fd)
 {
@@ -1732,10 +1954,20 @@ static int run_service_process(struct jvm *jvm,int is_a64,int control_fd)
    process.channel=luna_process_channel_open(control_fd);
    if(!process.channel){fprintf(stderr,"[service-process] control channel: %s\n",strerror(errno));return EXIT_FAILURE;}
    process.vm=dvm_jni_vm();
+   process.control_fd=control_fd;
+   atomic_init(&process.fatal,0);atomic_init(&process.io_stop,0);
+   int io_error=pthread_mutex_init(&process.inbox_lock,NULL);
+   if(io_error){luna_process_channel_close(process.channel);return EXIT_FAILURE;}
+   dvm_content_providers_startup(process.vm,true);
    g_service_channel=process.channel;
-   g_service_process=&process;
    dvm_binder_set_transport(binder_transport_send,NULL);
-   dvm_binder_set_pump(service_process_pump);
+   dvm_binder_set_fd_transport(binder_transport_send_fds,NULL);
+   dvm_binder_set_pump(NULL);
+   io_error=pthread_create(&process.io_thread,NULL,service_process_io,&process);
+   if(io_error){
+      g_service_channel=NULL;
+      pthread_mutex_destroy(&process.inbox_lock);luna_process_channel_close(process.channel);return EXIT_FAILURE;
+   }
    jobject base=NULL,application=NULL;
    int result=EXIT_FAILURE;
    if(!process.vm || luna_application_start(jvm,getenv("ANDROID_APPLICATION_CLASS"),
@@ -1745,29 +1977,28 @@ static int run_service_process(struct jvm *jvm,int is_a64,int control_fd)
    }
    fprintf(stderr,"[service-process] ready: %s pid=%d\n",
            getenv("ANDROID_PROCESS_NAME") ? getenv("ANDROID_PROCESS_NAME") : "?",arm_exec_guest_pid());
-   process.ready=1;
-   for(unsigned i=0;i<process.nheld;++i){
-      service_process_command(&process,process.held[i].bytes,process.held[i].size);
-      free(process.held[i].bytes);
-   }
-   process.nheld=0;
    dvm_deliver_boot_completed(process.vm);
    void (*run_threads)(void)=is_a64 ? arm64_exec_run_pending_threads : arm_exec_run_pending_threads;
    result=EXIT_SUCCESS;
    while(!process.fatal){
       int status=0;
       if(process_exit_status(&status)){result=status;break;}
-      int rc=luna_process_channel_tick(process.channel,service_process_command,&process);
-      if(rc==-EPIPE)break;
-      /* A host may itself bind another host's Service (the Play Store uses Play services). */
-      component_pool_tick();
-      if(rc<0){fprintf(stderr,"[service-process] IPC error: %s\n",strerror(-rc));result=EXIT_FAILURE;break;}
+      service_process_drain(&process);
       run_threads();dvm_main_looper_tick(process.vm);dvm_prefs_flush(process.vm);
       usleep(1000);
    }
    if(process.fatal)result=EXIT_FAILURE;
 done:
-   g_service_process=NULL;
+   dvm_content_providers_startup(process.vm,false);
+   atomic_store(&process.io_stop,1);
+   pthread_join(process.io_thread,NULL);
+   while(process.inbox_head){
+      struct service_inbox *next=process.inbox_head->next;
+      for(size_t i=0;i<process.inbox_head->nfds;++i)luna_fd_close(process.inbox_head->fds[i]);
+      free(process.inbox_head);process.inbox_head=next;
+   }
+   pthread_mutex_destroy(&process.inbox_lock);
+   g_service_channel=NULL;
    luna_process_channel_close(process.channel);return result;
 }
 
@@ -1946,10 +2177,6 @@ run_jni_game_arm(struct jvm *jvm)
    fprintf(stderr, "[loader] nativeResume done, running pending threads...\n");
    arm_exec_run_pending_threads();
    fprintf(stderr, "[loader] entering render loop\n");
-   /* SIGUSR1: dump SVC ring buffer on demand (kill -USR1 <pid>) */
-#ifndef _WIN32
-   signal(SIGUSR1, svc_dump_handler);
-#endif
    schedule_unsafe_alarm_dump();
 
    /* 注意: nativeDone() はここでは呼ばない。Unity 5+ では nativeDone() は
@@ -2159,6 +2386,13 @@ main(int argc, const char *argv[])
    setvbuf(stdout, NULL, _IOLBF, 0);
 #ifndef _WIN32
    signal(SIGABRT, host_abort_report);
+   /* Register before selecting a launch path, including DEX/NativeActivity. */
+   struct sigaction dump_action;
+   memset(&dump_action,0,sizeof dump_action);
+   dump_action.sa_handler=thread_dump_signal;
+   dump_action.sa_flags=SA_RESTART;
+   sigemptyset(&dump_action.sa_mask);
+   if(sigaction(SIGUSR1,&dump_action,NULL))perror("SIGUSR1 diagnostic handler");
 #endif
 
    /* Descriptors 0, 1 and 2 are always open in an Android process: zygote
@@ -2239,6 +2473,16 @@ main(int argc, const char *argv[])
       if (init_ok < 0)
          errx(EXIT_FAILURE, "%s context init failed",
               is_a64 ? "arm64" : "arm32");
+      const char *data_root=getenv("LUNARIA_DATA_ROOT");
+      const char *gms_profile=getenv("LUNARIA_GMS_PROFILE");
+      char state_root[4096],state_dir[4096];
+      if (data_root && luna_google_accounts_directory(data_root,
+            gms_profile && *gms_profile ? gms_profile : "default",
+            state_root,sizeof state_root)==0 &&
+          snprintf(state_dir,sizeof state_dir,"%s/processes",state_root)<(int)sizeof state_dir) {
+         int state_error=luna_process_state_open(state_dir);
+         if (state_error) fprintf(stderr,"[loader] process registry: %s\n",strerror(-state_error));
+      }
       arm_exec_set_main_lib_dir(libdir);
       if (!service_process && !arm_exec_host_egl_init())
          fprintf(stderr, "[loader] early APK-process host EGL init failed\n");

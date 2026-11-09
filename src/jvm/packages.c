@@ -642,9 +642,25 @@ int lunaria_android_package_install(const char *name, uint32_t uid, const char *
    char line[1024], guest[512], host[PATH_MAX], dir[PATH_MAX], *slash;
    ledger_ready();
    if (!name || !*name || strlen(name) > 200 || row_exists(name)) return 0;
+   char version[256];
+   int version_code = 0, target_sdk = 0;
+   bool have_manifest = host_apk && host_apk[0] == '/';
+   if (have_manifest && luna_apk_package_version(host_apk,name,&version_code,version,sizeof version,&target_sdk) < 1)
+      return -1;
    snprintf(guest, sizeof guest, "/data/app/%s/base.apk", name);
    snprintf(line, sizeof line, "%s %u - %s", name, uid, guest);
+   size_t before = g_nrows;
    ledger_add_line(line, strlen(line));
+   if (g_nrows == before) return -1;
+   if (have_manifest) {
+      struct ledger_row *row = &g_rows[g_nrows-1];
+      char *copy = strdup(version);
+      if (!copy) { ledger_remove(name); return -1; }
+      free(row->version_name); row->version_name = copy;
+      row->record.version_name = *copy ? copy : NULL;
+      row->record.version_code = version_code;
+      row->record.target_sdk = target_sdk;
+   }
    if (!host_apk || host_apk[0] != '/') return 1;
    /* ledger_add_line materialised an empty archive there: put the real one in
     * its place. */

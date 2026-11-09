@@ -298,6 +298,11 @@ int dvm_webview_count(void);
 /* One turn of the main thread's Looper — see dvm.c.  The frame pump calls it
  * so a Handler.postDelayed() callback runs near its due time instead of
  * waiting for the guest to call into Java. */
+bool dvm_main_work_due(struct dvm *vm);
+void dvm_pump_wake(void);
+bool dvm_pump_wait_us(unsigned us);
+bool dvm_ui_input_pending(void);
+void dvm_media_start_event_thread(struct dvm *vm);
 void dvm_main_looper_tick(struct dvm *vm);
 
 /* Caps runaway bytecode (a spin loop in Java would otherwise hang the pump
@@ -435,16 +440,30 @@ void dvm_service_set_submit(struct dvm *,int (*submit)(void *,const char *,const
 /* Provided by the launcher (apk.c): the ';'-separated content authorities an APK's
  * manifest declares, malloc'd; 0 on success, -1 when it cannot be read. */
 int luna_apk_content_authorities(const char *apk_path, char **out);
+/* System registered-service metadata, resolved from the installed APK's own
+ * resource table. Returns 1 match, 0 absent, -1 unreadable/invalid. */
+int luna_apk_find_registered_service(const char *apk, const char *action, const char *metadata,
+                                    const char *attribute, const char *value, unsigned sdk,
+                                    char *component, size_t cap);
 /* A whole Cursor as bytes and back (dvm_sqlite.c): how a ContentProvider's result
  * crosses a process boundary.  The snapshot is malloc'd; 0 / NULL on failure. */
 int dvm_sqlite_cursor_snapshot(struct dvm *,uint32_t cursor,void **bytes,size_t *size);
 uint32_t dvm_sqlite_cursor_from_snapshot(struct dvm *,const void *bytes,size_t size);
+/* Publish the manifest provider batch before Application.onCreate. Remote
+ * acquisitions release the interpreter lock while installation is pending. */
+void dvm_content_providers_startup(struct dvm *,bool);
+bool dvm_content_providers_wait(struct dvm *);
 void dvm_binder_set_transport(int (*send)(void *,const char *,const void *,size_t),void *user);
+void dvm_binder_set_fd_transport(int (*send)(void *,const char *,const void *,size_t,const int *,size_t),void *user);
 void dvm_binder_set_pump(void (*pump)(void));
 void dvm_binder_set_provider_server(int (*serve)(struct dvm *,uint32_t,uint32_t,const uint8_t *,size_t));
 int dvm_binder_request(struct dvm *,const char *package,const char *magic,const void *body,size_t body_size,
                        int32_t *status,uint8_t **payload,size_t *payload_size);
 int dvm_binder_receive(struct dvm *,const char *name,const void *bytes,size_t size);
+int dvm_binder_receive_fds(struct dvm *,const char *,const void *,size_t,const int *,size_t);
+/* Dispatch transactions/provider calls and synchronous replies off the main
+ * thread; return 0 for lifecycle commands and ServiceConnection callbacks. */
+int dvm_binder_receive_io(struct dvm *,const void *bytes,size_t size);
 int dvm_binder_remote_bind(struct dvm *,const char *package,uint32_t intent,uint32_t connection);
 
 /* ---- DEX / APK container readers (dex.c, apk_signers.c) ---- */
